@@ -6,6 +6,13 @@
 int sg_cmd_init(int argc, char **argv);
 int sg_cmd_hash_object(int argc, char **argv);
 int sg_cmd_cat_file(int argc, char **argv);
+int sg_cmd_add(int argc, char **argv);
+int sg_cmd_commit(int argc, char **argv);
+int sg_cmd_log(int argc, char **argv);
+int sg_cmd_status(int argc, char **argv);
+int sg_cmd_diff(int argc, char **argv);
+int sg_cmd_switch(int argc, char **argv);
+int sg_cmd_restore(int argc, char **argv);
 
 int sg_cli_run(int argc, char **argv);
 

@@ -103,6 +103,80 @@ GIT_STATUS_RC=$?
 check "git status exits 0 inside sg-inited repo" test "$GIT_STATUS_RC" = 0
 check "git status does not complain about an invalid repository" sh -c "! grep -qi 'not a git repository' '$GIT_STATUS_OUT'"
 
+export GIT_AUTHOR_NAME="Interop Test"
+export GIT_AUTHOR_EMAIL="interop@example.com"
+
+# --- Phase 2 case 1: sg init/add/commit, real git reads it back ---
+P2_REPO="$WORKDIR/phase2_sg_repo"
+mkdir -p "$P2_REPO/sub"
+(cd "$WORKDIR" && "$SG" init phase2_sg_repo) > /dev/null 2>&1
+printf 'top level file\n' > "$P2_REPO/top.txt"
+printf 'nested file\n' > "$P2_REPO/sub/nested.txt"
+(cd "$P2_REPO" && "$SG" add top.txt sub/nested.txt) > /dev/null 2>&1
+check "sg add exits 0" test $? = 0
+COMMIT_OUT="$WORKDIR/p2_commit_out.txt"
+(cd "$P2_REPO" && "$SG" commit -m "first commit") > "$COMMIT_OUT" 2>&1
+check "sg commit exits 0" test $? = 0
+check "sg commit prints root-commit summary" grep -q "root-commit" "$COMMIT_OUT"
+
+(cd "$P2_REPO" && git log --format='%H' -1) > /dev/null 2>&1
+check "git log reads sg-created commit" test $? = 0
+
+GIT_SHOW_TOP="$WORKDIR/p2_show_top.txt"
+(cd "$P2_REPO" && git show HEAD:top.txt) > "$GIT_SHOW_TOP" 2>/dev/null
+check "git show HEAD:top.txt matches sg-added content" cmp -s "$P2_REPO/top.txt" "$GIT_SHOW_TOP"
+
+GIT_SHOW_NESTED="$WORKDIR/p2_show_nested.txt"
+(cd "$P2_REPO" && git show HEAD:sub/nested.txt) > "$GIT_SHOW_NESTED" 2>/dev/null
+check "git show HEAD:sub/nested.txt matches sg-added nested content" cmp -s "$P2_REPO/sub/nested.txt" "$GIT_SHOW_NESTED"
+
+GIT_STATUS_P2="$WORKDIR/p2_git_status.txt"
+(cd "$P2_REPO" && git status --porcelain) > "$GIT_STATUS_P2" 2>&1
+check "git status --porcelain is empty (clean) after sg add+commit" test ! -s "$GIT_STATUS_P2"
+
+# --- Phase 2 case 2: real git init/add/commit, sg reads it back ---
+P2_GIT_REPO="$WORKDIR/phase2_git_repo"
+mkdir -p "$P2_GIT_REPO"
+(cd "$WORKDIR" && git init -q phase2_git_repo)
+(cd "$P2_GIT_REPO" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'from real git\n' > "$P2_GIT_REPO/file.txt"
+(cd "$P2_GIT_REPO" && git add file.txt && git commit -q -m "real git commit")
+
+SG_LOG_OUT="$WORKDIR/p2_sg_log.txt"
+(cd "$P2_GIT_REPO" && "$SG" log) > "$SG_LOG_OUT" 2>&1
+check "sg log exits 0 on a real-git repo" test $? = 0
+REAL_SHA=$(cd "$P2_GIT_REPO" && git rev-parse HEAD)
+check "sg log shows the real git commit sha" grep -q "$REAL_SHA" "$SG_LOG_OUT"
+
+SG_STATUS_OUT="$WORKDIR/p2_sg_status.txt"
+(cd "$P2_GIT_REPO" && "$SG" status) > "$SG_STATUS_OUT" 2>&1
+check "sg status exits 0 on a real-git repo" test $? = 0
+check "sg status reports clean tree on a real-git repo" grep -q "nothing to commit" "$SG_STATUS_OUT"
+
+printf 'more from real git\n' >> "$P2_GIT_REPO/file.txt"
+SG_STATUS_DIRTY="$WORKDIR/p2_sg_status_dirty.txt"
+(cd "$P2_GIT_REPO" && "$SG" status) > "$SG_STATUS_DIRTY" 2>&1
+check "sg status detects unstaged modification on a real-git repo" grep -q "modified" "$SG_STATUS_DIRTY"
+(cd "$P2_GIT_REPO" && git checkout -q -- file.txt)
+
+# --- Phase 2 case 3: sg switch -c, commit on branch, switch back, verify content via real git ---
+BRANCH_REPO="$P2_REPO"
+(cd "$BRANCH_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+check "sg switch -c exits 0" test $? = 0
+printf 'top level file\nfeature addition\n' > "$BRANCH_REPO/top.txt"
+(cd "$BRANCH_REPO" && "$SG" add top.txt) > /dev/null 2>&1
+(cd "$BRANCH_REPO" && "$SG" commit -m "feature change") > /dev/null 2>&1
+check "sg commit on feature branch exits 0" test $? = 0
+
+(cd "$BRANCH_REPO" && "$SG" switch master) > /dev/null 2>&1
+check "sg switch back to master exits 0" test $? = 0
+
+GIT_SHOW_MASTER_TOP="$WORKDIR/p2_master_top.txt"
+(cd "$BRANCH_REPO" && git show HEAD:top.txt) > "$GIT_SHOW_MASTER_TOP" 2>/dev/null
+check "git show HEAD:top.txt on master has original content after switching back" \
+    sh -c "! grep -q 'feature addition' '$GIT_SHOW_MASTER_TOP'"
+check "working tree top.txt matches master content after sg switch" cmp -s "$BRANCH_REPO/top.txt" "$GIT_SHOW_MASTER_TOP"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed"
 
