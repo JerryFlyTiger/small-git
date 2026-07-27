@@ -255,6 +255,95 @@ check "workdir is clean before the clean-switch check" \
 CLEAN_SWITCH_RC=$?
 check "sg switch succeeds without --force when the workdir is clean" test "$CLEAN_SWITCH_RC" = 0
 
+# --- Phase 4: automatic snapshots on dangerous switch/restore + `sg undo` ---
+# Each case below uses its own freshly-initialized repo so that one case's
+# snapshot count can never leak into another case's before/after comparison.
+
+snapshot_count() {
+    # counts numbered lines ("  N) ...") in `sg undo`'s listing; the "no
+    # snapshots yet" message and the header/footer lines never contain ')'
+    (cd "$1" && "$SG" undo < /dev/null) 2>&1 | grep -c ')'
+}
+
+# case A: sg switch --force overwrites an uncommitted change; sg undo brings it back
+P4A_REPO="$WORKDIR/phase4a_repo"
+mkdir -p "$P4A_REPO"
+(cd "$WORKDIR" && "$SG" init phase4a_repo) > /dev/null 2>&1
+printf 'original\n' > "$P4A_REPO/f.txt"
+(cd "$P4A_REPO" && "$SG" add f.txt && "$SG" commit -m "p4a first") > /dev/null 2>&1
+(cd "$P4A_REPO" && "$SG" switch -c other) > /dev/null 2>&1
+(cd "$P4A_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+
+printf 'original\nlocal edit before switch\n' > "$P4A_REPO/f.txt"
+(cd "$P4A_REPO" && "$SG" switch other --force < /dev/null) > /dev/null 2>&1
+check "phase4a: sg switch --force succeeds over a dirty workdir" test $? = 0
+check "phase4a: switch --force actually overwrote the uncommitted change" \
+    sh -c "! grep -q 'local edit before switch' '$P4A_REPO/f.txt'"
+
+(cd "$P4A_REPO" && "$SG" undo 1 --force < /dev/null) > /dev/null 2>&1
+check "phase4a: sg undo 1 exits 0" test $? = 0
+check "phase4a: sg undo 1 restores the content that switch overwrote" \
+    grep -q "local edit before switch" "$P4A_REPO/f.txt"
+
+# case B: sg restore --force discards an uncommitted change; sg undo brings it back
+P4B_REPO="$WORKDIR/phase4b_repo"
+mkdir -p "$P4B_REPO"
+(cd "$WORKDIR" && "$SG" init phase4b_repo) > /dev/null 2>&1
+printf 'original\n' > "$P4B_REPO/f.txt"
+(cd "$P4B_REPO" && "$SG" add f.txt && "$SG" commit -m "p4b first") > /dev/null 2>&1
+
+printf 'original\nlocal edit before restore\n' > "$P4B_REPO/f.txt"
+(cd "$P4B_REPO" && "$SG" restore f.txt --force < /dev/null) > /dev/null 2>&1
+check "phase4b: sg restore --force succeeds discarding a dirty change" test $? = 0
+check "phase4b: restore --force actually discarded the uncommitted change" \
+    sh -c "! grep -q 'local edit before restore' '$P4B_REPO/f.txt'"
+
+(cd "$P4B_REPO" && "$SG" undo 1 --force < /dev/null) > /dev/null 2>&1
+check "phase4b: sg undo 1 exits 0" test $? = 0
+check "phase4b: sg undo 1 recovers the content that restore discarded" \
+    grep -q "local edit before restore" "$P4B_REPO/f.txt"
+
+# case C: `sg undo` with no args lists at least one snapshot after the dangerous ops above
+UNDO_LIST_OUT="$WORKDIR/p4_undo_list.txt"
+(cd "$P4A_REPO" && "$SG" undo < /dev/null) > "$UNDO_LIST_OUT" 2>&1
+check "phase4c: sg undo (list) exits 0" test $? = 0
+C_COUNT=$(snapshot_count "$P4A_REPO")
+check "phase4c: sg undo (list) shows at least one snapshot" test "$C_COUNT" -ge 1
+
+# case D: a clean switch (no --force needed) must NOT create a new snapshot
+P4D_REPO="$WORKDIR/phase4d_repo"
+mkdir -p "$P4D_REPO"
+(cd "$WORKDIR" && "$SG" init phase4d_repo) > /dev/null 2>&1
+printf 'content\n' > "$P4D_REPO/f.txt"
+(cd "$P4D_REPO" && "$SG" add f.txt && "$SG" commit -m "p4d first") > /dev/null 2>&1
+(cd "$P4D_REPO" && "$SG" switch -c other) > /dev/null 2>&1
+
+D_COUNT_BEFORE=$(snapshot_count "$P4D_REPO")
+check "phase4d: no snapshots exist yet in a repo with no dangerous ops" test "$D_COUNT_BEFORE" = 0
+
+(cd "$P4D_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+check "phase4d: clean switch (no --force needed) exits 0" test $? = 0
+
+D_COUNT_AFTER=$(snapshot_count "$P4D_REPO")
+check "phase4d: a clean switch does not create a new snapshot" test "$D_COUNT_BEFORE" = "$D_COUNT_AFTER"
+
+# case E: --force only skips the confirmation prompt, never the snapshot itself
+P4E_REPO="$WORKDIR/phase4e_repo"
+mkdir -p "$P4E_REPO"
+(cd "$WORKDIR" && "$SG" init phase4e_repo) > /dev/null 2>&1
+printf 'content\n' > "$P4E_REPO/f.txt"
+(cd "$P4E_REPO" && "$SG" add f.txt && "$SG" commit -m "p4e first") > /dev/null 2>&1
+(cd "$P4E_REPO" && "$SG" switch -c other) > /dev/null 2>&1
+(cd "$P4E_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+
+printf 'content\nlocal edit\n' > "$P4E_REPO/f.txt"
+E_COUNT_BEFORE=$(snapshot_count "$P4E_REPO")
+(cd "$P4E_REPO" && "$SG" switch other --force < /dev/null) > /dev/null 2>&1
+check "phase4e: sg switch --force exits 0" test $? = 0
+E_COUNT_AFTER=$(snapshot_count "$P4E_REPO")
+check "phase4e: --force still creates a snapshot when something would be lost" \
+    test "$E_COUNT_AFTER" -gt "$E_COUNT_BEFORE"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed"
 

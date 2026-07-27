@@ -7,6 +7,7 @@
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/snapshot.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -203,6 +204,7 @@ int sg_cmd_restore(int argc, char **argv)
         }
     } else {
         strbuf msg = {0};
+        strbuf affected = {0};
         int any_lossy = 0;
 
         for (i = 1; i < argc; i++) {
@@ -221,7 +223,10 @@ int sg_cmd_restore(int argc, char **argv)
                     strbuf_append(&msg,
                                   "sg restore: 以下路徑目前的工作目錄內容跟 index 不同，"
                                   "還原後這些變更會遺失：\n");
+                else
+                    strbuf_append(&affected, ",");
                 strbuf_append_path(&msg, rel);
+                strbuf_append(&affected, rel);
                 any_lossy = 1;
             }
             free(rel);
@@ -229,6 +234,7 @@ int sg_cmd_restore(int argc, char **argv)
 
         if (any_lossy && !sg_confirm_dangerous(msg.buf != NULL ? msg.buf : "", force)) {
             free(msg.buf);
+            free(affected.buf);
             sg_flat_list_free(&head_flat);
             sg_index_free(&idx);
             free(repo_root);
@@ -236,7 +242,28 @@ int sg_cmd_restore(int argc, char **argv)
             fprintf(stderr, "sg: restore aborted\n");
             return 1;
         }
+
+        /* confirmed (or nothing was actually at risk): snapshot before the
+           real restore loop below touches anything -- a failed snapshot
+           must abort instead of silently restoring unprotected */
+        if (any_lossy) {
+            char label[512];
+
+            snprintf(label, sizeof(label), "restore %s", affected.buf != NULL ? affected.buf : "");
+            if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
+                fprintf(stderr,
+                       "sg: 自動快照失敗，為了安全起見中止這次還原（沒有做任何變更）\n");
+                free(msg.buf);
+                free(affected.buf);
+                sg_flat_list_free(&head_flat);
+                sg_index_free(&idx);
+                free(repo_root);
+                free(git_dir);
+                return 1;
+            }
+        }
         free(msg.buf);
+        free(affected.buf);
     }
 
     for (i = 1; i < argc; i++) {
