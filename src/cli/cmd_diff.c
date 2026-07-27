@@ -152,11 +152,9 @@ int sg_cmd_diff(int argc, char **argv)
         return 1;
     }
 
-    git_dir = sg_find_git_dir();
-    if (git_dir == NULL) {
-        fprintf(stderr, "sg: not a git repository (or any parent up to the root)\n");
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
         return 1;
-    }
     repo_root = sg_repo_root(git_dir);
     if (repo_root == NULL) {
         fprintf(stderr, "sg: failed to determine repository root\n");

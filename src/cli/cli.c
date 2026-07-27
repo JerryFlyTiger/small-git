@@ -1,13 +1,44 @@
 #include "sg/cli.h"
 
+#include "sg/levenshtein.h"
+
 #include <stdio.h>
 #include <string.h>
 
+typedef struct {
+    const char *name;
+    const char *desc;
+} sg_command_info;
+
+static const sg_command_info COMMANDS[] = {
+    {"init", "建立新的 repository"},
+    {"hash-object", "計算(並可選擇寫入)物件的雜湊"},
+    {"cat-file", "檢視 object 內容/型別/大小"},
+    {"add", "將檔案加入暫存區"},
+    {"commit", "建立一個 commit"},
+    {"log", "顯示 commit 歷史"},
+    {"status", "顯示工作目錄狀態"},
+    {"diff", "顯示尚未暫存的變更"},
+    {"switch", "切換分支"},
+    {"restore", "還原檔案或取消暫存"},
+};
+#define COMMANDS_COUNT (sizeof(COMMANDS) / sizeof(COMMANDS[0]))
+
+static void print_help(FILE *out)
+{
+    size_t i;
+
+    fprintf(out, "usage: sg <command> [<args>]\n\nCommands:\n");
+    for (i = 0; i < COMMANDS_COUNT; i++)
+        fprintf(out, "  %-13s %s\n", COMMANDS[i].name, COMMANDS[i].desc);
+}
+
 int sg_cli_run(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "usage: sg <command> [<args>]\n");
-        return 1;
+    if (argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0 ||
+       strcmp(argv[1], "help") == 0) {
+        print_help(stdout);
+        return 0;
     }
 
     if (strcmp(argv[1], "init") == 0)
@@ -31,6 +62,27 @@ int sg_cli_run(int argc, char **argv)
     if (strcmp(argv[1], "restore") == 0)
         return sg_cmd_restore(argc - 1, argv + 1);
 
-    fprintf(stderr, "sg: '%s' is not a sg command\n", argv[1]);
+    {
+        size_t i;
+        size_t best_idx = 0;
+        size_t best_dist = (size_t)-1;
+
+        for (i = 0; i < COMMANDS_COUNT; i++) {
+            size_t dist = sg_levenshtein(argv[1], COMMANDS[i].name);
+
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = i;
+            }
+        }
+
+        fprintf(stderr, "sg: '%s' is not a sg command\n", argv[1]);
+        if (best_dist <= 2) {
+            fprintf(stderr, "\n你是不是想輸入 '%s'?\n", COMMANDS[best_idx].name);
+        } else {
+            fprintf(stderr, "\n");
+            print_help(stderr);
+        }
+    }
     return 1;
 }

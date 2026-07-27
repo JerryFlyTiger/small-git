@@ -14,4 +14,11 @@ int sg_repo_init(const char *dir);
    the .git directory, or NULL if none was found. Caller frees the result. */
 char *sg_find_git_dir(void);
 
+/* Same as sg_find_git_dir, but prints a consistent "not a git repository"
+   message (with a suggestion to run `sg init`) to stderr when none is found,
+   so callers don't each need their own copy of that message. Returns NULL on
+   failure (message already printed); a malloc'd path (caller frees) on
+   success, same as sg_find_git_dir. */
+char *sg_require_git_dir(void);
+
 #endif

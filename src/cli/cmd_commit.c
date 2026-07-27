@@ -58,11 +58,9 @@ int sg_cmd_commit(int argc, char **argv)
         return 1;
     }
 
-    git_dir = sg_find_git_dir();
-    if (git_dir == NULL) {
-        fprintf(stderr, "sg: not a git repository (or any parent up to the root)\n");
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
         return 1;
-    }
 
     if (sg_index_read(git_dir, &idx) != 0) {
         fprintf(stderr, "sg: failed to read index (corrupt?)\n");

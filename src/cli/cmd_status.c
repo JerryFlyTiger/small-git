@@ -6,6 +6,7 @@
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/status.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -15,51 +16,31 @@
 #include <string.h>
 #include <sys/stat.h>
 
-typedef struct {
-    char **lines;
-    size_t count;
-    size_t cap;
-} line_list;
-
-static void line_list_add(line_list *list, const char *fmt, const char *path)
+static const char *kind_label(sg_status_kind kind)
 {
-    char buf[4200];
-
-    if (list->count == list->cap) {
-        size_t new_cap = list->cap == 0 ? 8 : list->cap * 2;
-        char **grown = realloc(list->lines, new_cap * sizeof(*grown));
-
-        if (grown == NULL)
-            return;
-        list->lines = grown;
-        list->cap = new_cap;
+    switch (kind) {
+    case SG_STATUS_NEW:
+        return "new file:   ";
+    case SG_STATUS_MODIFIED:
+        return "modified:   ";
+    case SG_STATUS_DELETED:
+        return "deleted:    ";
     }
-    snprintf(buf, sizeof(buf), fmt, path);
-    list->lines[list->count++] = strdup(buf);
+    return "";
 }
 
-static void line_list_free(line_list *list)
-{
-    size_t i;
-
-    for (i = 0; i < list->count; i++)
-        free(list->lines[i]);
-    free(list->lines);
-    list->lines = NULL;
-    list->count = 0;
-    list->cap = 0;
-}
-
-static void print_section(const char *title, const char *hint, line_list *list)
+static void print_section(const char *title, const char **hints, size_t hint_count,
+                          const sg_status_list *list)
 {
     size_t i;
 
     if (list->count == 0)
         return;
     printf("%s\n", title);
-    printf("  (%s)\n", hint);
+    for (i = 0; i < hint_count; i++)
+        printf("  (%s)\n", hints[i]);
     for (i = 0; i < list->count; i++)
-        printf("\t%s\n", list->lines[i]);
+        printf("\t%s%s\n", kind_label(list->entries[i].kind), list->entries[i].path);
     printf("\n");
 }
 
@@ -135,12 +116,19 @@ int sg_cmd_status(int argc, char **argv)
     unsigned char head_commit_id[SG_SHA1_RAW_LEN];
     int has_head;
     sg_flat_list head_flat;
-    line_list staged = {0};
-    line_list unstaged = {0};
+    sg_status_list staged;
+    sg_status_list unstaged;
     char **untracked = NULL;
     size_t untracked_count = 0;
     size_t untracked_cap = 0;
-    size_t hi, ii, i;
+    size_t i;
+    static const char *staged_hints[] = {
+        "use \"sg restore --staged <file>...\" to unstage",
+    };
+    static const char *unstaged_hints[] = {
+        "use \"sg add <file>...\" to update what will be committed",
+        "use \"sg restore <file>...\" to discard changes in working directory",
+    };
 
     (void)argv;
     if (argc != 1) {
@@ -148,11 +136,9 @@ int sg_cmd_status(int argc, char **argv)
         return 1;
     }
 
-    git_dir = sg_find_git_dir();
-    if (git_dir == NULL) {
-        fprintf(stderr, "sg: not a git repository (or any parent up to the root)\n");
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
         return 1;
-    }
     repo_root = sg_repo_root(git_dir);
     if (repo_root == NULL) {
         fprintf(stderr, "sg: failed to determine repository root\n");
@@ -190,62 +176,19 @@ int sg_cmd_status(int argc, char **argv)
         printf("\nNo commits yet\n");
     }
 
-    /* staged: HEAD tree vs index, merged since both lists are path-sorted */
-    hi = 0;
-    ii = 0;
-    while (hi < head_flat.count || ii < idx.count) {
-        int cmp;
-
-        if (hi >= head_flat.count)
-            cmp = 1;
-        else if (ii >= idx.count)
-            cmp = -1;
-        else
-            cmp = strcmp(head_flat.entries[hi].path, idx.entries[ii].path);
-
-        if (cmp == 0) {
-            if (memcmp(head_flat.entries[hi].sha1, idx.entries[ii].sha1, SG_SHA1_RAW_LEN) != 0 ||
-               head_flat.entries[hi].mode != idx.entries[ii].mode)
-                line_list_add(&staged, "modified:   %s", idx.entries[ii].path);
-            hi++;
-            ii++;
-        } else if (cmp < 0) {
-            line_list_add(&staged, "deleted:    %s", head_flat.entries[hi].path);
-            hi++;
-        } else {
-            line_list_add(&staged, "new file:   %s", idx.entries[ii].path);
-            ii++;
-        }
-    }
+    if (sg_status_diff_staged(&head_flat, &idx, &staged) != 0)
+        fprintf(stderr, "sg: warning: out of memory computing staged changes\n");
     sg_flat_list_free(&head_flat);
 
-    /* unstaged: index vs working directory */
-    for (i = 0; i < idx.count; i++) {
-        char abspath[4096];
-        unsigned char wd_sha1[SG_SHA1_RAW_LEN];
-        struct stat st;
-
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx.entries[i].path);
-        if (stat(abspath, &st) != 0) {
-            line_list_add(&unstaged, "deleted:    %s", idx.entries[i].path);
-            continue;
-        }
-        if (sg_hash_file_blob(abspath, wd_sha1) != 0) {
-            line_list_add(&unstaged, "deleted:    %s", idx.entries[i].path);
-            continue;
-        }
-        if (memcmp(wd_sha1, idx.entries[i].sha1, SG_SHA1_RAW_LEN) != 0)
-            line_list_add(&unstaged, "modified:   %s", idx.entries[i].path);
-    }
+    if (sg_status_diff_unstaged(repo_root, &idx, &unstaged) != 0)
+        fprintf(stderr, "sg: warning: out of memory computing unstaged changes\n");
 
     collect_untracked(repo_root, "", &idx, &untracked, &untracked_count, &untracked_cap);
     if (untracked_count > 0)
         qsort(untracked, untracked_count, sizeof(*untracked), str_cmp);
 
-    print_section("Changes to be committed:", "use \"sg restore --staged <file>...\" to unstage",
-                  &staged);
-    print_section("Changes not staged for commit:", "use \"sg add <file>...\" to update what will be committed",
-                  &unstaged);
+    print_section("Changes to be committed:", staged_hints, 1, &staged);
+    print_section("Changes not staged for commit:", unstaged_hints, 2, &unstaged);
 
     if (untracked_count > 0) {
         printf("Untracked files:\n");
@@ -261,8 +204,8 @@ int sg_cmd_status(int argc, char **argv)
     for (i = 0; i < untracked_count; i++)
         free(untracked[i]);
     free(untracked);
-    line_list_free(&staged);
-    line_list_free(&unstaged);
+    sg_status_list_free(&staged);
+    sg_status_list_free(&unstaged);
     sg_index_free(&idx);
     free(repo_root);
     free(git_dir);

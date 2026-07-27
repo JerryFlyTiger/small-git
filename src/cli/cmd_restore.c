@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/confirm.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static int flat_find(const sg_flat_list *list, const char *path)
 {
@@ -80,10 +82,67 @@ static void restore_staged(sg_index *idx, int has_head, const sg_flat_list *head
     }
 }
 
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} strbuf;
+
+static void strbuf_append(strbuf *b, const char *s)
+{
+    size_t slen = strlen(s);
+    size_t needed = b->len + slen + 1;
+
+    if (needed > b->cap) {
+        size_t new_cap = b->cap == 0 ? 256 : b->cap * 2;
+        char *grown;
+
+        while (new_cap < needed)
+            new_cap *= 2;
+        grown = realloc(b->buf, new_cap);
+        if (grown == NULL)
+            return; /* best effort: message may end up truncated */
+        b->buf = grown;
+        b->cap = new_cap;
+    }
+    memcpy(b->buf + b->len, s, slen + 1);
+    b->len += slen;
+}
+
+static void strbuf_append_path(strbuf *b, const char *path)
+{
+    char line[4200];
+
+    snprintf(line, sizeof(line), "\t%s\n", path);
+    strbuf_append(b, line);
+}
+
+/* Determines whether restoring rel from the index would actually discard
+   working-directory content: a missing file or one whose content already
+   matches the index entry loses nothing. */
+static int would_lose_content(const char *repo_root, const sg_index *idx, const char *rel)
+{
+    int pos = sg_index_find(idx, rel);
+    char abspath[4096];
+    struct stat st;
+    unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+
+    if (pos < 0)
+        return 0; /* not tracked: restore will error out, nothing to lose */
+
+    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, rel);
+    if (stat(abspath, &st) != 0)
+        return 0;
+    if (sg_hash_file_blob(abspath, wd_sha1) != 0)
+        return 0;
+    return memcmp(wd_sha1, idx->entries[pos].sha1, SG_SHA1_RAW_LEN) != 0;
+}
+
 int sg_cmd_restore(int argc, char **argv)
 {
-    static const char usage[] = "usage: sg restore [--staged] <path>...\n";
+    static const char usage[] = "usage: sg restore [--staged] [--force|-f] <path>...\n";
     int staged = 0;
+    int force = 0;
     int npaths = 0;
     char *git_dir;
     char *repo_root;
@@ -99,6 +158,8 @@ int sg_cmd_restore(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--staged") == 0)
             staged = 1;
+        else if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0)
+            force = 1;
         else
             npaths++;
     }
@@ -107,11 +168,9 @@ int sg_cmd_restore(int argc, char **argv)
         return 1;
     }
 
-    git_dir = sg_find_git_dir();
-    if (git_dir == NULL) {
-        fprintf(stderr, "sg: not a git repository (or any parent up to the root)\n");
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
         return 1;
-    }
     repo_root = sg_repo_root(git_dir);
     if (repo_root == NULL) {
         fprintf(stderr, "sg: failed to determine repository root\n");
@@ -142,12 +201,49 @@ int sg_cmd_restore(int argc, char **argv)
                 free(content);
             }
         }
+    } else {
+        strbuf msg = {0};
+        int any_lossy = 0;
+
+        for (i = 1; i < argc; i++) {
+            char *rel;
+
+            if (strcmp(argv[i], "--staged") == 0 || strcmp(argv[i], "--force") == 0 ||
+               strcmp(argv[i], "-f") == 0)
+                continue;
+
+            rel = sg_resolve_repo_path(repo_root, argv[i]);
+            if (rel == NULL)
+                continue; /* reported as an error in the main loop below */
+
+            if (would_lose_content(repo_root, &idx, rel)) {
+                if (!any_lossy)
+                    strbuf_append(&msg,
+                                  "sg restore: 以下路徑目前的工作目錄內容跟 index 不同，"
+                                  "還原後這些變更會遺失：\n");
+                strbuf_append_path(&msg, rel);
+                any_lossy = 1;
+            }
+            free(rel);
+        }
+
+        if (any_lossy && !sg_confirm_dangerous(msg.buf != NULL ? msg.buf : "", force)) {
+            free(msg.buf);
+            sg_flat_list_free(&head_flat);
+            sg_index_free(&idx);
+            free(repo_root);
+            free(git_dir);
+            fprintf(stderr, "sg: restore aborted\n");
+            return 1;
+        }
+        free(msg.buf);
     }
 
     for (i = 1; i < argc; i++) {
         char *rel;
 
-        if (strcmp(argv[i], "--staged") == 0)
+        if (strcmp(argv[i], "--staged") == 0 || strcmp(argv[i], "--force") == 0 ||
+           strcmp(argv[i], "-f") == 0)
             continue;
 
         rel = sg_resolve_repo_path(repo_root, argv[i]);

@@ -112,10 +112,9 @@ int sg_cmd_hash_object(int argc, char **argv)
     }
 
     if (write_flag) {
-        char *git_dir = sg_find_git_dir();
+        char *git_dir = sg_require_git_dir();
 
         if (git_dir == NULL) {
-            fprintf(stderr, "sg: not a git repository (or any parent up to the root)\n");
             free(content);
             return 1;
         }

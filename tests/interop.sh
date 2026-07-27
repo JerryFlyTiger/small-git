@@ -177,6 +177,84 @@ check "git show HEAD:top.txt on master has original content after switching back
     sh -c "! grep -q 'feature addition' '$GIT_SHOW_MASTER_TOP'"
 check "working tree top.txt matches master content after sg switch" cmp -s "$BRANCH_REPO/top.txt" "$GIT_SHOW_MASTER_TOP"
 
+# --- Phase 3 case 1: did-you-mean suggestion for a typo'd command ---
+TYPO_OUT="$WORKDIR/p3_typo_out.txt"
+"$SG" stat > /dev/null 2> "$TYPO_OUT"
+check "typo'd command's suggestion names the intended command" grep -q "status" "$TYPO_OUT"
+
+# --- Phase 3 case 2: bare `sg` / `sg --help` succeed and list every command ---
+HELP_OUT="$WORKDIR/p3_help_out.txt"
+"$SG" > "$HELP_OUT" 2>&1
+HELP_RC=$?
+check "sg with no args exits 0" test "$HELP_RC" = 0
+for cmd in init hash-object cat-file add commit log status diff switch restore; do
+    check "help output mentions '$cmd'" grep -q -- "$cmd" "$HELP_OUT"
+done
+
+HELP_FLAG_OUT="$WORKDIR/p3_help_flag_out.txt"
+"$SG" --help > "$HELP_FLAG_OUT" 2>&1
+HELP_FLAG_RC=$?
+check "sg --help exits 0" test "$HELP_FLAG_RC" = 0
+check "sg --help output mentions 'switch'" grep -q "switch" "$HELP_FLAG_OUT"
+
+# --- Phase 3 cases 3-6: switch/restore require confirmation for dangerous, lossy changes ---
+P3_REPO="$WORKDIR/phase3_repo"
+mkdir -p "$P3_REPO"
+(cd "$WORKDIR" && "$SG" init phase3_repo) > /dev/null 2>&1
+printf 'line one\n' > "$P3_REPO/a.txt"
+(cd "$P3_REPO" && "$SG" add a.txt) > /dev/null 2>&1
+(cd "$P3_REPO" && "$SG" commit -m "p3 first") > /dev/null 2>&1
+(cd "$P3_REPO" && "$SG" switch -c other) > /dev/null 2>&1
+
+# an unstaged, uncommitted modification -- this is what switch/restore must protect
+printf 'line one\nuncommitted change\n' > "$P3_REPO/a.txt"
+
+BEFORE_BRANCH=$(cd "$P3_REPO" && "$SG" status 2>&1 | head -1)
+
+# case 3: switch without --force, non-interactive stdin -> must fail, nothing changed
+(cd "$P3_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+SWITCH_NOFORCE_RC=$?
+check "sg switch without --force fails on a dirty, non-interactive workdir" \
+    test "$SWITCH_NOFORCE_RC" -ne 0
+
+AFTER_BRANCH=$(cd "$P3_REPO" && "$SG" status 2>&1 | head -1)
+check "branch unchanged after refused switch" test "$BEFORE_BRANCH" = "$AFTER_BRANCH"
+check "working tree unchanged after refused switch" grep -q "uncommitted change" "$P3_REPO/a.txt"
+
+# case 4: same dirty state, but with --force -> must succeed
+(cd "$P3_REPO" && "$SG" switch master --force < /dev/null) > /dev/null 2>&1
+SWITCH_FORCE_RC=$?
+check "sg switch --force succeeds despite a dirty workdir" test "$SWITCH_FORCE_RC" = 0
+
+AFTER_FORCE_BRANCH=$(cd "$P3_REPO" && "$SG" status 2>&1 | head -1)
+check "branch actually switched with --force" test "$AFTER_FORCE_BRANCH" = "On branch master"
+check "working tree overwritten by --force switch" \
+    sh -c "! grep -q 'uncommitted change' '$P3_REPO/a.txt'"
+
+# case 5: restore on an unstaged modification -- refuses without --force, applies with it
+printf 'line one\nrestore target uncommitted\n' > "$P3_REPO/a.txt"
+
+(cd "$P3_REPO" && "$SG" restore a.txt < /dev/null) > /dev/null 2>&1
+RESTORE_NOFORCE_RC=$?
+check "sg restore without --force fails on a non-interactive, lossy restore" \
+    test "$RESTORE_NOFORCE_RC" -ne 0
+check "file content unchanged after refused restore" grep -q "restore target uncommitted" "$P3_REPO/a.txt"
+
+(cd "$P3_REPO" && "$SG" restore a.txt --force < /dev/null) > /dev/null 2>&1
+RESTORE_FORCE_RC=$?
+check "sg restore --force succeeds" test "$RESTORE_FORCE_RC" = 0
+check "file restored to index content with --force" \
+    sh -c "! grep -q 'restore target uncommitted' '$P3_REPO/a.txt'"
+
+# case 6: a clean workdir needs no confirmation at all -- switch just succeeds
+CLEAN_STATUS_OUT=$(cd "$P3_REPO" && "$SG" status 2>&1)
+check "workdir is clean before the clean-switch check" \
+    sh -c "printf '%s' '$CLEAN_STATUS_OUT' | grep -q 'nothing to commit'"
+
+(cd "$P3_REPO" && "$SG" switch other < /dev/null) > /dev/null 2>&1
+CLEAN_SWITCH_RC=$?
+check "sg switch succeeds without --force when the workdir is clean" test "$CLEAN_SWITCH_RC" = 0
+
 echo ""
 echo "interop: $PASS/$TOTAL passed"
 
