@@ -1,7 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/hash.h"
-#include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -44,7 +44,7 @@ int sg_cmd_log(int argc, char **argv)
         char timebuf[64];
         struct tm tmv;
 
-        if (sg_loose_read(git_dir, id, &type, &content, &content_len) != 0 || type != SG_OBJ_COMMIT) {
+        if (sg_object_read(git_dir, id, &type, &content, &content_len) != 0 || type != SG_OBJ_COMMIT) {
             fprintf(stderr, "sg: corrupt commit object\n");
             rc = 1;
             break;

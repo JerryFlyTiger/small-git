@@ -22,6 +22,7 @@ static const sg_command_info COMMANDS[] = {
     {"switch", "切換分支"},
     {"restore", "還原檔案或取消暫存"},
     {"undo", "列出或還原自動快照"},
+    {"repack", "將 loose object 打包成 packfile"},
 };
 #define COMMANDS_COUNT (sizeof(COMMANDS) / sizeof(COMMANDS[0]))
 
@@ -64,6 +65,8 @@ int sg_cli_run(int argc, char **argv)
         return sg_cmd_restore(argc - 1, argv + 1);
     if (strcmp(argv[1], "undo") == 0)
         return sg_cmd_undo(argc - 1, argv + 1);
+    if (strcmp(argv[1], "repack") == 0)
+        return sg_cmd_repack(argc - 1, argv + 1);
 
     {
         size_t i;

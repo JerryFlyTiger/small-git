@@ -2,7 +2,7 @@
 
 #include "sg/apply.h"
 #include "sg/hash.h"
-#include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -36,7 +36,7 @@ static int resolve_commit_tree(const char *git_dir, const unsigned char commit_i
     size_t content_len;
     sg_commit commit;
 
-    if (sg_loose_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
+    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
        type != SG_OBJ_COMMIT)
         return -1;
     if (sg_commit_parse(content, content_len, &commit) != 0) {

@@ -3,7 +3,7 @@
 #include "sg/confirm.h"
 #include "sg/hash.h"
 #include "sg/index.h"
-#include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -49,7 +49,7 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
         fprintf(stderr, "sg: '%s' is not tracked in the index\n", arg);
         return -1;
     }
-    if (sg_loose_read(git_dir, idx->entries[pos].sha1, &type, &content, &content_len) != 0) {
+    if (sg_object_read(git_dir, idx->entries[pos].sha1, &type, &content, &content_len) != 0) {
         fprintf(stderr, "sg: failed to read staged content for '%s'\n", arg);
         return -1;
     }
@@ -193,7 +193,7 @@ int sg_cmd_restore(int argc, char **argv)
             size_t content_len;
             sg_commit commit;
 
-            if (sg_loose_read(git_dir, head_commit_id, &type, &content, &content_len) == 0 &&
+            if (sg_object_read(git_dir, head_commit_id, &type, &content, &content_len) == 0 &&
                type == SG_OBJ_COMMIT) {
                 if (sg_commit_parse(content, content_len, &commit) == 0) {
                     sg_tree_flatten(git_dir, commit.tree, &head_flat);

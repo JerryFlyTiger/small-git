@@ -2,7 +2,7 @@
 
 #include "sg/hash.h"
 #include "sg/index.h"
-#include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/repo.h"
 #include "sg/workdir.h"
@@ -176,7 +176,7 @@ int sg_cmd_diff(int argc, char **argv)
         unsigned char *b_content = NULL;
         size_t b_len = 0;
 
-        if (sg_loose_read(git_dir, idx.entries[i].sha1, &type, &a_content, &a_len) != 0) {
+        if (sg_object_read(git_dir, idx.entries[i].sha1, &type, &a_content, &a_len) != 0) {
             fprintf(stderr, "sg: warning: cannot read staged blob for '%s'\n", idx.entries[i].path);
             continue;
         }

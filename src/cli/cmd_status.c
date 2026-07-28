@@ -2,7 +2,7 @@
 
 #include "sg/hash.h"
 #include "sg/index.h"
-#include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -164,7 +164,7 @@ int sg_cmd_status(int argc, char **argv)
         size_t content_len;
         sg_commit commit;
 
-        if (sg_loose_read(git_dir, head_commit_id, &type, &content, &content_len) == 0 &&
+        if (sg_object_read(git_dir, head_commit_id, &type, &content, &content_len) == 0 &&
            type == SG_OBJ_COMMIT) {
             if (sg_commit_parse(content, content_len, &commit) == 0) {
                 sg_tree_flatten(git_dir, commit.tree, &head_flat);

@@ -1,6 +1,7 @@
 #include "sg/snapshot.h"
 
 #include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/tree_build.h"
@@ -270,7 +271,7 @@ int sg_snapshot_list_read(const char *git_dir, sg_snapshot_list *out)
         if (sg_hex_to_sha1(hexbuf, commit_id) != 0)
             continue;
 
-        if (sg_loose_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
+        if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
            type != SG_OBJ_COMMIT)
             continue;
         if (sg_commit_parse(content, content_len, &commit) != 0) {
@@ -377,7 +378,7 @@ int sg_snapshot_get_tree(const char *git_dir, const sg_snapshot_list *list, size
     if (index >= list->count)
         return -1;
 
-    if (sg_loose_read(git_dir, list->entries[index].commit_id, &type, &content, &content_len) != 0 ||
+    if (sg_object_read(git_dir, list->entries[index].commit_id, &type, &content, &content_len) != 0 ||
        type != SG_OBJ_COMMIT)
         return -1;
     if (sg_commit_parse(content, content_len, &commit) != 0) {

@@ -1,7 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/hash.h"
-#include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/repo.h"
 
@@ -80,7 +80,7 @@ int sg_cmd_cat_file(int argc, char **argv)
     if (git_dir == NULL)
         return 1;
 
-    if (sg_loose_read(git_dir, id, &type, &content, &content_len) != 0) {
+    if (sg_object_read(git_dir, id, &type, &content, &content_len) != 0) {
         fprintf(stderr, "sg: object '%s' not found or corrupt\n", hex_arg);
         free(git_dir);
         return 1;

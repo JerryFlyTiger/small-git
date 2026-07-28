@@ -2,7 +2,7 @@
 
 #include "sg/confirm.h"
 #include "sg/index.h"
-#include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/snapshot.h"
@@ -76,7 +76,7 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         sg_index_entry entry;
 
         snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, target_flat.entries[i].path);
-        if (sg_loose_read(git_dir, target_flat.entries[i].sha1, &blob_type, &blob_content, &blob_len) !=
+        if (sg_object_read(git_dir, target_flat.entries[i].sha1, &blob_type, &blob_content, &blob_len) !=
            0) {
             fprintf(stderr, "sg: missing blob for '%s'\n", target_flat.entries[i].path);
             rc = -1;
@@ -188,7 +188,7 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
         size_t content_len;
         sg_commit commit;
 
-        if (sg_loose_read(git_dir, head_id, &type, &content, &content_len) == 0 &&
+        if (sg_object_read(git_dir, head_id, &type, &content, &content_len) == 0 &&
            type == SG_OBJ_COMMIT) {
             if (sg_commit_parse(content, content_len, &commit) == 0) {
                 sg_tree_flatten(git_dir, commit.tree, &head_flat);

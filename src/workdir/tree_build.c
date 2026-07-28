@@ -1,6 +1,7 @@
 #include "sg/tree_build.h"
 
 #include "sg/loose.h"
+#include "sg/objstore.h"
 #include "sg/object.h"
 
 #include <stdlib.h>
@@ -166,7 +167,7 @@ static int flatten_into(const char *git_dir, const unsigned char tree_id[SG_SHA1
     size_t i;
     int rc = 0;
 
-    if (sg_loose_read(git_dir, tree_id, &type, &content, &content_len) != 0 || type != SG_OBJ_TREE)
+    if (sg_object_read(git_dir, tree_id, &type, &content, &content_len) != 0 || type != SG_OBJ_TREE)
         return -1;
 
     if (sg_tree_parse(content, content_len, &tree) != 0) {

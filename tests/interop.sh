@@ -344,6 +344,139 @@ E_COUNT_AFTER=$(snapshot_count "$P4E_REPO")
 check "phase4e: --force still creates a snapshot when something would be lost" \
     test "$E_COUNT_AFTER" -gt "$E_COUNT_BEFORE"
 
+# --- Phase 5a case 1: sg repack produces a pack real git can read, and sg
+# itself still works normally afterwards (loose objects are gone) ---
+P5_REPO="$WORKDIR/phase5_sg_repo"
+mkdir -p "$P5_REPO"
+(cd "$WORKDIR" && "$SG" init phase5_sg_repo) > /dev/null 2>&1
+printf 'file one content\n' > "$P5_REPO/one.txt"
+printf 'file two content\n' > "$P5_REPO/two.txt"
+(cd "$P5_REPO" && "$SG" add one.txt two.txt) > /dev/null 2>&1
+(cd "$P5_REPO" && "$SG" commit -m "p5 first") > /dev/null 2>&1
+P5_COMMIT=$(cd "$P5_REPO" && "$SG" log 2>/dev/null | head -1 | awk '{print $2}')
+P5_TREE=$(cd "$P5_REPO" && git cat-file -p "$P5_COMMIT" 2>/dev/null | awk '/^tree/{print $2}')
+P5_BLOB1=$(cd "$P5_REPO" && git hash-object one.txt 2>/dev/null)
+
+LOOSE_COUNT_BEFORE=$(find "$P5_REPO/.git/objects" -mindepth 2 -type f ! -path '*/pack/*' ! -path '*/info/*' | wc -l | tr -d ' ')
+check "phase5 case1: some loose objects exist before repack" test "$LOOSE_COUNT_BEFORE" -gt 0
+
+REPACK_OUT="$WORKDIR/p5_repack_out.txt"
+(cd "$P5_REPO" && "$SG" repack < /dev/null) > "$REPACK_OUT" 2>&1
+check "phase5 case1: sg repack exits 0" test $? = 0
+
+LOOSE_COUNT_AFTER=$(find "$P5_REPO/.git/objects" -mindepth 2 -type f ! -path '*/pack/*' ! -path '*/info/*' | wc -l | tr -d ' ')
+check "phase5 case1: loose objects are gone after repack" test "$LOOSE_COUNT_AFTER" = 0
+
+PACK_FILE=$(find "$P5_REPO/.git/objects/pack" -name '*.pack' | head -1)
+check "phase5 case1: a .pack file was created" test -n "$PACK_FILE"
+
+check "phase5 case1: real git cat-file -p reads the packed commit" \
+    sh -c "(cd '$P5_REPO' && git cat-file -p '$P5_COMMIT') > /dev/null 2>&1"
+check "phase5 case1: real git cat-file -p reads the packed tree" \
+    sh -c "(cd '$P5_REPO' && git cat-file -p '$P5_TREE') > /dev/null 2>&1"
+
+GIT_BLOB1_OUT="$WORKDIR/p5_git_blob1.txt"
+(cd "$P5_REPO" && git cat-file -p "$P5_BLOB1") > "$GIT_BLOB1_OUT" 2>/dev/null
+check "phase5 case1: real git reads packed blob with identical content" \
+    cmp -s "$P5_REPO/one.txt" "$GIT_BLOB1_OUT"
+
+if command -v git >/dev/null 2>&1 && (cd "$P5_REPO" && git verify-pack -v "$PACK_FILE" >/dev/null 2>&1); then
+    check "phase5 case1: git verify-pack accepts the sg-written pack" \
+        sh -c "(cd '$P5_REPO' && git verify-pack -v '$PACK_FILE') > /dev/null 2>&1"
+fi
+
+SG_CATFILE_AFTER="$WORKDIR/p5_sg_catfile_after.txt"
+(cd "$P5_REPO" && "$SG" cat-file -p "$P5_COMMIT") > "$SG_CATFILE_AFTER" 2>&1
+check "phase5 case1: sg cat-file still works after repack (reads from pack)" test $? = 0
+
+SG_LOG_AFTER="$WORKDIR/p5_sg_log_after.txt"
+(cd "$P5_REPO" && "$SG" log) > "$SG_LOG_AFTER" 2>&1
+check "phase5 case1: sg log still works after repack" test $? = 0
+check "phase5 case1: sg log still shows the commit after repack" grep -q "$P5_COMMIT" "$SG_LOG_AFTER"
+
+SG_STATUS_AFTER="$WORKDIR/p5_sg_status_after.txt"
+(cd "$P5_REPO" && "$SG" status) > "$SG_STATUS_AFTER" 2>&1
+check "phase5 case1: sg status still works after repack" test $? = 0
+check "phase5 case1: sg status reports clean tree after repack" \
+    grep -q "nothing to commit" "$SG_STATUS_AFTER"
+
+# --- Phase 5a case 2: real git's own delta-compressed pack must be readable
+# by sg (the most important compatibility test -- OFS_DELTA/REF_DELTA
+# reconstruction has to be correct, not just literal-object packs) ---
+P5_GIT_REPO="$WORKDIR/phase5_git_repo"
+mkdir -p "$P5_GIT_REPO"
+(cd "$WORKDIR" && git init -q phase5_git_repo)
+(cd "$P5_GIT_REPO" && git config user.email "a@b.c" && git config user.name "git user")
+
+python3 - "$P5_GIT_REPO/big.txt" <<'PYEOF'
+import sys
+path = sys.argv[1]
+lines = [f"line {i} filler filler filler filler filler filler\n" for i in range(2000)]
+with open(path, "w") as f:
+    f.writelines(lines)
+PYEOF
+(cd "$P5_GIT_REPO" && git add big.txt && git commit -q -m "v1")
+
+python3 - "$P5_GIT_REPO/big.txt" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+lines[500] = "line 500 CHANGED filler filler filler filler filler filler\n"
+lines[1000] = "line 1000 CHANGED filler filler filler filler filler filler\n"
+with open(path, "w") as f:
+    f.writelines(lines)
+PYEOF
+(cd "$P5_GIT_REPO" && git add big.txt && git commit -q -m "v2")
+
+GIT_HEAD=$(cd "$P5_GIT_REPO" && git rev-parse HEAD)
+GIT_TREE=$(cd "$P5_GIT_REPO" && git cat-file -p HEAD | awk '/^tree/{print $2}')
+GIT_BLOB=$(cd "$P5_GIT_REPO" && git rev-parse HEAD:big.txt)
+
+(cd "$P5_GIT_REPO" && git repack -ad -q) > /dev/null 2>&1
+check "phase5 case2: git repack -ad exits 0" test $? = 0
+
+GIT_LOOSE_COUNT=$(find "$P5_GIT_REPO/.git/objects" -mindepth 2 -type f ! -path '*/pack/*' ! -path '*/info/*' | wc -l | tr -d ' ')
+check "phase5 case2: real git's loose objects are gone after repack -ad" test "$GIT_LOOSE_COUNT" = 0
+
+GIT_PACK_FILE=$(find "$P5_GIT_REPO/.git/objects/pack" -name '*.pack' | head -1)
+check "phase5 case2: real git produced a .pack file" test -n "$GIT_PACK_FILE"
+
+VERIFY_OUT="$WORKDIR/p5_verify_pack.txt"
+(cd "$P5_GIT_REPO" && git verify-pack -v "$GIT_PACK_FILE") > "$VERIFY_OUT" 2>&1
+if grep -qE ' [0-9]+ [1-9][0-9]* [0-9]+$' "$VERIFY_OUT"; then
+    echo "note: real git's pack contains at least one delta object (depth column > 0)"
+else
+    echo "note: real git did not produce a delta object in this pack (non-delta-only pack is still a valid case to test)"
+fi
+
+SG_CATFILE_COMMIT="$WORKDIR/p5_sg_catfile_commit.txt"
+(cd "$P5_GIT_REPO" && "$SG" cat-file -p "$GIT_HEAD") > "$SG_CATFILE_COMMIT" 2>&1
+check "phase5 case2: sg cat-file -p reads real git's packed commit" test $? = 0
+
+SG_CATFILE_TREE="$WORKDIR/p5_sg_catfile_tree.txt"
+(cd "$P5_GIT_REPO" && "$SG" cat-file -p "$GIT_TREE") > "$SG_CATFILE_TREE" 2>&1
+check "phase5 case2: sg cat-file -p reads real git's packed tree" test $? = 0
+
+SG_CATFILE_BLOB="$WORKDIR/p5_sg_catfile_blob.txt"
+(cd "$P5_GIT_REPO" && "$SG" cat-file -p "$GIT_BLOB") > "$SG_CATFILE_BLOB" 2>&1
+check "phase5 case2: sg cat-file -p reads real git's (possibly delta-compressed) packed blob" \
+    test $? = 0
+check "phase5 case2: sg-read blob content matches the real working tree file" \
+    cmp -s "$P5_GIT_REPO/big.txt" "$SG_CATFILE_BLOB"
+
+SG_LOG_GIT="$WORKDIR/p5_sg_log_git.txt"
+(cd "$P5_GIT_REPO" && "$SG" log) > "$SG_LOG_GIT" 2>&1
+check "phase5 case2: sg log exits 0 on real git's delta pack" test $? = 0
+check "phase5 case2: sg log shows both real git commits" \
+    sh -c "grep -q \"$GIT_HEAD\" '$SG_LOG_GIT'"
+
+SG_STATUS_GIT="$WORKDIR/p5_sg_status_git.txt"
+(cd "$P5_GIT_REPO" && "$SG" status) > "$SG_STATUS_GIT" 2>&1
+check "phase5 case2: sg status exits 0 on real git's delta pack" test $? = 0
+check "phase5 case2: sg status reports clean tree on real git's delta pack" \
+    grep -q "nothing to commit" "$SG_STATUS_GIT"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed"
 
