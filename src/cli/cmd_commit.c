@@ -3,6 +3,7 @@
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
+#include "sg/merge.h"
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -18,6 +19,23 @@ static const char *env_or(const char *name, const char *fallback)
     const char *v = getenv(name);
 
     return (v != NULL && v[0] != '\0') ? v : fallback;
+}
+
+/* Prints every distinct path carrying a stage 1/2/3 entry (idx is sorted by
+   (path, stage), so duplicates for one path are contiguous). */
+static void print_unmerged_paths(const sg_index *idx)
+{
+    size_t i;
+
+    fprintf(stderr, "sg: 尚有未解決的衝突，無法 commit：\n");
+    for (i = 0; i < idx->count; i++) {
+        if (idx->entries[i].stage == 0)
+            continue;
+        if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
+            continue;
+        fprintf(stderr, "\t%s\n", idx->entries[i].path);
+    }
+    fprintf(stderr, "請先解決衝突並執行 `sg add <file>...` 標記為已解決，再重新 commit。\n");
 }
 
 int sg_cmd_commit(int argc, char **argv)
@@ -38,6 +56,8 @@ int sg_cmd_commit(int argc, char **argv)
     char commit_hex[SG_SHA1_HEX_LEN + 1];
     const char *name;
     const char *email;
+    unsigned char merge_head_id[SG_SHA1_RAW_LEN];
+    int is_merge_commit;
     size_t i;
     int rc = 0;
 
@@ -68,6 +88,15 @@ int sg_cmd_commit(int argc, char **argv)
         return 1;
     }
 
+    if (sg_index_has_unmerged(&idx)) {
+        print_unmerged_paths(&idx);
+        sg_index_free(&idx);
+        free(git_dir);
+        return 1;
+    }
+
+    is_merge_commit = (sg_merge_head_read(git_dir, merge_head_id) == 0);
+
     if (idx.count > 0) {
         flat = malloc(idx.count * sizeof(*flat));
         if (flat == NULL) {
@@ -95,6 +124,12 @@ int sg_cmd_commit(int argc, char **argv)
 
     has_parent = (sg_ref_resolve_head(git_dir, parent_id) == 0);
 
+    if (is_merge_commit && !has_parent) {
+        fprintf(stderr, "sg: 損壞的合併狀態（MERGE_HEAD 存在，但目前分支還沒有任何 commit）\n");
+        free(git_dir);
+        return 1;
+    }
+
     branch = sg_ref_current_branch(git_dir);
     if (branch == NULL) {
         fprintf(stderr, "sg: failed to determine current branch\n");
@@ -108,7 +143,7 @@ int sg_cmd_commit(int argc, char **argv)
     memset(&commit, 0, sizeof(commit));
     memcpy(commit.tree, tree_id, SG_SHA1_RAW_LEN);
     if (has_parent) {
-        commit.parents = malloc(sizeof(*commit.parents));
+        commit.parents = malloc((is_merge_commit ? 2 : 1) * sizeof(*commit.parents));
         if (commit.parents == NULL) {
             fprintf(stderr, "sg: out of memory\n");
             free(branch);
@@ -117,6 +152,10 @@ int sg_cmd_commit(int argc, char **argv)
         }
         memcpy(commit.parents[0], parent_id, SG_SHA1_RAW_LEN);
         commit.parent_count = 1;
+        if (is_merge_commit) {
+            memcpy(commit.parents[1], merge_head_id, SG_SHA1_RAW_LEN);
+            commit.parent_count = 2;
+        }
     }
     commit.author_name = (char *)name;
     commit.author_email = (char *)email;
@@ -150,6 +189,9 @@ int sg_cmd_commit(int argc, char **argv)
         fprintf(stderr, "sg: failed to update branch '%s'\n", branch);
         rc = 1;
     }
+
+    if (rc == 0 && is_merge_commit && sg_merge_head_remove(git_dir) != 0)
+        fprintf(stderr, "sg: warning: commit succeeded but failed to remove MERGE_HEAD\n");
 
     sg_sha1_to_hex(commit_id, commit_hex);
     {

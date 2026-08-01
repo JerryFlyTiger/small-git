@@ -1,0 +1,808 @@
+#include "sg/merge.h"
+
+#include "sg/diff_lcs.h"
+#include "sg/loose.h"
+#include "sg/object.h"
+#include "sg/objstore.h"
+#include "sg/tree_build.h"
+
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ==================== merge base ==================== */
+
+typedef struct {
+    unsigned char (*ids)[SG_SHA1_RAW_LEN];
+    size_t count, cap;
+} id_set;
+
+static void id_set_free(id_set *s)
+{
+    free(s->ids);
+    s->ids = NULL;
+    s->count = 0;
+    s->cap = 0;
+}
+
+static int id_set_contains(const id_set *s, const unsigned char id[SG_SHA1_RAW_LEN])
+{
+    size_t i;
+
+    for (i = 0; i < s->count; i++) {
+        if (memcmp(s->ids[i], id, SG_SHA1_RAW_LEN) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Returns 1 if id was newly added, 0 if already present, -1 on OOM. */
+static int id_set_add(id_set *s, const unsigned char id[SG_SHA1_RAW_LEN])
+{
+    if (id_set_contains(s, id))
+        return 0;
+    if (s->count == s->cap) {
+        size_t new_cap = s->cap == 0 ? 16 : s->cap * 2;
+        unsigned char(*grown)[SG_SHA1_RAW_LEN] = realloc(s->ids, new_cap * sizeof(*grown));
+
+        if (grown == NULL)
+            return -1;
+        s->ids = grown;
+        s->cap = new_cap;
+    }
+    memcpy(s->ids[s->count], id, SG_SHA1_RAW_LEN);
+    s->count++;
+    return 1;
+}
+
+/* Collects start and every ancestor of start (walking ALL parents) into
+   *out, including start itself -- matching git's convention that a commit
+   is its own merge-base with one of its descendants. Returns 0 on success,
+   -1 on allocation failure. An unreadable/corrupt commit along the way is
+   treated as a dead end (best effort) rather than a hard failure, since a
+   partially-packed or shallow history shouldn't make merge-base impossible
+   for the reachable part of the graph. */
+static int collect_ancestors(const char *git_dir, const unsigned char start[SG_SHA1_RAW_LEN],
+                             id_set *out)
+{
+    size_t qi = 0;
+
+    memset(out, 0, sizeof(*out));
+    if (id_set_add(out, start) < 0)
+        return -1;
+
+    while (qi < out->count) {
+        unsigned char cur[SG_SHA1_RAW_LEN];
+        sg_obj_type type;
+        unsigned char *content;
+        size_t content_len;
+        sg_commit commit;
+        size_t i;
+
+        memcpy(cur, out->ids[qi], SG_SHA1_RAW_LEN); /* out->ids may realloc below */
+        qi++;
+
+        if (sg_object_read(git_dir, cur, &type, &content, &content_len) != 0 || type != SG_OBJ_COMMIT)
+            continue;
+        if (sg_commit_parse(content, content_len, &commit) != 0) {
+            free(content);
+            continue;
+        }
+        free(content);
+
+        for (i = 0; i < commit.parent_count; i++) {
+            if (id_set_add(out, commit.parents[i]) < 0) {
+                sg_commit_free(&commit);
+                id_set_free(out);
+                return -1;
+            }
+        }
+        sg_commit_free(&commit);
+    }
+    return 0;
+}
+
+/* Returns 1 if candidate is an ancestor of (or equal to) other, 0 if not,
+   -1 on allocation failure. */
+static int is_ancestor(const char *git_dir, const unsigned char candidate[SG_SHA1_RAW_LEN],
+                       const unsigned char other[SG_SHA1_RAW_LEN])
+{
+    id_set anc;
+    int result;
+
+    if (collect_ancestors(git_dir, other, &anc) != 0)
+        return -1;
+    result = id_set_contains(&anc, candidate);
+    id_set_free(&anc);
+    return result;
+}
+
+int sg_merge_base(const char *git_dir, const unsigned char a[SG_SHA1_RAW_LEN],
+                  const unsigned char b[SG_SHA1_RAW_LEN], unsigned char out[SG_SHA1_RAW_LEN])
+{
+    id_set anc_a, anc_b;
+    id_set candidates = {0};
+    int *dominated = NULL;
+    size_t i, j;
+    size_t remaining;
+    int rc;
+
+    if (collect_ancestors(git_dir, a, &anc_a) != 0)
+        return -1;
+    if (collect_ancestors(git_dir, b, &anc_b) != 0) {
+        id_set_free(&anc_a);
+        return -1;
+    }
+
+    for (i = 0; i < anc_a.count; i++) {
+        if (id_set_contains(&anc_b, anc_a.ids[i])) {
+            if (id_set_add(&candidates, anc_a.ids[i]) < 0) {
+                id_set_free(&anc_a);
+                id_set_free(&anc_b);
+                id_set_free(&candidates);
+                return -1;
+            }
+        }
+    }
+    id_set_free(&anc_a);
+    id_set_free(&anc_b);
+
+    if (candidates.count == 0) {
+        id_set_free(&candidates);
+        return -1;
+    }
+
+    /* Reduce to the best (most-derived) candidates: drop any candidate that
+       is itself an ancestor of another candidate -- it isn't "closest". */
+    dominated = calloc(candidates.count, sizeof(*dominated));
+    if (dominated == NULL) {
+        id_set_free(&candidates);
+        return -1;
+    }
+
+    remaining = candidates.count;
+    for (i = 0; i < candidates.count; i++) {
+        for (j = 0; j < candidates.count; j++) {
+            int anc_result;
+
+            if (i == j)
+                continue;
+            anc_result = is_ancestor(git_dir, candidates.ids[i], candidates.ids[j]);
+            if (anc_result < 0) {
+                free(dominated);
+                id_set_free(&candidates);
+                return -1;
+            }
+            if (anc_result == 1) {
+                dominated[i] = 1;
+                remaining--;
+                break;
+            }
+        }
+    }
+
+    if (remaining == 1) {
+        for (i = 0; i < candidates.count; i++) {
+            if (!dominated[i]) {
+                memcpy(out, candidates.ids[i], SG_SHA1_RAW_LEN);
+                break;
+            }
+        }
+        rc = 0;
+    } else if (remaining == 0) {
+        rc = -1; /* defensive: shouldn't happen given candidates.count > 0 */
+    } else {
+        rc = -2; /* criss-cross: multiple independent best common ancestors */
+    }
+
+    free(dominated);
+    id_set_free(&candidates);
+    return rc;
+}
+
+/* ==================== three-way content merge (diff3-lite) ==================== */
+
+typedef struct {
+    unsigned char *buf;
+    size_t len;
+    size_t cap;
+} bytebuf;
+
+static int bytebuf_append(bytebuf *b, const void *data, size_t len)
+{
+    if (b->len + len > b->cap) {
+        size_t new_cap = b->cap == 0 ? 256 : b->cap * 2;
+        unsigned char *grown;
+
+        while (new_cap < b->len + len)
+            new_cap *= 2;
+        grown = realloc(b->buf, new_cap);
+        if (grown == NULL)
+            return -1;
+        b->buf = grown;
+        b->cap = new_cap;
+    }
+    if (len > 0)
+        memcpy(b->buf + b->len, data, len);
+    b->len += len;
+    return 0;
+}
+
+static int bytebuf_append_str(bytebuf *b, const char *s)
+{
+    return bytebuf_append(b, s, strlen(s));
+}
+
+static int bytebuf_append_line(bytebuf *b, sg_diff_line line)
+{
+    if (bytebuf_append(b, line.ptr, line.len) != 0)
+        return -1;
+    if (line.has_nl && bytebuf_append(b, "\n", 1) != 0)
+        return -1;
+    return 0;
+}
+
+static int bytebuf_append_lines(bytebuf *b, const sg_diff_line *lines, size_t start, size_t end)
+{
+    size_t k;
+
+    for (k = start; k < end; k++) {
+        if (bytebuf_append_line(b, lines[k]) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int content_has_nul(const unsigned char *data, size_t len)
+{
+    return len > 0 && memchr(data, '\0', len) != NULL;
+}
+
+static int segment_equal(const sg_diff_line *a, size_t as, size_t ae, const sg_diff_line *b,
+                         size_t bs, size_t be)
+{
+    size_t na = ae - as;
+    size_t nb = be - bs;
+    size_t k;
+
+    if (na != nb)
+        return 0;
+    for (k = 0; k < na; k++) {
+        if (!sg_diff_lines_equal(a[as + k], b[bs + k]))
+            return 0;
+    }
+    return 1;
+}
+
+/* Backtracks an LCS table (built over a as rows, b as columns) into a
+   match array of size na: match[i] = the b-index a[i] was aligned to, or -1
+   if a[i] wasn't part of the alignment. This is exactly the walk `sg diff`
+   uses to classify +/-/context lines, reused here to find base<->ours and
+   base<->theirs alignments. Returns NULL on allocation failure. */
+static long *lcs_matches(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
+                        size_t **dp)
+{
+    long *match = malloc((na > 0 ? na : 1) * sizeof(*match));
+    size_t i, j;
+
+    if (match == NULL)
+        return NULL;
+    for (i = 0; i < na; i++)
+        match[i] = -1;
+
+    i = 0;
+    j = 0;
+    while (i < na && j < nb) {
+        if (sg_diff_lines_equal(a[i], b[j])) {
+            match[i] = (long)j;
+            i++;
+            j++;
+        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+            i++;
+        } else {
+            j++;
+        }
+    }
+    return match;
+}
+
+typedef struct {
+    long base_idx, ours_idx, theirs_idx;
+} sync_point;
+
+int sg_merge_content(const unsigned char *base, size_t base_len, const unsigned char *ours,
+                     size_t ours_len, const unsigned char *theirs, size_t theirs_len,
+                     const char *ours_label, const char *theirs_label, unsigned char **out,
+                     size_t *out_len)
+{
+    size_t nbase = 0, nours = 0, ntheirs = 0;
+    sg_diff_line *base_lines = NULL;
+    sg_diff_line *ours_lines = NULL;
+    sg_diff_line *theirs_lines = NULL;
+    size_t **dp_bo = NULL;
+    size_t **dp_bt = NULL;
+    long *bo_match = NULL;
+    long *bt_match = NULL;
+    sync_point *syncs = NULL;
+    size_t sync_cap;
+    size_t sync_count = 0;
+    bytebuf outbuf = {0};
+    int conflict = 0;
+    int rc = -1;
+    size_t k, idx;
+
+    *out = NULL;
+    *out_len = 0;
+
+    if (content_has_nul(base, base_len) || content_has_nul(ours, ours_len) ||
+       content_has_nul(theirs, theirs_len)) {
+        unsigned char *copy = NULL;
+
+        if (ours_len > 0) {
+            copy = malloc(ours_len);
+            if (copy == NULL)
+                return -1;
+            memcpy(copy, ours, ours_len);
+        }
+        *out = copy;
+        *out_len = ours_len;
+        return 1;
+    }
+
+    base_lines = sg_diff_split_lines(base, base_len, &nbase);
+    ours_lines = sg_diff_split_lines(ours, ours_len, &nours);
+    theirs_lines = sg_diff_split_lines(theirs, theirs_len, &ntheirs);
+    if (base_lines == NULL || ours_lines == NULL || theirs_lines == NULL)
+        goto done;
+
+    dp_bo = sg_diff_lcs_table(base_lines, nbase, ours_lines, nours);
+    dp_bt = sg_diff_lcs_table(base_lines, nbase, theirs_lines, ntheirs);
+    if (dp_bo == NULL || dp_bt == NULL)
+        goto done;
+
+    bo_match = lcs_matches(base_lines, nbase, ours_lines, nours, dp_bo);
+    bt_match = lcs_matches(base_lines, nbase, theirs_lines, ntheirs, dp_bt);
+    if (bo_match == NULL || bt_match == NULL)
+        goto done;
+
+    /* sync points: base lines matched on both sides ("the same" per the
+       spec), bracketed by sentinels for the start/end of the whole file. */
+    sync_cap = nbase + 2;
+    syncs = malloc(sync_cap * sizeof(*syncs));
+    if (syncs == NULL)
+        goto done;
+    syncs[sync_count].base_idx = -1;
+    syncs[sync_count].ours_idx = -1;
+    syncs[sync_count].theirs_idx = -1;
+    sync_count++;
+    for (k = 0; k < nbase; k++) {
+        if (bo_match[k] != -1 && bt_match[k] != -1) {
+            syncs[sync_count].base_idx = (long)k;
+            syncs[sync_count].ours_idx = bo_match[k];
+            syncs[sync_count].theirs_idx = bt_match[k];
+            sync_count++;
+        }
+    }
+    syncs[sync_count].base_idx = (long)nbase;
+    syncs[sync_count].ours_idx = (long)nours;
+    syncs[sync_count].theirs_idx = (long)ntheirs;
+    sync_count++;
+
+    for (idx = 1; idx < sync_count; idx++) {
+        sync_point prev = syncs[idx - 1];
+        sync_point cur = syncs[idx];
+        size_t bs = (size_t)(prev.base_idx + 1), be = (size_t)cur.base_idx;
+        size_t os = (size_t)(prev.ours_idx + 1), oe = (size_t)cur.ours_idx;
+        size_t ts = (size_t)(prev.theirs_idx + 1), te = (size_t)cur.theirs_idx;
+        int ours_eq_base = segment_equal(base_lines, bs, be, ours_lines, os, oe);
+        int theirs_eq_base = segment_equal(base_lines, bs, be, theirs_lines, ts, te);
+        int ours_eq_theirs = segment_equal(ours_lines, os, oe, theirs_lines, ts, te);
+
+        if (ours_eq_base) {
+            if (bytebuf_append_lines(&outbuf, theirs_lines, ts, te) != 0)
+                goto done;
+        } else if (theirs_eq_base) {
+            if (bytebuf_append_lines(&outbuf, ours_lines, os, oe) != 0)
+                goto done;
+        } else if (ours_eq_theirs) {
+            if (bytebuf_append_lines(&outbuf, ours_lines, os, oe) != 0)
+                goto done;
+        } else {
+            conflict = 1;
+            if (bytebuf_append_str(&outbuf, "<<<<<<< ") != 0 ||
+               bytebuf_append_str(&outbuf, ours_label) != 0 ||
+               bytebuf_append_str(&outbuf, "\n") != 0 ||
+               bytebuf_append_lines(&outbuf, ours_lines, os, oe) != 0 ||
+               bytebuf_append_str(&outbuf, "=======\n") != 0 ||
+               bytebuf_append_lines(&outbuf, theirs_lines, ts, te) != 0 ||
+               bytebuf_append_str(&outbuf, ">>>>>>> ") != 0 ||
+               bytebuf_append_str(&outbuf, theirs_label) != 0 ||
+               bytebuf_append_str(&outbuf, "\n") != 0)
+                goto done;
+        }
+
+        if (idx < sync_count - 1) {
+            /* sg_diff_lines_equal ignores has_nl, so a sync point's base line
+               may carry a has_nl that doesn't match the position it's being
+               emitted at (e.g. base's final, newline-less line matching
+               identical content earlier in ours/theirs). Only trust base's
+               own has_nl when this anchor is truly the last line of all
+               three inputs; otherwise more content follows, so force a
+               newline to avoid gluing lines together. */
+            sg_diff_line anchor = base_lines[cur.base_idx];
+            int is_final_line = cur.base_idx == (long)nbase - 1 &&
+                                cur.ours_idx == (long)nours - 1 &&
+                                cur.theirs_idx == (long)ntheirs - 1;
+
+            if (!is_final_line)
+                anchor.has_nl = 1;
+            if (bytebuf_append_line(&outbuf, anchor) != 0)
+                goto done;
+        }
+    }
+
+    *out = outbuf.buf;
+    *out_len = outbuf.len;
+    rc = conflict;
+
+done:
+    if (rc < 0)
+        free(outbuf.buf);
+    free(syncs);
+    free(bo_match);
+    free(bt_match);
+    sg_diff_lcs_free_table(dp_bo, nbase);
+    sg_diff_lcs_free_table(dp_bt, nbase);
+    free(base_lines);
+    free(ours_lines);
+    free(theirs_lines);
+    return rc;
+}
+
+/* ==================== three-way tree merge ==================== */
+
+typedef struct {
+    const char *path;
+    int base_present, ours_present, theirs_present;
+    const sg_flat_entry *base_e, *ours_e, *theirs_e;
+} triple;
+
+static const char *min_path3(const char *a, const char *b, const char *c)
+{
+    const char *m = NULL;
+
+    if (a != NULL)
+        m = a;
+    if (b != NULL && (m == NULL || strcmp(b, m) < 0))
+        m = b;
+    if (c != NULL && (m == NULL || strcmp(c, m) < 0))
+        m = c;
+    return m;
+}
+
+static int blob_eq(int a_present, const sg_flat_entry *a, int b_present, const sg_flat_entry *b)
+{
+    if (a_present != b_present)
+        return 0;
+    if (!a_present)
+        return 1; /* both absent */
+    return a->mode == b->mode && memcmp(a->sha1, b->sha1, SG_SHA1_RAW_LEN) == 0;
+}
+
+static void fill_conflict_sides(sg_merge_result_entry *e, const triple *t)
+{
+    e->base_present = t->base_present;
+    e->ours_present = t->ours_present;
+    e->theirs_present = t->theirs_present;
+    if (t->base_present) {
+        e->base_mode = t->base_e->mode;
+        memcpy(e->base_sha1, t->base_e->sha1, SG_SHA1_RAW_LEN);
+    }
+    if (t->ours_present) {
+        e->ours_mode = t->ours_e->mode;
+        memcpy(e->ours_sha1, t->ours_e->sha1, SG_SHA1_RAW_LEN);
+    }
+    if (t->theirs_present) {
+        e->theirs_mode = t->theirs_e->mode;
+        memcpy(e->theirs_sha1, t->theirs_e->sha1, SG_SHA1_RAW_LEN);
+    }
+}
+
+/* Handles the "all three present" (modify/modify) and "base absent, both
+   added" (add/add) conflict candidates by calling sg_merge_content; a clean
+   result (rc 0) turns out not to be a conflict after all and gets a freshly
+   written blob. */
+static int resolve_via_content_merge(const char *git_dir, const triple *t, const char *ours_label,
+                                     const char *theirs_label, sg_merge_result_entry *out)
+{
+    unsigned char *base_content = NULL;
+    size_t base_len = 0;
+    unsigned char *ours_content = NULL;
+    size_t ours_len = 0;
+    unsigned char *theirs_content = NULL;
+    size_t theirs_len = 0;
+    unsigned char *merged = NULL;
+    size_t merged_len = 0;
+    sg_obj_type type;
+    int rc;
+
+    if (t->base_present && sg_object_read(git_dir, t->base_e->sha1, &type, &base_content, &base_len) != 0)
+        return -1;
+    if (sg_object_read(git_dir, t->ours_e->sha1, &type, &ours_content, &ours_len) != 0) {
+        free(base_content);
+        return -1;
+    }
+    if (sg_object_read(git_dir, t->theirs_e->sha1, &type, &theirs_content, &theirs_len) != 0) {
+        free(base_content);
+        free(ours_content);
+        return -1;
+    }
+
+    rc = sg_merge_content(base_content, base_len, ours_content, ours_len, theirs_content, theirs_len,
+                          ours_label, theirs_label, &merged, &merged_len);
+    free(base_content);
+    free(ours_content);
+    free(theirs_content);
+    if (rc < 0)
+        return -1;
+
+    if (rc == 0) {
+        unsigned char new_sha1[SG_SHA1_RAW_LEN];
+
+        if (sg_loose_write(git_dir, SG_OBJ_BLOB, merged, merged_len, new_sha1) != 0) {
+            free(merged);
+            return -1;
+        }
+        free(merged);
+        out->conflict = 0;
+        out->deleted = 0;
+        memcpy(out->sha1, new_sha1, SG_SHA1_RAW_LEN);
+        if (t->base_present) {
+            if (t->ours_e->mode != t->base_e->mode)
+                out->mode = t->ours_e->mode;
+            else if (t->theirs_e->mode != t->base_e->mode)
+                out->mode = t->theirs_e->mode;
+            else
+                out->mode = t->base_e->mode;
+        } else {
+            out->mode = t->ours_e->mode;
+        }
+        return 0;
+    }
+
+    out->conflict_content = merged;
+    out->conflict_content_len = merged_len;
+    return 0;
+}
+
+static int process_path(const char *git_dir, const triple *t, const char *ours_label,
+                        const char *theirs_label, sg_merge_result_entry *out)
+{
+    int eq_ob = blob_eq(t->ours_present, t->ours_e, t->base_present, t->base_e);
+    int eq_tb = blob_eq(t->theirs_present, t->theirs_e, t->base_present, t->base_e);
+    int eq_ot = blob_eq(t->ours_present, t->ours_e, t->theirs_present, t->theirs_e);
+
+    memset(out, 0, sizeof(*out));
+    out->path = strdup(t->path);
+    if (out->path == NULL)
+        return -1;
+
+    if (eq_ob && eq_tb) {
+        out->deleted = !t->base_present;
+        if (t->base_present) {
+            out->mode = t->base_e->mode;
+            memcpy(out->sha1, t->base_e->sha1, SG_SHA1_RAW_LEN);
+        }
+        return 0;
+    }
+    if (eq_ob) { /* ours unchanged from base, theirs changed: take theirs */
+        out->deleted = !t->theirs_present;
+        if (t->theirs_present) {
+            out->mode = t->theirs_e->mode;
+            memcpy(out->sha1, t->theirs_e->sha1, SG_SHA1_RAW_LEN);
+        }
+        return 0;
+    }
+    if (eq_tb) { /* theirs unchanged from base, ours changed: take ours */
+        out->deleted = !t->ours_present;
+        if (t->ours_present) {
+            out->mode = t->ours_e->mode;
+            memcpy(out->sha1, t->ours_e->sha1, SG_SHA1_RAW_LEN);
+        }
+        return 0;
+    }
+    if (eq_ot) { /* both sides agree, whatever base said */
+        out->deleted = !t->ours_present;
+        if (t->ours_present) {
+            out->mode = t->ours_e->mode;
+            memcpy(out->sha1, t->ours_e->sha1, SG_SHA1_RAW_LEN);
+        }
+        return 0;
+    }
+
+    /* genuine conflict candidate */
+    fill_conflict_sides(out, t);
+    out->conflict = 1;
+
+    if (t->ours_present && t->theirs_present) {
+        /* modify/modify (base present) or add/add (base absent) */
+        if (resolve_via_content_merge(git_dir, t, ours_label, theirs_label, out) != 0) {
+            free(out->path);
+            return -1;
+        }
+        return 0;
+    }
+
+    /* modify/delete: base present, exactly one of ours/theirs still has it */
+    {
+        const sg_flat_entry *present_e = t->ours_present ? t->ours_e : t->theirs_e;
+        sg_obj_type type;
+
+        if (sg_object_read(git_dir, present_e->sha1, &type, &out->conflict_content,
+                           &out->conflict_content_len) != 0) {
+            free(out->path);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RAW_LEN],
+                   const unsigned char ours_tree[SG_SHA1_RAW_LEN],
+                   const unsigned char theirs_tree[SG_SHA1_RAW_LEN], const char *ours_label,
+                   const char *theirs_label, sg_merge_result *out)
+{
+    sg_flat_list base_flat, ours_flat, theirs_flat;
+    size_t bi = 0, oi = 0, ti = 0;
+    size_t cap = 0;
+    int rc = 0;
+
+    memset(out, 0, sizeof(*out));
+    memset(&base_flat, 0, sizeof(base_flat));
+    memset(&ours_flat, 0, sizeof(ours_flat));
+    memset(&theirs_flat, 0, sizeof(theirs_flat));
+
+    if (sg_tree_flatten(git_dir, base_tree, &base_flat) != 0)
+        return -1;
+    if (sg_tree_flatten(git_dir, ours_tree, &ours_flat) != 0) {
+        sg_flat_list_free(&base_flat);
+        return -1;
+    }
+    if (sg_tree_flatten(git_dir, theirs_tree, &theirs_flat) != 0) {
+        sg_flat_list_free(&base_flat);
+        sg_flat_list_free(&ours_flat);
+        return -1;
+    }
+
+    while (bi < base_flat.count || oi < ours_flat.count || ti < theirs_flat.count) {
+        const char *bp = bi < base_flat.count ? base_flat.entries[bi].path : NULL;
+        const char *op = oi < ours_flat.count ? ours_flat.entries[oi].path : NULL;
+        const char *tp = ti < theirs_flat.count ? theirs_flat.entries[ti].path : NULL;
+        const char *path = min_path3(bp, op, tp);
+        triple t;
+        sg_merge_result_entry entry;
+
+        memset(&t, 0, sizeof(t));
+        t.path = path;
+        if (bp != NULL && strcmp(bp, path) == 0) {
+            t.base_present = 1;
+            t.base_e = &base_flat.entries[bi];
+            bi++;
+        }
+        if (op != NULL && strcmp(op, path) == 0) {
+            t.ours_present = 1;
+            t.ours_e = &ours_flat.entries[oi];
+            oi++;
+        }
+        if (tp != NULL && strcmp(tp, path) == 0) {
+            t.theirs_present = 1;
+            t.theirs_e = &theirs_flat.entries[ti];
+            ti++;
+        }
+
+        if (process_path(git_dir, &t, ours_label, theirs_label, &entry) != 0) {
+            rc = -1;
+            break;
+        }
+
+        if (out->count == cap) {
+            size_t new_cap = cap == 0 ? 16 : cap * 2;
+            sg_merge_result_entry *grown = realloc(out->entries, new_cap * sizeof(*grown));
+
+            if (grown == NULL) {
+                free(entry.path);
+                free(entry.conflict_content);
+                rc = -1;
+                break;
+            }
+            out->entries = grown;
+            cap = new_cap;
+        }
+        out->entries[out->count] = entry;
+        out->count++;
+    }
+
+    sg_flat_list_free(&base_flat);
+    sg_flat_list_free(&ours_flat);
+    sg_flat_list_free(&theirs_flat);
+
+    if (rc != 0) {
+        sg_merge_result_free(out);
+        return -1;
+    }
+    return 0;
+}
+
+void sg_merge_result_free(sg_merge_result *result)
+{
+    size_t i;
+
+    for (i = 0; i < result->count; i++) {
+        free(result->entries[i].path);
+        free(result->entries[i].conflict_content);
+    }
+    free(result->entries);
+    result->entries = NULL;
+    result->count = 0;
+}
+
+/* ==================== MERGE_HEAD ==================== */
+
+static int merge_head_path(const char *git_dir, char *out, size_t out_size)
+{
+    return (size_t)snprintf(out, out_size, "%s/MERGE_HEAD", git_dir) < out_size ? 0 : -1;
+}
+
+int sg_merge_head_read(const char *git_dir, unsigned char out[SG_SHA1_RAW_LEN])
+{
+    char path[4096];
+    FILE *f;
+    char hexbuf[SG_SHA1_HEX_LEN + 2];
+    char *nl;
+
+    if (merge_head_path(git_dir, path, sizeof(path)) != 0)
+        return -1;
+    f = fopen(path, "rb");
+    if (f == NULL)
+        return -1;
+    if (fgets(hexbuf, sizeof(hexbuf), f) == NULL) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    nl = strchr(hexbuf, '\n');
+    if (nl != NULL)
+        *nl = '\0';
+    return sg_hex_to_sha1(hexbuf, out);
+}
+
+int sg_merge_head_write(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN])
+{
+    char path[4096];
+    char hex[SG_SHA1_HEX_LEN + 1];
+    FILE *f;
+
+    if (merge_head_path(git_dir, path, sizeof(path)) != 0)
+        return -1;
+    sg_sha1_to_hex(id, hex);
+    f = fopen(path, "wb");
+    if (f == NULL)
+        return -1;
+    if (fprintf(f, "%s\n", hex) < 0) {
+        fclose(f);
+        return -1;
+    }
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+int sg_merge_head_remove(const char *git_dir)
+{
+    char path[4096];
+
+    if (merge_head_path(git_dir, path, sizeof(path)) != 0)
+        return -1;
+    if (remove(path) != 0 && errno != ENOENT)
+        return -1;
+    return 0;
+}

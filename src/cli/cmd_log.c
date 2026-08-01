@@ -63,6 +63,21 @@ int sg_cmd_log(int argc, char **argv)
         strftime(timebuf, sizeof(timebuf), "%a %b %d %H:%M:%S %Y", &tmv);
 
         printf("commit %s\n", hex);
+        if (commit.parent_count > 1) {
+            /* first-parent-only walk (Phase 2 scope): the other parents are
+               never themselves visited, but a merge commit is still flagged
+               here so its extra history isn't silently invisible. */
+            size_t pi;
+
+            printf("Merge:");
+            for (pi = 0; pi < commit.parent_count; pi++) {
+                char phex[SG_SHA1_HEX_LEN + 1];
+
+                sg_sha1_to_hex(commit.parents[pi], phex);
+                printf(" %.7s", phex);
+            }
+            printf("\n");
+        }
         printf("Author: %s <%s>\n", commit.author_name, commit.author_email);
         printf("Date:   %s %s\n", timebuf, commit.author_tz);
         printf("\n    %s\n\n", commit.message);

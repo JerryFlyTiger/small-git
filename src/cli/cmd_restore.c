@@ -66,21 +66,25 @@ static void restore_staged(sg_index *idx, int has_head, const sg_flat_list *head
                            const char *rel)
 {
     int head_pos = has_head ? flat_find(head_flat, rel) : -1;
+    int existing = sg_index_find(idx, rel);
+    sg_index_entry entry;
 
-    if (head_pos < 0) {
-        sg_index_remove(idx, rel); /* not tracked by HEAD: unstaging removes it */
-    } else {
-        sg_index_entry entry;
-        int existing = sg_index_find(idx, rel);
+    memset(&entry, 0, sizeof(entry));
+    if (existing >= 0)
+        entry = idx->entries[existing];
 
-        memset(&entry, 0, sizeof(entry));
-        if (existing >= 0)
-            entry = idx->entries[existing];
-        entry.mode = head_flat->entries[head_pos].mode;
-        memcpy(entry.sha1, head_flat->entries[head_pos].sha1, SG_SHA1_RAW_LEN);
-        entry.path = (char *)rel;
-        sg_index_upsert(idx, &entry);
-    }
+    /* Also clears any stage 1/2/3 entries at rel: unstaging an unresolved
+       conflict path should not leave it half-marked as still conflicting. */
+    sg_index_remove_all_stages(idx, rel);
+
+    if (head_pos < 0)
+        return; /* not tracked by HEAD: unstaging removes it (already cleared above) */
+
+    entry.mode = head_flat->entries[head_pos].mode;
+    memcpy(entry.sha1, head_flat->entries[head_pos].sha1, SG_SHA1_RAW_LEN);
+    entry.stage = 0;
+    entry.path = (char *)rel;
+    sg_index_upsert(idx, &entry);
 }
 
 typedef struct {

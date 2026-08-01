@@ -185,14 +185,10 @@ int sg_index_read(const char *git_dir, sg_index *out)
         p += SG_SHA1_RAW_LEN;
         flags = read_be16(&p);
 
-        /* stage bits 13-12: a non-zero stage means an unresolved merge
-           conflict entry. Phase 2 has no merge support, and silently reading
-           these as normal entries would produce multiple entries sharing the
-           same path -- which breaks sg_index_find's sorted-uniqueness
-           assumption and can corrupt the index/tree on the next write. Bail
-           out with a clear error instead. */
-        if (flags & 0x3000)
-            goto fail;
+        /* stage bits 13-12: 0 = ordinary entry, 1/2/3 = base/ours/theirs
+           while a conflict at this path is unresolved. Phase 4b onwards
+           supports multiple entries sharing a path, one per stage. */
+        e->stage = (flags >> 12) & 0x3;
 
         if (flags & 0x4000) { /* extended flag, bit 14 */
             extended = 1;
@@ -300,7 +296,8 @@ int sg_index_write(const char *git_dir, const sg_index *index)
         size_t entry_len = SG_INDEX_ENTRY_FIXED_LEN + name_len;
         size_t padded_len = ((entry_len + 8) / 8) * 8;
         size_t padding = padded_len - entry_len;
-        unsigned short flags = (unsigned short)(name_len < 0x0FFF ? name_len : 0x0FFF);
+        unsigned short flags = (unsigned short)((name_len < 0x0FFF ? name_len : 0x0FFF) |
+                                                ((e->stage & 0x3) << 12));
 
         write_be32(&p, e->ctime_sec);
         write_be32(&p, e->ctime_nsec);
@@ -349,7 +346,12 @@ void sg_index_free(sg_index *index)
     index->count = 0;
 }
 
-static int find_insert_pos(const sg_index *index, const char *path, size_t *pos_out)
+/* Sort/lookup key is (path, stage): path compares first (byte-wise), and
+   only entries sharing a path are then ordered by stage -- this matches
+   git's on-disk ordering exactly (required for a real git to read the index
+   correctly) and keeps every stage of a conflicted path contiguous. */
+static int find_insert_pos_stage(const sg_index *index, const char *path, unsigned int stage,
+                                 size_t *pos_out)
 {
     size_t lo = 0;
     size_t hi = index->count;
@@ -359,8 +361,11 @@ static int find_insert_pos(const sg_index *index, const char *path, size_t *pos_
         int cmp = strcmp(index->entries[mid].path, path);
 
         if (cmp == 0) {
-            *pos_out = mid;
-            return 1;
+            if (index->entries[mid].stage == stage) {
+                *pos_out = mid;
+                return 1;
+            }
+            cmp = index->entries[mid].stage < stage ? -1 : 1;
         }
         if (cmp < 0)
             lo = mid + 1;
@@ -371,13 +376,49 @@ static int find_insert_pos(const sg_index *index, const char *path, size_t *pos_
     return 0;
 }
 
-int sg_index_find(const sg_index *index, const char *path)
+/* Path-only search, used by sg_index_remove_all_stages to find the
+   contiguous run of every stage sharing a path. */
+static int find_path_range(const sg_index *index, const char *path, size_t *lo_out, size_t *hi_out)
+{
+    size_t lo = 0;
+    size_t hi = index->count;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(index->entries[mid].path, path);
+
+        if (cmp == 0) {
+            size_t range_lo = mid;
+            size_t range_hi = mid + 1;
+
+            while (range_lo > 0 && strcmp(index->entries[range_lo - 1].path, path) == 0)
+                range_lo--;
+            while (range_hi < index->count && strcmp(index->entries[range_hi].path, path) == 0)
+                range_hi++;
+            *lo_out = range_lo;
+            *hi_out = range_hi;
+            return 1;
+        }
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return 0;
+}
+
+int sg_index_find_stage(const sg_index *index, const char *path, unsigned int stage)
 {
     size_t pos;
 
-    if (find_insert_pos(index, path, &pos))
+    if (find_insert_pos_stage(index, path, stage, &pos))
         return (int)pos;
     return -1;
+}
+
+int sg_index_find(const sg_index *index, const char *path)
+{
+    return sg_index_find_stage(index, path, 0);
 }
 
 int sg_index_upsert(sg_index *index, const sg_index_entry *entry)
@@ -388,7 +429,7 @@ int sg_index_upsert(sg_index *index, const sg_index_entry *entry)
     if (path_copy == NULL)
         return -1;
 
-    if (find_insert_pos(index, entry->path, &pos)) {
+    if (find_insert_pos_stage(index, entry->path, entry->stage, &pos)) {
         free(index->entries[pos].path);
         index->entries[pos] = *entry;
         index->entries[pos].path = path_copy;
@@ -416,7 +457,7 @@ int sg_index_remove(sg_index *index, const char *path)
 {
     size_t pos;
 
-    if (!find_insert_pos(index, path, &pos))
+    if (!find_insert_pos_stage(index, path, 0, &pos))
         return -1;
 
     free(index->entries[pos].path);
@@ -426,6 +467,36 @@ int sg_index_remove(sg_index *index, const char *path)
     if (index->count == 0) {
         free(index->entries);
         index->entries = NULL;
+    }
+    return 0;
+}
+
+int sg_index_remove_all_stages(sg_index *index, const char *path)
+{
+    size_t lo, hi, n, i;
+
+    if (!find_path_range(index, path, &lo, &hi))
+        return 0;
+
+    n = hi - lo;
+    for (i = lo; i < hi; i++)
+        free(index->entries[i].path);
+    memmove(&index->entries[lo], &index->entries[hi], (index->count - hi) * sizeof(*index->entries));
+    index->count -= n;
+    if (index->count == 0) {
+        free(index->entries);
+        index->entries = NULL;
+    }
+    return (int)n;
+}
+
+int sg_index_has_unmerged(const sg_index *index)
+{
+    size_t i;
+
+    for (i = 0; i < index->count; i++) {
+        if (index->entries[i].stage != 0)
+            return 1;
     }
     return 0;
 }

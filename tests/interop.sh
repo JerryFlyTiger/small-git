@@ -477,6 +477,198 @@ check "phase5 case2: sg status exits 0 on real git's delta pack" test $? = 0
 check "phase5 case2: sg status reports clean tree on real git's delta pack" \
     grep -q "nothing to commit" "$SG_STATUS_GIT"
 
+# --- Phase 4b: merge + conflict UX ---
+
+# case 1: merge-base cross-check against a diverging history
+P4B_MB_REPO="$WORKDIR/p4b_mergebase_repo"
+mkdir -p "$P4B_MB_REPO"
+(cd "$WORKDIR" && "$SG" init p4b_mergebase_repo) > /dev/null 2>&1
+printf 'root\n' > "$P4B_MB_REPO/r.txt"
+(cd "$P4B_MB_REPO" && "$SG" add r.txt && "$SG" commit -m "root") > /dev/null 2>&1
+(cd "$P4B_MB_REPO" && "$SG" switch -c side) > /dev/null 2>&1
+printf 'root\nside\n' > "$P4B_MB_REPO/r.txt"
+(cd "$P4B_MB_REPO" && "$SG" add r.txt && "$SG" commit -m "side commit") > /dev/null 2>&1
+(cd "$P4B_MB_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'root\nmain\n' > "$P4B_MB_REPO/r.txt"
+(cd "$P4B_MB_REPO" && "$SG" add r.txt && "$SG" commit -m "main commit") > /dev/null 2>&1
+
+MB_A=$(cd "$P4B_MB_REPO" && git rev-parse master)
+MB_B=$(cd "$P4B_MB_REPO" && git rev-parse side)
+SG_MB=$(cd "$P4B_MB_REPO" && "$SG" merge-base "$MB_A" "$MB_B" 2>/dev/null)
+GIT_MB=$(cd "$P4B_MB_REPO" && git merge-base "$MB_A" "$MB_B" 2>/dev/null)
+check "phase4b case1: sg merge-base matches real git merge-base" test "$SG_MB" = "$GIT_MB"
+
+# case 2: sg produces a conflict that real git recognizes as unmerged (UU)
+P4B_CONFLICT_REPO="$WORKDIR/p4b_conflict_repo"
+mkdir -p "$P4B_CONFLICT_REPO"
+(cd "$WORKDIR" && "$SG" init p4b_conflict_repo) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P4B_CONFLICT_REPO/c.txt"
+(cd "$P4B_CONFLICT_REPO" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4B_CONFLICT_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P4B_CONFLICT_REPO/c.txt"
+(cd "$P4B_CONFLICT_REPO" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P4B_CONFLICT_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P4B_CONFLICT_REPO/c.txt"
+(cd "$P4B_CONFLICT_REPO" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+
+(cd "$P4B_CONFLICT_REPO" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+SG_MERGE_CONFLICT_RC=$?
+check "phase4b case2: sg merge with a real conflict exits non-zero" test "$SG_MERGE_CONFLICT_RC" -ne 0
+
+GIT_PORCELAIN_UU="$WORKDIR/p4b_git_porcelain_uu.txt"
+(cd "$P4B_CONFLICT_REPO" && git status --porcelain) > "$GIT_PORCELAIN_UU" 2>&1
+check "phase4b case2: real git sees the sg-made conflict as UU" grep -q "^UU c.txt" "$GIT_PORCELAIN_UU"
+
+# case 3: a conflict made by real git's own `git merge` is recognized by `sg status`
+P4B_GITCONFLICT_REPO="$WORKDIR/p4b_gitconflict_repo"
+mkdir -p "$P4B_GITCONFLICT_REPO"
+(cd "$WORKDIR" && git init -q p4b_gitconflict_repo)
+(cd "$P4B_GITCONFLICT_REPO" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'orig1\norig2\n' > "$P4B_GITCONFLICT_REPO/g.txt"
+(cd "$P4B_GITCONFLICT_REPO" && git add g.txt && git commit -q -m "base")
+(cd "$P4B_GITCONFLICT_REPO" && git switch -q -c feature)
+printf 'feature1\norig2\n' > "$P4B_GITCONFLICT_REPO/g.txt"
+(cd "$P4B_GITCONFLICT_REPO" && git add g.txt && git commit -q -m "feature change")
+(cd "$P4B_GITCONFLICT_REPO" && git switch -q master)
+printf 'master1\norig2\n' > "$P4B_GITCONFLICT_REPO/g.txt"
+(cd "$P4B_GITCONFLICT_REPO" && git add g.txt && git commit -q -m "master change")
+(cd "$P4B_GITCONFLICT_REPO" && git merge feature) > /dev/null 2>&1
+
+SG_STATUS_GITCONFLICT="$WORKDIR/p4b_sg_status_gitconflict.txt"
+(cd "$P4B_GITCONFLICT_REPO" && "$SG" status) > "$SG_STATUS_GITCONFLICT" 2>&1
+check "phase4b case3: sg status exits 0 on a real-git-made conflict" test $? = 0
+check "phase4b case3: sg status reports unmerged paths for a real-git-made conflict" \
+    grep -q "Unmerged paths" "$SG_STATUS_GITCONFLICT"
+check "phase4b case3: sg status names the conflicted file" grep -q "g.txt" "$SG_STATUS_GITCONFLICT"
+
+# case 4: clean auto-merge of well-separated edits; merge commit has two
+# parents, both a real git and sg agree on that
+P4B_CLEAN_REPO="$WORKDIR/p4b_clean_repo"
+mkdir -p "$P4B_CLEAN_REPO"
+(cd "$WORKDIR" && "$SG" init p4b_clean_repo) > /dev/null 2>&1
+printf 'line1\nline2\nline3\nline4\nline5\n' > "$P4B_CLEAN_REPO/m.txt"
+(cd "$P4B_CLEAN_REPO" && "$SG" add m.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4B_CLEAN_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'line1\nline2\nline3\nCHANGED4\nline5\n' > "$P4B_CLEAN_REPO/m.txt"
+(cd "$P4B_CLEAN_REPO" && "$SG" add m.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P4B_CLEAN_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'line1\nCHANGED2\nline3\nline4\nline5\n' > "$P4B_CLEAN_REPO/m.txt"
+(cd "$P4B_CLEAN_REPO" && "$SG" add m.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+
+(cd "$P4B_CLEAN_REPO" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+check "phase4b case4: clean auto-merge exits 0" test $? = 0
+check "phase4b case4: merged file contains both sides' edits" \
+    sh -c "grep -q CHANGED2 '$P4B_CLEAN_REPO/m.txt' && grep -q CHANGED4 '$P4B_CLEAN_REPO/m.txt'"
+
+GIT_MERGE_COMMIT_SHOW="$WORKDIR/p4b_git_merge_commit_show.txt"
+(cd "$P4B_CLEAN_REPO" && git cat-file -p HEAD) > "$GIT_MERGE_COMMIT_SHOW" 2>&1
+PARENT_LINE_COUNT=$(grep -c "^parent " "$GIT_MERGE_COMMIT_SHOW")
+check "phase4b case4: merge commit has exactly two parent lines" test "$PARENT_LINE_COUNT" = 2
+
+GIT_LOG_MERGE="$WORKDIR/p4b_git_log_merge.txt"
+(cd "$P4B_CLEAN_REPO" && git log --oneline) > "$GIT_LOG_MERGE" 2>&1
+check "phase4b case4: git log exits 0 and reads the merge commit" test $? = 0
+check "phase4b case4: git status --porcelain is clean after the auto-merge" \
+    sh -c "test -z \"\$(cd '$P4B_CLEAN_REPO' && git status --porcelain)\""
+
+# case 5: fast-forward
+P4B_FF_REPO="$WORKDIR/p4b_ff_repo"
+mkdir -p "$P4B_FF_REPO"
+(cd "$WORKDIR" && "$SG" init p4b_ff_repo) > /dev/null 2>&1
+printf 'orig\n' > "$P4B_FF_REPO/f.txt"
+(cd "$P4B_FF_REPO" && "$SG" add f.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4B_FF_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'orig\nfeature added\n' > "$P4B_FF_REPO/f.txt"
+(cd "$P4B_FF_REPO" && "$SG" add f.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P4B_FF_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+
+FF_OUT="$WORKDIR/p4b_ff_out.txt"
+(cd "$P4B_FF_REPO" && "$SG" merge feature < /dev/null) > "$FF_OUT" 2>&1
+check "phase4b case5: fast-forward merge exits 0" test $? = 0
+check "phase4b case5: fast-forward merge prints Fast-forward" grep -q "Fast-forward" "$FF_OUT"
+
+FF_MASTER_SHA=$(cd "$P4B_FF_REPO" && git rev-parse master)
+FF_FEATURE_SHA=$(cd "$P4B_FF_REPO" && git rev-parse feature)
+check "phase4b case5: HEAD now points at feature's commit" test "$FF_MASTER_SHA" = "$FF_FEATURE_SHA"
+
+# case 6: merging an already-ancestor branch is a no-op
+UTD_OUT="$WORKDIR/p4b_utd_out.txt"
+(cd "$P4B_FF_REPO" && "$SG" merge feature < /dev/null) > "$UTD_OUT" 2>&1
+check "phase4b case6: already-up-to-date merge exits 0" test $? = 0
+check "phase4b case6: already-up-to-date merge says so" grep -q "Already up to date" "$UTD_OUT"
+
+# case 7: full conflict-resolution flow
+P4B_RESOLVE_REPO="$WORKDIR/p4b_resolve_repo"
+mkdir -p "$P4B_RESOLVE_REPO"
+(cd "$WORKDIR" && "$SG" init p4b_resolve_repo) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P4B_RESOLVE_REPO/c.txt"
+(cd "$P4B_RESOLVE_REPO" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4B_RESOLVE_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P4B_RESOLVE_REPO/c.txt"
+(cd "$P4B_RESOLVE_REPO" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P4B_RESOLVE_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P4B_RESOLVE_REPO/c.txt"
+(cd "$P4B_RESOLVE_REPO" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+
+(cd "$P4B_RESOLVE_REPO" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+check "phase4b case7: merge with conflict exits non-zero" test $? -ne 0
+
+# case 8: commit is blocked while the conflict is unresolved
+BLOCKED_COMMIT_OUT="$WORKDIR/p4b_blocked_commit_out.txt"
+BLOCKED_HEAD_BEFORE=$(cd "$P4B_RESOLVE_REPO" && git rev-parse HEAD)
+(cd "$P4B_RESOLVE_REPO" && "$SG" commit -m "premature" < /dev/null) > "$BLOCKED_COMMIT_OUT" 2>&1
+BLOCKED_COMMIT_RC=$?
+check "phase4b case8: sg commit is refused while unresolved" test "$BLOCKED_COMMIT_RC" -ne 0
+BLOCKED_HEAD_AFTER=$(cd "$P4B_RESOLVE_REPO" && git rev-parse HEAD)
+check "phase4b case8: blocked commit created no new commit" test "$BLOCKED_HEAD_BEFORE" = "$BLOCKED_HEAD_AFTER"
+
+# now actually resolve it
+printf 'resolved1\norig2\n' > "$P4B_RESOLVE_REPO/c.txt"
+(cd "$P4B_RESOLVE_REPO" && "$SG" add c.txt) > /dev/null 2>&1
+(cd "$P4B_RESOLVE_REPO" && "$SG" commit -m "resolved merge") > /dev/null 2>&1
+check "phase4b case7: sg commit completing the merge exits 0" test $? = 0
+
+RESOLVE_COMMIT_SHOW="$WORKDIR/p4b_resolve_commit_show.txt"
+(cd "$P4B_RESOLVE_REPO" && git cat-file -p HEAD) > "$RESOLVE_COMMIT_SHOW" 2>&1
+RESOLVE_PARENT_COUNT=$(grep -c "^parent " "$RESOLVE_COMMIT_SHOW")
+check "phase4b case7: resolved merge commit has two parents" test "$RESOLVE_PARENT_COUNT" = 2
+
+check "phase4b case7: git status --porcelain is clean after resolving" \
+    sh -c "test -z \"\$(cd '$P4B_RESOLVE_REPO' && git status --porcelain)\""
+RESOLVE_SG_STATUS="$WORKDIR/p4b_resolve_sg_status.txt"
+(cd "$P4B_RESOLVE_REPO" && "$SG" status) > "$RESOLVE_SG_STATUS" 2>&1
+check "phase4b case7: sg status is clean after resolving" grep -q "nothing to commit" "$RESOLVE_SG_STATUS"
+
+# case 9: sg merge --abort restores the pre-merge working tree
+P4B_ABORT_REPO="$WORKDIR/p4b_abort_repo"
+mkdir -p "$P4B_ABORT_REPO"
+(cd "$WORKDIR" && "$SG" init p4b_abort_repo) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P4B_ABORT_REPO/a.txt"
+(cd "$P4B_ABORT_REPO" && "$SG" add a.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4B_ABORT_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P4B_ABORT_REPO/a.txt"
+(cd "$P4B_ABORT_REPO" && "$SG" add a.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P4B_ABORT_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P4B_ABORT_REPO/a.txt"
+(cd "$P4B_ABORT_REPO" && "$SG" add a.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+
+(cd "$P4B_ABORT_REPO" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+(cd "$P4B_ABORT_REPO" && "$SG" merge --abort < /dev/null) > /dev/null 2>&1
+check "phase4b case9: sg merge --abort exits 0" test $? = 0
+check "phase4b case9: working tree content is back to pre-merge (master) content" \
+    sh -c "! grep -q '<<<<<<<' '$P4B_ABORT_REPO/a.txt' && grep -q 'master1' '$P4B_ABORT_REPO/a.txt'"
+check "phase4b case9: MERGE_HEAD is gone after abort" test ! -f "$P4B_ABORT_REPO/.git/MERGE_HEAD"
+check "phase4b case9: git status --porcelain is clean after abort" \
+    sh -c "test -z \"\$(cd '$P4B_ABORT_REPO' && git status --porcelain)\""
+ABORT_SG_STATUS="$WORKDIR/p4b_abort_sg_status.txt"
+(cd "$P4B_ABORT_REPO" && "$SG" status) > "$ABORT_SG_STATUS" 2>&1
+check "phase4b case9: sg status is clean after abort" grep -q "nothing to commit" "$ABORT_SG_STATUS"
+
+# case 10: a merge that overwrites the workdir also takes a safety snapshot
+ABORT_SNAPSHOT_COUNT=$(snapshot_count "$P4B_ABORT_REPO")
+check "phase4b case10: sg undo listing gained a snapshot from the merge/abort above" \
+    test "$ABORT_SNAPSHOT_COUNT" -ge 1
+
 echo ""
 echo "interop: $PASS/$TOTAL passed"
 

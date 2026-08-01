@@ -80,6 +80,11 @@ static int add_one(const char *git_dir, const char *repo_root, sg_index *idx, co
     }
     free(content);
 
+    /* If rel_path currently carries stage 1/2/3 entries (an unresolved
+       merge conflict), staging it now means the user has resolved it:
+       clear those before writing the ordinary stage-0 entry below. */
+    sg_index_remove_all_stages(idx, rel_path);
+
     if (sg_index_upsert(idx, &entry) != 0) {
         fprintf(stderr, "sg: failed to stage '%s'\n", arg);
         free(rel_path);

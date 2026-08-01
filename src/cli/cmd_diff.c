@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/diff_lcs.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/objstore.h"
@@ -10,54 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-typedef struct {
-    const char *ptr;
-    size_t len;
-} diff_line;
-
-static diff_line *split_lines(const unsigned char *data, size_t len, size_t *count_out)
-{
-    size_t cap = 16;
-    size_t count = 0;
-    diff_line *lines = malloc(cap * sizeof(*lines));
-    size_t pos = 0;
-
-    if (lines == NULL) {
-        *count_out = 0;
-        return NULL;
-    }
-
-    while (pos < len) {
-        const unsigned char *nl = memchr(data + pos, '\n', len - pos);
-        size_t linelen = nl != NULL ? (size_t)(nl - (data + pos)) : (len - pos);
-
-        if (count == cap) {
-            diff_line *grown;
-
-            cap *= 2;
-            grown = realloc(lines, cap * sizeof(*lines));
-            if (grown == NULL)
-                break;
-            lines = grown;
-        }
-        lines[count].ptr = (const char *)(data + pos);
-        lines[count].len = linelen;
-        count++;
-
-        pos += linelen;
-        if (nl != NULL)
-            pos++;
-    }
-
-    *count_out = count;
-    return lines;
-}
-
-static int lines_equal(diff_line a, diff_line b)
-{
-    return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
-}
 
 static int has_nul(const unsigned char *data, size_t len)
 {
@@ -71,43 +24,16 @@ static int print_text_diff(const char *path, const unsigned char *a_data, size_t
                            const unsigned char *b_data, size_t b_len)
 {
     size_t na, nb;
-    diff_line *a = split_lines(a_data, a_len, &na);
-    diff_line *b = split_lines(b_data, b_len, &nb);
+    sg_diff_line *a = sg_diff_split_lines(a_data, a_len, &na);
+    sg_diff_line *b = sg_diff_split_lines(b_data, b_len, &nb);
     size_t **dp;
     size_t i, j;
-    size_t allocated_rows = 0;
 
-    dp = malloc((na + 1) * sizeof(*dp));
+    dp = sg_diff_lcs_table(a, na, b, nb);
     if (dp == NULL) {
         free(a);
         free(b);
         return -1;
-    }
-    for (i = 0; i <= na; i++) {
-        dp[i] = malloc((nb + 1) * sizeof(**dp));
-        if (dp[i] == NULL) {
-            for (allocated_rows = 0; allocated_rows < i; allocated_rows++)
-                free(dp[allocated_rows]);
-            free(dp);
-            free(a);
-            free(b);
-            return -1;
-        }
-    }
-
-    for (i = na + 1; i-- > 0;) {
-        for (j = nb + 1; j-- > 0;) {
-            if (i == na || j == nb) {
-                dp[i][j] = 0;
-            } else if (lines_equal(a[i], b[j])) {
-                dp[i][j] = dp[i + 1][j + 1] + 1;
-            } else {
-                size_t v1 = dp[i + 1][j];
-                size_t v2 = dp[i][j + 1];
-
-                dp[i][j] = v1 > v2 ? v1 : v2;
-            }
-        }
     }
 
     printf("diff --git a/%s b/%s\n", path, path);
@@ -118,7 +44,7 @@ static int print_text_diff(const char *path, const unsigned char *a_data, size_t
     i = 0;
     j = 0;
     while (i < na || j < nb) {
-        if (i < na && j < nb && lines_equal(a[i], b[j])) {
+        if (i < na && j < nb && sg_diff_lines_equal(a[i], b[j])) {
             printf(" %.*s\n", (int)a[i].len, a[i].ptr);
             i++;
             j++;
@@ -131,9 +57,7 @@ static int print_text_diff(const char *path, const unsigned char *a_data, size_t
         }
     }
 
-    for (i = 0; i <= na; i++)
-        free(dp[i]);
-    free(dp);
+    sg_diff_lcs_free_table(dp, na);
     free(a);
     free(b);
     return 0;
@@ -175,6 +99,12 @@ int sg_cmd_diff(int argc, char **argv)
         size_t a_len = 0;
         unsigned char *b_content = NULL;
         size_t b_len = 0;
+
+        /* stage 1/2/3 entries (an unresolved conflict) have no single
+           "staged blob" to diff against the working tree -- skip them here;
+           `sg status`'s "Unmerged paths" section is what surfaces those. */
+        if (idx.entries[i].stage != 0)
+            continue;
 
         if (sg_object_read(git_dir, idx.entries[i].sha1, &type, &a_content, &a_len) != 0) {
             fprintf(stderr, "sg: warning: cannot read staged blob for '%s'\n", idx.entries[i].path);

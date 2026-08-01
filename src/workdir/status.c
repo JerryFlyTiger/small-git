@@ -39,6 +39,24 @@ void sg_status_list_free(sg_status_list *list)
     list->cap = 0;
 }
 
+/* True if idx has any stage 1/2/3 entry at path -- i.e. path is an
+   unresolved conflict, already surfaced by `sg status`'s "Unmerged paths"
+   section rather than here. */
+static int path_has_unmerged_stage(const sg_index *idx, const char *path)
+{
+    return sg_index_find_stage(idx, path, 1) >= 0 || sg_index_find_stage(idx, path, 2) >= 0 ||
+        sg_index_find_stage(idx, path, 3) >= 0;
+}
+
+/* Both loops below only ever look at stage-0 entries: a path with an
+   unresolved conflict has no stage-0 entry (only 1/2/3), so it is simply
+   absent from the staged/unstaged comparison here -- `sg status`'s
+   "Unmerged paths" section is what reports those separately, and treating
+   stage 1/2/3 rows as ordinary entries here would both misreport them and
+   break this loop's assumption of at most one idx entry per path. A HEAD
+   path with an unresolved conflict (no stage-0 counterpart) must likewise
+   not be reported as "deleted" here -- path_has_unmerged_stage catches that,
+   since otherwise it would look exactly like index really did drop it. */
 int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg_status_list *out)
 {
     size_t hi = 0;
@@ -48,6 +66,11 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
 
     while (hi < head_flat->count || ii < idx->count) {
         int cmp;
+
+        if (ii < idx->count && idx->entries[ii].stage != 0) {
+            ii++;
+            continue;
+        }
 
         if (hi >= head_flat->count)
             cmp = 1;
@@ -65,8 +88,10 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
             hi++;
             ii++;
         } else if (cmp < 0) {
-            if (status_list_add(out, head_flat->entries[hi].path, SG_STATUS_DELETED) != 0)
-                return -1;
+            if (!path_has_unmerged_stage(idx, head_flat->entries[hi].path)) {
+                if (status_list_add(out, head_flat->entries[hi].path, SG_STATUS_DELETED) != 0)
+                    return -1;
+            }
             hi++;
         } else {
             if (status_list_add(out, idx->entries[ii].path, SG_STATUS_NEW) != 0)
@@ -87,6 +112,9 @@ int sg_status_diff_unstaged(const char *repo_root, const sg_index *idx, sg_statu
         char abspath[4096];
         unsigned char wd_sha1[SG_SHA1_RAW_LEN];
         struct stat st;
+
+        if (idx->entries[i].stage != 0)
+            continue;
 
         snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx->entries[i].path);
         if (stat(abspath, &st) != 0) {

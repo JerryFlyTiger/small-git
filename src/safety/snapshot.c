@@ -92,6 +92,7 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
                        const char *label, unsigned char commit_id_out[SG_SHA1_RAW_LEN])
 {
     sg_flat_entry *entries = NULL;
+    size_t entry_count = 0;
     unsigned char tree_id[SG_SHA1_RAW_LEN];
     unsigned char parent_id[SG_SHA1_RAW_LEN];
     int has_parent;
@@ -123,6 +124,18 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
         size_t content_len = 0;
         unsigned char blob_id[SG_SHA1_RAW_LEN];
 
+        /* idx may hold several stage 1/2/3 entries for the same path while a
+           conflict is unresolved (there is no separate stage-0 entry then).
+           Entries are sorted by (path, stage), so duplicates are contiguous
+           and the first one seen is stage 0 if one exists, otherwise the
+           lowest of whatever conflict stages are present -- either way,
+           exactly one representative per path is snapshotted, using
+           whatever content currently sits in the working tree (e.g. the
+           conflict-marked content), never producing a tree with two entries
+           sharing a name. */
+        if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
+            continue;
+
         snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx->entries[i].path);
         if (sg_read_file(abspath, &content, &content_len) == 0) {
             int write_ok = sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, blob_id) == 0;
@@ -136,12 +149,13 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
             memcpy(blob_id, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
         }
 
-        entries[i].path = idx->entries[i].path; /* transient view, not owned */
-        entries[i].mode = idx->entries[i].mode;
-        memcpy(entries[i].sha1, blob_id, SG_SHA1_RAW_LEN);
+        entries[entry_count].path = idx->entries[i].path; /* transient view, not owned */
+        entries[entry_count].mode = idx->entries[i].mode;
+        memcpy(entries[entry_count].sha1, blob_id, SG_SHA1_RAW_LEN);
+        entry_count++;
     }
 
-    if (sg_tree_build(git_dir, entries, idx->count, tree_id) != 0)
+    if (sg_tree_build(git_dir, entries, entry_count, tree_id) != 0)
         goto out_free_entries;
 
     has_parent = (sg_ref_resolve_head(git_dir, parent_id) == 0);

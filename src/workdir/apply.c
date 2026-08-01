@@ -2,6 +2,7 @@
 
 #include "sg/confirm.h"
 #include "sg/index.h"
+#include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
@@ -55,8 +56,12 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
     }
 
     /* remove working-tree files that are currently tracked but absent from
-       the target tree */
+       the target tree. old_idx may hold multiple stage 1/2/3 entries for the
+       same path (an unresolved conflict this apply is about to blow away) --
+       skip the duplicates so each path is only checked/removed once. */
     for (i = 0; i < old_idx.count; i++) {
+        if (i > 0 && strcmp(old_idx.entries[i].path, old_idx.entries[i - 1].path) == 0)
+            continue;
         if (flat_find(&target_flat, old_idx.entries[i].path) < 0) {
             char abspath[4096];
 
@@ -209,8 +214,11 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
     unstaged_ok = sg_status_diff_unstaged(repo_root, &idx, &unstaged) == 0;
 
     /* A failed diff (e.g. out of memory) must NOT be read as "clean" -- that
-       would silently defeat the whole point of this safety gate. */
-    dirty = !staged_ok || !unstaged_ok || staged.count > 0 || unstaged.count > 0;
+       would silently defeat the whole point of this safety gate. An
+       in-progress, unresolved merge is also "dirty": overwriting it here
+       would silently discard the conflict resolution work in progress. */
+    dirty = !staged_ok || !unstaged_ok || staged.count > 0 || unstaged.count > 0 ||
+        sg_index_has_unmerged(&idx);
 
     if (dirty) {
         strbuf msg = {0};
@@ -227,6 +235,8 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
             strbuf_append_path(&msg, "staged: ", staged.entries[i].path);
         if (!staged_ok || !unstaged_ok)
             strbuf_append(&msg, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足），為安全起見要求確認\n");
+        if (sg_index_has_unmerged(&idx))
+            strbuf_append(&msg, "sg: 目前有一個尚未完成的合併，繼續會放棄它\n");
 
         confirmed = sg_confirm_dangerous(msg.buf != NULL ? msg.buf : "", force);
         free(msg.buf);
@@ -253,5 +263,19 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
     sg_status_list_free(&unstaged);
     sg_index_free(&idx);
 
-    return sg_apply_tree_to_workdir(git_dir, repo_root, tree_id) == 0 ? 0 : -1;
+    {
+        unsigned char merge_head[SG_SHA1_RAW_LEN];
+        int merge_in_progress = sg_merge_head_read(git_dir, merge_head) == 0;
+
+        if (sg_apply_tree_to_workdir(git_dir, repo_root, tree_id) != 0)
+            return -1;
+
+        /* The apply above rebuilt the index from tree_id, wiping any conflict
+           stages -- whatever merge was in flight is over. Leaving MERGE_HEAD
+           behind would make the next unrelated `sg commit` silently record a
+           two-parent merge commit against a branch it never merged. */
+        if (merge_in_progress && sg_merge_head_remove(git_dir) != 0)
+            fprintf(stderr, "sg: warning: 未能清除 MERGE_HEAD\n");
+        return 0;
+    }
 }

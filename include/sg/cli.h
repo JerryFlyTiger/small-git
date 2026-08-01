@@ -15,6 +15,8 @@ int sg_cmd_switch(int argc, char **argv);
 int sg_cmd_restore(int argc, char **argv);
 int sg_cmd_undo(int argc, char **argv);
 int sg_cmd_repack(int argc, char **argv);
+int sg_cmd_merge(int argc, char **argv);
+int sg_cmd_merge_base(int argc, char **argv);
 
 int sg_cli_run(int argc, char **argv);
 

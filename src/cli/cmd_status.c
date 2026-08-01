@@ -2,6 +2,7 @@
 
 #include "sg/hash.h"
 #include "sg/index.h"
+#include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
@@ -52,6 +53,55 @@ static int str_cmp(const void *a, const void *b)
     return strcmp(sa, sb);
 }
 
+/* A path with an unresolved conflict has no stage-0 entry (only 1/2/3), so
+   plain sg_index_find would wrongly call it untracked. */
+static int path_tracked_any_stage(const sg_index *idx, const char *path)
+{
+    unsigned int stage;
+
+    for (stage = 0; stage <= 3; stage++) {
+        if (sg_index_find_stage(idx, path, stage) >= 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Prints every distinct path carrying a stage 1/2/3 entry (idx is sorted by
+   (path, stage), so duplicates for a path are contiguous). Returns the
+   number of distinct unmerged paths found. */
+static size_t print_unmerged(const sg_index *idx)
+{
+    size_t i;
+    size_t count = 0;
+    static const char *hints[] = {
+        "use \"sg add <file>...\" to mark resolution",
+        "use \"sg merge --abort\" to abort the merge",
+    };
+
+    for (i = 0; i < idx->count; i++) {
+        if (idx->entries[i].stage == 0)
+            continue;
+        if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
+            continue;
+        count++;
+    }
+    if (count == 0)
+        return 0;
+
+    printf("Unmerged paths:\n");
+    printf("  (%s)\n", hints[0]);
+    printf("  (%s)\n", hints[1]);
+    for (i = 0; i < idx->count; i++) {
+        if (idx->entries[i].stage == 0)
+            continue;
+        if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
+            continue;
+        printf("\tboth modified:   %s\n", idx->entries[i].path);
+    }
+    printf("\n");
+    return count;
+}
+
 static void collect_untracked(const char *repo_root, const char *reldir, const sg_index *idx,
                               char ***out, size_t *count, size_t *cap)
 {
@@ -90,7 +140,7 @@ static void collect_untracked(const char *repo_root, const char *reldir, const s
         if (S_ISDIR(st.st_mode)) {
             collect_untracked(repo_root, relpath, idx, out, count, cap);
         } else if (S_ISREG(st.st_mode)) {
-            if (sg_index_find(idx, relpath) < 0) {
+            if (!path_tracked_any_stage(idx, relpath)) {
                 if (*count == *cap) {
                     size_t new_cap = *cap == 0 ? 16 : *cap * 2;
                     char **grown = realloc(*out, new_cap * sizeof(*grown));
@@ -121,6 +171,8 @@ int sg_cmd_status(int argc, char **argv)
     char **untracked = NULL;
     size_t untracked_count = 0;
     size_t untracked_cap = 0;
+    size_t unmerged_count;
+    unsigned char merge_head_id[SG_SHA1_RAW_LEN];
     size_t i;
     static const char *staged_hints[] = {
         "use \"sg restore --staged <file>...\" to unstage",
@@ -156,6 +208,13 @@ int sg_cmd_status(int argc, char **argv)
     printf("On branch %s\n", branch != NULL ? branch : "?");
     free(branch);
 
+    if (sg_merge_head_read(git_dir, merge_head_id) == 0) {
+        if (sg_index_has_unmerged(&idx))
+            printf("You have unmerged paths.\n");
+        else
+            printf("All conflicts fixed but you are still merging.\n");
+    }
+
     has_head = (sg_ref_resolve_head(git_dir, head_commit_id) == 0);
     memset(&head_flat, 0, sizeof(head_flat));
     if (has_head) {
@@ -187,6 +246,8 @@ int sg_cmd_status(int argc, char **argv)
     if (untracked_count > 0)
         qsort(untracked, untracked_count, sizeof(*untracked), str_cmp);
 
+    unmerged_count = print_unmerged(&idx);
+
     print_section("Changes to be committed:", staged_hints, 1, &staged);
     print_section("Changes not staged for commit:", unstaged_hints, 2, &unstaged);
 
@@ -198,7 +259,7 @@ int sg_cmd_status(int argc, char **argv)
         printf("\n");
     }
 
-    if (staged.count == 0 && unstaged.count == 0 && untracked_count == 0)
+    if (staged.count == 0 && unstaged.count == 0 && untracked_count == 0 && unmerged_count == 0)
         printf("nothing to commit, working tree clean\n");
 
     for (i = 0; i < untracked_count; i++)
