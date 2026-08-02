@@ -686,6 +686,305 @@ ABORT_SNAPSHOT_COUNT=$(snapshot_count "$P4B_ABORT_REPO")
 check "phase4b case10: sg undo listing gained a snapshot from the merge/abort above" \
     test "$ABORT_SNAPSHOT_COUNT" -ge 1
 
+# --- Phase 4c: sg rebase (non-interactive) ---
+
+# case 1: basic rebase -- linear history, original authors preserved, a
+# fresh committer identity is used for the replayed commits
+P4C_REPO="$WORKDIR/p4c_basic_repo"
+mkdir -p "$P4C_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_basic_repo) > /dev/null 2>&1
+printf 'A\n' > "$P4C_REPO/f.txt"
+(cd "$P4C_REPO" && "$SG" add f.txt && "$SG" commit -m "A") > /dev/null 2>&1
+(cd "$P4C_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'A\nB\n' > "$P4C_REPO/f.txt"
+(cd "$P4C_REPO" && "$SG" add f.txt) > /dev/null 2>&1
+(cd "$P4C_REPO" && GIT_AUTHOR_NAME="Feature Dev" GIT_AUTHOR_EMAIL="feature@dev.example" "$SG" commit -m "B") > /dev/null 2>&1
+printf 'A\nB\nC\n' > "$P4C_REPO/f.txt"
+(cd "$P4C_REPO" && "$SG" add f.txt) > /dev/null 2>&1
+(cd "$P4C_REPO" && GIT_AUTHOR_NAME="Feature Dev" GIT_AUTHOR_EMAIL="feature@dev.example" "$SG" commit -m "C") > /dev/null 2>&1
+(cd "$P4C_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'D\n' > "$P4C_REPO/d.txt"
+(cd "$P4C_REPO" && "$SG" add d.txt && "$SG" commit -m "D") > /dev/null 2>&1
+(cd "$P4C_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+
+P4C_REBASE_OUT="$WORKDIR/p4c_basic_rebase_out.txt"
+(cd "$P4C_REPO" && "$SG" rebase master < /dev/null) > "$P4C_REBASE_OUT" 2>&1
+check "phase4c case1: sg rebase exits 0" test $? = 0
+
+P4C_SUBJECTS="$WORKDIR/p4c_basic_subjects.txt"
+(cd "$P4C_REPO" && git log --format=%s) > "$P4C_SUBJECTS" 2>&1
+check "phase4c case1: history is linear -- C,B,D,A (newest first)" \
+    sh -c "test \"\$(tr '\n' ',' < '$P4C_SUBJECTS')\" = 'C,B,D,A,'"
+
+P4C_AUTHORS="$WORKDIR/p4c_basic_authors.txt"
+(cd "$P4C_REPO" && git log --format='%s|%an') > "$P4C_AUTHORS" 2>&1
+check "phase4c case1: replayed commit B keeps its original author" grep -q "^B|Feature Dev\$" "$P4C_AUTHORS"
+check "phase4c case1: replayed commit C keeps its original author" grep -q "^C|Feature Dev\$" "$P4C_AUTHORS"
+
+P4C_COMMITTERS="$WORKDIR/p4c_basic_committers.txt"
+(cd "$P4C_REPO" && git log --format='%s|%cn') > "$P4C_COMMITTERS" 2>&1
+check "phase4c case1: replayed commit B gets a fresh committer identity" grep -q "^B|Interop Test\$" "$P4C_COMMITTERS"
+check "phase4c case1: replayed commit C gets a fresh committer identity" grep -q "^C|Interop Test\$" "$P4C_COMMITTERS"
+
+check "phase4c case1: file content is correct after rebase" \
+    sh -c "printf 'A\nB\nC\n' | cmp -s - '$P4C_REPO/f.txt'"
+check "phase4c case1: master's own file survived the rebase" test -f "$P4C_REPO/d.txt"
+
+P4C_FSCK="$WORKDIR/p4c_basic_fsck.txt"
+(cd "$P4C_REPO" && git fsck --full) > "$P4C_FSCK" 2>&1
+check "phase4c case1: git fsck is clean" test -z "$(cat "$P4C_FSCK")"
+check "phase4c case1: git status --porcelain is clean" \
+    sh -c "test -z \"\$(cd '$P4C_REPO' && git status --porcelain)\""
+
+# case 2: cross-check final working-tree content against a real `git rebase`
+# run on an identical, independently-built history (commit shas will differ
+# since committer timestamps differ -- only compare resulting file bytes)
+P4C_SG_CMP_REPO="$WORKDIR/p4c_cmp_sg_repo"
+P4C_GIT_CMP_REPO="$WORKDIR/p4c_cmp_git_repo"
+mkdir -p "$P4C_SG_CMP_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_cmp_sg_repo) > /dev/null 2>&1
+(cd "$WORKDIR" && git init -q p4c_cmp_git_repo)
+(cd "$P4C_GIT_CMP_REPO" && git config user.email "a@b.c" && git config user.name "git user")
+
+# sg side
+printf 'base\n' > "$P4C_SG_CMP_REPO/x.txt"
+(cd "$P4C_SG_CMP_REPO" && "$SG" add x.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4C_SG_CMP_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'base\nfeat1\n' > "$P4C_SG_CMP_REPO/x.txt"
+(cd "$P4C_SG_CMP_REPO" && "$SG" add x.txt && "$SG" commit -m "feat1") > /dev/null 2>&1
+printf 'base\nfeat1\nfeat2\n' > "$P4C_SG_CMP_REPO/x.txt"
+(cd "$P4C_SG_CMP_REPO" && "$SG" add x.txt && "$SG" commit -m "feat2") > /dev/null 2>&1
+(cd "$P4C_SG_CMP_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'mstr1\n' > "$P4C_SG_CMP_REPO/y.txt"
+(cd "$P4C_SG_CMP_REPO" && "$SG" add y.txt && "$SG" commit -m "mstr1") > /dev/null 2>&1
+(cd "$P4C_SG_CMP_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+(cd "$P4C_SG_CMP_REPO" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+
+# real-git side, same operations
+printf 'base\n' > "$P4C_GIT_CMP_REPO/x.txt"
+(cd "$P4C_GIT_CMP_REPO" && git add x.txt && git commit -q -m "base")
+(cd "$P4C_GIT_CMP_REPO" && git switch -q -c feature)
+printf 'base\nfeat1\n' > "$P4C_GIT_CMP_REPO/x.txt"
+(cd "$P4C_GIT_CMP_REPO" && git add x.txt && git commit -q -m "feat1")
+printf 'base\nfeat1\nfeat2\n' > "$P4C_GIT_CMP_REPO/x.txt"
+(cd "$P4C_GIT_CMP_REPO" && git add x.txt && git commit -q -m "feat2")
+(cd "$P4C_GIT_CMP_REPO" && git switch -q master)
+printf 'mstr1\n' > "$P4C_GIT_CMP_REPO/y.txt"
+(cd "$P4C_GIT_CMP_REPO" && git add y.txt && git commit -q -m "mstr1")
+(cd "$P4C_GIT_CMP_REPO" && git switch -q feature)
+(cd "$P4C_GIT_CMP_REPO" && git rebase master) > /dev/null 2>&1
+
+check "phase4c case2: sg rebase and real git rebase agree on final x.txt content" \
+    cmp -s "$P4C_SG_CMP_REPO/x.txt" "$P4C_GIT_CMP_REPO/x.txt"
+check "phase4c case2: sg rebase and real git rebase agree on final y.txt content" \
+    cmp -s "$P4C_SG_CMP_REPO/y.txt" "$P4C_GIT_CMP_REPO/y.txt"
+
+# case 3: conflict -> resolve -> --continue
+P4C_CONFLICT_REPO="$WORKDIR/p4c_conflict_repo"
+mkdir -p "$P4C_CONFLICT_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_conflict_repo) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P4C_CONFLICT_REPO/c.txt"
+(cd "$P4C_CONFLICT_REPO" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4C_CONFLICT_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P4C_CONFLICT_REPO/c.txt"
+(cd "$P4C_CONFLICT_REPO" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P4C_CONFLICT_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P4C_CONFLICT_REPO/c.txt"
+(cd "$P4C_CONFLICT_REPO" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P4C_CONFLICT_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+
+(cd "$P4C_CONFLICT_REPO" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+P4C_CONFLICT_RC=$?
+check "phase4c case3: sg rebase with a real conflict exits non-zero" test "$P4C_CONFLICT_RC" -ne 0
+
+P4C_CONFLICT_PORCELAIN="$WORKDIR/p4c_conflict_porcelain.txt"
+(cd "$P4C_CONFLICT_REPO" && git status --porcelain) > "$P4C_CONFLICT_PORCELAIN" 2>&1
+check "phase4c case3: real git sees the sg-made rebase conflict as UU" grep -q "^UU c.txt" "$P4C_CONFLICT_PORCELAIN"
+
+printf 'resolved1\norig2\n' > "$P4C_CONFLICT_REPO/c.txt"
+(cd "$P4C_CONFLICT_REPO" && "$SG" add c.txt) > /dev/null 2>&1
+(cd "$P4C_CONFLICT_REPO" && "$SG" rebase --continue < /dev/null) > /dev/null 2>&1
+check "phase4c case3: sg rebase --continue exits 0" test $? = 0
+
+P4C_CONTINUE_SUBJECTS="$WORKDIR/p4c_continue_subjects.txt"
+(cd "$P4C_CONFLICT_REPO" && git log --format=%s) > "$P4C_CONTINUE_SUBJECTS" 2>&1
+check "phase4c case3: history after --continue is linear -- feature change,master change,base" \
+    sh -c "test \"\$(tr '\n' ',' < '$P4C_CONTINUE_SUBJECTS')\" = 'feature change,master change,base,'"
+check "phase4c case3: resolved content is in the working tree" grep -q "resolved1" "$P4C_CONFLICT_REPO/c.txt"
+check "phase4c case3: git status --porcelain is clean after --continue" \
+    sh -c "test -z \"\$(cd '$P4C_CONFLICT_REPO' && git status --porcelain)\""
+check "phase4c case3: .git/sg-rebase is gone after --continue" test ! -d "$P4C_CONFLICT_REPO/.git/sg-rebase"
+
+# case 4: --abort restores the pre-rebase state exactly
+P4C_ABORT_REPO="$WORKDIR/p4c_abort_repo"
+mkdir -p "$P4C_ABORT_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_abort_repo) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P4C_ABORT_REPO/c.txt"
+(cd "$P4C_ABORT_REPO" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4C_ABORT_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P4C_ABORT_REPO/c.txt"
+(cd "$P4C_ABORT_REPO" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P4C_ABORT_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P4C_ABORT_REPO/c.txt"
+(cd "$P4C_ABORT_REPO" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P4C_ABORT_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+
+P4C_ABORT_HEAD_BEFORE=$(cd "$P4C_ABORT_REPO" && git rev-parse HEAD)
+(cd "$P4C_ABORT_REPO" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+(cd "$P4C_ABORT_REPO" && "$SG" rebase --abort < /dev/null) > /dev/null 2>&1
+check "phase4c case4: sg rebase --abort exits 0" test $? = 0
+P4C_ABORT_HEAD_AFTER=$(cd "$P4C_ABORT_REPO" && git rev-parse HEAD)
+check "phase4c case4: HEAD sha is back to exactly its pre-rebase value" \
+    test "$P4C_ABORT_HEAD_BEFORE" = "$P4C_ABORT_HEAD_AFTER"
+check "phase4c case4: working tree content is back to pre-rebase (feature) content" \
+    sh -c "! grep -q '<<<<<<<' '$P4C_ABORT_REPO/c.txt' && grep -q 'feature1' '$P4C_ABORT_REPO/c.txt'"
+check "phase4c case4: .git/sg-rebase is gone after --abort" test ! -d "$P4C_ABORT_REPO/.git/sg-rebase"
+check "phase4c case4: git status --porcelain is clean after --abort" \
+    sh -c "test -z \"\$(cd '$P4C_ABORT_REPO' && git status --porcelain)\""
+
+# case 5: --skip drops the conflicting commit but keeps the rest
+P4C_SKIP_REPO="$WORKDIR/p4c_skip_repo"
+mkdir -p "$P4C_SKIP_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_skip_repo) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P4C_SKIP_REPO/c.txt"
+(cd "$P4C_SKIP_REPO" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4C_SKIP_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P4C_SKIP_REPO/c.txt"
+(cd "$P4C_SKIP_REPO" && "$SG" add c.txt && "$SG" commit -m "will conflict") > /dev/null 2>&1
+printf 'other content\n' > "$P4C_SKIP_REPO/other.txt"
+(cd "$P4C_SKIP_REPO" && "$SG" add other.txt && "$SG" commit -m "unrelated change") > /dev/null 2>&1
+(cd "$P4C_SKIP_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P4C_SKIP_REPO/c.txt"
+(cd "$P4C_SKIP_REPO" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P4C_SKIP_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+
+(cd "$P4C_SKIP_REPO" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+(cd "$P4C_SKIP_REPO" && "$SG" rebase --skip < /dev/null) > /dev/null 2>&1
+check "phase4c case5: sg rebase --skip exits 0" test $? = 0
+
+P4C_SKIP_SUBJECTS="$WORKDIR/p4c_skip_subjects.txt"
+(cd "$P4C_SKIP_REPO" && git log --format=%s) > "$P4C_SKIP_SUBJECTS" 2>&1
+check "phase4c case5: skipped commit 'will conflict' is gone from history" \
+    sh -c "! grep -q 'will conflict' '$P4C_SKIP_SUBJECTS'"
+check "phase4c case5: unrelated commit still made it onto the rebased branch" \
+    grep -q "unrelated change" "$P4C_SKIP_SUBJECTS"
+check "phase4c case5: master's own content is what survives (skip discarded the conflicting change)" \
+    grep -q "master1" "$P4C_SKIP_REPO/c.txt"
+check "phase4c case5: git status --porcelain is clean after --skip completes the rebase" \
+    sh -c "test -z \"\$(cd '$P4C_SKIP_REPO' && git status --porcelain)\""
+
+# case 6: a commit whose change is already present upstream is skipped, no
+# empty commit is created
+P4C_EMPTY_REPO="$WORKDIR/p4c_empty_repo"
+mkdir -p "$P4C_EMPTY_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_empty_repo) > /dev/null 2>&1
+printf 'base\n' > "$P4C_EMPTY_REPO/e.txt"
+(cd "$P4C_EMPTY_REPO" && "$SG" add e.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4C_EMPTY_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'base\ndup-change\n' > "$P4C_EMPTY_REPO/e.txt"
+(cd "$P4C_EMPTY_REPO" && "$SG" add e.txt && "$SG" commit -m "duplicated-elsewhere") > /dev/null 2>&1
+printf 'base\ndup-change\nunique-change\n' > "$P4C_EMPTY_REPO/e.txt"
+(cd "$P4C_EMPTY_REPO" && "$SG" add e.txt && "$SG" commit -m "unique") > /dev/null 2>&1
+(cd "$P4C_EMPTY_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+# master independently picks up the exact same change as "duplicated-elsewhere"
+printf 'base\ndup-change\n' > "$P4C_EMPTY_REPO/e.txt"
+(cd "$P4C_EMPTY_REPO" && "$SG" add e.txt && "$SG" commit -m "master already has this change") > /dev/null 2>&1
+(cd "$P4C_EMPTY_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+
+P4C_EMPTY_OUT="$WORKDIR/p4c_empty_out.txt"
+(cd "$P4C_EMPTY_REPO" && "$SG" rebase master < /dev/null) > "$P4C_EMPTY_OUT" 2>&1
+check "phase4c case6: rebase with an already-upstream change exits 0" test $? = 0
+check "phase4c case6: sg reports the duplicate commit as skipped" grep -q "已跳過" "$P4C_EMPTY_OUT"
+
+P4C_EMPTY_SUBJECTS="$WORKDIR/p4c_empty_subjects.txt"
+(cd "$P4C_EMPTY_REPO" && git log --format=%s) > "$P4C_EMPTY_SUBJECTS" 2>&1
+check "phase4c case6: the duplicated commit does not appear twice in history" \
+    test "$(grep -c "duplicated-elsewhere" "$P4C_EMPTY_SUBJECTS")" = 0
+check "phase4c case6: the unique commit still made it onto the rebased branch" \
+    grep -q "^unique\$" "$P4C_EMPTY_SUBJECTS"
+check "phase4c case6: git status --porcelain is clean" \
+    sh -c "test -z \"\$(cd '$P4C_EMPTY_REPO' && git status --porcelain)\""
+
+# case 7: rebasing onto an already-contained upstream is a no-op
+P4C_UTD_REPO="$WORKDIR/p4c_utd_repo"
+mkdir -p "$P4C_UTD_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_utd_repo) > /dev/null 2>&1
+printf 'orig\n' > "$P4C_UTD_REPO/f.txt"
+(cd "$P4C_UTD_REPO" && "$SG" add f.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4C_UTD_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'orig\nfeature added\n' > "$P4C_UTD_REPO/f.txt"
+(cd "$P4C_UTD_REPO" && "$SG" add f.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+
+P4C_UTD_OUT="$WORKDIR/p4c_utd_out.txt"
+(cd "$P4C_UTD_REPO" && "$SG" rebase master < /dev/null) > "$P4C_UTD_OUT" 2>&1
+check "phase4c case7: rebasing onto an ancestor exits 0" test $? = 0
+check "phase4c case7: rebasing onto an ancestor says up to date" grep -q "is up to date" "$P4C_UTD_OUT"
+
+# case 7b: the reverse direction is a pure fast-forward
+P4C_FF_OUT="$WORKDIR/p4c_ff_out.txt"
+(cd "$P4C_UTD_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+(cd "$P4C_UTD_REPO" && "$SG" rebase feature < /dev/null) > "$P4C_FF_OUT" 2>&1
+check "phase4c case7b: rebasing an ancestor branch forward exits 0" test $? = 0
+check "phase4c case7b: rebasing an ancestor branch forward fast-forwards" grep -q "Fast-forwarded" "$P4C_FF_OUT"
+
+# case 8: a merge commit in the range is rejected outright, no changes made
+P4C_MERGE_REPO="$WORKDIR/p4c_mergecommit_repo"
+mkdir -p "$P4C_MERGE_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_mergecommit_repo) > /dev/null 2>&1
+printf 'base\n' > "$P4C_MERGE_REPO/f.txt"
+(cd "$P4C_MERGE_REPO" && "$SG" add f.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4C_MERGE_REPO" && "$SG" switch -c topic) > /dev/null 2>&1
+printf 't1\n' > "$P4C_MERGE_REPO/t.txt"
+(cd "$P4C_MERGE_REPO" && "$SG" add t.txt && "$SG" commit -m "T1") > /dev/null 2>&1
+(cd "$P4C_MERGE_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'm1\n' > "$P4C_MERGE_REPO/m.txt"
+(cd "$P4C_MERGE_REPO" && "$SG" add m.txt && "$SG" commit -m "M1") > /dev/null 2>&1
+(cd "$P4C_MERGE_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'f1\n' > "$P4C_MERGE_REPO/f2.txt"
+(cd "$P4C_MERGE_REPO" && "$SG" add f2.txt && "$SG" commit -m "F1") > /dev/null 2>&1
+(cd "$P4C_MERGE_REPO" && "$SG" merge topic < /dev/null) > /dev/null 2>&1
+(cd "$P4C_MERGE_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'm2\n' > "$P4C_MERGE_REPO/m2.txt"
+(cd "$P4C_MERGE_REPO" && "$SG" add m2.txt && "$SG" commit -m "M2") > /dev/null 2>&1
+(cd "$P4C_MERGE_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+
+P4C_MERGE_HEAD_BEFORE=$(cd "$P4C_MERGE_REPO" && git rev-parse HEAD)
+(cd "$P4C_MERGE_REPO" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+P4C_MERGE_RC=$?
+check "phase4c case8: rebase with a merge commit in range is rejected" test "$P4C_MERGE_RC" -ne 0
+P4C_MERGE_HEAD_AFTER=$(cd "$P4C_MERGE_REPO" && git rev-parse HEAD)
+check "phase4c case8: HEAD is unchanged after the rejection" test "$P4C_MERGE_HEAD_BEFORE" = "$P4C_MERGE_HEAD_AFTER"
+check "phase4c case8: no rebase state was left behind" test ! -d "$P4C_MERGE_REPO/.git/sg-rebase"
+
+# case 9: a completed rebase takes an automatic safety snapshot
+P4C_SNAPSHOT_COUNT=$(snapshot_count "$P4C_REPO")
+check "phase4c case9: sg undo listing gained a snapshot from the rebase in case 1" \
+    test "$P4C_SNAPSHOT_COUNT" -ge 1
+
+# case 10: rebase is refused outright when the working directory is dirty
+P4C_DIRTY_REPO="$WORKDIR/p4c_dirty_repo"
+mkdir -p "$P4C_DIRTY_REPO"
+(cd "$WORKDIR" && "$SG" init p4c_dirty_repo) > /dev/null 2>&1
+printf 'orig\n' > "$P4C_DIRTY_REPO/f.txt"
+(cd "$P4C_DIRTY_REPO" && "$SG" add f.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P4C_DIRTY_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'orig\nfeat\n' > "$P4C_DIRTY_REPO/f.txt"
+(cd "$P4C_DIRTY_REPO" && "$SG" add f.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P4C_DIRTY_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'orig\nmaster\n' > "$P4C_DIRTY_REPO/f.txt"
+(cd "$P4C_DIRTY_REPO" && "$SG" add f.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P4C_DIRTY_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+printf 'uncommitted change\n' >> "$P4C_DIRTY_REPO/f.txt"
+
+P4C_DIRTY_HEAD_BEFORE=$(cd "$P4C_DIRTY_REPO" && git rev-parse HEAD)
+(cd "$P4C_DIRTY_REPO" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+P4C_DIRTY_RC=$?
+check "phase4c case10: rebase with a dirty working directory is refused" test "$P4C_DIRTY_RC" -ne 0
+P4C_DIRTY_HEAD_AFTER=$(cd "$P4C_DIRTY_REPO" && git rev-parse HEAD)
+check "phase4c case10: HEAD is unchanged after the dirty-workdir rejection" \
+    test "$P4C_DIRTY_HEAD_BEFORE" = "$P4C_DIRTY_HEAD_AFTER"
+check "phase4c case10: no rebase state was left behind" test ! -d "$P4C_DIRTY_REPO/.git/sg-rebase"
+
 # --- Phase 5b: smart HTTP clone/fetch against a local `git http-backend` CGI
 # server. This is the important end-to-end case -- everything else in this
 # phase (pkt-line codec, ref advertisement parsing, sideband demux, idx

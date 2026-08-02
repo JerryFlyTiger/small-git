@@ -25,6 +25,7 @@ static const sg_command_info COMMANDS[] = {
     {"repack", "將 loose object 打包成 packfile"},
     {"merge", "合併另一個分支"},
     {"merge-base", "找出兩個 commit 的最近共同祖先"},
+    {"rebase", "將目前分支重新套用到另一個分支之上"},
     {"clone", "從遠端複製一個 repository"},
     {"fetch", "從遠端取得新的 commit 與 ref"},
     {"push", "將本地分支推送到遠端"},
@@ -76,6 +77,8 @@ int sg_cli_run(int argc, char **argv)
         return sg_cmd_merge_base(argc - 1, argv + 1);
     if (strcmp(argv[1], "merge") == 0)
         return sg_cmd_merge(argc - 1, argv + 1);
+    if (strcmp(argv[1], "rebase") == 0)
+        return sg_cmd_rebase(argc - 1, argv + 1);
     if (strcmp(argv[1], "clone") == 0)
         return sg_cmd_clone(argc - 1, argv + 1);
     if (strcmp(argv[1], "fetch") == 0)

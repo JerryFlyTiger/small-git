@@ -30,4 +30,14 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
                        const unsigned char tree_id[SG_SHA1_RAW_LEN],
                        const char *label, int force);
 
+/* Requires a perfectly clean working directory (no staged or unstaged
+   changes) as a precondition for operations that would silently drop
+   uncommitted state if allowed to proceed (merge, rebase) -- unlike
+   sg_safe_apply_tree, there is no confirm-and-snapshot-then-overwrite path
+   here, the operation is refused outright. `what` names the operation in the
+   error message (e.g. "sg merge"). A failed staged/unstaged diff is treated
+   as dirty, same fail-safe convention as the rest of the safety gates.
+   Returns 0 if clean, 1 otherwise (message already printed to stderr). */
+int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const char *what);
+
 #endif

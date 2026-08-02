@@ -5,6 +5,7 @@
 #include "sg/loose.h"
 #include "sg/merge.h"
 #include "sg/object.h"
+#include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/tree_build.h"
@@ -81,6 +82,20 @@ int sg_cmd_commit(int argc, char **argv)
     git_dir = sg_require_git_dir();
     if (git_dir == NULL)
         return 1;
+
+    /* A rebase advances the current branch ref commit-by-commit as it
+       replays; an ordinary `sg commit` here would create a normal commit on
+       top of whatever partial progress exists, leaving the sequencer's
+       todo/current state pointing at a sequence that no longer makes sense.
+       Route the user through the rebase's own continuation instead. */
+    if (sg_rebase_state_exists(git_dir)) {
+        fprintf(stderr,
+               "sg: 目前有一個進行中的 rebase，無法直接 commit\n"
+               "請解決衝突並 `sg add <file>...` 後執行 `sg rebase --continue`，"
+               "或執行 `sg rebase --abort` 放棄\n");
+        free(git_dir);
+        return 1;
+    }
 
     if (sg_index_read(git_dir, &idx) != 0) {
         fprintf(stderr, "sg: failed to read index (corrupt?)\n");

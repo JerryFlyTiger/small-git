@@ -5,6 +5,7 @@
 #include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/snapshot.h"
 #include "sg/status.h"
@@ -15,6 +16,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+static int resolve_commit_tree(const char *git_dir, const unsigned char commit_id[SG_SHA1_RAW_LEN],
+                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
+{
+    sg_obj_type type;
+    unsigned char *content;
+    size_t content_len;
+    sg_commit commit;
+
+    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
+       type != SG_OBJ_COMMIT)
+        return -1;
+    if (sg_commit_parse(content, content_len, &commit) != 0) {
+        free(content);
+        return -1;
+    }
+    free(content);
+    memcpy(tree_id_out, commit.tree, SG_SHA1_RAW_LEN);
+    sg_commit_free(&commit);
+    return 0;
+}
 
 static int flat_find(const sg_flat_list *list, const char *path)
 {
@@ -215,10 +237,11 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
 
     /* A failed diff (e.g. out of memory) must NOT be read as "clean" -- that
        would silently defeat the whole point of this safety gate. An
-       in-progress, unresolved merge is also "dirty": overwriting it here
-       would silently discard the conflict resolution work in progress. */
+       in-progress, unresolved merge or rebase is also "dirty": overwriting
+       it here would silently discard the conflict resolution work (or the
+       whole rebase sequence) in progress. */
     dirty = !staged_ok || !unstaged_ok || staged.count > 0 || unstaged.count > 0 ||
-        sg_index_has_unmerged(&idx);
+        sg_index_has_unmerged(&idx) || sg_rebase_state_exists(git_dir);
 
     if (dirty) {
         strbuf msg = {0};
@@ -237,6 +260,8 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
             strbuf_append(&msg, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足），為安全起見要求確認\n");
         if (sg_index_has_unmerged(&idx))
             strbuf_append(&msg, "sg: 目前有一個尚未完成的合併，繼續會放棄它\n");
+        if (sg_rebase_state_exists(git_dir))
+            strbuf_append(&msg, "sg: 目前有一個進行中的 rebase，繼續會放棄它\n");
 
         confirmed = sg_confirm_dangerous(msg.buf != NULL ? msg.buf : "", force);
         free(msg.buf);
@@ -266,16 +291,73 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
     {
         unsigned char merge_head[SG_SHA1_RAW_LEN];
         int merge_in_progress = sg_merge_head_read(git_dir, merge_head) == 0;
+        int rebase_in_progress = sg_rebase_state_exists(git_dir);
 
         if (sg_apply_tree_to_workdir(git_dir, repo_root, tree_id) != 0)
             return -1;
 
         /* The apply above rebuilt the index from tree_id, wiping any conflict
-           stages -- whatever merge was in flight is over. Leaving MERGE_HEAD
-           behind would make the next unrelated `sg commit` silently record a
-           two-parent merge commit against a branch it never merged. */
+           stages -- whatever merge or rebase was in flight is over. Leaving
+           MERGE_HEAD/sg-rebase behind would make the next unrelated `sg
+           commit` silently record a bogus merge commit, or make a later `sg
+           rebase --continue` resume a sequence that no longer makes sense. */
         if (merge_in_progress && sg_merge_head_remove(git_dir) != 0)
             fprintf(stderr, "sg: warning: 未能清除 MERGE_HEAD\n");
+        if (rebase_in_progress && sg_rebase_state_remove(git_dir) != 0)
+            fprintf(stderr, "sg: warning: 未能清除進行中的 rebase 狀態\n");
         return 0;
     }
+}
+
+/* Formerly a static helper duplicated in cmd_merge.c; extracted here so
+   rebase can require the same precondition without a copy. */
+int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const char *what)
+{
+    unsigned char head_id[SG_SHA1_RAW_LEN];
+    sg_flat_list head_flat;
+    sg_index idx;
+    sg_status_list staged = {0};
+    sg_status_list unstaged = {0};
+    int staged_ok, unstaged_ok, dirty;
+    size_t i;
+
+    if (sg_index_read(git_dir, &idx) != 0) {
+        fprintf(stderr, "sg: failed to read index (corrupt?)\n");
+        return 1;
+    }
+
+    memset(&head_flat, 0, sizeof(head_flat));
+    if (sg_ref_resolve_head(git_dir, head_id) == 0) {
+        unsigned char tree_id[SG_SHA1_RAW_LEN];
+
+        if (resolve_commit_tree(git_dir, head_id, tree_id) == 0)
+            sg_tree_flatten(git_dir, tree_id, &head_flat);
+    }
+
+    staged_ok = sg_status_diff_staged(&head_flat, &idx, &staged) == 0;
+    sg_flat_list_free(&head_flat);
+    unstaged_ok = sg_status_diff_unstaged(repo_root, &idx, &unstaged) == 0;
+
+    /* A failed diff must never read as "clean" -- same rule as the rest of
+       the safety gates. */
+    dirty = !staged_ok || !unstaged_ok || staged.count > 0 || unstaged.count > 0;
+
+    if (dirty) {
+        fprintf(stderr, "sg: %s 需要乾淨的工作目錄，但下列變更尚未提交：\n", what);
+        for (i = 0; i < staged.count; i++)
+            fprintf(stderr, "\tstaged:              %s\n", staged.entries[i].path);
+        for (i = 0; i < unstaged.count; i++)
+            fprintf(stderr, "\tmodified (unstaged): %s\n", unstaged.entries[i].path);
+        if (!staged_ok || !unstaged_ok)
+            fprintf(stderr, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足）\n");
+        fprintf(stderr,
+               "請先處理這些變更，再重新執行：\n"
+               "  sg commit -m \"...\"      把它們提交進來\n"
+               "  sg restore <file>...    丟棄工作目錄的修改\n");
+    }
+
+    sg_status_list_free(&staged);
+    sg_status_list_free(&unstaged);
+    sg_index_free(&idx);
+    return dirty ? 1 : 0;
 }

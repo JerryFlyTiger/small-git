@@ -7,6 +7,7 @@
 #include "sg/merge.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/snapshot.h"
@@ -46,64 +47,6 @@ static int resolve_commit_tree(const char *git_dir, const unsigned char commit_i
     memcpy(tree_id_out, commit.tree, SG_SHA1_RAW_LEN);
     sg_commit_free(&commit);
     return 0;
-}
-
-/* A merge rebuilds the index from the merge result, so anything staged but
-   not committed has no representation in that result: a staged-only new file
-   would silently vanish from the index, and staged edits to a tracked file
-   would be silently replaced by the merged version. Rather than half-merge
-   uncommitted state (where those losses hide), refuse outright the way real
-   git does, and say what to do about it. Returns 0 if clean, 1 otherwise
-   (message already printed). */
-static int merge_require_clean(const char *git_dir, const char *repo_root, const char *what)
-{
-    unsigned char head_id[SG_SHA1_RAW_LEN];
-    sg_flat_list head_flat;
-    sg_index idx;
-    sg_status_list staged = {0};
-    sg_status_list unstaged = {0};
-    int staged_ok, unstaged_ok, dirty;
-    size_t i;
-
-    if (sg_index_read(git_dir, &idx) != 0) {
-        fprintf(stderr, "sg: failed to read index (corrupt?)\n");
-        return 1;
-    }
-
-    memset(&head_flat, 0, sizeof(head_flat));
-    if (sg_ref_resolve_head(git_dir, head_id) == 0) {
-        unsigned char tree_id[SG_SHA1_RAW_LEN];
-
-        if (resolve_commit_tree(git_dir, head_id, tree_id) == 0)
-            sg_tree_flatten(git_dir, tree_id, &head_flat);
-    }
-
-    staged_ok = sg_status_diff_staged(&head_flat, &idx, &staged) == 0;
-    sg_flat_list_free(&head_flat);
-    unstaged_ok = sg_status_diff_unstaged(repo_root, &idx, &unstaged) == 0;
-
-    /* A failed diff must never read as "clean" -- same rule as the rest of
-       the safety gates. */
-    dirty = !staged_ok || !unstaged_ok || staged.count > 0 || unstaged.count > 0;
-
-    if (dirty) {
-        fprintf(stderr, "sg: %s 需要乾淨的工作目錄，但下列變更尚未提交：\n", what);
-        for (i = 0; i < staged.count; i++)
-            fprintf(stderr, "\tstaged:              %s\n", staged.entries[i].path);
-        for (i = 0; i < unstaged.count; i++)
-            fprintf(stderr, "\tmodified (unstaged): %s\n", unstaged.entries[i].path);
-        if (!staged_ok || !unstaged_ok)
-            fprintf(stderr, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足）\n");
-        fprintf(stderr,
-               "請先處理這些變更，再重新執行：\n"
-               "  sg commit -m \"...\"      把它們提交進來\n"
-               "  sg restore <file>...    丟棄工作目錄的修改\n");
-    }
-
-    sg_status_list_free(&staged);
-    sg_status_list_free(&unstaged);
-    sg_index_free(&idx);
-    return dirty ? 1 : 0;
 }
 
 static int do_fast_forward(const char *git_dir, const char *repo_root, const char *current_branch,
@@ -535,7 +478,20 @@ int sg_cmd_merge(int argc, char **argv)
             return 1;
         }
 
-        if (merge_require_clean(git_dir, repo_root, "sg merge") != 0) {
+        /* Starting a merge on top of an in-progress rebase would let the
+           rebase's advancing branch ref and this merge's own commit graph
+           surgery trample each other -- same reasoning as the MERGE_HEAD
+           check above, just for the other direction. */
+        if (sg_rebase_state_exists(git_dir)) {
+            fprintf(stderr,
+                   "sg: 目前有一個進行中的 rebase\n"
+                   "請先完成它（sg rebase --continue）或執行 sg rebase --abort 放棄\n");
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+
+        if (sg_require_clean_workdir(git_dir, repo_root, "sg merge") != 0) {
             free(git_dir);
             free(repo_root);
             return 1;

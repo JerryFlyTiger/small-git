@@ -3,6 +3,13 @@
 
 #include "sg/hash.h"
 
+/* Branch names get concatenated straight into a filesystem path by the
+   functions below; a name like "../../../tmp/evil" would otherwise write/
+   read outside refs/heads. Exposed (not just internal to refs.c) so other
+   validated on-disk state (e.g. sg-rebase's orig-branch) can reuse the same
+   check. */
+int sg_ref_branch_name_is_safe(const char *name);
+
 /* Resolves HEAD -> refs/heads/<branch> -> that branch's current commit id.
    Returns -1 if the branch has no commits yet (a brand new repo) -- callers
    should treat that as "no parent commit", not an error. */

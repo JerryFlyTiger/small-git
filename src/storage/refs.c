@@ -9,10 +9,7 @@
 #define HEAD_PREFIX "ref: "
 #define BRANCH_PREFIX "refs/heads/"
 
-/* Branch names get concatenated straight into a filesystem path below; a
-   name like "../../../tmp/evil" (e.g. via `sg switch -c`) would otherwise
-   write/read outside refs/heads. */
-static int branch_name_is_safe(const char *name)
+int sg_ref_branch_name_is_safe(const char *name)
 {
     if (name[0] == '\0' || name[0] == '/')
         return 0;
@@ -119,7 +116,7 @@ int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id
     char *nl;
     int rc;
 
-    if (!branch_name_is_safe(branch))
+    if (!sg_ref_branch_name_is_safe(branch))
         return -1;
 
     snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
@@ -154,7 +151,7 @@ int sg_ref_update_branch(const char *git_dir, const char *branch, const unsigned
     char hex[SG_SHA1_HEX_LEN + 1];
     FILE *f;
 
-    if (!branch_name_is_safe(branch))
+    if (!sg_ref_branch_name_is_safe(branch))
         return -1;
 
     snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
@@ -175,7 +172,7 @@ int sg_ref_branch_exists(const char *git_dir, const char *branch)
     char path[SG_PATH_MAX];
     struct stat st;
 
-    if (!branch_name_is_safe(branch))
+    if (!sg_ref_branch_name_is_safe(branch))
         return 0;
 
     snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
