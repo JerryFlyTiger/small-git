@@ -807,30 +807,24 @@ done:
     return ok ? 0 : -1;
 }
 
-int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN], size_t count)
+/* Shared core of sg_pack_write and sg_pack_build_buf: appends the PACK
+   header, every object in `ids` (literal zlib, no delta compression), and
+   the trailing whole-pack SHA-1 checksum to pack_buf. `entries` is optional
+   (NULL skips the per-entry crc/offset bookkeeping, which only the on-disk
+   .idx needs) -- when non-NULL it must have room for `count` entries.
+   Returns 0 on success, -1 on failure. */
+static int pack_build_core(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN],
+                           size_t count, byte_buf *pack_buf, pack_entry_meta *entries,
+                           unsigned char pack_sha1_out[SG_SHA1_RAW_LEN])
 {
-    byte_buf pack_buf;
-    pack_entry_meta *entries;
     unsigned char header[12];
-    unsigned char pack_sha1[SG_SHA1_RAW_LEN];
-    char pack_hex[SG_SHA1_HEX_LEN + 1];
-    char pack_dir[SG_PATH_MAX];
-    char pack_path[SG_PATH_MAX];
-    char idx_path[SG_PATH_MAX];
     size_t i;
-    int ok = 0;
-
-    memset(&pack_buf, 0, sizeof(pack_buf));
-
-    entries = malloc(count > 0 ? count * sizeof(*entries) : 1);
-    if (entries == NULL)
-        return -1;
 
     memcpy(header, "PACK", 4);
     put_be32(header + 4, 2);
     put_be32(header + 8, (uint32_t)count);
-    if (buf_append(&pack_buf, header, sizeof(header)) != 0)
-        goto done;
+    if (buf_append(pack_buf, header, sizeof(header)) != 0)
+        return -1;
 
     for (i = 0; i < count; i++) {
         sg_obj_type type;
@@ -841,48 +835,85 @@ int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LE
         unsigned char hdr[16];
         size_t hdr_len;
         int raw_type;
-        size_t entry_offset = pack_buf.len;
-        uLong crc;
+        size_t entry_offset = pack_buf->len;
 
         if (sg_object_read(git_dir, ids[i], &type, &content, &content_len) != 0)
-            goto done;
+            return -1;
 
         raw_type = obj_type_to_pack_type(type);
         if (raw_type < 0) {
             free(content);
-            goto done;
+            return -1;
         }
         hdr_len = sg_pack_encode_obj_header(raw_type, (uint64_t)content_len, hdr);
 
         if (sg_compress(content, content_len, &compressed, &compressed_len) != 0) {
             free(content);
-            goto done;
+            return -1;
         }
         free(content);
 
-        if (entry_offset > 0x7fffffffULL) {
+        if (entries != NULL && entry_offset > 0x7fffffffULL) {
             /* would need the 8-byte large-offset .idx table; not supported */
             free(compressed);
-            goto done;
+            return -1;
         }
 
-        if (buf_append(&pack_buf, hdr, hdr_len) != 0 ||
-           buf_append(&pack_buf, compressed, compressed_len) != 0) {
+        if (buf_append(pack_buf, hdr, hdr_len) != 0 ||
+           buf_append(pack_buf, compressed, compressed_len) != 0) {
             free(compressed);
-            goto done;
+            return -1;
         }
         free(compressed);
 
-        crc = crc32(0L, Z_NULL, 0);
-        crc = crc32(crc, pack_buf.data + entry_offset, (uInt)(pack_buf.len - entry_offset));
+        if (entries != NULL) {
+            uLong crc = crc32(0L, Z_NULL, 0);
 
-        memcpy(entries[i].id, ids[i], SG_SHA1_RAW_LEN);
-        entries[i].crc = (uint32_t)crc;
-        entries[i].offset = entry_offset;
+            crc = crc32(crc, pack_buf->data + entry_offset, (uInt)(pack_buf->len - entry_offset));
+            memcpy(entries[i].id, ids[i], SG_SHA1_RAW_LEN);
+            entries[i].crc = (uint32_t)crc;
+            entries[i].offset = entry_offset;
+        }
     }
 
-    sg_sha1(pack_buf.data, pack_buf.len, pack_sha1);
-    if (buf_append(&pack_buf, pack_sha1, SG_SHA1_RAW_LEN) != 0)
+    sg_sha1(pack_buf->data, pack_buf->len, pack_sha1_out);
+    return buf_append(pack_buf, pack_sha1_out, SG_SHA1_RAW_LEN);
+}
+
+int sg_pack_build_buf(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN], size_t count,
+                      unsigned char **out, size_t *out_len)
+{
+    byte_buf pack_buf;
+    unsigned char pack_sha1[SG_SHA1_RAW_LEN];
+
+    memset(&pack_buf, 0, sizeof(pack_buf));
+    if (pack_build_core(git_dir, ids, count, &pack_buf, NULL, pack_sha1) != 0) {
+        free(pack_buf.data);
+        return -1;
+    }
+    *out = pack_buf.data;
+    *out_len = pack_buf.len;
+    return 0;
+}
+
+int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN], size_t count)
+{
+    byte_buf pack_buf;
+    pack_entry_meta *entries;
+    unsigned char pack_sha1[SG_SHA1_RAW_LEN];
+    char pack_hex[SG_SHA1_HEX_LEN + 1];
+    char pack_dir[SG_PATH_MAX];
+    char pack_path[SG_PATH_MAX];
+    char idx_path[SG_PATH_MAX];
+    int ok = 0;
+
+    memset(&pack_buf, 0, sizeof(pack_buf));
+
+    entries = malloc(count > 0 ? count * sizeof(*entries) : 1);
+    if (entries == NULL)
+        return -1;
+
+    if (pack_build_core(git_dir, ids, count, &pack_buf, entries, pack_sha1) != 0)
         goto done;
     sg_sha1_to_hex(pack_sha1, pack_hex);
 

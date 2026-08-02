@@ -718,6 +718,9 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     (cd "$HTTP_SRC" && git repack -ad -q) > /dev/null 2>&1
 
     (cd "$WORKDIR" && git clone --bare -q http_src "$HTTP_SERVERROOT/repo.git") > /dev/null 2>&1
+    # bare repos refuse receive-pack (push) by default -- phase 5c's push
+    # tests need this served over smart HTTP, not just fetch/clone
+    (cd "$HTTP_SERVERROOT/repo.git" && git config http.receivepack true) > /dev/null 2>&1
 
     HTTP_SERVER_SCRIPT="$WORKDIR/http_server.py"
     cat > "$HTTP_SERVER_SCRIPT" <<'PYEOF'
@@ -941,11 +944,110 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     check "phase5b: a second sg fetch reports already up to date" \
         grep -q "Already up to date" "$FETCH_AGAIN_OUT"
 
+    # --- phase 5c: sg push over smart HTTP (git-receive-pack) ---
+
+    # phase 5b deliberately left refs/heads/<branch> behind the bare repo's
+    # current tip (fetch must never move a local branch) -- bring the local
+    # branch up to what the remote actually has first, the same way a real
+    # `sg merge` from the now-updated refs/remotes/origin/<branch> would,
+    # done directly here so the push tests below start from a genuine
+    # fast-forward position rather than an already-diverged one.
+    git -C "$HTTP_DEST" update-ref "refs/heads/$HTTP_SRC_BRANCH" "$NEW_SRC_HEAD"
+    printf 'top level file\nsecond line\nthird line\n' > "$HTTP_DEST/top.txt"
+
+    # case 1: a genuine local commit -> sg push succeeds; verified against
+    # the bare repo with real git (ref, log, content, fsck)
+    printf 'top level file\nsecond line\nthird line\npushed from sg\n' > "$HTTP_DEST/top.txt"
+    (cd "$HTTP_DEST" && "$SG" add top.txt) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" commit -m "pushed commit") > /dev/null 2>&1
+    PUSH_NEW_HEAD=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+
+    PUSH_OUT="$WORKDIR/http_push_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push) > "$PUSH_OUT" 2>&1
+    check "phase5c: sg push exits 0" test $? = 0
+
+    check "phase5c: bare repo branch ref updated to the pushed commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/$HTTP_SRC_BRANCH)\" = '$PUSH_NEW_HEAD'"
+    check "phase5c: bare repo git log reads the pushed commit" \
+        sh -c "cd '$HTTP_SERVERROOT/repo.git' && git log --format='%H' -1 'refs/heads/$HTTP_SRC_BRANCH' | grep -q '$PUSH_NEW_HEAD'"
+    check "phase5c: git fsck passes on the bare repo after push" \
+        sh -c "git -C '$HTTP_SERVERROOT/repo.git' fsck > /dev/null 2>&1"
+
+    PUSH_SHOW_OUT="$WORKDIR/http_push_show_out.txt"
+    (cd "$HTTP_SERVERROOT/repo.git" && git show "$PUSH_NEW_HEAD:top.txt") > "$PUSH_SHOW_OUT" 2>/dev/null
+    check "phase5c: pushed file content matches on the bare repo" \
+        cmp -s "$HTTP_DEST/top.txt" "$PUSH_SHOW_OUT"
+
+    # case 5: local refs/remotes/origin/<branch> updated after a successful push
+    check "phase5c: local refs/remotes/origin/<branch> updated after push" \
+        sh -c "test \"\$(cat '$HTTP_DEST/.git/refs/remotes/origin/$HTTP_SRC_BRANCH')\" = '$PUSH_NEW_HEAD'"
+
+    # case 4: nothing left to push -> Everything up-to-date, exit 0
+    PUSH_AGAIN_OUT="$WORKDIR/http_push_again_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push) > "$PUSH_AGAIN_OUT" 2>&1
+    check "phase5c: a second sg push (nothing new) exits 0" test $? = 0
+    check "phase5c: a second sg push reports Everything up-to-date" \
+        grep -q "Everything up-to-date" "$PUSH_AGAIN_OUT"
+
+    # case 2: push a branch the remote doesn't have yet
+    (cd "$HTTP_DEST" && "$SG" switch -c sg-new-branch) > /dev/null 2>&1
+    printf 'new branch content\n' > "$HTTP_DEST/newbranch.txt"
+    (cd "$HTTP_DEST" && "$SG" add newbranch.txt) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" commit -m "new branch commit") > /dev/null 2>&1
+    NEW_BRANCH_HEAD=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+
+    NEW_BRANCH_PUSH_OUT="$WORKDIR/http_push_newbranch_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin sg-new-branch) > "$NEW_BRANCH_PUSH_OUT" 2>&1
+    check "phase5c: sg push of a new branch exits 0" test $? = 0
+    check "phase5c: sg push of a new branch reports it as a new branch" \
+        grep -q "new branch" "$NEW_BRANCH_PUSH_OUT"
+    check "phase5c: bare repo gained the new branch at the right commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/sg-new-branch 2>/dev/null)\" = '$NEW_BRANCH_HEAD'"
+
+    (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
+
+    # case 3: non-fast-forward protection. Diverge by having real git push a
+    # commit directly into the bare repo, `sg fetch` so the object is known
+    # locally (without moving the local branch -- this is what makes it a
+    # genuine "known but not an ancestor" non-fast-forward case rather than
+    # the separate "remote commit we've never seen" case, which sg push must
+    # refuse unconditionally, --force included), then commit locally on the
+    # old (pre-divergence) base so the two histories actually diverge.
+    DIVERGE_SRC="$WORKDIR/http_diverge_src"
+    (cd "$WORKDIR" && git clone -q "$HTTP_SERVERROOT/repo.git" http_diverge_src) > /dev/null 2>&1
+    (cd "$DIVERGE_SRC" && git config user.email "diverge@example.com" && git config user.name "diverge tester")
+    printf 'diverged on the server\n' >> "$DIVERGE_SRC/top.txt"
+    (cd "$DIVERGE_SRC" && git add top.txt && git commit -q -m "server-side divergent commit")
+    (cd "$DIVERGE_SRC" && git push -q origin "HEAD:refs/heads/$HTTP_SRC_BRANCH") > /dev/null 2>&1
+    DIVERGED_BARE_HEAD=$(cd "$HTTP_SERVERROOT/repo.git" && git rev-parse "refs/heads/$HTTP_SRC_BRANCH")
+
+    (cd "$HTTP_DEST" && "$SG" fetch) > /dev/null 2>&1
+
+    printf 'top level file\nsecond line\nthird line\npushed from sg\nlocal-only change\n' > "$HTTP_DEST/top.txt"
+    (cd "$HTTP_DEST" && "$SG" add top.txt) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" commit -m "local divergent commit") > /dev/null 2>&1
+
+    NOFORCE_PUSH_OUT="$WORKDIR/http_push_noforce_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push < /dev/null) > "$NOFORCE_PUSH_OUT" 2>&1
+    check "phase5c: sg push without --force fails on non-fast-forward" test $? -ne 0
+    check "phase5c: bare repo ref unchanged after refused non-fast-forward push" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/$HTTP_SRC_BRANCH)\" = '$DIVERGED_BARE_HEAD'"
+
+    FORCE_PUSH_LOCAL_HEAD=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+    FORCE_PUSH_OUT="$WORKDIR/http_push_force_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push --force < /dev/null) > "$FORCE_PUSH_OUT" 2>&1
+    check "phase5c: sg push --force succeeds over a non-fast-forward" test $? = 0
+    check "phase5c: bare repo ref now matches the force-pushed commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/$HTTP_SRC_BRANCH)\" = '$FORCE_PUSH_LOCAL_HEAD'"
+    check "phase5c: git fsck still passes on the bare repo after force push" \
+        sh -c "git -C '$HTTP_SERVERROOT/repo.git' fsck > /dev/null 2>&1"
+
     kill "$HTTP_SERVER_PID" 2>/dev/null
     HTTP_SERVER_PID=""
 else
     skip "phase5b: sg clone over smart HTTP"
     skip "phase5b: sg fetch over smart HTTP"
+    skip "phase5c: sg push over smart HTTP"
 fi
 
 echo ""

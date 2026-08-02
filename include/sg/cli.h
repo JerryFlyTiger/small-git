@@ -19,6 +19,7 @@ int sg_cmd_merge(int argc, char **argv);
 int sg_cmd_merge_base(int argc, char **argv);
 int sg_cmd_clone(int argc, char **argv);
 int sg_cmd_fetch(int argc, char **argv);
+int sg_cmd_push(int argc, char **argv);
 
 int sg_cli_run(int argc, char **argv);
 

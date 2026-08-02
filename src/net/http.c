@@ -54,6 +54,43 @@ static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *userdata)
     return n;
 }
 
+char *sg_url_redact(const char *url)
+{
+    const char *scheme_end = strstr(url, "://");
+    const char *authority_start;
+    const char *authority_end;
+    const char *at = NULL;
+    const char *p;
+    size_t prefix_len;
+    size_t suffix_len;
+    char *out;
+
+    if (scheme_end == NULL)
+        return strdup(url);
+    authority_start = scheme_end + 3;
+    authority_end = authority_start;
+    while (*authority_end != '\0' && *authority_end != '/')
+        authority_end++;
+
+    for (p = authority_start; p < authority_end; p++) {
+        if (*p == '@')
+            at = p; /* the last '@' before the path is where userinfo ends */
+    }
+    if (at == NULL)
+        return strdup(url);
+
+    prefix_len = (size_t)(authority_start - url);
+    suffix_len = strlen(at); /* "@host..." onward, '\0' included via the +1 below */
+
+    out = malloc(prefix_len + 3 + suffix_len + 1);
+    if (out == NULL)
+        return NULL;
+    memcpy(out, url, prefix_len);
+    memcpy(out + prefix_len, "***", 3);
+    memcpy(out + prefix_len + 3, at, suffix_len + 1);
+    return out;
+}
+
 static void print_error_body(const sg_buf *out)
 {
     if (out->len > 0) {
@@ -67,19 +104,31 @@ static int perform_request(CURL *curl, const char *method, const char *url, sg_b
 {
     CURLcode res;
     long http_code = 0;
+    char *safe_url = sg_url_redact(url);
+    /* Fail closed: if redaction couldn't allocate, printing the raw URL would
+       leak any user:password embedded in it. A vaguer message is strictly
+       better than a leaked credential. */
+    const char *shown_url = safe_url != NULL ? safe_url : "(remote)";
 
     res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        fprintf(stderr, "sg: %s %s failed: %s\n", method, url, curl_easy_strerror(res));
+        fprintf(stderr, "sg: %s %s failed: %s\n", method, shown_url, curl_easy_strerror(res));
+        free(safe_url);
         return -1;
     }
 
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     if (http_code != 200) {
-        fprintf(stderr, "sg: %s %s failed: HTTP %ld\n", method, url, http_code);
+        fprintf(stderr, "sg: %s %s failed: HTTP %ld\n", method, shown_url, http_code);
+        if (http_code == 401 || http_code == 403) {
+            fprintf(stderr, "sg: 認證失敗。請確認 ~/.netrc 內有此主機的帳密，"
+                            "或設定環境變數 SG_USERNAME / SG_PASSWORD 後再試一次\n");
+        }
         print_error_body(out);
+        free(safe_url);
         return -1;
     }
+    free(safe_url);
     return 0;
 }
 
@@ -111,6 +160,19 @@ static CURL *make_curl(const char *url, sg_buf *out)
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
 
+    /* CURL_NETRC_OPTIONAL: use ~/.netrc credentials for a matching host if
+       present, but don't require one -- same as real git's own default. */
+    curl_easy_setopt(curl, CURLOPT_NETRC, (long)CURL_NETRC_OPTIONAL);
+    {
+        const char *user = getenv("SG_USERNAME");
+        const char *pass = getenv("SG_PASSWORD");
+
+        if (user != NULL)
+            curl_easy_setopt(curl, CURLOPT_USERNAME, user);
+        if (pass != NULL)
+            curl_easy_setopt(curl, CURLOPT_PASSWORD, pass);
+    }
+
     return curl;
 }
 
@@ -126,7 +188,11 @@ int sg_http_get(const char *url, const char *accept_header, sg_buf *out)
 
     curl = make_curl(url, out);
     if (curl == NULL) {
-        fprintf(stderr, "sg: failed to initialize HTTP client for %s\n", url);
+        char *safe_url = sg_url_redact(url);
+
+        fprintf(stderr, "sg: failed to initialize HTTP client for %s\n",
+               safe_url != NULL ? safe_url : "(remote)");
+        free(safe_url);
         return -1;
     }
 
@@ -159,7 +225,11 @@ int sg_http_post(const char *url, const char *content_type, const char *accept_h
 
     curl = make_curl(url, out);
     if (curl == NULL) {
-        fprintf(stderr, "sg: failed to initialize HTTP client for %s\n", url);
+        char *safe_url = sg_url_redact(url);
+
+        fprintf(stderr, "sg: failed to initialize HTTP client for %s\n",
+               safe_url != NULL ? safe_url : "(remote)");
+        free(safe_url);
         return -1;
     }
 

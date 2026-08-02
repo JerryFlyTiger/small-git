@@ -1,4 +1,4 @@
-/* sg_parse_ref_advertisement and demux_upload_pack_response are defined
+/* sg_parse_ref_advertisement and sg_demux_sideband_response are defined
    (non-static, but not part of the public sg/transport.h surface) in
    src/net/transport.c; declared here via extern to keep them unit-testable
    without a real network round trip, the same convention
@@ -14,7 +14,8 @@
 #include <string.h>
 
 extern int sg_parse_ref_advertisement(const unsigned char *data, size_t len, sg_ref_adv *adv_out);
-extern int demux_upload_pack_response(const unsigned char *data, size_t len, sg_buf *pack_out);
+extern int sg_demux_sideband_response(const unsigned char *data, size_t len, sg_buf *out_band1);
+extern int sg_parse_ref_advertisement_push(const unsigned char *data, size_t len, sg_ref_adv *adv_out);
 
 static int failures = 0;
 
@@ -194,6 +195,39 @@ static void test_service_line_without_trailing_newline_accepted(void)
     free(buf);
 }
 
+/* ---- receive-pack (push) advertisement -- same wire shape as upload-pack's,
+   just a different service line and capability set, per phase 5c ---- */
+
+static void test_push_advertisement_service_line(void)
+{
+    unsigned char *buf = NULL;
+    size_t len = 0, cap = 0;
+    sg_ref_adv adv;
+
+    if (sg_pkt_append_str(&buf, &len, &cap, "# service=git-receive-pack\n") != 0 ||
+       sg_pkt_append_flush(&buf, &len, &cap) != 0)
+        abort();
+    append_ref_line(&buf, &len, &cap, ID_A, "refs/heads/main",
+                    "report-status side-band-64k agent=git/2.40.0");
+    append_ref_line(&buf, &len, &cap, ID_B, "refs/heads/other", NULL);
+    if (sg_pkt_append_flush(&buf, &len, &cap) != 0)
+        abort();
+
+    CHECK(sg_parse_ref_advertisement_push(buf, len, &adv) == 0,
+         "a well-formed receive-pack advertisement should parse");
+    CHECK(adv.count == 2, "expected 2 refs, got %zu", adv.count);
+    CHECK(adv.capabilities != NULL && strstr(adv.capabilities, "report-status") != NULL,
+         "capabilities should contain report-status");
+    sg_ref_adv_free(&adv);
+
+    /* the two parsers must not silently accept each other's service line --
+       that would defeat the whole point of parametrizing it in phase 5c */
+    CHECK(sg_parse_ref_advertisement(buf, len, &adv) == -1,
+         "the upload-pack parser must reject a receive-pack service line");
+
+    free(buf);
+}
+
 static void test_ref_name_is_safe_direct(void)
 {
     CHECK(sg_ref_name_is_safe("refs/heads/main") == 1, "a normal branch ref should be safe");
@@ -221,7 +255,7 @@ static void test_ref_name_is_safe_direct(void)
     CHECK(sg_ref_name_is_safe("") == 0, "must reject empty string");
 }
 
-/* ---- sideband-64k demux (demux_upload_pack_response) ---- */
+/* ---- sideband-64k demux (sg_demux_sideband_response) ---- */
 
 static void test_demux_valid_pack_band_accumulates_and_returns_success(void)
 {
@@ -246,7 +280,7 @@ static void test_demux_valid_pack_band_accumulates_and_returns_success(void)
     if (sg_pkt_append_flush(&buf, &len, &cap) != 0)
         abort();
 
-    rc = demux_upload_pack_response(buf, len, &pack_out);
+    rc = sg_demux_sideband_response(buf, len, &pack_out);
     CHECK(rc == 0, "a well-formed sideband response should demux successfully, got rc=%d", rc);
     CHECK(pack_out.len == 8, "expected 8 accumulated pack bytes, got %zu", pack_out.len);
     CHECK(pack_out.len == 8 && memcmp(pack_out.data, "PACK\0\0\0\x02", 8) == 0,
@@ -271,7 +305,7 @@ static void test_demux_band3_is_fatal(void)
     if (sg_pkt_append_flush(&buf, &len, &cap) != 0)
         abort();
 
-    rc = demux_upload_pack_response(buf, len, &pack_out);
+    rc = sg_demux_sideband_response(buf, len, &pack_out);
     CHECK(rc == -1, "a band-3 fatal error message should fail the whole demux, got rc=%d", rc);
 
     sg_buf_free(&pack_out);
@@ -298,7 +332,7 @@ static void test_demux_unknown_band_after_multiplex_is_protocol_error(void)
     if (sg_pkt_append_flush(&buf, &len, &cap) != 0)
         abort();
 
-    rc = demux_upload_pack_response(buf, len, &pack_out);
+    rc = sg_demux_sideband_response(buf, len, &pack_out);
     CHECK(rc == -1,
          "an unknown band byte encountered after multiplexing has started must be a protocol "
          "error (spec: \"其他值 = 協定錯誤\"), got rc=%d",
@@ -330,7 +364,7 @@ static void test_demux_pre_multiplex_unknown_first_byte_is_tolerated(void)
     if (sg_pkt_append_flush(&buf, &len, &cap) != 0)
         abort();
 
-    rc = demux_upload_pack_response(buf, len, &pack_out);
+    rc = sg_demux_sideband_response(buf, len, &pack_out);
     CHECK(rc == 0,
          "a pre-multiplex packet with an unexpected first byte should still be tolerated, got "
          "rc=%d",
@@ -349,6 +383,7 @@ int main(void)
     test_malicious_ref_names_are_skipped();
     test_not_a_smart_http_response_is_rejected();
     test_service_line_without_trailing_newline_accepted();
+    test_push_advertisement_service_line();
     test_ref_name_is_safe_direct();
 
     test_demux_valid_pack_band_accumulates_and_returns_success();

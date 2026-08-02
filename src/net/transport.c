@@ -135,13 +135,15 @@ static char *find_head_symref(const char *capabilities)
 }
 
 /* Pure parser over an already-fetched info/refs response body -- factored out
-   of sg_transport_ls_refs so it's unit-testable without a network round
-   trip. Not part of the public sg/transport.h surface (same convention as
+   of sg_transport_ls_refs/sg_transport_ls_refs_push so it's unit-testable
+   without a network round trip, and shared between the upload-pack and
+   receive-pack advertisements (identical wire format, different service
+   name). Not part of the public sg/transport.h surface (same convention as
    src/storage/pack.c's non-static varint helpers), declared via extern in
    tests/test_refadv.c. */
-int sg_parse_ref_advertisement(const unsigned char *data, size_t len, sg_ref_adv *adv_out)
+static int parse_ref_advertisement_for_service(const unsigned char *data, size_t len,
+                                               const char *service_prefix, sg_ref_adv *adv_out)
 {
-    static const char service_prefix[] = "# service=git-upload-pack";
     size_t pos = 0;
     sg_pkt_type type;
     const unsigned char *payload;
@@ -249,6 +251,21 @@ fail:
     return -1;
 }
 
+/* Non-static (but not part of the public sg/transport.h surface, same
+   convention as sg_demux_sideband_response below) so tests/test_refadv.c can
+   exercise the parser directly via extern, without a network round trip. */
+int sg_parse_ref_advertisement(const unsigned char *data, size_t len, sg_ref_adv *adv_out)
+{
+    return parse_ref_advertisement_for_service(data, len, "# service=git-upload-pack", adv_out);
+}
+
+/* Same as sg_parse_ref_advertisement, for the receive-pack advertisement --
+   exposed the same way for tests/test_refadv.c. */
+int sg_parse_ref_advertisement_push(const unsigned char *data, size_t len, sg_ref_adv *adv_out)
+{
+    return parse_ref_advertisement_for_service(data, len, "# service=git-receive-pack", adv_out);
+}
+
 int sg_transport_ls_refs(const char *base_url, sg_ref_adv *adv_out)
 {
     char url[SG_PATH_MAX];
@@ -265,32 +282,72 @@ int sg_transport_ls_refs(const char *base_url, sg_ref_adv *adv_out)
     return rc;
 }
 
+int sg_transport_ls_refs_push(const char *base_url, sg_ref_adv *adv_out)
+{
+    char url[SG_PATH_MAX];
+    sg_buf resp;
+    int rc;
+
+    snprintf(url, sizeof(url), "%s/info/refs?service=git-receive-pack", base_url);
+
+    if (sg_http_get(url, "*/*", &resp) != 0)
+        return -1;
+
+    rc = sg_parse_ref_advertisement_push(resp.data, resp.len, adv_out);
+    sg_buf_free(&resp);
+    return rc;
+}
+
 /* ---- sideband-64k demux + fetch negotiation ---- */
 
 #define SG_BAND_PACK 1
 #define SG_BAND_PROGRESS 2
 #define SG_BAND_ERROR 3
 
-/* Not static (but not part of the public sg/transport.h surface, same
+/* Remote-authored text goes straight to a terminal, so strip anything that
+   could be an ANSI escape or other control sequence -- a hostile server must
+   not be able to repaint the user's screen or hide what it actually said.
+   \n, \r and \t are the only control characters progress output legitimately
+   needs. */
+void sg_print_remote_text(const unsigned char *text, size_t len, FILE *f)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        unsigned char c = text[i];
+
+        if (c == '\n' || c == '\r' || c == '\t' || (c >= 0x20 && c != 0x7f))
+            fputc(c, f);
+        else
+            fputc('?', f);
+    }
+}
+
+/* Demuxes a side-band-64k pkt-line stream, whichever service produced it
+   (git-upload-pack's packfile response or git-receive-pack's report-status
+   response have the same band framing) -- band 1 accumulates into *out_band1,
+   band 2 streams to stderr as progress, band 3 is a fatal remote error.
+   Not static (but not part of the public sg/transport.h surface, same
    convention as sg_parse_ref_advertisement above) so tests/test_refadv.c can
    exercise the band-byte protocol-error path directly via extern, without
    needing a real HTTP round trip. */
-int demux_upload_pack_response(const unsigned char *data, size_t len, sg_buf *pack_out)
+int sg_demux_sideband_response(const unsigned char *data, size_t len, sg_buf *out_band1)
 {
     size_t pos = 0;
     sg_pkt_type type;
     const unsigned char *payload;
     size_t payload_len;
     /* Once we've seen a real band byte (1/2/3), we're past the
-       pre-multiplex NAK/ACK line(s) and into genuine side-band-64k framing
-       -- from that point on, every packet's first byte must be a band
-       number, and anything else is a protocol error per spec section 2
-       ("其他值 = 協定錯誤"), not something to silently skip. */
+       pre-multiplex NAK/ACK line(s) (upload-pack only; receive-pack has none)
+       and into genuine side-band-64k framing -- from that point on, every
+       packet's first byte must be a band number, and anything else is a
+       protocol error per spec section 2 ("其他值 = 協定錯誤"), not something
+       to silently skip. */
     int in_multiplex = 0;
 
     for (;;) {
         if (sg_pkt_read(data, len, &pos, &type, &payload, &payload_len) != 0) {
-            fprintf(stderr, "sg: 遠端 git-upload-pack 回應格式錯誤\n");
+            fprintf(stderr, "sg: 遠端回應格式錯誤\n");
             return -1;
         }
         if (type == SG_PKT_FLUSH)
@@ -308,17 +365,18 @@ int demux_upload_pack_response(const unsigned char *data, size_t len, sg_buf *pa
             switch (band) {
             case SG_BAND_PACK:
                 in_multiplex = 1;
-                if (sg_buf_append(pack_out, payload + 1, payload_len - 1) != 0)
+                if (sg_buf_append(out_band1, payload + 1, payload_len - 1) != 0)
                     return -1;
                 break;
             case SG_BAND_PROGRESS:
                 in_multiplex = 1;
-                fwrite(payload + 1, 1, payload_len - 1, stderr);
+                sg_print_remote_text(payload + 1, payload_len - 1, stderr);
                 break;
             case SG_BAND_ERROR:
                 in_multiplex = 1;
-                fprintf(stderr, "sg: remote error: %.*s\n", (int)(payload_len - 1),
-                       (const char *)payload + 1);
+                fputs("sg: remote error: ", stderr);
+                sg_print_remote_text(payload + 1, payload_len - 1, stderr);
+                fputc('\n', stderr);
                 return -1;
             default:
                 if (in_multiplex) {
@@ -392,7 +450,7 @@ int sg_transport_fetch_pack(const char *base_url,
                      "application/x-git-upload-pack-result", body, body_len, &resp) != 0)
         goto done;
 
-    rc = demux_upload_pack_response(resp.data, resp.len, &pack_buf);
+    rc = sg_demux_sideband_response(resp.data, resp.len, &pack_buf);
     sg_buf_free(&resp);
 
     if (rc != 0) {
@@ -402,6 +460,264 @@ int sg_transport_fetch_pack(const char *base_url,
 
     *pack_out = pack_buf.data;
     *pack_len_out = pack_buf.len;
+
+done:
+    free(body);
+    return rc;
+}
+
+/* ---- push (git-receive-pack) ---- */
+
+/* Same growable-raw-buffer shape as sg_pkt_append's own internal `grow`
+   (pktline.c), but appends bytes verbatim with no pkt-line framing -- needed
+   here because the packfile goes straight after the command flush-pkt,
+   unlike everything else in a git smart-HTTP request body. */
+static int raw_append(unsigned char **buf, size_t *len, size_t *cap, const void *data, size_t n)
+{
+    if (*len + n > *cap) {
+        size_t new_cap = (*cap == 0) ? 4096 : *cap;
+        unsigned char *grown;
+
+        while (new_cap < *len + n)
+            new_cap *= 2;
+        grown = realloc(*buf, new_cap);
+        if (grown == NULL)
+            return -1;
+        *buf = grown;
+        *cap = new_cap;
+    }
+    if (n > 0)
+        memcpy(*buf + *len, data, n);
+    *len += n;
+    return 0;
+}
+
+static int push_refs_grow(sg_push_ref_result **refs, size_t *cap, size_t need)
+{
+    size_t new_cap;
+    sg_push_ref_result *grown;
+
+    if (need <= *cap)
+        return 0;
+    new_cap = (*cap == 0) ? 8 : *cap * 2;
+    while (new_cap < need)
+        new_cap *= 2;
+    grown = realloc(*refs, new_cap * sizeof(**refs));
+    if (grown == NULL)
+        return -1;
+    *refs = grown;
+    *cap = new_cap;
+    return 0;
+}
+
+void sg_push_report_free(sg_push_report *report)
+{
+    size_t i;
+
+    for (i = 0; i < report->ref_count; i++) {
+        free(report->refs[i].ref_name);
+        free(report->refs[i].message);
+    }
+    free(report->refs);
+    free(report->unpack_error);
+    memset(report, 0, sizeof(*report));
+}
+
+/* Parses a report-status body (already demuxed out of band 1, if
+   side-band-64k was in play): "unpack ok\n" or "unpack <error>\n", then one
+   "ok <ref>\n" / "ng <ref> <reason>\n" line per pushed ref, then a flush.
+   Not part of the public sg/transport.h surface (same convention as
+   sg_parse_ref_advertisement above), declared via extern in
+   tests/test_push_report.c. */
+int sg_parse_push_report_status(const unsigned char *data, size_t len, sg_push_report *out)
+{
+    size_t pos = 0;
+    sg_pkt_type type;
+    const unsigned char *payload;
+    size_t payload_len;
+    sg_push_ref_result *refs = NULL;
+    size_t count = 0, cap = 0;
+    static const char unpack_prefix[] = "unpack ";
+
+    memset(out, 0, sizeof(*out));
+
+    if (sg_pkt_read(data, len, &pos, &type, &payload, &payload_len) != 0 || type != SG_PKT_DATA)
+        goto malformed;
+    {
+        size_t plen = payload_len;
+        const unsigned char *msg;
+        size_t msg_len;
+
+        if (plen > 0 && payload[plen - 1] == '\n')
+            plen--;
+        if (plen < strlen(unpack_prefix) || memcmp(payload, unpack_prefix, strlen(unpack_prefix)) != 0)
+            goto malformed;
+
+        msg = payload + strlen(unpack_prefix);
+        msg_len = plen - strlen(unpack_prefix);
+        if (msg_len == 2 && memcmp(msg, "ok", 2) == 0) {
+            out->unpack_ok = 1;
+        } else {
+            out->unpack_ok = 0;
+            out->unpack_error = malloc(msg_len + 1);
+            if (out->unpack_error == NULL)
+                goto fail;
+            memcpy(out->unpack_error, msg, msg_len);
+            out->unpack_error[msg_len] = '\0';
+        }
+    }
+
+    for (;;) {
+        size_t plen;
+        int is_ok;
+        const unsigned char *rest;
+        size_t rest_len;
+        char *ref_name;
+        char *message = NULL;
+
+        if (sg_pkt_read(data, len, &pos, &type, &payload, &payload_len) != 0)
+            goto malformed;
+        if (type == SG_PKT_FLUSH)
+            break;
+        if (type != SG_PKT_DATA)
+            goto malformed;
+
+        plen = payload_len;
+        if (plen > 0 && payload[plen - 1] == '\n')
+            plen--;
+
+        if (plen >= 3 && memcmp(payload, "ok ", 3) == 0) {
+            is_ok = 1;
+            rest = payload + 3;
+            rest_len = plen - 3;
+        } else if (plen >= 3 && memcmp(payload, "ng ", 3) == 0) {
+            is_ok = 0;
+            rest = payload + 3;
+            rest_len = plen - 3;
+        } else {
+            goto malformed;
+        }
+
+        if (is_ok) {
+            ref_name = malloc(rest_len + 1);
+            if (ref_name == NULL)
+                goto fail;
+            memcpy(ref_name, rest, rest_len);
+            ref_name[rest_len] = '\0';
+        } else {
+            const unsigned char *sp = memchr(rest, ' ', rest_len);
+            size_t name_len = (sp != NULL) ? (size_t)(sp - rest) : rest_len;
+            size_t msg_len = (sp != NULL) ? rest_len - name_len - 1 : 0;
+
+            ref_name = malloc(name_len + 1);
+            if (ref_name == NULL)
+                goto fail;
+            memcpy(ref_name, rest, name_len);
+            ref_name[name_len] = '\0';
+
+            message = malloc(msg_len + 1);
+            if (message == NULL) {
+                free(ref_name);
+                goto fail;
+            }
+            if (sp != NULL)
+                memcpy(message, sp + 1, msg_len);
+            message[msg_len] = '\0';
+        }
+
+        if (push_refs_grow(&refs, &cap, count + 1) != 0) {
+            free(ref_name);
+            free(message);
+            goto fail;
+        }
+        refs[count].ok = is_ok;
+        refs[count].ref_name = ref_name;
+        refs[count].message = message;
+        count++;
+    }
+
+    out->refs = refs;
+    out->ref_count = count;
+    return 0;
+
+malformed:
+    fprintf(stderr, "sg: 遠端 git-receive-pack 的 report-status 回應格式錯誤\n");
+fail:
+    {
+        size_t i;
+
+        for (i = 0; i < count; i++) {
+            free(refs[i].ref_name);
+            free(refs[i].message);
+        }
+        free(refs);
+        free(out->unpack_error);
+        out->unpack_error = NULL;
+    }
+    return -1;
+}
+
+int sg_transport_push(const char *base_url, const unsigned char old_id[SG_SHA1_RAW_LEN],
+                      const unsigned char new_id[SG_SHA1_RAW_LEN], const char *ref_name,
+                      int use_side_band_64k, const unsigned char *pack_data, size_t pack_len,
+                      sg_push_report *report_out)
+{
+    unsigned char *body = NULL;
+    size_t body_len = 0, body_cap = 0;
+    char url[SG_PATH_MAX];
+    char old_hex[SG_SHA1_HEX_LEN + 1];
+    char new_hex[SG_SHA1_HEX_LEN + 1];
+    sg_buf resp;
+    int rc = -1;
+
+    sg_sha1_to_hex(old_id, old_hex);
+    sg_sha1_to_hex(new_id, new_hex);
+
+    {
+        char line[SG_REF_NAME_MAX + 256];
+        size_t n;
+
+        n = (size_t)snprintf(line, sizeof(line), "%s %s %s", old_hex, new_hex, ref_name);
+        if (n >= sizeof(line) - 64) {
+            fprintf(stderr, "sg: ref name too long for a push command line\n");
+            goto done;
+        }
+        line[n++] = '\0';
+        n += (size_t)snprintf(line + n, sizeof(line) - n, "report-status%s agent=small-git/0.1",
+                              use_side_band_64k ? " side-band-64k" : "");
+        line[n++] = '\n';
+        if (sg_pkt_append(&body, &body_len, &body_cap, line, n) != 0)
+            goto done;
+    }
+    if (sg_pkt_append_flush(&body, &body_len, &body_cap) != 0)
+        goto done;
+    /* the packfile is NOT pkt-line wrapped -- raw bytes go straight after the
+       command flush-pkt, unlike every other part of this request body */
+    if (raw_append(&body, &body_len, &body_cap, pack_data, pack_len) != 0)
+        goto done;
+
+    snprintf(url, sizeof(url), "%s/git-receive-pack", base_url);
+
+    memset(&resp, 0, sizeof(resp));
+    if (sg_http_post(url, "application/x-git-receive-pack-request",
+                     "application/x-git-receive-pack-result", body, body_len, &resp) != 0)
+        goto done;
+
+    if (use_side_band_64k) {
+        sg_buf band1;
+
+        memset(&band1, 0, sizeof(band1));
+        if (sg_demux_sideband_response(resp.data, resp.len, &band1) != 0) {
+            sg_buf_free(&band1);
+            sg_buf_free(&resp);
+            goto done;
+        }
+        rc = sg_parse_push_report_status(band1.data, band1.len, report_out);
+        sg_buf_free(&band1);
+    } else {
+        rc = sg_parse_push_report_status(resp.data, resp.len, report_out);
+    }
+    sg_buf_free(&resp);
 
 done:
     free(body);

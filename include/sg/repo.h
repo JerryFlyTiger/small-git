@@ -21,4 +21,11 @@ char *sg_find_git_dir(void);
    success, same as sg_find_git_dir. */
 char *sg_require_git_dir(void);
 
+/* Minimal "just enough" .git/config reader: finds `[remote "<remote>"]` and
+   returns the url = value in that section, malloc'd (caller frees). Not a
+   general gitconfig parser (no quoting/escaping/multi-line support) -- this
+   is all `sg fetch`/`sg push` need. Returns NULL if the section or its url
+   key is missing, or the file can't be read. */
+char *sg_repo_read_remote_url(const char *git_dir, const char *remote);
+
 #endif

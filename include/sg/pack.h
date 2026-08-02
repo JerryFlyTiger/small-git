@@ -31,6 +31,16 @@ int sg_pack_read(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
    format, which isn't supported). */
 int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN], size_t count);
 
+/* Same object encoding as sg_pack_write (no delta compression; each object
+   read via sg_object_read and stored as its own literal zlib-compressed
+   entry), but built entirely in memory and handed back rather than written
+   to objects/pack/ -- for a push, where the bytes need to go straight into
+   an HTTP request body instead of onto local disk. *out is malloc'd, caller
+   frees; it always ends with the pack's own trailing 20-byte SHA-1 checksum,
+   same as an on-disk pack. Returns 0 on success, -1 on failure. */
+int sg_pack_build_buf(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN], size_t count,
+                      unsigned char **out, size_t *out_len);
+
 /* Writes already-formed packfile bytes (as received over the network, e.g.
    by sg_transport_fetch_pack) to git_dir/objects/pack/pack-<hex>.pack, where
    <hex> is the pack's own trailing 20-byte checksum -- not recomputed here,

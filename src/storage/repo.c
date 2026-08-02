@@ -120,3 +120,50 @@ char *sg_require_git_dir(void)
     }
     return git_dir;
 }
+
+char *sg_repo_read_remote_url(const char *git_dir, const char *remote)
+{
+    char path[SG_PATH_MAX];
+    char header[256];
+    FILE *f;
+    char line[1024];
+    int in_section = 0;
+    char *result = NULL;
+
+    snprintf(path, sizeof(path), "%s/config", git_dir);
+    f = fopen(path, "r");
+    if (f == NULL)
+        return NULL;
+
+    snprintf(header, sizeof(header), "[remote \"%s\"]", remote);
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *p = line;
+        size_t plen;
+
+        while (*p == ' ' || *p == '\t')
+            p++;
+        plen = strlen(p);
+        while (plen > 0 && (p[plen - 1] == '\n' || p[plen - 1] == '\r'))
+            p[--plen] = '\0';
+
+        if (p[0] == '[') {
+            in_section = (strcmp(p, header) == 0);
+            continue;
+        }
+        if (in_section && strncmp(p, "url", 3) == 0) {
+            char *eq = strchr(p, '=');
+
+            if (eq != NULL) {
+                char *val = eq + 1;
+
+                while (*val == ' ' || *val == '\t')
+                    val++;
+                result = strdup(val);
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return result;
+}

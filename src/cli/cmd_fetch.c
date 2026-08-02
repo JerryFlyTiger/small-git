@@ -17,57 +17,6 @@
 #define SG_PATH_MAX 4096
 #define SG_FETCH_MAX_HAVES 256
 
-/* Minimal "just enough" .git/config reader: finds `[remote "<remote>"]` and
-   returns the url = value in that section. Not a general gitconfig parser
-   (no quoting/escaping/multi-line support), which is all this needs per the
-   phase 5b spec. */
-static char *read_remote_url(const char *git_dir, const char *remote)
-{
-    char path[SG_PATH_MAX];
-    char header[256];
-    FILE *f;
-    char line[1024];
-    int in_section = 0;
-    char *result = NULL;
-
-    snprintf(path, sizeof(path), "%s/config", git_dir);
-    f = fopen(path, "r");
-    if (f == NULL)
-        return NULL;
-
-    snprintf(header, sizeof(header), "[remote \"%s\"]", remote);
-
-    while (fgets(line, sizeof(line), f) != NULL) {
-        char *p = line;
-        size_t plen;
-
-        while (*p == ' ' || *p == '\t')
-            p++;
-        plen = strlen(p);
-        while (plen > 0 && (p[plen - 1] == '\n' || p[plen - 1] == '\r'))
-            p[--plen] = '\0';
-
-        if (p[0] == '[') {
-            in_section = (strcmp(p, header) == 0);
-            continue;
-        }
-        if (in_section && strncmp(p, "url", 3) == 0) {
-            char *eq = strchr(p, '=');
-
-            if (eq != NULL) {
-                char *val = eq + 1;
-
-                while (*val == ' ' || *val == '\t')
-                    val++;
-                result = strdup(val);
-                break;
-            }
-        }
-    }
-    fclose(f);
-    return result;
-}
-
 static int build_want_ids(const sg_ref_adv *adv, unsigned char (**ids_out)[SG_SHA1_RAW_LEN],
                           size_t *count_out)
 {
@@ -334,7 +283,7 @@ int sg_cmd_fetch(int argc, char **argv)
     if (git_dir == NULL)
         return 1;
 
-    url = read_remote_url(git_dir, remote);
+    url = sg_repo_read_remote_url(git_dir, remote);
     if (url == NULL) {
         fprintf(stderr, "sg: remote '%s' 未設定 (找不到 .git/config 裡的 [remote \"%s\"] url)\n",
                remote, remote);
