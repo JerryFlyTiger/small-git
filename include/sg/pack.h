@@ -31,4 +31,27 @@ int sg_pack_read(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
    format, which isn't supported). */
 int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN], size_t count);
 
+/* Writes already-formed packfile bytes (as received over the network, e.g.
+   by sg_transport_fetch_pack) to git_dir/objects/pack/pack-<hex>.pack, where
+   <hex> is the pack's own trailing 20-byte checksum -- not recomputed here,
+   just read off the end of `data` (sg_pack_index_existing independently
+   verifies it against a hash of the rest of the file). *pack_path_out is
+   malloc'd, caller frees. Returns 0 on success, -1 on failure (including
+   `data` not starting with the "PACK" magic). */
+int sg_pack_store_raw(const char *git_dir, const unsigned char *data, size_t len,
+                      char **pack_path_out);
+
+/* Scans an existing *.pack file already placed at pack_path (which must be
+   under some git_dir's objects/pack/ directory) and writes the matching
+   *.idx next to it, in the same version-2 format sg_pack_write produces.
+   Validates the pack's "PACK" magic, version, and whole-file trailer
+   checksum before trusting any of its contents -- this data typically just
+   came off the network. Every object's id, CRC32, and offset are recomputed
+   from scratch (OFS_DELTA/REF_DELTA chains are reconstructed exactly like
+   sg_pack_read, including the same SG_PACK_MAX_DELTA_DEPTH guard); a
+   REF_DELTA base not found within this pack falls back to sg_object_read
+   against git_dir's existing loose/pack storage. Returns 0 on success, -1 on
+   any validation or I/O failure. */
+int sg_pack_index_existing(const char *pack_path);
+
 #endif

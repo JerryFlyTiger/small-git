@@ -9,6 +9,7 @@ SG="$PROJECT_ROOT/build/sg"
 PASS=0
 FAIL=0
 TOTAL=0
+SKIP=0
 
 check() {
     label="$1"
@@ -23,13 +24,29 @@ check() {
     fi
 }
 
+skip() {
+    SKIP=$((SKIP + 1))
+    echo "SKIP: $1"
+}
+
 if [ ! -x "$SG" ]; then
     echo "error: $SG not found, run 'make' first" >&2
     exit 1
 fi
 
 WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+# HTTP_SERVER_PID is set once the phase 5b smart-HTTP test server is
+# launched; cleanup() kills it (if still running) alongside removing WORKDIR,
+# so a failure partway through phase 5b can never leak an orphaned server
+# process.
+HTTP_SERVER_PID=""
+cleanup() {
+    if [ -n "$HTTP_SERVER_PID" ]; then
+        kill "$HTTP_SERVER_PID" 2>/dev/null
+    fi
+    rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
 
 REPO="$WORKDIR/repo"
 mkdir -p "$REPO"
@@ -669,8 +686,270 @@ ABORT_SNAPSHOT_COUNT=$(snapshot_count "$P4B_ABORT_REPO")
 check "phase4b case10: sg undo listing gained a snapshot from the merge/abort above" \
     test "$ABORT_SNAPSHOT_COUNT" -ge 1
 
+# --- Phase 5b: smart HTTP clone/fetch against a local `git http-backend` CGI
+# server. This is the important end-to-end case -- everything else in this
+# phase (pkt-line codec, ref advertisement parsing, sideband demux, idx
+# generation) only proves itself for real via an actual clone/fetch over the
+# wire against a real git server implementation. ---
+
+HTTP_AVAILABLE=1
+if ! command -v python3 >/dev/null 2>&1; then
+    HTTP_AVAILABLE=0
+fi
+if ! command -v git >/dev/null 2>&1; then
+    HTTP_AVAILABLE=0
+fi
+
+if [ "$HTTP_AVAILABLE" = 1 ]; then
+    HTTP_SERVERROOT="$WORKDIR/http_serverroot"
+    mkdir -p "$HTTP_SERVERROOT"
+
+    HTTP_SRC="$WORKDIR/http_src"
+    mkdir -p "$HTTP_SRC/sub"
+    git init -q "$HTTP_SRC"
+    (cd "$HTTP_SRC" && git config user.email "http@example.com" && git config user.name "http tester")
+    printf 'top level file\n' > "$HTTP_SRC/top.txt"
+    printf 'nested content\n' > "$HTTP_SRC/sub/nested.txt"
+    head -c 300 /dev/urandom > "$HTTP_SRC/bin.dat" 2>/dev/null
+    (cd "$HTTP_SRC" && git add top.txt sub/nested.txt bin.dat && git commit -q -m "first commit") > /dev/null 2>&1
+    printf 'top level file\nsecond line\n' > "$HTTP_SRC/top.txt"
+    (cd "$HTTP_SRC" && git add top.txt && git commit -q -m "second commit") > /dev/null 2>&1
+    (cd "$HTTP_SRC" && git tag v1.0) > /dev/null 2>&1
+    (cd "$HTTP_SRC" && git repack -ad -q) > /dev/null 2>&1
+
+    (cd "$WORKDIR" && git clone --bare -q http_src "$HTTP_SERVERROOT/repo.git") > /dev/null 2>&1
+
+    HTTP_SERVER_SCRIPT="$WORKDIR/http_server.py"
+    cat > "$HTTP_SERVER_SCRIPT" <<'PYEOF'
+import http.server
+import os
+import socketserver
+import subprocess
+import sys
+
+serverroot = sys.argv[1]
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def run_backend(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length > 0 else b""
+
+        env = dict(os.environ)
+        env["GIT_PROJECT_ROOT"] = serverroot
+        env["GIT_HTTP_EXPORT_ALL"] = "1"
+        env["REQUEST_METHOD"] = self.command
+        path, _, query = self.path.partition("?")
+        env["PATH_INFO"] = path
+        env["QUERY_STRING"] = query
+        env["SERVER_PROTOCOL"] = "HTTP/1.1"
+        env["GATEWAY_INTERFACE"] = "CGI/1.1"
+        env["SERVER_NAME"] = "127.0.0.1"
+        env["SERVER_PORT"] = str(self.server.server_address[1])
+        env["REMOTE_ADDR"] = self.client_address[0]
+        ctype = self.headers.get("Content-Type")
+        if ctype:
+            env["CONTENT_TYPE"] = ctype
+        env["CONTENT_LENGTH"] = str(length)
+
+        proc = subprocess.run(
+            ["git", "http-backend"],
+            input=body,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out = proc.stdout
+
+        header_end = out.find(b"\r\n\r\n")
+        sep_len = 4
+        if header_end == -1:
+            header_end = out.find(b"\n\n")
+            sep_len = 2
+        if header_end == -1:
+            self.send_response(502)
+            self.end_headers()
+            return
+
+        header_blob = out[:header_end].decode("utf-8", "replace")
+        payload = out[header_end + sep_len:]
+
+        status = 200
+        headers = []
+        for line in header_blob.split("\n"):
+            line = line.strip("\r")
+            if not line:
+                continue
+            k, _, v = line.partition(":")
+            v = v.strip()
+            if k.lower() == "status":
+                status = int(v.split()[0])
+            else:
+                headers.append((k, v))
+
+        self.send_response(status)
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        self.run_backend()
+
+    def do_POST(self):
+        self.run_backend()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class Server(socketserver.TCPServer):
+    allow_reuse_address = True
+
+
+httpd = Server(("127.0.0.1", 0), Handler)
+print("PORT %d" % httpd.server_address[1], flush=True)
+httpd.serve_forever()
+PYEOF
+
+    HTTP_SERVER_LOG="$WORKDIR/http_server.log"
+    python3 "$HTTP_SERVER_SCRIPT" "$HTTP_SERVERROOT" > "$HTTP_SERVER_LOG" 2>&1 &
+    HTTP_SERVER_PID=$!
+
+    HTTP_PORT=""
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if [ -s "$HTTP_SERVER_LOG" ]; then
+            HTTP_PORT=$(awk '/^PORT /{print $2; exit}' "$HTTP_SERVER_LOG")
+            if [ -n "$HTTP_PORT" ]; then
+                break
+            fi
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    if [ -z "$HTTP_PORT" ]; then
+        echo "warning: HTTP test server 未能在時限內就緒，跳過 phase 5b HTTP 測試" >&2
+        HTTP_AVAILABLE=0
+    fi
+fi
+
+if [ "$HTTP_AVAILABLE" = 1 ]; then
+    HTTP_BASE_URL="http://127.0.0.1:$HTTP_PORT/repo.git"
+    HTTP_DEST="$WORKDIR/http_clone_dest"
+    HTTP_SRC_HEAD=$(cd "$HTTP_SRC" && git rev-parse HEAD)
+    HTTP_SRC_BRANCH=$(cd "$HTTP_SRC" && git rev-parse --abbrev-ref HEAD)
+
+    CLONE_OUT="$WORKDIR/http_clone_out.txt"
+    "$SG" clone "$HTTP_BASE_URL" "$HTTP_DEST" > "$CLONE_OUT" 2>&1
+    check "phase5b: sg clone over smart HTTP exits 0" test $? = 0
+
+    check "phase5b: cloned local branch sha matches source HEAD" \
+        sh -c "test -f '$HTTP_DEST/.git/refs/heads/$HTTP_SRC_BRANCH' && test \"\$(cat '$HTTP_DEST/.git/refs/heads/$HTTP_SRC_BRANCH')\" = '$HTTP_SRC_HEAD'"
+
+    check "phase5b: cloned working tree top.txt matches source" \
+        cmp -s "$HTTP_SRC/top.txt" "$HTTP_DEST/top.txt"
+    check "phase5b: cloned working tree sub/nested.txt matches source" \
+        cmp -s "$HTTP_SRC/sub/nested.txt" "$HTTP_DEST/sub/nested.txt"
+    check "phase5b: cloned working tree binary file matches source" \
+        cmp -s "$HTTP_SRC/bin.dat" "$HTTP_DEST/bin.dat"
+
+    check "phase5b: git fsck passes on the cloned repo" \
+        sh -c "git -C '$HTTP_DEST' fsck > /dev/null 2>&1"
+
+    GIT_LOG_HTTP="$WORKDIR/http_git_log.txt"
+    git -C "$HTTP_DEST" log --oneline > "$GIT_LOG_HTTP" 2>&1
+    check "phase5b: git log reads both commits from the cloned repo" \
+        test "$(wc -l < "$GIT_LOG_HTTP" | tr -d ' ')" = 2
+
+    SG_LOG_HTTP_OUT="$WORKDIR/http_sg_log.txt"
+    (cd "$HTTP_DEST" && "$SG" log) > "$SG_LOG_HTTP_OUT" 2>&1
+    check "phase5b: sg log exits 0 on the cloned repo" test $? = 0
+    check "phase5b: sg log shows the source HEAD sha" grep -q "$HTTP_SRC_HEAD" "$SG_LOG_HTTP_OUT"
+
+    SG_STATUS_HTTP_OUT="$WORKDIR/http_sg_status.txt"
+    (cd "$HTTP_DEST" && "$SG" status) > "$SG_STATUS_HTTP_OUT" 2>&1
+    check "phase5b: sg status exits 0 on the cloned repo" test $? = 0
+    check "phase5b: sg status reports clean tree on the cloned repo" \
+        grep -q "nothing to commit" "$SG_STATUS_HTTP_OUT"
+
+    # --- clone must also fetch and write tags (refs/tags/v1.0 was created on
+    # the source before the bare repo was cloned), not just branches ---
+    HTTP_SRC_V1=$(cd "$HTTP_SRC" && git rev-parse v1.0)
+    check "phase5b: sg clone wrote refs/tags/v1.0 with the correct sha" \
+        sh -c "test -f '$HTTP_DEST/.git/refs/tags/v1.0' && test \"\$(cat '$HTTP_DEST/.git/refs/tags/v1.0')\" = '$HTTP_SRC_V1'"
+
+    # --- .idx must be byte-for-byte identical to real `git index-pack`'s output ---
+    HTTP_PACK_FILE=$(find "$HTTP_DEST/.git/objects/pack" -name '*.pack' | head -1)
+    HTTP_OUR_IDX=$(find "$HTTP_DEST/.git/objects/pack" -name '*.idx' | head -1)
+    check "phase5b: a .pack file exists after clone" test -n "$HTTP_PACK_FILE"
+    check "phase5b: a .idx file exists after clone" test -n "$HTTP_OUR_IDX"
+
+    if [ -n "$HTTP_PACK_FILE" ]; then
+        HTTP_VERIFY_DIR="$WORKDIR/http_idx_verify"
+        mkdir -p "$HTTP_VERIFY_DIR"
+        cp "$HTTP_PACK_FILE" "$HTTP_VERIFY_DIR/"
+        GIT_IDXPACK_OUT="$WORKDIR/http_index_pack_out.txt"
+        (cd "$HTTP_VERIFY_DIR" && git index-pack "$(basename "$HTTP_PACK_FILE")") > "$GIT_IDXPACK_OUT" 2>&1
+        check "phase5b: real git index-pack succeeds on our received pack" test $? = 0
+
+        GIT_IDX_FILE="$HTTP_VERIFY_DIR/$(basename "$HTTP_PACK_FILE" .pack).idx"
+        check "phase5b: our .idx is byte-for-byte identical to git index-pack's .idx" \
+            cmp -s "$HTTP_OUR_IDX" "$GIT_IDX_FILE"
+    fi
+
+    # --- cloning into an existing, non-empty directory must be refused ---
+    RECLONE_OUT="$WORKDIR/http_reclone_out.txt"
+    "$SG" clone "$HTTP_BASE_URL" "$HTTP_DEST" > "$RECLONE_OUT" 2>&1
+    check "phase5b: sg clone into an existing non-empty directory is refused" test $? -ne 0
+
+    # --- fetch: add a commit (and a new tag on it) on the source, push both
+    # to the bare serving repo, then fetch into the clone made above ---
+    printf 'top level file\nsecond line\nthird line\n' > "$HTTP_SRC/top.txt"
+    (cd "$HTTP_SRC" && git add top.txt && git commit -q -m "third commit") > /dev/null 2>&1
+    (cd "$HTTP_SRC" && git tag v2.0) > /dev/null 2>&1
+    (cd "$HTTP_SRC" && git push -q "$HTTP_SERVERROOT/repo.git" "HEAD:refs/heads/$HTTP_SRC_BRANCH") > /dev/null 2>&1
+    (cd "$HTTP_SRC" && git push -q "$HTTP_SERVERROOT/repo.git" refs/tags/v2.0) > /dev/null 2>&1
+    NEW_SRC_HEAD=$(cd "$HTTP_SRC" && git rev-parse HEAD)
+    HTTP_SRC_V2=$(cd "$HTTP_SRC" && git rev-parse v2.0)
+
+    FETCH_OUT="$WORKDIR/http_fetch_out.txt"
+    (cd "$HTTP_DEST" && "$SG" fetch) > "$FETCH_OUT" 2>&1
+    check "phase5b: sg fetch exits 0" test $? = 0
+    check "phase5b: sg fetch reports the updated branch" grep -q "$HTTP_SRC_BRANCH" "$FETCH_OUT"
+    check "phase5b: sg fetch reports the new tag" grep -q "v2.0" "$FETCH_OUT"
+
+    check "phase5b: refs/remotes/origin/<branch> now points at the new commit" \
+        sh -c "test \"\$(cat '$HTTP_DEST/.git/refs/remotes/origin/$HTTP_SRC_BRANCH')\" = '$NEW_SRC_HEAD'"
+    check "phase5b: sg fetch wrote the new tag refs/tags/v2.0 with the correct sha" \
+        sh -c "test -f '$HTTP_DEST/.git/refs/tags/v2.0' && test \"\$(cat '$HTTP_DEST/.git/refs/tags/v2.0')\" = '$HTTP_SRC_V2'"
+    check "phase5b: git fsck still passes after fetch" \
+        sh -c "git -C '$HTTP_DEST' fsck > /dev/null 2>&1"
+
+    check "phase5b: sg fetch did not move the local branch" \
+        sh -c "test \"\$(cat '$HTTP_DEST/.git/refs/heads/$HTTP_SRC_BRANCH')\" = '$HTTP_SRC_HEAD'"
+    check "phase5b: sg fetch did not touch the working tree" \
+        sh -c "! grep -q 'third line' '$HTTP_DEST/top.txt'"
+
+    FETCH_AGAIN_OUT="$WORKDIR/http_fetch_again_out.txt"
+    (cd "$HTTP_DEST" && "$SG" fetch) > "$FETCH_AGAIN_OUT" 2>&1
+    check "phase5b: a second sg fetch (nothing new) exits 0" test $? = 0
+    check "phase5b: a second sg fetch reports already up to date" \
+        grep -q "Already up to date" "$FETCH_AGAIN_OUT"
+
+    kill "$HTTP_SERVER_PID" 2>/dev/null
+    HTTP_SERVER_PID=""
+else
+    skip "phase5b: sg clone over smart HTTP"
+    skip "phase5b: sg fetch over smart HTTP"
+fi
+
 echo ""
-echo "interop: $PASS/$TOTAL passed"
+echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
 if [ "$FAIL" -gt 0 ]; then
     exit 1

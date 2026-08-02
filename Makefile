@@ -7,9 +7,11 @@ ZLIB_CFLAGS   := $(shell $(PKG_CONFIG) --cflags zlib)
 ZLIB_LIBS     := $(shell $(PKG_CONFIG) --libs zlib)
 OPENSSL_CFLAGS := $(shell $(PKG_CONFIG) --cflags openssl)
 OPENSSL_LIBS   := $(shell $(PKG_CONFIG) --libs openssl)
+CURL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libcurl)
+CURL_LIBS   := $(shell $(PKG_CONFIG) --libs libcurl)
 
-CFLAGS  += $(ZLIB_CFLAGS) $(OPENSSL_CFLAGS)
-LDFLAGS += $(ZLIB_LIBS) $(OPENSSL_LIBS)
+CFLAGS  += $(ZLIB_CFLAGS) $(OPENSSL_CFLAGS) $(CURL_CFLAGS)
+LDFLAGS += $(ZLIB_LIBS) $(OPENSSL_LIBS) $(CURL_LIBS)
 
 BUILD_DIR := build
 BIN       := $(BUILD_DIR)/sg
@@ -43,7 +45,7 @@ test: $(TEST_BINS)
 
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize: LDFLAGS += -fsanitize=address,undefined
-sanitize: clean test
+sanitize: clean test $(BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)

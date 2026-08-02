@@ -179,6 +179,13 @@ int sg_pack_delta_apply(const unsigned char *base, size_t base_len, const unsign
     if (hdr_base_size != (uint64_t)base_len)
         return -1;
 
+    /* hdr_target_size is delta-stream-controlled. On a build where size_t is
+       narrower than uint64_t, casting it below would truncate the allocation
+       while the bounds checks further down keep using the full 64-bit value
+       -- a heap overflow. Reject anything size_t can't represent. */
+    if (hdr_target_size > (uint64_t)SIZE_MAX)
+        return -1;
+
     result = malloc(hdr_target_size > 0 ? (size_t)hdr_target_size : 1);
     if (result == NULL)
         return -1;
@@ -721,25 +728,99 @@ static int write_atomic(const char *dir, const char *final_path, const unsigned 
     return 0;
 }
 
-int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN], size_t count)
+/* Shared by sg_pack_write and sg_pack_index_existing: sorts entries by id,
+   builds the fanout / sorted-sha1 / crc32 / offset tables plus trailer, and
+   atomically writes the result to idx_path (same version-2 .idx format
+   either caller produces). Returns 0 on success, -1 on failure. */
+static int write_idx_for_pack(const char *pack_dir, const char *idx_path,
+                              pack_entry_meta *entries, size_t count,
+                              const unsigned char pack_sha1[SG_SHA1_RAW_LEN])
 {
-    byte_buf pack_buf;
     byte_buf idx_buf;
-    pack_entry_meta *entries;
-    unsigned char header[12];
-    unsigned char pack_sha1[SG_SHA1_RAW_LEN];
     unsigned char idx_sha1[SG_SHA1_RAW_LEN];
-    char pack_hex[SG_SHA1_HEX_LEN + 1];
-    char pack_dir[SG_PATH_MAX];
-    char pack_path[SG_PATH_MAX];
-    char idx_path[SG_PATH_MAX];
     uint32_t counts[256];
     uint32_t fanout[256];
     size_t i;
     int ok = 0;
 
-    memset(&pack_buf, 0, sizeof(pack_buf));
     memset(&idx_buf, 0, sizeof(idx_buf));
+
+    qsort(entries, count, sizeof(*entries), cmp_entry_by_id);
+
+    memset(counts, 0, sizeof(counts));
+    for (i = 0; i < count; i++)
+        counts[entries[i].id[0]]++;
+    {
+        uint32_t running = 0;
+
+        for (i = 0; i < 256; i++) {
+            running += counts[i];
+            fanout[i] = running;
+        }
+    }
+
+    {
+        unsigned char idx_header[8] = {0xff, 0x74, 0x4f, 0x63, 0, 0, 0, 2};
+
+        if (buf_append(&idx_buf, idx_header, sizeof(idx_header)) != 0)
+            goto done;
+    }
+    for (i = 0; i < 256; i++) {
+        unsigned char be[4];
+
+        put_be32(be, fanout[i]);
+        if (buf_append(&idx_buf, be, 4) != 0)
+            goto done;
+    }
+    for (i = 0; i < count; i++) {
+        if (buf_append(&idx_buf, entries[i].id, SG_SHA1_RAW_LEN) != 0)
+            goto done;
+    }
+    for (i = 0; i < count; i++) {
+        unsigned char be[4];
+
+        put_be32(be, entries[i].crc);
+        if (buf_append(&idx_buf, be, 4) != 0)
+            goto done;
+    }
+    for (i = 0; i < count; i++) {
+        unsigned char be[4];
+
+        put_be32(be, (uint32_t)entries[i].offset);
+        if (buf_append(&idx_buf, be, 4) != 0)
+            goto done;
+    }
+    if (buf_append(&idx_buf, pack_sha1, SG_SHA1_RAW_LEN) != 0)
+        goto done;
+
+    sg_sha1(idx_buf.data, idx_buf.len, idx_sha1);
+    if (buf_append(&idx_buf, idx_sha1, SG_SHA1_RAW_LEN) != 0)
+        goto done;
+
+    if (write_atomic(pack_dir, idx_path, idx_buf.data, idx_buf.len) != 0)
+        goto done;
+
+    ok = 1;
+
+done:
+    free(idx_buf.data);
+    return ok ? 0 : -1;
+}
+
+int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LEN], size_t count)
+{
+    byte_buf pack_buf;
+    pack_entry_meta *entries;
+    unsigned char header[12];
+    unsigned char pack_sha1[SG_SHA1_RAW_LEN];
+    char pack_hex[SG_SHA1_HEX_LEN + 1];
+    char pack_dir[SG_PATH_MAX];
+    char pack_path[SG_PATH_MAX];
+    char idx_path[SG_PATH_MAX];
+    size_t i;
+    int ok = 0;
+
+    memset(&pack_buf, 0, sizeof(pack_buf));
 
     entries = malloc(count > 0 ? count * sizeof(*entries) : 1);
     if (entries == NULL)
@@ -805,58 +886,6 @@ int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LE
         goto done;
     sg_sha1_to_hex(pack_sha1, pack_hex);
 
-    qsort(entries, count, sizeof(*entries), cmp_entry_by_id);
-
-    memset(counts, 0, sizeof(counts));
-    for (i = 0; i < count; i++)
-        counts[entries[i].id[0]]++;
-    {
-        uint32_t running = 0;
-
-        for (i = 0; i < 256; i++) {
-            running += counts[i];
-            fanout[i] = running;
-        }
-    }
-
-    {
-        unsigned char idx_header[8] = {0xff, 0x74, 0x4f, 0x63, 0, 0, 0, 2};
-
-        if (buf_append(&idx_buf, idx_header, sizeof(idx_header)) != 0)
-            goto done;
-    }
-    for (i = 0; i < 256; i++) {
-        unsigned char be[4];
-
-        put_be32(be, fanout[i]);
-        if (buf_append(&idx_buf, be, 4) != 0)
-            goto done;
-    }
-    for (i = 0; i < count; i++) {
-        if (buf_append(&idx_buf, entries[i].id, SG_SHA1_RAW_LEN) != 0)
-            goto done;
-    }
-    for (i = 0; i < count; i++) {
-        unsigned char be[4];
-
-        put_be32(be, entries[i].crc);
-        if (buf_append(&idx_buf, be, 4) != 0)
-            goto done;
-    }
-    for (i = 0; i < count; i++) {
-        unsigned char be[4];
-
-        put_be32(be, (uint32_t)entries[i].offset);
-        if (buf_append(&idx_buf, be, 4) != 0)
-            goto done;
-    }
-    if (buf_append(&idx_buf, pack_sha1, SG_SHA1_RAW_LEN) != 0)
-        goto done;
-
-    sg_sha1(idx_buf.data, idx_buf.len, idx_sha1);
-    if (buf_append(&idx_buf, idx_sha1, SG_SHA1_RAW_LEN) != 0)
-        goto done;
-
     snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", git_dir);
     if (mkdir(pack_dir, 0755) != 0 && errno != EEXIST)
         goto done;
@@ -866,7 +895,7 @@ int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LE
 
     if (write_atomic(pack_dir, pack_path, pack_buf.data, pack_buf.len) != 0)
         goto done;
-    if (write_atomic(pack_dir, idx_path, idx_buf.data, idx_buf.len) != 0)
+    if (write_idx_for_pack(pack_dir, idx_path, entries, count, pack_sha1) != 0)
         goto done;
 
     ok = 1;
@@ -874,6 +903,492 @@ int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LE
 done:
     free(entries);
     free(pack_buf.data);
-    free(idx_buf.data);
     return ok ? 0 : -1;
+}
+
+/* ---- indexing an already-on-disk pack received over the network ---- */
+
+/* Per-entry bookkeeping built by the metadata pass (pass 1) below and
+   consumed by the resolve pass (pass 2). data_offset/decompressed_size let
+   pass 2 re-inflate the entry's compressed bytes on demand without having
+   kept them decompressed in memory since pass 1; crc is already final
+   (computed in pass 1, since it only needs the raw compressed byte range,
+   not the decompressed content). */
+typedef struct {
+    size_t start_offset;
+    size_t data_offset;
+    size_t decompressed_size;
+    int raw_type;
+    size_t base_offset;                    /* valid if raw_type == OFS_DELTA */
+    unsigned char base_id[SG_SHA1_RAW_LEN]; /* valid if raw_type == REF_DELTA */
+    uint32_t crc;
+} idx_build_entry;
+
+typedef struct {
+    const char *git_dir;
+    const unsigned char *pack_data;
+    size_t pack_len;
+    idx_build_entry *metas;
+    size_t count;
+    /* pass-2 resolution state, indexed in parallel with metas; content[i] ==
+       NULL means "not yet resolved". Every resolved entry's full content is
+       kept until the whole pass finishes (rather than freed the instant
+       nothing *already processed* still needs it) -- an intentionally simple
+       choice given a REF_DELTA's base object id can't be matched against an
+       offset until that base is itself decoded, so knowing exactly when a
+       given entry is safe to free would need a separate dependency-closure
+       pre-pass; seen packs (single fetch's worth of objects) are expected to
+       comfortably fit in memory for this phase. */
+    sg_obj_type *type;
+    unsigned char **content;
+    size_t *content_len;
+    unsigned char (*id)[SG_SHA1_RAW_LEN];
+    /* id -> entry index, bucketed on the id's first byte and filled in as
+       entries resolve. Only resolved entries are ever inserted, so lookups
+       keep the "an unresolved entry can't serve as a base" property that
+       breaks REF_DELTA cycles -- this is purely a faster way to ask the same
+       question than scanning all `count` entries per REF_DELTA, which a
+       hostile pack full of REF_DELTAs could otherwise drive to O(n^2). */
+    size_t **bucket;
+    size_t *bucket_len;
+    size_t *bucket_cap;
+} idx_build_ctx;
+
+#define SG_IDX_BUILD_BUCKETS 256
+
+static int idx_build_bucket_add(idx_build_ctx *ctx, size_t entry_idx)
+{
+    unsigned char b = ctx->id[entry_idx][0];
+
+    if (ctx->bucket_len[b] == ctx->bucket_cap[b]) {
+        size_t new_cap = ctx->bucket_cap[b] == 0 ? 8 : ctx->bucket_cap[b] * 2;
+        size_t *grown = realloc(ctx->bucket[b], new_cap * sizeof(*grown));
+
+        if (grown == NULL)
+            return -1;
+        ctx->bucket[b] = grown;
+        ctx->bucket_cap[b] = new_cap;
+    }
+    ctx->bucket[b][ctx->bucket_len[b]++] = entry_idx;
+    return 0;
+}
+
+/* entries are laid out in strictly increasing start_offset order (pass 1
+   walks the pack linearly), so this is a binary search. */
+static int idx_build_find_by_offset(const idx_build_ctx *ctx, size_t offset, size_t *idx_out)
+{
+    size_t lo = 0, hi = ctx->count;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if (ctx->metas[mid].start_offset == offset) {
+            *idx_out = mid;
+            return 0;
+        }
+        if (ctx->metas[mid].start_offset < offset)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return -1;
+}
+
+/* Only entries already resolved (content != NULL) have a valid id -- by the
+   time this is called for entry k, every entry with index < k has already
+   been fully resolved (the pass-2 driving loop processes indices in order
+   and blocks on each), which is exactly what a REF_DELTA base is guaranteed
+   to satisfy for a non-thin pack (its base is always written earlier). */
+static int idx_build_find_by_id(const idx_build_ctx *ctx, const unsigned char id[SG_SHA1_RAW_LEN],
+                                size_t *idx_out)
+{
+    unsigned char b = id[0];
+    size_t k;
+
+    for (k = 0; k < ctx->bucket_len[b]; k++) {
+        size_t i = ctx->bucket[b][k];
+
+        if (ctx->content[i] != NULL && memcmp(ctx->id[i], id, SG_SHA1_RAW_LEN) == 0) {
+            *idx_out = i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int idx_build_resolve(idx_build_ctx *ctx, size_t idx, int depth)
+{
+    idx_build_entry *m;
+
+    if (idx >= ctx->count)
+        return -1;
+    if (ctx->content[idx] != NULL)
+        return 0;
+    if (depth > SG_PACK_MAX_DELTA_DEPTH)
+        return -1;
+    m = &ctx->metas[idx];
+
+    if (m->raw_type == SG_PACK_TYPE_OFS_DELTA || m->raw_type == SG_PACK_TYPE_REF_DELTA) {
+        unsigned char *base_content;
+        size_t base_len;
+        sg_obj_type base_type;
+        int base_is_external = 0;
+        unsigned char *delta_data;
+        size_t consumed;
+        int rc;
+
+        if (m->raw_type == SG_PACK_TYPE_OFS_DELTA) {
+            size_t base_idx;
+
+            if (idx_build_find_by_offset(ctx, m->base_offset, &base_idx) != 0)
+                return -1;
+            if (idx_build_resolve(ctx, base_idx, depth + 1) != 0)
+                return -1;
+            base_content = ctx->content[base_idx];
+            base_len = ctx->content_len[base_idx];
+            base_type = ctx->type[base_idx];
+        } else {
+            size_t base_idx;
+
+            if (idx_build_find_by_id(ctx, m->base_id, &base_idx) == 0) {
+                if (idx_build_resolve(ctx, base_idx, depth + 1) != 0)
+                    return -1;
+                base_content = ctx->content[base_idx];
+                base_len = ctx->content_len[base_idx];
+                base_type = ctx->type[base_idx];
+            } else if (sg_object_read(ctx->git_dir, m->base_id, &base_type, &base_content,
+                                      &base_len) == 0) {
+                /* not in this (thin-less) pack -- shouldn't normally happen,
+                   but fall back to local storage rather than fail outright */
+                base_is_external = 1;
+            } else {
+                return -1;
+            }
+        }
+
+        delta_data = malloc(m->decompressed_size > 0 ? m->decompressed_size : 1);
+        if (delta_data == NULL) {
+            if (base_is_external)
+                free(base_content);
+            return -1;
+        }
+        if (pack_inflate(ctx->pack_data + m->data_offset, ctx->pack_len - m->data_offset,
+                         m->decompressed_size, delta_data, &consumed) != 0) {
+            free(delta_data);
+            if (base_is_external)
+                free(base_content);
+            return -1;
+        }
+
+        rc = sg_pack_delta_apply(base_content, base_len, delta_data, m->decompressed_size,
+                                 &ctx->content[idx], &ctx->content_len[idx]);
+        free(delta_data);
+        if (base_is_external)
+            free(base_content);
+        if (rc != 0)
+            return -1;
+        ctx->type[idx] = base_type;
+    } else {
+        sg_obj_type t;
+        unsigned char *content;
+        size_t consumed;
+
+        if (pack_type_to_obj_type(m->raw_type, &t) != 0)
+            return -1;
+        content = malloc(m->decompressed_size > 0 ? m->decompressed_size : 1);
+        if (content == NULL)
+            return -1;
+        if (pack_inflate(ctx->pack_data + m->data_offset, ctx->pack_len - m->data_offset,
+                         m->decompressed_size, content, &consumed) != 0) {
+            free(content);
+            return -1;
+        }
+        ctx->content[idx] = content;
+        ctx->content_len[idx] = m->decompressed_size;
+        ctx->type[idx] = t;
+    }
+
+    sg_object_hash(ctx->type[idx], ctx->content[idx], ctx->content_len[idx], ctx->id[idx]);
+    return idx_build_bucket_add(ctx, idx);
+}
+
+/* Finds the last "/objects/pack/" component of pack_path (there should only
+   ever be one, but scanning for the last occurrence is cheap insurance
+   against a pathological git_dir path that itself contains that substring)
+   and returns everything before it. */
+static int git_dir_from_pack_path(const char *pack_path, char *out, size_t out_size)
+{
+    static const char marker[] = "/objects/pack/";
+    const char *search = pack_path;
+    const char *last = NULL;
+    size_t len;
+
+    while ((search = strstr(search, marker)) != NULL) {
+        last = search;
+        search++;
+    }
+    if (last == NULL)
+        return -1;
+
+    len = (size_t)(last - pack_path);
+    if (len + 1 > out_size)
+        return -1;
+    memcpy(out, pack_path, len);
+    out[len] = '\0';
+    return 0;
+}
+
+static int idx_path_from_pack_path(const char *pack_path, char *out, size_t out_size)
+{
+    size_t len = strlen(pack_path);
+
+    if (len < 5 || strcmp(pack_path + len - 5, ".pack") != 0)
+        return -1;
+    if (len - 5 + 4 + 1 > out_size)
+        return -1;
+    memcpy(out, pack_path, len - 5);
+    memcpy(out + (len - 5), ".idx", 5); /* includes the NUL */
+    return 0;
+}
+
+int sg_pack_index_existing(const char *pack_path)
+{
+    char git_dir[SG_PATH_MAX];
+    char pack_dir[SG_PATH_MAX];
+    char idx_path[SG_PATH_MAX];
+    unsigned char *pack_data = NULL;
+    size_t pack_len = 0;
+    uint32_t count;
+    size_t pos;
+    size_t i;
+    unsigned char computed_trailer[SG_SHA1_RAW_LEN];
+    idx_build_entry *metas = NULL;
+    sg_obj_type *types = NULL;
+    unsigned char **contents = NULL;
+    size_t *content_lens = NULL;
+    unsigned char (*ids)[SG_SHA1_RAW_LEN] = NULL;
+    size_t **buckets = NULL;
+    size_t *bucket_lens = NULL;
+    size_t *bucket_caps = NULL;
+    pack_entry_meta *out_entries = NULL;
+    idx_build_ctx ctx;
+    int ok = 0;
+
+    if (git_dir_from_pack_path(pack_path, git_dir, sizeof(git_dir)) != 0) {
+        fprintf(stderr, "sg: pack path is not under .../objects/pack/: %s\n", pack_path);
+        return -1;
+    }
+    snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", git_dir);
+    if (idx_path_from_pack_path(pack_path, idx_path, sizeof(idx_path)) != 0) {
+        fprintf(stderr, "sg: not a .pack path: %s\n", pack_path);
+        return -1;
+    }
+
+    if (pack_load(pack_path, &pack_data, &pack_len) != 0) {
+        fprintf(stderr, "sg: failed to read %s\n", pack_path);
+        return -1;
+    }
+
+    if (pack_len < 12 + SG_SHA1_RAW_LEN || memcmp(pack_data, "PACK", 4) != 0 ||
+       be32(pack_data + 4) != 2) {
+        fprintf(stderr, "sg: %s is not a valid version-2 pack\n", pack_path);
+        goto done;
+    }
+    sg_sha1(pack_data, pack_len - SG_SHA1_RAW_LEN, computed_trailer);
+    if (memcmp(computed_trailer, pack_data + pack_len - SG_SHA1_RAW_LEN, SG_SHA1_RAW_LEN) != 0) {
+        fprintf(stderr, "sg: %s fails trailer checksum verification\n", pack_path);
+        goto done;
+    }
+
+    count = be32(pack_data + 8);
+    /* The count is attacker-controlled. Every entry needs at least a header
+       byte plus a zlib stream, so a count exceeding the bytes actually
+       available is a lie -- reject it before sizing any allocation off it. */
+    if ((uint64_t)count > (uint64_t)(pack_len - 12 - SG_SHA1_RAW_LEN)) {
+        fprintf(stderr, "sg: %s declares %u objects, more than its size allows\n", pack_path,
+               count);
+        goto done;
+    }
+    metas = malloc(count > 0 ? count * sizeof(*metas) : 1);
+    if (metas == NULL)
+        goto done;
+
+    /* ---- pass 1: per-entry metadata (type, delta base ref, crc) only ---- */
+    pos = 12;
+    for (i = 0; i < count; i++) {
+        size_t start = pos;
+        int raw_type;
+        uint64_t size;
+        size_t n;
+        size_t data_offset;
+        unsigned char *scratch;
+        size_t consumed;
+        uLong crc;
+
+        if (start > 0x7fffffffULL) {
+            /* would need the 8-byte large-offset .idx table; not supported */
+            fprintf(stderr, "sg: %s is too large (needs large-offset .idx, unsupported)\n",
+                   pack_path);
+            goto done;
+        }
+
+        n = sg_pack_decode_obj_header(pack_data + pos, pack_len - pos, &raw_type, &size);
+        if (n == 0) {
+            fprintf(stderr, "sg: %s: malformed entry header at offset %zu\n", pack_path, start);
+            goto done;
+        }
+        pos += n;
+
+        metas[i].base_offset = 0;
+        if (raw_type == SG_PACK_TYPE_OFS_DELTA) {
+            uint64_t rel;
+
+            n = sg_pack_decode_ofs_delta_offset(pack_data + pos, pack_len - pos, &rel);
+            if (n == 0 || rel == 0 || rel > start) {
+                fprintf(stderr, "sg: %s: malformed OFS_DELTA offset at %zu\n", pack_path, start);
+                goto done;
+            }
+            pos += n;
+            metas[i].base_offset = start - (size_t)rel;
+        } else if (raw_type == SG_PACK_TYPE_REF_DELTA) {
+            if (pack_len - pos < SG_SHA1_RAW_LEN) {
+                fprintf(stderr, "sg: %s: truncated REF_DELTA base id at %zu\n", pack_path, start);
+                goto done;
+            }
+            memcpy(metas[i].base_id, pack_data + pos, SG_SHA1_RAW_LEN);
+            pos += SG_SHA1_RAW_LEN;
+        } else if (raw_type < SG_PACK_TYPE_COMMIT || raw_type > SG_PACK_TYPE_TAG) {
+            fprintf(stderr, "sg: %s: unrecognized object type %d at %zu\n", pack_path, raw_type,
+                   start);
+            goto done;
+        }
+
+        data_offset = pos;
+        scratch = malloc(size > 0 ? (size_t)size : 1);
+        if (scratch == NULL)
+            goto done;
+        if (pack_inflate(pack_data + data_offset, pack_len - data_offset, (size_t)size, scratch,
+                         &consumed) != 0) {
+            free(scratch);
+            fprintf(stderr, "sg: %s: zlib inflate failed for entry at %zu\n", pack_path, start);
+            goto done;
+        }
+        free(scratch);
+        pos = data_offset + consumed;
+
+        crc = crc32(0L, Z_NULL, 0);
+        crc = crc32(crc, pack_data + start, (uInt)(pos - start));
+
+        metas[i].start_offset = start;
+        metas[i].data_offset = data_offset;
+        metas[i].decompressed_size = (size_t)size;
+        metas[i].raw_type = raw_type;
+        metas[i].crc = (uint32_t)crc;
+    }
+
+    if (pos != pack_len - SG_SHA1_RAW_LEN) {
+        fprintf(stderr, "sg: %s: trailing garbage after the last object entry\n", pack_path);
+        goto done;
+    }
+
+    /* ---- pass 2: resolve each entry's full content just long enough to
+       hash it, recursing into delta bases (which may themselves still need
+       resolving) as needed ---- */
+    types = malloc(count > 0 ? count * sizeof(*types) : 1);
+    contents = calloc(count > 0 ? count : 1, sizeof(*contents));
+    content_lens = malloc(count > 0 ? count * sizeof(*content_lens) : 1);
+    ids = malloc(count > 0 ? count * sizeof(*ids) : 1);
+    buckets = calloc(SG_IDX_BUILD_BUCKETS, sizeof(*buckets));
+    bucket_lens = calloc(SG_IDX_BUILD_BUCKETS, sizeof(*bucket_lens));
+    bucket_caps = calloc(SG_IDX_BUILD_BUCKETS, sizeof(*bucket_caps));
+    if (types == NULL || contents == NULL || content_lens == NULL || ids == NULL ||
+       buckets == NULL || bucket_lens == NULL || bucket_caps == NULL)
+        goto done;
+
+    ctx.git_dir = git_dir;
+    ctx.pack_data = pack_data;
+    ctx.pack_len = pack_len;
+    ctx.metas = metas;
+    ctx.count = count;
+    ctx.type = types;
+    ctx.content = contents;
+    ctx.content_len = content_lens;
+    ctx.id = ids;
+    ctx.bucket = buckets;
+    ctx.bucket_len = bucket_lens;
+    ctx.bucket_cap = bucket_caps;
+
+    for (i = 0; i < count; i++) {
+        if (idx_build_resolve(&ctx, i, 0) != 0) {
+            fprintf(stderr, "sg: %s: failed to resolve object at offset %zu\n", pack_path,
+                   metas[i].start_offset);
+            goto done;
+        }
+    }
+
+    out_entries = malloc(count > 0 ? count * sizeof(*out_entries) : 1);
+    if (out_entries == NULL)
+        goto done;
+    for (i = 0; i < count; i++) {
+        memcpy(out_entries[i].id, ids[i], SG_SHA1_RAW_LEN);
+        out_entries[i].crc = metas[i].crc;
+        out_entries[i].offset = metas[i].start_offset;
+    }
+
+    if (write_idx_for_pack(pack_dir, idx_path, out_entries, count, computed_trailer) != 0) {
+        fprintf(stderr, "sg: failed to write %s\n", idx_path);
+        goto done;
+    }
+
+    ok = 1;
+
+done:
+    if (contents != NULL) {
+        for (i = 0; i < count; i++)
+            free(contents[i]);
+    }
+    free(contents);
+    free(content_lens);
+    free(types);
+    free(ids);
+    if (buckets != NULL) {
+        size_t b;
+
+        for (b = 0; b < SG_IDX_BUILD_BUCKETS; b++)
+            free(buckets[b]);
+    }
+    free(buckets);
+    free(bucket_lens);
+    free(bucket_caps);
+    free(out_entries);
+    free(metas);
+    free(pack_data);
+    return ok ? 0 : -1;
+}
+
+int sg_pack_store_raw(const char *git_dir, const unsigned char *data, size_t len,
+                      char **pack_path_out)
+{
+    char pack_dir[SG_PATH_MAX];
+    char pack_path[SG_PATH_MAX];
+    char pack_hex[SG_SHA1_HEX_LEN + 1];
+    unsigned char trailer[SG_SHA1_RAW_LEN];
+
+    if (len < 12 + SG_SHA1_RAW_LEN || memcmp(data, "PACK", 4) != 0) {
+        fprintf(stderr, "sg: refusing to store data that isn't a packfile\n");
+        return -1;
+    }
+    memcpy(trailer, data + len - SG_SHA1_RAW_LEN, SG_SHA1_RAW_LEN);
+    sg_sha1_to_hex(trailer, pack_hex);
+
+    snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", git_dir);
+    if (mkdir(pack_dir, 0755) != 0 && errno != EEXIST)
+        return -1;
+
+    snprintf(pack_path, sizeof(pack_path), "%s/pack-%s.pack", pack_dir, pack_hex);
+    if (write_atomic(pack_dir, pack_path, data, len) != 0)
+        return -1;
+
+    *pack_path_out = strdup(pack_path);
+    return (*pack_path_out != NULL) ? 0 : -1;
 }

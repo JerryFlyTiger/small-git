@@ -13,8 +13,8 @@ make test     # 執行測試
 make sanitize # 以 ASan/UBSan 建置並跑測試
 ```
 
-需要系統已安裝 `zlib`、`openssl`(透過 pkg-config 偵測)。
+需要系統已安裝 `zlib`、`openssl`、`libcurl`(均透過 pkg-config 偵測)。
 
 ## 現況
 
-Phase 0(專案骨架)。尚無可用功能。
+Phase 5b(smart HTTP clone/fetch,唯讀方向)。
