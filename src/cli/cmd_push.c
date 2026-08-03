@@ -195,9 +195,32 @@ static int walk_add_object(const char *git_dir, const unsigned char id[SG_SHA1_R
                notion of "is this really a pointer" (format alone is not
                enough -- see sg_chunk_pointer_parse's own doc comment). */
             unsigned char effective_id[SG_SHA1_RAW_LEN];
+            int eff_rc = sg_chunk_effective_id(git_dir, cur, effective_id);
 
-            if (sg_chunk_effective_id(git_dir, cur, effective_id) == 0 &&
-               memcmp(effective_id, cur, SG_SHA1_RAW_LEN) != 0) {
+            /* -2 means cur is a genuine chunk pointer (chunk_resolve's
+               discriminator recognized its first chunk id as real) whose
+               data is missing or corrupt -- e.g. a chunk that was never
+               kept alive, or was collected by a gc that raced with this
+               push. Silently falling through to "not a pointer, push cur's
+               739-ish raw bytes as-is" here would be exactly the bug this
+               phase fixed for restore, just replayed on the push path: the
+               remote would end up with a pointer blob that looks complete
+               (fsck-clean) but can never be reassembled. Abort the whole
+               push instead. */
+            if (eff_rc == -2) {
+                char hex[SG_SHA1_HEX_LEN + 1];
+
+                sg_sha1_to_hex(cur, hex);
+                fprintf(stderr,
+                       "sg: push 中止：分塊檔案的物件 %s 在本地物件庫中有缺失或損毀的資料塊，"
+                       "無法確保推送完整資料\n",
+                       hex);
+                free(content);
+                rc = -1;
+                break;
+            }
+
+            if (eff_rc == 0 && memcmp(effective_id, cur, SG_SHA1_RAW_LEN) != 0) {
                 sg_chunk_pointer ptr;
 
                 if (sg_chunk_pointer_parse(content, content_len, &ptr)) {

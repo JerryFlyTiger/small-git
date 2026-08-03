@@ -49,9 +49,19 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
         fprintf(stderr, "sg: '%s' is not tracked in the index\n", arg);
         return -1;
     }
-    if (sg_chunk_read_blob(git_dir, idx->entries[pos].sha1, &content, &content_len) != 0) {
-        fprintf(stderr, "sg: failed to read staged content for '%s'\n", arg);
-        return -1;
+    {
+        sg_chunk_missing_info missing;
+        int read_rc = sg_chunk_read_blob(git_dir, idx->entries[pos].sha1, &content, &content_len,
+                                         &missing);
+
+        if (read_rc == -2) {
+            sg_chunk_print_missing_error(arg, &missing);
+            return -1;
+        }
+        if (read_rc != 0) {
+            fprintf(stderr, "sg: failed to read staged content for '%s'\n", arg);
+            return -1;
+        }
     }
 
     snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, rel);

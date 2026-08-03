@@ -1404,17 +1404,18 @@ check "phase6a: sg restore round-trips a chunked file byte-for-byte" \
     cmp -s "$WORKDIR/p6a_original.bin" "$P6A_FILE"
 
 # case 5: git fsck stays clean (exit 0) on a repo containing chunked blobs.
-# The individual chunk blobs are, from git's own object-model perspective,
-# unreachable ("dangling") -- they're referenced only as plain hex text
-# inside the pointer blob's content, not via a real tree/commit graph edge,
-# so `git fsck` reports them as dangling. That's an expected, harmless
-# side-effect of this storage scheme, not corruption: git fsck still exits 0
-# and reports no actual errors (missing/broken links), so check the exit
-# code rather than requiring empty output.
+# As of the phase 6b durability fix, the individual chunk blobs are no
+# longer dangling from git's own object-model perspective either: they're
+# also referenced via the refs/sg/chunks keep-alive tree (see chunk.c's
+# keep_alive_add), a real tree/commit graph edge, not just plain hex text
+# inside the pointer blob's content -- that's precisely what makes them
+# survive `git gc` (see phase6b's core acceptance test below). Either way,
+# `git fsck` exits 0 and reports no actual errors (missing/broken links), so
+# check the exit code rather than requiring empty output.
 P6A_FSCK_OUT="$WORKDIR/p6a_fsck.txt"
 (cd "$P6A_REPO" && git fsck) > "$P6A_FSCK_OUT" 2>&1
 P6A_FSCK_RC=$?
-check "phase6a: git fsck exits 0 on a repo containing chunked blobs (dangling-chunk notices are expected, not errors)" \
+check "phase6a: git fsck exits 0 on a repo containing chunked blobs" \
     test "$P6A_FSCK_RC" = 0
 
 # case 4: deduplication -- editing a small region in the middle of a large
@@ -1609,6 +1610,335 @@ else
     skip "phase6a: git fsck exits 0 on the bare repo after pushing a chunked blob"
     skip "phase6a: sg clone over smart HTTP exits 0 for a repo containing a chunked blob"
     skip "phase6a: a plain clone cannot recover chunk data a real git server never advertised as reachable"
+fi
+
+# --- Phase 6b: chunk durability (refs/sg/chunks keep-alive) and the
+# real-pointer-vs-fake-pointer discriminator fix ---
+#
+# Recap of the two problems phase6b fixes (see chunk.c/refs.c and this
+# phase's report for the full design):
+#   1. (durability) chunk ids were only named as plain hex text inside a
+#      pointer blob's content, not a real tree/commit graph edge, so any
+#      `git gc` (manual or gc.auto) collected them as garbage. Fixed by
+#      keeping every chunk reachable from refs/sg/chunks.
+#   2. (silent corruption) a pointer whose data was actually lost used to
+#      fall back to treating the pointer's own text as if it were the
+#      file's content -- reporting success while writing 500-ish bytes of
+#      pointer text over what should have been megabytes of real data.
+#      Fixed by hard-failing instead once a chunk pointer is recognized as
+#      real (see chunk_resolve's discriminator in chunk.c).
+#
+# Phase 6c note: problem 2's original fix still had a gap -- the
+# "recognized as real" check itself was "does the first declared chunk id's
+# object file exist", which is an *integrity* question, not an *identity*
+# question. When the first chunk specifically was the one lost, a genuine
+# pointer got misdiagnosed as "not a pointer at all" and problem 2 recurred
+# for exactly that one case. Phase 6c fixed this by deciding identity via
+# SG_CHUNK_KEEPALIVE_REF tree membership (which doesn't depend on any
+# chunk's object file still existing) instead -- see case 3b below.
+
+# helper: number of loose object files under <repo>/.git/objects (excluding
+# pack/info) -- a count, complementing phase6a's objects_bytes (which
+# measures total size) -- makes "git gc actually repacked something" visible
+# in the test output.
+objects_count() {
+    find "$1/.git/objects" -mindepth 2 -type f ! -path '*/pack/*' ! -path '*/info/*' 2>/dev/null \
+        | wc -l | tr -d ' '
+}
+
+# case 1 (core acceptance): a real `git gc --prune=now` must not destroy a
+# chunked file's data now that its chunks are kept reachable via
+# refs/sg/chunks. Uses real `git gc`, not anything sg-specific, so this
+# proves the object graph itself -- not just sg's own bookkeeping --
+# protects the chunks.
+P6B_GC_REPO="$WORKDIR/phase6b_gc_repo"
+mkdir -p "$P6B_GC_REPO"
+(cd "$WORKDIR" && "$SG" init phase6b_gc_repo) > /dev/null 2>&1
+git config -f "$P6B_GC_REPO/.git/config" sg.chunking true
+git config -f "$P6B_GC_REPO/.git/config" sg.chunkthreshold 1048576
+
+P6B_GC_FILE="$P6B_GC_REPO/big.bin"
+head -c 5242880 /dev/urandom > "$P6B_GC_FILE" 2>/dev/null
+cp "$P6B_GC_FILE" "$WORKDIR/p6b_gc_original.bin"
+(cd "$P6B_GC_REPO" && "$SG" add big.bin && "$SG" commit -m "big file, chunking + keep-alive") \
+    > /dev/null 2>&1
+
+P6B_OBJCOUNT_BEFORE=$(objects_count "$P6B_GC_REPO")
+echo "phase6b gc: loose object count before gc = $P6B_OBJCOUNT_BEFORE"
+
+(cd "$P6B_GC_REPO" && git gc --prune=now) > /dev/null 2>&1
+P6B_GC_RC=$?
+check "phase6b: git gc --prune=now exits 0 on a repo with chunked+keep-alive objects" \
+    test "$P6B_GC_RC" = 0
+
+P6B_OBJCOUNT_AFTER=$(objects_count "$P6B_GC_REPO")
+echo "phase6b gc: loose object count after gc = $P6B_OBJCOUNT_AFTER (git gc repacks reachable loose objects into a packfile and deletes the now-redundant loose copies -- a low/zero loose count here is expected and proves gc actually ran; what matters is restore still working below)"
+
+rm -f "$P6B_GC_FILE"
+(cd "$P6B_GC_REPO" && "$SG" restore big.bin < /dev/null) > /dev/null 2>&1
+P6B_RESTORE_RC=$?
+check "phase6b: sg restore exits 0 after a real git gc --prune=now" test "$P6B_RESTORE_RC" = 0
+check "phase6b: sg restore round-trips a chunked file byte-for-byte after git gc --prune=now (the core durability fix)" \
+    cmp -s "$WORKDIR/p6b_gc_original.bin" "$P6B_GC_FILE"
+
+# case 2: git fsck stays clean (exit 0) on that same repo after the gc above.
+P6B_FSCK_OUT="$WORKDIR/p6b_fsck.txt"
+(cd "$P6B_GC_REPO" && git fsck) > "$P6B_FSCK_OUT" 2>&1
+P6B_FSCK_RC=$?
+check "phase6b: git fsck exits 0 after git gc --prune=now" test "$P6B_FSCK_RC" = 0
+
+# case 3: if a chunk really does go missing (partial corruption, manual
+# tampering, a gc racing with something that hadn't kept it alive yet --
+# whatever the cause), restore must fail loudly and must never overwrite the
+# working file with the pointer's own text. This is problem 2 above,
+# reproduced end-to-end through the real CLI (not just the library-level
+# unit tests in test_chunk.c).
+P6B_MISSING_REPO="$WORKDIR/phase6b_missing_repo"
+mkdir -p "$P6B_MISSING_REPO"
+(cd "$WORKDIR" && "$SG" init phase6b_missing_repo) > /dev/null 2>&1
+git config -f "$P6B_MISSING_REPO/.git/config" sg.chunking true
+git config -f "$P6B_MISSING_REPO/.git/config" sg.chunkthreshold 1048576
+
+P6B_MISSING_FILE="$P6B_MISSING_REPO/big.bin"
+head -c 5242880 /dev/urandom > "$P6B_MISSING_FILE" 2>/dev/null
+cp "$P6B_MISSING_FILE" "$WORKDIR/p6b_missing_original.bin"
+(cd "$P6B_MISSING_REPO" && "$SG" add big.bin && "$SG" commit -m "big file for missing-chunk test") \
+    > /dev/null 2>&1
+
+# Delete one of the pointer's declared chunk ids' loose object files
+# straight off disk -- the same end state an untimely deletion/gc leaves an
+# unreachable chunk in. Skips the *first* declared chunk id on purpose: per
+# chunk_resolve's documented discriminator (chunk.c), that specific one is
+# used to decide "is this a real pointer" at all, so deleting it would
+# (correctly, per that documented trade-off) make this file look like an
+# unrecognized ordinary file rather than a broken real pointer -- deleting a
+# later chunk exercises the "recognized as real, then found broken" path
+# this test is actually after.
+P6B_MISSING_BLOB=$(cd "$P6B_MISSING_REPO" && git ls-files -s big.bin 2>/dev/null | awk '{print $2}')
+P6B_MISSING_CHUNK_ID=$(git -C "$P6B_MISSING_REPO" cat-file -p "$P6B_MISSING_BLOB" 2>/dev/null \
+    | grep -E '^[0-9a-f]{40}$' | sed -n '2p')
+P6B_MISSING_CHUNK_PREFIX=$(echo "$P6B_MISSING_CHUNK_ID" | cut -c1-2)
+P6B_MISSING_CHUNK_SUFFIX=$(echo "$P6B_MISSING_CHUNK_ID" | cut -c3-)
+rm -f "$P6B_MISSING_REPO/.git/objects/$P6B_MISSING_CHUNK_PREFIX/$P6B_MISSING_CHUNK_SUFFIX"
+
+# Also remove the working copy before restoring (rather than leaving the
+# still-correct working file in place): sg_safe_apply_tree-style commands
+# take an automatic pre-restore safety snapshot whenever restoring would
+# discard *working-tree* changes, and that snapshot machinery re-derives
+# every index entry's blob from whatever is currently in the working tree
+# (see snapshot.c) -- if the (still byte-correct) working file were left in
+# place, that snapshot step would harmlessly re-chunk and re-write the
+# exact same content, silently regenerating the very chunk this test just
+# deleted before the actual restore even ran, and the test would no longer
+# be exercising the failure path it's meant to. Deleting the working file
+# first also sidesteps that snapshot step entirely (nothing to lose, so no
+# snapshot is taken) and matches restore's actual real-world use case: the
+# working file is gone/wrong and needs to be regenerated from the object
+# store, which is exactly when a missing chunk must be reported instead of
+# silently producing 500-ish bytes of pointer text.
+rm -f "$P6B_MISSING_FILE"
+
+P6B_MISSING_RESTORE_OUT="$WORKDIR/p6b_missing_restore_out.txt"
+(cd "$P6B_MISSING_REPO" && "$SG" restore --force big.bin) > "$P6B_MISSING_RESTORE_OUT" 2>&1
+P6B_MISSING_RESTORE_RC=$?
+check "phase6b: sg restore fails (non-zero) when a chunk object is missing from the object store" \
+    test "$P6B_MISSING_RESTORE_RC" != 0
+check "phase6b: sg restore prints an actionable error naming the missing chunk(s)" \
+    grep -q "資料塊" "$P6B_MISSING_RESTORE_OUT"
+check "phase6b: a failed restore never writes the pointer text in place of the file -- big.bin stays absent rather than being created with wrong (short) content" \
+    test ! -e "$P6B_MISSING_FILE"
+
+# case 3b (phase 6c regression): same idea as case 3 above, but deleting the
+# *first* declared chunk id instead of a later one -- this is exactly the
+# residual silent-corruption case a manual verification found: the old
+# discriminator in chunk_resolve (chunk.c) decided "is this a real pointer at
+# all" by checking whether the first declared chunk id's object file
+# existed, so losing precisely that chunk (as opposed to any other one) made
+# a genuine chunk pointer misdiagnosed as ordinary content, and restore wrote
+# the pointer's own ~450-byte text into big.bin as if it were the file's
+# 5MiB content -- silently, with exit 0. The fix changed the discriminator
+# to check SG_CHUNK_KEEPALIVE_REF tree membership instead of raw object
+# existence, which does not depend on any chunk's object file still being
+# present, so deleting the first chunk must now fail exactly like deleting
+# any other one.
+P6C_FIRSTCHUNK_REPO="$WORKDIR/phase6c_firstchunk_repo"
+mkdir -p "$P6C_FIRSTCHUNK_REPO"
+(cd "$WORKDIR" && "$SG" init phase6c_firstchunk_repo) > /dev/null 2>&1
+git config -f "$P6C_FIRSTCHUNK_REPO/.git/config" sg.chunking true
+git config -f "$P6C_FIRSTCHUNK_REPO/.git/config" sg.chunkthreshold 1048576
+
+P6C_FIRSTCHUNK_FILE="$P6C_FIRSTCHUNK_REPO/big.bin"
+head -c 3145728 /dev/urandom > "$P6C_FIRSTCHUNK_FILE" 2>/dev/null
+(cd "$P6C_FIRSTCHUNK_REPO" && "$SG" add big.bin && "$SG" commit -m "big file for first-chunk-missing test") \
+    > /dev/null 2>&1
+
+# Delete the *first* declared chunk id's loose object file specifically
+# (sed -n '1p' instead of case 3's '2p').
+P6C_FIRSTCHUNK_BLOB=$(cd "$P6C_FIRSTCHUNK_REPO" && git ls-files -s big.bin 2>/dev/null | awk '{print $2}')
+P6C_FIRSTCHUNK_ID=$(git -C "$P6C_FIRSTCHUNK_REPO" cat-file -p "$P6C_FIRSTCHUNK_BLOB" 2>/dev/null \
+    | grep -E '^[0-9a-f]{40}$' | sed -n '1p')
+P6C_FIRSTCHUNK_PREFIX=$(echo "$P6C_FIRSTCHUNK_ID" | cut -c1-2)
+P6C_FIRSTCHUNK_SUFFIX=$(echo "$P6C_FIRSTCHUNK_ID" | cut -c3-)
+rm -f "$P6C_FIRSTCHUNK_REPO/.git/objects/$P6C_FIRSTCHUNK_PREFIX/$P6C_FIRSTCHUNK_SUFFIX"
+
+# Remove the working copy first for the same reason case 3 does (sidesteps
+# the pre-restore safety snapshot re-chunking and silently regenerating the
+# very chunk just deleted).
+rm -f "$P6C_FIRSTCHUNK_FILE"
+
+P6C_FIRSTCHUNK_RESTORE_OUT="$WORKDIR/p6c_firstchunk_restore_out.txt"
+(cd "$P6C_FIRSTCHUNK_REPO" && "$SG" restore --force big.bin) > "$P6C_FIRSTCHUNK_RESTORE_OUT" 2>&1
+P6C_FIRSTCHUNK_RESTORE_RC=$?
+check "phase6c: sg restore fails (non-zero) when the FIRST chunk object is missing (residual silent-corruption regression)" \
+    test "$P6C_FIRSTCHUNK_RESTORE_RC" != 0
+check "phase6c: sg restore prints an actionable error naming the missing chunk(s) when the first chunk is gone" \
+    grep -q "資料塊" "$P6C_FIRSTCHUNK_RESTORE_OUT"
+check "phase6c: a failed restore never writes the pointer text in place of the file when the first chunk is gone -- big.bin stays absent" \
+    test ! -e "$P6C_FIRSTCHUNK_FILE"
+
+# case 4: the existing "fake pointer" case from phase6a (a small ordinary
+# file whose content merely *looks* like a well-formed chunk pointer, but
+# whose declared chunk id was never a real object) is re-checked by simply
+# re-running the whole suite -- see phase6a's own case 6 above, still
+# expected to pass unchanged: this is exactly what chunk_resolve's
+# discriminator classifies as "not a pointer" (case 3 in the report), not
+# "broken pointer" (case 3 above), because its first declared chunk id was
+# never a real object either.
+
+# case 5: sg<->sg clone (over the same local git-http-backend server used by
+# phase 5b/5c/6a) carries a chunked file's chunk data across, not just its
+# pointer text -- this is the clone-side half of the durability fix
+# (build_want_ids wanting refs/sg/chunks when advertised, clone writing it
+# locally). The "server" bare repo is built with `git clone --mirror` (not
+# --bare) straight from the sg source repo so refs/sg/chunks (and everything
+# it reaches) is already present remotely -- deliberately sidestepping `sg
+# push`, which does not yet propagate refs/sg/chunks to a remote itself (see
+# this phase's report): that is a separate, documented gap in `sg push`, not
+# something this test is about. What's being verified here is genuinely the
+# clone-side code path.
+if [ "$HTTP_AVAILABLE" = 1 ]; then
+    P6B_CLONE_SRC="$WORKDIR/phase6b_clone_src"
+    mkdir -p "$P6B_CLONE_SRC"
+    (cd "$WORKDIR" && "$SG" init phase6b_clone_src) > /dev/null 2>&1
+    git config -f "$P6B_CLONE_SRC/.git/config" sg.chunking true
+    git config -f "$P6B_CLONE_SRC/.git/config" sg.chunkthreshold 1048576
+
+    P6B_CLONE_SRC_FILE="$P6B_CLONE_SRC/big.bin"
+    head -c 5242880 /dev/urandom > "$P6B_CLONE_SRC_FILE" 2>/dev/null
+    cp "$P6B_CLONE_SRC_FILE" "$WORKDIR/p6b_clone_original.bin"
+    (cd "$P6B_CLONE_SRC" && "$SG" add big.bin && "$SG" commit -m "chunked file, source for sg clone test") \
+        > /dev/null 2>&1
+
+    P6B_SERVERROOT="$WORKDIR/phase6b_serverroot"
+    mkdir -p "$P6B_SERVERROOT"
+    (cd "$WORKDIR" && git clone --mirror -q phase6b_clone_src "$P6B_SERVERROOT/repo.git") \
+        > /dev/null 2>&1
+    (cd "$P6B_SERVERROOT/repo.git" && git config http.receivepack true) > /dev/null 2>&1
+
+    P6B_SERVER_LOG="$WORKDIR/phase6b_server.log"
+    python3 "$HTTP_SERVER_SCRIPT" "$P6B_SERVERROOT" > "$P6B_SERVER_LOG" 2>&1 &
+    HTTP_SERVER_PID=$!
+
+    P6B_PORT=""
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if [ -s "$P6B_SERVER_LOG" ]; then
+            P6B_PORT=$(awk '/^PORT /{print $2; exit}' "$P6B_SERVER_LOG")
+            if [ -n "$P6B_PORT" ]; then
+                break
+            fi
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    if [ -z "$P6B_PORT" ]; then
+        echo "warning: phase6b HTTP test server 未能在時限內就緒，跳過 phase6b sg clone chunk 測試" >&2
+        skip "phase6b: sg clone over smart HTTP recovers a chunked file's chunk data byte-for-byte"
+        skip "phase6b: git fsck exits 0 on the sg-clone destination"
+        skip "phase6b: a real (non-sg) git clone of the same repo only recovers the pointer text, not the chunk data"
+    else
+        P6B_BASE_URL="http://127.0.0.1:$P6B_PORT/repo.git"
+        P6B_DEST="$WORKDIR/phase6b_dest"
+
+        "$SG" clone "$P6B_BASE_URL" "$P6B_DEST" > /dev/null 2>&1
+        check "phase6b: sg clone over smart HTTP recovers a chunked file's chunk data byte-for-byte" \
+            cmp -s "$WORKDIR/p6b_clone_original.bin" "$P6B_DEST/big.bin"
+
+        P6B_DEST_FSCK_OUT="$WORKDIR/p6b_dest_fsck.txt"
+        (cd "$P6B_DEST" && git fsck) > "$P6B_DEST_FSCK_OUT" 2>&1
+        P6B_DEST_FSCK_RC=$?
+        check "phase6b: git fsck exits 0 on the sg-clone destination" test "$P6B_DEST_FSCK_RC" = 0
+
+        # case 6: a real (non-sg) `git clone` of the exact same server only
+        # ever recovers the pointer text -- its default refspec
+        # (+refs/heads/*:refs/remotes/origin/*) never asks for
+        # refs/sg/chunks at all, regardless of whether the remote has it.
+        # This is the accepted, documented trade-off from the phase 6b spec
+        # (the same category of limitation Git LFS has under a
+        # non-LFS-aware git client), not a bug -- assert it explicitly
+        # rather than silently assuming it.
+        P6B_REALGIT_CLONE="$WORKDIR/phase6b_realgit_clone"
+        git clone -q "$P6B_BASE_URL" "$P6B_REALGIT_CLONE" > /dev/null 2>&1
+        P6B_REALGIT_SIZE=$(wc -c < "$P6B_REALGIT_CLONE/big.bin" 2>/dev/null | tr -d ' ')
+        echo "phase6b real git clone limitation: original file was 5242880 bytes; a real (non-sg) git clone recovered only ${P6B_REALGIT_SIZE:-0} bytes (the pointer text itself -- real git's default refspec never requests refs/sg/chunks)"
+        check "phase6b: a real (non-sg) git clone of the same repo only recovers the pointer text, not the chunk data" \
+            test "${P6B_REALGIT_SIZE:-0}" -lt 50000
+
+        # case 7: sg push must abort (non-zero, actionable message) rather
+        # than silently push a chunked file's bare pointer text when one of
+        # its declared chunks is missing/corrupt locally -- the push-side
+        # mirror of case 3's restore-side check above. Reuses this same
+        # running server (a second, initially-empty bare repo under it) so
+        # a brand-new branch push exercises walk_add_object's full object
+        # walk, same as any real first push would.
+        P6B_PUSHFAIL_BARE="$P6B_SERVERROOT/pushfail_repo.git"
+        git init -q --bare "$P6B_PUSHFAIL_BARE" > /dev/null 2>&1
+        git -C "$P6B_PUSHFAIL_BARE" config http.receivepack true
+
+        P6B_PUSHFAIL_URL="http://127.0.0.1:$P6B_PORT/pushfail_repo.git"
+        P6B_PUSHFAIL_SRC="$WORKDIR/phase6b_pushfail_src"
+        "$SG" clone "$P6B_PUSHFAIL_URL" "$P6B_PUSHFAIL_SRC" > /dev/null 2>&1
+
+        git config -f "$P6B_PUSHFAIL_SRC/.git/config" sg.chunking true
+        git config -f "$P6B_PUSHFAIL_SRC/.git/config" sg.chunkthreshold 1048576
+
+        head -c 5242880 /dev/urandom > "$P6B_PUSHFAIL_SRC/big.bin" 2>/dev/null
+        (cd "$P6B_PUSHFAIL_SRC" && "$SG" add big.bin && "$SG" commit -m "chunked file for push-failure test") \
+            > /dev/null 2>&1
+
+        # Delete a non-first declared chunk id's loose object file (same
+        # "not the first chunk" reasoning as case 3's restore test above).
+        P6B_PUSHFAIL_BLOB=$(cd "$P6B_PUSHFAIL_SRC" && git ls-files -s big.bin 2>/dev/null | awk '{print $2}')
+        P6B_PUSHFAIL_CHUNK_ID=$(git -C "$P6B_PUSHFAIL_SRC" cat-file -p "$P6B_PUSHFAIL_BLOB" 2>/dev/null \
+            | grep -E '^[0-9a-f]{40}$' | sed -n '2p')
+        P6B_PUSHFAIL_CHUNK_PREFIX=$(echo "$P6B_PUSHFAIL_CHUNK_ID" | cut -c1-2)
+        P6B_PUSHFAIL_CHUNK_SUFFIX=$(echo "$P6B_PUSHFAIL_CHUNK_ID" | cut -c3-)
+        rm -f "$P6B_PUSHFAIL_SRC/.git/objects/$P6B_PUSHFAIL_CHUNK_PREFIX/$P6B_PUSHFAIL_CHUNK_SUFFIX"
+
+        P6B_PUSHFAIL_OUT="$WORKDIR/p6b_pushfail_out.txt"
+        (cd "$P6B_PUSHFAIL_SRC" && "$SG" push) > "$P6B_PUSHFAIL_OUT" 2>&1
+        P6B_PUSHFAIL_RC=$?
+        check "phase6b: sg push fails (non-zero) when a locally chunked file has a missing chunk object" \
+            test "$P6B_PUSHFAIL_RC" != 0
+        check "phase6b: sg push prints an actionable abort message naming the broken chunked object" \
+            grep -q "push 中止" "$P6B_PUSHFAIL_OUT"
+
+        P6B_PUSHFAIL_REMOTE_BRANCHES=$(git -C "$P6B_PUSHFAIL_BARE" for-each-ref --format='%(refname)' \
+            2>/dev/null | grep -c '^refs/heads/')
+        check "phase6b: after the aborted push, the remote gained no branch ref (no incomplete pointer text was published)" \
+            test "$P6B_PUSHFAIL_REMOTE_BRANCHES" = 0
+
+        kill "$HTTP_SERVER_PID" 2>/dev/null
+        HTTP_SERVER_PID=""
+    fi
+else
+    skip "phase6b: sg clone over smart HTTP recovers a chunked file's chunk data byte-for-byte"
+    skip "phase6b: git fsck exits 0 on the sg-clone destination"
+    skip "phase6b: a real (non-sg) git clone of the same repo only recovers the pointer text, not the chunk data"
+    skip "phase6b: sg push fails (non-zero) when a locally chunked file has a missing chunk object"
+    skip "phase6b: sg push prints an actionable abort message naming the broken chunked object"
+    skip "phase6b: after the aborted push, the remote gained no branch ref (no incomplete pointer text was published)"
 fi
 
 echo ""

@@ -103,10 +103,21 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         sg_index_entry entry;
 
         snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, target_flat.entries[i].path);
-        if (sg_chunk_read_blob(git_dir, target_flat.entries[i].sha1, &blob_content, &blob_len) != 0) {
-            fprintf(stderr, "sg: missing blob for '%s'\n", target_flat.entries[i].path);
-            rc = -1;
-            continue;
+        {
+            sg_chunk_missing_info missing;
+            int read_rc = sg_chunk_read_blob(git_dir, target_flat.entries[i].sha1, &blob_content,
+                                             &blob_len, &missing);
+
+            if (read_rc == -2) {
+                sg_chunk_print_missing_error(target_flat.entries[i].path, &missing);
+                rc = -1;
+                continue;
+            }
+            if (read_rc != 0) {
+                fprintf(stderr, "sg: missing blob for '%s'\n", target_flat.entries[i].path);
+                rc = -1;
+                continue;
+            }
         }
         if (sg_write_file_mkdirs(abspath, blob_content, blob_len,
                                  (int)(target_flat.entries[i].mode & 0777)) != 0) {

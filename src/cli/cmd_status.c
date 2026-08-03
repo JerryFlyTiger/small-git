@@ -264,7 +264,9 @@ int sg_cmd_status(int argc, char **argv)
     sg_flat_list_free(&head_flat);
 
     if (sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) != 0)
-        fprintf(stderr, "sg: warning: out of memory computing unstaged changes\n");
+        fprintf(stderr,
+               "sg: warning: failed to compute unstaged changes (out of memory, or a chunked "
+               "file's data is missing/corrupt -- see sg restore for details)\n");
 
     collect_untracked(repo_root, "", &idx, &untracked, &untracked_count, &untracked_cap);
     if (untracked_count > 0)

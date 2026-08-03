@@ -56,42 +56,112 @@ void sg_chunk_pointer_free(sg_chunk_pointer *p);
 /* Stores content (len bytes) under git_dir/objects/, chunking it when
    len >= threshold: content is split with sg_chunk_split, each chunk is
    written as its own loose blob, and the written chunks are read back and
-   compared byte-for-byte against content as a round-trip safety check before
-   a pointer blob (see SG_CHUNK_MAGIC) is written and its id returned in
-   id_out with *chunked_out = 1. If len < threshold, or the round-trip check
-   fails, content is written as a single ordinary loose blob instead, id_out
-   receives its id, and *chunked_out = 0 (a round-trip failure additionally
-   prints a warning to stderr, since it means chunking was silently unsafe for
-   this content). Returns 0 on success, -1 on I/O/allocation failure (a
-   round-trip mismatch is not a failure of this function -- it is handled
-   internally by falling back to an ordinary blob). */
+   compared byte-for-byte against content as a round-trip safety check. Once
+   that passes, the new chunk ids are merged into the SG_CHUNK_KEEPALIVE_REF
+   tree (see sg_chunk.c's keep_alive_add) so they stay reachable from git's
+   object graph -- only then is a pointer blob (see SG_CHUNK_MAGIC) written
+   and its id returned in id_out with *chunked_out = 1. If len < threshold,
+   the round-trip check fails, or the keep-alive update fails, content is
+   written as a single ordinary loose blob instead, id_out receives its id,
+   and *chunked_out = 0 (the round-trip/keep-alive fallback cases additionally
+   print a warning to stderr, since they mean chunking was unsafe for this
+   content). Returns 0 on success, -1 on I/O/allocation failure (a round-trip
+   mismatch or keep-alive failure is not a failure of this function -- both
+   are handled internally by falling back to an ordinary blob). */
 int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_t len,
                         size_t threshold, unsigned char id_out[SG_SHA1_RAW_LEN],
                         int *chunked_out);
 
-/* Reads out the blob id points to; if it strictly matches the pointer format
-   (sg_chunk_pointer_parse) and the reassembled chunks hash back to the
-   pointer's declared sha1, returns the reassembled original content
-   (*content_out malloc'd, caller frees). Otherwise (not a pointer, a
-   malformed pointer, any chunk object failing to read, or a hash mismatch
-   after reassembly), returns the blob's own raw content unmodified. Only
-   returns -1 when the underlying object read genuinely fails (id itself is
-   not found/corrupt); a pointer-shaped blob that fails reassembly/validation
-   is not an error here -- it falls back to raw content and returns 0. Never
-   returns partially reassembled or unvalidated content. */
+/* Filled in on a -2 ("real pointer, but data missing/corrupt") return from
+   sg_chunk_read_blob/sg_chunk_effective_id below, so the caller can print an
+   actionable message naming how bad the damage is. missing_count counts
+   chunk ids that failed to read at all; it can be 0 even though the overall
+   result is still "broken" -- that means every chunk read back fine but the
+   reassembled bytes didn't hash-verify against the pointer's declared sha1
+   (corruption, not loss). */
+typedef struct {
+    size_t chunk_count;
+    size_t missing_count;
+} sg_chunk_missing_info;
+
+/* Prints a standard, actionable stderr message for a real-but-broken chunk
+   pointer at `path` (a display name -- a repo-relative path, or anything
+   else identifying what's being read), using *info as filled by a -2 return
+   from sg_chunk_read_blob/sg_chunk_effective_id. Shared by every write path
+   (checkout/restore/merge/rebase) so the message is worded consistently. */
+void sg_chunk_print_missing_error(const char *path, const sg_chunk_missing_info *info);
+
+/* Reads out the blob id points to. Three possible outcomes:
+
+   1. id is not a chunk pointer, or is pointer-shaped text whose first
+      declared chunk id isn't listed in the SG_CHUNK_KEEPALIVE_REF tree --
+      i.e. not a pointer this repo's own sg_chunk_store_blob ever produced
+      (see the discriminator comment on chunk_resolve in chunk.c for why
+      only the first chunk's *identity*, not its data, is checked here, and
+      what that trades off): returns 0, with *content_out and *len_out set
+      to the blob's own raw bytes, unmodified. Deliberately does not depend
+      on whether the first chunk's object file still exists -- see outcome 3
+      below for what happens when it doesn't.
+
+   2. id is a genuine chunk pointer (first chunk id is a keep-alive tree
+      member) and every chunk reads back and the reassembled bytes
+      hash-verify against the pointer's declared sha1: returns 0, with
+      *content_out and *len_out set to the reassembled original content.
+
+   3. id is a genuine chunk pointer (first chunk id is a keep-alive tree
+      member) but some chunk -- including possibly the first one -- failed
+      to read, or the reassembled bytes don't hash-verify: returns -2. This
+      is a hard error -- data is missing or corrupt, never to be silently
+      papered over by handing back the pointer's own raw text as if it were
+      the file's content. *missing_out (if non-NULL) is filled in;
+      *content_out and *len_out are left untouched and must not be used.
+
+   Returns -1 only when the underlying object read of id itself fails (id
+   not found/corrupt) -- distinct from outcome 3 above, where id itself
+   reads fine and only its declared chunks are the problem. Never returns
+   partially reassembled or unvalidated content. */
 int sg_chunk_read_blob(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
-                       unsigned char **content_out, size_t *len_out);
+                       unsigned char **content_out, size_t *len_out,
+                       sg_chunk_missing_info *missing_out);
 
 /* If id points to a well-formed, hash-verified chunk pointer, fills out with
-   the original content's sha1 as recorded in the pointer. Otherwise (not a
-   pointer, malformed, any chunk unreadable, or a hash mismatch), copies id
+   the original content's sha1 as recorded in the pointer. If id is not a
+   chunk pointer at all (including one whose first declared chunk isn't a
+   keep-alive tree member -- see sg_chunk_read_blob's outcome 1), copies id
    into out unchanged. Used to normalize an id read from the index/tree into
-   the id of its *content*, so it can be compared against
-   sg_hash_file_blob()'s result for a working-directory file (status/diff).
-   Unlike sg_chunk_read_blob, this does not need to hand back the reassembled
-   bytes, only verify them. Returns -1 only when the underlying object read
-   fails; otherwise (including "not a pointer") returns 0 with out filled. */
+   the id of its *content*, so it can be compared against sg_hash_file_blob()'s result
+   for a working-directory file (status/diff). Unlike sg_chunk_read_blob,
+   this does not need to hand back the reassembled bytes, only verify them.
+   Returns -2 for the same "genuine pointer, but broken" case as
+   sg_chunk_read_blob (out is left untouched); -1 only when the underlying
+   object read of id itself fails; otherwise (including "not a pointer")
+   returns 0 with out filled. */
 int sg_chunk_effective_id(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
                           unsigned char out[SG_SHA1_RAW_LEN]);
+
+/* The ref every chunk sg_chunk_store_blob writes gets merged into, keeping
+   it reachable from git's object graph so `git gc` (manual or gc.auto)
+   doesn't collect chunk blobs as garbage -- see the phase 6b durability fix.
+   A commit (not a bare tree) so ref/gc/fsck tooling that expects a ref to
+   point at a commit has nothing unusual to special-case. */
+#define SG_CHUNK_KEEPALIVE_REF "refs/sg/chunks"
+
+/* Merges the chunk ids declared by keepalive_commit_id's tree (a
+   SG_CHUNK_KEEPALIVE_REF-shaped commit -- see sg_chunk_store_blob) into this
+   repo's own SG_CHUNK_KEEPALIVE_REF, deduplicating against whatever this
+   repo already keeps alive on its own account. Used by fetch/clone when the
+   remote advertises its own SG_CHUNK_KEEPALIVE_REF: merging rather than
+   overwriting means a local chunk this repo produced (and hasn't pushed
+   yet) doesn't lose its keep-alive protection just because a fetch pulled
+   in the remote's ref too. keepalive_commit_id and everything its tree
+   references must already be present in this repo's object store (true
+   right after a fetch/clone that wanted this ref, since its objects come
+   down in the same pack). Returns 0 on success, -1 if keepalive_commit_id's
+   commit/tree can't be read/parsed, or if merging fails (matches
+   sg_chunk_store_blob's own keep-alive failure handling -- callers should
+   treat this as a soft failure worth warning about, not a hard error, since
+   the remote's chunks are still physically present locally either way). */
+int sg_chunk_keepalive_merge_commit(const char *git_dir,
+                                    const unsigned char keepalive_commit_id[SG_SHA1_RAW_LEN]);
 
 #endif

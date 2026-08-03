@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
@@ -17,6 +18,11 @@
 #define SG_PATH_MAX 4096
 #define SG_FETCH_MAX_HAVES 256
 
+/* Deduplicated want list: the tip of every refs/heads/, refs/tags/, and (if
+   advertised) SG_CHUNK_KEEPALIVE_REF entry the server advertised -- the
+   latter so a chunked file's chunk blobs actually come down in the pack,
+   not just the pointer blob that names them (see the phase 6b spec's
+   clone/fetch section). */
 static int build_want_ids(const sg_ref_adv *adv, unsigned char (**ids_out)[SG_SHA1_RAW_LEN],
                           size_t *count_out)
 {
@@ -32,7 +38,8 @@ static int build_want_ids(const sg_ref_adv *adv, unsigned char (**ids_out)[SG_SH
         int dup = 0;
 
         if (strncmp(adv->refs[i].name, "refs/heads/", 11) != 0 &&
-           strncmp(adv->refs[i].name, "refs/tags/", 10) != 0)
+           strncmp(adv->refs[i].name, "refs/tags/", 10) != 0 &&
+           strcmp(adv->refs[i].name, SG_CHUNK_KEEPALIVE_REF) != 0)
             continue;
         for (j = 0; j < count; j++) {
             if (memcmp(ids[j], adv->refs[i].id, SG_SHA1_RAW_LEN) == 0) {
@@ -331,6 +338,34 @@ int sg_cmd_fetch(int argc, char **argv)
         free(pack_data);
         if (fetch_rc != 0)
             goto done;
+    }
+
+    /* Merge the remote's SG_CHUNK_KEEPALIVE_REF into this repo's own (if it
+       advertised one) so the chunk blobs just fetched into the pack above
+       stay reachable here too -- otherwise a local `git gc` would
+       immediately collect them right back out from under whatever pointer
+       blob refers to them. A merge (via sg_chunk_keepalive_merge_commit),
+       not an overwrite: this repo may already have its own
+       SG_CHUNK_KEEPALIVE_REF protecting chunks from files committed locally
+       but not yet pushed anywhere, and clobbering it with the remote's
+       would strip those local chunks of their only keep-alive protection --
+       exactly the durability bug this phase exists to fix, just replayed on
+       the fetch path. keepalive_commit_id and everything its tree
+       references are guaranteed present locally at this point: this ref's
+       tip was included in want_ids above (build_want_ids), so its objects
+       came down in the same pack already stored/indexed. A merge failure is
+       only a warning, not a fatal error: the remote's chunk objects are
+       already safely on disk from the pack either way, this only affects
+       whether they're *also* protected from a local gc, so failing the
+       whole fetch over it would be disproportionate. Silent on success (no
+       printed line, doesn't affect "Already up to date."): this is internal
+       plumbing, not a branch/tag the user asked to fetch. */
+    for (i = 0; i < adv.count; i++) {
+        if (strcmp(adv.refs[i].name, SG_CHUNK_KEEPALIVE_REF) == 0) {
+            if (sg_chunk_keepalive_merge_commit(git_dir, adv.refs[i].id) != 0)
+                fprintf(stderr, "sg: warning: 未能合併遠端的 %s\n", SG_CHUNK_KEEPALIVE_REF);
+            break;
+        }
     }
 
     for (i = 0; i < adv.count; i++) {

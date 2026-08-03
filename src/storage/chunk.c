@@ -3,11 +3,20 @@
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/refs.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static const char *env_or(const char *name, const char *fallback)
+{
+    const char *v = getenv(name);
+
+    return (v != NULL && v[0] != '\0') ? v : fallback;
+}
 
 /* Precomputed with a fixed seed (splitmix64(0x736D616C6C5F676974)) -- never
    generate this at runtime with rand()/a PRNG, since differing PRNGs across
@@ -379,6 +388,305 @@ static int chunks_round_trip_ok(const char *git_dir, unsigned char (*chunk_ids)[
     return ok;
 }
 
+/* ---- refs/sg/chunks keep-alive tree: see SG_CHUNK_KEEPALIVE_REF's doc
+   comment for why this exists. Every chunk id ever written by
+   sg_chunk_store_blob ends up as an entry (mode 100644, name = the chunk's
+   own 40-hex id) in the tree this ref's commit points at, so `git gc` always
+   sees them as reachable. Rebuilt from scratch on every call -- O(total kept
+   chunk count) -- rather than incrementally patched on disk; deliberately
+   not optimized further in this phase (see the phase 6b spec's own note:
+   correctness first, this would only matter at chunk counts in the tens of
+   thousands). ---- */
+
+/* Reads a keep-alive-shaped commit (commit -> tree, each tree entry's sha1
+   one chunk id -- see keep_alive_add) and flattens its entries into a raw
+   id array. Shared by keep_alive_read_existing (this repo's own current
+   SG_CHUNK_KEEPALIVE_REF) and sg_chunk_keepalive_merge_commit (an arbitrary
+   keep-alive commit, e.g. one just fetched from a remote). Returns -1 if
+   commit_id's commit/tree can't be read or parsed. */
+static int keep_alive_read_commit(const char *git_dir, const unsigned char commit_id[SG_SHA1_RAW_LEN],
+                                  unsigned char (**ids_out)[SG_SHA1_RAW_LEN], size_t *count_out)
+{
+    sg_obj_type type;
+    unsigned char *content = NULL;
+    size_t content_len = 0;
+    sg_commit commit;
+    sg_tree tree;
+    unsigned char (*ids)[SG_SHA1_RAW_LEN] = NULL;
+    size_t i;
+
+    *ids_out = NULL;
+    *count_out = 0;
+
+    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 || type != SG_OBJ_COMMIT)
+        return -1;
+    if (sg_commit_parse(content, content_len, &commit) != 0) {
+        free(content);
+        return -1;
+    }
+    free(content);
+    content = NULL;
+
+    if (sg_object_read(git_dir, commit.tree, &type, &content, &content_len) != 0 || type != SG_OBJ_TREE) {
+        sg_commit_free(&commit);
+        return -1;
+    }
+    sg_commit_free(&commit);
+
+    if (sg_tree_parse(content, content_len, &tree) != 0) {
+        free(content);
+        return -1;
+    }
+    free(content);
+
+    if (tree.count > 0) {
+        ids = malloc(tree.count * sizeof(*ids));
+        if (ids == NULL) {
+            sg_tree_free(&tree);
+            return -1;
+        }
+    }
+    for (i = 0; i < tree.count; i++)
+        memcpy(ids[i], tree.entries[i].sha1, SG_SHA1_RAW_LEN);
+
+    /* sg_tree_free zeroes tree.count as part of freeing tree.entries, so the
+       count must be captured before the free, not after -- reading it after
+       would silently report zero existing chunks every time, defeating the
+       whole point of keeping previously-added chunks alive. */
+    *count_out = tree.count;
+    sg_tree_free(&tree);
+
+    *ids_out = ids;
+    return 0;
+}
+
+/* Reads SG_CHUNK_KEEPALIVE_REF -> commit -> tree via keep_alive_read_commit.
+   *count_out is set to 0 (not an error) if the ref doesn't exist yet -- the
+   ordinary state before the first chunk has ever been written. Returns -1
+   only if the ref exists but the commit/tree it names can't be read or
+   parsed. */
+static int keep_alive_read_existing(const char *git_dir, unsigned char (**ids_out)[SG_SHA1_RAW_LEN],
+                                    size_t *count_out)
+{
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+
+    *ids_out = NULL;
+    *count_out = 0;
+
+    if (sg_ref_read_path(git_dir, SG_CHUNK_KEEPALIVE_REF, commit_id) != 0)
+        return 0; /* no keep-alive ref yet: nothing kept alive so far */
+
+    return keep_alive_read_commit(git_dir, commit_id, ids_out, count_out);
+}
+
+/* Merges new_ids (new_count of them, just written by sg_chunk_store_blob)
+   into the SG_CHUNK_KEEPALIVE_REF tree, deduplicating against whatever chunk
+   ids are already kept alive, and points the ref at a fresh no-parent commit
+   wrapping the rebuilt tree. Returns 0 on success, -1 on failure -- the
+   caller treats that as reason to fall back to an ordinary (unchunked) blob
+   rather than hand back a pointer whose chunks aren't gc-safe. */
+static int keep_alive_add(const char *git_dir, unsigned char (*new_ids)[SG_SHA1_RAW_LEN],
+                          size_t new_count)
+{
+    unsigned char (*existing)[SG_SHA1_RAW_LEN] = NULL;
+    size_t existing_count = 0;
+    sg_tree_entry *entries = NULL;
+    size_t entry_count = 0;
+    size_t cap;
+    unsigned char *tree_content = NULL;
+    size_t tree_len = 0;
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    sg_commit commit;
+    unsigned char *commit_content = NULL;
+    size_t commit_len = 0;
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    size_t i;
+    int rc = -1;
+
+    if (new_count == 0)
+        return 0;
+
+    if (keep_alive_read_existing(git_dir, &existing, &existing_count) != 0)
+        return -1;
+
+    cap = existing_count + new_count;
+    entries = malloc(cap * sizeof(*entries));
+    if (entries == NULL) {
+        free(existing);
+        return -1;
+    }
+
+    /* sg_tree_free (used elsewhere on any sg_tree) always frees .name, so
+       every entry below -- including ones surviving unchanged from the
+       existing tree -- gets its own fresh strdup rather than sharing a
+       buffer, so this array can be torn down the same way. */
+    for (i = 0; i < existing_count; i++) {
+        char hex[SG_SHA1_HEX_LEN + 1];
+
+        sg_sha1_to_hex(existing[i], hex);
+        entries[entry_count].name = strdup(hex);
+        if (entries[entry_count].name == NULL)
+            goto done;
+        entries[entry_count].mode = 0100644;
+        memcpy(entries[entry_count].sha1, existing[i], SG_SHA1_RAW_LEN);
+        entry_count++;
+    }
+
+    for (i = 0; i < new_count; i++) {
+        char hex[SG_SHA1_HEX_LEN + 1];
+        size_t j;
+        int dup = 0;
+
+        for (j = 0; j < entry_count; j++) {
+            if (memcmp(entries[j].sha1, new_ids[i], SG_SHA1_RAW_LEN) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup)
+            continue;
+
+        sg_sha1_to_hex(new_ids[i], hex);
+        entries[entry_count].name = strdup(hex);
+        if (entries[entry_count].name == NULL)
+            goto done;
+        entries[entry_count].mode = 0100644;
+        memcpy(entries[entry_count].sha1, new_ids[i], SG_SHA1_RAW_LEN);
+        entry_count++;
+    }
+
+    if (sg_tree_serialize(entries, entry_count, &tree_content, &tree_len) != 0)
+        goto done;
+    if (sg_loose_write(git_dir, SG_OBJ_TREE, tree_content, tree_len, tree_id) != 0)
+        goto done;
+
+    memset(&commit, 0, sizeof(commit));
+    memcpy(commit.tree, tree_id, SG_SHA1_RAW_LEN);
+    commit.parents = NULL;
+    commit.parent_count = 0;
+    commit.author_name = (char *)env_or("GIT_AUTHOR_NAME", "small_git");
+    commit.author_email = (char *)env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+    commit.author_time = (long long)time(NULL);
+    strcpy(commit.author_tz, "+0000");
+    commit.committer_name = (char *)env_or("GIT_COMMITTER_NAME", commit.author_name);
+    commit.committer_email = (char *)env_or("GIT_COMMITTER_EMAIL", commit.author_email);
+    commit.committer_time = commit.author_time;
+    strcpy(commit.committer_tz, "+0000");
+    commit.message = (char *)"sg chunk keep-alive\n";
+
+    if (sg_commit_serialize(&commit, &commit_content, &commit_len) != 0)
+        goto done;
+    if (sg_loose_write(git_dir, SG_OBJ_COMMIT, commit_content, commit_len, commit_id) != 0)
+        goto done;
+    if (sg_ref_write_path(git_dir, SG_CHUNK_KEEPALIVE_REF, commit_id) != 0)
+        goto done;
+
+    rc = 0;
+
+done:
+    free(tree_content);
+    free(commit_content);
+    for (i = 0; i < entry_count; i++)
+        free(entries[i].name);
+    free(entries);
+    free(existing);
+    return rc;
+}
+
+int sg_chunk_keepalive_merge_commit(const char *git_dir,
+                                    const unsigned char keepalive_commit_id[SG_SHA1_RAW_LEN])
+{
+    unsigned char (*ids)[SG_SHA1_RAW_LEN] = NULL;
+    size_t count = 0;
+    int rc;
+
+    if (keep_alive_read_commit(git_dir, keepalive_commit_id, &ids, &count) != 0)
+        return -1;
+    rc = keep_alive_add(git_dir, ids, count);
+    free(ids);
+    return rc;
+}
+
+/* ---- keep-alive membership check: the "is this a pointer of ours?"
+   identity test used by chunk_resolve below. Deliberately answers a
+   different question than "does this chunk's object file still exist" --
+   see chunk_resolve's discriminator comment for why conflating the two was
+   the bug this replaces. Membership is checked against the tree
+   SG_CHUNK_KEEPALIVE_REF's commit points at (every chunk id this repo's own
+   sg_chunk_store_blob has ever produced), never against the object store
+   directly, so a chunk that's genuinely ours but whose loose object went
+   missing (gc, incomplete clone/fetch) is still correctly recognized as
+   "ours" -- it just also turns out to be broken, which is chunk_resolve's
+   job to detect and report, not this function's. ---- */
+
+static int chunk_id_cmp(const void *a, const void *b)
+{
+    return memcmp(a, b, SG_SHA1_RAW_LEN);
+}
+
+/* Process-lifetime cache of the flattened, sorted keep-alive tree, so
+   repeatedly resolving many chunk pointers (e.g. walking a whole commit's
+   tree during restore/switch/merge/rebase/push) doesn't re-read and
+   re-parse the commit/tree from scratch for every single pointer. Keyed on
+   git_dir (by value, not pointer identity -- callers pass their own copies)
+   plus the ref's current commit id, so it's automatically invalidated both
+   by a fresh keep_alive_add in this same process (the ref's commit id
+   changes) and by a different repo reusing the same git_dir path. */
+static struct {
+    int valid;
+    char *git_dir;
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    unsigned char (*ids)[SG_SHA1_RAW_LEN];
+    size_t count;
+} g_keepalive_cache;
+
+static void keepalive_cache_atexit(void)
+{
+    free(g_keepalive_cache.git_dir);
+    free(g_keepalive_cache.ids);
+}
+
+static int keep_alive_is_member(const char *git_dir, const unsigned char chunk_id[SG_SHA1_RAW_LEN])
+{
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+
+    if (sg_ref_read_path(git_dir, SG_CHUNK_KEEPALIVE_REF, commit_id) != 0)
+        return 0; /* no keep-alive ref (e.g. a plain `git clone`): nothing is a member */
+
+    if (!g_keepalive_cache.valid || g_keepalive_cache.git_dir == NULL ||
+       strcmp(g_keepalive_cache.git_dir, git_dir) != 0 ||
+       memcmp(g_keepalive_cache.commit_id, commit_id, SG_SHA1_RAW_LEN) != 0) {
+        unsigned char (*ids)[SG_SHA1_RAW_LEN] = NULL;
+        size_t count = 0;
+        char *git_dir_copy;
+
+        if (keep_alive_read_commit(git_dir, commit_id, &ids, &count) != 0)
+            return 0; /* ref names an unreadable commit/tree: treat as not a member */
+
+        git_dir_copy = strdup(git_dir);
+        if (git_dir_copy == NULL) {
+            free(ids);
+            return 0;
+        }
+
+        if (count > 1)
+            qsort(ids, count, sizeof(*ids), chunk_id_cmp);
+
+        if (!g_keepalive_cache.valid)
+            atexit(keepalive_cache_atexit);
+        free(g_keepalive_cache.git_dir);
+        free(g_keepalive_cache.ids);
+        g_keepalive_cache.git_dir = git_dir_copy;
+        memcpy(g_keepalive_cache.commit_id, commit_id, SG_SHA1_RAW_LEN);
+        g_keepalive_cache.ids = ids;
+        g_keepalive_cache.count = count;
+        g_keepalive_cache.valid = 1;
+    }
+
+    return bsearch(chunk_id, g_keepalive_cache.ids, g_keepalive_cache.count,
+                   sizeof(*g_keepalive_cache.ids), chunk_id_cmp) != NULL;
+}
+
 int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_t len,
                         size_t threshold, unsigned char id_out[SG_SHA1_RAW_LEN],
                         int *chunked_out)
@@ -436,6 +744,26 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
         return 0;
     }
 
+    /* The chunks reproduce content correctly, but they're still only
+       reachable -- from git's own object-graph perspective -- as plain hex
+       text inside the pointer blob about to be written below; a `git gc`
+       (manual or gc.auto) would otherwise collect them as garbage right out
+       from under the pointer. Protect them by merging into the
+       SG_CHUNK_KEEPALIVE_REF tree *before* handing back a pointer that
+       depends on them existing; if that fails, fall back to an ordinary
+       blob rather than produce a pointer whose chunks aren't gc-safe yet,
+       same fallback shape as the round-trip failure just above. */
+    if (keep_alive_add(git_dir, chunk_ids, count) != 0) {
+        free(chunk_ids);
+        fprintf(stderr,
+               "sg: warning: 無法將 chunk 加入 %s 保活樹，改以一般 blob 儲存\n",
+               SG_CHUNK_KEEPALIVE_REF);
+        if (sg_loose_write(git_dir, SG_OBJ_BLOB, content, len, id_out) != 0)
+            return -1;
+        *chunked_out = 0;
+        return 0;
+    }
+
     sg_object_hash(SG_OBJ_BLOB, content, len, ptr.original_sha1);
     ptr.original_size = len;
     ptr.chunk_ids = chunk_ids;
@@ -457,19 +785,44 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
     return 0;
 }
 
-/* Shared core of sg_chunk_read_blob/sg_chunk_effective_id: reads the id's
-   blob and, if its content is a well-formed *and* hash-verified chunk
-   pointer, reassembles it. Always fills raw_content/raw_len (the blob's own
-   bytes, as read) on success; additionally fills is_pointer/rebuilt/
-   rebuilt_len/original_sha1 when the pointer validated. Returns 0 on
-   success, -1 only when the top-level sg_object_read itself fails. */
+void sg_chunk_print_missing_error(const char *path, const sg_chunk_missing_info *info)
+{
+    if (info->missing_count > 0) {
+        fprintf(stderr, "sg: '%s' 是分塊儲存的檔案，但有 %zu/%zu 個資料塊在物件庫中找不到\n", path,
+               info->missing_count, info->chunk_count);
+    } else {
+        fprintf(stderr,
+               "sg: '%s' 是分塊儲存的檔案，但重組後的內容與記錄的雜湊碼不符（物件庫可能已損毀）\n",
+               path);
+    }
+    fprintf(stderr, "sg: 這通常表示物件庫被 git gc 清理過，或 clone 時未取得 %s\n",
+           SG_CHUNK_KEEPALIVE_REF);
+    fprintf(stderr, "sg: 無法還原這個檔案的內容\n");
+}
+
+/* Shared core of sg_chunk_read_blob/sg_chunk_effective_id. Always fills
+   raw_content/raw_len (the blob's own bytes, as read) on success. Beyond
+   that there are three outcomes, tracked by is_pointer/is_broken (see the
+   discriminator comment below for why "first chunk id exists" is the line
+   between "not a pointer" and "a real pointer"):
+     - neither set: not a pointer (or an unverifiable pointer-shaped file) --
+       raw_content/raw_len is the final answer.
+     - is_pointer: a genuine, hash-verified pointer -- rebuilt/rebuilt_len/
+       original_sha1 are the reassembled content.
+     - is_broken: a genuine pointer whose data is missing/corrupt -- missing
+       is filled in, rebuilt is NULL. Callers must treat this as a hard
+       error, never falling back to raw_content as if it were real content.
+   Returns 0 on success, -1 only when the top-level sg_object_read of id
+   itself fails. */
 typedef struct {
     unsigned char *raw_content; /* malloc'd; always set when this returns 0 */
     size_t raw_len;
     int is_pointer;
+    int is_broken;
     unsigned char *rebuilt; /* malloc'd; only set when is_pointer */
     size_t rebuilt_len;
     unsigned char original_sha1[SG_SHA1_RAW_LEN];
+    sg_chunk_missing_info missing; /* only meaningful when is_broken */
 } chunk_resolved;
 
 static int chunk_resolve(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
@@ -477,6 +830,7 @@ static int chunk_resolve(const char *git_dir, const unsigned char id[SG_SHA1_RAW
 {
     sg_obj_type type;
     sg_chunk_pointer ptr;
+    int is_our_pointer;
     int ok;
     size_t i;
 
@@ -488,6 +842,47 @@ static int chunk_resolve(const char *git_dir, const unsigned char id[SG_SHA1_RAW
     if (!sg_chunk_pointer_parse(r->raw_content, r->raw_len, &ptr))
         return 0; /* not a pointer -- raw_content/raw_len is the final answer */
 
+    /* Discriminator between "coincidental pointer-shaped ordinary content"
+       and "a real chunk pointer of ours, possibly with missing/corrupt
+       data": format alone (sg_chunk_pointer_parse succeeding) can't tell
+       them apart -- an ordinary file can coincidentally contain
+       well-formed-looking magic/size/sha1/chunks text (interop exercises
+       exactly this with a small hand-written file). This is a question of
+       *identity* ("did our own sg_chunk_store_blob ever produce this
+       pointer's chunks?"), which is answered by checking whether the first
+       declared chunk id is a member of the SG_CHUNK_KEEPALIVE_REF tree --
+       every chunk id we've ever written ends up there (see keep_alive_add),
+       and the set travels with clone/fetch independently of which loose
+       object files happen to still be present.
+
+       This used to be answered by checking whether the first chunk id's
+       object file exists in the object store, which conflated identity with
+       integrity: if that specific chunk (the first one) was the one lost to
+       gc/corruption/an incomplete clone, a genuine pointer of ours would be
+       misdiagnosed as "not a pointer" and its raw pointer text handed back
+       as if it were the file's content -- silent data corruption on exactly
+       the failure this whole discriminator exists to catch. Checking tree
+       membership instead answers "is this ours?" without depending on
+       whether the data is still intact; intactness is then verified
+       separately below (every declared chunk read back and the reassembly
+       hash-verified), with a lost/corrupt chunk now failing hard via
+       is_broken instead of falling through to "not a pointer".
+
+       sg_chunk_store_blob never produces a pointer with zero chunks
+       (chunking only ever triggers for len >= threshold > 0, which always
+       yields at least one chunk), so chunk_count == 0 takes the same "not a
+       pointer" path as a first chunk id absent from the keep-alive tree.
+       This is a heuristic, not a proof -- a contrived file could in
+       principle collide with a real chunk id -- but it turns "real pointer,
+       data lost" from silent corruption into a hard error while still
+       protecting ordinary files from being misdiagnosed as broken
+       pointers. */
+    is_our_pointer = ptr.chunk_count > 0 && keep_alive_is_member(git_dir, ptr.chunk_ids[0]);
+    if (!is_our_pointer) {
+        sg_chunk_pointer_free(&ptr);
+        return 0; /* not a pointer we recognize as ours */
+    }
+
     ok = 1;
     if (ptr.original_size > 0) {
         r->rebuilt = malloc(ptr.original_size);
@@ -495,19 +890,29 @@ static int chunk_resolve(const char *git_dir, const unsigned char id[SG_SHA1_RAW
             ok = 0;
     }
 
-    for (i = 0; ok && i < ptr.chunk_count; i++) {
+    r->missing.chunk_count = ptr.chunk_count;
+    r->missing.missing_count = 0;
+
+    /* Unlike a plain reassembly, this deliberately keeps scanning every
+       chunk even after one is found missing or a copy would overflow --
+       ok latches false and stops contributing to rebuilt, but the loop
+       still needs to finish so missing_count reflects every absent chunk
+       for sg_chunk_print_missing_error's message, not just the first one
+       found. */
+    for (i = 0; i < ptr.chunk_count; i++) {
         sg_obj_type chunk_type;
-        unsigned char *chunk_content;
-        size_t chunk_len;
+        unsigned char *chunk_content = NULL;
+        size_t chunk_len = 0;
 
         if (sg_object_read(git_dir, ptr.chunk_ids[i], &chunk_type, &chunk_content, &chunk_len) != 0) {
+            r->missing.missing_count++;
             ok = 0;
-            break;
+            continue;
         }
-        if (chunk_len > ptr.original_size - r->rebuilt_len) {
+        if (!ok || chunk_len > ptr.original_size - r->rebuilt_len) {
             free(chunk_content);
             ok = 0;
-            break;
+            continue;
         }
         memcpy(r->rebuilt + r->rebuilt_len, chunk_content, chunk_len);
         r->rebuilt_len += chunk_len;
@@ -528,13 +933,13 @@ static int chunk_resolve(const char *git_dir, const unsigned char id[SG_SHA1_RAW
         memcpy(r->original_sha1, ptr.original_sha1, SG_SHA1_RAW_LEN);
         r->is_pointer = 1;
     } else {
-        /* Format looked right but reassembly/verification failed (missing
-           chunk or hash mismatch): treat as ordinary content, never hand
-           back a partially/unverified rebuild. */
+        /* A genuine chunk pointer (first chunk id resolved) whose data is
+           missing or corrupt: this is a hard error for the caller, never a
+           silent fallback to the pointer's own raw text. */
         free(r->rebuilt);
         r->rebuilt = NULL;
         r->rebuilt_len = 0;
-        r->is_pointer = 0;
+        r->is_broken = 1;
     }
 
     sg_chunk_pointer_free(&ptr);
@@ -548,12 +953,20 @@ static void chunk_resolved_free(chunk_resolved *r)
 }
 
 int sg_chunk_read_blob(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
-                       unsigned char **content_out, size_t *len_out)
+                       unsigned char **content_out, size_t *len_out,
+                       sg_chunk_missing_info *missing_out)
 {
     chunk_resolved r;
 
     if (chunk_resolve(git_dir, id, &r) != 0)
         return -1;
+
+    if (r.is_broken) {
+        if (missing_out != NULL)
+            *missing_out = r.missing;
+        chunk_resolved_free(&r);
+        return -2;
+    }
 
     if (r.is_pointer) {
         free(r.raw_content);
@@ -573,6 +986,11 @@ int sg_chunk_effective_id(const char *git_dir, const unsigned char id[SG_SHA1_RA
 
     if (chunk_resolve(git_dir, id, &r) != 0)
         return -1;
+
+    if (r.is_broken) {
+        chunk_resolved_free(&r);
+        return -2;
+    }
 
     if (r.is_pointer)
         memcpy(out, r.original_sha1, SG_SHA1_RAW_LEN);
