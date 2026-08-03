@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
@@ -86,6 +87,22 @@ int sg_cmd_cat_file(int argc, char **argv)
         return 1;
     }
     free(git_dir);
+
+    /* Plumbing: -p/-t/-s always operate on the object's own stored bytes
+       (the pointer text itself, never reassembled) -- but if it happens to
+       be a chunked-storage pointer, a stderr note helps explain why the
+       content/size looks the way it does, without touching stdout's
+       object-content output. */
+    if (type == SG_OBJ_BLOB) {
+        sg_chunk_pointer ptr;
+
+        if (sg_chunk_pointer_parse(content, content_len, &ptr)) {
+            fprintf(stderr,
+                   "sg: this is a chunked-storage pointer (original size: %zu bytes, %zu chunks)\n",
+                   ptr.original_size, ptr.chunk_count);
+            sg_chunk_pointer_free(&ptr);
+        }
+    }
 
     if (strcmp(mode, "-t") == 0) {
         printf("%s\n", sg_obj_type_name(type));

@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/http.h"
 #include "sg/merge.h"
@@ -183,9 +184,35 @@ static int walk_add_object(const char *git_dir, const unsigned char id[SG_SHA1_R
         }
 
         switch (type) {
-        case SG_OBJ_BLOB:
+        case SG_OBJ_BLOB: {
+            /* A chunked-storage pointer blob's declared chunk ids are, from
+               git's own object-model perspective, invisible -- they're only
+               named as plain hex text inside this blob's content, not a real
+               tree/commit graph edge. A push that only sent this blob would
+               silently leave the actual file data unreachable on the remote
+               (fsck-clean, but useless), so walk the chunk ids too, exactly
+               like sg_chunk_effective_id/sg_chunk_read_blob's own hash-verified
+               notion of "is this really a pointer" (format alone is not
+               enough -- see sg_chunk_pointer_parse's own doc comment). */
+            unsigned char effective_id[SG_SHA1_RAW_LEN];
+
+            if (sg_chunk_effective_id(git_dir, cur, effective_id) == 0 &&
+               memcmp(effective_id, cur, SG_SHA1_RAW_LEN) != 0) {
+                sg_chunk_pointer ptr;
+
+                if (sg_chunk_pointer_parse(content, content_len, &ptr)) {
+                    size_t i;
+
+                    for (i = 0; i < ptr.chunk_count && rc == 0; i++) {
+                        if (walk_enqueue(&q, out, ptr.chunk_ids[i]) < 0)
+                            rc = -1;
+                    }
+                    sg_chunk_pointer_free(&ptr);
+                }
+            }
             free(content);
             break;
+        }
 
         case SG_OBJ_TREE: {
             sg_tree tree;

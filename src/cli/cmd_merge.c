@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -234,9 +235,8 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         } else {
             unsigned char *content;
             size_t content_len;
-            sg_obj_type type;
 
-            if (sg_object_read(git_dir, e->sha1, &type, &content, &content_len) == 0) {
+            if (sg_chunk_read_blob(git_dir, e->sha1, &content, &content_len) == 0) {
                 if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0)
                     fprintf(stderr, "sg: failed to write '%s'\n", e->path);
                 free(content);

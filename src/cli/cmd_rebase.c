@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -264,9 +265,8 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
         } else {
             unsigned char *blob_content;
             size_t blob_len;
-            sg_obj_type blob_type;
 
-            if (sg_object_read(git_dir, e->sha1, &blob_type, &blob_content, &blob_len) == 0) {
+            if (sg_chunk_read_blob(git_dir, e->sha1, &blob_content, &blob_len) == 0) {
                 if (sg_write_file_mkdirs(abspath, blob_content, blob_len, (int)(e->mode & 0777)) != 0)
                     fprintf(stderr, "sg: failed to write '%s'\n", e->path);
                 free(blob_content);
