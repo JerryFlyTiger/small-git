@@ -365,13 +365,14 @@ int sg_cmd_fetch(int argc, char **argv)
             if (sg_chunk_keepalive_merge_commit(git_dir, adv.refs[i].id) != 0) {
                 fprintf(stderr, "sg: warning: 未能合併遠端的 %s\n", SG_CHUNK_KEEPALIVE_REF);
             } else if (sg_repo_mark_chunking_used(git_dir) != 0) {
-                /* Same local durability marker `sg clone` writes -- see
-                   cmd_clone.c's write_remote_and_tag_refs and
-                   sg_repo_mark_chunking_used's doc comment. Not fatal: the
-                   merged-in chunk ids are already protected by the ref
-                   itself right now; the marker only hardens what happens if
-                   that ref is deleted from this repo later. */
-                fprintf(stderr, "sg: warning: 無法在 .git/config 標記本地端已使用過分塊儲存\n");
+                /* Fatal for the same reason as in cmd_clone.c: a repo holding
+                   chunk pointers but missing this marker reads as "never
+                   chunked" the moment the keep-alive ref goes away, and
+                   chunk_resolve then hands back pointer text as file
+                   contents. sg_chunk_store_blob refuses to chunk when it
+                   can't write the marker; fetch must not be laxer. */
+                fprintf(stderr, "sg: 無法在 .git/config 標記本地端已使用過分塊儲存\n");
+                goto done;
             }
             break;
         }

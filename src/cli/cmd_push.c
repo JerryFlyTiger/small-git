@@ -763,6 +763,7 @@ int sg_cmd_push(int argc, char **argv)
             size_t pack_len = 0;
             int use_sb64k = adv.capabilities != NULL &&
                             strstr(adv.capabilities, "side-band-64k") != NULL;
+            int use_atomic = 0;
             sg_push_report report;
             int push_rc;
 
@@ -786,9 +787,15 @@ int sg_cmd_push(int argc, char **argv)
                     update_count = 2;
                 }
 
+                /* Only meaningful with more than one command, and only when
+                   the server offered it: the branch tip and refs/sg/chunks
+                   must not be able to land separately. */
+                use_atomic = update_count > 1 && adv.capabilities != NULL &&
+                             strstr(adv.capabilities, "atomic") != NULL;
+
                 memset(&report, 0, sizeof(report));
-                push_rc = sg_transport_push(url, updates, update_count, use_sb64k, pack_data, pack_len,
-                                           &report);
+                push_rc = sg_transport_push(url, updates, update_count, use_sb64k, use_atomic,
+                                           pack_data, pack_len, &report);
             }
             free(pack_data);
 

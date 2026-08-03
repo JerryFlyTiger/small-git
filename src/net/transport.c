@@ -658,8 +658,8 @@ fail:
 }
 
 int sg_transport_push(const char *base_url, const sg_push_ref_update *updates, size_t update_count,
-                      int use_side_band_64k, const unsigned char *pack_data, size_t pack_len,
-                      sg_push_report *report_out)
+                      int use_side_band_64k, int use_atomic, const unsigned char *pack_data,
+                      size_t pack_len, sg_push_report *report_out)
 {
     unsigned char *body = NULL;
     size_t body_len = 0, body_cap = 0;
@@ -695,9 +695,15 @@ int sg_transport_push(const char *base_url, const sg_push_ref_update *updates, s
         }
         if (i == 0) {
             line[n++] = '\0';
+            /* `atomic` binds every command in this request into one
+               transaction. It matters because the branch ref and
+               refs/sg/chunks must land together: a branch tip published
+               without the keep-alive ref covering its new chunks is exactly
+               the state a remote `git gc` deletes data from. */
             n += (size_t)snprintf(line + n, sizeof(line) - n,
-                                  "report-status%s agent=small-git/0.1",
-                                  use_side_band_64k ? " side-band-64k" : "");
+                                  "report-status%s%s agent=small-git/0.1",
+                                  use_side_band_64k ? " side-band-64k" : "",
+                                  use_atomic ? " atomic" : "");
         }
         line[n++] = '\n';
         if (sg_pkt_append(&body, &body_len, &body_cap, line, n) != 0)

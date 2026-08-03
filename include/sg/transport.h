@@ -113,7 +113,7 @@ typedef struct {
    always has at least one ref to update; message already printed to
    stderr). */
 int sg_transport_push(const char *base_url, const sg_push_ref_update *updates, size_t update_count,
-                      int use_side_band_64k, const unsigned char *pack_data, size_t pack_len,
-                      sg_push_report *report_out);
+                      int use_side_band_64k, int use_atomic, const unsigned char *pack_data,
+                      size_t pack_len, sg_push_report *report_out);
 
 #endif
