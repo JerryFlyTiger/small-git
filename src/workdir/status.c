@@ -1,5 +1,6 @@
 #include "sg/status.h"
 
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/workdir.h"
 
@@ -102,7 +103,8 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
     return 0;
 }
 
-int sg_status_diff_unstaged(const char *repo_root, const sg_index *idx, sg_status_list *out)
+int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg_index *idx,
+                            sg_status_list *out)
 {
     size_t i;
 
@@ -111,6 +113,7 @@ int sg_status_diff_unstaged(const char *repo_root, const sg_index *idx, sg_statu
     for (i = 0; i < idx->count; i++) {
         char abspath[4096];
         unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+        unsigned char effective_sha1[SG_SHA1_RAW_LEN];
         struct stat st;
 
         if (idx->entries[i].stage != 0)
@@ -127,7 +130,12 @@ int sg_status_diff_unstaged(const char *repo_root, const sg_index *idx, sg_statu
                 return -1;
             continue;
         }
-        if (memcmp(wd_sha1, idx->entries[i].sha1, SG_SHA1_RAW_LEN) != 0) {
+        /* idx's id may be a chunked-storage pointer's id rather than the
+           content's own id -- normalize before comparing, or a chunked file
+           that never actually changed would show up as modified forever. */
+        if (sg_chunk_effective_id(git_dir, idx->entries[i].sha1, effective_sha1) != 0)
+            return -1;
+        if (memcmp(wd_sha1, effective_sha1, SG_SHA1_RAW_LEN) != 0) {
             if (status_list_add(out, idx->entries[i].path, SG_STATUS_MODIFIED) != 0)
                 return -1;
         }

@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -151,6 +152,7 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     size_t i;
     int has_conflict = 0;
     int index_ok = 1;
+    int content_missing = 0;
     int rc = 1;
 
     if (resolve_commit_tree(git_dir, ours_commit, ours_tree) != 0 ||
@@ -234,12 +236,16 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         } else {
             unsigned char *content;
             size_t content_len;
-            sg_obj_type type;
+            sg_chunk_missing_info missing;
+            int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &content, &content_len, &missing);
 
-            if (sg_object_read(git_dir, e->sha1, &type, &content, &content_len) == 0) {
+            if (read_rc == 0) {
                 if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0)
                     fprintf(stderr, "sg: failed to write '%s'\n", e->path);
                 free(content);
+            } else if (read_rc == -2) {
+                sg_chunk_print_missing_error(e->path, &missing);
+                content_missing = 1;
             } else {
                 fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
             }
@@ -251,6 +257,16 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
             memcpy(flat_entries[flat_count].sha1, e->sha1, SG_SHA1_RAW_LEN);
             flat_count++;
         }
+    }
+
+    /* A chunked file whose data actually can't be recovered must abort the
+       merge outright -- sg_chunk_print_missing_error already explained why
+       for every affected path above; there's nothing left to do here except
+       refuse to record an index/commit that silently drops the content. */
+    if (content_missing) {
+        sg_index_free(&new_idx);
+        rc = 1;
+        goto done;
     }
 
     /* An index missing entries would be silently wrong on disk -- refuse to

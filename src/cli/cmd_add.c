@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -72,11 +73,26 @@ static int add_one(const char *git_dir, const char *repo_root, sg_index *idx, co
     entry.file_size = (unsigned int)content_len;
     entry.path = rel_path;
 
-    if (sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, entry.sha1) != 0) {
-        fprintf(stderr, "sg: failed to write blob for '%s'\n", arg);
-        free(content);
-        free(rel_path);
-        return -1;
+    {
+        int enabled = 0;
+        size_t threshold = SG_CHUNK_DEFAULT_THRESHOLD;
+        int chunked;
+        int write_ok;
+
+        sg_repo_read_chunk_config(git_dir, &enabled, &threshold);
+
+        if (enabled)
+            write_ok = sg_chunk_store_blob(git_dir, content, content_len, threshold, entry.sha1,
+                                           &chunked) == 0;
+        else
+            write_ok = sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, entry.sha1) == 0;
+
+        if (!write_ok) {
+            fprintf(stderr, "sg: failed to write blob for '%s'\n", arg);
+            free(content);
+            free(rel_path);
+            return -1;
+        }
     }
     free(content);
 

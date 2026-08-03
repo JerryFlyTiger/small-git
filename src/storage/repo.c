@@ -1,5 +1,7 @@
 #include "sg/repo.h"
 
+#include "sg/chunk.h"
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,4 +168,156 @@ char *sg_repo_read_remote_url(const char *git_dir, const char *remote)
     }
     fclose(f);
     return result;
+}
+
+int sg_repo_read_chunk_config(const char *git_dir, int *enabled_out, size_t *threshold_out)
+{
+    char path[SG_PATH_MAX];
+    FILE *f;
+    char line[1024];
+    int in_section = 0;
+
+    *enabled_out = 0;
+    *threshold_out = SG_CHUNK_DEFAULT_THRESHOLD;
+
+    snprintf(path, sizeof(path), "%s/config", git_dir);
+    f = fopen(path, "r");
+    if (f == NULL)
+        return 0;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *p = line;
+        size_t plen;
+
+        while (*p == ' ' || *p == '\t')
+            p++;
+        plen = strlen(p);
+        while (plen > 0 && (p[plen - 1] == '\n' || p[plen - 1] == '\r'))
+            p[--plen] = '\0';
+
+        if (p[0] == '[') {
+            in_section = (strcmp(p, "[sg]") == 0);
+            continue;
+        }
+        if (!in_section)
+            continue;
+
+        if (strncmp(p, "chunking", 8) == 0) {
+            char *eq = strchr(p, '=');
+
+            if (eq != NULL) {
+                char *val = eq + 1;
+                size_t vlen;
+
+                while (*val == ' ' || *val == '\t')
+                    val++;
+                vlen = strlen(val);
+                while (vlen > 0 && (val[vlen - 1] == ' ' || val[vlen - 1] == '\t'))
+                    val[--vlen] = '\0';
+                *enabled_out = (strcmp(val, "true") == 0);
+            }
+        } else if (strncmp(p, "chunkthreshold", 14) == 0) {
+            char *eq = strchr(p, '=');
+
+            if (eq != NULL) {
+                char *val = eq + 1;
+                char *endp = NULL;
+                unsigned long parsed;
+
+                while (*val == ' ' || *val == '\t')
+                    val++;
+                errno = 0;
+                parsed = strtoul(val, &endp, 10);
+                if (endp != val && errno == 0 && parsed > 0)
+                    *threshold_out = (size_t)parsed;
+            }
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+/* Config key for sg_repo_mark_chunking_used/sg_repo_chunking_was_used.
+   Deliberately NOT named anything starting with "chunking" (e.g. the
+   phase 6 report's own suggested "chunkingused"): sg_repo_read_chunk_config
+   above tests its `chunking` flag with strncmp(p, "chunking", 8) == 0, which
+   would also match a line like "chunkingused = true" (its first 8 characters
+   are literally "chunking") and silently turn chunking on even when the user
+   never set `chunking = true` themselves. "everchunked" shares no prefix
+   with either "chunking" or "chunkthreshold", so it can never be
+   misinterpreted by that parser. */
+#define SG_CHUNKING_USED_KEY "everchunked"
+
+int sg_repo_chunking_was_used(const char *git_dir)
+{
+    char path[SG_PATH_MAX];
+    FILE *f;
+    char line[1024];
+    int in_section = 0;
+    int used = 0;
+    size_t key_len = strlen(SG_CHUNKING_USED_KEY);
+
+    snprintf(path, sizeof(path), "%s/config", git_dir);
+    f = fopen(path, "r");
+    if (f == NULL)
+        return 0;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *p = line;
+        size_t plen;
+
+        while (*p == ' ' || *p == '\t')
+            p++;
+        plen = strlen(p);
+        while (plen > 0 && (p[plen - 1] == '\n' || p[plen - 1] == '\r'))
+            p[--plen] = '\0';
+
+        if (p[0] == '[') {
+            in_section = (strcmp(p, "[sg]") == 0);
+            continue;
+        }
+        if (!in_section)
+            continue;
+
+        if (strncmp(p, SG_CHUNKING_USED_KEY, key_len) == 0) {
+            char *eq = strchr(p, '=');
+
+            if (eq != NULL) {
+                char *val = eq + 1;
+                size_t vlen;
+
+                while (*val == ' ' || *val == '\t')
+                    val++;
+                vlen = strlen(val);
+                while (vlen > 0 && (val[vlen - 1] == ' ' || val[vlen - 1] == '\t'))
+                    val[--vlen] = '\0';
+                if (strcmp(val, "true") == 0)
+                    used = 1;
+            }
+        }
+    }
+    fclose(f);
+    return used;
+}
+
+int sg_repo_mark_chunking_used(const char *git_dir)
+{
+    char path[SG_PATH_MAX];
+    FILE *f;
+
+    /* Idempotent: an already-set marker is a cheap no-op rather than an
+       ever-growing pile of duplicate [sg] stanzas appended on every single
+       chunked write. */
+    if (sg_repo_chunking_was_used(git_dir))
+        return 0;
+
+    snprintf(path, sizeof(path), "%s/config", git_dir);
+    f = fopen(path, "a");
+    if (f == NULL)
+        return -1;
+    if (fprintf(f, "[sg]\n\t%s = true\n", SG_CHUNKING_USED_KEY) < 0) {
+        fclose(f);
+        return -1;
+    }
+    return fclose(f) == 0 ? 0 : -1;
 }

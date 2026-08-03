@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -172,6 +173,7 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
     size_t conflict_count = 0;
     int has_conflict = 0;
     int index_ok = 1;
+    int content_missing = 0;
     char short_sha[8];
     char theirs_label[300];
     pick_rc rc = PICK_ERROR;
@@ -264,12 +266,16 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
         } else {
             unsigned char *blob_content;
             size_t blob_len;
-            sg_obj_type blob_type;
+            sg_chunk_missing_info missing;
+            int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &blob_content, &blob_len, &missing);
 
-            if (sg_object_read(git_dir, e->sha1, &blob_type, &blob_content, &blob_len) == 0) {
+            if (read_rc == 0) {
                 if (sg_write_file_mkdirs(abspath, blob_content, blob_len, (int)(e->mode & 0777)) != 0)
                     fprintf(stderr, "sg: failed to write '%s'\n", e->path);
                 free(blob_content);
+            } else if (read_rc == -2) {
+                sg_chunk_print_missing_error(e->path, &missing);
+                content_missing = 1;
             } else {
                 fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
             }
@@ -281,6 +287,17 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
             memcpy(flat_entries[flat_count].sha1, e->sha1, SG_SHA1_RAW_LEN);
             flat_count++;
         }
+    }
+
+    /* A chunked file whose data actually can't be recovered (as opposed to a
+       plain missing-blob defensive check, which "can't happen" in practice)
+       must abort this pick outright -- sg_chunk_print_missing_error already
+       explained why for every affected path above, so there's nothing left
+       to do here except refuse to record a commit/index that silently drops
+       the content. */
+    if (content_missing) {
+        rc = PICK_ERROR;
+        goto done;
     }
 
     if (!index_ok) {

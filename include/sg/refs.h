@@ -28,4 +28,27 @@ int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id
 
 int sg_ref_branch_exists(const char *git_dir, const char *branch);
 
+/* Like sg_ref_update_branch, but for an arbitrary ref path under git_dir
+   (e.g. "refs/sg/chunks"), not just "refs/heads/<name>" -- used for internal
+   refs that don't fit the branch namespace. Creates any missing parent
+   directories. Applies the same path-safety check as
+   sg_ref_branch_name_is_safe (no leading '/', no ".."), applied to the whole
+   ref_path this time, so a caller-supplied path still can't escape
+   .git/refs (or .git itself). Returns 0 on success, -1 on an unsafe path or
+   I/O failure. */
+int sg_ref_write_path(const char *git_dir, const char *ref_path,
+                      const unsigned char id[SG_SHA1_RAW_LEN]);
+
+/* Reads a ref written by sg_ref_write_path. Returns -1 if it doesn't exist,
+   is unsafe, or is malformed (same "doesn't exist yet" vs "corrupt" caveat
+   as sg_ref_read_branch -- callers that treat a missing ref as "nothing
+   there yet" rather than an error should keep doing so here too). Falls
+   back to git_dir/packed-refs if there's no loose file at ref_path -- `git
+   gc` (via `git pack-refs`) can move any ref, including ones this project
+   writes itself (e.g. SG_CHUNK_KEEPALIVE_REF), out of its loose per-ref file
+   and into packed-refs instead, and that must not look like the ref no
+   longer exists. */
+int sg_ref_read_path(const char *git_dir, const char *ref_path,
+                     unsigned char id_out[SG_SHA1_RAW_LEN]);
+
 #endif

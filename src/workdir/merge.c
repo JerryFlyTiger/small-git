@@ -1,9 +1,11 @@
 #include "sg/merge.h"
 
+#include "sg/chunk.h"
 #include "sg/diff_lcs.h"
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/repo.h"
 #include "sg/tree_build.h"
 
 #include <errno.h>
@@ -509,6 +511,33 @@ static void fill_conflict_sides(sg_merge_result_entry *e, const triple *t)
     }
 }
 
+/* Reads the content a tree entry's blob id actually names, transparently
+   reassembling it if id is a chunked-storage pointer (see sg/chunk.h) --
+   using sg_object_read here instead would hand back the pointer's own
+   ~500-byte text (magic/size/sha1/chunk-id-list) as if it were the file's
+   real content, which is exactly the bug this function exists to avoid: a
+   large file's real bytes would never even be looked at by the diff3/binary
+   logic below, and a "conflict" would end up being two branches' pointer
+   texts diffed against each other instead of the actual file. path is used
+   only for sg_chunk_print_missing_error's message. Returns 0 on success, -1
+   on any failure -- including a -2 ("real pointer, but the data is missing
+   or corrupt") from sg_chunk_read_blob, which is deliberately turned into a
+   hard failure here rather than falling back to raw pointer text or
+   silently skipping the path: losing a chunked file's data must abort the
+   whole merge, never be papered over. */
+static int read_blob_chunk_aware(const char *git_dir, const unsigned char sha1[SG_SHA1_RAW_LEN],
+                                 const char *path, unsigned char **content_out, size_t *len_out)
+{
+    sg_chunk_missing_info missing;
+    int rc = sg_chunk_read_blob(git_dir, sha1, content_out, len_out, &missing);
+
+    if (rc == -2) {
+        sg_chunk_print_missing_error(path, &missing);
+        return -1;
+    }
+    return rc;
+}
+
 /* Handles the "all three present" (modify/modify) and "base absent, both
    added" (add/add) conflict candidates by calling sg_merge_content; a clean
    result (rc 0) turns out not to be a conflict after all and gets a freshly
@@ -524,16 +553,17 @@ static int resolve_via_content_merge(const char *git_dir, const triple *t, const
     size_t theirs_len = 0;
     unsigned char *merged = NULL;
     size_t merged_len = 0;
-    sg_obj_type type;
     int rc;
 
-    if (t->base_present && sg_object_read(git_dir, t->base_e->sha1, &type, &base_content, &base_len) != 0)
+    if (t->base_present &&
+       read_blob_chunk_aware(git_dir, t->base_e->sha1, t->path, &base_content, &base_len) != 0)
         return -1;
-    if (sg_object_read(git_dir, t->ours_e->sha1, &type, &ours_content, &ours_len) != 0) {
+    if (read_blob_chunk_aware(git_dir, t->ours_e->sha1, t->path, &ours_content, &ours_len) != 0) {
         free(base_content);
         return -1;
     }
-    if (sg_object_read(git_dir, t->theirs_e->sha1, &type, &theirs_content, &theirs_len) != 0) {
+    if (read_blob_chunk_aware(git_dir, t->theirs_e->sha1, t->path, &theirs_content, &theirs_len) !=
+       0) {
         free(base_content);
         free(ours_content);
         return -1;
@@ -549,8 +579,24 @@ static int resolve_via_content_merge(const char *git_dir, const triple *t, const
 
     if (rc == 0) {
         unsigned char new_sha1[SG_SHA1_RAW_LEN];
+        int enabled = 0;
+        size_t threshold = SG_CHUNK_DEFAULT_THRESHOLD;
+        int chunked;
 
-        if (sg_loose_write(git_dir, SG_OBJ_BLOB, merged, merged_len, new_sha1) != 0) {
+        /* A clean multi-line merge can itself produce a file large enough to
+           deserve chunking (e.g. two branches each touched a different part
+           of a multi-megabyte text file) -- store it the same chunk-aware
+           way `sg add` does, using this repo's own configured threshold, so
+           the merge result isn't silently forced back into full-size,
+           non-deduplicated storage. */
+        sg_repo_read_chunk_config(git_dir, &enabled, &threshold);
+        if (enabled) {
+            if (sg_chunk_store_blob(git_dir, merged, merged_len, threshold, new_sha1, &chunked) !=
+               0) {
+                free(merged);
+                return -1;
+            }
+        } else if (sg_loose_write(git_dir, SG_OBJ_BLOB, merged, merged_len, new_sha1) != 0) {
             free(merged);
             return -1;
         }
@@ -634,13 +680,15 @@ static int process_path(const char *git_dir, const triple *t, const char *ours_l
         return 0;
     }
 
-    /* modify/delete: base present, exactly one of ours/theirs still has it */
+    /* modify/delete: base present, exactly one of ours/theirs still has it.
+       The surviving side's real content (chunk-aware, not its raw pointer
+       text if it's a chunked file) is what gets left in the working tree
+       for the user to resolve. */
     {
         const sg_flat_entry *present_e = t->ours_present ? t->ours_e : t->theirs_e;
-        sg_obj_type type;
 
-        if (sg_object_read(git_dir, present_e->sha1, &type, &out->conflict_content,
-                           &out->conflict_content_len) != 0) {
+        if (read_blob_chunk_aware(git_dir, present_e->sha1, t->path, &out->conflict_content,
+                                  &out->conflict_content_len) != 0) {
             free(out->path);
             return -1;
         }

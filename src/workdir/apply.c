@@ -1,5 +1,6 @@
 #include "sg/apply.h"
 
+#include "sg/chunk.h"
 #include "sg/confirm.h"
 #include "sg/index.h"
 #include "sg/merge.h"
@@ -98,16 +99,25 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         char abspath[4096];
         unsigned char *blob_content;
         size_t blob_len;
-        sg_obj_type blob_type;
         struct stat st;
         sg_index_entry entry;
 
         snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, target_flat.entries[i].path);
-        if (sg_object_read(git_dir, target_flat.entries[i].sha1, &blob_type, &blob_content, &blob_len) !=
-           0) {
-            fprintf(stderr, "sg: missing blob for '%s'\n", target_flat.entries[i].path);
-            rc = -1;
-            continue;
+        {
+            sg_chunk_missing_info missing;
+            int read_rc = sg_chunk_read_blob(git_dir, target_flat.entries[i].sha1, &blob_content,
+                                             &blob_len, &missing);
+
+            if (read_rc == -2) {
+                sg_chunk_print_missing_error(target_flat.entries[i].path, &missing);
+                rc = -1;
+                continue;
+            }
+            if (read_rc != 0) {
+                fprintf(stderr, "sg: missing blob for '%s'\n", target_flat.entries[i].path);
+                rc = -1;
+                continue;
+            }
         }
         if (sg_write_file_mkdirs(abspath, blob_content, blob_len,
                                  (int)(target_flat.entries[i].mode & 0777)) != 0) {
@@ -233,7 +243,7 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
 
     staged_ok = sg_status_diff_staged(&head_flat, &idx, &staged) == 0;
     sg_flat_list_free(&head_flat);
-    unstaged_ok = sg_status_diff_unstaged(repo_root, &idx, &unstaged) == 0;
+    unstaged_ok = sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) == 0;
 
     /* A failed diff (e.g. out of memory) must NOT be read as "clean" -- that
        would silently defeat the whole point of this safety gate. An
@@ -336,7 +346,7 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
 
     staged_ok = sg_status_diff_staged(&head_flat, &idx, &staged) == 0;
     sg_flat_list_free(&head_flat);
-    unstaged_ok = sg_status_diff_unstaged(repo_root, &idx, &unstaged) == 0;
+    unstaged_ok = sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) == 0;
 
     /* A failed diff must never read as "clean" -- same rule as the rest of
        the safety gates. */

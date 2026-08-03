@@ -35,8 +35,12 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
 
 /* Changes not yet staged: compares idx against the actual working directory
    contents under repo_root. A path missing from the working directory (or
-   unreadable) counts as SG_STATUS_DELETED. Returns 0 on success, -1 on
-   allocation failure. */
-int sg_status_diff_unstaged(const char *repo_root, const sg_index *idx, sg_status_list *out);
+   unreadable) counts as SG_STATUS_DELETED. git_dir is used to normalize a
+   chunked-storage pointer id from idx into the id of its actual content (see
+   sg/chunk.h's sg_chunk_effective_id) before comparing against the working
+   file's hash, so a chunked file that hasn't actually changed doesn't show up
+   as permanently modified. Returns 0 on success, -1 on allocation failure. */
+int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg_index *idx,
+                            sg_status_list *out);
 
 #endif

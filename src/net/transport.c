@@ -657,34 +657,54 @@ fail:
     return -1;
 }
 
-int sg_transport_push(const char *base_url, const unsigned char old_id[SG_SHA1_RAW_LEN],
-                      const unsigned char new_id[SG_SHA1_RAW_LEN], const char *ref_name,
-                      int use_side_band_64k, const unsigned char *pack_data, size_t pack_len,
-                      sg_push_report *report_out)
+int sg_transport_push(const char *base_url, const sg_push_ref_update *updates, size_t update_count,
+                      int use_side_band_64k, int use_atomic, const unsigned char *pack_data,
+                      size_t pack_len, sg_push_report *report_out)
 {
     unsigned char *body = NULL;
     size_t body_len = 0, body_cap = 0;
     char url[SG_PATH_MAX];
-    char old_hex[SG_SHA1_HEX_LEN + 1];
-    char new_hex[SG_SHA1_HEX_LEN + 1];
     sg_buf resp;
     int rc = -1;
+    size_t i;
 
-    sg_sha1_to_hex(old_id, old_hex);
-    sg_sha1_to_hex(new_id, new_hex);
+    if (update_count == 0) {
+        fprintf(stderr, "sg: push 命令列表是空的（沒有任何 ref 要更新）\n");
+        return -1;
+    }
 
-    {
+    /* Only the FIRST ref-update command line carries the NUL-separated
+       capabilities suffix -- every command line after it is a plain
+       "<old> <new> <ref>\n" pkt-line, exactly matching how a real git push
+       updates several refs (e.g. a branch plus refs/sg/chunks) in one
+       request. All of them precede the single flush-pkt that terminates the
+       command list, before the raw pack bytes. */
+    for (i = 0; i < update_count; i++) {
+        char old_hex[SG_SHA1_HEX_LEN + 1];
+        char new_hex[SG_SHA1_HEX_LEN + 1];
         char line[SG_REF_NAME_MAX + 256];
         size_t n;
 
-        n = (size_t)snprintf(line, sizeof(line), "%s %s %s", old_hex, new_hex, ref_name);
+        sg_sha1_to_hex(updates[i].old_id, old_hex);
+        sg_sha1_to_hex(updates[i].new_id, new_hex);
+
+        n = (size_t)snprintf(line, sizeof(line), "%s %s %s", old_hex, new_hex, updates[i].ref_name);
         if (n >= sizeof(line) - 64) {
             fprintf(stderr, "sg: ref name too long for a push command line\n");
             goto done;
         }
-        line[n++] = '\0';
-        n += (size_t)snprintf(line + n, sizeof(line) - n, "report-status%s agent=small-git/0.1",
-                              use_side_band_64k ? " side-band-64k" : "");
+        if (i == 0) {
+            line[n++] = '\0';
+            /* `atomic` binds every command in this request into one
+               transaction. It matters because the branch ref and
+               refs/sg/chunks must land together: a branch tip published
+               without the keep-alive ref covering its new chunks is exactly
+               the state a remote `git gc` deletes data from. */
+            n += (size_t)snprintf(line + n, sizeof(line) - n,
+                                  "report-status%s%s agent=small-git/0.1",
+                                  use_side_band_64k ? " side-band-64k" : "",
+                                  use_atomic ? " atomic" : "");
+        }
         line[n++] = '\n';
         if (sg_pkt_append(&body, &body_len, &body_cap, line, n) != 0)
             goto done;

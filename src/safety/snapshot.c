@@ -1,9 +1,11 @@
 #include "sg/snapshot.h"
 
+#include "sg/chunk.h"
 #include "sg/loose.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
+#include "sg/repo.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -109,6 +111,8 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
     long long ts;
     size_t i;
     int rc = -1;
+    int chunk_enabled = 0;
+    size_t chunk_threshold = SG_CHUNK_DEFAULT_THRESHOLD;
 
     memset(&commit, 0, sizeof(commit));
 
@@ -117,6 +121,8 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
         if (entries == NULL)
             return -1;
     }
+
+    sg_repo_read_chunk_config(git_dir, &chunk_enabled, &chunk_threshold);
 
     for (i = 0; i < idx->count; i++) {
         char abspath[SG_PATH_MAX];
@@ -138,7 +144,16 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
 
         snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx->entries[i].path);
         if (sg_read_file(abspath, &content, &content_len) == 0) {
-            int write_ok = sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, blob_id) == 0;
+            int write_ok;
+
+            if (chunk_enabled) {
+                int chunked;
+
+                write_ok = sg_chunk_store_blob(git_dir, content, content_len, chunk_threshold,
+                                              blob_id, &chunked) == 0;
+            } else {
+                write_ok = sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, blob_id) == 0;
+            }
 
             free(content);
             if (!write_ok)

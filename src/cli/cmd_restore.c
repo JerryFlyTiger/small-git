@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/chunk.h"
 #include "sg/confirm.h"
 #include "sg/hash.h"
 #include "sg/index.h"
@@ -39,7 +40,6 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
                             const char *arg, const char *rel)
 {
     int pos = sg_index_find(idx, rel);
-    sg_obj_type type;
     unsigned char *content;
     size_t content_len;
     char abspath[4096];
@@ -49,9 +49,19 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
         fprintf(stderr, "sg: '%s' is not tracked in the index\n", arg);
         return -1;
     }
-    if (sg_object_read(git_dir, idx->entries[pos].sha1, &type, &content, &content_len) != 0) {
-        fprintf(stderr, "sg: failed to read staged content for '%s'\n", arg);
-        return -1;
+    {
+        sg_chunk_missing_info missing;
+        int read_rc = sg_chunk_read_blob(git_dir, idx->entries[pos].sha1, &content, &content_len,
+                                         &missing);
+
+        if (read_rc == -2) {
+            sg_chunk_print_missing_error(arg, &missing);
+            return -1;
+        }
+        if (read_rc != 0) {
+            fprintf(stderr, "sg: failed to read staged content for '%s'\n", arg);
+            return -1;
+        }
     }
 
     snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, rel);
@@ -125,12 +135,14 @@ static void strbuf_append_path(strbuf *b, const char *path)
 /* Determines whether restoring rel from the index would actually discard
    working-directory content: a missing file or one whose content already
    matches the index entry loses nothing. */
-static int would_lose_content(const char *repo_root, const sg_index *idx, const char *rel)
+static int would_lose_content(const char *git_dir, const char *repo_root, const sg_index *idx,
+                              const char *rel)
 {
     int pos = sg_index_find(idx, rel);
     char abspath[4096];
     struct stat st;
     unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+    unsigned char effective_sha1[SG_SHA1_RAW_LEN];
 
     if (pos < 0)
         return 0; /* not tracked: restore will error out, nothing to lose */
@@ -140,7 +152,12 @@ static int would_lose_content(const char *repo_root, const sg_index *idx, const 
         return 0;
     if (sg_hash_file_blob(abspath, wd_sha1) != 0)
         return 0;
-    return memcmp(wd_sha1, idx->entries[pos].sha1, SG_SHA1_RAW_LEN) != 0;
+    /* idx's sha1 may be a chunked-storage pointer's id -- normalize to the
+       content's own id first, or a chunked file would always look "lossy"
+       here even when nothing actually changed. */
+    if (sg_chunk_effective_id(git_dir, idx->entries[pos].sha1, effective_sha1) != 0)
+        return 1; /* can't verify: treat conservatively as lossy */
+    return memcmp(wd_sha1, effective_sha1, SG_SHA1_RAW_LEN) != 0;
 }
 
 int sg_cmd_restore(int argc, char **argv)
@@ -222,7 +239,7 @@ int sg_cmd_restore(int argc, char **argv)
             if (rel == NULL)
                 continue; /* reported as an error in the main loop below */
 
-            if (would_lose_content(repo_root, &idx, rel)) {
+            if (would_lose_content(git_dir, repo_root, &idx, rel)) {
                 if (!any_lossy)
                     strbuf_append(&msg,
                                   "sg restore: 以下路徑目前的工作目錄內容跟 index 不同，"

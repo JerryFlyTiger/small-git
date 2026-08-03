@@ -1,5 +1,7 @@
 #include "sg/refs.h"
 
+#include "sg/workdir.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,50 +111,12 @@ char *sg_ref_current_branch(const char *git_dir)
     return branch;
 }
 
-/* `git gc` (and `git pack-refs`) move refs out of individual files into
-   .git/packed-refs and delete the loose ones. A reader that only looks for
-   the loose file concludes the branch has no commits at all -- after which
-   the next commit is written as a fresh root commit and the entire prior
-   history stops being reachable from any ref. Every ref lookup must fall
-   back to this file.
-
-   Format: one "<40-hex> <refname>" per line; lines starting with '#' are
-   the header, and a line starting with '^' is the peeled target of the
-   preceding annotated tag (not a ref of its own -- skipping it is what
-   keeps a tag from being mistaken for its own commit). */
-static int read_packed_ref(const char *git_dir, const char *ref_name,
-                           unsigned char id_out[SG_SHA1_RAW_LEN])
-{
-    char path[SG_PATH_MAX];
-    char *content;
-    char *line;
-    char *saveptr = NULL;
-    size_t want_len = strlen(ref_name);
-    int rc = -1;
-
-    snprintf(path, sizeof(path), "%s/packed-refs", git_dir);
-    content = read_small_file(path);
-    if (content == NULL)
-        return -1;
-
-    for (line = strtok_r(content, "\n", &saveptr); line != NULL;
-         line = strtok_r(NULL, "\n", &saveptr)) {
-        if (line[0] == '#' || line[0] == '^' || line[0] == '\0')
-            continue;
-        if (strlen(line) < SG_SHA1_HEX_LEN + 2 || line[SG_SHA1_HEX_LEN] != ' ')
-            continue;
-        if (strlen(line + SG_SHA1_HEX_LEN + 1) != want_len ||
-           memcmp(line + SG_SHA1_HEX_LEN + 1, ref_name, want_len) != 0)
-            continue;
-
-        line[SG_SHA1_HEX_LEN] = '\0';
-        rc = sg_hex_to_sha1(line, id_out);
-        break;
-    }
-
-    free(content);
-    return rc;
-}
+/* defined below, next to sg_ref_read_path -- `git gc` packs refs away
+   from their loose files, and a lookup that misses that concludes the
+   branch has no commits, which turns the next commit into a root commit
+   and orphans the whole history. */
+static int read_packed_ref(const char *git_dir, const char *ref_path,
+                           unsigned char id_out[SG_SHA1_RAW_LEN]);
 
 int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
@@ -230,4 +194,92 @@ int sg_ref_branch_exists(const char *git_dir, const char *branch)
 
     /* a packed branch is still a branch -- see read_packed_ref */
     return sg_ref_read_branch(git_dir, branch, id) == 0;
+}
+
+int sg_ref_write_path(const char *git_dir, const char *ref_path, const unsigned char id[SG_SHA1_RAW_LEN])
+{
+    char full_path[SG_PATH_MAX];
+    char content[SG_SHA1_HEX_LEN + 2];
+
+    if (!sg_ref_branch_name_is_safe(ref_path))
+        return -1;
+
+    snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path);
+    sg_sha1_to_hex(id, content);
+    content[SG_SHA1_HEX_LEN] = '\n';
+    content[SG_SHA1_HEX_LEN + 1] = '\0';
+    return sg_write_file_mkdirs(full_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, 0644);
+}
+
+/* Parses git's packed-refs file (a plain "<40-hex-sha1> <ref-name>\n" list,
+   with an optional leading '#'-comment header line and, for annotated tags
+   only, '^'-prefixed peeled-object lines following the ref they annotate)
+   looking for exactly ref_path. `git gc` (via the `git pack-refs` step it
+   runs) routinely moves refs out of their loose per-ref file and into this
+   single file instead -- including SG_CHUNK_KEEPALIVE_REF, since by design
+   it's an ordinary ref from git's own perspective (see that ref's doc
+   comment in chunk.h) -- so a reader that only ever checks the loose path
+   would start reporting "ref doesn't exist" right after a real `git gc`,
+   even though the ref is still there. Returns 0 with id_out filled in if
+   found, -1 if packed-refs is missing/unreadable or doesn't list ref_path. */
+static int read_packed_ref(const char *git_dir, const char *ref_path,
+                           unsigned char id_out[SG_SHA1_RAW_LEN])
+{
+    char path[SG_PATH_MAX];
+    char *content;
+    char *saveptr = NULL;
+    char *line;
+    int rc = -1;
+
+    snprintf(path, sizeof(path), "%s/packed-refs", git_dir);
+    content = read_small_file(path);
+    if (content == NULL)
+        return -1;
+
+    for (line = strtok_r(content, "\n", &saveptr); line != NULL;
+        line = strtok_r(NULL, "\n", &saveptr)) {
+        char *space;
+
+        if (line[0] == '#' || line[0] == '^')
+            continue;
+        space = strchr(line, ' ');
+        if (space == NULL || (size_t)(space - line) != SG_SHA1_HEX_LEN)
+            continue;
+        if (strcmp(space + 1, ref_path) == 0) {
+            char hex[SG_SHA1_HEX_LEN + 1];
+
+            memcpy(hex, line, SG_SHA1_HEX_LEN);
+            hex[SG_SHA1_HEX_LEN] = '\0';
+            rc = sg_hex_to_sha1(hex, id_out);
+            break;
+        }
+    }
+
+    free(content);
+    return rc;
+}
+
+int sg_ref_read_path(const char *git_dir, const char *ref_path, unsigned char id_out[SG_SHA1_RAW_LEN])
+{
+    char full_path[SG_PATH_MAX];
+    unsigned char *content;
+    size_t content_len;
+    char hex[SG_SHA1_HEX_LEN + 1];
+    int rc;
+
+    if (!sg_ref_branch_name_is_safe(ref_path))
+        return -1;
+
+    snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path);
+    if (sg_read_file(full_path, &content, &content_len) != 0)
+        return read_packed_ref(git_dir, ref_path, id_out); /* loose ref file absent: maybe packed by `git gc` */
+    if (content_len < SG_SHA1_HEX_LEN) {
+        free(content);
+        return -1;
+    }
+    memcpy(hex, content, SG_SHA1_HEX_LEN);
+    hex[SG_SHA1_HEX_LEN] = '\0';
+    rc = sg_hex_to_sha1(hex, id_out);
+    free(content);
+    return rc;
 }

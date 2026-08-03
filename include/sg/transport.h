@@ -84,19 +84,36 @@ typedef struct {
 
 void sg_push_report_free(sg_push_report *report);
 
-/* POST <base_url>/git-receive-pack updating a single ref (old_id -> new_id
-   for ref_name) and uploading pack_data/pack_len as the packfile. Requests
-   the capabilities "report-status agent=small-git/0.1", plus "side-band-64k"
-   iff use_side_band_64k is set -- callers must only pass 1 for that when the
-   remote's own advertisement (sg_transport_ls_refs_push) listed it; this
-   function does not check. Parses the report-status response (demuxing
-   side-band-64k first, if requested) into *report_out. Returns 0 if the HTTP
-   round trip itself succeeded -- this says nothing about whether the ref
-   update was actually accepted, which is what *report_out is for -- or -1 on
-   a transport-level failure (message already printed to stderr). */
-int sg_transport_push(const char *base_url, const unsigned char old_id[SG_SHA1_RAW_LEN],
-                      const unsigned char new_id[SG_SHA1_RAW_LEN], const char *ref_name,
-                      int use_side_band_64k, const unsigned char *pack_data, size_t pack_len,
-                      sg_push_report *report_out);
+/* One ref update command line in a push (old_id -> new_id for ref_name).
+   ref_name is borrowed, not owned -- callers keep it alive for the duration
+   of the sg_transport_push call. */
+typedef struct {
+    unsigned char old_id[SG_SHA1_RAW_LEN];
+    unsigned char new_id[SG_SHA1_RAW_LEN];
+    const char *ref_name;
+} sg_push_ref_update;
+
+/* POST <base_url>/git-receive-pack updating one or more refs (updates,
+   update_count of them -- must be > 0) and uploading pack_data/pack_len as
+   the packfile. Wire format: the first update's pkt-line carries the
+   capabilities suffix ("report-status agent=small-git/0.1", plus
+   "side-band-64k" iff use_side_band_64k is set -- callers must only pass 1
+   for that when the remote's own advertisement (sg_transport_ls_refs_push)
+   listed it; this function does not check), every subsequent update is its
+   own plain "<old-hex> <new-hex> <ref-name>\n" pkt-line with no NUL/
+   capabilities, then a single flush-pkt terminates the command list before
+   the raw pack bytes -- this is exactly how a real git push updates several
+   refs (e.g. a branch and a tag) in one round trip. Parses the report-status
+   response (demuxing side-band-64k first, if requested) into *report_out,
+   which contains one result per accepted/rejected ref, in whatever order the
+   server returned them (see sg_parse_push_report_status). Returns 0 if the
+   HTTP round trip itself succeeded -- this says nothing about whether any
+   given ref update was actually accepted, which is what *report_out is for
+   -- or -1 on a transport-level failure, or if update_count == 0 (a push
+   always has at least one ref to update; message already printed to
+   stderr). */
+int sg_transport_push(const char *base_url, const sg_push_ref_update *updates, size_t update_count,
+                      int use_side_band_64k, int use_atomic, const unsigned char *pack_data,
+                      size_t pack_len, sg_push_report *report_out);
 
 #endif

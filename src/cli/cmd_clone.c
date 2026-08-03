@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
@@ -107,6 +108,15 @@ static int write_ref_file(const char *git_dir, const char *ref_path,
                                 0644);
 }
 
+/* refs/heads/<name> -> refs/remotes/<remote>/<name>, refs/tags/<name> ->
+   refs/tags/<name> (unchanged), and SG_CHUNK_KEEPALIVE_REF -> the same path
+   locally (it's
+   shared keep-alive plumbing, not a branch/tag, so it isn't namespaced under
+   refs/remotes/) -- see the phase 6b spec's clone/fetch section: this is
+   what lets a fresh `sg clone` from another sg repo actually recover a
+   chunked file's chunk blobs instead of just the pointer text, since
+   without this ref the freshly-cloned chunks would be unreachable here too
+   and gc'd right back out from under the pointer. */
 static int write_remote_and_tag_refs(const char *git_dir, const sg_ref_adv *adv,
                                      const char *remote_name)
 {
@@ -115,22 +125,49 @@ static int write_remote_and_tag_refs(const char *git_dir, const sg_ref_adv *adv,
     for (i = 0; i < adv->count; i++) {
         const char *name = adv->refs[i].name;
         char ref_path[SG_PATH_MAX];
+        int is_keepalive = 0;
 
         if (strncmp(name, "refs/heads/", 11) == 0) {
             snprintf(ref_path, sizeof(ref_path), "refs/remotes/%s/%s", remote_name, name + 11);
         } else if (strncmp(name, "refs/tags/", 10) == 0) {
             snprintf(ref_path, sizeof(ref_path), "%s", name);
+        } else if (strcmp(name, SG_CHUNK_KEEPALIVE_REF) == 0) {
+            snprintf(ref_path, sizeof(ref_path), "%s", name);
+            is_keepalive = 1;
         } else {
             continue;
         }
         if (write_ref_file(git_dir, ref_path, adv->refs[i].id) != 0)
             return -1;
+
+        /* This clone just received (and locally wrote) another sg repo's own
+           SG_CHUNK_KEEPALIVE_REF -- record that fact in .git/config the same
+           way sg_chunk_store_blob does for chunks produced locally (see
+           sg_repo_mark_chunking_used's doc comment).
+
+           Fatal, not a warning: without the marker, a repo that later loses
+           this ref reads as "never chunked anything", which is exactly the
+           case chunk_resolve treats as ordinary content -- it would hand back
+           pointer text as file contents. sg_chunk_store_blob already refuses
+           to chunk at all when it can't write the marker; a clone that keeps
+           going here would be the one path left where the two disagree. */
+        if (is_keepalive && sg_repo_mark_chunking_used(git_dir) != 0) {
+            fprintf(stderr, "sg: 無法在 .git/config 標記本地端已使用過分塊儲存\n");
+            return -1;
+        }
     }
     return 0;
 }
 
-/* Deduplicated want list: the tip of every refs/heads/ and refs/tags/ entry
-   the server advertised. */
+/* Deduplicated want list: the tip of every refs/heads/, refs/tags/, and (if
+   advertised) SG_CHUNK_KEEPALIVE_REF entry the server advertised -- the
+   latter so a chunked file's chunk blobs actually come down in the pack,
+   not just the pointer blob that names them (see the phase 6b spec's
+   clone/fetch section). A real, unmodified `git` server never advertises
+   this custom ref outside of its own refs/heads/tags refspecs, so this is
+   sg <-> sg specific; against a plain `git clone`/`git fetch` of an sg
+   repo, this list is unaffected and the known limitation documented in
+   interop.sh applies. */
 static int build_want_ids(const sg_ref_adv *adv, unsigned char (**ids_out)[SG_SHA1_RAW_LEN],
                           size_t *count_out)
 {
@@ -146,7 +183,8 @@ static int build_want_ids(const sg_ref_adv *adv, unsigned char (**ids_out)[SG_SH
         int dup = 0;
 
         if (strncmp(adv->refs[i].name, "refs/heads/", 11) != 0 &&
-           strncmp(adv->refs[i].name, "refs/tags/", 10) != 0)
+           strncmp(adv->refs[i].name, "refs/tags/", 10) != 0 &&
+           strcmp(adv->refs[i].name, SG_CHUNK_KEEPALIVE_REF) != 0)
             continue;
         for (j = 0; j < count; j++) {
             if (memcmp(ids[j], adv->refs[i].id, SG_SHA1_RAW_LEN) == 0) {
