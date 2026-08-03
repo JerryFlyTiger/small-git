@@ -109,9 +109,55 @@ char *sg_ref_current_branch(const char *git_dir)
     return branch;
 }
 
+/* `git gc` (and `git pack-refs`) move refs out of individual files into
+   .git/packed-refs and delete the loose ones. A reader that only looks for
+   the loose file concludes the branch has no commits at all -- after which
+   the next commit is written as a fresh root commit and the entire prior
+   history stops being reachable from any ref. Every ref lookup must fall
+   back to this file.
+
+   Format: one "<40-hex> <refname>" per line; lines starting with '#' are
+   the header, and a line starting with '^' is the peeled target of the
+   preceding annotated tag (not a ref of its own -- skipping it is what
+   keeps a tag from being mistaken for its own commit). */
+static int read_packed_ref(const char *git_dir, const char *ref_name,
+                           unsigned char id_out[SG_SHA1_RAW_LEN])
+{
+    char path[SG_PATH_MAX];
+    char *content;
+    char *line;
+    char *saveptr = NULL;
+    size_t want_len = strlen(ref_name);
+    int rc = -1;
+
+    snprintf(path, sizeof(path), "%s/packed-refs", git_dir);
+    content = read_small_file(path);
+    if (content == NULL)
+        return -1;
+
+    for (line = strtok_r(content, "\n", &saveptr); line != NULL;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        if (line[0] == '#' || line[0] == '^' || line[0] == '\0')
+            continue;
+        if (strlen(line) < SG_SHA1_HEX_LEN + 2 || line[SG_SHA1_HEX_LEN] != ' ')
+            continue;
+        if (strlen(line + SG_SHA1_HEX_LEN + 1) != want_len ||
+           memcmp(line + SG_SHA1_HEX_LEN + 1, ref_name, want_len) != 0)
+            continue;
+
+        line[SG_SHA1_HEX_LEN] = '\0';
+        rc = sg_hex_to_sha1(line, id_out);
+        break;
+    }
+
+    free(content);
+    return rc;
+}
+
 int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
     char path[SG_PATH_MAX];
+    char ref_name[SG_PATH_MAX];
     char *content;
     char *nl;
     int rc;
@@ -121,8 +167,10 @@ int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id
 
     snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
     content = read_small_file(path);
-    if (content == NULL)
-        return -1;
+    if (content == NULL) {
+        snprintf(ref_name, sizeof(ref_name), "refs/heads/%s", branch);
+        return read_packed_ref(git_dir, ref_name, id_out);
+    }
 
     nl = strchr(content, '\n');
     if (nl != NULL)
@@ -171,10 +219,15 @@ int sg_ref_branch_exists(const char *git_dir, const char *branch)
 {
     char path[SG_PATH_MAX];
     struct stat st;
+    unsigned char id[SG_SHA1_RAW_LEN];
 
     if (!sg_ref_branch_name_is_safe(branch))
         return 0;
 
     snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+        return 1;
+
+    /* a packed branch is still a branch -- see read_packed_ref */
+    return sg_ref_read_branch(git_dir, branch, id) == 0;
 }
