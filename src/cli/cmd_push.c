@@ -545,6 +545,12 @@ int sg_cmd_push(int argc, char **argv)
     sg_ref_adv adv;
     int have_adv = 0;
     unsigned char(*diff_ids)[SG_SHA1_RAW_LEN] = NULL;
+    /* refs/sg/chunks propagation (see the phase 6 push-side durability fix):
+       populated below, right after the fast-forward check, only when this
+       repo has ever genuinely used chunked storage locally. */
+    int send_chunks_update = 0;
+    unsigned char chunks_old_id[SG_SHA1_RAW_LEN];
+    unsigned char chunks_new_id[SG_SHA1_RAW_LEN];
     int rc = 1;
 
     {
@@ -643,6 +649,77 @@ int sg_cmd_push(int argc, char **argv)
         }
     }
 
+    /* refs/sg/chunks propagation: if this repo has never chunked anything
+       locally, SG_CHUNK_KEEPALIVE_REF simply doesn't exist here and there is
+       nothing to protect on the remote -- skip all of the below entirely.
+       Otherwise, compare our local keep-alive commit against whatever the
+       remote already advertised for this same ref name (adv, from the
+       sg_transport_ls_refs_push call above, includes it like any other ref
+       that passes sg_ref_name_is_safe). */
+    {
+        unsigned char local_keepalive_id[SG_SHA1_RAW_LEN];
+
+        if (sg_ref_read_path(git_dir, SG_CHUNK_KEEPALIVE_REF, local_keepalive_id) == 0) {
+            int remote_has_chunks_ref = 0;
+            unsigned char remote_chunks_old_id[SG_SHA1_RAW_LEN];
+            size_t i;
+
+            for (i = 0; i < adv.count; i++) {
+                if (strcmp(adv.refs[i].name, SG_CHUNK_KEEPALIVE_REF) == 0) {
+                    memcpy(remote_chunks_old_id, adv.refs[i].id, SG_SHA1_RAW_LEN);
+                    remote_has_chunks_ref = 1;
+                    break;
+                }
+            }
+
+            if (!remote_has_chunks_ref) {
+                /* The remote has never seen this ref at all: create it. */
+                memset(chunks_old_id, 0, sizeof(chunks_old_id));
+                memcpy(chunks_new_id, local_keepalive_id, SG_SHA1_RAW_LEN);
+                send_chunks_update = 1;
+            } else if (memcmp(remote_chunks_old_id, local_keepalive_id, SG_SHA1_RAW_LEN) == 0) {
+                /* Already in sync -- nothing to send for this ref. */
+            } else {
+                sg_obj_type remote_commit_type;
+                unsigned char *remote_commit_content = NULL;
+                size_t remote_commit_content_len = 0;
+
+                /* The remote's current tip differs from ours. If we happen
+                   to already have that exact commit locally (e.g. from an
+                   earlier `sg fetch`/`sg clone` that merged it in, or just a
+                   loose object still lying around), merge it into our own
+                   keep-alive tree -- a deduped union, same as
+                   sg_chunk_keepalive_merge_commit's fetch-side use in
+                   cmd_fetch.c -- rather than clobbering either side's set of
+                   protected chunks. If we can't read it at all, we have no
+                   way to know what the remote's chunk set even contains, so
+                   there's no safe way to proceed: abort the whole push
+                   rather than risk silently dropping the remote's existing
+                   protection for chunks we don't know about. */
+                if (sg_object_read(git_dir, remote_chunks_old_id, &remote_commit_type,
+                                   &remote_commit_content, &remote_commit_content_len) == 0) {
+                    free(remote_commit_content);
+
+                    if (sg_chunk_keepalive_merge_commit(git_dir, remote_chunks_old_id) != 0 ||
+                       sg_ref_read_path(git_dir, SG_CHUNK_KEEPALIVE_REF, local_keepalive_id) != 0) {
+                        fprintf(stderr,
+                               "sg: 拒絕推送：遠端的 refs/sg/chunks 有本地無法讀取的內容，"
+                               "無法安全合併，請先執行 sg fetch\n");
+                        goto done;
+                    }
+                    memcpy(chunks_old_id, remote_chunks_old_id, SG_SHA1_RAW_LEN);
+                    memcpy(chunks_new_id, local_keepalive_id, SG_SHA1_RAW_LEN);
+                    send_chunks_update = 1;
+                } else {
+                    fprintf(stderr,
+                           "sg: 拒絕推送：遠端的 refs/sg/chunks 有本地無法讀取的內容，"
+                           "無法安全合併，請先執行 sg fetch\n");
+                    goto done;
+                }
+            }
+        }
+    }
+
     {
         id_set have_set, send_set;
         size_t diff_count = 0;
@@ -655,6 +732,14 @@ int sg_cmd_push(int argc, char **argv)
             build_ok = 0;
         if (build_ok && walk_add_object(git_dir, local_id, &send_set) < 0)
             build_ok = 0;
+        /* The (possibly newly merged) keep-alive commit is deliberately
+           parentless and ref-only -- never reachable from the branch
+           history walked just above -- so its tree/entries (the actual raw
+           chunk blobs, not the pointer blobs that name them) must be walked
+           into send_set separately, or the remote would end up with
+           refs/sg/chunks pointing at objects it was never sent. */
+        if (build_ok && send_chunks_update && walk_add_object(git_dir, chunks_new_id, &send_set) < 0)
+            build_ok = 0;
         if (build_ok && compute_diff_ids(&send_set, &have_set, &diff_ids, &diff_count) != 0)
             build_ok = 0;
 
@@ -666,7 +751,8 @@ int sg_cmd_push(int argc, char **argv)
             goto done;
         }
 
-        if (diff_count == 0 && remote_ref_exists && memcmp(remote_old_id, local_id, SG_SHA1_RAW_LEN) == 0) {
+        if (diff_count == 0 && !send_chunks_update && remote_ref_exists &&
+           memcmp(remote_old_id, local_id, SG_SHA1_RAW_LEN) == 0) {
             printf("Everything up-to-date.\n");
             rc = 0;
             goto done;
@@ -685,9 +771,25 @@ int sg_cmd_push(int argc, char **argv)
                 goto done;
             }
 
-            memset(&report, 0, sizeof(report));
-            push_rc = sg_transport_push(url, remote_old_id, local_id, ref_name, use_sb64k, pack_data,
-                                        pack_len, &report);
+            {
+                sg_push_ref_update updates[2];
+                size_t update_count = 1;
+
+                memcpy(updates[0].old_id, remote_old_id, SG_SHA1_RAW_LEN);
+                memcpy(updates[0].new_id, local_id, SG_SHA1_RAW_LEN);
+                updates[0].ref_name = ref_name;
+
+                if (send_chunks_update) {
+                    memcpy(updates[1].old_id, chunks_old_id, SG_SHA1_RAW_LEN);
+                    memcpy(updates[1].new_id, chunks_new_id, SG_SHA1_RAW_LEN);
+                    updates[1].ref_name = SG_CHUNK_KEEPALIVE_REF;
+                    update_count = 2;
+                }
+
+                memset(&report, 0, sizeof(report));
+                push_rc = sg_transport_push(url, updates, update_count, use_sb64k, pack_data, pack_len,
+                                           &report);
+            }
             free(pack_data);
 
             if (push_rc != 0) {
@@ -706,35 +808,50 @@ int sg_cmd_push(int argc, char **argv)
                 size_t i;
                 int any_ng = 0;
                 int found_our_ref = 0;
+                int chunks_ref_ok = 0;
 
                 printf("To %s\n", safe_url != NULL ? safe_url : "(remote)");
                 for (i = 0; i < report.ref_count; i++) {
-                    if (strcmp(report.refs[i].ref_name, ref_name) != 0)
-                        continue;
-                    found_our_ref = 1;
+                    if (strcmp(report.refs[i].ref_name, ref_name) == 0) {
+                        found_our_ref = 1;
 
-                    if (report.refs[i].ok) {
-                        if (!remote_ref_exists) {
-                            printf(" * [new branch]      %s -> %s/%s\n", branch, remote, branch);
+                        if (report.refs[i].ok) {
+                            if (!remote_ref_exists) {
+                                printf(" * [new branch]      %s -> %s/%s\n", branch, remote, branch);
+                            } else {
+                                char old_hex[SG_SHA1_HEX_LEN + 1];
+                                char new_hex[SG_SHA1_HEX_LEN + 1];
+
+                                sg_sha1_to_hex(remote_old_id, old_hex);
+                                sg_sha1_to_hex(local_id, new_hex);
+                                printf("   %.7s..%.7s  %s -> %s/%s\n", old_hex, new_hex, branch, remote,
+                                      branch);
+                            }
                         } else {
-                            char old_hex[SG_SHA1_HEX_LEN + 1];
-                            char new_hex[SG_SHA1_HEX_LEN + 1];
+                            const char *why = report.refs[i].message;
 
-                            sg_sha1_to_hex(remote_old_id, old_hex);
-                            sg_sha1_to_hex(local_id, new_hex);
-                            printf("   %.7s..%.7s  %s -> %s/%s\n", old_hex, new_hex, branch, remote,
-                                  branch);
+                            any_ng = 1;
+                            fprintf(stderr, "sg: 遠端拒絕更新 %s: ", ref_name);
+                            if (why != NULL)
+                                sg_print_remote_text((const unsigned char *)why, strlen(why), stderr);
+                            else
+                                fputs("(未知原因)", stderr);
+                            fputc('\n', stderr);
                         }
-                    } else {
-                        const char *why = report.refs[i].message;
+                    } else if (send_chunks_update &&
+                              strcmp(report.refs[i].ref_name, SG_CHUNK_KEEPALIVE_REF) == 0) {
+                        if (report.refs[i].ok) {
+                            chunks_ref_ok = 1;
+                        } else {
+                            const char *why = report.refs[i].message;
 
-                        any_ng = 1;
-                        fprintf(stderr, "sg: 遠端拒絕更新 %s: ", ref_name);
-                        if (why != NULL)
-                            sg_print_remote_text((const unsigned char *)why, strlen(why), stderr);
-                        else
-                            fputs("(未知原因)", stderr);
-                        fputc('\n', stderr);
+                            fprintf(stderr, "sg: 遠端拒絕更新 %s: ", SG_CHUNK_KEEPALIVE_REF);
+                            if (why != NULL)
+                                sg_print_remote_text((const unsigned char *)why, strlen(why), stderr);
+                            else
+                                fputs("(未知原因)", stderr);
+                            fputc('\n', stderr);
+                        }
                     }
                 }
 
@@ -746,6 +863,20 @@ int sg_cmd_push(int argc, char **argv)
                 }
                 if (any_ng)
                     goto done;
+                /* Both a missing entry (server silently didn't apply it) and
+                   an explicit "ng" (already printed above) must be treated
+                   as failure here -- this is the CRITICAL bug this whole
+                   change exists to fix: a chunked file whose protective ref
+                   didn't verifiably land on the remote must never be
+                   reported as a successful push, even though the branch ref
+                   itself may well have gone through (git applies each ref
+                   update independently). */
+                if (send_chunks_update && !chunks_ref_ok) {
+                    fprintf(stderr,
+                           "sg: chunk 資料的保護 ref (%s) 未能推送，遠端的分塊檔案將無法還原\n",
+                           SG_CHUNK_KEEPALIVE_REF);
+                    goto done;
+                }
             }
 
             {

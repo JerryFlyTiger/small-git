@@ -6,11 +6,16 @@
 #include "sg/refs.h"
 #include "sg/repo.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
+#define SG_PATH_MAX 4096
 
 static const char *env_or(const char *name, const char *fallback)
 {
@@ -265,6 +270,18 @@ int sg_chunk_pointer_parse(const unsigned char *content, size_t len, sg_chunk_po
     if (chunks_val > SIZE_MAX / sizeof(*chunk_ids))
         return 0;
 
+    /* Guards against more than an integer-overflow-safe malloc size: a
+       hostile/corrupt blob could still declare an astronomically large
+       "chunks" value (e.g. "chunks 900000000000") while the buffer actually
+       has only a handful of real hex lines left, which would pass the check
+       above and still trigger one huge transient malloc before the per-line
+       parse loop below fails partway through anyway. Each chunk line is
+       exactly SG_SHA1_HEX_LEN hex chars plus a newline, so the remaining
+       input can never hold more than (end - p) / (SG_SHA1_HEX_LEN + 1) of
+       them -- reject up front if the declared count exceeds that. */
+    if (chunks_val > (size_t)(end - p) / (SG_SHA1_HEX_LEN + 1))
+        return 0;
+
     if (chunks_val == 0) {
         chunk_ids = NULL;
     } else {
@@ -480,12 +497,97 @@ static int keep_alive_read_existing(const char *git_dir, unsigned char (**ids_ou
     return keep_alive_read_commit(git_dir, commit_id, ids_out, count_out);
 }
 
+/* ---- sg-chunks.lock: guards keep_alive_add's read-modify-write critical
+   section (read the existing keep-alive tree, merge in new ids, write a new
+   tree/commit, repoint the ref) against two concurrent callers racing. Two
+   `sg add`/`sg commit` invocations on different large files (or one of those
+   racing against `sg fetch`'s/the push-time merge's own call into
+   sg_chunk_keepalive_merge_commit, which funnels through this same
+   function) can both read the same old snapshot of the tree; whichever
+   writes last simply clobbers the other's newly-added chunk ids out of the
+   tree, silently dropping them from keep-alive protection -- a `git gc`
+   later collects them right out from under their pointer blob, recreating
+   the exact durability bug this ref exists to prevent, just via a race
+   instead of a missing ref. A plain lock file (not flock()/fcntl() advisory
+   locking) is deliberately used here: it needs no extra per-platform
+   plumbing, and every acquire/release in this codebase is short-lived and
+   funnels through these two helpers, so a stale lock is only ever left
+   behind by a killed/crashed process, not by ordinary contention. ---- */
+
+#define SG_CHUNK_LOCK_FILE "sg-chunks.lock"
+/* 40 attempts * 100ms = ~4s total before giving up -- long enough to ride
+   out ordinary contention between a couple of concurrent commands, short
+   enough that a genuinely stuck/leaked lock (e.g. a killed `sg` process)
+   fails loud in a few seconds rather than hanging every future
+   chunk-storing command indefinitely. */
+#define SG_CHUNK_LOCK_MAX_ATTEMPTS 40
+#define SG_CHUNK_LOCK_RETRY_NSEC (100L * 1000L * 1000L) /* 100ms */
+
+/* Acquires the lock at <git_dir>/sg-chunks.lock, writing the path used into
+   lock_path (lock_path_size bytes) so the caller can release it later.
+   O_CREAT|O_EXCL makes the create-if-absent check atomic across processes
+   (not just threads), which is the actual mutual-exclusion primitive here --
+   the file's contents are never read, only its existence matters. Retries a
+   bounded number of times with a short sleep between attempts (see the
+   attempt-count/retry-interval constants above) rather than blocking
+   forever. Returns 0 on success (lock held, caller must eventually call
+   chunk_lock_release), -1 if the lock couldn't be acquired within the retry
+   budget or the lock file couldn't be created for any other reason (message
+   already printed to stderr either way). */
+static int chunk_lock_acquire(const char *git_dir, char *lock_path, size_t lock_path_size)
+{
+    int attempt;
+
+    snprintf(lock_path, lock_path_size, "%s/%s", git_dir, SG_CHUNK_LOCK_FILE);
+
+    for (attempt = 0; attempt < SG_CHUNK_LOCK_MAX_ATTEMPTS; attempt++) {
+        int fd = open(lock_path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+
+        if (fd >= 0) {
+            close(fd);
+            return 0;
+        }
+        if (errno != EEXIST) {
+            fprintf(stderr, "sg: 無法建立 chunk 保活鎖 %s: %s\n", lock_path, strerror(errno));
+            return -1;
+        }
+
+        {
+            struct timespec ts;
+
+            ts.tv_sec = 0;
+            ts.tv_nsec = SG_CHUNK_LOCK_RETRY_NSEC;
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    fprintf(stderr,
+           "sg: 無法取得 chunk 保活鎖 %s（可能有其他 sg 程序正在寫入，或有殘留的鎖檔案，"
+           "可手動確認後刪除）\n",
+           lock_path);
+    return -1;
+}
+
+/* Releases a lock acquired by chunk_lock_acquire. keep_alive_add calls this
+   unconditionally on every exit path out of its critical section (success
+   or failure alike), so a failure partway through never leaves the lock
+   file behind and blocks every subsequent chunk-storing call indefinitely. */
+static void chunk_lock_release(const char *lock_path)
+{
+    unlink(lock_path);
+}
+
 /* Merges new_ids (new_count of them, just written by sg_chunk_store_blob)
    into the SG_CHUNK_KEEPALIVE_REF tree, deduplicating against whatever chunk
    ids are already kept alive, and points the ref at a fresh no-parent commit
    wrapping the rebuilt tree. Returns 0 on success, -1 on failure -- the
    caller treats that as reason to fall back to an ordinary (unchunked) blob
-   rather than hand back a pointer whose chunks aren't gc-safe. */
+   rather than hand back a pointer whose chunks aren't gc-safe. The entire
+   read-existing-through-update-ref critical section below is protected by
+   sg-chunks.lock (see chunk_lock_acquire's doc comment just above) -- every
+   path out of this function past the lock-acquire funnels through `done:`,
+   which is what releases it, so a failure partway through never leaves the
+   lock held. */
 static int keep_alive_add(const char *git_dir, unsigned char (*new_ids)[SG_SHA1_RAW_LEN],
                           size_t new_count)
 {
@@ -501,21 +603,25 @@ static int keep_alive_add(const char *git_dir, unsigned char (*new_ids)[SG_SHA1_
     unsigned char *commit_content = NULL;
     size_t commit_len = 0;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
+    char lock_path[SG_PATH_MAX];
+    int lock_held = 0;
     size_t i;
     int rc = -1;
 
     if (new_count == 0)
         return 0;
 
-    if (keep_alive_read_existing(git_dir, &existing, &existing_count) != 0)
+    if (chunk_lock_acquire(git_dir, lock_path, sizeof(lock_path)) != 0)
         return -1;
+    lock_held = 1;
+
+    if (keep_alive_read_existing(git_dir, &existing, &existing_count) != 0)
+        goto done;
 
     cap = existing_count + new_count;
     entries = malloc(cap * sizeof(*entries));
-    if (entries == NULL) {
-        free(existing);
-        return -1;
-    }
+    if (entries == NULL)
+        goto done;
 
     /* sg_tree_free (used elsewhere on any sg_tree) always frees .name, so
        every entry below -- including ones surviving unchanged from the
@@ -591,6 +697,8 @@ done:
         free(entries[i].name);
     free(entries);
     free(existing);
+    if (lock_held)
+        chunk_lock_release(lock_path);
     return rc;
 }
 

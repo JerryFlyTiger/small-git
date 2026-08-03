@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/chunk.h"
 #include "sg/diff_lcs.h"
 #include "sg/hash.h"
 #include "sg/index.h"
@@ -69,6 +70,7 @@ int sg_cmd_diff(int argc, char **argv)
     char *repo_root;
     sg_index idx;
     size_t i;
+    int had_chunk_error = 0;
 
     (void)argv;
     if (argc != 1) {
@@ -94,7 +96,6 @@ int sg_cmd_diff(int argc, char **argv)
 
     for (i = 0; i < idx.count; i++) {
         char abspath[4096];
-        sg_obj_type type;
         unsigned char *a_content = NULL;
         size_t a_len = 0;
         unsigned char *b_content = NULL;
@@ -106,9 +107,23 @@ int sg_cmd_diff(int argc, char **argv)
         if (idx.entries[i].stage != 0)
             continue;
 
-        if (sg_object_read(git_dir, idx.entries[i].sha1, &type, &a_content, &a_len) != 0) {
-            fprintf(stderr, "sg: warning: cannot read staged blob for '%s'\n", idx.entries[i].path);
-            continue;
+        {
+            sg_chunk_missing_info missing;
+            int read_rc = sg_chunk_read_blob(git_dir, idx.entries[i].sha1, &a_content, &a_len, &missing);
+
+            if (read_rc == -2) {
+                /* A genuine chunk pointer whose data is missing/corrupt --
+                   must hard-error, not diff the pointer's own raw text
+                   against the working tree as if it were the file's real
+                   content (that would produce meaningless garbage hunks). */
+                sg_chunk_print_missing_error(idx.entries[i].path, &missing);
+                had_chunk_error = 1;
+                continue;
+            }
+            if (read_rc != 0) {
+                fprintf(stderr, "sg: warning: cannot read staged blob for '%s'\n", idx.entries[i].path);
+                continue;
+            }
         }
 
         snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx.entries[i].path);
@@ -133,5 +148,5 @@ int sg_cmd_diff(int argc, char **argv)
     sg_index_free(&idx);
     free(repo_root);
     free(git_dir);
-    return 0;
+    return had_chunk_error ? 1 : 0;
 }
