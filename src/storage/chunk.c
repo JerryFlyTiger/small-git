@@ -4,6 +4,7 @@
 #include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/refs.h"
+#include "sg/repo.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -764,6 +765,28 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
         return 0;
     }
 
+    /* Record locally (in .git/config, not a ref -- see sg_repo_mark_chunking_used's
+       doc comment) that this repo has now genuinely produced a chunk
+       pointer. This is the durability fix's second half: if
+       SG_CHUNK_KEEPALIVE_REF itself is later deleted/lost, chunk_resolve's
+       discriminator needs some other way to know "this repo used chunking
+       for real, an absent keep-alive ref here means the safety net broke"
+       rather than misreading the absence as "this repo never chunked
+       anything, e.g. a plain `git clone`" and quietly handing back pointer
+       text as if it were file content. Treated the same as the round-trip
+       and keep-alive-tree failures just above: if the marker can't be
+       written, don't hand back a pointer this repo can't actually protect
+       against a later lost ref -- fall back to an ordinary blob instead. */
+    if (sg_repo_mark_chunking_used(git_dir) != 0) {
+        free(chunk_ids);
+        fprintf(stderr,
+               "sg: warning: 無法在 .git/config 標記本地端已使用過分塊儲存，改以一般 blob 儲存\n");
+        if (sg_loose_write(git_dir, SG_OBJ_BLOB, content, len, id_out) != 0)
+            return -1;
+        *chunked_out = 0;
+        return 0;
+    }
+
     sg_object_hash(SG_OBJ_BLOB, content, len, ptr.original_sha1);
     ptr.original_size = len;
     ptr.chunk_ids = chunk_ids;
@@ -787,6 +810,19 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
 
 void sg_chunk_print_missing_error(const char *path, const sg_chunk_missing_info *info)
 {
+    if (info->keepalive_lost) {
+        fprintf(stderr, "sg: '%s' 是分塊儲存的檔案，但 %s 已經遺失\n", path, SG_CHUNK_KEEPALIVE_REF);
+        fprintf(stderr,
+               "sg: 這個 repository 的 .git/config 記錄了曾經使用過分塊儲存，"
+               "但用來保護分塊資料不被 git gc 回收的 %s 已經不存在（可能被手動刪除，"
+               "或從未被 fetch/clone 取得）\n",
+               SG_CHUNK_KEEPALIVE_REF);
+        fprintf(stderr,
+               "sg: 這代表這個 repository 裡所有分塊儲存的檔案都可能已經被 git gc 清除，"
+               "資料很可能已經遺失\n");
+        fprintf(stderr, "sg: 無法還原這個檔案的內容\n");
+        return;
+    }
     if (info->missing_count > 0) {
         fprintf(stderr, "sg: '%s' 是分塊儲存的檔案，但有 %zu/%zu 個資料塊在物件庫中找不到\n", path,
                info->missing_count, info->chunk_count);
@@ -831,6 +867,8 @@ static int chunk_resolve(const char *git_dir, const unsigned char id[SG_SHA1_RAW
     sg_obj_type type;
     sg_chunk_pointer ptr;
     int is_our_pointer;
+    unsigned char keepalive_commit_id[SG_SHA1_RAW_LEN];
+    int keepalive_ref_exists;
     int ok;
     size_t i;
 
@@ -841,6 +879,39 @@ static int chunk_resolve(const char *git_dir, const unsigned char id[SG_SHA1_RAW
 
     if (!sg_chunk_pointer_parse(r->raw_content, r->raw_len, &ptr))
         return 0; /* not a pointer -- raw_content/raw_len is the final answer */
+
+    keepalive_ref_exists = sg_ref_read_path(git_dir, SG_CHUNK_KEEPALIVE_REF, keepalive_commit_id) == 0;
+
+    if (!keepalive_ref_exists && ptr.chunk_count > 0 && sg_repo_chunking_was_used(git_dir)) {
+        /* The keep-alive ref -- the only thing that lets us tell "a pointer
+           our own sg_chunk_store_blob really produced" apart from
+           "coincidentally pointer-shaped ordinary content" (see the
+           discriminator comment just below) -- is gone: deleted, never
+           fetched, or otherwise unreadable. Ordinarily that would just mean
+           "this repo never used chunking" (e.g. a plain `git clone`, which
+           never asks for SG_CHUNK_KEEPALIVE_REF at all) and every
+           pointer-shaped file would correctly fall through to "not a
+           pointer" below. But .git/config says otherwise: this repo's own
+           sg_chunk_store_blob (or a `sg clone`/`sg fetch` that merged in a
+           remote's keep-alive ref) DID produce real chunk pointers here at
+           some point (see sg_repo_mark_chunking_used). With the ref gone,
+           there is no way left to verify membership at all -- not just for
+           this one pointer, but for every chunked file this repo ever
+           committed, since the tree that would prove "these chunk ids are
+           ours" no longer exists. Silently falling through to "not a
+           pointer" here would resurrect exactly the bug this whole
+           discriminator exists to prevent, just triggered a different way:
+           it would hand back this (and every other chunked file's) raw
+           pointer text as if it were real content, across the WHOLE
+           repository, not just one broken file. Treat every well-formed
+           pointer as broken instead -- a hard failure that's impossible to
+           miss, versus data that's already gone being handed out as if
+           nothing were wrong. */
+        sg_chunk_pointer_free(&ptr);
+        r->is_broken = 1;
+        r->missing.keepalive_lost = 1;
+        return 0;
+    }
 
     /* Discriminator between "coincidental pointer-shaped ordinary content"
        and "a real chunk pointer of ours, possibly with missing/corrupt

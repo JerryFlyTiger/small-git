@@ -78,10 +78,24 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
    chunk ids that failed to read at all; it can be 0 even though the overall
    result is still "broken" -- that means every chunk read back fine but the
    reassembled bytes didn't hash-verify against the pointer's declared sha1
-   (corruption, not loss). */
+   (corruption, not loss).
+
+   keepalive_lost is a distinct flavor of -2, set instead of the above: it
+   means SG_CHUNK_KEEPALIVE_REF itself is gone (deleted, never fetched, or
+   otherwise unreadable) while this repository's own .git/config records
+   having used chunked storage before (see sg_repo_mark_chunking_used /
+   sg_repo_chunking_was_used in sg/repo.h). Without the ref there is no way
+   left to tell "a pointer this repo's own sg_chunk_store_blob really
+   produced" apart from "content that coincidentally looks pointer-shaped",
+   so every well-formed pointer in a repo that's lost its keep-alive ref this
+   way is treated as broken -- chunk_count/missing_count are not populated in
+   this case (there is no way to know how much, if anything, is actually
+   lost without the ref). See chunk_resolve's discriminator comment in
+   chunk.c for the full reasoning. */
 typedef struct {
     size_t chunk_count;
     size_t missing_count;
+    int keepalive_lost;
 } sg_chunk_missing_info;
 
 /* Prints a standard, actionable stderr message for a real-but-broken chunk

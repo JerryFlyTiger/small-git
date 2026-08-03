@@ -1445,6 +1445,7 @@ static void test_keep_alive_tree_incremental(void)
     free(git_dir);
 }
 
+
 static void write_repo_config(const char *git_dir, const char *content)
 {
     char path[4096];
@@ -1459,6 +1460,271 @@ static void write_repo_config(const char *git_dir, const char *content)
     }
     fputs(content, f);
     fclose(f);
+}
+
+/* ---- refs/sg/chunks *deletion* tests (the second CRITICAL bug this report
+   fixes): losing the keep-alive ref must be told apart from a repo that
+   simply never used chunking (a plain `git clone`), via the .git/config
+   marker sg_repo_mark_chunking_used/sg_repo_chunking_was_used writes/reads.
+   ---- */
+
+/* Core regression test for the fix: a repo that has genuinely chunked a
+   file (so sg_chunk_store_blob already wrote the .git/config marker) whose
+   SG_CHUNK_KEEPALIVE_REF is later deleted straight off disk -- exactly what
+   `git update-ref -d refs/sg/chunks` does -- must fail hard (-2, with
+   missing.keepalive_lost set) on every subsequent read of any chunked file
+   in that repo, never silently fall back to handing back the pointer's own
+   raw text as if it were the file's content. Before this fix,
+   keep_alive_is_member (and thus chunk_resolve's discriminator) treated "no
+   keep-alive ref" as flatly equivalent to "not a member", which made a
+   pointer whose ref just went missing indistinguishable from ordinary
+   content coming out of a plain, non-sg `git clone`. */
+static void test_read_blob_keepalive_ref_deleted_with_marker_hard_error(void)
+{
+    char *git_dir = make_tmp_repo();
+    size_t len = 3 * 1024 * 1024;
+    unsigned char *data = malloc(len);
+    unsigned char id[SG_SHA1_RAW_LEN];
+    int chunked = -1;
+    unsigned char *out = NULL;
+    size_t out_len = 0;
+    unsigned char effective[SG_SHA1_RAW_LEN];
+    sg_chunk_missing_info missing;
+    char keepalive_path[4096];
+    int ok;
+
+    if (data == NULL) {
+        fprintf(stderr, "FAIL keepalive-ref-deleted: out of memory\n");
+        failures++;
+        free(git_dir);
+        return;
+    }
+    fill_random(data, len, 91);
+
+    ok = sg_chunk_store_blob(git_dir, data, len, 1024 * 1024, id, &chunked) == 0 && chunked == 1;
+
+    /* sg_chunk_store_blob must have marked this repo as having used chunking
+       -- that marker is exactly what this test depends on surviving the ref
+       deletion below. */
+    if (ok)
+        ok = sg_repo_chunking_was_used(git_dir) == 1;
+
+    /* A sanity check that the pointer is readable before we break anything --
+       isolates a failure here from a failure in the actual regression being
+       tested below. */
+    if (ok)
+        ok = sg_chunk_read_blob(git_dir, id, &out, &out_len, NULL) == 0 && out_len == len &&
+            memcmp(out, data, len) == 0;
+    free(out);
+    out = NULL;
+    out_len = 0;
+
+    /* Delete refs/sg/chunks straight off disk -- the same effect `git
+       update-ref -d refs/sg/chunks` has on a never-packed loose ref (see
+       sg_ref_write_path: it always writes ref_path as git_dir/ref_path). */
+    if (ok) {
+        memset(&missing, 0, sizeof(missing));
+        snprintf(keepalive_path, sizeof(keepalive_path), "%s/%s", git_dir, SG_CHUNK_KEEPALIVE_REF);
+        ok = remove(keepalive_path) == 0;
+    }
+
+    if (ok) {
+        ok = sg_chunk_read_blob(git_dir, id, &out, &out_len, &missing) == -2 &&
+            missing.keepalive_lost == 1 && out == NULL;
+    }
+    if (ok)
+        ok = sg_chunk_effective_id(git_dir, id, effective) == -2;
+
+    if (!ok) {
+        fprintf(stderr,
+               "FAIL keepalive-ref-deleted: expected a hard -2/keepalive_lost error once "
+               "refs/sg/chunks is gone from a repo that used chunking, not a silent fallback\n");
+        failures++;
+    } else {
+        printf("PASS keepalive-ref-deleted: deleting refs/sg/chunks from a repo that used "
+              "chunking fails closed (keepalive_lost) instead of silently returning pointer "
+              "text\n");
+    }
+
+    free(out);
+    free(data);
+    free(git_dir);
+}
+
+/* The flip side, spelled out explicitly: a repo that never used chunking at
+   all (no SG_CHUNK_KEEPALIVE_REF, no .git/config marker -- exactly what a
+   real `git clone` produces) must keep treating pointer-shaped content as
+   ordinary content, unaffected by the fix above. Functionally the same
+   invariant test_read_blob_fake_pointer_missing_chunk already exercises, but
+   named and asserted here against the specific three-way discriminator this
+   report adds to chunk_resolve (ref exists / ref absent+marker / ref
+   absent+no marker), so that discriminator's "no ref, no marker" branch has
+   its own explicit regression coverage. */
+static void test_read_blob_no_ref_no_marker_still_ordinary(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char missing_id[SG_SHA1_RAW_LEN];
+    sg_chunk_pointer ptr;
+    unsigned char ids[1][SG_SHA1_RAW_LEN];
+    unsigned char *pointer_content = NULL;
+    size_t pointer_len = 0;
+    unsigned char fake_id[SG_SHA1_RAW_LEN];
+    unsigned char *out = NULL;
+    size_t out_len = 0;
+    unsigned char effective[SG_SHA1_RAW_LEN];
+    int ok;
+
+    /* Precondition this test actually depends on: a freshly sg_repo_init'd
+       repo has never called sg_chunk_store_blob, so neither the keep-alive
+       ref nor the .git/config marker exist yet. */
+    ok = sg_repo_chunking_was_used(git_dir) == 0;
+
+    sg_sha1("another-nonexistent-chunk", 25, missing_id);
+    memcpy(ids[0], missing_id, SG_SHA1_RAW_LEN);
+
+    memset(ptr.original_sha1, 0xCD, SG_SHA1_RAW_LEN);
+    ptr.original_size = 54321;
+    ptr.chunk_ids = ids;
+    ptr.chunk_count = 1;
+
+    if (ok)
+        ok = sg_chunk_pointer_format(&ptr, &pointer_content, &pointer_len) == 0;
+    if (ok)
+        ok = sg_loose_write(git_dir, SG_OBJ_BLOB, pointer_content, pointer_len, fake_id) == 0;
+    if (ok)
+        ok = sg_chunk_read_blob(git_dir, fake_id, &out, &out_len, NULL) == 0 &&
+            out_len == pointer_len && memcmp(out, pointer_content, pointer_len) == 0;
+    if (ok)
+        ok = sg_chunk_effective_id(git_dir, fake_id, effective) == 0 &&
+            memcmp(effective, fake_id, SG_SHA1_RAW_LEN) == 0;
+
+    if (!ok) {
+        fprintf(stderr,
+               "FAIL no-ref-no-marker: expected pointer-shaped content in a repo that never used "
+               "chunking to still fall back to ordinary content\n");
+        failures++;
+    } else {
+        printf("PASS no-ref-no-marker: a repo with neither refs/sg/chunks nor the .git/config "
+              "marker (e.g. a plain `git clone`) still treats pointer-shaped content as "
+              "ordinary, unaffected by the keepalive-loss hard-failure path\n");
+    }
+
+    free(out);
+    free(pointer_content);
+    free(git_dir);
+}
+
+/* ---- sg_repo_mark_chunking_used / sg_repo_chunking_was_used ---- */
+
+static void test_chunking_used_marker_roundtrip(void)
+{
+    char *git_dir = make_tmp_repo();
+    int ok;
+
+    ok = sg_repo_chunking_was_used(git_dir) == 0;
+    if (ok)
+        ok = sg_repo_mark_chunking_used(git_dir) == 0;
+    if (ok)
+        ok = sg_repo_chunking_was_used(git_dir) == 1;
+    /* Idempotent: calling it again must not error, and (checked below) must
+       not append a second stanza. */
+    if (ok)
+        ok = sg_repo_mark_chunking_used(git_dir) == 0;
+    if (ok)
+        ok = sg_repo_chunking_was_used(git_dir) == 1;
+
+    if (ok) {
+        char path[4096];
+        FILE *f;
+        char line[1024];
+        int count = 0;
+
+        snprintf(path, sizeof(path), "%s/config", git_dir);
+        f = fopen(path, "r");
+        ok = f != NULL;
+        if (ok) {
+            while (fgets(line, sizeof(line), f) != NULL) {
+                if (strstr(line, "everchunked") != NULL)
+                    count++;
+            }
+            fclose(f);
+            ok = count == 1;
+        }
+    }
+
+    if (!ok) {
+        fprintf(stderr,
+               "FAIL chunking-used marker roundtrip: expected unset -> mark -> set, with a "
+               "second mark call staying idempotent (exactly one stanza written)\n");
+        failures++;
+    } else {
+        printf("PASS chunking-used marker roundtrip: unset by default, set after "
+              "sg_repo_mark_chunking_used, and idempotent on a second call\n");
+    }
+
+    free(git_dir);
+}
+
+/* The marker's config key must not collide with sg_repo_read_chunk_config's
+   own prefix-based parsing of `chunking`/`chunkthreshold` -- see
+   SG_CHUNKING_USED_KEY's doc comment in repo.c for the exact collision this
+   guards against ("chunkingused" would have been misread as the `chunking`
+   flag itself). Exercises both directions: existing chunking config survives
+   the marker being added, and adding the marker doesn't fabricate a
+   `chunking = true` that was never set. */
+static void test_chunking_used_marker_no_collision_with_chunk_config(void)
+{
+    char *git_dir = make_tmp_repo();
+    int enabled = -1;
+    size_t threshold = 0;
+    int ok;
+
+    write_repo_config(git_dir, "[sg]\n\tchunking = true\n\tchunkthreshold = 1048576\n");
+
+    ok = sg_repo_mark_chunking_used(git_dir) == 0;
+    if (ok)
+        ok = sg_repo_chunking_was_used(git_dir) == 1;
+    if (ok)
+        ok = sg_repo_read_chunk_config(git_dir, &enabled, &threshold) == 0 && enabled == 1 &&
+            threshold == 1048576;
+
+    if (!ok) {
+        fprintf(stderr,
+               "FAIL chunking-used marker vs chunk config: adding the marker must not disturb "
+               "an existing chunking=true/chunkthreshold config\n");
+        failures++;
+    } else {
+        printf("PASS chunking-used marker vs chunk config: marker key does not collide with "
+              "sg_repo_read_chunk_config's chunking/chunkthreshold parsing\n");
+    }
+
+    /* And the reverse: chunking was never explicitly enabled here, only the
+       marker was set -- sg_repo_read_chunk_config must still report it as
+       disabled (default), not accidentally turned on by the marker line. */
+    {
+        char *git_dir2 = make_tmp_repo();
+        int enabled2 = -1;
+        size_t threshold2 = 0;
+        int ok2;
+
+        ok2 = sg_repo_mark_chunking_used(git_dir2) == 0;
+        if (ok2)
+            ok2 = sg_repo_read_chunk_config(git_dir2, &enabled2, &threshold2) == 0 &&
+                enabled2 == 0 && threshold2 == SG_CHUNK_DEFAULT_THRESHOLD;
+
+        if (!ok2) {
+            fprintf(stderr,
+                   "FAIL chunking-used marker vs chunk config: setting only the marker must not "
+                   "make sg_repo_read_chunk_config report chunking as enabled\n");
+            failures++;
+        } else {
+            printf("PASS chunking-used marker vs chunk config: setting only the marker leaves "
+                  "chunking reported as disabled (no false-positive prefix match)\n");
+        }
+        free(git_dir2);
+    }
+
+    free(git_dir);
 }
 
 static void test_repo_read_chunk_config_defaults(void)
@@ -1544,6 +1810,10 @@ int main(void)
     test_read_blob_store_then_delete_one_chunk();
     test_read_blob_store_then_delete_first_chunk();
     test_keep_alive_tree_incremental();
+    test_read_blob_keepalive_ref_deleted_with_marker_hard_error();
+    test_read_blob_no_ref_no_marker_still_ordinary();
+    test_chunking_used_marker_roundtrip();
+    test_chunking_used_marker_no_collision_with_chunk_config();
     test_repo_read_chunk_config_defaults();
     test_repo_read_chunk_config_enabled();
     test_repo_read_chunk_config_bad_threshold();

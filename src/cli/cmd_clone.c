@@ -125,6 +125,7 @@ static int write_remote_and_tag_refs(const char *git_dir, const sg_ref_adv *adv,
     for (i = 0; i < adv->count; i++) {
         const char *name = adv->refs[i].name;
         char ref_path[SG_PATH_MAX];
+        int is_keepalive = 0;
 
         if (strncmp(name, "refs/heads/", 11) == 0) {
             snprintf(ref_path, sizeof(ref_path), "refs/remotes/%s/%s", remote_name, name + 11);
@@ -132,11 +133,24 @@ static int write_remote_and_tag_refs(const char *git_dir, const sg_ref_adv *adv,
             snprintf(ref_path, sizeof(ref_path), "%s", name);
         } else if (strcmp(name, SG_CHUNK_KEEPALIVE_REF) == 0) {
             snprintf(ref_path, sizeof(ref_path), "%s", name);
+            is_keepalive = 1;
         } else {
             continue;
         }
         if (write_ref_file(git_dir, ref_path, adv->refs[i].id) != 0)
             return -1;
+
+        /* This clone just received (and locally wrote) another sg repo's own
+           SG_CHUNK_KEEPALIVE_REF -- record that fact in .git/config the same
+           way sg_chunk_store_blob does for chunks produced locally (see
+           sg_repo_mark_chunking_used's doc comment), so this repo is
+           protected too if that ref is ever later deleted here. Not fatal to
+           the clone if the marker write fails: the ref itself (just written
+           above) is what actually lets sg_chunk_read_blob recover the file
+           content right now -- the marker only hardens what happens if the
+           ref is lost *afterward*. */
+        if (is_keepalive && sg_repo_mark_chunking_used(git_dir) != 0)
+            fprintf(stderr, "sg: warning: 無法在 .git/config 標記本地端已使用過分塊儲存\n");
     }
     return 0;
 }

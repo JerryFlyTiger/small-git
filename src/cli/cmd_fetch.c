@@ -362,8 +362,17 @@ int sg_cmd_fetch(int argc, char **argv)
        plumbing, not a branch/tag the user asked to fetch. */
     for (i = 0; i < adv.count; i++) {
         if (strcmp(adv.refs[i].name, SG_CHUNK_KEEPALIVE_REF) == 0) {
-            if (sg_chunk_keepalive_merge_commit(git_dir, adv.refs[i].id) != 0)
+            if (sg_chunk_keepalive_merge_commit(git_dir, adv.refs[i].id) != 0) {
                 fprintf(stderr, "sg: warning: 未能合併遠端的 %s\n", SG_CHUNK_KEEPALIVE_REF);
+            } else if (sg_repo_mark_chunking_used(git_dir) != 0) {
+                /* Same local durability marker `sg clone` writes -- see
+                   cmd_clone.c's write_remote_and_tag_refs and
+                   sg_repo_mark_chunking_used's doc comment. Not fatal: the
+                   merged-in chunk ids are already protected by the ref
+                   itself right now; the marker only hardens what happens if
+                   that ref is deleted from this repo later. */
+                fprintf(stderr, "sg: warning: 無法在 .git/config 標記本地端已使用過分塊儲存\n");
+            }
             break;
         }
     }

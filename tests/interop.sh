@@ -1940,6 +1940,182 @@ else
     skip "phase6b: sg push prints an actionable abort message naming the broken chunked object"
     skip "phase6b: after the aborted push, the remote gained no branch ref (no incomplete pointer text was published)"
 fi
+
+# --- Phase 6d: two CRITICAL bugs found reviewing merge/rebase against
+# phase 6's chunked-blob storage --
+#
+#   A. src/workdir/merge.c predates phase 6 entirely and read blob content
+#      via plain sg_object_read, never sg_chunk_read_blob -- so merging a
+#      chunked file compared/diffed its ~500-byte pointer TEXT (magic/size/
+#      sha1/chunk-id-list), not the real multi-megabyte content. A conflict
+#      on a chunked file left the pointer text's own conflict markers in the
+#      working tree, and `sg add && sg commit` (exactly what sg's own
+#      conflict-resolution instructions tell the user to do) would
+#      permanently commit that garbage in place of the real file.
+#
+#   B. chunk_resolve's discriminator (chunk.c) used to treat "no
+#      SG_CHUNK_KEEPALIVE_REF" as flatly meaning "not a pointer of ours",
+#      which is only true for a repo that never used chunking (e.g. a plain
+#      `git clone`). If the ref existed and was later deleted (accidentally,
+#      by tooling unaware of this custom ref, or by anything that treats an
+#      unrecognized ref as safe to prune), every chunked file in the WHOLE
+#      repository would silently start "restoring" as a few hundred bytes of
+#      pointer text with exit 0 -- total, silent data loss. The fix records
+#      a local (not-cloned) marker the first time this repo ever chunks
+#      anything, so an absent ref can be told apart from "never used
+#      chunking" vs. "used chunking, and the safety net is now gone".
+#
+# case 1 (bug A, binary): two branches each modify a different, non-
+# overlapping region of the same large *binary* chunked file. Before the
+# fix, `sg merge` would "succeed" at producing a ~650-byte conflict file made
+# of the two branches' pointer texts diffed against each other -- neither
+# side's actual file content ever appears. After the fix, a binary conflict
+# correctly surfaces (NUL bytes are near-certain in 3 MiB of random data),
+# and the file left in the working tree must be one side's REAL content, at
+# its real (megabyte-scale) size, never the pointer text.
+P6D_BIN_REPO="$WORKDIR/phase6d_binary_repo"
+mkdir -p "$P6D_BIN_REPO"
+(cd "$WORKDIR" && "$SG" init phase6d_binary_repo) > /dev/null 2>&1
+git config -f "$P6D_BIN_REPO/.git/config" sg.chunking true
+git config -f "$P6D_BIN_REPO/.git/config" sg.chunkthreshold 1048576
+
+P6D_BIN_FILE="$P6D_BIN_REPO/big.bin"
+head -c 3145728 /dev/urandom > "$P6D_BIN_FILE" 2>/dev/null
+(cd "$P6D_BIN_REPO" && "$SG" add big.bin && "$SG" commit -m "base binary") > /dev/null 2>&1
+(cd "$P6D_BIN_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+python3 -c "
+data = bytearray(open('$P6D_BIN_FILE', 'rb').read())
+data[0:1000] = b'F' * 1000
+open('$P6D_BIN_FILE', 'wb').write(data)
+"
+(cd "$P6D_BIN_REPO" && "$SG" add big.bin && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P6D_BIN_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+python3 -c "
+data = bytearray(open('$P6D_BIN_FILE', 'rb').read())
+data[2000000:2001000] = b'M' * 1000
+open('$P6D_BIN_FILE', 'wb').write(data)
+"
+(cd "$P6D_BIN_REPO" && "$SG" add big.bin && "$SG" commit -m "master change") > /dev/null 2>&1
+
+(cd "$P6D_BIN_REPO" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+P6D_BIN_MERGE_RC=$?
+check "phase6d bug A (binary): sg merge on a chunked binary file conflict exits non-zero" \
+    test "$P6D_BIN_MERGE_RC" -ne 0
+
+P6D_BIN_SIZE=$(wc -c < "$P6D_BIN_FILE" 2>/dev/null | tr -d ' ')
+echo "phase6d bug A (binary): conflicted big.bin is ${P6D_BIN_SIZE:-0} bytes (original was 3145728)"
+check "phase6d bug A (binary): the conflicted file in the working tree is NOT shrunk to pointer-text size" \
+    test "${P6D_BIN_SIZE:-0}" -gt 1000000
+check "phase6d bug A (binary): the conflicted file does not contain the sg-chunked pointer magic" \
+    sh -c "! grep -qa 'sg-chunked' '$P6D_BIN_FILE'"
+
+# case 2 (bug A, text): two branches each modify a different line of the
+# same large *text* chunked file (line counts kept in the low thousands, not
+# hundreds of thousands, to stay within sg_merge_content's O(n*m) diff3-lite
+# table -- an unrelated, pre-existing algorithmic limit, not part of either
+# bug this phase fixes). Before the fix this would "merge" two pointer texts
+# together and produce garbage; after the fix it must be a real, clean,
+# automatic three-way merge containing both sides' actual edits.
+P6D_TXT_REPO="$WORKDIR/phase6d_text_repo"
+mkdir -p "$P6D_TXT_REPO"
+(cd "$WORKDIR" && "$SG" init phase6d_text_repo) > /dev/null 2>&1
+git config -f "$P6D_TXT_REPO/.git/config" sg.chunking true
+git config -f "$P6D_TXT_REPO/.git/config" sg.chunkthreshold 1048576
+
+P6D_TXT_FILE="$P6D_TXT_REPO/big.txt"
+python3 -c "
+lines = [('line %06d ' % i) + ('x' * 80) + '\n' for i in range(15000)]
+open('$P6D_TXT_FILE', 'w').writelines(lines)
+"
+(cd "$P6D_TXT_REPO" && "$SG" add big.txt && "$SG" commit -m "base text") > /dev/null 2>&1
+(cd "$P6D_TXT_REPO" && "$SG" switch -c feature) > /dev/null 2>&1
+python3 -c "
+lines = open('$P6D_TXT_FILE').readlines()
+lines[100] = 'PHASE6D FEATURE CHANGE\n'
+open('$P6D_TXT_FILE', 'w').writelines(lines)
+"
+(cd "$P6D_TXT_REPO" && "$SG" add big.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P6D_TXT_REPO" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+python3 -c "
+lines = open('$P6D_TXT_FILE').readlines()
+lines[14000] = 'PHASE6D MASTER CHANGE\n'
+open('$P6D_TXT_FILE', 'w').writelines(lines)
+"
+(cd "$P6D_TXT_REPO" && "$SG" add big.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+
+(cd "$P6D_TXT_REPO" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+check "phase6d bug A (text): sg merge cleanly auto-merges non-overlapping edits to a chunked text file" \
+    test $? = 0
+check "phase6d bug A (text): the merged file does not contain the sg-chunked pointer magic" \
+    sh -c "! grep -qa 'sg-chunked' '$P6D_TXT_FILE'"
+check "phase6d bug A (text): the merged file contains BOTH branches' real edits" \
+    sh -c "grep -q 'PHASE6D FEATURE CHANGE' '$P6D_TXT_FILE' && grep -q 'PHASE6D MASTER CHANGE' '$P6D_TXT_FILE'"
+check "phase6d bug A (text): git fsck exits 0 on the repo after the chunk-aware merge" \
+    sh -c "(cd '$P6D_TXT_REPO' && git fsck) > /dev/null 2>&1"
+
+# case 3 (bug B): deleting refs/sg/chunks from a repo that has genuinely used
+# chunked storage (so the .git/config marker is set) must make `sg restore`
+# fail loudly instead of silently writing the pointer's own text in place of
+# the real file -- the same failure mode as phase6b's case 3/3b, but caused
+# by losing the *ref* rather than an individual chunk object.
+P6D_LOSTREF_REPO="$WORKDIR/phase6d_lostref_repo"
+mkdir -p "$P6D_LOSTREF_REPO"
+(cd "$WORKDIR" && "$SG" init phase6d_lostref_repo) > /dev/null 2>&1
+git config -f "$P6D_LOSTREF_REPO/.git/config" sg.chunking true
+git config -f "$P6D_LOSTREF_REPO/.git/config" sg.chunkthreshold 1048576
+
+P6D_LOSTREF_FILE="$P6D_LOSTREF_REPO/big.bin"
+head -c 5242880 /dev/urandom > "$P6D_LOSTREF_FILE" 2>/dev/null
+(cd "$P6D_LOSTREF_REPO" && "$SG" add big.bin && "$SG" commit -m "big file for lost-ref test") \
+    > /dev/null 2>&1
+
+check "phase6d bug B: .git/config records that this repo has used chunked storage" \
+    grep -q "everchunked" "$P6D_LOSTREF_REPO/.git/config"
+
+(cd "$P6D_LOSTREF_REPO" && git update-ref -d refs/sg/chunks) > /dev/null 2>&1
+check "phase6d bug B: refs/sg/chunks really is gone after git update-ref -d" \
+    sh -c "! (cd '$P6D_LOSTREF_REPO' && git show-ref --verify --quiet refs/sg/chunks)"
+
+rm -f "$P6D_LOSTREF_FILE"
+P6D_LOSTREF_OUT="$WORKDIR/p6d_lostref_restore_out.txt"
+(cd "$P6D_LOSTREF_REPO" && "$SG" restore --force big.bin) > "$P6D_LOSTREF_OUT" 2>&1
+P6D_LOSTREF_RC=$?
+check "phase6d bug B: sg restore fails (non-zero) once refs/sg/chunks is deleted from a repo that used chunking" \
+    test "$P6D_LOSTREF_RC" != 0
+check "phase6d bug B: sg restore's error names refs/sg/chunks as the thing that went missing" \
+    grep -q "refs/sg/chunks" "$P6D_LOSTREF_OUT"
+check "phase6d bug B: a failed restore never writes the pointer text in place of the file -- big.bin stays absent" \
+    test ! -e "$P6D_LOSTREF_FILE"
+
+# case 4 (bug B, accepted baseline): a repo obtained via a real (non-sg) `git
+# clone` has neither refs/sg/chunks nor the .git/config marker -- this must
+# keep behaving exactly as documented before this phase (pointer text is
+# what a non-chunk-aware reader gets back), unaffected by the hard-failure
+# path added above. Uses a local filesystem clone (not the HTTP server) so
+# this case always runs regardless of HTTP availability.
+P6D_PLAINCLONE_SRC="$WORKDIR/phase6d_plainclone_src"
+mkdir -p "$P6D_PLAINCLONE_SRC"
+(cd "$WORKDIR" && "$SG" init phase6d_plainclone_src) > /dev/null 2>&1
+git config -f "$P6D_PLAINCLONE_SRC/.git/config" sg.chunking true
+git config -f "$P6D_PLAINCLONE_SRC/.git/config" sg.chunkthreshold 1048576
+head -c 5242880 /dev/urandom > "$P6D_PLAINCLONE_SRC/big.bin" 2>/dev/null
+(cd "$P6D_PLAINCLONE_SRC" && "$SG" add big.bin && "$SG" commit -m "big file, source for plain clone") \
+    > /dev/null 2>&1
+
+P6D_PLAINCLONE_DEST="$WORKDIR/phase6d_plainclone_dest"
+(cd "$WORKDIR" && git clone -q phase6d_plainclone_src phase6d_plainclone_dest) > /dev/null 2>&1
+check "phase6d bug B baseline: a real git clone has no refs/sg/chunks (never advertised/requested)" \
+    sh -c "! (cd '$P6D_PLAINCLONE_DEST' && git show-ref --verify --quiet refs/sg/chunks)"
+check "phase6d bug B baseline: a real git clone has no .git/config chunking-used marker (fresh config)" \
+    sh -c "! grep -q 'everchunked' '$P6D_PLAINCLONE_DEST/.git/config'"
+
+P6D_PLAINCLONE_SIZE=$(wc -c < "$P6D_PLAINCLONE_DEST/big.bin" 2>/dev/null | tr -d ' ')
+echo "phase6d bug B baseline: original was 5242880 bytes; a plain git clone's big.bin is ${P6D_PLAINCLONE_SIZE:-0} bytes (pointer text -- documented, unaffected by the fix)"
+check "phase6d bug B baseline: a repo that never used chunking still gets the pointer text unchanged (documented limitation, not a bug)" \
+    test "${P6D_PLAINCLONE_SIZE:-0}" -lt 50000
+check "phase6d bug B baseline: sg status still exits 0 against that pointer text (treated as ordinary content)" \
+    sh -c "(cd '$P6D_PLAINCLONE_DEST' && '$SG' status) > /dev/null 2>&1"
+
 # ---- packed-refs: `git gc` moves refs out of loose files, and a reader that
 # only checks refs/heads/<name> concludes the branch has no commits -- after
 # which the next commit becomes a root commit and the whole history stops
