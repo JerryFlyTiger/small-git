@@ -1940,6 +1940,33 @@ else
     skip "phase6b: sg push prints an actionable abort message naming the broken chunked object"
     skip "phase6b: after the aborted push, the remote gained no branch ref (no incomplete pointer text was published)"
 fi
+# ---- packed-refs: `git gc` moves refs out of loose files, and a reader that
+# only checks refs/heads/<name> concludes the branch has no commits -- after
+# which the next commit becomes a root commit and the whole history stops
+# being reachable from any ref.
+PACKED_REPO="$WORKDIR/packed_refs_repo"
+mkdir -p "$PACKED_REPO"
+(cd "$PACKED_REPO" && "$SG" init) > /dev/null 2>&1
+printf 'one\n' > "$PACKED_REPO/a.txt"
+(cd "$PACKED_REPO" && "$SG" add a.txt && "$SG" commit -m "first") > /dev/null 2>&1
+PACKED_FIRST=$(cat "$PACKED_REPO/.git/refs/heads/master" 2>/dev/null)
+(cd "$PACKED_REPO" && git gc --prune=now) > /dev/null 2>&1
+
+check "packed-refs: git gc really did pack the loose branch ref away" \
+    sh -c "test ! -f '$PACKED_REPO/.git/refs/heads/master'"
+check "packed-refs: sg log still finds the commit once the ref is packed" \
+    sh -c "(cd '$PACKED_REPO' && '$SG' log) 2>&1 | grep -q '$PACKED_FIRST'"
+
+printf 'two\n' > "$PACKED_REPO/b.txt"
+(cd "$PACKED_REPO" && "$SG" add b.txt && "$SG" commit -m "second") > /dev/null 2>&1
+PACKED_SECOND=$(cat "$PACKED_REPO/.git/refs/heads/master" 2>/dev/null)
+
+check "packed-refs: the commit after a gc has a parent (history not orphaned)" \
+    sh -c "test \"\$(cd '$PACKED_REPO' && git cat-file -p '$PACKED_SECOND' | grep -c '^parent ')\" = 1"
+check "packed-refs: both commits remain reachable from a ref after a gc" \
+    sh -c "test \"\$(cd '$PACKED_REPO' && git log --oneline --all | wc -l | tr -d ' ')\" = 2"
+check "packed-refs: sg switch recognizes a branch that only exists packed" \
+    sh -c "(cd '$PACKED_REPO' && '$SG' switch -c feat && '$SG' switch master) > /dev/null 2>&1"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

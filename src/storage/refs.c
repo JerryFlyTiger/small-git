@@ -111,9 +111,17 @@ char *sg_ref_current_branch(const char *git_dir)
     return branch;
 }
 
+/* defined below, next to sg_ref_read_path -- `git gc` packs refs away
+   from their loose files, and a lookup that misses that concludes the
+   branch has no commits, which turns the next commit into a root commit
+   and orphans the whole history. */
+static int read_packed_ref(const char *git_dir, const char *ref_path,
+                           unsigned char id_out[SG_SHA1_RAW_LEN]);
+
 int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
     char path[SG_PATH_MAX];
+    char ref_name[SG_PATH_MAX];
     char *content;
     char *nl;
     int rc;
@@ -123,8 +131,10 @@ int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id
 
     snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
     content = read_small_file(path);
-    if (content == NULL)
-        return -1;
+    if (content == NULL) {
+        snprintf(ref_name, sizeof(ref_name), "refs/heads/%s", branch);
+        return read_packed_ref(git_dir, ref_name, id_out);
+    }
 
     nl = strchr(content, '\n');
     if (nl != NULL)
@@ -173,12 +183,17 @@ int sg_ref_branch_exists(const char *git_dir, const char *branch)
 {
     char path[SG_PATH_MAX];
     struct stat st;
+    unsigned char id[SG_SHA1_RAW_LEN];
 
     if (!sg_ref_branch_name_is_safe(branch))
         return 0;
 
     snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+    if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
+        return 1;
+
+    /* a packed branch is still a branch -- see read_packed_ref */
+    return sg_ref_read_branch(git_dir, branch, id) == 0;
 }
 
 int sg_ref_write_path(const char *git_dir, const char *ref_path, const unsigned char id[SG_SHA1_RAW_LEN])
