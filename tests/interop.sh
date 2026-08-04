@@ -2344,6 +2344,176 @@ check "packed-refs: both commits remain reachable from a ref after a gc" \
 check "packed-refs: sg switch recognizes a branch that only exists packed" \
     sh -c "(cd '$PACKED_REPO' && '$SG' switch -c feat && '$SG' switch master) > /dev/null 2>&1"
 
+# ---- idx v2 large-offset table: a pack needing an offset that doesn't fit
+# in 31 bits (i.e. >2GB into the pack) uses an escape hatch in the idx v2
+# format -- the normal 4-byte offset table entry has its MSB set, and its
+# low 31 bits are instead an index into a separate 8-byte-per-entry
+# large-offset table appended after the normal tables. Synthesizing an
+# actual >2GB pack to exercise this isn't practical here, so this hand-
+# builds a tiny one-object pack + matching idx whose sole offset-table entry
+# takes that indirect path (even though the real offset it resolves to,
+# 12, is tiny) -- this is the only piece of this refactor with no other
+# coverage in this suite.
+LARGE_OFF_REPO="$WORKDIR/large_offset_repo"
+mkdir -p "$LARGE_OFF_REPO"
+(cd "$WORKDIR" && "$SG" init large_offset_repo) > /dev/null 2>&1
+
+LARGE_OFF_EXPECTED="$WORKDIR/large_offset_expected.txt"
+LARGE_OFF_ID=$(python3 - "$LARGE_OFF_REPO/.git" "$LARGE_OFF_EXPECTED" <<'PYEOF'
+import hashlib
+import os
+import struct
+import sys
+import zlib
+
+git_dir, expected_path = sys.argv[1], sys.argv[2]
+content = b"large-offset idx v2 synthetic test object\n"
+
+# git blob object id: sha1("blob " + len + "\0" + content)
+obj_id = hashlib.sha1(b"blob " + str(len(content)).encode() + b"\x00" + content).digest()
+
+def encode_obj_header(obj_type, size):
+    # pack entry header varint: first byte's bit7 is a continuation flag,
+    # bits6-4 the type, bits3-0 the low 4 bits of size; each continuation
+    # byte then contributes 7 more bits.
+    b0 = (obj_type << 4) | (size & 0x0F)
+    size >>= 4
+    out = bytearray([b0 | (0x80 if size else 0)])
+    while size:
+        b = size & 0x7F
+        size >>= 7
+        out.append(b | (0x80 if size else 0))
+    return bytes(out)
+
+OBJ_BLOB = 3
+compressed = zlib.compress(content)
+entry_header = encode_obj_header(OBJ_BLOB, len(content))
+
+pack_body = b"PACK" + struct.pack(">II", 2, 1)  # version 2, 1 object
+entry_offset = len(pack_body)  # this entry starts right after the 12-byte header
+pack_body += entry_header + compressed
+pack_trailer = hashlib.sha1(pack_body).digest()
+pack_bytes = pack_body + pack_trailer
+
+crc = zlib.crc32(entry_header + compressed) & 0xFFFFFFFF
+
+idx = bytearray([0xFF, 0x74, 0x4F, 0x63]) + struct.pack(">I", 2)
+fanout = [1 if i >= obj_id[0] else 0 for i in range(256)]
+for v in fanout:
+    idx += struct.pack(">I", v)
+idx += obj_id
+idx += struct.pack(">I", crc)
+idx += struct.pack(">I", 0x80000000)  # offset table: MSB set, index 0 into large-offset table
+idx += struct.pack(">Q", entry_offset)  # large-offset table: 1 entry, real 8-byte BE offset
+idx += pack_trailer  # pack checksum
+idx += hashlib.sha1(bytes(idx)).digest()  # idx's own trailing checksum
+
+pack_dir = os.path.join(git_dir, "objects", "pack")
+os.makedirs(pack_dir, exist_ok=True)
+pack_hex = pack_trailer.hex()
+with open(os.path.join(pack_dir, f"pack-{pack_hex}.pack"), "wb") as f:
+    f.write(pack_bytes)
+with open(os.path.join(pack_dir, f"pack-{pack_hex}.idx"), "wb") as f:
+    f.write(bytes(idx))
+with open(expected_path, "wb") as f:
+    f.write(content)
+
+print(obj_id.hex())
+PYEOF
+)
+
+LARGE_OFF_OUT="$WORKDIR/large_offset_catfile_out.txt"
+(cd "$LARGE_OFF_REPO" && "$SG" cat-file -p "$LARGE_OFF_ID") > "$LARGE_OFF_OUT" 2>&1
+LARGE_OFF_RC=$?
+check "idx v2 large-offset table: sg cat-file -p exits 0 for an object reached via the large-offset table" \
+    test "$LARGE_OFF_RC" = 0
+check "idx v2 large-offset table: content read back matches exactly what was packed" \
+    cmp -s "$LARGE_OFF_EXPECTED" "$LARGE_OFF_OUT"
+
+LARGE_OFF_TYPE=$(cd "$LARGE_OFF_REPO" && "$SG" cat-file -t "$LARGE_OFF_ID" 2>/dev/null)
+check "idx v2 large-offset table: sg cat-file -t reports the correct object type" \
+    test "$LARGE_OFF_TYPE" = "blob"
+
+echo ""
+
+# ---- REF_DELTA whose base exists nowhere ----------------------------------
+# Reading this forces read_entry_at() to recurse back into pack_read_depth()
+# to resolve the base, and that nested lookup then misses in every pack --
+# the exact path where a rescan triggered underneath an in-progress read used
+# to free the pack list the outer loop was still walking (a use-after-free
+# confirmed under ASan, now fixed by deferring reclamation until the
+# outermost read returns). The race itself needs a concurrent writer and so
+# isn't deterministic enough to assert here; what this pins deterministically
+# is that the nested-miss path stays reachable and still fails cleanly rather
+# than crashing, hanging, or inventing content.
+MISSING_BASE_REPO="$WORKDIR/missing_base_repo"
+mkdir -p "$MISSING_BASE_REPO"
+(cd "$WORKDIR" && "$SG" init missing_base_repo) > /dev/null 2>&1
+
+MISSING_BASE_ID=$(python3 - "$MISSING_BASE_REPO/.git" <<'PYEOF'
+import binascii
+import hashlib
+import os
+import struct
+import sys
+import zlib
+
+git_dir = sys.argv[1]
+OBJ_REF_DELTA = 7
+fake_id = bytes([0xAA]) * 20      # what the idx claims is in there
+missing_base = bytes([0xBB]) * 20  # a base id present in no pack and no loose object
+
+def encode_obj_header(obj_type, size):
+    b0 = (obj_type << 4) | (size & 0x0F)
+    size >>= 4
+    out = bytearray([b0 | (0x80 if size else 0)])
+    while size:
+        b = size & 0x7F
+        size >>= 7
+        out.append(b | (0x80 if size else 0))
+    return bytes(out)
+
+# the delta stream's own bytes never get applied (the base can't be found),
+# so its contents don't matter -- only that it inflates cleanly.
+delta = b"\x00" * 4096
+body = encode_obj_header(OBJ_REF_DELTA, len(delta)) + missing_base + zlib.compress(delta, 1)
+pack_body = b"PACK" + struct.pack(">II", 2, 1)
+entry_offset = len(pack_body)
+pack_body += body
+pack_trailer = hashlib.sha1(pack_body).digest()
+pack_bytes = pack_body + pack_trailer
+
+idx = bytearray([0xFF, 0x74, 0x4F, 0x63]) + struct.pack(">I", 2)
+for i in range(256):
+    idx += struct.pack(">I", 1 if i >= fake_id[0] else 0)
+idx += fake_id
+idx += struct.pack(">I", binascii.crc32(body) & 0xFFFFFFFF)
+idx += struct.pack(">I", entry_offset)
+idx += pack_trailer
+idx += hashlib.sha1(bytes(idx)).digest()
+
+pack_dir = os.path.join(git_dir, "objects", "pack")
+os.makedirs(pack_dir, exist_ok=True)
+pack_hex = pack_trailer.hex()
+with open(os.path.join(pack_dir, f"pack-{pack_hex}.pack"), "wb") as f:
+    f.write(pack_bytes)
+with open(os.path.join(pack_dir, f"pack-{pack_hex}.idx"), "wb") as f:
+    f.write(bytes(idx))
+
+print(fake_id.hex())
+PYEOF
+)
+
+MISSING_BASE_OUT="$WORKDIR/missing_base_out.txt"
+(cd "$MISSING_BASE_REPO" && "$SG" cat-file -p "$MISSING_BASE_ID") > "$MISSING_BASE_OUT" 2>&1
+MISSING_BASE_RC=$?
+check "REF_DELTA with an unresolvable base: sg cat-file fails instead of succeeding" \
+    test "$MISSING_BASE_RC" != 0
+check "REF_DELTA with an unresolvable base: exit status is a clean failure, not a signal/crash" \
+    test "$MISSING_BASE_RC" -lt 128
+check "REF_DELTA with an unresolvable base: reports it as not found rather than emitting content" \
+    grep -q "not found or corrupt" "$MISSING_BASE_OUT"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

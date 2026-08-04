@@ -17,7 +17,18 @@
    *content_out is malloc'd, caller frees. Returns 0 on success, -1 if not
    found in any pack, malformed, or the chain depth limit was hit -- this is
    not by itself proof the object doesn't exist at all, since loose storage
-   hasn't necessarily been checked (see sg_object_read). */
+   hasn't necessarily been checked (see sg_object_read).
+
+   Every idx/pack pair is mmap'd once and kept in a process-lifetime
+   cache keyed by git_dir (see pack.c), so repeated calls -- e.g. walking a
+   long history -- don't re-open and re-parse every pack on every lookup.
+   The cache is invalidated automatically both by this process's own writes
+   (sg_pack_write / sg_pack_store_raw / sg_pack_index_existing) and by
+   detecting that objects/pack/'s mtime has moved since the last scan (e.g.
+   an external `git gc`), so callers don't need to do anything special.
+   idx v2's large-offset table (for packs needing offsets past 2GB) is
+   understood on this read path, so packs written by real git that needed
+   it are readable here even though sg_pack_write itself won't produce one. */
 int sg_pack_read(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
                  sg_obj_type *type_out, unsigned char **content_out, size_t *content_len_out);
 
