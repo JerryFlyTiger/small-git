@@ -6,11 +6,14 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
@@ -453,94 +456,155 @@ static int read_entry_at(const char *git_dir, const unsigned char *pack_data, si
     }
 }
 
-/* ---- .idx (version 2) reading ---- */
+/* ---- .idx (version 2) reading, mmap-backed pack registry ----
 
-typedef struct {
-    unsigned char *raw;
-    size_t raw_len;
+   Every *.idx / *.pack pair under a git_dir's objects/pack/ is mapped once
+   (mmap, not malloc+fread -- these files can be tens of MB and querying one
+   object shouldn't page the whole thing into a heap buffer) and kept in a
+   process-lifetime cache keyed by git_dir, so a run doing many lookups (e.g.
+   `sg log` walking history) opens/parses each pack at most once instead of
+   once per object. See pack_cache_invalidate and pack_read_depth below for
+   how the cache stays correct across writes made by this same process and
+   changes made by other processes (e.g. `git gc`). */
+
+struct sg_pack_file {
+    char *pack_path;
+    unsigned char *pack_map;
+    size_t pack_len;
+    unsigned char *idx_map;
+    size_t idx_len;
     size_t count;
-    const unsigned char *sha1_table;   /* count * 20 bytes, sorted */
-    const unsigned char *offset_table; /* count * 4 bytes, big-endian */
-} sg_idx;
+    const unsigned char *fanout;             /* 256 * 4 bytes, big-endian, cumulative counts */
+    const unsigned char *sha1_table;         /* count * 20 bytes, sorted */
+    const unsigned char *offset_table;       /* count * 4 bytes, big-endian */
+    const unsigned char *large_offset_table; /* large_offset_count * 8 bytes, big-endian; NULL if none */
+    size_t large_offset_count;
+    struct sg_pack_file *next;
+};
 
-static int idx_load(const char *idx_path, sg_idx *out)
+struct sg_pack_dir {
+    char *git_dir;
+    struct sg_pack_file *packs;
+    int scanned;
+    /* mtime of objects/pack/ as of the last scan. (time_t)-1 doubles as
+       "objects/pack/ didn't exist at the last scan" -- stat() failing again
+       next time compares equal (no rescan needed), stat() succeeding
+       compares unequal (the directory just appeared, rescan). A real mtime
+       landing on exactly -1 is not a practical concern. */
+    time_t scan_mtime;
+    struct sg_pack_dir *next;
+};
+
+static struct sg_pack_dir *g_pack_dirs = NULL;
+
+/* mmaps the whole file read-only and closes the fd immediately (the mapping
+   stays valid per POSIX). Rejects zero-length files outright -- not a valid
+   idx or pack, and mmap of length 0 is undefined. Returns 0/-1; on failure
+   *map_out and *len_out are left untouched. */
+static int mmap_file(const char *path, unsigned char **map_out, size_t *len_out)
 {
-    FILE *f;
+    int fd;
     struct stat st;
-    unsigned char *buf;
-    size_t len;
-    size_t fanout_off, sha1_off, crc_off, offset_off;
+    void *map;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+        close(fd);
+        return -1;
+    }
+    map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED)
+        return -1;
+
+    *map_out = map;
+    *len_out = (size_t)st.st_size;
+    return 0;
+}
+
+/* Parses pf->idx_map (already mmap'd, pf->idx_len set) into the fanout /
+   sha1 / offset / large-offset table pointers. Every offset and count is
+   validated against the file's actual length before being trusted -- this
+   data may have come off the network. Returns 0/-1. */
+static int idx_parse(struct sg_pack_file *pf)
+{
+    const unsigned char *buf = pf->idx_map;
+    uint64_t len = (uint64_t)pf->idx_len;
+    uint64_t fanout_off, sha1_off, crc_off, offset_off, after_offset, rest;
     uint32_t count;
 
-    f = fopen(idx_path, "rb");
-    if (f == NULL)
-        return -1;
-    if (fstat(fileno(f), &st) != 0) {
-        fclose(f);
-        return -1;
-    }
-    len = (size_t)st.st_size;
-    buf = malloc(len > 0 ? len : 1);
-    if (buf == NULL) {
-        fclose(f);
-        return -1;
-    }
-    if (fread(buf, 1, len, f) != len) {
-        fclose(f);
-        free(buf);
-        return -1;
-    }
-    fclose(f);
-
     if (len < 8 + 256 * 4 + 40 || buf[0] != 0xff || buf[1] != 0x74 || buf[2] != 0x4f ||
-       buf[3] != 0x63 || be32(buf + 4) != 2) {
-        free(buf);
+       buf[3] != 0x63 || be32(buf + 4) != 2)
         return -1;
-    }
 
     fanout_off = 8;
     count = be32(buf + fanout_off + 255 * 4);
     sha1_off = fanout_off + 256 * 4;
-    crc_off = sha1_off + (size_t)count * SG_SHA1_RAW_LEN;
-    offset_off = crc_off + (size_t)count * 4;
+    crc_off = sha1_off + (uint64_t)count * SG_SHA1_RAW_LEN;
+    offset_off = crc_off + (uint64_t)count * 4;
+    after_offset = offset_off + (uint64_t)count * 4;
 
-    if (offset_off + (size_t)count * 4 + 2 * SG_SHA1_RAW_LEN != len) {
-        free(buf);
+    /* the fixed-size tables (fanout/sha1/crc/offset) plus the two trailing
+       checksums must fit; whatever's left over (possibly nothing) is the
+       optional 8-byte large-offset table, one entry per large offset. */
+    if (after_offset + 2 * SG_SHA1_RAW_LEN > len)
         return -1;
-    }
+    rest = len - after_offset - 2 * SG_SHA1_RAW_LEN;
+    if (rest % 8 != 0)
+        return -1;
 
-    out->raw = buf;
-    out->raw_len = len;
-    out->count = count;
-    out->sha1_table = buf + sha1_off;
-    out->offset_table = buf + offset_off;
+    pf->count = (size_t)count;
+    pf->fanout = buf + fanout_off;
+    pf->sha1_table = buf + (size_t)sha1_off;
+    pf->offset_table = buf + (size_t)offset_off;
+    pf->large_offset_count = (size_t)(rest / 8);
+    pf->large_offset_table = pf->large_offset_count > 0 ? buf + (size_t)after_offset : NULL;
     return 0;
 }
 
-static void idx_free(sg_idx *idx)
+/* Looks up `id` in pf's idx. Narrows the search range with the fanout table
+   first (id[0]'s bucket), then binary-searches the sorted sha1 table within
+   that range. A 4-byte offset with its MSB set indicates a large-offset
+   table index in its low 31 bits instead of a literal offset (idx v2's
+   >2GB-pack escape hatch); both paths validate the resolved offset against
+   the pack's actual length before returning it. Returns 0 (found,
+   *offset_out set), 1 (not present), or -1 (the idx's own data is
+   internally inconsistent -- treated the same as "not present" by callers,
+   since this table may have come off the network). */
+static int idx_find(const struct sg_pack_file *pf, const unsigned char id[SG_SHA1_RAW_LEN],
+                    size_t *offset_out)
 {
-    free(idx->raw);
-}
+    size_t lo, hi;
 
-/* binary search over the sorted sha1 table; the fanout table exists in the
-   format for git's own two-level lookup, but a plain binary search over the
-   already-sorted table below is just as correct, so it's parsed above only
-   to locate `count` and validate the file's shape, not used to narrow the
-   search range here. */
-static int idx_find(const sg_idx *idx, const unsigned char id[SG_SHA1_RAW_LEN], size_t *offset_out)
-{
-    size_t lo = 0, hi = idx->count;
+    lo = (id[0] == 0) ? 0 : be32(pf->fanout + (size_t)(id[0] - 1) * 4);
+    hi = be32(pf->fanout + (size_t)id[0] * 4);
+    if (lo > hi || hi > pf->count)
+        return -1;
 
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        int cmp = memcmp(idx->sha1_table + mid * SG_SHA1_RAW_LEN, id, SG_SHA1_RAW_LEN);
+        int cmp = memcmp(pf->sha1_table + mid * SG_SHA1_RAW_LEN, id, SG_SHA1_RAW_LEN);
 
         if (cmp == 0) {
-            uint32_t off = be32(idx->offset_table + mid * 4);
+            uint32_t off = be32(pf->offset_table + mid * 4);
+            uint64_t real_off;
 
-            if (off & 0x80000000u)
-                return -1; /* 8-byte large-offset table entries aren't supported */
-            *offset_out = off;
+            if (off & 0x80000000u) {
+                uint64_t k = off & 0x7fffffffu;
+
+                if (k >= pf->large_offset_count)
+                    return -1;
+                real_off = ((uint64_t)be32(pf->large_offset_table + k * 8) << 32) |
+                          (uint64_t)be32(pf->large_offset_table + k * 8 + 4);
+            } else {
+                real_off = off;
+            }
+
+            if (real_off > (uint64_t)SIZE_MAX || (size_t)real_off >= pf->pack_len)
+                return -1;
+            *offset_out = (size_t)real_off;
             return 0;
         }
         if (cmp < 0)
@@ -551,92 +615,316 @@ static int idx_find(const sg_idx *idx, const unsigned char id[SG_SHA1_RAW_LEN], 
     return 1;
 }
 
-static int pack_load(const char *pack_path, unsigned char **data_out, size_t *len_out)
+static void pack_file_list_free(struct sg_pack_file *pf)
 {
-    FILE *f;
-    struct stat st;
-    unsigned char *buf;
+    while (pf != NULL) {
+        struct sg_pack_file *next = pf->next;
 
-    f = fopen(pack_path, "rb");
-    if (f == NULL)
-        return -1;
-    if (fstat(fileno(f), &st) != 0) {
-        fclose(f);
-        return -1;
+        if (pf->idx_map != NULL)
+            munmap(pf->idx_map, pf->idx_len);
+        if (pf->pack_map != NULL)
+            munmap(pf->pack_map, pf->pack_len);
+        free(pf->pack_path);
+        free(pf);
+        pf = next;
     }
-    *len_out = (size_t)st.st_size;
-    buf = malloc(*len_out > 0 ? *len_out : 1);
-    if (buf == NULL) {
-        fclose(f);
-        return -1;
-    }
-    if (fread(buf, 1, *len_out, f) != *len_out) {
-        fclose(f);
-        free(buf);
-        return -1;
-    }
-    fclose(f);
-    *data_out = buf;
-    return 0;
 }
 
-static int pack_read_depth(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN], int depth,
-                          sg_obj_type *type_out, unsigned char **content_out,
-                          size_t *content_len_out)
+/* Deferred reclamation of replaced pack lists.
+   ------------------------------------------------------------------
+   A rescan replaces pd->packs wholesale, but a rescan can be triggered from
+   *inside* an in-progress read: read_entry_at() resolves a REF_DELTA base by
+   recursing into pack_read_depth(), and if that nested lookup misses and
+   objects/pack/'s mtime has moved (a concurrent `git gc`, say), it rescans.
+   Freeing the old list right there pulls memory out from under the outer
+   pack_read_from_dir() loop, which is still holding both the `pf` it is
+   iterating and, one frame up, a pack_map pointer it decodes from. That is a
+   genuine use-after-free, confirmed under ASan: the outer loop's `pf->next`
+   read lands in a block freed by pack_dir_do_scan() several frames below it.
+
+   So while any read is in flight, a replaced list is parked on g_retired
+   instead of being freed, and the whole backlog is reclaimed only once the
+   outermost pack_read_depth() returns. Retiring records the list head in a
+   separate holder rather than splicing the list itself, because the `next`
+   chain is exactly what the outer loop is still walking. */
+static int g_pack_read_active = 0;
+
+struct sg_retired_packs {
+    struct sg_pack_file *list;
+    struct sg_retired_packs *next;
+};
+
+static struct sg_retired_packs *g_retired = NULL;
+
+static void pack_file_list_release(struct sg_pack_file *pf)
 {
-    char pack_dir[SG_PATH_MAX];
+    struct sg_retired_packs *r;
+
+    if (pf == NULL)
+        return;
+    if (g_pack_read_active == 0) {
+        pack_file_list_free(pf);
+        return;
+    }
+    r = calloc(1, sizeof(*r));
+    if (r == NULL)
+        return; /* can't park it: leak rather than free memory still in use */
+    r->list = pf;
+    r->next = g_retired;
+    g_retired = r;
+}
+
+static void pack_retired_drain(void)
+{
+    while (g_retired != NULL) {
+        struct sg_retired_packs *r = g_retired;
+
+        g_retired = r->next;
+        pack_file_list_free(r->list);
+        free(r);
+    }
+}
+
+static struct sg_pack_dir *pack_dir_lookup(const char *git_dir)
+{
+    struct sg_pack_dir *pd;
+
+    for (pd = g_pack_dirs; pd != NULL; pd = pd->next) {
+        if (strcmp(pd->git_dir, git_dir) == 0)
+            return pd;
+    }
+    return NULL;
+}
+
+static struct sg_pack_dir *pack_dir_get_or_create(const char *git_dir)
+{
+    struct sg_pack_dir *pd;
+
+    pd = pack_dir_lookup(git_dir);
+    if (pd != NULL)
+        return pd;
+
+    pd = calloc(1, sizeof(*pd));
+    if (pd == NULL)
+        return NULL;
+    pd->git_dir = strdup(git_dir);
+    if (pd->git_dir == NULL) {
+        free(pd);
+        return NULL;
+    }
+    pd->scan_mtime = (time_t)-1;
+    pd->next = g_pack_dirs;
+    g_pack_dirs = pd;
+    return pd;
+}
+
+/* Scans pack_dir_path for *.idx + *.pack pairs and mmaps each. A pack that
+   fails to mmap or whose idx fails to parse is silently skipped (not fatal
+   to the scan as a whole) -- it may simply not have a matching file yet
+   (mid-write elsewhere) or be foreign/corrupt data. Returns the list head,
+   or NULL if the directory is empty/unreadable/has no usable packs. */
+static struct sg_pack_file *pack_scan_build(const char *pack_dir_path)
+{
     DIR *d;
     struct dirent *de;
-    int found = -1;
+    struct sg_pack_file *head = NULL;
 
-    snprintf(pack_dir, sizeof(pack_dir), "%s/objects/pack", git_dir);
-    d = opendir(pack_dir);
+    d = opendir(pack_dir_path);
     if (d == NULL)
-        return -1;
+        return NULL;
 
     while ((de = readdir(d)) != NULL) {
         size_t name_len = strlen(de->d_name);
         char idx_path[SG_PATH_MAX];
         char pack_path[SG_PATH_MAX];
-        sg_idx idx;
-        size_t offset;
-        unsigned char *pack_data;
-        size_t pack_len;
-        struct stat st;
+        struct sg_pack_file *pf;
 
         if (name_len < 4 || strcmp(de->d_name + name_len - 4, ".idx") != 0)
             continue;
 
-        snprintf(idx_path, sizeof(idx_path), "%s/%s", pack_dir, de->d_name);
-        snprintf(pack_path, sizeof(pack_path), "%s/%.*s.pack", pack_dir, (int)(name_len - 4),
-                de->d_name);
+        snprintf(idx_path, sizeof(idx_path), "%s/%s", pack_dir_path, de->d_name);
+        snprintf(pack_path, sizeof(pack_path), "%s/%.*s.pack", pack_dir_path,
+                (int)(name_len - 4), de->d_name);
 
-        if (stat(pack_path, &st) != 0)
+        pf = calloc(1, sizeof(*pf));
+        if (pf == NULL)
             continue;
 
-        if (idx_load(idx_path, &idx) != 0)
-            continue;
-
-        if (idx_find(&idx, id, &offset) != 0) {
-            idx_free(&idx);
+        if (mmap_file(idx_path, &pf->idx_map, &pf->idx_len) != 0) {
+            free(pf);
             continue;
         }
-        idx_free(&idx);
-
-        if (pack_load(pack_path, &pack_data, &pack_len) != 0)
+        if (mmap_file(pack_path, &pf->pack_map, &pf->pack_len) != 0) {
+            munmap(pf->idx_map, pf->idx_len);
+            free(pf);
             continue;
-
-        if (read_entry_at(git_dir, pack_data, pack_len, offset, depth, type_out, content_out,
-                          content_len_out) == 0) {
-            free(pack_data);
-            found = 0;
-            break;
         }
-        free(pack_data);
+        if (idx_parse(pf) != 0) {
+            munmap(pf->idx_map, pf->idx_len);
+            munmap(pf->pack_map, pf->pack_len);
+            free(pf);
+            continue;
+        }
+        pf->pack_path = strdup(pack_path);
+        if (pf->pack_path == NULL) {
+            munmap(pf->idx_map, pf->idx_len);
+            munmap(pf->pack_map, pf->pack_len);
+            free(pf);
+            continue;
+        }
+
+        pf->next = head;
+        head = pf;
     }
-
     closedir(d);
-    return found;
+    return head;
+}
+
+/* Unconditionally throws away pd's current pack list and rebuilds it from
+   pack_dir_path, recording the directory's mtime at scan time (or -1 if it
+   doesn't exist, e.g. a brand new repo with no packs yet). */
+static void pack_dir_do_scan(struct sg_pack_dir *pd, const char *pack_dir_path)
+{
+    struct stat st;
+    time_t current_mtime;
+
+    current_mtime = (stat(pack_dir_path, &st) == 0) ? st.st_mtime : (time_t)-1;
+
+    pack_file_list_release(pd->packs);
+    pd->packs = (current_mtime == (time_t)-1) ? NULL : pack_scan_build(pack_dir_path);
+    pd->scan_mtime = current_mtime;
+    pd->scanned = 1;
+}
+
+/* Forces the next lookup for git_dir to rescan objects/pack/ from scratch.
+   Called after this process writes a new pack (sg_pack_write,
+   sg_pack_store_raw, sg_pack_index_existing) so that a pack written and then
+   immediately read back within the same run -- fetch/clone/push all do this
+   -- is never missed, even if the write landed within the same directory-
+   mtime second as the registry's last scan. (The mtime check in
+   pack_read_depth below independently covers changes made by *other*
+   processes, e.g. a concurrent `git gc`; the two mechanisms are
+   complementary, not redundant.) */
+static void pack_cache_invalidate(const char *git_dir)
+{
+    struct sg_pack_dir *pd = pack_dir_lookup(git_dir);
+
+    if (pd == NULL)
+        return; /* never scanned for this git_dir -- nothing cached to invalidate */
+    pack_file_list_release(pd->packs);
+    pd->packs = NULL;
+    pd->scanned = 0;
+}
+
+/* Reads pack_path in full via mmap. Used only by sg_pack_index_existing,
+   which reads a pack that doesn't have a matching .idx yet (it's building
+   one) and so can't go through the registry above -- this is a deliberately
+   separate, uncached path. Caller must munmap(*data_out, *len_out). */
+static int pack_load(const char *pack_path, unsigned char **data_out, size_t *len_out)
+{
+    return mmap_file(pack_path, data_out, len_out);
+}
+
+/* Tries every pack currently in pd's list for `id`, in the order they
+   appear (mirroring the old readdir-order scan): if the id is present in a
+   pack's idx but decoding it there fails, other packs are still tried
+   rather than giving up immediately (ids should never collide across packs
+   in practice, but this preserves prior behavior exactly). Returns 0 on
+   success, -1 if `id` isn't present in any pack's idx (a "genuine" miss --
+   the caller may want to rescan and retry), or -2 if it was found in at
+   least one idx but every pack claiming to have it failed to decode it (a
+   real failure; rescanning wouldn't change that). */
+static int pack_read_from_dir(struct sg_pack_dir *pd, const char *git_dir,
+                              const unsigned char id[SG_SHA1_RAW_LEN], int depth,
+                              sg_obj_type *type_out, unsigned char **content_out,
+                              size_t *content_len_out)
+{
+    struct sg_pack_file *pf;
+    int found_in_idx = 0;
+
+    for (pf = pd->packs; pf != NULL; pf = pf->next) {
+        size_t offset;
+
+        if (idx_find(pf, id, &offset) != 0)
+            continue;
+        found_in_idx = 1;
+        if (read_entry_at(git_dir, pf->pack_map, pf->pack_len, offset, depth, type_out,
+                          content_out, content_len_out) == 0)
+            return 0;
+    }
+    return found_in_idx ? -2 : -1;
+}
+
+static int pack_read_depth_inner(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
+                                 int depth, sg_obj_type *type_out, unsigned char **content_out,
+                                 size_t *content_len_out)
+{
+    struct sg_pack_dir *pd;
+    char pack_dir_path[SG_PATH_MAX];
+    int rc;
+
+    pd = pack_dir_get_or_create(git_dir);
+    if (pd == NULL)
+        return -1;
+
+    snprintf(pack_dir_path, sizeof(pack_dir_path), "%s/objects/pack", git_dir);
+
+    if (!pd->scanned)
+        pack_dir_do_scan(pd, pack_dir_path);
+
+    rc = pack_read_from_dir(pd, git_dir, id, depth, type_out, content_out, content_len_out);
+    if (rc == -1) {
+        /* Not found in any currently-cached pack. Common and cheap (loose
+           objects, or the id genuinely doesn't exist) -- so only pay for a
+           full rescan if objects/pack/'s mtime actually moved since our last
+           scan, and retry exactly once even then (a still-missing object
+           after a rescan is a real miss, not a reason to loop).
+
+           st_mtime has one-second resolution, so "unchanged mtime" alone is
+           not proof that nothing changed: another process writing a pack
+           within the same second as our scan leaves the mtime we recorded
+           untouched, and we would report an object that genuinely exists as
+           missing -- a regression against the old scan-every-lookup code,
+           which could not go stale. So a scan whose recorded mtime is still
+           the current second is treated as untrustworthy and always rescans
+           on a miss. Once the clock moves past that second the cheap
+           comparison resumes, and any later write necessarily lands on a
+           mtime that differs from the recorded one, which is detected
+           normally. (This is the same reasoning as git's "racily clean"
+           index entries.) */
+        struct stat st;
+        time_t current_mtime;
+        int scan_may_be_stale;
+
+        current_mtime = (stat(pack_dir_path, &st) == 0) ? st.st_mtime : (time_t)-1;
+        scan_may_be_stale =
+            (pd->scan_mtime != (time_t)-1 && pd->scan_mtime == time(NULL));
+
+        if (current_mtime != pd->scan_mtime || scan_may_be_stale) {
+            pack_dir_do_scan(pd, pack_dir_path);
+            rc = pack_read_from_dir(pd, git_dir, id, depth, type_out, content_out,
+                                    content_len_out);
+        }
+    }
+    return rc == 0 ? 0 : -1;
+}
+
+/* Marks a read as in flight for the whole of its (possibly deeply recursive,
+   via REF_DELTA base resolution) duration, so that any rescan happening
+   underneath it parks the list it replaces instead of freeing it. Only the
+   outermost frame reclaims the backlog -- see pack_file_list_release. */
+static int pack_read_depth(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN], int depth,
+                          sg_obj_type *type_out, unsigned char **content_out,
+                          size_t *content_len_out)
+{
+    int rc;
+
+    g_pack_read_active++;
+    rc = pack_read_depth_inner(git_dir, id, depth, type_out, content_out, content_len_out);
+    g_pack_read_active--;
+    if (g_pack_read_active == 0)
+        pack_retired_drain();
+    return rc;
 }
 
 int sg_pack_read(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
@@ -929,6 +1217,7 @@ int sg_pack_write(const char *git_dir, const unsigned char (*ids)[SG_SHA1_RAW_LE
     if (write_idx_for_pack(pack_dir, idx_path, entries, count, pack_sha1) != 0)
         goto done;
 
+    pack_cache_invalidate(git_dir);
     ok = 1;
 
 done:
@@ -1371,6 +1660,7 @@ int sg_pack_index_existing(const char *pack_path)
         goto done;
     }
 
+    pack_cache_invalidate(git_dir);
     ok = 1;
 
 done:
@@ -1393,7 +1683,8 @@ done:
     free(bucket_caps);
     free(out_entries);
     free(metas);
-    free(pack_data);
+    if (pack_data != NULL)
+        munmap(pack_data, pack_len);
     return ok ? 0 : -1;
 }
 
@@ -1419,6 +1710,8 @@ int sg_pack_store_raw(const char *git_dir, const unsigned char *data, size_t len
     snprintf(pack_path, sizeof(pack_path), "%s/pack-%s.pack", pack_dir, pack_hex);
     if (write_atomic(pack_dir, pack_path, data, len) != 0)
         return -1;
+
+    pack_cache_invalidate(git_dir);
 
     *pack_path_out = strdup(pack_path);
     return (*pack_path_out != NULL) ? 0 : -1;
