@@ -5,15 +5,22 @@ LDFLAGS  ?=
 # Feature-test macros. -std=c11 asks for strict ISO C, and on glibc that
 # hides everything POSIX behind feature-test macros -- including strdup,
 # strtok_r, mkstemp, getcwd and struct stat's st_mtim, all of which this
-# code uses. Without this, a Linux build fails on the very #else branches
-# written for it. Darwin exposes those by default and instead *hides*
-# st_mtimespec once _POSIX_C_SOURCE is set, so the two platforms need
-# opposite macros; picking the wrong one breaks the other platform.
+# code uses. Without any macro defined, -std=c11 makes glibc default to
+# POSIX.1-2008 visibility on its own, which is *still* too narrow: it also
+# hides S_IFMT/S_IFDIR in <sys/stat.h> (src/object/tree.c), which are XSI/BSD
+# extensions, not POSIX base -- confirmed by a real Linux CI build failing on
+# exactly that. So plain _POSIX_C_SOURCE isn't enough either; _DEFAULT_SOURCE
+# is glibc's own superset macro for this (it forces _POSIX_C_SOURCE=200809L
+# and _XOPEN_SOURCE=700 internally, while also keeping the XSI/BSD/GNU
+# extensions visible), and is what's used here to avoid this turning into
+# one hidden-declaration fix per build. Darwin needs the opposite: it exposes
+# all of this by default and instead *hides* st_mtimespec once
+# _POSIX_C_SOURCE is set, so the two platforms need different macros here.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   CFLAGS += -D_DARWIN_C_SOURCE
 else
-  CFLAGS += -D_POSIX_C_SOURCE=200809L
+  CFLAGS += -D_DEFAULT_SOURCE
 endif
 
 PREFIX  ?= /usr/local
