@@ -214,6 +214,17 @@ HELP_FLAG_RC=$?
 check "sg --help exits 0" test "$HELP_FLAG_RC" = 0
 check "sg --help output mentions 'switch'" grep -q "switch" "$HELP_FLAG_OUT"
 
+# --- `sg --version`: part of the packaging contract, and the same string the
+# --- protocol layer announces to remotes as its agent, so a drift between
+# --- the two is a real (if quiet) inconsistency rather than a cosmetic one.
+for vflag in --version -v version; do
+    VER_OUT="$WORKDIR/p8_version_out.txt"
+    "$SG" "$vflag" > "$VER_OUT" 2>&1
+    VER_RC=$?
+    check "sg $vflag exits 0" test "$VER_RC" = 0
+    check "sg $vflag reports a version" grep -qE "^sg version [0-9]+\.[0-9]+" "$VER_OUT"
+done
+
 # --- Phase 3 cases 3-6: switch/restore require confirmation for dangerous, lossy changes ---
 P3_REPO="$WORKDIR/phase3_repo"
 mkdir -p "$P3_REPO"

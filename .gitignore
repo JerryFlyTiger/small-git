@@ -2,3 +2,4 @@
 *.o
 *.dSYM/
 .DS_Store
+/stage/

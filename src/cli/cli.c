@@ -50,6 +50,15 @@ int sg_cli_run(int argc, char **argv)
         return 0;
     }
 
+    /* Phrased like `git version` so scripts that already scrape that shape
+       need no special case; SG_VERSION is the single definition shared with
+       the man page's .TH line and the packaging targets. */
+    if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0 ||
+       strcmp(argv[1], "version") == 0) {
+        printf("sg version %s\n", SG_VERSION);
+        return 0;
+    }
+
     if (strcmp(argv[1], "init") == 0)
         return sg_cmd_init(argc - 1, argv + 1);
     if (strcmp(argv[1], "hash-object") == 0)

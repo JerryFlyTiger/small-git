@@ -67,17 +67,29 @@ small_git/
 
 ## 分階段路線圖
 
-| Phase | 內容 | 交付驗證方式 |
-|---|---|---|
-| 0 | 專案骨架:build system、目錄結構、測試框架、CI | `make && make test` 可執行 |
-| 1 | 物件模型:SHA-1/zlib wrapper、loose object 讀寫、`sg init`/`hash-object`/`cat-file` | small_git 寫的 blob 能被系統 `git cat-file -p` 讀出;反之亦然 |
-| 2 | Index + 基礎 porcelain:`add`/`status`/`commit`/`log`/`diff`、refs、`switch`/`restore` | 在 small_git 建立的 repo,`git log`/`git status` 可正常運作 |
-| 3 | UX 差異化層:友善錯誤訊息、guided status、危險操作二次確認 | 手動 UX walkthrough |
-| 4 | 救援機制:自動快照 ref、`sg undo`、merge/rebase 與衝突 UX | 模擬誤操作後可 100% 復原 |
-| 5 | Packfile 與網路互通:pack reader/writer、delta 壓縮、smart HTTP v2 client(clone/fetch/push) | 可 clone 真實 GitHub repo、可 push 上去 |
-| 6 | 大檔案 chunking(選配功能) | 大檔案 repo 體積與 checkout 時間對比 |
-| 7 | 巨型 repo 效能:commit-graph、multi-pack-index、平行化 | 大型 repo 上 status/log 效能 benchmark |
-| 8 | 文件、打包、跨平台收尾 | README、man page、release build |
+| Phase | 內容 | 狀態 | 交付驗證方式 |
+|---|---|---|---|
+| 0 | 專案骨架:build system、目錄結構、測試框架、CI | 完成 | `make && make test` 可執行;CI 於 Phase 8 補上 |
+| 1 | 物件模型:SHA-1/zlib wrapper、loose object 讀寫、`sg init`/`hash-object`/`cat-file` | 完成 | small_git 寫的 blob 能被系統 `git cat-file -p` 讀出;反之亦然 |
+| 2 | Index + 基礎 porcelain:`add`/`status`/`commit`/`log`/`diff`、refs、`switch`/`restore` | 完成 | 在 small_git 建立的 repo,`git log`/`git status` 可正常運作 |
+| 3 | UX 差異化層:友善錯誤訊息、guided status、危險操作二次確認 | 完成 | 手動 UX walkthrough |
+| 4 | 救援機制:自動快照 ref、`sg undo`、merge/rebase 與衝突 UX | 完成 | 模擬誤操作後可 100% 復原 |
+| 5 | Packfile 與網路互通:pack reader/writer、smart HTTP client(clone/fetch/push) | 完成 | 可 clone 真實 repo、可 push 上去 |
+| 6 | 大檔案 chunking(選配功能) | 完成(預設關閉) | 大檔案 repo 體積與 checkout 時間對比 |
+| 7 | 巨型 repo 效能 | 部分完成 | 見下方 Phase 7a;**實際做的與原規劃不同**,說明如下 |
+| 8 | 文件、打包、跨平台收尾 | 完成 | README、man page、`make release`/`install`;CI 設定為在 Linux(gcc/clang)與 macOS 上建置並跑完整測試 |
+
+Phase 7 的內容與原規劃不同,原因記錄在此以免日後誤解:原本列的是 commit-graph、multi-pack-index、平行化。實測後發現真正的瓶頸完全不在那裡——是物件查找每次都重讀整個 pack(見下方 Phase 7a)。修好之後 `sg log` 已與 `git log` 同級,commit-graph 的邊際效益因此大幅下降,故未實作,留待有實際需求時再評估。原規劃的三項都尚未完成。
+
+另外,Phase 5 原本列有「delta 壓縮」,但寫入端至今仍是每個物件各自 zlib 壓縮、不做 delta;讀取端則完整支援 OFS_DELTA/REF_DELTA。表格已移除這個未兌現的描述。
+
+
+## 支援平台
+
+- **macOS**:已在本機實際建置並跑過完整測試套件(release 與 ASan/UBSan 版本各一次)。
+- **Linux**:CI 設定為以 gcc 與 clang 建置並跑完整測試套件。開發機沒有 Linux 環境,因此 Linux 的建置結果**以 CI 為準**,而非本機驗證過的結論。
+- **Windows 不支援**。程式碼直接使用 POSIX API(`mmap`、`opendir`、`fcntl` 檔案鎖、POSIX 路徑分隔),要支援 Windows 需要一層相容層,目前不在範圍內。
+- 兩個平台需要不同的 feature-test macro:`-std=c11` 是嚴格 ISO C,glibc 會把 `strdup`、`strtok_r`、`mkstemp`、`getcwd` 以及 `struct stat` 的 `st_mtim` 都藏在 `_POSIX_C_SOURCE` 後面;而 Darwin 預設就看得到這些,反而是**定義了** `_POSIX_C_SOURCE` 會把 `st_mtimespec` 藏起來。因此 Makefile 依 `uname -s` 分別定義 `-D_POSIX_C_SOURCE=200809L` 與 `-D_DARWIN_C_SOURCE`,兩者不可互換。
 
 ## 開放技術決策(隨開發過程確認)
 

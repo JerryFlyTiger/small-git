@@ -1,4 +1,5 @@
 #include "sg/transport.h"
+#include "sg/version.h"
 
 #include "sg/http.h"
 #include "sg/pktline.h"
@@ -419,7 +420,7 @@ int sg_transport_fetch_pack(const char *base_url,
 
         sg_sha1_to_hex(want_ids[i], hex);
         if (i == 0)
-            snprintf(line, sizeof(line), "want %s side-band-64k ofs-delta agent=small-git/0.1\n",
+            snprintf(line, sizeof(line), "want %s side-band-64k ofs-delta agent=small-git/" SG_VERSION "\n",
                     hex);
         else
             snprintf(line, sizeof(line), "want %s\n", hex);
@@ -701,7 +702,7 @@ int sg_transport_push(const char *base_url, const sg_push_ref_update *updates, s
                without the keep-alive ref covering its new chunks is exactly
                the state a remote `git gc` deletes data from. */
             n += (size_t)snprintf(line + n, sizeof(line) - n,
-                                  "report-status%s%s agent=small-git/0.1",
+                                  "report-status%s%s agent=small-git/" SG_VERSION,
                                   use_side_band_64k ? " side-band-64k" : "",
                                   use_atomic ? " atomic" : "");
         }

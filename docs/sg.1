@@ -1,0 +1,758 @@
+.TH SG 1 "2026-08-04" "small_git 0.1" "User Commands"
+.SH NAME
+sg \- small_git: a git-object-format-compatible version control tool
+.SH SYNOPSIS
+.B sg
+.I command
+.RI [ args ...]
+.br
+.B sg
+.RB ( -h | --help | help )
+.br
+.B sg
+.RB ( -v | --version | version )
+.SH DESCRIPTION
+.B sg
+is a from-scratch, pure C implementation of a version control tool that
+reads and writes the same on-disk object format, packfile format, and index
+format as
+.BR git (1).
+A repository initialized by
+.B sg
+can be operated on by the real
+.B git
+binary and vice versa, in the same
+.B .git
+directory, as long as
+.B sg
+specific opt-in features (content-defined chunking; see
+.B chunk-info
+below and the
+.B FILES
+section) are not in use.
+.PP
+.B sg
+implements a focused subset of git's porcelain and plumbing commands. It
+does not attempt to be a drop-in replacement for every git flag or
+subcommand; only the commands and options listed below are recognized. In
+particular, most long-form git options (e.g.
+.BR "git log --oneline" ,
+.BR "git commit --amend" )
+have no
+.B sg
+equivalent unless explicitly documented here.
+.PP
+Every subcommand that touches the working directory or index requires being
+run inside a repository (a directory containing, or with an ancestor
+containing, a
+.B .git
+directory), the same discovery rule git itself uses.
+.SH COMMANDS
+.SS init
+.B sg init
+.RI [ directory ]
+.PP
+Creates a new repository. If
+.I directory
+is given it is created (if necessary) and initialized there; otherwise the
+current directory is used. Prints
+.RI "\(dqInitialized empty Git repository in " dir "/.git/\(dq" .
+.SS hash-object
+.B sg hash-object
+.RB [ -w ]
+.RB [ -t
+.IR type ]
+.RB [ --stdin ]
+.I file
+.PP
+Computes the object id of a file's content (or, with
+.BR --stdin ", of standard input)."
+.B -t
+.I type
+selects the object type used to compute the hash (default
+.BR blob ).
+.B -w
+additionally writes the object into the repository's object store as a
+loose object.
+.I file
+is required unless
+.B --stdin
+is given. The whole input is read into memory before hashing; there is no
+streaming mode.
+.SS cat-file
+.B sg cat-file
+.RB ( -t | -s | -p )
+.I object
+.PP
+Inspects a single object by its full 40-character hex id (abbreviated ids
+are not accepted).
+.B -t
+prints the object's type,
+.B -s
+prints its size in bytes, and
+.B -p
+pretty-prints its content: for a
+.B tree
+object, each entry is printed as
+.IR "mode type hash\etname" ;
+for
+.B blob
+and
+.B commit
+objects, the object's raw stored bytes are written to stdout unmodified.
+If the object is a blob whose content is an
+.BR sg -internal
+chunked-storage pointer (see
+.BR chunk-info ),
+a note is printed to stderr explaining this; stdout still receives the
+pointer's own raw text, never the reassembled file content \(em
+.B cat-file
+never resolves chunk pointers.
+.SS add
+.B sg add
+.I path
+.RI [ path ...]
+.PP
+Stages one or more files into the index. Each
+.I path
+must resolve inside the repository; paths outside the repository are
+rejected. Differences from
+.BR "git add" :
+.IP \(bu 2
+.B Not recursive.
+If
+.I path
+names a directory, that path is reported as an error and skipped; only
+individual files may be given. There is no equivalent of
+.B "git add <dir>"
+or
+.BR "git add -A" .
+.IP \(bu 2
+.B Symlinks are skipped, not staged.
+A symlink argument prints a warning (\(dqis a symlink, skipping
+(unsupported)\(dq) and is not added to the index; this is not an error for
+the overall command.
+.IP \(bu 2
+If a path currently carries an unresolved merge conflict (stage 1/2/3
+entries in the index), staging it clears the conflict and records the
+working-directory content as the resolution \(em this is how
+.B sg
+expects conflicts to be marked resolved during
+.B merge
+or
+.BR rebase .
+.PP
+If chunked storage is enabled for the repository (see
+.B FILES
+below) and a file's content is at or above the configured threshold, its
+blob is written using content-defined chunking instead of as a single
+ordinary blob.
+.SS commit
+.B sg commit -m
+.I message
+.PP
+Creates a commit from the current index content, updating the current
+branch to point at it.
+.B -m
+.I message
+is required; there is no editor-based message flow, no
+.BR --amend ,
+and no way to sign or author-override a commit via flags (see
+.B ENVIRONMENT
+for author/committer identity).
+.PP
+Fails if the index has unresolved merge conflicts (stage 1/2/3 entries) or
+if a rebase is currently in progress (use
+.B "sg rebase --continue"
+instead). If a merge is in progress (\c
+.B MERGE_HEAD
+present) and all conflicts are resolved, the resulting commit is a merge
+commit with two parents.
+.SS log
+.B sg log
+.PP
+Prints the commit history starting at
+.BR HEAD ,
+one commit per entry (hash, author, date, message), in the familiar
+.B "git log"
+default format. Takes no arguments or flags.
+.B "sg log"
+walks
+.B first-parent only
+\(em when a merge commit is encountered its other parents are not
+themselves visited (though the commit is flagged with a
+.B Merge:
+line listing all of its parents). There is no
+.BR --oneline ,
+.BR --graph ,
+path filtering, or any other
+.B "git log"
+option.
+.SS status
+.B sg status
+.PP
+Prints the current branch, whether a merge or rebase is in progress (with
+next-step hints), and three sections of changes: staged (index vs.
+.BR HEAD ),
+unstaged (working directory vs. index), and untracked files \(em each
+section includes a short hint about the relevant follow-up command, such as
+.B add
+or
+.BR restore .
+Unresolved merge conflicts are listed under \(dqUnmerged paths\(dq. Takes no
+arguments or flags.
+.SS diff
+.B sg diff
+.PP
+Shows the difference between the index and the working directory (i.e. the
+unstaged changes that
+.B "git diff"
+would show with no arguments) for every stage-0 index entry, in unified-diff
+form. Files whose content contains a NUL byte are reported as \(dqBinary
+files ... differ\(dq rather than diffed line-by-line. Entries with an
+unresolved merge conflict (stage 1/2/3) are skipped (see
+.B status
+for those). Takes no arguments or flags; there is no path filtering, no
+.BR --staged / --cached ,
+and no diffing against an arbitrary commit or ref.
+.PP
+The line-level diff algorithm is a plain LCS-based implementation: it is
+correct but does not replicate git's exact hunk-splitting or context-window
+conventions, and always emits a single hunk covering the whole file.
+.SS switch
+.B sg switch
+.RB [ -c ]
+.RB [ --force | -f ]
+.I branch
+.PP
+Switches the current branch to
+.IR branch ,
+updating the working directory and index to match its tip commit.
+.B -c
+creates
+.I branch
+(from the current
+.BR HEAD )
+before switching to it; it is an error if a branch by that name already
+exists, or if the current branch has no commits yet.
+.PP
+If switching would discard uncommitted changes (staged or unstaged), or
+would abandon an in-progress merge or rebase, the affected paths are listed
+and confirmation is required before proceeding (an automatic safety
+snapshot is taken first \(em see
+.B undo
+below); pass
+.B --force
+(or
+.BR -f )
+to skip the interactive confirmation. A non-interactive stdin (e.g. in a
+script) is always treated as \(dqno\(dq unless
+.B --force
+is given.
+.SS restore
+.B sg restore
+.RB [ --staged ]
+.RB [ --force | -f ]
+.I path
+.RI [ path ...]
+.PP
+Restores one or more paths. With
+.BR --staged ,
+unstages
+.I path
+(resets its index entry to match
+.B HEAD
+if tracked there, or removes it from the index otherwise) without touching
+the working directory. Without
+.BR --staged ,
+overwrites
+.IR path 's
+working-directory content with what is currently staged in the index
+(not
+.BR HEAD ).
+.PP
+If restoring without
+.B --staged
+would discard working-directory content that differs from the index, the
+affected paths are listed and confirmation is required (with an automatic
+safety snapshot taken first), same as
+.BR switch .
+.B --force
+(or
+.BR -f )
+skips the interactive confirmation.
+.SS undo
+.B sg undo
+.RI [ N ]
+.RB [ --force | -f ]
+.PP
+Without
+.IR N ,
+lists the repository's automatic safety snapshots (newest first, numbered),
+each with its timestamp and a short label describing what created it (e.g.
+a
+.BR switch ", " restore ", " merge ", or " rebase
+that overwrote something). With
+.IR N ,
+restores the working directory and index to snapshot number
+.IR N .
+Restoring goes through the same dirty-working-tree confirmation and
+automatic snapshot as
+.B switch
+(so an
+.B undo
+can itself be undone);
+.B --force
+(or
+.BR -f )
+skips the confirmation prompt.
+.PP
+Snapshots are created automatically by
+.BR switch ,
+.BR restore ,
+.BR merge ,
+and
+.B rebase
+whenever they are about to overwrite uncommitted work or abandon an
+in-progress merge/rebase; there is no manual \(dqtake a snapshot now\(dq
+command. See
+.B FILES
+for where snapshots are stored.
+.SS repack
+.B sg repack
+.PP
+Packs every loose object currently under
+.B objects/
+into a single new packfile, then removes the now-redundant loose copies.
+If there are no loose objects, prints a message and does nothing. Takes no
+arguments or flags; there is no delta compression tuning, no
+.BR "--window" / "--depth" ,
+and no garbage collection of unreachable objects.
+.SS merge
+.B sg merge
+.RB [ --force | -f ]
+.I branch
+.br
+.B sg merge --abort
+.PP
+Merges
+.I branch
+into the current branch. If the current branch is a strict ancestor of
+.I branch
+(or has no commits yet), this is a fast-forward. Otherwise a three-way
+merge is attempted using the merge base; conflicting files are written to
+the working directory with conflict markers and left staged at stages 1/2/3
+for resolution (resolve with
+.BR "sg add <file>..." ,
+then
+.BR "sg commit" ).
+.PP
+Refuses to start if the working directory is not clean, or if a merge or
+rebase is already in progress. A fast-forward or the start of a three-way
+merge takes an automatic safety snapshot first (see
+.BR undo );
+.B --force
+(or
+.BR -f )
+only affects the interactive confirmation for a dirty-tree fast-forward, not
+whether a snapshot is taken.
+.PP
+.B --abort
+cancels an in-progress merge, restoring the working directory/index to the
+pre-merge
+.B HEAD
+and removing
+.BR MERGE_HEAD ,
+also taking an automatic safety snapshot first.
+.SS merge-base
+.B sg merge-base
+.I commit-a commit-b
+.PP
+Prints the hex id of the best common ancestor of the two given commits
+(each given as a full 40-character hex object id, not a ref name). If
+multiple, mutually unreachable common ancestors exist (a criss-cross merge
+history), this is reported as an error rather than picking one arbitrarily.
+.SS rebase
+.B sg rebase
+.I upstream
+.br
+.B sg rebase --continue
+.br
+.B sg rebase --skip
+.br
+.B sg rebase --abort
+.PP
+Replays the commits unique to the current branch (since its merge base with
+.IR upstream )
+one at a time on top of
+.IR upstream 's
+tip, then moves the current branch to point at the result. Exactly one of
+.IR upstream ,
+.BR --continue ,
+.BR --skip ,
+or
+.B --abort
+must be given.
+.PP
+If
+.I upstream
+is already an ancestor of the current branch, nothing is replayed
+(\(dqup to date\(dq). If the current branch is an ancestor of
+.IR upstream ,
+this is a pure fast-forward. Rebasing a range that includes a merge commit
+is not supported and is reported as an error, with a suggestion to use
+.B merge
+instead. A commit that becomes empty after replay (its change is already
+present upstream) is silently skipped rather than recorded.
+.PP
+When a replayed commit conflicts, the rebase pauses with conflict markers
+and stage 1/2/3 index entries, the same shape as a
+.B merge
+conflict; resolve with
+.BR "sg add <file>..." ,
+then
+.BR "sg rebase --continue" .
+.B --skip
+discards the conflicting commit entirely and continues with the next one.
+.B --abort
+restores the original branch tip and working directory, discarding all
+progress made so far.
+.PP
+Rebase state is stored under
+.B .git/sg-rebase/
+(see
+.BR FILES );
+.B sg status
+reports an in-progress rebase and the commands above are the only supported
+way to leave that state. Requires the current branch (\c
+.BR HEAD )
+to not be detached. Refuses to start on top of an in-progress merge, and
+refuses ordinary
+.B commit
+while a rebase is in progress.
+.SS clone
+.B sg clone
+.I url
+.RI [ directory ]
+.PP
+Clones a repository served over the git smart HTTP protocol (an
+.B http://
+or
+.B https://
+URL) into a new directory. If
+.I directory
+is omitted, it is derived from the last path segment of
+.IR url ,
+with a trailing
+.B .git
+stripped. Refuses to clone into an existing, non-empty directory.
+.PP
+After fetching, checks out the remote's default branch (preferring its
+advertised HEAD symref, then
+.BR main ,
+then
+.BR master ,
+then the first advertised branch) and records
+.BR "[remote \(dqorigin\(dq]"
+and a tracking
+.B [branch]
+stanza in
+.BR .git/config .
+If the remote has no branches (only tags, or is entirely empty), the clone
+completes without a checkout. There is no support for
+.BR git:// ,
+.BR ssh:// ,
+or local filesystem clone sources, and no
+.BR --depth / --branch / --bare
+options.
+.SS fetch
+.B sg fetch
+.RI [ remote ]
+.PP
+Fetches new commits and refs from
+.I remote
+(default
+.BR origin ,
+which must already have a
+.B url
+configured, e.g. by
+.BR clone ).
+Remote branches are written to
+.BR refs/remotes/ \fIremote\fP / ,
+tags are written directly to
+.BR refs/tags/ .
+Neither the current branch nor
+.B HEAD
+is changed. Have-negotiation is a simplified, capped ancestry walk (not a
+full git protocol v2 negotiation) \(em this can only cause some redundant
+data to be transferred, never an incorrect result. Takes no other flags;
+there is no
+.BR --all / --prune / --tags-only .
+.SS push
+.B sg push
+.RI [ remote ]
+.RI [ branch ]
+.RB [ --force | -f ]
+.PP
+Pushes a local branch to
+.I remote
+(default
+.BR origin )
+over the git smart HTTP protocol.
+.I branch
+defaults to the current branch (and is required if
+.B HEAD
+is detached).
+.B --force
+(or
+.BR -f )
+allows a non-fast-forward update of the remote ref; without it, a push that
+is not a fast-forward is rejected.
+.PP
+If this repository has ever used chunked storage locally, the push also
+attempts to update the remote's
+.B refs/sg/chunks
+keep-alive ref alongside the branch (atomically, if the server advertises
+that capability) so chunk blobs stay reachable on the remote too; see
+.B FILES
+below.
+.SS chunk-info
+.B sg chunk-info
+.IR "path\-or\-blob\-hex"
+.PP
+Prints diagnostic information about how a file (given as a working-tree
+path currently in the index, or as a full 40-character blob hex id) is
+stored: whether it is chunked, its original size, its chunk count, and (if
+chunked) how many of its chunks are also referenced by some other chunked
+blob in the repository (\(dqshared chunks\(dq). This is a read-only
+diagnostic command; it does not modify anything.
+.SH FILES
+.TP
+.B .git/config
+Read for
+.B sg
+specific settings under an
+.B [sg]
+section, and for
+.B [remote \(dqNAME\(dq]
+.B url
+(used by
+.BR fetch / push ).
+Only the repository's own
+.B .git/config
+is consulted \(em
+.B sg
+does not read a user-global
+.B ~/.gitconfig
+or any system-wide git config file.
+.RS
+.TP
+.B chunking
+Boolean (\c
+.B true
+or any other value/absent, treated as false). When true, files added via
+.B sg add
+whose content is at or above the
+.B chunkthreshold
+are stored using content-defined chunking instead of as an ordinary blob.
+.B Default: false (chunking is off).
+.TP
+.B chunkthreshold
+A positive integer, in bytes. The minimum content size at or above which
+.B sg add
+chunks a file's blob when
+.B chunking
+is true. Ignored (and left at its default) if absent, zero, or
+unparseable. Default: 4194304 (4 MiB).
+.TP
+.B everchunked
+Boolean, set to
+.B true
+automatically the first time this repository (locally, or via a
+.BR clone / fetch
+that pulled in a remote's chunk data) actually produces or receives a
+chunked blob. This is a durability marker, not a user-facing setting: once
+set, its absence later (e.g. from an edited or reconstructed config) is
+treated as evidence that
+.B refs/sg/chunks
+has been lost, and every chunk pointer in the repository is then treated as
+broken rather than silently re-interpreted as ordinary content. It should
+not be hand-edited.
+.RE
+.TP
+.B refs/sg/chunks
+An
+.B sg
+specific keep-alive ref (a commit, not a branch or tag) that references
+every chunk blob any file in this repository has ever been split into.
+Its sole purpose is to keep chunk blobs reachable from git's object graph
+so that
+.B git gc
+(run by real
+.B git
+or by any other tool) does not collect them as garbage \(em without it, a
+chunk pointer blob's referenced chunks could be silently deleted out from
+under it.
+.B Must not be deleted once chunking has been used
+in a repository: if
+.B refs/sg/chunks
+is deleted or otherwise lost while
+.B everchunked
+is still recorded as true, every chunked file becomes unrecoverable and
+.B sg
+fails hard (rather than silently returning pointer text as file content)
+for each one. It is merged, not overwritten, by
+.BR clone / fetch ,
+and its update is bundled together with the branch ref update by
+.B push
+when the server supports atomic ref updates.
+.TP
+.B .git/sg-chunks.lock
+A lock file (created with
+.B O_CREAT|O_EXCL
+and never read) used to serialize concurrent updates to
+.B refs/sg/chunks
+across concurrent
+.B sg
+invocations in the same repository (e.g. two
+.B "sg add"
+calls on different large files, or an
+.B add
+racing a
+.BR fetch ).
+Only its existence is meaningful, not its content. A lock held
+by a process that was killed or crashed can be left behind; if
+.B sg
+repeatedly fails to acquire it (after roughly 4 seconds of retries), remove
+it by hand once you have confirmed no other
+.B sg
+process is actually running against the repository.
+Concurrency protection is local-machine only \(em it is not safe against
+concurrent
+.B sg
+processes on different machines sharing the repository over a network
+filesystem.
+.TP
+.B refs/small-git/undo/*
+Where
+.B sg
+stores its automatic safety snapshots (see the
+.B undo
+command above), one ref per snapshot. Not intended to be read or edited
+directly; use
+.B "sg undo"
+to list and restore them.
+.TP
+.B .git/sg-rebase/
+Holds the on-disk state of an in-progress
+.B sg rebase
+(the original branch/commit, the upstream target, and the remaining
+todo list). Present only while a rebase is paused or running; removed
+automatically when the rebase finishes, is skipped to completion, or is
+aborted. Not intended to be edited by hand \(em use
+.BR "sg rebase --continue|--skip|--abort" .
+.SH ENVIRONMENT
+.TP
+.B GIT_AUTHOR_NAME
+.TQ
+.B GIT_AUTHOR_EMAIL
+Identity recorded as both the author and (unless overridden below) the
+committer of commits created by
+.BR commit ,
+.BR merge ,
+and
+.BR rebase ,
+and of the internal keep-alive commits chunked storage writes to
+.BR refs/sg/chunks .
+Default when unset or empty:
+.B small_git
+and
+.BR sg@localhost ,
+respectively. There is no config-file equivalent (no
+.BR user.name / user.email
+support) \(em these environment variables are the only way to set commit
+identity.
+.TP
+.B GIT_COMMITTER_NAME
+.TQ
+.B GIT_COMMITTER_EMAIL
+Committer identity used specifically for the internal keep-alive commits
+that chunked storage writes to
+.BR refs/sg/chunks ;
+defaults to the same value as
+.B GIT_AUTHOR_NAME
+/
+.B GIT_AUTHOR_EMAIL
+if unset. Ordinary commits made by
+.BR commit / merge / rebase
+always use
+.B GIT_AUTHOR_NAME
+/
+.B GIT_AUTHOR_EMAIL
+for the committer field too (there is no separate committer override for
+those).
+.TP
+.B SG_USERNAME
+.TQ
+.B SG_PASSWORD
+HTTP basic-auth credentials used by
+.BR clone ,
+.BR fetch ,
+and
+.B push
+when talking to a remote over
+.BR http(s) .
+If unset, credentials are still looked up from
+.B ~/.netrc
+(via libcurl's optional netrc support) for a matching host; a 401/403
+response suggests both of these. There is no
+.B sg
+specific mechanism for token/OAuth authentication beyond what a URL's own
+userinfo or these two variables provide.
+.PP
+.B sg
+does not read or honor any proxy- or TLS-verification-specific environment
+variable itself (no
+.B SG_PROXY,
+no
+.B SG_NO_VERIFY_SSL,
+etc.); TLS certificate verification is always left at libcurl's secure
+defaults and is not configurable via
+.B sg .
+The underlying HTTP transport (libcurl) does, independently of
+.BR sg 's
+own code, honor the standard
+.B http_proxy
+/
+.B https_proxy
+/
+.B no_proxy
+environment variables if libcurl was built with that support, exactly as
+.B curl(1)
+itself would.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure: an invalid invocation (bad flags/argument count), a repository
+state that prevents the operation (dirty working directory, unresolved
+conflicts, not a repository, etc.), an aborted confirmation prompt, an I/O
+error, or a merge/rebase left paused on a conflict.
+.SH SEE ALSO
+.BR git (1)
+.PP
+.BR docs/DESIGN.md
+in the small_git source tree documents the project's design goals,
+phased roadmap, and per-phase known limitations in more detail than this
+manual page.
+.SH BUGS
+.B sg
+implements a deliberately narrow subset of git's functionality (see
+.B DESCRIPTION
+above and small_git's
+.B README.md
+\(dq已知限制\(dq / Known Limitations section); missing flags and
+subcommands found in real git are not oversights to be reported unless
+they contradict what is documented here.
