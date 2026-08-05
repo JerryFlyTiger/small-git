@@ -1,0 +1,109 @@
+name: CI
+
+# Every branch, not just master: the point of this workflow is to catch
+# platform breakage before it reaches master, and this project is developed
+# on short-lived phase branches that are merged after they go green.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.cc }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+          - os: ubuntu-latest
+            cc: clang
+          - os: macos-latest
+            cc: clang
+    steps:
+      - uses: actions/checkout@v4
+
+      # The interop suite drives the real `git` binary alongside sg, and some
+      # of those steps commit. A bare CI runner has no identity configured,
+      # and `sg init` hardcodes refs/heads/master, so a runner whose git
+      # defaults to a different initial branch would fail tests that are
+      # actually fine. Both are environment facts, not behaviour under test.
+      - name: Configure git for the interop suite
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "small_git CI"
+          git config --global init.defaultBranch master
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang zlib1g-dev libssl-dev libcurl4-openssl-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config openssl@3
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: make CC=${{ matrix.cc }}
+
+      - name: Unit tests
+        run: make CC=${{ matrix.cc }} test
+
+      # Exercises sg against the real `git` binary, including a local
+      # smart-HTTP server, so it is the check that actually proves
+      # object-format compatibility rather than just self-consistency.
+      - name: Interop tests
+        run: bash tests/interop.sh
+
+      - name: Release build
+        run: make CC=${{ matrix.cc }} release
+
+      - name: Install / uninstall into a staging dir
+        run: |
+          make CC=${{ matrix.cc }} install DESTDIR="$PWD/stage" PREFIX=/usr
+          test -x "$PWD/stage/usr/bin/sg"
+          test -f "$PWD/stage/usr/share/man/man1/sg.1"
+          make uninstall DESTDIR="$PWD/stage" PREFIX=/usr
+          test ! -e "$PWD/stage/usr/bin/sg"
+
+  sanitizers:
+    name: ASan + UBSan (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The interop suite drives the real `git` binary alongside sg, and some
+      # of those steps commit. A bare CI runner has no identity configured,
+      # and `sg init` hardcodes refs/heads/master, so a runner whose git
+      # defaults to a different initial branch would fail tests that are
+      # actually fine. Both are environment facts, not behaviour under test.
+      - name: Configure git for the interop suite
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "small_git CI"
+          git config --global init.defaultBranch master
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang zlib1g-dev libssl-dev libcurl4-openssl-dev
+      # LeakSanitizer is enabled by default under ASan on Linux but not on
+      # macOS, so this job would fail where local macOS runs pass -- and it
+      # would fail on things that are not bugs: sg is a short-lived CLI whose
+      # pack registry is an intentional process-lifetime cache that is never
+      # freed (see the comment on pack_file_list_release in
+      # src/storage/pack.c). ASan is here for memory-safety errors --
+      # use-after-free, overflow, UB -- which stay fully enabled.
+      - name: Build with sanitizers and run unit tests
+        run: make CC=clang sanitize
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+      - name: Interop tests under sanitizers
+        run: bash tests/interop.sh
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
