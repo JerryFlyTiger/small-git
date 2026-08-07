@@ -2991,6 +2991,68 @@ check "phase9 deep tree: sg status still succeeds" test "$P9DEEP_ST_RC" = 0
 check "phase9 deep tree: sg status warns that the untracked list may be incomplete" \
     sh -c "grep -q 'leaf\.txt' '$WORKDIR/p9deep_st.txt' || [ -s '$WORKDIR/p9deep_st_err.txt' ]"
 
+# --- Tracked files are never subject to ignore rules -- including when it is
+# --- their whole PARENT DIRECTORY that became ignored after they were
+# --- committed. Pruning the directory is right for untracked content, but
+# --- the walk is also the only thing that re-hashes tracked files, so
+# --- pruning one holding tracked files left their modifications silently
+# --- unstaged while `git add .` staged them. Compared against real git
+# --- rather than against an expectation.
+P9TD_SG="$WORKDIR/phase9_trackdir_sg"
+P9TD_GIT="$WORKDIR/phase9_trackdir_git"
+for d in "$P9TD_SG" "$P9TD_GIT"; do
+    git init -q "$d"
+    (cd "$d" && git config user.email "a@b.c" && git config user.name "a" \
+        && git config core.ignorecase false)
+    mkdir -p "$d/logs/sub"
+    printf 'v1\n' > "$d/logs/app.txt"
+    printf 'x\n' > "$d/other.txt"
+done
+(cd "$P9TD_SG" && "$SG" add logs/app.txt other.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P9TD_GIT" && git add logs/app.txt other.txt && git commit -qm base) > /dev/null 2>&1
+for d in "$P9TD_SG" "$P9TD_GIT"; do
+    printf 'logs/\n' > "$d/.gitignore"
+    printf 'v2\n' > "$d/logs/app.txt"          # tracked, parent now ignored
+    printf 'untracked\n' > "$d/logs/sub/new.txt"  # ignored AND untracked: must stay out
+done
+(cd "$P9TD_SG" && "$SG" add .) > /dev/null 2>&1
+(cd "$P9TD_GIT" && git add .) > /dev/null 2>&1
+(cd "$P9TD_SG" && git ls-files -s) > "$WORKDIR/p9td_sg.txt" 2>&1
+(cd "$P9TD_GIT" && git ls-files -s) > "$WORKDIR/p9td_git.txt" 2>&1
+check "phase9 tracked-under-ignored-dir: sg add . produces the same index as git add ." \
+    cmp -s "$WORKDIR/p9td_sg.txt" "$WORKDIR/p9td_git.txt"
+check "phase9 tracked-under-ignored-dir: the modification is actually staged, not the old blob" \
+    sh -c "(cd '$P9TD_SG' && git cat-file -p :logs/app.txt) | grep -q v2"
+check "phase9 tracked-under-ignored-dir: an ignored untracked file under it is still excluded" \
+    sh -c "! (cd '$P9TD_SG' && git ls-files) | grep -q 'logs/sub/new.txt'"
+
+# --- A failed branch deletion must not leave the repository half-deleted.
+# --- packed-refs is rewritten BEFORE the loose ref is unlinked, so if the
+# --- rewrite fails the loose ref -- which shadows packed -- is still there
+# --- and the branch reads exactly as before. The reverse order would expose
+# --- a stale packed entry, silently resurrecting the branch at an older
+# --- commit while reporting failure.
+if [ "$(id -u)" = "0" ]; then
+    skip "phase9 branch delete failure atomicity (running as root: permissions do not apply)"
+else
+    P9BD="$WORKDIR/phase9_branchdel"
+    git init -q "$P9BD"
+    (cd "$P9BD" && git config user.email "a@b.c" && git config user.name "a")
+    printf 'a\n' > "$P9BD/f.txt"
+    (cd "$P9BD" && git add f.txt && git commit -qm c1) > /dev/null 2>&1
+    (cd "$P9BD" && git branch victim && git pack-refs --all) > /dev/null 2>&1
+    (cd "$P9BD" && git switch -q victim && printf 'b\n' >> f.txt \
+        && git commit -qam c2 && git switch -q master) > /dev/null 2>&1
+    P9BD_TIP=$(cd "$P9BD" && git rev-parse victim)
+    chmod 555 "$P9BD/.git"
+    (cd "$P9BD" && "$SG" branch -d victim --force) > "$WORKDIR/p9bd.txt" 2>&1
+    P9BD_RC=$?
+    chmod 755 "$P9BD/.git"
+    check "phase9 branch delete: a failed deletion reports failure" test "$P9BD_RC" != 0
+    check "phase9 branch delete: a failed deletion leaves the branch at its real tip, not a stale packed one" \
+        sh -c "[ \"\$(cd '$P9BD' && git rev-parse victim 2>/dev/null)\" = '$P9BD_TIP' ]"
+fi
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

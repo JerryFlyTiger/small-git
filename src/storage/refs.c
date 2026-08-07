@@ -562,11 +562,24 @@ int sg_ref_delete_branch(const char *git_dir, const char *branch)
        packed-only branch (post `git pack-refs`) has no loose file at all
        and the rewrite below is the entire deletion. A branch name long
        enough to truncate the path would aim unlink() at some OTHER file,
-       so refuse instead of truncating (the name comes from argv). */
+       so refuse instead of truncating (the name comes from argv).
+
+       Order matters: packed-refs FIRST, loose file second. Deleting the
+       loose ref first and then failing the rewrite (ENOSPC, EROFS, a
+       failed rename) would leave the stale packed entry exposed -- the
+       branch silently resurrects at an older commit on a path that reports
+       failure to the caller, which is the very bug this function exists to
+       prevent. In this order a failed rewrite leaves the loose ref in
+       place, and since loose shadows packed, the repository still reads
+       exactly as it did before: the failure is inert. */
     if (snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch) >= (int)sizeof(path))
         return -1;
+
+    if (packed_refs_remove(git_dir, branch) != 0)
+        return -1;
+
     if (unlink(path) != 0 && errno != ENOENT)
         return -1;
 
-    return packed_refs_remove(git_dir, branch);
+    return 0;
 }

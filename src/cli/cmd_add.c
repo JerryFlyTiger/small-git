@@ -30,6 +30,37 @@ static int tracked_any_stage(const sg_index *idx, const char *path)
     return 0;
 }
 
+/* Non-zero if any index entry lives under dir/ (at any depth).
+   An ignored directory is normally pruned outright, which is correct for
+   untracked content: nothing under an excluded directory can be re-included.
+   But tracked content is never subject to ignore rules, and pruning is the
+   only thing that decides whether a tracked file is ever visited and
+   re-hashed -- so pruning a directory that still holds tracked files made
+   `sg add .` silently leave their modifications unstaged, exiting 0 while
+   `git add .` staged them (git avoids this because its tracked-file updates
+   are driven from the index rather than from the ignore-filtered walk).
+   Entries are sorted byte-wise by path, so everything sharing the "dir/"
+   prefix is contiguous and a scan can stop as soon as it passes it. */
+static int tracked_under_dir(const sg_index *idx, const char *dir)
+{
+    size_t dir_len = strlen(dir);
+    size_t i;
+
+    if (dir_len == 0)
+        return idx->count > 0;
+
+    for (i = 0; i < idx->count; i++) {
+        const char *p = idx->entries[i].path;
+        int cmp = strncmp(p, dir, dir_len);
+
+        if (cmp > 0)
+            break; /* sorted: past every possible "dir/..." entry */
+        if (cmp == 0 && p[dir_len] == '/')
+            return 1;
+    }
+    return 0;
+}
+
 /* Stages the regular file at rel_path (repo-root-relative). display is the
    name used in messages: the user's own spelling for explicit arguments, the
    repo-relative path during recursion. Symlinks warn and are skipped;
@@ -258,8 +289,12 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
 
         if (S_ISDIR(st.st_mode)) {
             /* An ignored directory is pruned outright: nothing under it can
-               be re-included by any pattern (verified git behavior). */
-            if (!force && sg_ignore_is_ignored(ig, relpath, 1))
+               be re-included by any pattern (verified git behavior) -- unless
+               it still holds tracked files, which ignore rules never apply to
+               and which are only re-staged by being walked (see
+               tracked_under_dir). */
+            if (!force && sg_ignore_is_ignored(ig, relpath, 1) &&
+               !tracked_under_dir(idx, relpath))
                 continue;
             if (sg_ignore_push_dir(ig, relpath) != 0) {
                 fprintf(stderr, "sg: 記憶體不足，無法載入 .gitignore 規則\n");
