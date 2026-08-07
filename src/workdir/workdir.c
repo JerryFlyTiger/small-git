@@ -89,7 +89,10 @@ static int normalize_abs_path(const char *abs, char *out, size_t out_size)
     return 0;
 }
 
-char *sg_resolve_repo_path(const char *repo_root, const char *arg)
+/* Shared body of sg_resolve_repo_path and its allow-root sibling. When
+   allow_root is set, an argument that names the repository root itself
+   resolves to "" instead of being rejected. */
+static char *resolve_repo_path_internal(const char *repo_root, const char *arg, int allow_root)
 {
     char abs[SG_PATH_MAX];
     char normalized[SG_PATH_MAX];
@@ -114,17 +117,31 @@ char *sg_resolve_repo_path(const char *repo_root, const char *arg)
 
     if (strcmp(root_norm, "/") == 0) {
         if (strcmp(normalized, "/") == 0)
-            return NULL;
+            return allow_root ? strdup("") : NULL;
         return strdup(normalized + 1);
     }
 
     {
         size_t root_len = strlen(root_norm);
 
-        if (strncmp(normalized, root_norm, root_len) != 0 || normalized[root_len] != '/')
+        if (strncmp(normalized, root_norm, root_len) != 0)
+            return NULL;
+        if (normalized[root_len] == '\0')
+            return allow_root ? strdup("") : NULL;
+        if (normalized[root_len] != '/')
             return NULL;
         return strdup(normalized + root_len + 1);
     }
+}
+
+char *sg_resolve_repo_path(const char *repo_root, const char *arg)
+{
+    return resolve_repo_path_internal(repo_root, arg, 0);
+}
+
+char *sg_resolve_repo_path_allow_root(const char *repo_root, const char *arg)
+{
+    return resolve_repo_path_internal(repo_root, arg, 1);
 }
 
 int sg_mkdir_parents(const char *path)

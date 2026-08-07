@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/hash.h"
+#include "sg/ignore.h"
 #include "sg/index.h"
 #include "sg/merge.h"
 #include "sg/objstore.h"
@@ -13,6 +14,7 @@
 #include "sg/workdir.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -102,8 +104,16 @@ static size_t print_unmerged(const sg_index *idx, int rebase_in_progress)
     return count;
 }
 
-static void collect_untracked(const char *repo_root, const char *reldir, const sg_index *idx,
-                              char ***out, size_t *count, size_t *cap)
+/* Walks the worktree collecting untracked files, filtered through the
+   .gitignore engine (ig): ignored directories are pruned outright -- nothing
+   under an ignored directory can be re-included -- and ignored files are
+   skipped. Tracked paths are checked first, since tracked files are never
+   ignore-filtered. Returns 0 on success, -1 on allocation failure; callers
+   must treat that as an error, never as "no untracked files" (silently
+   swallowing an alloc failure here would let sg status claim a clean tree it
+   never actually examined). */
+static int collect_untracked(const char *repo_root, const char *reldir, const sg_index *idx,
+                             sg_ignore *ig, char ***out, size_t *count, size_t *cap)
 {
     char absdir[4096];
     DIR *d;
@@ -115,8 +125,15 @@ static void collect_untracked(const char *repo_root, const char *reldir, const s
         snprintf(absdir, sizeof(absdir), "%s", repo_root);
 
     d = opendir(absdir);
-    if (d == NULL)
-        return;
+    if (d == NULL) {
+        /* Not fatal -- status still reports everything it did manage to see
+           -- but never silent: an unreadable directory means the untracked
+           list below is incomplete, and a status that under-reports without
+           saying so is how uncommitted work gets lost. */
+        fprintf(stderr, "sg: warning: 無法讀取目錄 '%s': %s（未追蹤清單可能不完整）\n",
+                reldir[0] != '\0' ? reldir : ".", strerror(errno));
+        return 0;
+    }
 
     while ((ent = readdir(d)) != NULL) {
         char relpath[4096];
@@ -125,7 +142,10 @@ static void collect_untracked(const char *repo_root, const char *reldir, const s
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
-        if (reldir[0] == '\0' && strcmp(ent->d_name, ".git") == 0)
+        /* skip any git dir at ANY depth, not just the top level: there is no
+           submodule support, and an embedded repo's metadata must never be
+           walked or reported */
+        if (strcmp(ent->d_name, ".git") == 0)
             continue;
 
         if (reldir[0] != '\0')
@@ -134,27 +154,56 @@ static void collect_untracked(const char *repo_root, const char *reldir, const s
             snprintf(relpath, sizeof(relpath), "%s", ent->d_name);
         snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, relpath);
 
-        if (lstat(abspath, &st) != 0)
+        if (lstat(abspath, &st) != 0) {
+            /* ENOENT = the entry vanished between readdir and now, benign.
+               Anything else (ENAMETOOLONG on a tree deeper than the
+               platform's PATH_MAX, EACCES, ELOOP) means we are dropping a
+               real entry, so say so rather than under-report in silence. */
+            if (errno != ENOENT)
+                fprintf(stderr, "sg: warning: 無法讀取 '%s': %s（未追蹤清單可能不完整）\n",
+                        relpath, strerror(errno));
             continue;
+        }
 
         if (S_ISDIR(st.st_mode)) {
-            collect_untracked(repo_root, relpath, idx, out, count, cap);
-        } else if (S_ISREG(st.st_mode)) {
-            if (!path_tracked_any_stage(idx, relpath)) {
-                if (*count == *cap) {
-                    size_t new_cap = *cap == 0 ? 16 : *cap * 2;
-                    char **grown = realloc(*out, new_cap * sizeof(*grown));
-
-                    if (grown == NULL)
-                        continue;
-                    *out = grown;
-                    *cap = new_cap;
-                }
-                (*out)[(*count)++] = strdup(relpath);
+            if (sg_ignore_is_ignored(ig, relpath, 1))
+                continue; /* prune: nothing below can be re-included */
+            if (sg_ignore_push_dir(ig, relpath) != 0) {
+                closedir(d);
+                return -1;
             }
+            if (collect_untracked(repo_root, relpath, idx, ig, out, count, cap) != 0) {
+                sg_ignore_pop_dir(ig);
+                closedir(d);
+                return -1;
+            }
+            sg_ignore_pop_dir(ig);
+        } else if (S_ISREG(st.st_mode)) {
+            if (path_tracked_any_stage(idx, relpath))
+                continue;
+            if (sg_ignore_is_ignored(ig, relpath, 0))
+                continue;
+            if (*count == *cap) {
+                size_t new_cap = *cap == 0 ? 16 : *cap * 2;
+                char **grown = realloc(*out, new_cap * sizeof(*grown));
+
+                if (grown == NULL) {
+                    closedir(d);
+                    return -1;
+                }
+                *out = grown;
+                *cap = new_cap;
+            }
+            (*out)[*count] = strdup(relpath);
+            if ((*out)[*count] == NULL) {
+                closedir(d);
+                return -1;
+            }
+            (*count)++;
         }
     }
     closedir(d);
+    return 0;
 }
 
 int sg_cmd_status(int argc, char **argv)
@@ -163,6 +212,7 @@ int sg_cmd_status(int argc, char **argv)
     char *repo_root;
     char *branch;
     sg_index idx;
+    sg_ignore *ig = NULL;
     unsigned char head_commit_id[SG_SHA1_RAW_LEN];
     int has_head;
     sg_flat_list head_flat;
@@ -199,6 +249,16 @@ int sg_cmd_status(int argc, char **argv)
     }
     if (sg_index_read(git_dir, &idx) != 0) {
         fprintf(stderr, "sg: failed to read index (corrupt?)\n");
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    /* Load the ignore rules up front: a failure here must fail the whole
+       command -- silently showing everything (or nothing) on an alloc
+       failure is a bug class this codebase has already been bitten by. */
+    if (sg_ignore_open(&ig, git_dir, repo_root) != 0) {
+        fprintf(stderr, "sg: 記憶體不足，無法載入 .gitignore 規則\n");
+        sg_index_free(&idx);
         free(git_dir);
         free(repo_root);
         return 1;
@@ -268,7 +328,20 @@ int sg_cmd_status(int argc, char **argv)
                "sg: warning: failed to compute unstaged changes (out of memory, or a chunked "
                "file's data is missing/corrupt -- see sg restore for details)\n");
 
-    collect_untracked(repo_root, "", &idx, &untracked, &untracked_count, &untracked_cap);
+    if (collect_untracked(repo_root, "", &idx, ig, &untracked, &untracked_count,
+                          &untracked_cap) != 0) {
+        fprintf(stderr, "sg: 記憶體不足，無法掃描未追蹤的檔案\n");
+        for (i = 0; i < untracked_count; i++)
+            free(untracked[i]);
+        free(untracked);
+        sg_status_list_free(&staged);
+        sg_status_list_free(&unstaged);
+        sg_ignore_free(ig);
+        sg_index_free(&idx);
+        free(repo_root);
+        free(git_dir);
+        return 1;
+    }
     if (untracked_count > 0)
         qsort(untracked, untracked_count, sizeof(*untracked), str_cmp);
 
@@ -293,6 +366,7 @@ int sg_cmd_status(int argc, char **argv)
     free(untracked);
     sg_status_list_free(&staged);
     sg_status_list_free(&unstaged);
+    sg_ignore_free(ig);
     sg_index_free(&idx);
     free(repo_root);
     free(git_dir);

@@ -15,6 +15,13 @@ char *sg_repo_root(const char *git_dir);
    allocation failure. */
 char *sg_resolve_repo_path(const char *repo_root, const char *arg);
 
+/* Like sg_resolve_repo_path, but an argument naming the repository root
+   itself (e.g. "." run from the root) resolves to "" instead of being
+   rejected, so commands that accept a directory argument can take the whole
+   worktree. Result is malloc'd. Returns NULL if the path falls outside
+   repo_root or on allocation failure. */
+char *sg_resolve_repo_path_allow_root(const char *repo_root, const char *arg);
+
 /* mkdir -p for every directory component leading up to (but not including)
    the file named by path. */
 int sg_mkdir_parents(const char *path);

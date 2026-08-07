@@ -19,6 +19,7 @@ static const sg_command_info COMMANDS[] = {
     {"log", "顯示 commit 歷史"},
     {"status", "顯示工作目錄狀態"},
     {"diff", "顯示尚未暫存的變更"},
+    {"branch", "列出、建立或刪除分支"},
     {"switch", "切換分支"},
     {"restore", "還原檔案或取消暫存"},
     {"undo", "列出或還原自動快照"},
@@ -75,6 +76,8 @@ int sg_cli_run(int argc, char **argv)
         return sg_cmd_status(argc - 1, argv + 1);
     if (strcmp(argv[1], "diff") == 0)
         return sg_cmd_diff(argc - 1, argv + 1);
+    if (strcmp(argv[1], "branch") == 0)
+        return sg_cmd_branch(argc - 1, argv + 1);
     if (strcmp(argv[1], "switch") == 0)
         return sg_cmd_switch(argc - 1, argv + 1);
     if (strcmp(argv[1], "restore") == 0)
