@@ -112,6 +112,25 @@ static size_t print_unmerged(const sg_index *idx, int rebase_in_progress)
    must treat that as an error, never as "no untracked files" (silently
    swallowing an alloc failure here would let sg status claim a clean tree it
    never actually examined). */
+/* Joins base and rel as "base/rel", returning -1 rather than a truncated
+   result if it does not fit -- see the identically-named helper in
+   cmd_add.c for why truncation must never be acted on. */
+static int path_join(char *out, size_t out_size, const char *base, const char *rel)
+{
+    int n;
+
+    if (rel == NULL || rel[0] == '\0')
+        n = snprintf(out, out_size, "%s", base);
+    else if (base == NULL || base[0] == '\0')
+        n = snprintf(out, out_size, "%s", rel);
+    else
+        n = snprintf(out, out_size, "%s/%s", base, rel);
+
+    if (n < 0 || (size_t)n >= out_size)
+        return -1;
+    return 0;
+}
+
 static int collect_untracked(const char *repo_root, const char *reldir, const sg_index *idx,
                              sg_ignore *ig, char ***out, size_t *count, size_t *cap)
 {
@@ -119,10 +138,10 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
     DIR *d;
     struct dirent *ent;
 
-    if (reldir[0] != '\0')
-        snprintf(absdir, sizeof(absdir), "%s/%s", repo_root, reldir);
-    else
-        snprintf(absdir, sizeof(absdir), "%s", repo_root);
+    if (path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
+        fprintf(stderr, "sg: warning: 路徑過長,略過目錄 '%s'(未追蹤清單可能不完整)\n", reldir);
+        return 0;
+    }
 
     d = opendir(absdir);
     if (d == NULL) {
@@ -148,11 +167,15 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
         if (strcmp(ent->d_name, ".git") == 0)
             continue;
 
-        if (reldir[0] != '\0')
-            snprintf(relpath, sizeof(relpath), "%s/%s", reldir, ent->d_name);
-        else
-            snprintf(relpath, sizeof(relpath), "%s", ent->d_name);
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, relpath);
+        /* Never act on a truncated path: it usually still names a real
+           directory further up, so lstat would succeed against the wrong
+           entry and this would report a path that is not the one on disk. */
+        if (path_join(relpath, sizeof(relpath), reldir, ent->d_name) != 0 ||
+           path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
+            fprintf(stderr, "sg: warning: 路徑過長,略過 '%s/%s'(未追蹤清單可能不完整)\n",
+                    reldir[0] != '\0' ? reldir : ".", ent->d_name);
+            continue;
+        }
 
         if (lstat(abspath, &st) != 0) {
             /* ENOENT = the entry vanished between readdir and now, benign.

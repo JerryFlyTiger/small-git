@@ -131,6 +131,31 @@ static int str_ptr_cmp(const void *a, const void *b)
     return strcmp(sa, sb);
 }
 
+/* Joins base and rel into out as "base/rel" (or just base when rel is empty),
+   returning -1 rather than a truncated result if it does not fit.
+   Callers MUST treat that as fatal: a truncated path frequently still names
+   a real directory higher up the tree, so a following lstat/opendir would
+   succeed against the WRONG entry instead of failing. On Linux PATH_MAX
+   (4096) equals these buffers, so truncation is reached before the kernel
+   would reject the path -- which is exactly how a silently-incomplete
+   `sg add .` passed on macOS (PATH_MAX 1024, kernel rejects first) and
+   failed on Linux. */
+static int path_join(char *out, size_t out_size, const char *base, const char *rel)
+{
+    int n;
+
+    if (rel == NULL || rel[0] == '\0')
+        n = snprintf(out, out_size, "%s", base);
+    else if (base == NULL || base[0] == '\0')
+        n = snprintf(out, out_size, "%s", rel);
+    else
+        n = snprintf(out, out_size, "%s/%s", base, rel);
+
+    if (n < 0 || (size_t)n >= out_size)
+        return -1;
+    return 0;
+}
+
 /* Recursive directory walk for `sg add <dir>`. reldir is repo-root-relative
    ("" = the repo root itself); the caller has already pushed ignore frames
    for reldir and every ancestor. Entries are sorted before processing so
@@ -150,10 +175,10 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
     size_t i;
     int rc = 0;
 
-    if (reldir[0] != '\0')
-        snprintf(absdir, sizeof(absdir), "%s/%s", repo_root, reldir);
-    else
-        snprintf(absdir, sizeof(absdir), "%s", repo_root);
+    if (path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
+        fprintf(stderr, "sg: 路徑過長,無法處理目錄 '%s'\n", reldir);
+        return -1;
+    }
 
     d = opendir(absdir);
     if (d == NULL) {
@@ -199,21 +224,31 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
         char abspath[4096];
         struct stat st;
 
-        if (reldir[0] != '\0')
-            snprintf(relpath, sizeof(relpath), "%s/%s", reldir, names[i]);
-        else
-            snprintf(relpath, sizeof(relpath), "%s", names[i]);
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, relpath);
+        /* Truncation here is NOT a cosmetic problem: a path cut off at the
+           buffer boundary is usually still a real directory further up the
+           tree, so the lstat below would SUCCEED against the wrong entry and
+           the walk would silently operate on it. That is how this failed on
+           Linux while passing on macOS -- Linux's PATH_MAX (4096) equals
+           these buffers, so truncation happens before the kernel ever gets a
+           chance to reject the path, whereas macOS's 1024 limit means the
+           kernel rejects it first. Refuse instead of guessing. */
+        if (path_join(relpath, sizeof(relpath), reldir, names[i]) != 0 ||
+           path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
+            fprintf(stderr, "sg: 路徑過長,無法處理 '%s/%s'\n",
+                    reldir[0] != '\0' ? reldir : ".", names[i]);
+            rc = -1;
+            break;
+        }
 
         if (lstat(abspath, &st) != 0) {
             /* ENOENT genuinely means the entry disappeared between readdir
                and here, which is benign. Every other errno does NOT mean
                "gone" -- ENAMETOOLONG (this walk builds absolute paths, so a
-               deep enough tree exceeds the platform's PATH_MAX long before
-               our own buffers fill), EACCES, ELOOP. Skipping those silently
-               made `sg add .` stage nothing and still exit 0 while `git add
-               .` staged the file: a commit quietly missing content, which is
-               strictly worse than refusing to run. */
+               deep enough tree exceeds the platform's PATH_MAX), EACCES,
+               ELOOP. Skipping those silently made `sg add .` stage nothing
+               and still exit 0 while `git add .` staged the file: a commit
+               quietly missing content, which is strictly worse than refusing
+               to run. */
             if (errno == ENOENT)
                 continue;
             fprintf(stderr, "sg: 無法讀取 '%s': %s\n", relpath, strerror(errno));
@@ -280,7 +315,14 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
             continue;
         if (plen > 0 && (strncmp(e->path, prefix, plen) != 0 || e->path[plen] != '/'))
             continue;
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, e->path);
+        /* A truncated path could lstat successfully against some shorter
+           real path and make this conclude the file still exists -- which
+           here would mean silently NOT staging a deletion. Refuse instead. */
+        if (path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
+            fprintf(stderr, "sg: 路徑過長,無法檢查 '%s' 是否已刪除\n", e->path);
+            rc = -1;
+            break;
+        }
         if (lstat(abspath, &st) == 0 || errno != ENOENT)
             continue;
         if (count == cap) {
