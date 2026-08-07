@@ -139,7 +139,14 @@ make                # 一般建置(含 -g)
 make test           # 單元測試
 bash tests/interop.sh   # 與真正的 git 互通測試(需先 make)
 make sanitize       # ASan/UBSan 建置並跑測試
+
+python3 tests/fuzz_ignore.py        # .gitignore 一致性模糊測試(以真 git 為 oracle)
+python3 tests/fuzz_ignore.py 1000   # 跑久一點
 ```
+
+`tests/fuzz_ignore.py` 隨機產生 pattern 集合與目錄樹,要求 `sg status` 的未追蹤集合與
+`git status --porcelain -uall` **完全相等**。它不在 `make test` 裡(需要 python3 與真 git、
+耗時較長),但動到 `src/workdir/ignore.c` 或兩個走訪之後應該手動跑一次。
 
 切換建置模式(一般 / `release` / `sanitize`)之間要先 `make clean`——object 檔帶著當初編譯的
 旗標,而 make 只在來源較新時重新連結,不清乾淨會沿用上一個模式的 object。
