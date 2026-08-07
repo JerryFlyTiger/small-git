@@ -13,6 +13,7 @@ int sg_cmd_commit(int argc, char **argv);
 int sg_cmd_log(int argc, char **argv);
 int sg_cmd_status(int argc, char **argv);
 int sg_cmd_diff(int argc, char **argv);
+int sg_cmd_branch(int argc, char **argv);
 int sg_cmd_switch(int argc, char **argv);
 int sg_cmd_restore(int argc, char **argv);
 int sg_cmd_undo(int argc, char **argv);

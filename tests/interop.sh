@@ -2526,6 +2526,472 @@ check "REF_DELTA with an unresolvable base: reports it as not found rather than 
     grep -q "not found or corrupt" "$MISSING_BASE_OUT"
 
 echo ""
+
+# --- Phase 9: sg branch -- list / create / delete, packed-refs-correct ------
+# Deletion is the part with teeth here: a delete that only unlinks the loose
+# file leaves any stale packed-refs line behind, and the branch "resurrects"
+# at whatever old commit that line records (this codebase has been bitten by
+# exactly this loose-vs-packed blindness before, on the read side). The
+# packed-only and stale-shadow cases below pin the deletion side of it.
+P9B_REPO="$WORKDIR/phase9_branch_repo"
+mkdir -p "$P9B_REPO"
+(cd "$WORKDIR" && "$SG" init phase9_branch_repo) > /dev/null 2>&1
+printf 'branch base\n' > "$P9B_REPO/base.txt"
+(cd "$P9B_REPO" && "$SG" add base.txt) > /dev/null 2>&1
+(cd "$P9B_REPO" && "$SG" commit -m "p9 base") > /dev/null 2>&1
+
+# case 1: create at HEAD, do NOT switch; real git agrees on all of it
+(cd "$P9B_REPO" && "$SG" branch topic) > /dev/null 2>&1
+check "phase9 case1: sg branch <name> exits 0" test $? = 0
+P9_HEAD=$(cd "$P9B_REPO" && git rev-parse HEAD)
+P9_TOPIC=$(cd "$P9B_REPO" && git rev-parse --verify refs/heads/topic 2>/dev/null)
+check "phase9 case1: git rev-parse of the sg-created branch equals HEAD" \
+    test "$P9_TOPIC" = "$P9_HEAD"
+(cd "$P9B_REPO" && git branch --list topic) 2>/dev/null | grep -q "topic"
+check "phase9 case1: git branch --list shows the sg-created branch" test $? = 0
+check "phase9 case1: creating a branch does not switch away from master" \
+    test "$(cd "$P9B_REPO" && git branch --show-current)" = "master"
+(cd "$P9B_REPO" && git fsck) > /dev/null 2>&1
+check "phase9 case1: git fsck is clean after sg branch" test $? = 0
+
+# case 1 (cont.): a slash-containing name round-trips create/list/delete
+(cd "$P9B_REPO" && "$SG" branch feature/x) > /dev/null 2>&1
+check "phase9 case1: sg branch feature/x (slash name) exits 0" test $? = 0
+check "phase9 case1: git sees feature/x at HEAD" \
+    test "$(cd "$P9B_REPO" && git rev-parse --verify refs/heads/feature/x 2>/dev/null)" = "$P9_HEAD"
+(cd "$P9B_REPO" && "$SG" branch) 2>/dev/null | grep -q "^  feature/x\$"
+check "phase9 case1: sg branch lists feature/x" test $? = 0
+(cd "$P9B_REPO" && "$SG" branch -d feature/x < /dev/null) > /dev/null 2>&1
+check "phase9 case1: sg branch -d feature/x (merged, so no prompt) exits 0" test $? = 0
+(cd "$P9B_REPO" && git rev-parse --verify refs/heads/feature/x) > /dev/null 2>&1
+check "phase9 case1: feature/x is fully gone after sg delete" test $? != 0
+
+# case 2: listing parity vs git, including a branch created by real git
+(cd "$P9B_REPO" && git branch git-made) 2>/dev/null
+(cd "$P9B_REPO" && "$SG" branch zeta) > /dev/null 2>&1
+P9_SG_LIST="$WORKDIR/p9_sg_list.txt"
+P9_GIT_LIST="$WORKDIR/p9_git_list.txt"
+(cd "$P9B_REPO" && "$SG" branch) 2>/dev/null | cut -c3- | LC_ALL=C sort > "$P9_SG_LIST"
+(cd "$P9B_REPO" && git for-each-ref --format='%(refname:short)' refs/heads) 2>/dev/null \
+    | LC_ALL=C sort > "$P9_GIT_LIST"
+check "phase9 case2: sg branch listing matches git for-each-ref" cmp -s "$P9_SG_LIST" "$P9_GIT_LIST"
+
+# case 3: the * marker sits on the branch git considers current
+P9_MARKED=$(cd "$P9B_REPO" && "$SG" branch 2>/dev/null | grep '^\* ' | cut -c3-)
+check "phase9 case3: current-branch marker matches git branch --show-current" \
+    test "$P9_MARKED" = "$(cd "$P9B_REPO" && git branch --show-current)"
+
+# case 4a: packed-only branch (post pack-refs, no loose file at all)
+(cd "$P9B_REPO" && "$SG" branch packed-only) > /dev/null 2>&1
+(cd "$P9B_REPO" && git pack-refs --all) 2>/dev/null
+check "phase9 case4: precondition -- pack-refs removed the loose file" \
+    test ! -f "$P9B_REPO/.git/refs/heads/packed-only"
+(cd "$P9B_REPO" && "$SG" branch) 2>/dev/null | grep -q "^  packed-only\$"
+check "phase9 case4: packed-only branch is still listed by sg branch" test $? = 0
+(cd "$P9B_REPO" && "$SG" branch -d packed-only < /dev/null) > /dev/null 2>&1
+check "phase9 case4: sg branch -d deletes a packed-only branch" test $? = 0
+(cd "$P9B_REPO" && git branch --list packed-only) 2>/dev/null | grep -q "packed-only"
+check "phase9 case4: git branch no longer shows the packed-only branch" test $? != 0
+grep -q "refs/heads/packed-only" "$P9B_REPO/.git/packed-refs" 2>/dev/null
+check "phase9 case4: packed-refs has no line left for the deleted branch" test $? != 0
+
+# case 4b: STALE SHADOW -- pack, then advance the branch so a newer loose
+# file shadows the stale packed line; deleting must purge BOTH, or the
+# branch comes back from the dead at the stale sha
+(cd "$P9B_REPO" && "$SG" branch shadow) > /dev/null 2>&1
+(cd "$P9B_REPO" && git pack-refs --all) 2>/dev/null
+P9_STALE=$(cd "$P9B_REPO" && git rev-parse shadow)
+(cd "$P9B_REPO" && git switch -q shadow \
+    && printf 'shadow work\n' > shadow.txt \
+    && git add shadow.txt && git commit -q -m "shadow commit" \
+    && git switch -q master) 2>/dev/null
+P9_SHADOW_TIP=$(cd "$P9B_REPO" && git rev-parse shadow)
+check "phase9 case4: precondition -- loose shadow ref advanced past the stale packed entry" \
+    sh -c "test -f '$P9B_REPO/.git/refs/heads/shadow' \
+        && test '$P9_SHADOW_TIP' != '$P9_STALE' \
+        && grep -q '$P9_STALE refs/heads/shadow' '$P9B_REPO/.git/packed-refs'"
+P9_SHADOW_OUT="$WORKDIR/p9_shadow_out.txt"
+(cd "$P9B_REPO" && "$SG" branch -d shadow --force < /dev/null) > "$P9_SHADOW_OUT" 2>&1
+check "phase9 case4: forced delete of the stale-shadow branch exits 0" test $? = 0
+(cd "$P9B_REPO" && git rev-parse --verify refs/heads/shadow) > /dev/null 2>&1
+check "phase9 case4: shadow branch fully gone, NOT resurrected at the stale packed sha" \
+    test $? != 0
+grep -q "refs/heads/shadow" "$P9B_REPO/.git/packed-refs" 2>/dev/null
+check "phase9 case4: stale packed line purged as part of the delete" test $? != 0
+check "phase9 case4: delete printed the true (loose) tip in full, recoverable" \
+    grep -q "$P9_SHADOW_TIP" "$P9_SHADOW_OUT"
+
+# case 5: current-branch delete refused (even forced); unmerged delete is
+# refused on a non-tty stdin without --force, succeeds with it
+(cd "$P9B_REPO" && "$SG" branch -d master --force < /dev/null) > /dev/null 2>&1
+check "phase9 case5: deleting the current branch fails even with --force" test $? != 0
+(cd "$P9B_REPO" && git rev-parse --verify refs/heads/master) > /dev/null 2>&1
+check "phase9 case5: current branch is intact after the refused delete" test $? = 0
+
+(cd "$P9B_REPO" && git switch -q -c unmerged \
+    && printf 'um\n' > um.txt && git add um.txt && git commit -q -m "um" \
+    && git switch -q master) 2>/dev/null
+P9_UM_TIP=$(cd "$P9B_REPO" && git rev-parse unmerged)
+P9_UM_OUT="$WORKDIR/p9_um_out.txt"
+(cd "$P9B_REPO" && "$SG" branch -d unmerged < /dev/null) > "$P9_UM_OUT" 2>&1
+check "phase9 case5: unmerged delete on non-tty stdin without --force is refused" test $? != 0
+check "phase9 case5: the refusal names --force as the way through" \
+    grep -q -- "--force" "$P9_UM_OUT"
+check "phase9 case5: branch untouched after the refused unmerged delete" \
+    test "$(cd "$P9B_REPO" && git rev-parse unmerged)" = "$P9_UM_TIP"
+(cd "$P9B_REPO" && "$SG" branch -d unmerged --force < /dev/null) > "$P9_UM_OUT" 2>&1
+check "phase9 case5: unmerged delete with --force succeeds" test $? = 0
+check "phase9 case5: forced delete printed the branch's full 40-hex old tip" \
+    grep -q "$P9_UM_TIP" "$P9_UM_OUT"
+(cd "$P9B_REPO" && git rev-parse --verify refs/heads/unmerged) > /dev/null 2>&1
+check "phase9 case5: unmerged branch gone after the forced delete" test $? != 0
+
+# case 6: invalid creation names -- sg rejects each, and real git's
+# check-ref-format agrees every one is invalid
+for bad in 'a..b' 'a b' 'a.lock' 'HEAD' 'a/' '@{x}'; do
+    (cd "$P9B_REPO" && "$SG" branch "$bad") > /dev/null 2>&1
+    check "phase9 case6: sg rejects invalid creation name '$bad'" test $? != 0
+    (cd "$P9B_REPO" && git check-ref-format --branch "$bad") > /dev/null 2>&1
+    check "phase9 case6: git check-ref-format agrees '$bad' is invalid" test $? != 0
+done
+(cd "$P9B_REPO" && "$SG" branch -- -lead) > /dev/null 2>&1
+check "phase9 case6: sg rejects leading-dash name '-lead'" test $? != 0
+(cd "$P9B_REPO" && git check-ref-format --branch -lead) > /dev/null 2>&1
+check "phase9 case6: git check-ref-format agrees '-lead' is invalid" test $? != 0
+
+# case 7: creating over an existing branch fails, whether the existing one
+# is loose or lives only in packed-refs
+(cd "$P9B_REPO" && "$SG" branch dupe) > /dev/null 2>&1
+(cd "$P9B_REPO" && "$SG" branch dupe) > /dev/null 2>&1
+check "phase9 case7: creating over an existing loose branch fails" test $? != 0
+check "phase9 case7: precondition -- topic is packed-only by now" \
+    test ! -f "$P9B_REPO/.git/refs/heads/topic"
+(cd "$P9B_REPO" && "$SG" branch topic) > /dev/null 2>&1
+check "phase9 case7: creating over a packed-only branch fails" test $? != 0
+
+# case 8: empty repo (no commits): listing is silent success, creating errors
+P9E_REPO="$WORKDIR/phase9_empty_repo"
+mkdir -p "$P9E_REPO"
+(cd "$WORKDIR" && "$SG" init phase9_empty_repo) > /dev/null 2>&1
+P9E_LIST="$WORKDIR/p9_empty_list.txt"
+(cd "$P9E_REPO" && "$SG" branch) > "$P9E_LIST" 2>&1
+P9E_RC=$?
+check "phase9 case8: sg branch in an empty repo exits 0" test "$P9E_RC" = 0
+check "phase9 case8: sg branch in an empty repo prints nothing" test ! -s "$P9E_LIST"
+(cd "$P9E_REPO" && "$SG" branch nothing-yet) > /dev/null 2>&1
+check "phase9 case8: creating a branch in an empty repo fails (no commit yet)" test $? != 0
+
+# --- Phase 9: gitignore conformance sweep -- sg status vs git status -------
+# The strongest oracle in this phase: one tree whose paths exercise every
+# rule family in the ignore spec (bare name, /anchored, dir-only, a/*.txt,
+# **/, /**, a/**/b, a**b, negation, no-reinclusion-under-an-excluded-dir,
+# trailing-space handling, \#, \!, char classes, deeper-file-override, and
+# .git/info/exclude) is examined by BOTH sg status and real git, and the two
+# untracked path sets must be EXACTLY equal -- any future matcher drift
+# fails this loudly. The git side uses -z output because porcelain v1
+# C-quotes paths with trailing spaces (verified on this git).
+P9I_REPO="$WORKDIR/phase9_ignore_repo"
+mkdir -p "$P9I_REPO"
+git init -q "$P9I_REPO"
+git -C "$P9I_REPO" config core.ignorecase false
+
+cat > "$P9I_REPO/.gitignore" <<'EOF'
+# root ignore rules (this line is a comment)
+*.log
+!keep.log
+/anchored.txt
+build/
+onlydir/
+docs/*.txt
+**/anydepth.txt
+gen/**
+x/**/y
+a**b
+secret
+blocked/
+!blocked/inside.txt
+sp1 
+sp2\ 
+\#lit
+\!bang
+tmp[0-9].bin
+cls[!a-c].txt
+!exc-neg
+EOF
+mkdir -p "$P9I_REPO/.git/info"
+printf 'excfile\nexc-neg\n' > "$P9I_REPO/.git/info/exclude"
+
+mkdir -p "$P9I_REPO/deep" "$P9I_REPO/build" "$P9I_REPO/docs/deep" "$P9I_REPO/m" \
+    "$P9I_REPO/gen/deep" "$P9I_REPO/x/m/n" "$P9I_REPO/a" "$P9I_REPO/over" \
+    "$P9I_REPO/blocked" "$P9I_REPO/sub/deep" "$P9I_REPO/sub/inner"
+printf '!secret\n' > "$P9I_REPO/over/.gitignore"
+cat > "$P9I_REPO/sub/.gitignore" <<'EOF'
+subonly.dat
+/subanchored.txt
+inner/
+!special.log
+EOF
+
+for f in normal.txt app.log keep.log other.log anchored.txt deep/anchored.txt \
+    build/out.bin onlydir docs/a.txt docs/b.md docs/deep/c.txt anydepth.txt \
+    m/anydepth.txt m/other.txt gen/f.txt gen/deep/g.txt x/y x/z.txt a/qb axxb \
+    secret over/secret blocked/inside.txt sp1 sp2 '#lit' '#other' '!bang' \
+    '!other' tmp5.bin tmpX.bin clsd.txt clsa.txt excfile exc-neg \
+    sub/subonly.dat sub/deep/subonly.dat sub/subanchored.txt \
+    sub/deep/subanchored.txt sub/inner/file.txt sub/special.log \
+    sub/other2.log sub/plain.txt; do
+    printf 'content\n' > "$P9I_REPO/$f"
+done
+printf 'content\n' > "$P9I_REPO/sp2 "
+printf 'content\n' > "$P9I_REPO/x/m/n/y"
+
+P9I_GIT_SET="$WORKDIR/p9i_git_set.txt"
+P9I_SG_SET="$WORKDIR/p9i_sg_set.txt"
+P9I_SG_OUT="$WORKDIR/p9i_sg_out.txt"
+(cd "$P9I_REPO" && git status --porcelain -uall -z) | tr '\0' '\n' \
+    | sed -n 's/^?? //p' | LC_ALL=C sort > "$P9I_GIT_SET"
+(cd "$P9I_REPO" && "$SG" status) > "$P9I_SG_OUT" 2>&1
+P9I_SG_RC=$?
+awk '/^Untracked files:/{f=1;next} /^$/{f=0} f && /^\t/{sub(/^\t/,"");print}' \
+    "$P9I_SG_OUT" | LC_ALL=C sort > "$P9I_SG_SET"
+
+check "phase9 conformance: sg status exits 0 on the tricky tree" test "$P9I_SG_RC" = 0
+check "phase9 conformance: oracle sanity -- git reports a non-empty untracked set" \
+    test -s "$P9I_GIT_SET"
+check "phase9 conformance: oracle sanity -- deeper !secret re-includes over/secret" \
+    grep -q '^over/secret$' "$P9I_GIT_SET"
+check "phase9 conformance: oracle sanity -- *.log ignores app.log" \
+    sh -c "! grep -q '^app\.log\$' '$P9I_GIT_SET'"
+check "phase9 conformance: sg untracked set EXACTLY equals git status --porcelain -uall" \
+    cmp -s "$P9I_GIT_SET" "$P9I_SG_SET"
+
+# --- Phase 9: sg add . equivalence against git add . -----------------------
+# Twin copies of one dirty tree (new files, modified files, a deleted
+# tracked file, ignored files, and a tracked-but-ignored modified file):
+# sg add . in one, git add . in the other, then the two indexes must agree
+# byte-for-byte via git ls-files -s. This proves recursion, ignore-skip,
+# tracked-wins and deletion staging in one shot.
+P9T_BASE="$WORKDIR/phase9_add_base"
+mkdir -p "$P9T_BASE"
+git init -q "$P9T_BASE"
+git -C "$P9T_BASE" config core.ignorecase false
+printf '*.log\nbuild/\n' > "$P9T_BASE/.gitignore"
+mkdir -p "$P9T_BASE/src" "$P9T_BASE/build"
+printf 'main\n' > "$P9T_BASE/src/main.c"
+printf 'keep\n' > "$P9T_BASE/keep.txt"
+printf 'gone\n' > "$P9T_BASE/del.txt"
+printf 'log v1\n' > "$P9T_BASE/app.log"
+(cd "$P9T_BASE" && git add -A && git add -f app.log && git commit -q -m "p9 add base") \
+    > /dev/null 2>&1
+
+printf 'more\n' >> "$P9T_BASE/src/main.c"  # modified tracked file
+rm "$P9T_BASE/del.txt"                     # deleted tracked file
+printf 'new\n' > "$P9T_BASE/src/new.c"     # new file in a subdirectory
+printf 'top\n' > "$P9T_BASE/newtop.txt"    # new top-level file
+printf 'dbg\n' > "$P9T_BASE/debug.log"     # ignored new file
+printf 'obj\n' > "$P9T_BASE/build/out.bin" # new file inside an ignored dir
+printf 'log v2\n' >> "$P9T_BASE/app.log"   # tracked-but-ignored, modified
+
+P9T_TWIN="$WORKDIR/phase9_add_twin"
+cp -R "$P9T_BASE" "$P9T_TWIN"
+
+(cd "$P9T_BASE" && "$SG" add .) > /dev/null 2>&1
+check "phase9 add-equiv: sg add . exits 0 on the dirty tree" test $? = 0
+(cd "$P9T_TWIN" && git add .) > /dev/null 2>&1
+
+P9T_SG_LS="$WORKDIR/p9t_sg_ls.txt"
+P9T_GIT_LS="$WORKDIR/p9t_git_ls.txt"
+(cd "$P9T_BASE" && git ls-files -s) > "$P9T_SG_LS" 2>/dev/null
+(cd "$P9T_TWIN" && git ls-files -s) > "$P9T_GIT_LS" 2>/dev/null
+check "phase9 add-equiv: git ls-files -s after sg add . is byte-identical to git add ." \
+    cmp -s "$P9T_SG_LS" "$P9T_GIT_LS"
+check "phase9 add-equiv: the deleted tracked file was staged as deleted" \
+    sh -c "! grep -q 'del\.txt' '$P9T_SG_LS'"
+check "phase9 add-equiv: tracked-but-ignored app.log was re-staged (tracked wins)" \
+    grep -q "app.log" "$P9T_SG_LS"
+check "phase9 add-equiv: the ignored new file was NOT staged" \
+    sh -c "! grep -q 'debug\.log' '$P9T_SG_LS'"
+
+# --- Phase 9: explicit ignored args, -f/--force, tracked-wins --------------
+P9F_REPO="$WORKDIR/phase9_force_repo"
+mkdir -p "$P9F_REPO"
+(cd "$WORKDIR" && "$SG" init phase9_force_repo) > /dev/null 2>&1
+git -C "$P9F_REPO" config core.ignorecase false
+printf '*.log\n' > "$P9F_REPO/.gitignore"
+(cd "$P9F_REPO" && "$SG" add .gitignore && "$SG" commit -m "p9 ignore rules") > /dev/null 2>&1
+printf 'log v1\n' > "$P9F_REPO/app.log"
+
+P9F_BEFORE="$WORKDIR/p9f_before.txt"
+P9F_AFTER="$WORKDIR/p9f_after.txt"
+P9F_ERR="$WORKDIR/p9f_err.txt"
+(cd "$P9F_REPO" && git ls-files) > "$P9F_BEFORE" 2>/dev/null
+(cd "$P9F_REPO" && "$SG" add app.log) > "$P9F_ERR" 2>&1
+P9F_RC=$?
+(cd "$P9F_REPO" && git ls-files) > "$P9F_AFTER" 2>/dev/null
+check "phase9 force: explicitly adding an ignored file fails with exit 1" test "$P9F_RC" = 1
+check "phase9 force: the refusal mentions -f as the way through" grep -q -- "-f" "$P9F_ERR"
+check "phase9 force: the index is untouched after the refused add" \
+    cmp -s "$P9F_BEFORE" "$P9F_AFTER"
+
+(cd "$P9F_REPO" && "$SG" add -f app.log) > /dev/null 2>&1
+check "phase9 force: sg add -f stages the ignored file (exit 0)" test $? = 0
+(cd "$P9F_REPO" && git ls-files) | grep -q "^app.log\$"
+check "phase9 force: git ls-files shows the force-added file" test $? = 0
+(cd "$P9F_REPO" && "$SG" commit -m "p9 forced add") > /dev/null 2>&1
+printf 'log v2\n' >> "$P9F_REPO/app.log"
+P9F_STATUS="$WORKDIR/p9f_status.txt"
+(cd "$P9F_REPO" && "$SG" status) > "$P9F_STATUS" 2>&1
+check "phase9 force: a tracked-but-ignored file still shows as modified (tracked wins)" \
+    sh -c "grep -q 'modified:' '$P9F_STATUS' && grep -q 'app\.log' '$P9F_STATUS'"
+
+# explicit ignored DIRECTORY: refused without -f, contents staged with it
+P9D_REPO="$WORKDIR/phase9_dir_repo"
+mkdir -p "$P9D_REPO"
+(cd "$WORKDIR" && "$SG" init phase9_dir_repo) > /dev/null 2>&1
+git -C "$P9D_REPO" config core.ignorecase false
+printf 'build/\n' > "$P9D_REPO/.gitignore"
+mkdir -p "$P9D_REPO/build"
+printf 'o\n' > "$P9D_REPO/build/out.txt"
+(cd "$P9D_REPO" && "$SG" add build) > /dev/null 2>&1
+check "phase9 force: explicitly adding an ignored directory fails" test $? != 0
+(cd "$P9D_REPO" && git ls-files) | grep -q "build/out.txt"
+check "phase9 force: nothing staged after the refused directory add" test $? != 0
+(cd "$P9D_REPO" && "$SG" add -f build) > /dev/null 2>&1
+check "phase9 force: sg add -f on an ignored directory exits 0" test $? = 0
+(cd "$P9D_REPO" && git ls-files) | grep -q "^build/out.txt\$"
+check "phase9 force: git ls-files shows the force-added directory content" test $? = 0
+
+# --- Phase 9: pathspec shapes -- subdir ., dir/, nosuch, empty dir, FIFO ---
+P9S_REPO="$WORKDIR/phase9_paths_repo"
+mkdir -p "$P9S_REPO/sub" "$P9S_REPO/sub2" "$P9S_REPO/emptyd"
+(cd "$WORKDIR" && "$SG" init phase9_paths_repo) > /dev/null 2>&1
+printf 'a\n' > "$P9S_REPO/sub/a.txt"
+printf 'b\n' > "$P9S_REPO/sub2/b.txt"
+printf 'top\n' > "$P9S_REPO/top.txt"
+
+(cd "$P9S_REPO/sub" && "$SG" add .) > /dev/null 2>&1
+check "phase9 paths: sg add . from a subdirectory exits 0" test $? = 0
+P9S_LS="$WORKDIR/p9s_ls.txt"
+(cd "$P9S_REPO" && git ls-files) > "$P9S_LS" 2>/dev/null
+check "phase9 paths: the subdirectory's file was staged" grep -q "^sub/a.txt\$" "$P9S_LS"
+check "phase9 paths: files outside the subdirectory were NOT staged" \
+    sh -c "! grep -q '^top\.txt\$' '$P9S_LS'"
+
+(cd "$P9S_REPO" && "$SG" add nosuch) > /dev/null 2>&1
+check "phase9 paths: sg add nosuch still errors with a nonzero exit" test $? != 0
+
+(cd "$P9S_REPO" && "$SG" add sub2/) > /dev/null 2>&1
+check "phase9 paths: sg add dir/ (trailing slash) exits 0" test $? = 0
+(cd "$P9S_REPO" && git ls-files) | grep -q "^sub2/b.txt\$"
+check "phase9 paths: the trailing-slash dir's file was staged" test $? = 0
+
+P9S_EMPTY_OUT="$WORKDIR/p9s_empty_out.txt"
+(cd "$P9S_REPO" && "$SG" add emptyd) > "$P9S_EMPTY_OUT" 2>&1
+P9S_EMPTY_RC=$?
+check "phase9 paths: adding an empty directory exits 0" test "$P9S_EMPTY_RC" = 0
+check "phase9 paths: adding an empty directory prints nothing" test ! -s "$P9S_EMPTY_OUT"
+
+# an explicitly named FIFO must error cleanly, never hang reading it; the
+# perl alarm turns a hang into exit 142 so the check below still fails fast
+mkfifo "$P9S_REPO/fifo1" 2>/dev/null
+(cd "$P9S_REPO" && perl -e 'alarm 10; exit(system(@ARGV) == 0 ? 0 : 1);' "$SG" add fifo1) \
+    > /dev/null 2>&1
+P9S_FIFO_RC=$?
+check "phase9 paths: an explicit FIFO argument exits 1 without hanging" \
+    test "$P9S_FIFO_RC" = 1
+(cd "$P9S_REPO" && git ls-files) | grep -q "fifo1"
+check "phase9 paths: the FIFO was not staged" test $? != 0
+
+# --- Phase 9: chunking still works through add-recursion -------------------
+P9C_REPO="$WORKDIR/phase9_chunk_repo"
+mkdir -p "$P9C_REPO"
+(cd "$WORKDIR" && "$SG" init phase9_chunk_repo) > /dev/null 2>&1
+git config -f "$P9C_REPO/.git/config" sg.chunking true
+git config -f "$P9C_REPO/.git/config" sg.chunkthreshold 1048576
+mkdir -p "$P9C_REPO/data"
+head -c 2097152 /dev/urandom > "$P9C_REPO/data/big.bin" 2>/dev/null
+printf 'small\n' > "$P9C_REPO/data/small.txt"
+(cd "$P9C_REPO" && "$SG" add .) > /dev/null 2>&1
+check "phase9 chunk: sg add . exits 0 in a chunking-enabled repo" test $? = 0
+P9C_BLOB=$(cd "$P9C_REPO" && git ls-files -s data/big.bin 2>/dev/null | awk '{print $2}')
+P9C_SIZE=$(cd "$P9C_REPO" && git cat-file -s "$P9C_BLOB" 2>/dev/null)
+check "phase9 chunk: the staged blob is a small pointer, not the full 2MiB file" \
+    sh -c "test -n '$P9C_SIZE' && test '$P9C_SIZE' -lt 65536"
+(cd "$P9C_REPO" && git cat-file -p "$P9C_BLOB" 2>/dev/null) | head -1 | grep -q "sg-chunked"
+check "phase9 chunk: the pointer blob carries the sg-chunked magic" test $? = 0
+P9C_INFO="$WORKDIR/p9c_info.txt"
+(cd "$P9C_REPO" && "$SG" chunk-info data/big.bin) > "$P9C_INFO" 2>&1
+check "phase9 chunk: sg chunk-info reports the recursively added file as chunked" \
+    grep -q "chunked: yes" "$P9C_INFO"
+
+# --- Phase 9: status ignore filtering and nested .git ----------------------
+P9ST_REPO="$WORKDIR/phase9_statusign_repo"
+mkdir -p "$P9ST_REPO"
+(cd "$WORKDIR" && "$SG" init phase9_statusign_repo) > /dev/null 2>&1
+git -C "$P9ST_REPO" config core.ignorecase false
+printf 'ign.txt\n' > "$P9ST_REPO/.gitignore"
+(cd "$P9ST_REPO" && "$SG" add .gitignore && "$SG" commit -m "p9 status rules") > /dev/null 2>&1
+printf 'x\n' > "$P9ST_REPO/ign.txt"
+P9ST_OUT="$WORKDIR/p9st_out.txt"
+(cd "$P9ST_REPO" && "$SG" status) > "$P9ST_OUT" 2>&1
+check "phase9 status: an ignored untracked file is absent from sg status" \
+    sh -c "! grep -q 'ign\.txt' '$P9ST_OUT'"
+check "phase9 status: working tree clean when only ignored files exist" \
+    grep -q "nothing to commit, working tree clean" "$P9ST_OUT"
+
+mkdir -p "$P9ST_REPO/subrepo/.git"
+printf 'junk not a real ref\n' > "$P9ST_REPO/subrepo/.git/HEAD"
+printf 'real\n' > "$P9ST_REPO/subrepo/file.txt"
+(cd "$P9ST_REPO" && "$SG" status) > "$P9ST_OUT" 2>&1
+check "phase9 status: a file next to a nested .git dir is still reported" \
+    grep -q "subrepo/file.txt" "$P9ST_OUT"
+check "phase9 status: a nested .git dir is never descended into" \
+    sh -c "! grep -q 'subrepo/\.git' '$P9ST_OUT'"
+
+# --- A tree deeper than the platform's PATH_MAX must never be skipped in
+# --- silence. sg's walkers build ABSOLUTE paths, so on a deep enough tree
+# --- lstat/opendir fail with ENAMETOOLONG long before sg's own buffers fill
+# --- (git avoids this entirely by traversing with openat()). The original
+# --- walk treated every lstat failure as "vanished mid-walk" and skipped it,
+# --- so `sg add .` staged nothing, exited 0, and a commit would have been
+# --- quietly missing content. Failing loudly is acceptable here; failing
+# --- silently is not, so that is exactly what this asserts.
+P9DEEP_REPO="$WORKDIR/phase9_deep_repo"
+"$SG" init "$P9DEEP_REPO" > /dev/null 2>&1
+# Built by chdir'ing down one short relative component at a time, which is
+# how a tree whose ABSOLUTE paths exceed PATH_MAX can exist at all (git walks
+# it fine via openat; sg, which composes absolute paths, cannot). Nesting
+# "until mkdir fails" instead would make the depth depend on how long the
+# temp directory's own path happens to be, and would trip sg's opendir check
+# -- which already failed loudly -- rather than the per-entry lstat that used
+# to be silent. 250 levels clears PATH_MAX on both macOS (1024) and Linux (4096).
+python3 - "$P9DEEP_REPO" <<'PYEOF'
+import os, sys
+os.chdir(sys.argv[1])
+for _ in range(250):
+    os.mkdir("d" * 20)
+    os.chdir("d" * 20)
+with open("leaf.txt", "w") as f:
+    f.write("deep\n")
+PYEOF
+
+(cd "$P9DEEP_REPO" && "$SG" add .) > "$WORKDIR/p9deep_add.txt" 2>&1
+P9DEEP_RC=$?
+P9DEEP_STAGED=$( (cd "$P9DEEP_REPO" && git ls-files | grep -c 'leaf\.txt') 2>/dev/null || echo 0)
+# Pass if sg either staged the deep file, or refused with a non-zero exit.
+# Fail only on the silent case: exit 0 having quietly dropped it.
+check "phase9 deep tree: sg add . never exits 0 while silently omitting a file" \
+    sh -c "[ \"$P9DEEP_RC\" -ne 0 ] || [ \"$P9DEEP_STAGED\" -gt 0 ]"
+check "phase9 deep tree: an unreadable path is reported, not swallowed" \
+    sh -c "[ \"$P9DEEP_STAGED\" -gt 0 ] || [ -s '$WORKDIR/p9deep_add.txt' ]"
+
+(cd "$P9DEEP_REPO" && "$SG" status) > "$WORKDIR/p9deep_st.txt" 2>"$WORKDIR/p9deep_st_err.txt"
+P9DEEP_ST_RC=$?
+check "phase9 deep tree: sg status still succeeds" test "$P9DEEP_ST_RC" = 0
+check "phase9 deep tree: sg status warns that the untracked list may be incomplete" \
+    sh -c "grep -q 'leaf\.txt' '$WORKDIR/p9deep_st.txt' || [ -s '$WORKDIR/p9deep_st_err.txt' ]"
+
+echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
 if [ "$FAIL" -gt 0 ]; then

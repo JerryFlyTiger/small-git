@@ -1,6 +1,8 @@
 #ifndef SG_REFS_H
 #define SG_REFS_H
 
+#include <stddef.h>
+
 #include "sg/hash.h"
 
 /* Branch names get concatenated straight into a filesystem path by the
@@ -50,5 +52,24 @@ int sg_ref_write_path(const char *git_dir, const char *ref_path,
    longer exists. */
 int sg_ref_read_path(const char *git_dir, const char *ref_path,
                      unsigned char id_out[SG_SHA1_RAW_LEN]);
+
+/* Enumerates every branch, merging the loose refs/heads/ files with the
+   packed-refs entries (loose wins on duplicates -- the same precedence
+   sg_ref_read_branch applies when reading a single branch, and packed-only
+   branches left behind by `git pack-refs` must still be listed). Fills
+   *names_out with a malloc'd array of malloc'd names (no "refs/heads/"
+   prefix, slash-containing names kept whole), sorted byte-wise, and
+   *count_out with its length. count 0 leaves *names_out NULL. Caller frees
+   each name and then the array. Returns 0 on success, -1 on error (outputs
+   are then NULL/0). */
+int sg_ref_list_branches(const char *git_dir, char ***names_out, size_t *count_out);
+
+/* Deletes refs/heads/<branch> from BOTH stores: unlinks the loose file and
+   atomically rewrites packed-refs without that branch's line (and its peel
+   line, if any). Removing only the loose file is not a deletion -- a stale
+   packed entry would silently resurrect the branch at an old commit.
+   Returns 0 on success, 1 if the branch did not exist, -1 on an unsafe name
+   or I/O error. */
+int sg_ref_delete_branch(const char *git_dir, const char *branch);
 
 #endif

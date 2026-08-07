@@ -10,7 +10,8 @@
 
 **CLI/UX 混亂。** `switch`(切分支)與 `restore`(還原檔案)職責分離,不再全部擠在
 `checkout` 底下。指令打錯會給出建議(`sg stat` → 提示 `status`)。`status` 會直接說明下一步
-可以做什麼,而不是丟一串術語。
+可以做什麼,而不是丟一串術語。支援 `.gitignore`(逐目錄規則、否定、`**`、字元類等完整
+`gitignore(5)` 語意),`sg add .` 遞迴整個目錄樹,`sg branch` 列出/建立/刪除分支。
 
 **危險操作沒有救援。** 會造成資料遺失的操作(`switch`、`restore`、`merge`、`rebase`)在執行前
 自動建立快照,存在 `refs/small-git/undo/`,用 `sg undo` 列出、`sg undo <編號>` 還原。
@@ -79,12 +80,13 @@ sg undo 1                     # 內容回來了
 | 指令 | 說明 |
 |---|---|
 | `init` | 建立新的 repository |
-| `add` | 將檔案加入暫存區 |
+| `add` | 將檔案或整個目錄加入暫存區(`-f` 強制加入被忽略的檔案) |
 | `commit` | 建立一個 commit |
 | `log` | 顯示 commit 歷史 |
 | `status` | 顯示工作目錄狀態 |
 | `diff` | 顯示尚未暫存的變更 |
 | `switch` | 切換分支(`-c` 建立新分支) |
+| `branch` | 列出、建立或刪除分支(`-d` 刪除) |
 | `restore` | 還原檔案或取消暫存(`--staged`) |
 | `undo` | 列出或還原自動快照 |
 | `merge` | 合併另一個分支(`--abort` 中止) |
@@ -106,7 +108,7 @@ sg undo 1                     # 內容回來了
 - `sg` 建立的 repo 可以直接用 `git` 操作,通過 `git fsck --strict`;`git` 建立的 repo 也可以
   直接用 `sg` 操作,包含 `git gc` 之後把 ref 收進 `packed-refs`、把物件打包成 pack 的狀態。
 - 網路端實作 smart HTTP,可與真實的 git 伺服器互通(clone/fetch/push)。
-- 測試套件 `tests/interop.sh` 有 285 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
+- 測試套件 `tests/interop.sh` 有 377 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
   (含一個本機 `git http-backend` 伺服器)來驗證,而不是自己跟自己比對。
 
 **唯一的例外是啟用分塊之後**——那時 tree 裡放的是指標 blob,`git checkout` 會拿到指標文字。
@@ -117,8 +119,10 @@ sg undo 1                     # 內容回來了
 誠實列出,不是待辦清單:
 
 - **不支援 symlink 與 submodule**。
-- **不讀 `.gitignore`**,所有檔案都要明確 `sg add`。
-- **`sg add` 不遞迴處理目錄**,只接受檔案路徑。
+- **不讀 `core.excludesFile` / 全域 ignore 檔**;只支援逐目錄 `.gitignore` 與
+  `.git/info/exclude`。
+- **無法走訪超過平台 `PATH_MAX` 的目錄樹**(sg 組絕對路徑,git 用 `openat()` 相對走訪)。
+  遇到時 `sg add` 明確報錯、`sg status` 印警告說明清單可能不完整——不會靜默略過。
 - **不讀 `~/.gitconfig`**;commit 身分只能透過 `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` 環境變數
   設定(預設 `small_git <sg@localhost>`)。
 - **寫入端不做 delta 壓縮**,每個物件各自 zlib 壓縮;讀取端則完整支援 OFS_DELTA/REF_DELTA。

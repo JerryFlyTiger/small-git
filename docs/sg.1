@@ -110,28 +110,66 @@ pointer's own raw text, never the reassembled file content \(em
 never resolves chunk pointers.
 .SS add
 .B sg add
+.RB [ --force | -f ]
+.RB [ -- ]
 .I path
 .RI [ path ...]
 .PP
-Stages one or more files into the index. Each
+Stages files into the index. Each
 .I path
 must resolve inside the repository; paths outside the repository are
-rejected. Differences from
-.BR "git add" :
-.IP \(bu 2
-.B Not recursive.
-If
+rejected. A
 .I path
-names a directory, that path is reported as an error and skipped; only
-individual files may be given. There is no equivalent of
-.B "git add <dir>"
-or
-.BR "git add -A" .
+naming a directory is walked recursively (entries are processed in sorted
+order), so
+.B "sg add ."
+stages the whole tree from the current directory down. The walk never
+descends into a
+.B .git
+directory at any depth, and files matched by the ignore rules described
+under
+.B .gitignore
+below are skipped silently \(em except that an already-tracked file is
+always staged, because ignore rules never apply to tracked content.
+.PP
+Naming an ignored path explicitly on the command line is an error rather
+than a silent no-op; pass
+.B --force
+(or
+.BR -f )
+to stage it anyway. A
+.B --
+argument ends option parsing, so a file literally named
+.B -f
+can be staged.
+.PP
+A
+.I path
+that no longer exists but is still recorded in the index stages its
+deletion. Under a directory argument, the deletion of any tracked file
+beneath it is staged the same way, matching
+.BR "git add <dir>" .
+.PP
+Either every named path stages successfully or the index is left
+completely untouched: the index is written only after all arguments have
+been processed without error.
+.PP
+Remaining differences from
+.BR "git add" :
 .IP \(bu 2
 .B Symlinks are skipped, not staged.
 A symlink argument prints a warning (\(dqis a symlink, skipping
 (unsupported)\(dq) and is not added to the index; this is not an error for
 the overall command.
+.IP \(bu 2
+.B Only regular files are staged.
+A path that is not a regular file (FIFO, socket, device) is reported as an
+error when named explicitly, and skipped during a directory walk. There is
+no
+.BR "git add -p" ,
+no pathspec globbing, and no
+.BR "git add -A" /\%\fB-u\fR
+distinction.
 .IP \(bu 2
 If a path currently carries an unresolved merge conflict (stage 1/2/3
 entries in the index), staging it clears the conflict and records the
@@ -201,6 +239,23 @@ or
 .BR restore .
 Unresolved merge conflicts are listed under \(dqUnmerged paths\(dq. Takes no
 arguments or flags.
+.PP
+The untracked list honours the ignore rules described under
+.B .gitignore
+in
+.B FILES
+below: ignored files are omitted and ignored directories are not descended
+into. Tracked files are never affected by ignore rules. Every untracked
+path is listed individually; unlike
+.BR "git status" ,
+directories are not collapsed. If a directory cannot be read (for instance
+a tree nested deeper than the platform's
+.BR PATH_MAX ,
+which
+.B sg
+cannot traverse because it composes absolute paths), a warning is printed
+to standard error saying the list may be incomplete, rather than the entry
+being dropped silently.
 .SS diff
 .B sg diff
 .PP
@@ -219,6 +274,87 @@ and no diffing against an arbitrary commit or ref.
 The line-level diff algorithm is a plain LCS-based implementation: it is
 correct but does not replicate git's exact hunk-splitting or context-window
 conventions, and always emits a single hunk covering the whole file.
+.SS branch
+.B sg branch
+.RB [ -d | --delete ]
+.RB [ --force | -f ]
+.RB [ -- ]
+.RI [ name ]
+.PP
+With no arguments, lists every branch, one per line, with the current
+branch marked by a leading
+.BR * .
+The listing merges the loose files under
+.B refs/heads/
+with the entries in
+.BR packed-refs ,
+so a branch that
+.B "git gc"
+has packed away is still listed; where both exist the loose value wins,
+which is the same precedence
+.B sg
+uses when resolving a single ref.
+.PP
+With
+.IR name ,
+creates a branch pointing at the current
+.B HEAD
+commit and does
+.B not
+switch to it (use
+.B "sg switch"
+for that). Creating fails if the name already exists in either store, if
+the repository has no commits yet, or if the name is not a valid ref name
+\(em names may not begin with
+.BR - ,
+begin or end with
+.BR / ,
+end with
+.B .
+or
+.BR .lock ,
+contain
+.BR // ,
+.BR .. ,
+.BR @{ ,
+a backslash, whitespace, an ASCII control character, or any of
+.BR ~^:?*[ ,
+and may not be exactly
+.BR HEAD .
+Names containing
+.B /
+(for example
+.BR feature/x )
+are valid.
+.PP
+With
+.B -d
+(or
+.BR --delete ),
+deletes
+.IR name .
+Deletion removes the branch from
+.B both
+the loose file and
+.BR packed-refs ;
+removing only the loose file would leave a stale packed entry that
+silently resurrects the branch at an older commit. The current branch is
+never deletable, with or without
+.BR --force .
+.PP
+If the branch is not fully merged into
+.B HEAD
+its commits would become unreachable, so deletion asks for confirmation
+first; the prompt names the branch and its tip. As elsewhere in
+.BR sg ,
+.B --force
+skips the prompt but not the refusal to delete the current branch, and a
+non-interactive standard input refuses rather than assuming yes (see
+.BR "EXIT STATUS" ).
+A successful deletion prints the deleted tip's full object id \(em because
+.B "sg undo"
+snapshots the working tree and index but not refs, that printed id is the
+only way to recreate the branch.
 .SS switch
 .B sg switch
 .RB [ -c ]
@@ -527,6 +663,54 @@ chunked) how many of its chunks are also referenced by some other chunked
 blob in the repository (\(dqshared chunks\(dq). This is a read-only
 diagnostic command; it does not modify anything.
 .SH FILES
+.TP
+.B .gitignore
+Per-directory ignore rules, read by
+.B status
+and
+.BR add .
+A
+.B .gitignore
+in any directory applies to that directory and everything below it, and a
+deeper file's rules take precedence over a shallower one's; within one
+file, the last matching pattern decides. Supported syntax matches
+.BR gitignore (5):
+comments
+.RB ( # ),
+negation
+.RB ( ! ),
+directory-only patterns (trailing
+.BR / ),
+anchoring (a
+.B /
+anywhere except at the end anchors the pattern to that file's directory,
+otherwise it matches by basename at any depth),
+.BR * ,
+.BR ? ,
+character classes
+.RB ( [a-c] ,
+.BR [!a-c] ),
+and
+.B **
+as a whole path segment. A pattern that excludes a directory buries
+everything inside it \(em no negation can re-include content beneath an
+excluded directory. Ignore rules never apply to files already tracked in
+the index.
+.TP
+.B .git/info/exclude
+Repository-local ignore rules with the same syntax, consulted at lower
+precedence than any
+.BR .gitignore .
+The
+.B core.excludesFile
+setting and
+.B ~/.gitconfig
+are
+.B not
+read, so a global ignore file configured for
+.B git
+has no effect on
+.BR sg .
 .TP
 .B .git/config
 Read for
