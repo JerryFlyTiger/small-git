@@ -149,6 +149,30 @@ int sg_index_read(const char *git_dir, sg_index *out)
         return -1;
     }
 
+    /* nentries is an attacker-controlled u32 straight off disk (read above
+       at :142). Without a sanity check, a crafted 30-byte index declaring
+       nentries = 0xFFFFFFFF (its checksum can trivially be made to match,
+       since the check above covers the whole file including this field)
+       would drive `malloc((size_t)nentries * sizeof(*entries))` to request
+       hundreds of GB. Bound it instead by how many entries the remaining
+       file bytes could possibly hold: every entry occupies at least
+       padded_len bytes, whose minimum is reached at name_len == 0 and
+       non-extended (entry_len = SG_INDEX_ENTRY_FIXED_LEN = 62, padded to a
+       multiple of 8 -> 64). So nentries can never legitimately exceed
+       (bytes remaining before the trailing checksum) / 64; anything larger
+       is proof the file is malformed and can be rejected before the
+       allocation, mirroring the existing pack object-count bound in
+       src/storage/pack.c (sg_pack_index_existing). */
+    {
+        const size_t min_padded_len = ((SG_INDEX_ENTRY_FIXED_LEN + 8) / 8) * 8;
+        size_t max_possible_entries = (size_t)(content_end - p) / min_padded_len;
+
+        if ((size_t)nentries > max_possible_entries) {
+            free(buf);
+            return -1;
+        }
+    }
+
     if (nentries > 0) {
         entries = malloc((size_t)nentries * sizeof(*entries));
         if (entries == NULL) {
@@ -167,6 +191,8 @@ int sg_index_read(const char *git_dir, sg_index *out)
         size_t entry_len;
         size_t padded_len;
         const unsigned char *name_start;
+
+        e->path = NULL;
 
         if ((size_t)(content_end - p) < SG_INDEX_ENTRY_FIXED_LEN)
             goto fail;
@@ -225,7 +251,11 @@ int sg_index_read(const char *git_dir, sg_index *out)
         continue;
 
     fail:
-        free_entries(entries, i);
+        /* e->path (if malloc'd just above) is freed here too: free_entries'
+           upper bound is i + 1, not i, so it covers the in-progress entry
+           as well as every fully-parsed one before it. */
+        free_entries(entries, i + 1);
+        free(buf);
         return -1;
     }
 
@@ -237,12 +267,14 @@ int sg_index_read(const char *git_dir, sg_index *out)
 
         if ((size_t)(content_end - p) < 8) {
             free_entries(entries, nentries);
+            free(buf);
             return -1;
         }
         p += 4; /* signature */
         ext_size = read_be32(&p);
         if ((size_t)(content_end - p) < ext_size) {
             free_entries(entries, nentries);
+            free(buf);
             return -1;
         }
         p += ext_size;

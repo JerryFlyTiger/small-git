@@ -13,11 +13,23 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 20 個單元測試二進位,任一失敗即整體失敗
+make test                         # 22 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
 ```
+
+`tests/test_fuzz_pack.c` 與 `tests/test_fuzz_index.c` 是二進位解析器的 fuzzer,
+已含在 `make test` 裡(預設輪數只要幾秒)。`SG_FUZZ_ITERS` 調輪數、
+`SG_FUZZ_SEED_BASE` 位移種子(第 i 輪用種子 base+i,失敗訊息會印出來,照著跑
+就能精確重現)、`SG_FUZZ_TIMEOUT` 調看門狗(預設 600 秒,把卡死轉成乾淨失敗)。
+`SG_FUZZ_BIG=1` 額外跑一個會配置約 4 GB 的截斷回歸案例,預設關閉。
+
+**這兩支的鑑別力主要來自 sanitizer,不是斷言**——「拒絕荒謬大小」那類加固,
+加固前後的回傳值完全一樣(都是 -1,只是機制從顯式拒絕變成 malloc 失敗),
+只有在 ASan 底下才看得出差別。所以動到 `src/storage/pack.c` 或
+`src/index/index.c` 的解析路徑時,`make test` 綠**不算數**,要跑 `make sanitize`。
+細節與 mutation 驗證實測見 `docs/DESIGN.md` 的 Phase 10 段落。
 
 **完成標準**:`make` + `make test` + `bash tests/interop.sh` 全綠。動到
 `src/workdir/ignore.c` 或任一目錄走訪邏輯時,建議額外手動跑
@@ -113,7 +125,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 20 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 22 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。

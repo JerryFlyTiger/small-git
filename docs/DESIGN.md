@@ -187,3 +187,122 @@ matcher 的組合邊界。
 - **尚未做 delta base cache**。深 delta 鏈上的每一層都會重新解壓縮它的 base,深度 N 的鏈成本是 O(N²)。git 用 `core.deltaBaseCacheLimit`(預設 96MiB)處理這件事。目前的量測顯示這不是主要瓶頸,但在 `--aggressive` 打包過的 repo 上做大量 checkout 時會浮現。
 - **commit-graph 與 multi-pack-index 尚未實作**。原路線圖把它們列在 Phase 7;實測顯示物件存取層修好之後,`sg log` 已與 `git log` 同級,commit-graph 的邊際效益因此大幅下降,留待有實際需求(例如 `--graph`、大量 merge-base 查詢)時再評估。
 - **寫入端仍不產生 >2GB 的 pack**。讀取已支援 large-offset,寫入遇到需要它的情況會明確報錯而非產生壞檔。
+
+## Phase 10:二進位解析器的 fuzzing —— 攻擊面、發現與已知限制
+
+`sg` 會解析兩類**不可信的二進位輸入**:從網路收到的 packfile 與 `.idx`,以及
+磁碟上的 index v2。過去每次為這個專案手工合成惡意 pack 都會挖到真 bug
+(Phase 5a 的 REF_DELTA 環造成 stack overflow、Phase 7a 的 missing-base
+REF_DELTA 造成 use-after-free),所以把它系統化成常設的 fuzz harness。
+
+新增 `tests/test_fuzz_pack.c` 與 `tests/test_fuzz_index.c`,照既有測試慣例
+(無框架、`CHECK` 巨集、丟進 `tests/` 就被 `Makefile:48` 自動收集)。
+
+### 為什麼不能照抄 `tests/fuzz_ignore.py` 的形狀
+
+`fuzz_ignore.py` 是**差分測試**:拿真 `git` 當 oracle,比對語意分歧。二進位
+解析器要抓的是**記憶體安全問題**,而這裡沒有天然的 oracle——把同一份損毀資料
+餵給真 git,git 只會說「index 損毀」,不會告訴你 `sg` 有沒有越界。所以這兩支
+改成 in-process 的 C harness,鑑別力來自 sanitizer 而不是比對。CI 的接法也
+因此不同:`fuzz-ignore` job 是純 `make`,而這兩支真正有牙齒的地方是
+`sanitizers` job(見下方「哪些修法真的有回歸保護」)。
+
+### 兩個決定成敗的設計限制
+
+1. **破壞位元組後必須重算 trailer SHA-1**。`sg_index_read` 在解析任何 entry
+   **之前**就先驗全檔 checksum,pack 也一樣。純隨機 bit-flip 會 100% 卡在
+   checksum,永遠打不到後面的解析邏輯——那會是一支「看起來在 fuzz、其實什麼
+   都沒測到」的測試。
+2. **每輪要用全新的 `mkdtemp` git_dir**。pack registry 以 `git_dir` 為 key、
+   靠目錄 mtime 判斷是否重掃,而 `st_mtime` 只有秒級解析度;同一個 git_dir 在
+   一秒內反覆換 pack 內容會讀到 stale cache,測試就會假綠。
+
+### 找到並修掉的缺陷
+
+| # | 位置 | 問題 |
+|---|---|---|
+| 1 | `index.c` 三處錯誤路徑 | 整個 index 檔的 `buf` 沒釋放 |
+| 2 | `index.c` 的 `padded_len` 檢查 | `free_entries(entries, i)` 上界不含當前 entry,剛 malloc 的 path 漏掉 |
+| 3 | `index.c` 的 `nentries` | 攻擊者可控的 u32 直接當 malloc 大小,無上限 |
+| 4 | `pack_inflate` | `strm.avail_out = (uInt)expected_len` 把 64-bit size varint 截成 32-bit |
+| 5 | `read_entry_at` 等五處 | 宣告的解壓大小未與可用壓縮位元組數對照就 malloc |
+| 6 | `sg_pack_delta_apply` | target size 是**已解壓 delta stream** 裡的獨立 varint,不受 5 的檢查管轄 |
+
+缺陷 1、2 之所以長期存在,是因為 CI 的 ASan 為了容忍兩個 process 生命週期的
+快取而全域關掉了 leak detection——等於洩漏偵測有個大洞。
+
+缺陷 4 是唯一的記憶體**內容**安全問題(其餘是資源耗盡):宣告大小 `2^32+5`
+時 `avail_out` 被截成 5,壓縮流只要恰好解出 5 bytes,zlib 就回報成功,而呼叫端
+用的是未截斷的 `size`,於是回傳一個「宣告 4 GB、實際只有 5 個 byte 有效、
+其餘全是未初始化記憶體」的物件。修法是把 zlib 的餵料改成分塊,並加一道
+「本輪 `total_in`/`total_out` 都沒動就判定卡住」的獨立防線——這個迴圈在處理
+不可信輸入,卡死就是 DoS,不該把安全性外包給對 zlib 隱性契約的信任。
+
+### 壓縮比界限的實測
+
+缺陷 5、6 的修法都是「宣告大小 vs. 可用位元組數」的合理性檢查。pack 這邊用
+DEFLATE 的理論最大壓縮比。理論硬上限是 **1032:1**(258 bytes ÷ 2 bits),但
+實測真 zlib 對 8 MB 全零檔達到 **1026.8:1**(`git verify-pack -v` 量到
+size=8000000 / packed=7791),距離上限只剩 **0.45%**——而 pack 裡**最後一個**
+物件的可用位元組數幾乎等於它自己的壓縮大小,正是最緊的情況。1032 在數學上
+確實不會誤殺,但這種邊際沒有工程餘裕,因此常數放寬到 `1032 * 4`。這不損害
+檢查的目的:它要擋的是差了好幾個數量級的荒謬值(例如宣告 4 GB 卻只有 33
+bytes 可用)。
+
+`sg_pack_delta_apply` 不能用壓縮比,因為 target size 不是壓縮流的解壓結果,
+而是 copy/insert 指令重建出來的。界限改由指令流推導:一個 copy opcode byte
+最多帶出 65536 bytes,所以 target size 不可能超過「剩餘 delta 位元組數 ×
+65536」。
+
+### 哪些修法真的有回歸保護(mutation 驗證實測)
+
+逐一破壞每處修法、看對應測試會不會紅。**這一步由主對話執行,不交給寫測試的
+人自己驗**:
+
+| 破壞的地方 | 普通建置 | ASan 建置 |
+|---|---|---|
+| 拿掉錯誤路徑的 `free(buf)` | **紅** | — |
+| `free_entries(i + 1)` 改回 `(i)` | **紅** | — |
+| 拿掉 `nentries` 上限 | 綠 | 綠 |
+| `decompressed_size_is_plausible` 恆真 | 綠 | **紅**(19 TB 配置請求) |
+| 拿掉 delta target 界限 | 綠 | **紅**(545 TB 配置請求) |
+| 還原 `pack_inflate` 的 chunking | **紅** | — |
+| 同時拿掉 `pack_inflate` 的兩個 guard | **紅**(看門狗) | — |
+
+最後一列原本是**卡死**而不是紅燈——`fork()` + `alarm()` 只保護了單一呼叫點,
+同一個二進位裡其他呼叫點照樣會無限期停住,而 GitHub Actions 的 job 預設
+timeout 是 6 小時。因此兩支 fuzzer 的 `main()` 都裝了整體看門狗
+(`SG_FUZZ_TIMEOUT`,預設 600 秒),把任何位置的卡死轉成帶診斷訊息的非 0 退出。
+
+⚠ **做 mutation 驗證時每次都要 `make clean`**。第一次跑這張表時出現「還原修法
+後測試仍然紅」的詭異結果,查下來是增量重建沒有正確反映還原(object 檔不記錄
+自己是從哪個版本編來的,見 `Makefile:76-80`),clean 重建後兩個方向都正常。
+差點把自己的建置殘留誤判成測試不穩定。
+
+重點結論:**「拒絕荒謬大小」這類加固,回傳值與未加固版本完全相同**(都是
+-1,只是機制從顯式拒絕變成 malloc 失敗),透過公開 API 根本觀察不到差別。
+它們的鑑別力**只存在於 ASan 底下**——而且抓到它們的是隨機 fuzz 輪,不是手工
+構造的確定性測試。這也是為什麼 `sanitizers` job 裡加了一段長 campaign:那是
+這批加固唯一真正的守門員。
+
+### 已知限制
+
+- **`nentries` 上限沒有任何測試能分辨**。`0xFFFFFFFF × sizeof(sg_index_entry)`
+  約 344 GB,在 ASan 的 1 TB 配置上限之內,不會觸發 allocation-size-too-big;
+  普通建置下 malloc 失敗也一樣回 -1。這個檢查是 defense-in-depth,對應的測試
+  是 smoke test 而非鑑別性測試,已在測試註解裡明講,不假裝它守得住東西。
+- **macOS 完全不支援 LeakSanitizer**(指定 `detect_leaks=1` 會直接 abort,不是
+  「預設不啟用」)。洩漏偵測因此靠 `test_index_fail_path_leak` 的 RSS 探針,
+  而 ASan 的配置器 quarantine 會扣住已釋放的 chunk 撐大 RSS 造成偽陽性,所以
+  該探針在 ASan 建置下自我停用。結果是洩漏與記憶體安全兩種偵測分屬不同的 CI
+  job,不能只看其中一個。**更根本的問題是 CI 全域關掉了 `detect_leaks`,所以
+  除了 index 那一條失敗路徑之外,這個專案至今沒有任何自動化的洩漏偵測**——
+  缺陷 1、2 能存活這麼久就是這個原因。當初關掉它的理由是「pack registry 與
+  chunk keepalive 是刻意不釋放的 process 生命週期快取,會被誤報」,但那個前提
+  **很可能不成立**:兩者都掛在全域指標下(`pack.c:498`、`chunk.c:744`),而
+  LeakSanitizer 的可達性分析把全域變數當 root,仍然可達的記憶體本來就不會被
+  判定成 leak。也就是說在 Linux CI 上直接開 `detect_leaks=1` 有相當機會直接
+  通過,連抑制檔都不必寫。這是一次 CI 就能驗證的事,本機(macOS)測不到。
+- **只有 pack/idx/index 三個解析器被覆蓋**。`sg_decompress`
+  (`src/util/zutil.c`,loose object 的解壓路徑)是「每次滿了就 `cap*2`」的
+  無界成長,沒有輸出長度上限,是同類的 zip-bomb 攻擊面,但不在這次範圍內。
