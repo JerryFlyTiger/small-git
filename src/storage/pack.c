@@ -55,6 +55,55 @@ static void put_be32(unsigned char *p, uint32_t v)
     p[3] = (unsigned char)v;
 }
 
+/* DEFLATE's worst-case compression ratio is documented (zlib FAQ,
+   http://zlib.net/zlib_faq.html#faq37) as roughly 1032:1 in the most
+   favorable case -- a maximally repetitive input can shrink to about
+   1/1032 of its decompressed size, but never further. A declared
+   decompressed size that is vastly larger than that ratio relative to the
+   compressed bytes actually available to inflate from cannot be a real
+   deflate stream: it is proof of a corrupt/hostile size field. Rejecting
+   it before the malloc() it would otherwise size matters because plain
+   libc malloc typically just returns NULL for an absurd request (which
+   every call site here already handles), but AddressSanitizer's allocator
+   aborts the whole process outright for allocations past its configured
+   maximum -- confirmed via SG_FUZZ_BIG=1 build/tests/test_fuzz_pack under
+   ASan. `avail` is generously the whole remaining byte range available to
+   the inflate call (it also covers zlib's 2-byte header and 4-byte Adler
+   trailer, neither of which contributes to the ratio), so this bound is
+   deliberately loose in the safe direction: it can only reject sizes that
+   are already impossible, never a legitimate one.
+
+   1032 is the theoretical hard ceiling, but real zlib gets close enough to
+   it that using 1032 itself as the cutoff leaves essentially no engineering
+   margin: measured directly (8,000,000 bytes of all-zero input, real zlib,
+   `git verify-pack -v`: size=8000000 packed=7791), real zlib reached
+   1026.8:1 -- within 0.45% of the 1032 ceiling. That's the *last* object in
+   a pack, which is exactly the tightest case (its `avail` is essentially
+   just its own compressed size, with nothing past it to pad the bound), so
+   a real, honestly-produced pack can plausibly land within a hair of 1032
+   with no attacker involved at all. Multiplying the ceiling out here doesn't
+   weaken what this check is actually for: it exists to catch declared sizes
+   that are wrong by orders of magnitude (e.g. a few dozen available bytes
+   claiming a multi-GB result), and a 4x margin makes no difference to
+   catching those while giving genuine near-worst-case-ratio input the room
+   the 0.45% measurement above shows it needs. */
+#define SG_PACK_MAX_INFLATE_RATIO (1032 * 4)
+
+static int decompressed_size_is_plausible(uint64_t size, size_t avail)
+{
+    if (size == 0)
+        return 1;
+    if (avail == 0)
+        return 0;
+    /* avail this large is already astronomically outside anything a real
+       pack file could be (it would itself need to not fit in memory many
+       times over); treat it as "no useful bound available" rather than
+       risk overflowing the multiplication. */
+    if (avail > (size_t)(UINT64_MAX / SG_PACK_MAX_INFLATE_RATIO))
+        return 1;
+    return size <= (uint64_t)avail * SG_PACK_MAX_INFLATE_RATIO;
+}
+
 /* ---- variable-length encodings (see docs/pack format notes in the task spec) ---- */
 
 /* Entry header: bit7 of each byte is a continuation flag. First byte carries
@@ -185,9 +234,48 @@ int sg_pack_delta_apply(const unsigned char *base, size_t base_len, const unsign
     /* hdr_target_size is delta-stream-controlled. On a build where size_t is
        narrower than uint64_t, casting it below would truncate the allocation
        while the bounds checks further down keep using the full 64-bit value
-       -- a heap overflow. Reject anything size_t can't represent. */
+       -- a heap overflow. Reject anything size_t can't represent. (On a
+       64-bit build size_t and uint64_t are the same width, so this specific
+       comparison is always false there -- the check right below is what
+       actually bounds hdr_target_size on such builds.) */
     if (hdr_target_size > (uint64_t)SIZE_MAX)
         return -1;
+
+    /* hdr_target_size is an independent varint read from the *decompressed*
+       delta instruction stream -- a completely different field from the pack
+       entry header's own declared size, which decompressed_size_is_plausible
+       (above, near SG_PACK_MAX_INFLATE_RATIO) already checks pack_inflate's
+       output against. That check does not cover this one: a delta entry can
+       decompress to a tiny instruction stream (a few dozen bytes) that still
+       declares a target_size near UINT64_MAX right here, driving the malloc
+       below to an enormous request -- under AddressSanitizer that aborts the
+       whole process rather than returning NULL, for the same reason
+       documented on SG_PACK_MAX_INFLATE_RATIO.
+
+       Bound it using the instructions that remain to actually produce it:
+       every byte of the delta stream from this point on can encode at most
+       65536 bytes of reconstructed output. That maximum is hit by a copy
+       opcode consisting of nothing but its mandatory opcode byte (0x80) --
+       every offset/size byte omitted, per the decoding below, means offset 0
+       and size 65536 -- the highest output-per-input-byte ratio any
+       instruction in this format can achieve; an insert instruction, by
+       contrast, needs a full data byte per output byte. So the reconstructed
+       target can never exceed (bytes remaining after the two size varints)
+       * 65536; anything larger proves hdr_target_size is corrupt/hostile,
+       independent of whatever the pack entry header itself declared. */
+    {
+        uint64_t remaining = (uint64_t)(delta_len - pos);
+        uint64_t max_target;
+
+        if (remaining > UINT64_MAX / 0x10000)
+            max_target = UINT64_MAX; /* remaining this large already can't be
+                                         a real in-memory delta stream */
+        else
+            max_target = remaining * 0x10000;
+
+        if (hdr_target_size > max_target)
+            return -1;
+    }
 
     result = malloc(hdr_target_size > 0 ? (size_t)hdr_target_size : 1);
     if (result == NULL)
@@ -278,31 +366,115 @@ fail:
    off strm.avail_in afterwards to learn how many pack bytes the entry's
    compressed data actually occupied -- needed to locate the next entry and
    to compute the idx CRC32 span. */
+/* zlib's avail_in/avail_out are 32-bit uInt, but src_avail/expected_len are
+   size_t and can exceed UINT32_MAX (a pack file can be >4GB, and a crafted
+   object header can declare a decompressed size up to 2^64-1). Feeding
+   either straight to zlib truncates it mod 2^32: for avail_in that's only a
+   spurious failure (the pack genuinely is that large), but for avail_out
+   it's a real bug -- if the compressed stream happens to produce exactly
+   `expected_len mod 2^32` bytes, zlib reports Z_STREAM_END with avail_out
+   == 0 (success) while the caller goes on to trust the full, untruncated
+   `expected_len` as the object's size. So both are fed in chunks no larger
+   than this, refilled as zlib consumes/produces them, until the real
+   (untruncated) amounts are exhausted. */
+#define SG_PACK_INFLATE_CHUNK ((size_t)1 << 30)
+
 static int pack_inflate(const unsigned char *src, size_t src_avail, size_t expected_len,
                         unsigned char *out_buf, size_t *consumed_out)
 {
     z_stream strm;
     int zret;
+    size_t in_remaining = src_avail;
+    size_t out_remaining = expected_len;
 
     memset(&strm, 0, sizeof(strm));
     if (inflateInit(&strm) != Z_OK)
         return -1;
 
     strm.next_in = (unsigned char *)src;
-    strm.avail_in = (uInt)src_avail;
+    strm.avail_in = (uInt)(in_remaining < SG_PACK_INFLATE_CHUNK ? in_remaining
+                                                                : SG_PACK_INFLATE_CHUNK);
+    in_remaining -= strm.avail_in;
     strm.next_out = out_buf;
-    strm.avail_out = (uInt)expected_len;
+    strm.avail_out = (uInt)(out_remaining < SG_PACK_INFLATE_CHUNK ? out_remaining
+                                                                  : SG_PACK_INFLATE_CHUNK);
+    out_remaining -= strm.avail_out;
 
-    do {
+    for (;;) {
+        uLong prev_total_in = strm.total_in;
+        uLong prev_total_out = strm.total_out;
+
         zret = inflate(&strm, Z_FINISH);
-    } while (zret == Z_OK && strm.avail_out > 0);
 
-    if (zret != Z_STREAM_END || strm.avail_out != 0) {
+        if (zret == Z_STREAM_END)
+            break;
+        if (zret != Z_OK && zret != Z_BUF_ERROR) {
+            inflateEnd(&strm);
+            return -1;
+        }
+
+        /* Defense-in-depth, not a response to any observed zlib misbehavior:
+           the two escape checks below (out-of-output-space,
+           out-of-input-with-nothing-to-refill) are only a complete guard
+           against this loop spinning forever if a call to inflate() always
+           either finishes the stream or makes some progress (consumes input
+           or produces output) whenever it's given avail_in>0 and
+           avail_out>0. That contract lives in zlib's documentation, not in
+           this file's type system, and this loop's whole job is to keep
+           decoding untrusted pack bytes safely -- a hostile/corrupt input
+           spinning this loop forever is a clean DoS, so it shouldn't rest on
+           trusting an external library's behavior implicitly. Catch it
+           directly: if neither total_in nor total_out moved this iteration
+           and the stream didn't just finish, something is stuck. */
+        if (strm.total_in == prev_total_in && strm.total_out == prev_total_out) {
+            inflateEnd(&strm);
+            return -1;
+        }
+
+        /* Ran out of declared output space without the stream finishing.
+           This covers two cases: a genuine overflow (the real decompressed
+           data is longer than the declared size) and the degenerate
+           expected_len == 0 case, where avail_out is 0 from the very first
+           call and can never become nonzero again -- without this check
+           that case spins inflate() forever (Z_OK/Z_BUF_ERROR, no possible
+           progress, no refill ever happens since out_remaining never grows
+           past 0). Both are decode errors. */
+        if (strm.avail_out == 0 && out_remaining == 0) {
+            inflateEnd(&strm);
+            return -1;
+        }
+        /* Ran out of input with none left to refill, but the stream isn't
+           done -- truncated/malformed compressed data. */
+        if (strm.avail_in == 0 && in_remaining == 0) {
+            inflateEnd(&strm);
+            return -1;
+        }
+
+        if (strm.avail_in == 0) {
+            strm.avail_in = (uInt)(in_remaining < SG_PACK_INFLATE_CHUNK ? in_remaining
+                                                                        : SG_PACK_INFLATE_CHUNK);
+            in_remaining -= strm.avail_in;
+        }
+        if (strm.avail_out == 0) {
+            strm.avail_out = (uInt)(out_remaining < SG_PACK_INFLATE_CHUNK
+                                        ? out_remaining
+                                        : SG_PACK_INFLATE_CHUNK);
+            out_remaining -= strm.avail_out;
+        }
+    }
+
+    /* Must have exactly consumed all of expected_len's worth of output and
+       ended cleanly, with no output capacity left unused (mirrors the
+       original single-shot check's `strm.avail_out != 0` half). */
+    if (strm.avail_out != 0 || out_remaining != 0) {
         inflateEnd(&strm);
         return -1;
     }
 
-    *consumed_out = src_avail - strm.avail_in;
+    /* Bytes of src actually consumed: total offered so far (src_avail minus
+       whatever chunk-in-flight remains unqueued) minus whatever zlib still
+       has sitting in avail_in. */
+    *consumed_out = (src_avail - in_remaining) - strm.avail_in;
     inflateEnd(&strm);
     return 0;
 }
@@ -393,6 +565,8 @@ static int read_entry_at(const char *git_dir, const unsigned char *pack_data, si
             pos += SG_SHA1_RAW_LEN;
         }
 
+        if (!decompressed_size_is_plausible(size, pack_len - pos))
+            return -1;
         delta_data = malloc(size > 0 ? (size_t)size : 1);
         if (delta_data == NULL)
             return -1;
@@ -441,6 +615,8 @@ static int read_entry_at(const char *git_dir, const unsigned char *pack_data, si
         if (pack_type_to_obj_type(raw_type, &mapped) != 0)
             return -1;
 
+        if (!decompressed_size_is_plausible(size, pack_len - pos))
+            return -1;
         content = malloc(size > 0 ? (size_t)size : 1);
         if (content == NULL)
             return -1;
@@ -1386,6 +1562,12 @@ static int idx_build_resolve(idx_build_ctx *ctx, size_t idx, int depth)
             }
         }
 
+        if (!decompressed_size_is_plausible((uint64_t)m->decompressed_size,
+                                            ctx->pack_len - m->data_offset)) {
+            if (base_is_external)
+                free(base_content);
+            return -1;
+        }
         delta_data = malloc(m->decompressed_size > 0 ? m->decompressed_size : 1);
         if (delta_data == NULL) {
             if (base_is_external)
@@ -1414,6 +1596,9 @@ static int idx_build_resolve(idx_build_ctx *ctx, size_t idx, int depth)
         size_t consumed;
 
         if (pack_type_to_obj_type(m->raw_type, &t) != 0)
+            return -1;
+        if (!decompressed_size_is_plausible((uint64_t)m->decompressed_size,
+                                            ctx->pack_len - m->data_offset))
             return -1;
         content = malloc(m->decompressed_size > 0 ? m->decompressed_size : 1);
         if (content == NULL)
@@ -1584,6 +1769,13 @@ int sg_pack_index_existing(const char *pack_path)
         }
 
         data_offset = pos;
+        if (!decompressed_size_is_plausible(size, pack_len - data_offset)) {
+            fprintf(stderr,
+                   "sg: %s: declared decompressed size %llu implausible for %zu compressed "
+                   "bytes available at %zu\n",
+                   pack_path, (unsigned long long)size, pack_len - data_offset, start);
+            goto done;
+        }
         scratch = malloc(size > 0 ? (size_t)size : 1);
         if (scratch == NULL)
             goto done;

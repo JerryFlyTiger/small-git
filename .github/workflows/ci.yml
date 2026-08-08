@@ -108,6 +108,22 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
 
+      # `make sanitize` already ran both parser fuzzers once, but only at the
+      # small default round count that keeps `make test` fast. The sanitized
+      # binaries are still sitting in build/tests, so a longer campaign here
+      # costs nothing but time -- and this is the only place the pack/index
+      # parsers get fuzzed with ASan and UBSan actually watching. Seeds are
+      # offset by the run number so each CI run explores fresh territory
+      # rather than re-running the same inputs forever.
+      - name: Fuzz the parsers under sanitizers
+        run: |
+          SG_FUZZ_ITERS=5000 build/tests/test_fuzz_pack
+          SG_FUZZ_ITERS=20000 build/tests/test_fuzz_index
+        env:
+          SG_FUZZ_SEED_BASE: ${{ github.run_number }}00000
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+
   fuzz-ignore:
     name: gitignore conformance fuzzer
     runs-on: ubuntu-latest
@@ -127,3 +143,38 @@ jobs:
       # matcher or either walker, which meant it was routinely skipped.
       - name: Run fuzz_ignore.py
         run: python3 tests/fuzz_ignore.py
+
+  # Long-running campaign for the binary parsers that consume untrusted input:
+  # packfiles and .idx files arriving over the network, and the on-disk index.
+  # Deliberately a plain (non-sanitized) build, which is not a weaker version
+  # of the sanitizers job but a different check: test_fuzz_index's leak probe
+  # measures peak RSS across repeated failed parses, and ASan's allocator
+  # quarantine inflates RSS enough to make that reading meaningless -- so the
+  # probe disables itself under ASan and this is the only job where it runs.
+  # Memory-safety coverage for these same parsers lives in the sanitizers job.
+  fuzz-parse:
+    name: packfile / index parser fuzzer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config clang zlib1g-dev libssl-dev libcurl4-openssl-dev
+
+      - name: Build
+        run: make build/tests/test_fuzz_pack build/tests/test_fuzz_index
+
+      # Round i is seeded by SG_FUZZ_SEED_BASE + i through the fuzzers' own
+      # xorshift64 PRNG, so a failure here reproduces exactly by re-running
+      # with the seed base printed in the log.
+      - name: Fuzz the packfile / idx parser
+        run: SG_FUZZ_ITERS=20000 build/tests/test_fuzz_pack
+        env:
+          SG_FUZZ_SEED_BASE: ${{ github.run_number }}00000
+
+      - name: Fuzz the index v2 parser
+        run: SG_FUZZ_ITERS=100000 build/tests/test_fuzz_index
+        env:
+          SG_FUZZ_SEED_BASE: ${{ github.run_number }}00000
