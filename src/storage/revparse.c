@@ -1,0 +1,200 @@
+#include "sg/revparse.h"
+
+#include "sg/object.h"
+#include "sg/objstore.h"
+#include "sg/refs.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define SG_REVPARSE_PATH_MAX 4096
+
+/* An annotated tag can (maliciously or accidentally) point at another tag,
+   including itself; this bounds how many "object" hops sg_rev_parse_commit
+   will follow before giving up, so a cycle fails cleanly instead of
+   spinning forever. No real repository nests tags anywhere close to this
+   deep. */
+#define SG_REVPARSE_MAX_TAG_HOPS 10
+
+/* Follows tag objects (via sg_tag's `object` field) starting at id until a
+   non-tag object is reached, overwriting id in place. *type_out receives
+   the final object's type. Returns 0 on success, -1 if any object along
+   the chain is unreadable/malformed or the chain is too deep. */
+static int peel_to_non_tag(const char *git_dir, unsigned char id[SG_SHA1_RAW_LEN], sg_obj_type *type_out)
+{
+    int hops;
+
+    for (hops = 0;; hops++) {
+        sg_obj_type type;
+        unsigned char *content;
+        size_t content_len;
+
+        if (sg_object_read(git_dir, id, &type, &content, &content_len) != 0)
+            return -1;
+        if (type != SG_OBJ_TAG) {
+            free(content);
+            *type_out = type;
+            return 0;
+        }
+        if (hops >= SG_REVPARSE_MAX_TAG_HOPS) {
+            free(content);
+            return -1;
+        }
+        {
+            sg_tag tag;
+
+            if (sg_tag_parse(content, content_len, &tag) != 0) {
+                free(content);
+                return -1;
+            }
+            free(content);
+            memcpy(id, tag.object, SG_SHA1_RAW_LEN);
+            sg_tag_free(&tag);
+        }
+    }
+}
+
+/* Reads the commit at id and copies its Nth parent (1-based) into out.
+   `out` may alias `id`. Returns -1 if id isn't a commit, or has fewer than
+   N parents. */
+static int commit_nth_parent(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
+                             unsigned long n, unsigned char out[SG_SHA1_RAW_LEN])
+{
+    sg_obj_type type;
+    unsigned char *content;
+    size_t content_len;
+    sg_commit commit;
+
+    if (n == 0)
+        return -1;
+    if (sg_object_read(git_dir, id, &type, &content, &content_len) != 0)
+        return -1;
+    if (type != SG_OBJ_COMMIT) {
+        free(content);
+        return -1;
+    }
+    if (sg_commit_parse(content, content_len, &commit) != 0) {
+        free(content);
+        return -1;
+    }
+    free(content);
+    if (n > (unsigned long)commit.parent_count) {
+        sg_commit_free(&commit);
+        return -1;
+    }
+    memcpy(out, commit.parents[n - 1], SG_SHA1_RAW_LEN);
+    sg_commit_free(&commit);
+    return 0;
+}
+
+/* Parses the (possibly empty) run of decimal digits [s, s+len) that follows
+   a '~' or '^'. An empty run means the implicit N=1. Longer than 9 digits
+   is rejected outright -- no real history is anywhere near that deep, and
+   it keeps the accumulation below comfortably under overflow regardless of
+   `unsigned long`'s width. */
+static int parse_suffix_number(const char *s, size_t len, unsigned long *out)
+{
+    size_t i;
+    unsigned long v = 0;
+
+    if (len == 0) {
+        *out = 1;
+        return 0;
+    }
+    if (len > 9)
+        return -1;
+    for (i = 0; i < len; i++) {
+        if (s[i] < '0' || s[i] > '9')
+            return -1;
+        v = v * 10 + (unsigned long)(s[i] - '0');
+    }
+    *out = v;
+    return 0;
+}
+
+/* Resolves just the <base> part of the grammar (see revparse.h) to a raw
+   object id, trying HEAD, then tag, then branch, then a literal 40-hex
+   sha1, in that order -- the first that matches wins. This is real git's
+   own gitrevisions disambiguation order (refs/<name> -> refs/tags/<name> ->
+   refs/heads/<name> -> ...), measured against real git: with a branch and
+   a tag both named "foo", `git rev-parse foo` resolves to the TAG's
+   target (with a "refname is ambiguous" warning), not the branch's --
+   tag beats branch, not the other way around. Does not peel tags or apply
+   ~/^ suffixes. Returns 0 on success. */
+static int resolve_base(const char *git_dir, const char *base, unsigned char id_out[SG_SHA1_RAW_LEN])
+{
+    char ref_path[SG_REVPARSE_PATH_MAX];
+
+    if (strcmp(base, "HEAD") == 0)
+        return sg_ref_resolve_head(git_dir, id_out);
+
+    if (snprintf(ref_path, sizeof(ref_path), "refs/tags/%s", base) < (int)sizeof(ref_path) &&
+       sg_ref_read_path(git_dir, ref_path, id_out) == 0)
+        return 0;
+
+    if (sg_ref_read_branch(git_dir, base, id_out) == 0)
+        return 0;
+
+    if (strlen(base) == SG_SHA1_HEX_LEN && sg_hex_to_sha1(base, id_out) == 0)
+        return 0;
+
+    return -1;
+}
+
+int sg_rev_parse_commit(const char *git_dir, const char *rev,
+                        unsigned char commit_id_out[SG_SHA1_RAW_LEN])
+{
+    char base[SG_REVPARSE_PATH_MAX];
+    unsigned char id[SG_SHA1_RAW_LEN];
+    sg_obj_type type;
+    size_t base_len;
+    size_t pos;
+
+    if (rev == NULL || rev[0] == '\0')
+        return -1;
+
+    base_len = 0;
+    while (rev[base_len] != '\0' && rev[base_len] != '~' && rev[base_len] != '^')
+        base_len++;
+    if (base_len == 0 || base_len >= sizeof(base))
+        return -1;
+    memcpy(base, rev, base_len);
+    base[base_len] = '\0';
+
+    if (resolve_base(git_dir, base, id) != 0)
+        return -1;
+    if (peel_to_non_tag(git_dir, id, &type) != 0)
+        return -1;
+    if (type != SG_OBJ_COMMIT)
+        return -1;
+
+    pos = base_len;
+    while (rev[pos] != '\0') {
+        char op = rev[pos];
+        size_t start;
+        unsigned long n;
+
+        pos++;
+        start = pos;
+        while (rev[pos] != '\0' && rev[pos] != '~' && rev[pos] != '^')
+            pos++;
+        if (parse_suffix_number(rev + start, pos - start, &n) != 0)
+            return -1;
+
+        if (op == '~') {
+            unsigned long k;
+
+            for (k = 0; k < n; k++) {
+                if (commit_nth_parent(git_dir, id, 1, id) != 0)
+                    return -1;
+            }
+        } else { /* '^' */
+            if (n != 0 && commit_nth_parent(git_dir, id, n, id) != 0)
+                return -1;
+        }
+    }
+
+    memcpy(commit_id_out, id, SG_SHA1_RAW_LEN);
+    return 0;
+}

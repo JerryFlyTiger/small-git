@@ -12,6 +12,21 @@
    check. */
 int sg_ref_branch_name_is_safe(const char *name);
 
+/* The subset of git-check-ref-format rules that git enforces when CREATING a
+   ref, measured against real git (leading '-', "a..b", "a b", "a.lock",
+   "HEAD", "a/", "@{x}" all rejected there). Strictly stricter than
+   sg_ref_branch_name_is_safe above, which only guards against path
+   traversal and is applied to every ref access (existing refs, however they
+   got that name, must still list/read/delete); this one is applied only at
+   creation time (sg branch <name>, and later sg tag <name>), so a
+   pre-existing ref that wouldn't pass this check today is still reachable.
+   Distinct again from sg_ref_name_is_safe in transport.h, which validates a
+   REMOTE-advertised full ref path (must start with "refs/") before it is
+   used to build a filesystem path during fetch/push -- that one guards
+   against a hostile server, this one against a local user typo. Returns
+   non-zero if name would be accepted as a new branch/tag name. */
+int sg_ref_name_valid_for_create(const char *name);
+
 /* Resolves HEAD -> refs/heads/<branch> -> that branch's current commit id.
    Returns -1 if the branch has no commits yet (a brand new repo) -- callers
    should treat that as "no parent commit", not an error. */
@@ -71,5 +86,15 @@ int sg_ref_list_branches(const char *git_dir, char ***names_out, size_t *count_o
    Returns 0 on success, 1 if the branch did not exist, -1 on an unsafe name
    or I/O error. */
 int sg_ref_delete_branch(const char *git_dir, const char *branch);
+
+/* Generalizations of sg_ref_list_branches / sg_ref_delete_branch to an
+   arbitrary ref namespace prefix (e.g. "refs/heads/" or "refs/tags/"),
+   for callers (sg tag, in a later phase) that need the same loose+packed
+   merge/purge logic but under a different subtree. prefix must end in '/'.
+   Same semantics, output conventions, and loose-wins-over-packed precedence
+   as the branch-specific versions, which are now thin wrappers around
+   these with prefix "refs/heads/". */
+int sg_ref_list_under(const char *git_dir, const char *prefix, char ***names_out, size_t *count_out);
+int sg_ref_delete_under(const char *git_dir, const char *prefix, const char *name);
 
 #endif

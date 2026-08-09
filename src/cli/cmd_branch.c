@@ -12,39 +12,6 @@
 
 static const char USAGE[] = "usage: sg branch [-d|--delete] [--force|-f] [--] [<name>]\n";
 
-/* Stricter than sg_ref_branch_name_is_safe, and applied only when CREATING a
-   branch: existing refs, however they were named, must still list and delete.
-   This is the subset of git-check-ref-format rules measured against real git
-   (leading '-', "a..b", "a b", "a.lock", "HEAD", "a/", "@{x}" all rejected
-   there). */
-static int branch_name_valid_for_create(const char *name)
-{
-    size_t len = strlen(name);
-    size_t i;
-
-    if (len == 0)
-        return 0;
-    if (name[0] == '-' || name[0] == '/')
-        return 0;
-    if (name[len - 1] == '/' || name[len - 1] == '.')
-        return 0;
-    if (strcmp(name, "HEAD") == 0)
-        return 0;
-    if (len >= 5 && strcmp(name + len - 5, ".lock") == 0)
-        return 0;
-    if (strstr(name, "//") != NULL || strstr(name, "..") != NULL ||
-       strstr(name, "@{") != NULL)
-        return 0;
-    for (i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)name[i];
-
-        if (c < 0x20 || c == 0x7f || c == ' ' || c == '\\' || c == '~' ||
-           c == '^' || c == ':' || c == '?' || c == '*' || c == '[')
-            return 0;
-    }
-    return 1;
-}
-
 static int list_branches(const char *git_dir)
 {
     char **names;
@@ -74,7 +41,7 @@ static int create_branch(const char *git_dir, const char *name)
     unsigned char head_id[SG_SHA1_RAW_LEN];
     char ref_path[4096];
 
-    if (!branch_name_valid_for_create(name)) {
+    if (!sg_ref_name_valid_for_create(name)) {
         fprintf(stderr, "sg: '%s' 不是有效的分支名稱\n", name);
         return 1;
     }

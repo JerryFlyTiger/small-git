@@ -23,6 +23,34 @@ int sg_ref_branch_name_is_safe(const char *name)
     return 1;
 }
 
+int sg_ref_name_valid_for_create(const char *name)
+{
+    size_t len = strlen(name);
+    size_t i;
+
+    if (len == 0)
+        return 0;
+    if (name[0] == '-' || name[0] == '/')
+        return 0;
+    if (name[len - 1] == '/' || name[len - 1] == '.')
+        return 0;
+    if (strcmp(name, "HEAD") == 0)
+        return 0;
+    if (len >= 5 && strcmp(name + len - 5, ".lock") == 0)
+        return 0;
+    if (strstr(name, "//") != NULL || strstr(name, "..") != NULL ||
+       strstr(name, "@{") != NULL)
+        return 0;
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)name[i];
+
+        if (c < 0x20 || c == 0x7f || c == ' ' || c == '\\' || c == '~' ||
+           c == '^' || c == ':' || c == '?' || c == '*' || c == '[')
+            return 0;
+    }
+    return 1;
+}
+
 static char *read_small_file(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -371,13 +399,15 @@ static int list_loose_branches(const char *dir_path, const char *rel_prefix, nam
 
 /* The enumerating sibling of read_packed_ref: same line grammar ('#' header
    comments, '^' peel lines, "<40-hex> <refname>"), but collecting every
-   refname under refs/heads/ instead of looking one up. */
-static int list_packed_branches(const char *git_dir, name_list *acc)
+   refname under prefix instead of looking one up. prefix must include the
+   trailing '/' (e.g. "refs/heads/"). */
+static int list_packed_under(const char *git_dir, const char *prefix, name_list *acc)
 {
     char path[SG_PATH_MAX];
     char *content;
     char *saveptr = NULL;
     char *line;
+    size_t prefix_len = strlen(prefix);
     int rc = 0;
 
     snprintf(path, sizeof(path), "%s/packed-refs", git_dir);
@@ -385,7 +415,7 @@ static int list_packed_branches(const char *git_dir, name_list *acc)
     if (content == NULL) {
         /* Missing packed-refs just means nothing is packed; a packed-refs
            that exists but cannot be read means the listing would silently
-           omit every packed branch, so that is an error instead. */
+           omit every packed ref under prefix, so that is an error instead. */
         return access(path, F_OK) != 0 ? 0 : -1;
     }
 
@@ -398,9 +428,8 @@ static int list_packed_branches(const char *git_dir, name_list *acc)
         space = strchr(line, ' ');
         if (space == NULL || (size_t)(space - line) != SG_SHA1_HEX_LEN)
             continue;
-        if (strncmp(space + 1, BRANCH_PREFIX, strlen(BRANCH_PREFIX)) == 0 &&
-           space[1 + strlen(BRANCH_PREFIX)] != '\0')
-            rc = name_list_push(acc, space + 1 + strlen(BRANCH_PREFIX));
+        if (strncmp(space + 1, prefix, prefix_len) == 0 && space[1 + prefix_len] != '\0')
+            rc = name_list_push(acc, space + 1 + prefix_len);
     }
     free(content);
     return rc;
@@ -411,19 +440,26 @@ static int name_cmp(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-int sg_ref_list_branches(const char *git_dir, char ***names_out, size_t *count_out)
+int sg_ref_list_under(const char *git_dir, const char *prefix, char ***names_out, size_t *count_out)
 {
-    char heads_path[SG_PATH_MAX];
+    char dir_path[SG_PATH_MAX];
     name_list acc = {NULL, 0, 0};
+    size_t prefix_len = strlen(prefix);
     size_t i;
     size_t out_n;
 
     *names_out = NULL;
     *count_out = 0;
 
-    snprintf(heads_path, sizeof(heads_path), "%s/refs/heads", git_dir);
-    if (list_loose_branches(heads_path, "", &acc) != 0 ||
-       list_packed_branches(git_dir, &acc) != 0) {
+    /* prefix ends in '/'; strip it to get the on-disk directory to walk. */
+    if (prefix_len == 0 || prefix[prefix_len - 1] != '/')
+        return -1;
+    if (snprintf(dir_path, sizeof(dir_path), "%s/%.*s", git_dir, (int)(prefix_len - 1), prefix) >=
+       (int)sizeof(dir_path))
+        return -1;
+
+    if (list_loose_branches(dir_path, "", &acc) != 0 ||
+       list_packed_under(git_dir, prefix, &acc) != 0) {
         name_list_free(&acc);
         return -1;
     }
@@ -435,7 +471,7 @@ int sg_ref_list_branches(const char *git_dir, char ***names_out, size_t *count_o
 
     qsort(acc.names, acc.count, sizeof(char *), name_cmp);
 
-    /* A branch present both loose and packed appears twice under the same
+    /* A ref present both loose and packed appears twice under the same
        name; only the name is reported, so deduping adjacent entries after
        the sort is exactly the "loose wins" reader precedence. */
     out_n = 0;
@@ -451,13 +487,18 @@ int sg_ref_list_branches(const char *git_dir, char ***names_out, size_t *count_o
     return 0;
 }
 
-/* Rewrites packed-refs without refs/heads/<branch> (and without any peel
-   lines immediately following that entry). The rewrite is atomic -- filtered
-   content goes to a temp file in git_dir which is then rename()d over
-   packed-refs -- so a crash mid-delete can never leave a torn packed-refs.
-   Missing packed-refs, or one that doesn't list the branch, is success with
-   nothing to do. Returns 0 on success, -1 on I/O error. */
-static int packed_refs_remove(const char *git_dir, const char *branch)
+int sg_ref_list_branches(const char *git_dir, char ***names_out, size_t *count_out)
+{
+    return sg_ref_list_under(git_dir, BRANCH_PREFIX, names_out, count_out);
+}
+
+/* Rewrites packed-refs without prefix<name> (e.g. "refs/heads/"+"foo", and
+   without any peel lines immediately following that entry). The rewrite is
+   atomic -- filtered content goes to a temp file in git_dir which is then
+   rename()d over packed-refs -- so a crash mid-delete can never leave a torn
+   packed-refs. Missing packed-refs, or one that doesn't list the ref, is
+   success with nothing to do. Returns 0 on success, -1 on I/O error. */
+static int packed_refs_remove_under(const char *git_dir, const char *prefix, const char *name)
 {
     char path[SG_PATH_MAX];
     char tmp_path[SG_PATH_MAX];
@@ -480,9 +521,9 @@ static int packed_refs_remove(const char *git_dir, const char *branch)
         return access(path, F_OK) != 0 ? 0 : -1;
     }
 
-    /* branch comes from argv: a name long enough to truncate here would
+    /* name comes from argv: a name long enough to truncate here would
        make the filter below match (and drop) the WRONG packed line. */
-    if (snprintf(refname, sizeof(refname), "%s%s", BRANCH_PREFIX, branch) >= (int)sizeof(refname)) {
+    if (snprintf(refname, sizeof(refname), "%s%s", prefix, name) >= (int)sizeof(refname)) {
         free(content);
         return -1;
     }
@@ -533,7 +574,7 @@ static int packed_refs_remove(const char *git_dir, const char *branch)
 
     if (!removed) {
         unlink(tmp_path);
-        return 0; /* branch wasn't packed; leave packed-refs untouched */
+        return 0; /* ref wasn't packed; leave packed-refs untouched */
     }
     /* mkstemp creates the file 0600; packed-refs is world-readable in git
        repos, so restore the conventional mode before swapping it in. */
@@ -544,42 +585,57 @@ static int packed_refs_remove(const char *git_dir, const char *branch)
     return 0;
 }
 
-int sg_ref_delete_branch(const char *git_dir, const char *branch)
+int sg_ref_delete_under(const char *git_dir, const char *prefix, const char *name)
 {
     char path[SG_PATH_MAX];
+    char ref_path[SG_PATH_MAX];
+    unsigned char id[SG_SHA1_RAW_LEN];
+    struct stat st;
+    size_t prefix_len = strlen(prefix);
 
-    /* branch comes straight from argv -- same traversal concern as every
+    /* name comes straight from argv -- same traversal concern as every
        other function here. */
-    if (!sg_ref_branch_name_is_safe(branch))
+    if (!sg_ref_branch_name_is_safe(name) || prefix_len == 0 || prefix[prefix_len - 1] != '/')
         return -1;
 
-    if (!sg_ref_branch_exists(git_dir, branch))
+    if (snprintf(ref_path, sizeof(ref_path), "%s%s", prefix, name) >= (int)sizeof(ref_path))
+        return -1;
+    if (snprintf(path, sizeof(path), "%s/%s", git_dir, ref_path) >= (int)sizeof(path))
+        return -1;
+
+    /* Existence: a present loose file counts even before validating its
+       content (matching the previous branch-only sg_ref_branch_exists),
+       otherwise fall back to the packed store via sg_ref_read_path. */
+    if (!(stat(path, &st) == 0 && S_ISREG(st.st_mode)) &&
+       sg_ref_read_path(git_dir, ref_path, id) != 0)
         return 1;
 
     /* Purge BOTH stores. Unlinking only the loose file would resurrect the
-       branch from any stale packed-refs line (measured against real git:
+       ref from any stale packed-refs line (measured against real git:
        loose e6215c5 shadowing packed 72566fa came back at 72566fa); a
-       packed-only branch (post `git pack-refs`) has no loose file at all
-       and the rewrite below is the entire deletion. A branch name long
-       enough to truncate the path would aim unlink() at some OTHER file,
-       so refuse instead of truncating (the name comes from argv).
+       packed-only ref (post `git pack-refs`) has no loose file at all
+       and the rewrite below is the entire deletion. A name long enough to
+       truncate the path would aim unlink() at some OTHER file, so refuse
+       instead of truncating (the name comes from argv).
 
        Order matters: packed-refs FIRST, loose file second. Deleting the
        loose ref first and then failing the rewrite (ENOSPC, EROFS, a
        failed rename) would leave the stale packed entry exposed -- the
-       branch silently resurrects at an older commit on a path that reports
+       ref silently resurrects at an older commit on a path that reports
        failure to the caller, which is the very bug this function exists to
        prevent. In this order a failed rewrite leaves the loose ref in
        place, and since loose shadows packed, the repository still reads
        exactly as it did before: the failure is inert. */
-    if (snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch) >= (int)sizeof(path))
-        return -1;
-
-    if (packed_refs_remove(git_dir, branch) != 0)
+    if (packed_refs_remove_under(git_dir, prefix, name) != 0)
         return -1;
 
     if (unlink(path) != 0 && errno != ENOENT)
         return -1;
 
     return 0;
+}
+
+int sg_ref_delete_branch(const char *git_dir, const char *branch)
+{
+    return sg_ref_delete_under(git_dir, BRANCH_PREFIX, branch);
 }
