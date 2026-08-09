@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(377 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(642 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 22 個單元測試二進位,任一失敗即整體失敗
+make test                         # 26 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -63,11 +63,11 @@ staging 的驗證。本機綠燈不是充分證據。**
 | `object/` | 物件的序列化/解析,純記憶體,不碰 fs | hash |
 | `index/` | index v2 二進位讀寫與有序條目操作,不讀物件 | hash |
 | `util/` | zlib、SHA-1、levenshtein、LCS 表 | — |
-| `storage/` | 物件與 ref 落磁碟:loose、pack、chunk、refs、repo | object, workdir |
+| `storage/` | 物件與 ref 落磁碟:loose、pack、chunk、refs、repo、revparse | object, workdir |
 | `net/` | smart-HTTP:libcurl 封裝、pkt-line、transport | — |
 | `workdir/` | 工作目錄:路徑/檔案 I/O、ignore、status、apply、merge、tree_build | 幾乎全部 |
 | `safety/` | snapshot(可救回的備份 ref)、rebase 序列器狀態 | storage, workdir |
-| `cli/` | 19 個 `sg_cmd_*` + 派發器,唯一的組裝點 | 全部 |
+| `cli/` | 21 個 `sg_cmd_*` + 派發器,唯一的組裝點 | 全部 |
 
 - **讀物件一律走 `sg_object_read`**(`include/sg/objstore.h:16`):先 loose 再 pack。
   除了 `loose.c`/`pack.c` 自己以外不要直接呼叫底層。
@@ -75,11 +75,24 @@ staging 的驗證。本機綠燈不是充分證據。**
   在 `include/sg/workdir.h`(`sg_resolve_repo_path`、`sg_mkdir_parents`、
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
   `workdir.h`,不要去 `util/`,也不要自己再寫一份。
-- 已知重複(碰到時順手收斂,不要再增加第三份):`path_join` 逐字重複於
+- 已知重複(碰到時順手收斂,不要再增加下一份):`path_join` 逐字重複於
   `src/cli/cmd_add.c:174` 與 `src/cli/cmd_status.c:118`;小型 strbuf 重複於
-  `src/workdir/apply.c:175` 與 `src/cli/cmd_restore.c:104`。
+  `src/workdir/apply.c:175` 與 `src/cli/cmd_restore.c:104`;`resolve_commit_tree`
+  **已經有五份逐字複本**(`cmd_switch.c`、`cmd_merge.c`、`cmd_rebase.c`、
+  `cmd_clone.c`、`cmd_reset.c`)——這份最該收,新指令不要再抄第六份。
 - 遠端/使用者字串轉成檔案路徑前必須先過閘門函式:`sg_ref_name_is_safe`
   (`include/sg/transport.h:38`)、`sg_ref_branch_name_is_safe`(`include/sg/refs.h:13`)。
+  **建立**新 ref 時的 check-ref-format 驗證另有一支
+  `sg_ref_name_valid_for_create`(`include/sg/refs.h`),branch 與 tag 共用;
+  三者規則不同,標頭註解有寫分工,挑錯會留洞。
+- **使用者給的 revision 字串一律走 `sg_rev_parse_commit`**
+  (`include/sg/revparse.h`):`HEAD`/tag/分支/完整 40-hex 加 `~N`/`^N`,會 peel
+  annotated tag。**不支援縮寫 sha**(刻意)。不要再手刻「分支名或 40-hex」的
+  片段。列舉/刪除任一前綴底下的 ref 用 `sg_ref_list_under`/`sg_ref_delete_under`
+  (`prefix` 必須以 `/` 結尾)。
+- **使用者給的 commit/tag 訊息一律先過 `sg_message_cleanup`**
+  (`include/sg/object.h`),否則產生的物件 id 與真 git 不同。**例外是
+  `cmd_rebase.c`**——它轉發既有訊息,必須逐位元組保真,刻意不套用。
 
 ## 核心型別速查
 
@@ -128,7 +141,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 22 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 26 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。
