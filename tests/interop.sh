@@ -2681,6 +2681,131 @@ check "phase9 case8: sg branch in an empty repo prints nothing" test ! -s "$P9E_
 (cd "$P9E_REPO" && "$SG" branch nothing-yet) > /dev/null 2>&1
 check "phase9 case8: creating a branch in an empty repo fails (no commit yet)" test $? != 0
 
+echo ""
+
+# --- Phase 12: sg tag -- lightweight/annotated, packed-refs-correct --------
+# Same loose-vs-packed blindness that bit branch deletion applies to tags:
+# packed-only and stale-shadow cases below pin the deletion side, and the
+# annotated-tag object round-trip is the strongest oracle here (git must
+# read a tag object sg wrote, byte for byte).
+P12_REPO="$WORKDIR/phase12_tag_repo"
+mkdir -p "$P12_REPO"
+(cd "$WORKDIR" && "$SG" init phase12_tag_repo) > /dev/null 2>&1
+printf 'tag base\n' > "$P12_REPO/base.txt"
+(cd "$P12_REPO" && "$SG" add base.txt) > /dev/null 2>&1
+(cd "$P12_REPO" && "$SG" commit -m "p12 base") > /dev/null 2>&1
+P12_HEAD=$(cd "$P12_REPO" && git rev-parse HEAD)
+
+# case 1: lightweight tag at HEAD -- real git agrees it's a plain ref to the commit
+(cd "$P12_REPO" && "$SG" tag light) > /dev/null 2>&1
+check "phase12 case1: sg tag <name> exits 0" test $? = 0
+check "phase12 case1: git rev-parse of the lightweight tag equals HEAD" \
+    test "$(cd "$P12_REPO" && git rev-parse light)" = "$P12_HEAD"
+(cd "$P12_REPO" && git cat-file -t light) 2>/dev/null | grep -q "^commit\$"
+check "phase12 case1: git sees the lightweight tag's object type as commit (no tag object)" test $? = 0
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^light\$"
+check "phase12 case1: git tag -l lists the sg-created lightweight tag" test $? = 0
+
+# case 2: annotated tag -- git must read the tag object sg wrote
+(cd "$P12_REPO" && "$SG" tag -a -m "hello annotated" ann) > /dev/null 2>&1
+check "phase12 case2: sg tag -a -m <msg> <name> exits 0" test $? = 0
+(cd "$P12_REPO" && git cat-file -t ann) 2>/dev/null | grep -q "^tag\$"
+check "phase12 case2: git cat-file -t sees the annotated tag as a tag object" test $? = 0
+(cd "$P12_REPO" && git cat-file -p ann) 2>/dev/null | grep -q "^hello annotated\$"
+check "phase12 case2: git cat-file -p shows the annotated tag's message" test $? = 0
+check "phase12 case2: git rev-parse ann^{commit} peels to the tagged commit" \
+    test "$(cd "$P12_REPO" && git rev-parse 'ann^{commit}' 2>/dev/null)" = "$P12_HEAD"
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^ann\$"
+check "phase12 case2: git tag -l lists the sg-created annotated tag" test $? = 0
+(cd "$P12_REPO" && git fsck) > /dev/null 2>&1
+check "phase12 case2: git fsck is clean after sg tag -a" test $? = 0
+
+# case 2 (cont.): -m without -a also produces an annotated tag (measured
+# against real git: `git tag -m x name` creates an annotated tag)
+(cd "$P12_REPO" && "$SG" tag -m "implicit annotated" implicit) > /dev/null 2>&1
+check "phase12 case2: sg tag -m <msg> <name> (no -a) exits 0" test $? = 0
+(cd "$P12_REPO" && git cat-file -t implicit) 2>/dev/null | grep -q "^tag\$"
+check "phase12 case2: -m without -a still creates an annotated tag object" test $? = 0
+
+# case 2 (cont.): -a without -m is a usage error
+(cd "$P12_REPO" && "$SG" tag -a noamsg) > /dev/null 2>&1
+check "phase12 case2: sg tag -a without -m is rejected" test $? != 0
+
+# case 3: reverse direction -- a real-git-made annotated tag is listed by sg
+# and resolvable as a revision (sg_rev_parse_commit must peel it). Exercised
+# through `sg tag <newname> <rev>`, which is the only CLI surface for
+# sg_rev_parse_commit today: a lightweight tag created FROM the real-git
+# annotated tag must land on the peeled commit, not the tag object's own id.
+(cd "$P12_REPO" && git tag -a -m "git made this" gitmade) 2>/dev/null
+(cd "$P12_REPO" && "$SG" tag) 2>/dev/null | grep -q "^gitmade\$"
+check "phase12 case3: sg tag lists a tag created by real git" test $? = 0
+(cd "$P12_REPO" && "$SG" tag from-gitmade gitmade) > /dev/null 2>&1
+check "phase12 case3: sg tag <name> <rev> using a real-git annotated tag as <rev> exits 0" test $? = 0
+check "phase12 case3: sg peeled the real-git annotated tag to the tagged commit, not the tag object id" \
+    test "$(cd "$P12_REPO" && git rev-parse from-gitmade)" = "$P12_HEAD"
+
+# case 4: listing order matches git tag -l (byte-wise sort)
+P12_SG_LIST="$WORKDIR/p12_sg_list.txt"
+P12_GIT_LIST="$WORKDIR/p12_git_list.txt"
+(cd "$P12_REPO" && "$SG" tag) 2>/dev/null > "$P12_SG_LIST"
+(cd "$P12_REPO" && git tag -l) 2>/dev/null > "$P12_GIT_LIST"
+check "phase12 case4: sg tag listing matches git tag -l exactly (order included)" \
+    cmp -s "$P12_SG_LIST" "$P12_GIT_LIST"
+
+# case 5: packed-only tag (post pack-refs, no loose file at all)
+(cd "$P12_REPO" && "$SG" tag packed-only) > /dev/null 2>&1
+(cd "$P12_REPO" && git pack-refs --all) 2>/dev/null
+check "phase12 case5: precondition -- pack-refs removed the loose file" \
+    test ! -f "$P12_REPO/.git/refs/tags/packed-only"
+(cd "$P12_REPO" && "$SG" tag) 2>/dev/null | grep -q "^packed-only\$"
+check "phase12 case5: packed-only tag is still listed by sg tag" test $? = 0
+(cd "$P12_REPO" && "$SG" tag -d packed-only) > /dev/null 2>&1
+check "phase12 case5: sg tag -d deletes a packed-only tag" test $? = 0
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^packed-only\$"
+check "phase12 case5: git tag -l no longer shows the packed-only tag" test $? != 0
+grep -q "refs/tags/packed-only" "$P12_REPO/.git/packed-refs" 2>/dev/null
+check "phase12 case5: packed-refs has no line left for the deleted tag" test $? != 0
+
+# case 6: STALE SHADOW -- pack, then force-move the tag so a newer loose
+# file shadows the stale packed line; deleting must purge BOTH
+(cd "$P12_REPO" && "$SG" tag shadow) > /dev/null 2>&1
+(cd "$P12_REPO" && git pack-refs --all) 2>/dev/null
+P12_STALE=$(cd "$P12_REPO" && git rev-parse shadow)
+(cd "$P12_REPO" && printf 'shadow work\n' > shadow.txt \
+    && git add shadow.txt && git commit -q -m "shadow commit") 2>/dev/null
+(cd "$P12_REPO" && git tag -f shadow) > /dev/null 2>&1
+P12_SHADOW_TIP=$(cd "$P12_REPO" && git rev-parse shadow)
+check "phase12 case6: precondition -- loose shadow tag advanced past the stale packed entry" \
+    sh -c "test -f '$P12_REPO/.git/refs/tags/shadow' \
+        && test '$P12_SHADOW_TIP' != '$P12_STALE' \
+        && grep -q '$P12_STALE refs/tags/shadow' '$P12_REPO/.git/packed-refs'"
+(cd "$P12_REPO" && "$SG" tag -d shadow) > /dev/null 2>&1
+check "phase12 case6: delete of the stale-shadow tag exits 0" test $? = 0
+(cd "$P12_REPO" && git rev-parse --verify refs/tags/shadow) > /dev/null 2>&1
+check "phase12 case6: shadow tag fully gone, NOT resurrected at the stale packed sha" test $? != 0
+grep -q "refs/tags/shadow" "$P12_REPO/.git/packed-refs" 2>/dev/null
+check "phase12 case6: stale packed line purged as part of the delete" test $? != 0
+
+# case 7: invalid creation names -- sg rejects each, and real git's
+# check-ref-format --tag agrees every one is invalid
+for bad in 'a..b' 'a b' 'a.lock' 'HEAD' 'a/' '@{x}'; do
+    (cd "$P12_REPO" && "$SG" tag "$bad") > /dev/null 2>&1
+    check "phase12 case7: sg rejects invalid creation name '$bad'" test $? != 0
+    (cd "$P12_REPO" && git check-ref-format --tag "$bad") > /dev/null 2>&1
+    check "phase12 case7: git check-ref-format --tag agrees '$bad' is invalid" test $? != 0
+done
+
+# case 8: overwriting an existing tag fails without --force, succeeds with it
+(cd "$P12_REPO" && "$SG" tag dupe) > /dev/null 2>&1
+(cd "$P12_REPO" && "$SG" tag dupe) > /dev/null 2>&1
+check "phase12 case8: creating over an existing tag without --force fails" test $? != 0
+(cd "$P12_REPO" && "$SG" tag --force dupe) > /dev/null 2>&1
+check "phase12 case8: creating over an existing tag with --force succeeds" test $? = 0
+
+# case 9: deleting a nonexistent tag fails, not a silent success
+(cd "$P12_REPO" && "$SG" tag -d does-not-exist) > /dev/null 2>&1
+check "phase12 case9: deleting a nonexistent tag fails" test $? != 0
+
 # --- Phase 9: gitignore conformance sweep -- sg status vs git status -------
 # The strongest oracle in this phase: one tree whose paths exercise every
 # rule family in the ignore spec (bare name, /anchored, dir-only, a/*.txt,

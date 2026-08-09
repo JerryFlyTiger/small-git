@@ -355,6 +355,119 @@ A successful deletion prints the deleted tip's full object id \(em because
 .B "sg undo"
 snapshots the working tree and index but not refs, that printed id is the
 only way to recreate the branch.
+.SS tag
+.B sg tag
+.RB [ -a ]
+.RB [ -m
+.IR msg ]
+.RB [ --force | -f ]
+.RB [ -- ]
+.RI [ name
+.RI [ rev ]]
+.br
+.B sg tag
+.RB [ -d | --delete ]
+.I name
+.PP
+With no arguments, lists every tag under
+.BR refs/tags/ ,
+one per line, sorted byte-wise. As with
+.BR "sg branch" ,
+the listing merges the loose files with
+.B packed-refs
+entries, so a tag
+.B "git gc"
+has packed away is still listed.
+.PP
+With
+.IR name ,
+creates a tag named
+.I name
+pointing at
+.I rev
+(a commit, branch, or tag name, or a full 40-hex object id; see
+.B REVISIONS
+below), defaulting to
+.B HEAD
+if
+.I rev
+is omitted. Creating fails if a tag by that name already exists, unless
+.B --force
+(or
+.BR -f )
+is given, in which case the existing tag is overwritten; it also fails if
+.I name
+is not a valid ref name (the same rules
+.B "sg branch"
+enforces).
+.PP
+Without
+.B -a
+or
+.BR -m ,
+the tag is
+.IR lightweight :
+.B refs/tags/\fIname\fR
+is written directly as a ref to the target commit, no tag object is
+created. With
+.B -a
+(annotated) or
+.B -m
+.I msg
+(which implies
+.BR -a ),
+.B sg
+instead builds a
+.B tag
+object \(em recording the target object, its type, the tag name, a tagger
+identity/timestamp, and the message \(em writes it as a loose object, and
+points
+.B refs/tags/\fIname\fR
+at that tag object's id instead of the target directly.
+.B -a
+without
+.B -m
+is a usage error;
+.B sg
+has no editor integration to prompt for a message (same restriction as
+.BR "sg commit" ).
+The tagger identity is read from
+.B GIT_AUTHOR_NAME
+/
+.BR GIT_AUTHOR_EMAIL ,
+defaulting to
+.B small_git
+/
+.BR sg@localhost ,
+with a fixed
+.B +0000
+timezone offset.
+.PP
+With
+.B -d
+(or
+.BR --delete ),
+deletes
+.IR name .
+As with branch deletion, this removes the tag from
+.B both
+the loose file and
+.B packed-refs
+so a stale packed entry cannot resurrect it; deleting a tag that does not
+exist is an error, not a silent success. Unlike branch deletion there is no
+merge check or confirmation prompt \(em a tag is just a name for an object,
+not a line of unique history that could become unreachable.
+.PP
+.B sg push
+does not transmit tags; it only pushes
+.BR refs/heads/ .
+Since
+.B sg
+is bit-compatible with real git's object and ref formats, a tag created by
+.B sg tag
+can still be pushed with real git's own
+.B "git push --tags"
+against the same repository.
 .SS switch
 .B sg switch
 .RB [ -c ]

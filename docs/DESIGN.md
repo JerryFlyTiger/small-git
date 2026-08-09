@@ -79,6 +79,7 @@ small_git/
 | 7 | 巨型 repo 效能 | 部分完成 | 見下方 Phase 7a;**實際做的與原規劃不同**,說明如下 |
 | 8 | 文件、打包、跨平台收尾 | 完成 | README、man page、`make release`/`install`;CI 設定為在 Linux(gcc/clang)與 macOS 上建置並跑完整測試 |
 | 9 | 可用性補完:`.gitignore`、`sg add` 遞迴、`sg branch` | 完成 | 見下方 Phase 9;以真 git 為 oracle 的 600 次隨機模糊測試零分歧 |
+| 12 | revision 解析(`sg_rev_parse_commit`)、`sg tag`(輕量/annotated) | 完成 | 見下方 Phase 12;`interop.sh` 以真 git 為 oracle |
 
 Phase 7 的內容與原規劃不同,原因記錄在此以免日後誤解:原本列的是 commit-graph、multi-pack-index、平行化。實測後發現真正的瓶頸完全不在那裡——是物件查找每次都重讀整個 pack(見下方 Phase 7a)。修好之後 `sg log` 已與 `git log` 同級,commit-graph 的邊際效益因此大幅下降,故未實作,留待有實際需求時再評估。原規劃的三項都尚未完成。
 
@@ -366,3 +367,24 @@ CLI 呼叫,全部 0 leak——這是推 CI 前的信心來源。同樣的紀律�
 - 保守掃描的本質:仍然可達的記憶體不算 leak。刻意留存的快取因此免疫,但
   「本該釋放卻剛好還被某個全域或活框架指到」的真洩漏也會被漏掉。
 - 這是 Linux 專屬的閘門。macOS 那格 CI 不跑 ASan,本機也無法複製。
+
+
+## Phase 12:revision 解析與 `sg tag`
+
+新增 `sg_rev_parse_commit`(`include/sg/revparse.h`)——`HEAD`/分支/tag/40-hex
+加上 `~N`/`^N` 後綴的小型 rev 語法子集,以及 `sg tag`:輕量標籤只是
+`refs/tags/<name>` 直接指向 commit;`-a`/`-m` annotated 標籤額外寫入一個
+`SG_OBJ_TAG` 物件,ref 改指向該物件。`-m` 沒有 `-a` 時比照真 git 隱含
+annotated(已用真 git 實測確認)。與 `sg branch` 共用
+`sg_ref_list_under`/`sg_ref_delete_under`(loose+packed 合併/清除)及
+`sg_ref_name_valid_for_create`。
+
+### 已知限制:`sg push` 不推送 tag
+
+`sg push` 目前寫死只推送 `refs/heads/`(`src/cli/cmd_push.c:611`)——不論本地
+是否有 `sg tag` 或真 git 建立的 tag,`sg push` 都不會把它們傳到遠端,也不會
+報錯或警告,是靜默的範圍限制。因為 `sg` 與真 git 位元相容,使用者可以直接用
+真 git 的 `git push --tags` 對同一個 repo 補推 tag,繞過這個限制;這也是
+`docs/sg.1` 的 `tag` 小節裡明講的原因。要讓 `sg push` 自己支援 tag,需要擴充
+`cmd_push.c` 的 ref 列舉範圍與 pack 打包對象(annotated tag 物件本身也要進
+pack),留待有實際需求時再評估,不在本階段範圍內。
