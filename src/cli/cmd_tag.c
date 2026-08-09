@@ -195,6 +195,16 @@ int sg_cmd_tag(int argc, char **argv)
         fputs(USAGE, stderr);
         return 1;
     }
+    /* -d combined with any tag-creation option (-a/-m/-f) or a second
+       positional argument is a usage error in real git, not a silent
+       partial action -- verified directly: `git tag -d -a -m x name`,
+       `git tag -d -f name`, and `git tag -d name1 name2` (this project
+       doesn't support multi-name delete) all print usage and delete
+       nothing, exit 129. */
+    if (del && (annotated || message != NULL || force || rev != NULL)) {
+        fputs(USAGE, stderr);
+        return 1;
+    }
     if (annotated && message == NULL) {
         fputs(USAGE, stderr);
         return 1;

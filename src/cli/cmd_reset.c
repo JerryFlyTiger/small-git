@@ -3,8 +3,10 @@
 #include "sg/apply.h"
 #include "sg/hash.h"
 #include "sg/index.h"
+#include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
@@ -80,6 +82,13 @@ int sg_cmd_reset(int argc, char **argv)
             mode_set = 1;
         } else if (!saw_dashdash && (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0)) {
             force = 1;
+        } else if (!saw_dashdash && argv[i][0] == '-') {
+            /* Unrecognized flag: reject explicitly rather than falling
+               through to the rev_arg slot, where a typo like "--Hard" would
+               be reported as "invalid reference: --Hard" and mislead the
+               user into thinking their rev was wrong. */
+            fputs(usage, stderr);
+            return 1;
         } else if (saw_dashdash) {
             /* This project's `sg reset` deliberately has no pathspec form
                (that overlaps `sg restore --staged`) -- anything after "--"
@@ -128,15 +137,23 @@ int sg_cmd_reset(int argc, char **argv)
         return 1;
     }
 
-    if (resolve_commit_tree(git_dir, target_commit_id, target_tree_id) != 0) {
-        fprintf(stderr, "sg: corrupt commit for '%s'\n", rev_arg);
-        free(current_branch);
-        free(git_dir);
-        free(repo_root);
-        return 1;
-    }
-
     if (mode == RESET_SOFT) {
+        unsigned char merge_head_scratch[SG_SHA1_RAW_LEN];
+
+        /* Real git refuses `reset --soft` outright while a merge or rebase
+           is in progress ("cannot do a soft reset in the middle of a
+           merge"), rather than silently abandoning MERGE_HEAD / the rebase
+           sequencer state the way --mixed/--hard do. Verified directly
+           against git: both an unresolved merge conflict and a paused
+           rebase produce this same rejection, exit 128. */
+        if (sg_merge_head_read(git_dir, merge_head_scratch) == 0 || sg_rebase_state_exists(git_dir)) {
+            fprintf(stderr, "sg: 合併或 rebase 進行中，無法執行 soft reset\n");
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+
         /* Neither the index nor the working directory is touched: nothing
            uncommitted is ever at risk, so there is no confirmation gate and
            no automatic snapshot -- same rule real git follows. */
@@ -150,6 +167,16 @@ int sg_cmd_reset(int argc, char **argv)
     } else if (mode == RESET_MIXED) {
         sg_index idx;
         char label[256];
+        unsigned char merge_head_scratch[SG_SHA1_RAW_LEN];
+        int merge_in_progress;
+
+        if (resolve_commit_tree(git_dir, target_commit_id, target_tree_id) != 0) {
+            fprintf(stderr, "sg: corrupt commit for '%s'\n", rev_arg);
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
 
         if (sg_index_read(git_dir, &idx) != 0) {
             fprintf(stderr, "sg: failed to read index (corrupt?)\n");
@@ -175,6 +202,8 @@ int sg_cmd_reset(int argc, char **argv)
         }
         sg_index_free(&idx);
 
+        merge_in_progress = sg_merge_head_read(git_dir, merge_head_scratch) == 0;
+
         if (sg_index_reset_to_tree(git_dir, target_tree_id) != 0) {
             free(current_branch);
             free(git_dir);
@@ -189,9 +218,29 @@ int sg_cmd_reset(int argc, char **argv)
             free(repo_root);
             return 1;
         }
+
+        /* Leaving MERGE_HEAD behind would make a later, unrelated `sg
+           commit` silently record a bogus merge commit for a merge the user
+           just abandoned via reset. Verified against real git: `git reset`
+           (mixed) during a conflicted merge clears MERGE_HEAD. Unlike
+           --hard's sg_safe_apply_tree, this deliberately does NOT touch an
+           in-progress rebase's sequencer state -- verified against real
+           git, `git reset` (mixed) during a paused rebase leaves
+           rebase-merge/ untouched, only a soft-reset-style rejection or
+           `rebase --abort` ends it. */
+        if (merge_in_progress && sg_merge_head_remove(git_dir) != 0)
+            fprintf(stderr, "sg: warning: 未能清除 MERGE_HEAD\n");
     } else {
         char label[256];
         int apply_rc;
+
+        if (resolve_commit_tree(git_dir, target_commit_id, target_tree_id) != 0) {
+            fprintf(stderr, "sg: corrupt commit for '%s'\n", rev_arg);
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
 
         snprintf(label, sizeof(label), "reset --hard to '%s'", rev_arg);
         apply_rc = sg_safe_apply_tree(git_dir, repo_root, target_tree_id, label, force);

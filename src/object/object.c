@@ -102,11 +102,17 @@ int sg_message_cleanup(const char *msg, char **out)
         while (line_end < len && msg[line_end] != '\n')
             line_end++;
 
+        /* Only space, tab and \r are stripped as trailing whitespace here,
+           matching real git's --cleanup=whitespace exactly: \v (0x0B) and
+           \f (0x0C) are NOT considered whitespace by git's own strip logic
+           and are preserved verbatim. Verified directly against git 2.55.0
+           -- `git commit -m $'a\f'` keeps the \f byte in the message
+           segment, and a message consisting of nothing but \f is accepted
+           (not treated as empty). */
         trimmed_end = line_end;
         while (trimmed_end > line_start &&
               (msg[trimmed_end - 1] == ' ' || msg[trimmed_end - 1] == '\t' ||
-               msg[trimmed_end - 1] == '\r' || msg[trimmed_end - 1] == '\v' ||
-               msg[trimmed_end - 1] == '\f'))
+               msg[trimmed_end - 1] == '\r'))
             trimmed_end--;
 
         is_blank = (trimmed_end == line_start);

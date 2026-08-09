@@ -93,10 +93,29 @@ static void test_decompress_bounded_within_cap(void)
    return success; sg_decompress_bounded() must instead refuse to grow past
    max_out and fail cleanly. Because 200000 bytes is a perfectly reasonable
    allocation on its own, a passing result here only comes from max_out
-   actually being enforced, not from an incidental allocation failure --
-   which is exactly what makes this test mutation-sensitive (verified: removing
-   the `cap >= max_out` rejection in sg_decompress_bounded turns this CHECK
-   red with out_len==200000).
+   actually being enforced, not from an incidental allocation failure.
+
+   sg_decompress_bounded() actually has TWO independent lines of defense
+   against growing past max_out, and both have to be removed together for
+   this CHECK to actually fail -- verified directly with mutation testing on
+   a scratch copy, removing either one alone in isolation leaves this CHECK
+   green:
+     1. the explicit `cap >= max_out` rejection when the buffer needs to
+        grow past the hard cap;
+     2. the "no progress made" guard (`strm.total_in == prev_total_in &&
+        strm.total_out == prev_total_out`), which exists for a different,
+        unrelated reason (a defense against inflate() spinning forever) but
+        incidentally also catches guard 1's absence: with guard 1 gone, the
+        cap-growth arithmetic still clamps new_cap to max_out (a separate,
+        unconditional clamp a few lines below), so the buffer never actually
+        grows past max_out either way -- inflate() is then called with
+        avail_out==0 forever, makes no progress, and guard 2 alone still
+        rejects it with -1.
+   Only removing BOTH lets the loop spin with avail_out==0 indefinitely
+   (inflate() keeps returning Z_BUF_ERROR without ever reaching Z_STREAM_END
+   or exhausting input), so the actual failure mode of the double mutation is
+   an infinite loop/hang, not a wrong return value -- confirmed with `timeout
+   30 build/tests/test_zutil` exiting 124 after removing both guards.
 
    At this layer (sg_decompress_bounded called directly) that's the whole
    story: there's no downstream caller re-checking the output length, so a

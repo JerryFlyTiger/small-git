@@ -13,7 +13,14 @@ int sg_compress(const void *src, size_t src_len, unsigned char **out, size_t *ou
    -1 on failure (corrupt stream, trailing garbage, or the decompressed output would
    exceed max_out -- callers that know an upper bound on the expected size, e.g. from a
    trusted or format-declared length, should pass it here rather than SIZE_MAX to avoid
-   unbounded memory growth on hostile input). */
+   unbounded memory growth on hostile input).
+
+   max_out == 0 always fails with -1, even for a src that decompresses to zero bytes
+   (e.g. an empty input): the initial capacity is clamped to max_out before the first
+   inflate() call even runs, so the "buffer needs to grow past the hard cap" rejection
+   fires immediately. No caller currently hits this (every caller derives max_out from a
+   format-declared length that is provably >= some positive minimum), but if one ever
+   passes a literal 0, treat it as "always rejected", not "accepts an empty result". */
 int sg_decompress_bounded(const void *src, size_t src_len, size_t max_out, unsigned char **out,
                           size_t *out_len);
 

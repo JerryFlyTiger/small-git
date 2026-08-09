@@ -80,7 +80,9 @@ static void test_reset_reuses_stat_only_when_sha_matches(void)
     memset(&e, 0, sizeof(e));
     e.mode = 0100644;
     e.ctime_sec = 111;
+    e.ctime_nsec = 112;
     e.mtime_sec = 222;
+    e.mtime_nsec = 223;
     e.dev = 3;
     e.ino = 4;
     e.uid = 5;
@@ -93,7 +95,9 @@ static void test_reset_reuses_stat_only_when_sha_matches(void)
     memset(&e, 0, sizeof(e));
     e.mode = 0100644;
     e.ctime_sec = 333;
+    e.ctime_nsec = 334;
     e.mtime_sec = 444;
+    e.mtime_nsec = 445;
     e.dev = 7;
     e.ino = 8;
     e.uid = 9;
@@ -138,8 +142,12 @@ static void test_reset_reuses_stat_only_when_sha_matches(void)
              "unchanged.txt sha1 should match the target tree's blob");
         CHECK(result.entries[pos].ctime_sec == 111, "unchanged.txt should keep old ctime_sec, got %u",
              result.entries[pos].ctime_sec);
+        CHECK(result.entries[pos].ctime_nsec == 112, "unchanged.txt should keep old ctime_nsec, got %u",
+             result.entries[pos].ctime_nsec);
         CHECK(result.entries[pos].mtime_sec == 222, "unchanged.txt should keep old mtime_sec, got %u",
              result.entries[pos].mtime_sec);
+        CHECK(result.entries[pos].mtime_nsec == 223, "unchanged.txt should keep old mtime_nsec, got %u",
+             result.entries[pos].mtime_nsec);
         CHECK(result.entries[pos].dev == 3, "unchanged.txt should keep old dev, got %u",
              result.entries[pos].dev);
         CHECK(result.entries[pos].ino == 4, "unchanged.txt should keep old ino, got %u",
@@ -159,8 +167,12 @@ static void test_reset_reuses_stat_only_when_sha_matches(void)
              "changed.txt sha1 should match the target tree's (new) blob");
         CHECK(result.entries[pos].ctime_sec == 0, "changed.txt ctime_sec should be zeroed, got %u",
              result.entries[pos].ctime_sec);
+        CHECK(result.entries[pos].ctime_nsec == 0, "changed.txt ctime_nsec should be zeroed, got %u",
+             result.entries[pos].ctime_nsec);
         CHECK(result.entries[pos].mtime_sec == 0, "changed.txt mtime_sec should be zeroed, got %u",
              result.entries[pos].mtime_sec);
+        CHECK(result.entries[pos].mtime_nsec == 0, "changed.txt mtime_nsec should be zeroed, got %u",
+             result.entries[pos].mtime_nsec);
         CHECK(result.entries[pos].dev == 0, "changed.txt dev should be zeroed, got %u",
              result.entries[pos].dev);
         CHECK(result.entries[pos].ino == 0, "changed.txt ino should be zeroed, got %u",

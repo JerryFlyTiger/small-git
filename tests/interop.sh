@@ -2806,6 +2806,39 @@ check "phase12 case8: creating over an existing tag with --force succeeds" test 
 (cd "$P12_REPO" && "$SG" tag -d does-not-exist) > /dev/null 2>&1
 check "phase12 case9: deleting a nonexistent tag fails" test $? = 1
 
+# case 10: -d combined with tag-creation options is a usage error, not a
+# silent delete -- verified directly against real git: `git tag -d -a -m x
+# name` prints usage and deletes nothing, exit 129 (sg's own convention is
+# only ever exit 0/1, so only the "deletes nothing, non-zero exit" half of
+# that is checked here).
+(cd "$P12_REPO" && "$SG" tag dcombo) > /dev/null 2>&1
+(cd "$P12_REPO" && "$SG" tag -d -a -m "x" dcombo) > /dev/null 2>&1
+check "phase12 case10: sg tag -d -a -m <name> is rejected" test $? = 1
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dcombo\$"
+check "phase12 case10: -d -a -m rejection did not delete the tag" test $? = 0
+(cd "$P12_REPO" && git tag -d -a -m x dcombo) > /dev/null 2>&1
+check "phase12 case10: real git also rejects tag -d -a -m <name> (sanity check on the test itself)" \
+    test $? != 0
+
+(cd "$P12_REPO" && "$SG" tag -d --force dcombo) > /dev/null 2>&1
+check "phase12 case10: sg tag -d --force <name> is rejected" test $? = 1
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dcombo\$"
+check "phase12 case10: -d --force rejection did not delete the tag" test $? = 0
+(cd "$P12_REPO" && git tag -d --force dcombo) > /dev/null 2>&1
+check "phase12 case10: real git also rejects tag -d --force <name> (sanity check on the test itself)" \
+    test $? != 0
+
+# case 11: -d with a second name argument is a usage error, not a silent
+# partial delete (this project doesn't support multi-name delete, but must
+# not silently drop the second name and delete only the first).
+(cd "$P12_REPO" && "$SG" tag dmulti1 && "$SG" tag dmulti2) > /dev/null 2>&1
+(cd "$P12_REPO" && "$SG" tag -d dmulti1 dmulti2) > /dev/null 2>&1
+check "phase12 case11: sg tag -d <name1> <name2> is rejected" test $? = 1
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dmulti1\$"
+check "phase12 case11: rejection did not delete the first name either" test $? = 0
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dmulti2\$"
+check "phase12 case11: rejection did not delete the second name" test $? = 0
+
 # --- Phase 9: gitignore conformance sweep -- sg status vs git status -------
 # The strongest oracle in this phase: one tree whose paths exercise every
 # rule family in the ignore spec (bare name, /anchored, dir-only, a/*.txt,
@@ -3621,6 +3654,144 @@ P12R_BADREV="$P12R_SG_BASE/badrev"
 p12r_base "$P12R_BADREV" "$SG"
 (cd "$P12R_BADREV" && "$SG" reset no-such-rev-xyz) > /dev/null 2>&1
 check "phase12 reset reject: sg reset with an invalid rev exits non-zero" test $? = 1
+
+P12R_BADFLAG="$P12R_SG_BASE/badflag"
+p12r_base "$P12R_BADFLAG" "$SG"
+P12R_BADFLAG_ERR="$WORKDIR/p12r_badflag_err.txt"
+(cd "$P12R_BADFLAG" && "$SG" reset --Hard) > /dev/null 2> "$P12R_BADFLAG_ERR"
+check "phase12 reset reject: sg reset --Hard (unrecognized flag) exits non-zero" test $? = 1
+check "phase12 reset reject: unrecognized flag is reported as a usage error, not 'invalid reference'" \
+    sh -c "! grep -q 'invalid reference' '$P12R_BADFLAG_ERR'"
+
+# ============================================================
+# Phase 13 (cont.): sg reset vs. an in-progress merge or rebase
+#
+# Real git's behavior (verified directly, see the task writeup this was
+# checked against): --soft refuses outright (exit 128) whether a merge is
+# unresolved or a rebase is paused. --mixed and --hard both clear MERGE_HEAD
+# when a merge is in progress, but leave a paused rebase's on-disk state
+# completely untouched (only `rebase --abort`/`--continue` end it). sg's own
+# --hard is a documented, pre-existing exception to that last point (it
+# clears BOTH MERGE_HEAD and sg-rebase/ via sg_safe_apply_tree, matching
+# neither mode exactly for the rebase case) -- not re-tested for the rebase
+# side here, only --soft and --mixed, which is what this ticket's fix
+# actually touches.
+# ============================================================
+
+# --- merge conflict in progress ---
+
+p12r_conflict_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    printf 'orig1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c feature) > /dev/null 2>&1
+    printf 'feature1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+    printf 'master1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+}
+
+P12R_SOFT_MERGE="$WORKDIR/p12r_soft_merge"
+p12r_conflict_repo "$P12R_SOFT_MERGE"
+check "phase12 reset/merge: precondition -- MERGE_HEAD present after the sg-made conflict" \
+    test -f "$P12R_SOFT_MERGE/.git/MERGE_HEAD"
+(cd "$P12R_SOFT_MERGE" && "$SG" reset --soft) > /dev/null 2>&1
+check "phase12 reset/merge: sg reset --soft during an unresolved merge is rejected" test $? = 1
+check "phase12 reset/merge: --soft rejection left MERGE_HEAD in place" \
+    test -f "$P12R_SOFT_MERGE/.git/MERGE_HEAD"
+
+P12R_MIXED_MERGE="$WORKDIR/p12r_mixed_merge"
+p12r_conflict_repo "$P12R_MIXED_MERGE"
+(cd "$P12R_MIXED_MERGE" && "$SG" reset) > /dev/null 2>&1
+check "phase12 reset/merge: bare sg reset (mixed) during an unresolved merge exits 0" test $? = 0
+check "phase12 reset/merge: --mixed cleared MERGE_HEAD" \
+    test ! -f "$P12R_MIXED_MERGE/.git/MERGE_HEAD"
+
+# end-to-end assertion: this is what a user actually gets bitten by -- an
+# ordinary commit made after the reset must NOT come out as a 2-parent merge
+# commit for the merge that was just abandoned.
+printf 'resolved\norig2\n' > "$P12R_MIXED_MERGE/c.txt"
+(cd "$P12R_MIXED_MERGE" && "$SG" add c.txt && "$SG" commit -m "an ordinary commit") > /dev/null 2>&1
+check "phase12 reset/merge: sg commit after the mixed reset exits 0" test $? = 0
+P12R_MIXED_PARENTS=$(cd "$P12R_MIXED_MERGE" && git cat-file -p HEAD | grep -c '^parent ')
+check "phase12 reset/merge: the follow-up commit has exactly one parent (not a bogus merge commit)" \
+    test "$P12R_MIXED_PARENTS" = 1
+
+P12R_HARD_MERGE="$WORKDIR/p12r_hard_merge"
+p12r_conflict_repo "$P12R_HARD_MERGE"
+(cd "$P12R_HARD_MERGE" && "$SG" reset --hard --force) > /dev/null 2>&1
+check "phase12 reset/merge: sg reset --hard during an unresolved merge exits 0" test $? = 0
+check "phase12 reset/merge: --hard cleared MERGE_HEAD" \
+    test ! -f "$P12R_HARD_MERGE/.git/MERGE_HEAD"
+
+# --- rebase paused on a conflict ---
+
+p12r_rebase_paused_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    printf 'orig1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c feature) > /dev/null 2>&1
+    printf 'feature1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+    printf 'master1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+    (cd "$dir" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+}
+
+P12R_SOFT_REBASE="$WORKDIR/p12r_soft_rebase"
+p12r_rebase_paused_repo "$P12R_SOFT_REBASE"
+check "phase12 reset/rebase: precondition -- sg-rebase/ present after the paused rebase" \
+    test -d "$P12R_SOFT_REBASE/.git/sg-rebase"
+(cd "$P12R_SOFT_REBASE" && "$SG" reset --soft) > /dev/null 2>&1
+check "phase12 reset/rebase: sg reset --soft during a paused rebase is rejected" test $? = 1
+check "phase12 reset/rebase: --soft rejection left sg-rebase/ in place" \
+    test -d "$P12R_SOFT_REBASE/.git/sg-rebase"
+
+P12R_MIXED_REBASE="$WORKDIR/p12r_mixed_rebase"
+p12r_rebase_paused_repo "$P12R_MIXED_REBASE"
+(cd "$P12R_MIXED_REBASE" && "$SG" reset) > /dev/null 2>&1
+check "phase12 reset/rebase: bare sg reset (mixed) during a paused rebase exits 0" test $? = 0
+check "phase12 reset/rebase: --mixed does NOT clear sg-rebase/ (matches real git leaving a paused rebase alone)" \
+    test -d "$P12R_MIXED_REBASE/.git/sg-rebase"
+
+# --- --soft must not need to be able to resolve the target commit's tree ---
+#
+# resolve_commit_tree() used to run unconditionally before the three modes
+# were dispatched, so --soft (which never reads target_tree_id) would still
+# fail if the target commit's own content couldn't be parsed into a tree id
+# -- even though nothing about --soft's actual job (moving the branch ref)
+# needs that. Real git's own hash-object refuses to write a commit object
+# whose content fails its "tree <hex>" line check (fsck-on-write), so this
+# specific shape can't be constructed through real git at all -- sg's own
+# hash-object has no such validation, which is exactly what makes this
+# reachable through sg's own CLI (a self-check, not an sg-vs-git comparison
+# like the rest of this phase).
+P12R_BADTREE_REPO="$WORKDIR/p12r_badtree"
+mkdir -p "$P12R_BADTREE_REPO"
+(cd "$WORKDIR" && "$SG" init p12r_badtree) > /dev/null 2>&1
+printf 'content\n' > "$P12R_BADTREE_REPO/f.txt"
+(cd "$P12R_BADTREE_REPO" && "$SG" add f.txt && "$SG" commit -m "only commit") > /dev/null 2>&1
+
+P12R_BADCOMMIT_SRC="$WORKDIR/p12r_badcommit_src.txt"
+printf 'nottree 0000000000000000000000000000000000000000\nauthor a <a@b.c> 0 +0000\ncommitter a <a@b.c> 0 +0000\n\nmsg\n' \
+    > "$P12R_BADCOMMIT_SRC"
+P12R_BAD_SHA=$(cd "$P12R_BADTREE_REPO" && "$SG" hash-object -t commit -w "$P12R_BADCOMMIT_SRC" 2>/dev/null)
+check "phase12 reset reset --soft (unparsable tree line): precondition -- sg hash-object wrote the malformed commit" \
+    test -n "$P12R_BAD_SHA"
+(cd "$P12R_BADTREE_REPO" && "$SG" reset --soft "$P12R_BAD_SHA") > /dev/null 2>&1
+check "phase12 reset reset --soft (unparsable tree line): sg reset --soft still succeeds (it never needs the tree)" \
+    test $? = 0
+P12R_BADTREE_HEAD=$(cd "$P12R_BADTREE_REPO" && git rev-parse HEAD 2>/dev/null)
+check "phase12 reset reset --soft (unparsable tree line): the branch actually moved to the malformed commit" \
+    test "$P12R_BADTREE_HEAD" = "$P12R_BAD_SHA"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

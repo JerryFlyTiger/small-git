@@ -227,6 +227,15 @@ static void test_message_cleanup(void)
     expect_cleanup("\tx\t", "\tx\n", "leading tab preserved, trailing tab stripped");
     expect_cleanup("", "", "empty input normalizes to empty output");
     expect_cleanup("   \n\n  \n", "", "whitespace-only input normalizes to empty output");
+
+    /* \v (0x0B) and \f (0x0C) are NOT trailing whitespace to real git's
+       --cleanup=whitespace, unlike space/tab/\r -- verified directly against
+       git 2.55.0. A message consisting of nothing but \f must NOT normalize
+       to empty (it would if \f were treated as strippable whitespace, which
+       would then make sg_cmd_commit wrongly reject it as an empty message). */
+    expect_cleanup("a\f", "a\f\n", "trailing form feed preserved, not stripped");
+    expect_cleanup("a\v", "a\v\n", "trailing vertical tab preserved, not stripped");
+    expect_cleanup("\f", "\f\n", "message consisting only of \\f is not treated as empty");
 }
 
 static void test_parse_header(void)

@@ -291,6 +291,56 @@ static void test_declared_much_larger_than_actual(void)
     free(git_dir);
 }
 
+/* Neither test_declared_much_smaller_than_actual() nor
+   test_declared_much_larger_than_actual() above ever exercises a stream that
+   isn't valid zlib at all -- both plant a real deflate stream, just with a
+   lying header inside it. This case plants pure garbage bytes (not a zlib
+   stream in any sense), which must fail at the Phase 1 header probe itself:
+   sg_decompress_prefix() hits inflate()'s Z_DATA_ERROR on the very first
+   call (invalid zlib header), never reaching sg_object_parse_header() at
+   all. Before this test, nothing in this file or tests/test_zutil.c ever fed
+   sg_decompress_prefix() actual non-zlib bytes -- every existing case there
+   compresses real data first via sg_compress().
+
+   Honesty note (checked with mutation testing, same as the two shape tests
+   above claim for themselves): this test is defense-in-depth, NOT
+   independently mutation-sensitive for loose.c's `sg_decompress_prefix(...)
+   != 0` check specifically. Removing that check (while keeping probe_len
+   initialized to 0 so the removal doesn't just read uninitialized memory)
+   still leaves probe_len at 0 on this input, because sg_decompress_prefix()
+   returns before ever writing *out_len when inflate() reports Z_DATA_ERROR
+   on the very first call -- so sg_object_parse_header() immediately rejects
+   the resulting zero-length probe on its own (memchr() for a space finds
+   nothing in an empty buffer). Only a bug in a DIFFERENT layer (e.g.
+   zutil.c silently treating Z_DATA_ERROR as tolerable the way it already
+   tolerates Z_BUF_ERROR, or sg_object_parse_header() accepting a 0-length
+   probe) would make this specific CHECK fail -- this test's actual value is
+   covering a genuinely untested code path (real Z_DATA_ERROR), not proving
+   any one specific line is load-bearing. */
+static void test_pure_garbage_bytes(void)
+{
+    char *git_dir = make_tmp_repo();
+    /* Deliberately not a valid zlib stream: real zlib streams begin with a
+       recognizable two-byte header (e.g. 0x78 0x9c); these bytes are chosen
+       to not form one. */
+    static const unsigned char garbage[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11,
+                                            0x22, 0x33, 0x44, 0x55, 0x66, 0x77};
+    char hex[SG_SHA1_HEX_LEN + 1];
+    unsigned char *id;
+    sg_obj_type type;
+    unsigned char *read_content;
+    size_t read_len;
+
+    id = (unsigned char *)arbitrary_id();
+    sg_sha1_to_hex(id, hex);
+    plant_object_file(git_dir, hex, garbage, sizeof(garbage));
+
+    CHECK(sg_loose_read(git_dir, id, &type, &read_content, &read_len) != 0,
+         "sg_loose_read should reject a loose object file that isn't a valid zlib stream at all");
+
+    free(git_dir);
+}
+
 static long rss_kb(void)
 {
     struct rusage ru;
@@ -406,6 +456,7 @@ int main(void)
     test_roundtrip();
     test_declared_much_smaller_than_actual();
     test_declared_much_larger_than_actual();
+    test_pure_garbage_bytes();
     test_bound_caps_rss();
 
     if (failures > 0) {
