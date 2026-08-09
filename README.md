@@ -94,7 +94,7 @@ sg undo 1                     # 內容回來了
 | `rebase` | 重新套用到另一個分支之上(`--continue`/`--skip`/`--abort`) |
 | `clone` | 從遠端複製 repository(smart HTTP) |
 | `fetch` | 從遠端取得新的 commit 與 ref |
-| `push` | 將本地分支推送到遠端 |
+| `push` | 將本地分支或 tag 推送到遠端(`--tags` 推送全部 tag) |
 | `repack` | 將 loose object 打包成 packfile |
 | `hash-object` | 計算(並可選擇寫入)物件的雜湊 |
 | `cat-file` | 檢視 object 內容/型別/大小 |
@@ -108,7 +108,7 @@ sg undo 1                     # 內容回來了
 - `sg` 建立的 repo 可以直接用 `git` 操作,通過 `git fsck --strict`;`git` 建立的 repo 也可以
   直接用 `sg` 操作,包含 `git gc` 之後把 ref 收進 `packed-refs`、把物件打包成 pack 的狀態。
 - 網路端實作 smart HTTP,可與真實的 git 伺服器互通(clone/fetch/push)。
-- 測試套件 `tests/interop.sh` 有 377 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
+- 測試套件 `tests/interop.sh` 有 680 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
   (含一個本機 `git http-backend` 伺服器)來驗證,而不是自己跟自己比對。
 
 **唯一的例外是啟用分塊之後**——那時 tree 裡放的是指標 blob,`git checkout` 會拿到指標文字。
