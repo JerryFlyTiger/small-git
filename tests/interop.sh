@@ -1352,6 +1352,161 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     check "phase5c: git fsck still passes on the bare repo after force push" \
         sh -c "git -C '$HTTP_SERVERROOT/repo.git' fsck > /dev/null 2>&1"
 
+    # --- case 6: sg push can also push tags (Phase 13) ---
+    TAG_PUSH_HEAD=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+
+    # a lightweight tag: the remote ref must point straight at the commit
+    (cd "$HTTP_DEST" && "$SG" tag push-lw) > /dev/null 2>&1
+    LW_TAG_PUSH_OUT="$WORKDIR/http_push_tag_lw_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin push-lw) > "$LW_TAG_PUSH_OUT" 2>&1
+    check "phase5c: sg push of a lightweight tag exits 0" test $? = 0
+    check "phase5c: sg push of a lightweight tag reports it as new" \
+        grep -q "new tag" "$LW_TAG_PUSH_OUT"
+    check "phase5c: bare repo lightweight tag points at the commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/push-lw)\" = '$TAG_PUSH_HEAD'"
+    check "phase5c: bare repo lightweight tag object type is commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git cat-file -t refs/tags/push-lw)\" = 'commit'"
+    check "phase5c: pushing a tag does not create a remote-tracking ref" \
+        sh -c "! test -e '$HTTP_DEST/.git/refs/remotes/origin/push-lw'"
+
+    # an annotated tag: the remote ref must point at the TAG OBJECT id, not
+    # peeled to the commit it annotates
+    (cd "$HTTP_DEST" && "$SG" tag -a -m "annotated push tag" push-ann) > /dev/null 2>&1
+    PUSH_ANN_TAG_ID=$(cd "$HTTP_DEST" && git rev-parse refs/tags/push-ann)
+    ANN_TAG_PUSH_OUT="$WORKDIR/http_push_tag_ann_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin push-ann) > "$ANN_TAG_PUSH_OUT" 2>&1
+    check "phase5c: sg push of an annotated tag exits 0" test $? = 0
+    check "phase5c: sg push of an annotated tag reports it as new" \
+        grep -q "new tag" "$ANN_TAG_PUSH_OUT"
+    check "phase5c: bare repo annotated tag ref is the tag object id, not the peeled commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/push-ann)\" = '$PUSH_ANN_TAG_ID'"
+    check "phase5c: bare repo annotated tag object type is tag" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git cat-file -t refs/tags/push-ann)\" = 'tag'"
+    check "phase5c: bare repo annotated tag message is readable" \
+        sh -c "cd '$HTTP_SERVERROOT/repo.git' && git cat-file tag refs/tags/push-ann | grep -q 'annotated push tag'"
+    check "phase5c: git fsck passes on the bare repo after tag pushes" \
+        sh -c "git -C '$HTTP_SERVERROOT/repo.git' fsck > /dev/null 2>&1"
+
+    # pushing an unmoved tag a second time -> up to date, exit 0
+    TAG_AGAIN_OUT="$WORKDIR/http_push_tag_again_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin push-lw) > "$TAG_AGAIN_OUT" 2>&1
+    check "phase5c: a second sg push of an unmoved tag exits 0" test $? = 0
+    check "phase5c: a second sg push of an unmoved tag reports Everything up-to-date" \
+        grep -q "Everything up-to-date" "$TAG_AGAIN_OUT"
+
+    # move the lightweight tag locally (to the sg-new-branch tip created in
+    # case 2, a different commit), then push without --force -> rejected
+    # unconditionally (no merge-base question, unlike a branch), remote
+    # unchanged; with --force -> accepted, remote updated
+    (cd "$HTTP_DEST" && "$SG" switch sg-new-branch < /dev/null) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" tag --force push-lw) > /dev/null 2>&1
+    MOVED_TAG_ID=$(cd "$HTTP_DEST" && git rev-parse refs/tags/push-lw)
+    (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
+
+    TAG_NOFORCE_OUT="$WORKDIR/http_push_tag_noforce_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin push-lw < /dev/null) > "$TAG_NOFORCE_OUT" 2>&1
+    check "phase5c: sg push of a moved tag without --force fails" test $? -ne 0
+    check "phase5c: bare repo tag unchanged after refused tag push" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/push-lw)\" = '$TAG_PUSH_HEAD'"
+
+    TAG_FORCE_OUT="$WORKDIR/http_push_tag_force_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin push-lw --force < /dev/null) > "$TAG_FORCE_OUT" 2>&1
+    check "phase5c: sg push --force of a moved tag succeeds" test $? = 0
+    check "phase5c: bare repo tag now matches the force-pushed tag" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/push-lw)\" = '$MOVED_TAG_ID'"
+    check "phase5c: force-pushed tag update reports (forced update)" \
+        grep -q "forced update" "$TAG_FORCE_OUT"
+    check "phase5c: git fsck still passes on the bare repo after forced tag push" \
+        sh -c "git -C '$HTTP_SERVERROOT/repo.git' fsck > /dev/null 2>&1"
+
+    # --tags: push every local tag in one round trip (some already on the
+    # remote and unchanged, at least one lightweight and one annotated new)
+    (cd "$HTTP_DEST" && "$SG" tag tags-multi-lw) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" tag -a -m "multi annotated" tags-multi-ann) > /dev/null 2>&1
+    TAGS_MULTI_LW_ID=$(cd "$HTTP_DEST" && git rev-parse tags-multi-lw)
+    TAGS_MULTI_ANN_ID=$(cd "$HTTP_DEST" && git rev-parse refs/tags/tags-multi-ann)
+    TAGS_ALL_OUT="$WORKDIR/http_push_tags_all_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin --tags) > "$TAGS_ALL_OUT" 2>&1
+    check "phase5c: sg push --tags exits 0" test $? = 0
+    check "phase5c: bare repo gained tags-multi-lw at the right commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/tags-multi-lw 2>/dev/null)\" = '$TAGS_MULTI_LW_ID'"
+    check "phase5c: bare repo gained tags-multi-ann at the right commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/tags-multi-ann 2>/dev/null)\" = '$TAGS_MULTI_ANN_ID'"
+
+    # --tags and an explicit name together is a usage error, not "push both"
+    TAGS_AND_NAME_OUT="$WORKDIR/http_push_tags_and_name_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin --tags "$HTTP_SRC_BRANCH" < /dev/null) > "$TAGS_AND_NAME_OUT" 2>&1
+    check "phase5c: sg push --tags with an explicit name is a usage error" test $? -ne 0
+    check "phase5c: sg push --tags with an explicit name prints a usage line" \
+        grep -q "^usage: sg push" "$TAGS_AND_NAME_OUT"
+
+    # a tag name containing a slash (sg_ref_list_under returns it without the
+    # refs/tags/ prefix, slash kept whole) must round-trip through push too
+    (cd "$HTTP_DEST" && "$SG" tag rel/1.0) > /dev/null 2>&1
+    SLASH_TAG_ID=$(cd "$HTTP_DEST" && git rev-parse refs/tags/rel/1.0)
+    SLASH_TAG_OUT="$WORKDIR/http_push_slash_tag_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin rel/1.0) > "$SLASH_TAG_OUT" 2>&1
+    check "phase5c: sg push of a slash-containing tag name exits 0" test $? = 0
+    check "phase5c: bare repo gained refs/tags/rel/1.0 at the right commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/rel/1.0 2>/dev/null)\" = '$SLASH_TAG_ID'"
+
+    # --tags --force overwrites MULTIPLE diverged tags in one round trip
+    (cd "$HTTP_DEST" && "$SG" tag force-multi-a) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" tag force-multi-b) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" push origin --tags) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" switch sg-new-branch < /dev/null) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" tag --force force-multi-a) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" tag --force force-multi-b) > /dev/null 2>&1
+    FORCE_MULTI_A_ID=$(cd "$HTTP_DEST" && git rev-parse refs/tags/force-multi-a)
+    FORCE_MULTI_B_ID=$(cd "$HTTP_DEST" && git rev-parse refs/tags/force-multi-b)
+    (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
+
+    FORCE_MULTI_OUT="$WORKDIR/http_push_tags_force_multi_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin --tags --force < /dev/null) > "$FORCE_MULTI_OUT" 2>&1
+    check "phase5c: sg push --tags --force over multiple diverged tags exits 0" test $? = 0
+    check "phase5c: bare repo force-multi-a now matches the force-pushed tag" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/force-multi-a)\" = '$FORCE_MULTI_A_ID'"
+    check "phase5c: bare repo force-multi-b now matches the force-pushed tag" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/force-multi-b)\" = '$FORCE_MULTI_B_ID'"
+
+    # --tags with a mix of a brand-new tag and one that conflicts with the
+    # remote (already there, different id, no --force): the whole invocation
+    # must still exit non-zero, but the new tag must land anyway -- git
+    # applies each ref update independently, and rc = had_rejection ? 1 : 0
+    # (cmd_push.c) is what's supposed to make that visible on exit code
+    # alone even though most of the run succeeded.
+    (cd "$HTTP_DEST" && "$SG" tag mix-conflict) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" push origin mix-conflict) > /dev/null 2>&1
+    MIX_CONFLICT_REMOTE_BEFORE=$(cd "$HTTP_SERVERROOT/repo.git" && git rev-parse refs/tags/mix-conflict)
+    (cd "$HTTP_DEST" && "$SG" switch sg-new-branch < /dev/null) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" tag --force mix-conflict) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" tag mix-new) > /dev/null 2>&1
+    MIX_NEW_ID=$(cd "$HTTP_DEST" && git rev-parse refs/tags/mix-new)
+
+    MIX_TAGS_OUT="$WORKDIR/http_push_tags_mixed_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin --tags < /dev/null) > "$MIX_TAGS_OUT" 2>&1
+    check "phase5c: sg push --tags with a mix of success and rejection exits non-zero" \
+        test $? -ne 0
+    check "phase5c: sg push --tags landed the new tag despite the other's rejection" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/mix-new 2>/dev/null)\" = '$MIX_NEW_ID'"
+    check "phase5c: sg push --tags left the rejected tag untouched on the remote" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/mix-conflict)\" = '$MIX_CONFLICT_REMOTE_BEFORE'"
+
+    # a branch and a tag sharing a name -> ambiguous, refused, remote untouched
+    (cd "$HTTP_DEST" && "$SG" switch -c ambiguous-name) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" tag ambiguous-name) > /dev/null 2>&1
+    AMBIG_OUT="$WORKDIR/http_push_ambiguous_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin ambiguous-name < /dev/null) > "$AMBIG_OUT" 2>&1
+    check "phase5c: sg push of an ambiguous branch/tag name fails" test $? -ne 0
+    check "phase5c: sg push reports the ambiguous refspec error" \
+        grep -q "matches more than one" "$AMBIG_OUT"
+    check "phase5c: bare repo gained no tag for the ambiguous name" \
+        sh -c "test -z \"\$(cd '$HTTP_SERVERROOT/repo.git' && git tag -l ambiguous-name)\""
+    check "phase5c: bare repo gained no branch for the ambiguous name" \
+        sh -c "test -z \"\$(cd '$HTTP_SERVERROOT/repo.git' && git branch --list ambiguous-name)\""
+    (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
+
     kill "$HTTP_SERVER_PID" 2>/dev/null
     HTTP_SERVER_PID=""
 else
@@ -1359,6 +1514,27 @@ else
     skip "phase5b: sg fetch over smart HTTP"
     skip "phase5c: sg push over smart HTTP"
 fi
+
+# --- regression: `sg push --tags` with zero local tags must still contact
+# the remote. It used to short-circuit to "Everything up-to-date." purely
+# from local state (before sg_transport_ls_refs_push was ever called),
+# silently skipping both the network round trip and the refs/sg/chunks
+# keepalive propagation that every other push path performs. Needs no HTTP
+# server -- an unreachable URL is enough to distinguish "tried and failed"
+# from "never tried". ---
+ZEROTAG_REPO="$WORKDIR/zerotag_repo"
+"$SG" init "$ZEROTAG_REPO" > /dev/null 2>&1
+(cd "$ZEROTAG_REPO" && git config user.email "z@example.com" && git config user.name "z tester")
+printf 'hello\n' > "$ZEROTAG_REPO/f.txt"
+(cd "$ZEROTAG_REPO" && "$SG" add f.txt && "$SG" commit -m "init") > /dev/null 2>&1
+printf '[remote "origin"]\n\turl = http://127.0.0.1:1/unreachable\n' >> "$ZEROTAG_REPO/.git/config"
+
+ZEROTAG_OUT="$WORKDIR/zerotag_push_out.txt"
+(cd "$ZEROTAG_REPO" && "$SG" push origin --tags) > "$ZEROTAG_OUT" 2>&1
+check "phase5c bugfix: sg push --tags with zero local tags against an unreachable remote still tries to connect (fails, not a silent no-op)" \
+    test $? -ne 0
+check "phase5c bugfix: sg push --tags with zero local tags against an unreachable remote does not print Everything up-to-date" \
+    sh -c "! grep -q 'Everything up-to-date' '$ZEROTAG_OUT'"
 
 # --- Phase 6a: content-defined chunking for large/binary files ---
 
