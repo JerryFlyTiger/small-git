@@ -43,6 +43,7 @@ int sg_cmd_commit(int argc, char **argv)
 {
     static const char usage[] = "usage: sg commit -m <message>\n";
     const char *message = NULL;
+    char *cleaned_message = NULL;
     char *git_dir;
     sg_index idx;
     sg_flat_entry *flat = NULL;
@@ -79,9 +80,22 @@ int sg_cmd_commit(int argc, char **argv)
         return 1;
     }
 
-    git_dir = sg_require_git_dir();
-    if (git_dir == NULL)
+    if (sg_message_cleanup(message, &cleaned_message) != 0) {
+        fprintf(stderr, "sg: out of memory\n");
         return 1;
+    }
+    if (cleaned_message[0] == '\0') {
+        fprintf(stderr, "sg: aborting commit due to empty commit message\n");
+        free(cleaned_message);
+        return 1;
+    }
+    message = cleaned_message;
+
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL) {
+        free(cleaned_message);
+        return 1;
+    }
 
     /* A rebase advances the current branch ref commit-by-commit as it
        replays; an ordinary `sg commit` here would create a normal commit on
@@ -94,12 +108,14 @@ int sg_cmd_commit(int argc, char **argv)
                "請解決衝突並 `sg add <file>...` 後執行 `sg rebase --continue`，"
                "或執行 `sg rebase --abort` 放棄\n");
         free(git_dir);
+        free(cleaned_message);
         return 1;
     }
 
     if (sg_index_read(git_dir, &idx) != 0) {
         fprintf(stderr, "sg: failed to read index (corrupt?)\n");
         free(git_dir);
+        free(cleaned_message);
         return 1;
     }
 
@@ -107,6 +123,7 @@ int sg_cmd_commit(int argc, char **argv)
         print_unmerged_paths(&idx);
         sg_index_free(&idx);
         free(git_dir);
+        free(cleaned_message);
         return 1;
     }
 
@@ -118,6 +135,7 @@ int sg_cmd_commit(int argc, char **argv)
             fprintf(stderr, "sg: out of memory\n");
             sg_index_free(&idx);
             free(git_dir);
+            free(cleaned_message);
             return 1;
         }
         for (i = 0; i < idx.count; i++) {
@@ -132,6 +150,7 @@ int sg_cmd_commit(int argc, char **argv)
         free(flat);
         sg_index_free(&idx);
         free(git_dir);
+        free(cleaned_message);
         return 1;
     }
     free(flat);
@@ -142,6 +161,7 @@ int sg_cmd_commit(int argc, char **argv)
     if (is_merge_commit && !has_parent) {
         fprintf(stderr, "sg: 損壞的合併狀態（MERGE_HEAD 存在，但目前分支還沒有任何 commit）\n");
         free(git_dir);
+        free(cleaned_message);
         return 1;
     }
 
@@ -149,6 +169,7 @@ int sg_cmd_commit(int argc, char **argv)
     if (branch == NULL) {
         fprintf(stderr, "sg: failed to determine current branch\n");
         free(git_dir);
+        free(cleaned_message);
         return 1;
     }
 
@@ -163,6 +184,7 @@ int sg_cmd_commit(int argc, char **argv)
             fprintf(stderr, "sg: out of memory\n");
             free(branch);
             free(git_dir);
+            free(cleaned_message);
             return 1;
         }
         memcpy(commit.parents[0], parent_id, SG_SHA1_RAW_LEN);
@@ -187,6 +209,7 @@ int sg_cmd_commit(int argc, char **argv)
         free(commit.parents);
         free(branch);
         free(git_dir);
+        free(cleaned_message);
         return 1;
     }
     free(commit.parents);
@@ -196,6 +219,7 @@ int sg_cmd_commit(int argc, char **argv)
         free(serialized);
         free(branch);
         free(git_dir);
+        free(cleaned_message);
         return 1;
     }
     free(serialized);
@@ -223,5 +247,6 @@ int sg_cmd_commit(int argc, char **argv)
 
     free(branch);
     free(git_dir);
+    free(cleaned_message);
     return rc;
 }

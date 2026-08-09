@@ -198,6 +198,15 @@ is required; there is no editor-based message flow, no
 and no way to sign or author-override a commit via flags (see
 .B ENVIRONMENT
 for author/committer identity).
+.I message
+is normalized the same way real git's default
+.B --cleanup=whitespace
+does: trailing whitespace is stripped from each line, runs of blank lines
+are collapsed to one, and leading/trailing blank lines are dropped. If the
+result is empty (including an all-whitespace
+.IR message ),
+.B sg
+refuses to create the commit, matching real git.
 .PP
 Fails if the index has unresolved merge conflicts (stage 1/2/3 entries) or
 if a rebase is currently in progress (use
@@ -423,7 +432,20 @@ object \(em recording the target object, its type, the tag name, a tagger
 identity/timestamp, and the message \(em writes it as a loose object, and
 points
 .B refs/tags/\fIname\fR
-at that tag object's id instead of the target directly.
+at that tag object's id instead of the target directly. The message is
+normalized the same way as
+.BR "sg commit" 's
+(real git's default
+.BR --cleanup=whitespace ),
+but unlike
+.BR "sg commit" ,
+an empty (or all-whitespace) message is
+.I not
+rejected \(em it produces a tag object with an empty message segment,
+matching real git's own
+.B "git tag -a -m ''"
+behavior, which is intentionally asymmetric with
+.BR "git commit -m ''" .
 .B -a
 without
 .B -m

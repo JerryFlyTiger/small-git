@@ -86,6 +86,19 @@ int sg_commit_serialize(const sg_commit *commit, unsigned char **out, size_t *ou
 int sg_commit_parse(const unsigned char *content, size_t content_len, sg_commit *out);
 void sg_commit_free(sg_commit *commit);
 
+/* Applies git's default `--cleanup=whitespace` commit/tag message
+   normalization: strips trailing whitespace from each line, collapses runs
+   of blank lines into a single blank line, drops leading and trailing blank
+   lines, and -- if anything is left -- ensures the result ends with exactly
+   one trailing '\n'. Leading whitespace on a line is preserved.
+
+   *out is malloc'd, caller frees. Returns 0 on success (including the case
+   where the message normalizes to nothing, in which case *out is a malloc'd
+   empty string -- callers must check (*out)[0] == '\0' to detect that case;
+   it is distinct from allocation failure). Returns -1 only on OOM, in which
+   case *out is left untouched. */
+int sg_message_cleanup(const char *msg, char **out);
+
 /* ---- tag (annotated) ---- */
 
 typedef struct {

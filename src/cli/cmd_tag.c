@@ -85,6 +85,17 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         unsigned char tag_id[SG_SHA1_RAW_LEN];
         const char *tagger_name = env_or("GIT_AUTHOR_NAME", "small_git");
         const char *tagger_email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+        char *cleaned_message;
+
+        /* Unlike `git commit`, real `git tag -a -m` does NOT refuse an
+           empty (or whitespace-only, which normalizes to empty) message --
+           it happily creates a tag object whose message segment is empty.
+           Verified directly against git 2.55.0. So, unlike cmd_commit.c,
+           there is no empty-message rejection here. */
+        if (sg_message_cleanup(message, &cleaned_message) != 0) {
+            fprintf(stderr, "sg: out of memory\n");
+            return 1;
+        }
 
         memset(&tag, 0, sizeof(tag));
         memcpy(tag.object, target_id, SG_SHA1_RAW_LEN);
@@ -94,12 +105,14 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         tag.tagger_email = (char *)tagger_email;
         tag.tagger_time = (long long)time(NULL);
         strcpy(tag.tagger_tz, "+0000");
-        tag.message = (char *)message;
+        tag.message = cleaned_message;
 
         if (sg_tag_serialize(&tag, &serialized, &serialized_len) != 0) {
             fprintf(stderr, "sg: 無法序列化標籤物件\n");
+            free(cleaned_message);
             return 1;
         }
+        free(cleaned_message);
         if (sg_loose_write(git_dir, SG_OBJ_TAG, serialized, serialized_len, tag_id) != 0) {
             fprintf(stderr, "sg: 無法寫入標籤物件\n");
             free(serialized);

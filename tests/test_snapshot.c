@@ -120,7 +120,10 @@ static void test_create_uses_workdir_or_falls_back_to_index(void)
     CHECK(sg_commit_parse(content, content_len, &commit) == 0, "snapshot commit malformed");
     free(content);
 
-    CHECK(strcmp(commit.message, "test snapshot") == 0, "message mismatch: %s", commit.message);
+    /* sg_snapshot_create runs the label through sg_message_cleanup, the same
+       normalization real git applies to commit messages, so a trailing '\n'
+       gets appended here. */
+    CHECK(strcmp(commit.message, "test snapshot\n") == 0, "message mismatch: %s", commit.message);
     CHECK(commit.parent_count == 0, "brand new repo has no HEAD, snapshot should have no parent");
 
     CHECK(sg_tree_flatten(git_dir, commit.tree, &flat) == 0, "flatten snapshot tree failed");

@@ -309,20 +309,28 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         size_t serialized_len;
         unsigned char new_commit_id[SG_SHA1_RAW_LEN];
         char message[512];
+        char *cleaned_message;
         const char *name = env_or("GIT_AUTHOR_NAME", "small_git");
         const char *email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
 
         snprintf(message, sizeof(message), "Merge branch '%s' into %s\n", branch_arg, current_branch);
+        if (sg_message_cleanup(message, &cleaned_message) != 0) {
+            fprintf(stderr, "sg: out of memory\n");
+            rc = 1;
+            goto done;
+        }
 
         memset(&commit, 0, sizeof(commit));
         if (sg_tree_build(git_dir, flat_entries, flat_count, commit.tree) != 0) {
             fprintf(stderr, "sg: failed to build merge tree\n");
+            free(cleaned_message);
             rc = 1;
             goto done;
         }
         commit.parents = malloc(2 * sizeof(*commit.parents));
         if (commit.parents == NULL) {
             fprintf(stderr, "sg: out of memory\n");
+            free(cleaned_message);
             rc = 1;
             goto done;
         }
@@ -337,15 +345,17 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         commit.committer_email = (char *)email;
         commit.committer_time = commit.author_time;
         strcpy(commit.committer_tz, "+0000");
-        commit.message = message;
+        commit.message = cleaned_message;
 
         if (sg_commit_serialize(&commit, &serialized, &serialized_len) != 0) {
             fprintf(stderr, "sg: failed to serialize merge commit\n");
             free(commit.parents);
+            free(cleaned_message);
             rc = 1;
             goto done;
         }
         free(commit.parents);
+        free(cleaned_message);
 
         if (sg_loose_write(git_dir, SG_OBJ_COMMIT, serialized, serialized_len, new_commit_id) != 0) {
             fprintf(stderr, "sg: failed to write merge commit\n");

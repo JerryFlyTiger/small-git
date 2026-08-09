@@ -3178,6 +3178,170 @@ else
         sh -c "[ \"\$(cd '$P9BD' && git rev-parse victim 2>/dev/null)\" = '$P9BD_TIP' ]"
 fi
 
+# --- Phase 12: commit/tag message normalization must be bit-identical to
+# --- real git's default `--cleanup=whitespace`. Earlier interop coverage
+# --- never compared the raw bytes of the message segment, so sg producing
+# --- "msg" (no trailing newline) where git produces "msg\n" went unnoticed
+# --- even though both are valid, fsck-clean objects -- the object ids just
+# --- silently diverge. Each case below is a row of the normalization table
+# --- verified directly against a real `git commit`/`git tag`.
+#
+# extract_msg_segment: strips the header lines (everything up to and
+# including the first blank line) from `git cat-file <type> <id>` output,
+# leaving the message segment's exact bytes for a byte-for-byte cmp.
+extract_msg_segment() {
+    sed '1,/^$/d'
+}
+
+P12_SG_BASE="$WORKDIR/phase12_msg_sg"
+P12_GIT_BASE="$WORKDIR/phase12_msg_git"
+mkdir -p "$P12_SG_BASE" "$P12_GIT_BASE"
+P12_N=0
+
+# Runs a single commit-message case: $1 = human label, $2 = the raw -m
+# argument, $3 = 1 if real git is expected to reject this input (empty
+# message), 0 otherwise.
+p12_commit_case() {
+    case_label="$1"
+    msg="$2"
+    expect_reject="$3"
+
+    P12_N=$((P12_N + 1))
+    sgrepo="$P12_SG_BASE/c$P12_N"
+    gitrepo="$P12_GIT_BASE/c$P12_N"
+    mkdir -p "$sgrepo"
+    (cd "$P12_SG_BASE" && "$SG" init "c$P12_N") > /dev/null 2>&1
+    git init -q "$gitrepo"
+    (cd "$gitrepo" && git config user.email "a@b.c" && git config user.name "a")
+
+    printf 'x\n' > "$sgrepo/f.txt"
+    printf 'x\n' > "$gitrepo/f.txt"
+    (cd "$sgrepo" && "$SG" add f.txt && "$SG" commit -m "$msg") > /dev/null 2>&1
+    sg_rc=$?
+    (cd "$gitrepo" && git add f.txt && git commit -q -m "$msg") > /dev/null 2>&1
+    git_rc=$?
+
+    if [ "$expect_reject" = 1 ]; then
+        check "phase12 commit message ($case_label): real git rejects this input (sanity check on the test itself)" \
+            test "$git_rc" != 0
+        check "phase12 commit message ($case_label): sg rejects it too" test "$sg_rc" != 0
+        return
+    fi
+
+    check "phase12 commit message ($case_label): real git accepted this input (sanity check on the test itself)" \
+        test "$git_rc" = 0
+    check "phase12 commit message ($case_label): sg commit exits 0" test "$sg_rc" = 0
+
+    sg_id=$(cd "$sgrepo" && git rev-parse HEAD 2>/dev/null)
+    git_id=$(cd "$gitrepo" && git rev-parse HEAD 2>/dev/null)
+    sg_msg_file="$WORKDIR/p12_sg_msg_$P12_N.bin"
+    git_msg_file="$WORKDIR/p12_git_msg_$P12_N.bin"
+    (cd "$sgrepo" && git cat-file commit "$sg_id") | extract_msg_segment > "$sg_msg_file"
+    (cd "$gitrepo" && git cat-file commit "$git_id") | extract_msg_segment > "$git_msg_file"
+
+    check "phase12 commit message ($case_label): message segment byte-identical to real git" \
+        cmp -s "$sg_msg_file" "$git_msg_file"
+}
+
+# $(...) strips ALL trailing newlines from its output, which would corrupt
+# any case whose raw -m argument is meant to end in one or more '\n' bytes.
+# p12_mk appends a sentinel after the printf output and strips it back off,
+# which protects genuine trailing newlines from that stripping.
+p12_mk() {
+    tail_with_marker=$(printf '%sEND_MARK' "$1")
+    printf '%s' "${tail_with_marker%END_MARK}"
+}
+
+p12_commit_case "plain" "x" 0
+p12_commit_case "leading whitespace preserved" "  x  " 0
+p12_commit_case "already newline-terminated" "$(p12_mk 'x
+')" 0
+p12_commit_case "trailing blank lines removed" "$(p12_mk 'x
+
+
+')" 0
+p12_commit_case "leading blank lines removed" "$(printf '\n\nx')" 0
+p12_commit_case "single interior blank line preserved" "$(printf 'a\n\nb')" 0
+p12_commit_case "consecutive blank lines collapsed" "$(printf 'a\n\n\nb')" 0
+p12_commit_case "trailing whitespace stripped per line" "$(printf 'a   \nb')" 0
+p12_commit_case "leading tab preserved, trailing tab stripped" "$(printf '\tx\t')" 0
+p12_commit_case "empty message" "" 1
+p12_commit_case "whitespace-only message" "   " 1
+
+# --- same normalization table, but for annotated tag messages (`sg tag -a
+# --- -m` vs `git tag -a -m`). Reuses one base commit per sg/git pair so the
+# --- tag's target-object line is identical and only the message segment
+# --- (everything after "tag <name>\n...\ntagger ...\n\n") is compared.
+p12_tag_case() {
+    case_label="$1"
+    msg="$2"
+    expect_reject="$3"
+
+    P12_N=$((P12_N + 1))
+    sgrepo="$P12_SG_BASE/t$P12_N"
+    gitrepo="$P12_GIT_BASE/t$P12_N"
+    mkdir -p "$sgrepo"
+    (cd "$P12_SG_BASE" && "$SG" init "t$P12_N") > /dev/null 2>&1
+    git init -q "$gitrepo"
+    (cd "$gitrepo" && git config user.email "a@b.c" && git config user.name "a")
+
+    printf 'x\n' > "$sgrepo/f.txt"
+    printf 'x\n' > "$gitrepo/f.txt"
+    (cd "$sgrepo" && "$SG" add f.txt && "$SG" commit -m base) > /dev/null 2>&1
+    (cd "$gitrepo" && git add f.txt && git commit -q -m base) > /dev/null 2>&1
+
+    (cd "$sgrepo" && "$SG" tag -a -m "$msg" v1) > /dev/null 2>&1
+    sg_rc=$?
+    (cd "$gitrepo" && git tag -a -m "$msg" v1) > /dev/null 2>&1
+    git_rc=$?
+
+    if [ "$expect_reject" = 1 ]; then
+        check "phase12 tag message ($case_label): real git rejects this input (sanity check on the test itself)" \
+            test "$git_rc" != 0
+        check "phase12 tag message ($case_label): sg rejects it too" test "$sg_rc" != 0
+        return
+    fi
+
+    check "phase12 tag message ($case_label): real git accepted this input (sanity check on the test itself)" \
+        test "$git_rc" = 0
+    check "phase12 tag message ($case_label): sg tag exits 0" test "$sg_rc" = 0
+
+    sg_id=$(cd "$sgrepo" && git rev-parse v1 2>/dev/null)
+    git_id=$(cd "$gitrepo" && git rev-parse v1 2>/dev/null)
+    sg_msg_file="$WORKDIR/p12_sg_tagmsg_$P12_N.bin"
+    git_msg_file="$WORKDIR/p12_git_tagmsg_$P12_N.bin"
+    (cd "$sgrepo" && git cat-file tag "$sg_id") | extract_msg_segment > "$sg_msg_file"
+    (cd "$gitrepo" && git cat-file tag "$git_id") | extract_msg_segment > "$git_msg_file"
+
+    check "phase12 tag message ($case_label): message segment byte-identical to real git" \
+        cmp -s "$sg_msg_file" "$git_msg_file"
+}
+
+p12_tag_case "plain" "x" 0
+p12_tag_case "leading whitespace preserved" "  x  " 0
+p12_tag_case "already newline-terminated" "$(p12_mk 'x
+')" 0
+p12_tag_case "trailing blank lines removed" "$(p12_mk 'x
+
+
+')" 0
+p12_tag_case "leading blank lines removed" "$(printf '\n\nx')" 0
+p12_tag_case "single interior blank line preserved" "$(printf 'a\n\nb')" 0
+p12_tag_case "consecutive blank lines collapsed" "$(printf 'a\n\n\nb')" 0
+p12_tag_case "trailing whitespace stripped per line" "$(printf 'a   \nb')" 0
+p12_tag_case "leading tab preserved, trailing tab stripped" "$(printf '\tx\t')" 0
+# NOTE (verified directly against git 2.55.0, not assumed): `git commit -m`
+# and `git tag -a -m` are asymmetric here. `git commit -m ""` refuses to
+# create a commit ("aborting commit due to empty commit message"), but
+# `git tag -a -m ""` (or any message that normalizes to empty, like
+# whitespace-only) happily creates a tag object with an empty message
+# segment, exit 0. sg mirrors this asymmetry: sg_cmd_commit rejects an
+# empty-after-cleanup message, sg_cmd_tag does not. Don't "fix" this to be
+# symmetric later without re-checking real git -- it really is inconsistent
+# upstream, and interop is the oracle, not intuition.
+p12_tag_case "empty message accepted, empty message segment" "" 0
+p12_tag_case "whitespace-only message accepted, empty message segment" "   " 0
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

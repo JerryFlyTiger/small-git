@@ -199,6 +199,36 @@ static void test_commit_with_parents_roundtrip(void)
     free(out);
 }
 
+/* Each row reproduces a case verified directly against real git's
+   `--cleanup=whitespace` (the default for `git commit -m`) by committing the
+   input and inspecting the raw bytes with `git cat-file commit` -- see the
+   table in the phase12 task writeup. */
+static void expect_cleanup(const char *input, const char *expected, const char *label)
+{
+    char *out = NULL;
+    int rc = sg_message_cleanup(input, &out);
+
+    CHECK(rc == 0, "%s: sg_message_cleanup returned %d", label, rc);
+    if (rc == 0)
+        CHECK(strcmp(out, expected) == 0, "%s: got %s expected %s", label, out, expected);
+    free(out);
+}
+
+static void test_message_cleanup(void)
+{
+    expect_cleanup("x", "x\n", "plain");
+    expect_cleanup("  x  ", "  x\n", "leading whitespace preserved, trailing stripped");
+    expect_cleanup("x\n", "x\n", "already-terminated message unchanged");
+    expect_cleanup("x\n\n\n", "x\n", "trailing blank lines removed");
+    expect_cleanup("\n\nx", "x\n", "leading blank lines removed");
+    expect_cleanup("a\n\nb", "a\n\nb\n", "single interior blank line preserved");
+    expect_cleanup("a\n\n\nb", "a\n\nb\n", "consecutive blank lines collapsed to one");
+    expect_cleanup("a   \nb", "a\nb\n", "trailing whitespace stripped per line");
+    expect_cleanup("\tx\t", "\tx\n", "leading tab preserved, trailing tab stripped");
+    expect_cleanup("", "", "empty input normalizes to empty output");
+    expect_cleanup("   \n\n  \n", "", "whitespace-only input normalizes to empty output");
+}
+
 int main(void)
 {
     test_blob_vectors();
@@ -206,6 +236,7 @@ int main(void)
     test_tree_vectors();
     test_commit_vectors();
     test_commit_with_parents_roundtrip();
+    test_message_cleanup();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

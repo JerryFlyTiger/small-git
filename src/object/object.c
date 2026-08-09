@@ -79,6 +79,84 @@ void sg_object_hash(sg_obj_type type, const void *content, size_t content_len,
     free(formatted);
 }
 
+int sg_message_cleanup(const char *msg, char **out)
+{
+    size_t len = strlen(msg);
+    size_t out_cap = len + 2;
+    char *buf;
+    size_t out_len = 0;
+    size_t i = 0;
+    int have_content = 0;
+    int pending_blank = 0;
+
+    buf = malloc(out_cap);
+    if (buf == NULL)
+        return -1;
+
+    while (i < len) {
+        size_t line_start = i;
+        size_t line_end = line_start;
+        size_t trimmed_end;
+        int is_blank;
+
+        while (line_end < len && msg[line_end] != '\n')
+            line_end++;
+
+        trimmed_end = line_end;
+        while (trimmed_end > line_start &&
+              (msg[trimmed_end - 1] == ' ' || msg[trimmed_end - 1] == '\t' ||
+               msg[trimmed_end - 1] == '\r' || msg[trimmed_end - 1] == '\v' ||
+               msg[trimmed_end - 1] == '\f'))
+            trimmed_end--;
+
+        is_blank = (trimmed_end == line_start);
+
+        if (is_blank) {
+            if (have_content)
+                pending_blank = 1;
+            /* leading blank lines (have_content == 0) are simply dropped */
+        } else {
+            size_t line_len = trimmed_end - line_start;
+            size_t need = out_len + (pending_blank ? 1 : 0) + line_len + 1;
+
+            if (need > out_cap) {
+                char *tmp;
+
+                out_cap = need + 64;
+                tmp = realloc(buf, out_cap);
+                if (tmp == NULL) {
+                    free(buf);
+                    return -1;
+                }
+                buf = tmp;
+            }
+            if (pending_blank)
+                buf[out_len++] = '\n';
+            pending_blank = 0;
+            memcpy(buf + out_len, msg + line_start, line_len);
+            out_len += line_len;
+            buf[out_len++] = '\n';
+            have_content = 1;
+        }
+
+        i = (line_end < len) ? line_end + 1 : line_end;
+    }
+
+    if (out_len + 1 > out_cap) {
+        char *tmp = realloc(buf, out_len + 1);
+
+        if (tmp == NULL) {
+            free(buf);
+            return -1;
+        }
+        buf = tmp;
+    }
+    buf[out_len] = '\0';
+
+    *out = buf;
+    return 0;
+}
+
 int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj)
 {
     const unsigned char *space;
