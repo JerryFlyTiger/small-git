@@ -79,7 +79,7 @@ small_git/
 | 7 | 巨型 repo 效能 | 部分完成 | 見下方 Phase 7a;**實際做的與原規劃不同**,說明如下 |
 | 8 | 文件、打包、跨平台收尾 | 完成 | README、man page、`make release`/`install`;CI 設定為在 Linux(gcc/clang)與 macOS 上建置並跑完整測試 |
 | 9 | 可用性補完:`.gitignore`、`sg add` 遞迴、`sg branch` | 完成 | 見下方 Phase 9;以真 git 為 oracle 的 600 次隨機模糊測試零分歧 |
-| 12 | revision 解析(`sg_rev_parse_commit`)、`sg tag`(輕量/annotated) | 完成 | 見下方 Phase 12;`interop.sh` 以真 git 為 oracle |
+| 12 | revision 解析、`sg tag`、`sg reset`、訊息正規化、loose 解壓上限 | 完成 | 見下方 Phase 12;interop 從 382 增至 642 項,全部以真 git 為 oracle |
 
 Phase 7 的內容與原規劃不同,原因記錄在此以免日後誤解:原本列的是 commit-graph、multi-pack-index、平行化。實測後發現真正的瓶頸完全不在那裡——是物件查找每次都重讀整個 pack(見下方 Phase 7a)。修好之後 `sg log` 已與 `git log` 同級,commit-graph 的邊際效益因此大幅下降,故未實作,留待有實際需求時再評估。原規劃的三項都尚未完成。
 
@@ -369,7 +369,7 @@ CLI 呼叫,全部 0 leak——這是推 CI 前的信心來源。同樣的紀律�
 - 這是 Linux 專屬的閘門。macOS 那格 CI 不跑 ASan,本機也無法複製。
 
 
-## Phase 12:revision 解析與 `sg tag`
+## Phase 12:`sg tag`、`sg reset`,與兩個位元相容缺口
 
 新增 `sg_rev_parse_commit`(`include/sg/revparse.h`)——`HEAD`/分支/tag/40-hex
 加上 `~N`/`^N` 後綴的小型 rev 語法子集,以及 `sg tag`:輕量標籤只是
@@ -388,3 +388,103 @@ annotated(已用真 git 實測確認)。與 `sg branch` 共用
 `docs/sg.1` 的 `tag` 小節裡明講的原因。要讓 `sg push` 自己支援 tag,需要擴充
 `cmd_push.c` 的 ref 列舉範圍與 pack 打包對象(annotated tag 物件本身也要進
 pack),留待有實際需求時再評估,不在本階段範圍內。
+
+### `sg reset`:三種模式,三道不同的安全閘門
+
+`--soft` 只動分支指標,`--mixed`(預設)另外重寫 index,`--hard` 再加上工作
+目錄。目標 revision 走上面的 `sg_rev_parse_commit`。
+
+**不把三種模式都塞進 `sg_safe_apply_tree`**,雖然那是既有的破壞性操作骨架。
+真 git 對 `--soft`/`--mixed` 不要求確認——它們根本不覆寫檔案——全部走同一條
+路會比它模仿的工具還礙事。折衷是:`--hard` 完整的確認加快照;`--mixed` 自動
+建快照但不打斷;`--soft` 兩者皆無。
+
+`--mixed` 需要一條「重寫 index、不碰工作目錄」的路徑,而
+`sg_apply_tree_to_workdir` 表達不了——它靠 `stat()` 剛寫出的檔案來填 index
+條目的 stat 欄位。不寫檔就沒有那個來源,而**沿用舊條目的 stat 比看起來更糟**:
+index 會宣稱檔案是最新的,同時記錄一個不同的 blob,而真 git 把 stat 當捷徑
+信任,於是對一個內容已經不同的檔案回報乾淨。`sg_index_reset_to_tree` 因此
+只在 sha 未變時沿用 stat 欄位,其餘一律歸零。
+
+### 兩個位元相容缺口
+
+**訊息沒有正規化。** `sg commit -m "x"` 把字串原封不動寫進物件,真 git 先套用
+預設的 `--cleanup=whitespace`。同一個邏輯 commit 在兩邊算出不同的物件 id:
+git 的訊息段結尾有換行,sg 沒有。git 讀得懂 sg 的物件、`fsck` 也乾淨,所以
+沒有壞掉——但「同一個 commit 在兩個工具下雜湊相同」正是這個專案的主張,而
+382 項 interop 檢查從來沒有逐位元組比對過訊息段。
+
+規則是實測出來的,不是回想的:每行剝掉行尾空白、連續空行併成一個、去掉開頭
+與結尾的空行、結尾正好一個換行,行首空白保留。只有尾隨換行那條是顯而易見的
+——只補那一條會用一個分歧換來四個。**`\v` 與 `\f` 不算空白**(真 git 保留
+它們),`\r` 算。第一版把這兩個字元也剝了,審查時比對真 git 才發現。
+
+`sg_message_cleanup` 放在序列化函式旁邊,但**刻意不從序列化函式裡呼叫**:
+`cmd_rebase.c` 轉發既有 commit 的訊息,而真 git 用 `--cleanup=verbatim` 可以
+產生沒有尾隨換行的訊息,rebase 必須逐位元組保真。套用的是持有訊息的呼叫端
+——commit、tag、merge、snapshot、chunk。
+
+順帶記一個真 git 本身的不對稱,反直覺到值得寫下來免得日後被「順手統一」:
+**`git commit -m ""` 中止,`git tag -a -m ""` 接受**並建出訊息段為空的 tag。
+
+**loose object 解壓無上限。** `sg_decompress` 每次滿了就把緩衝區加倍,沒有
+天花板,所以一個解壓後有數 GB 的 loose object 檔會被完整解出來才輪到別人看它
+一眼。Phase 10 把這條記成剩下的 zip-bomb 面。
+
+上限不是魔術數字:`sg_loose_read` 先只解壓開頭 64 個位元組,從中解析出
+`"<type> <size>\0"` 標頭,再把 `header_len + declared_size` 當硬天花板做真正的
+解壓——git 自己的形狀。zutil 保持泛用(`sg_decompress_bounded` 把天花板當
+參數,不認識物件),兩階段邏輯放在有資格認識格式的 `loose.c`。
+
+同一輪修掉一個與 Phase 10 缺陷 4 同族的截斷:`avail_in` 讓 `size_t` 穿過
+32-bit 的 `uInt`,所以超過 4 GB 的 loose 檔會餵給 zlib 錯誤的長度。Phase 10
+修了 pack 那條,漏了這條。
+
+### 審查抓到的:一個假的 merge parent
+
+`sg reset` 沒有清掉 `.git/MERGE_HEAD`。在衝突的合併中用裸的 `sg reset` 放棄
+它、暫存修正、正常 commit——產出的 commit 有**兩個 parent**,第二個指向剛被
+放棄的 merge target,全程沒有任何警告。只有 `--hard` 會清理,因為它走
+`sg_safe_apply_tree`;soft 與 mixed 兩條路徑從來沒呼叫過 `sg_merge_head_remove`。
+
+矩陣是實測三種模式 × 兩種進行中狀態量出來的,不是猜的:真 git 在合併中或
+rebase 暫停中**直接拒絕** `--soft`,`--mixed` 清掉 `MERGE_HEAD`,而**三種模式
+都不動 rebase 狀態**。sg 現在與此一致,唯一例外是 `--hard` 仍會經
+`sg_safe_apply_tree` 清掉 rebase 狀態——那條路徑與 `switch`、`undo` 共用,
+要改屬於另一次改動,已記在 `docs/sg.1` 的 BUGS 段落。
+
+614 項檢查裡沒有一項看得到這件事:**從來沒有任何測試在合併進行中呼叫過
+`sg reset`**。新的檢查斷言使用者會注意到的終態——後續 commit 只有一個 parent。
+
+### 這一階段關於測試的三個教訓
+
+**優先序在同一個地方錯了兩次,方向相反。** 先是 tag 與 branch 誰優先(gitrevisions
+是 tag 勝),接著是完整 40-hex 的位置(它比任何 ref 都優先——名字剛好是別的
+commit 的 hex 的 branch 會被字面值蓋掉)。兩次都是憑對 gitrevisions 的記憶下
+判斷,兩次都錯。現在註解裡寫的是「哪個順序是實測來的」。
+
+**壞掉的 mutation 會給出看起來更漂亮的紅。** 驗證 hex 優先序時第一次改壞了
+`resolve_base` 的區塊順序,兩個測試都紅了——比正確的 mutation 多一個。重做成
+乾淨的 mutation 後只有目標測試紅,那才是有效證據。
+
+**保守式洩漏掃描與 stat 快取都會讓「沒紅」變得沒有意義。** 證明 CI 的
+LeakSanitizer 還活著時,種在會存活到 process 結束的框架裡的單一洩漏不會被報
+(見 Phase 11);而 `--mixed` 的 stat 守門,在檔案 mtime 與 index 同一秒時被
+git 的 racily-clean 規則遮住——所有其他檢查都在同一秒內寫檔與寫 index,所以
+整套測試都看不見它。把 mtime 用 `touch -t` 推到過去才顯形。
+
+### 已知限制
+
+- **沒有縮寫 sha。** `sg_rev_parse_commit` 只吃完整 40 字 hex;前綴匹配要同時
+  掃 loose 與每一個 pack,是另一個量級,標頭註解有寫明這是刻意的。
+- **`sg reset` 不吃 pathspec。** `sg restore --staged` 已經是
+  `git reset --mixed <path>` 的同義詞,硬做會變成第三份重疊邏輯。
+- **detached HEAD 一律拒絕。** sg 從來不寫裸 sha 進 HEAD,全專案沒有這個
+  primitive;`cmd_push.c` 與 `cmd_rebase.c` 已是「偵測到就拒絕」的既有慣例。
+- **`sg reset --soft --hard` 報用法錯誤**,真 git 則接受並讓最後一個旗標生效。
+  刻意收斂:模糊的呼叫寧可拒絕。寫進 man page 免得被當成 bug 修掉。
+- **4 GB 截斷的修法沒有測試覆蓋。** 要真的配置超過 1 GB 才觀測得到差異,與
+  專案「測試不配置大量記憶體」的既有約束衝突,只有程式碼審查層級的信心。
+- **`loose.c` 的溢位保護與「無進度即判定卡死」防線都沒有能鑑別的測試。**
+  前者需要 `declared_size` 接近 `SIZE_MAX` 的案例,後者需要一段病態的 deflate
+  串流,兩者都不容易自然構造。如實記錄,不假裝有覆蓋。
