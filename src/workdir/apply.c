@@ -168,6 +168,64 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
     return rc;
 }
 
+int sg_index_reset_to_tree(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW_LEN])
+{
+    sg_flat_list target_flat;
+    sg_index old_idx;
+    sg_index new_idx;
+    size_t i;
+    int rc = 0;
+
+    if (sg_tree_flatten(git_dir, tree_id, &target_flat) != 0) {
+        fprintf(stderr, "sg: failed to read target tree\n");
+        return -1;
+    }
+
+    if (sg_index_read(git_dir, &old_idx) != 0) {
+        fprintf(stderr, "sg: failed to read index (corrupt?)\n");
+        sg_flat_list_free(&target_flat);
+        return -1;
+    }
+
+    memset(&new_idx, 0, sizeof(new_idx));
+    for (i = 0; i < target_flat.count; i++) {
+        sg_index_entry entry;
+        int old_pos = sg_index_find(&old_idx, target_flat.entries[i].path);
+
+        memset(&entry, 0, sizeof(entry));
+        if (old_pos >= 0 &&
+           memcmp(old_idx.entries[old_pos].sha1, target_flat.entries[i].sha1, SG_SHA1_RAW_LEN) == 0) {
+            entry.ctime_sec = old_idx.entries[old_pos].ctime_sec;
+            entry.ctime_nsec = old_idx.entries[old_pos].ctime_nsec;
+            entry.mtime_sec = old_idx.entries[old_pos].mtime_sec;
+            entry.mtime_nsec = old_idx.entries[old_pos].mtime_nsec;
+            entry.dev = old_idx.entries[old_pos].dev;
+            entry.ino = old_idx.entries[old_pos].ino;
+            entry.uid = old_idx.entries[old_pos].uid;
+            entry.gid = old_idx.entries[old_pos].gid;
+            entry.file_size = old_idx.entries[old_pos].file_size;
+        }
+        entry.mode = target_flat.entries[i].mode;
+        memcpy(entry.sha1, target_flat.entries[i].sha1, SG_SHA1_RAW_LEN);
+        entry.path = target_flat.entries[i].path;
+
+        if (sg_index_upsert(&new_idx, &entry) != 0) {
+            fprintf(stderr, "sg: failed to stage '%s'\n", target_flat.entries[i].path);
+            rc = -1;
+        }
+    }
+    sg_index_free(&old_idx);
+    sg_flat_list_free(&target_flat);
+
+    if (rc == 0 && sg_index_write(git_dir, &new_idx) != 0) {
+        fprintf(stderr, "sg: failed to write index\n");
+        rc = -1;
+    }
+    sg_index_free(&new_idx);
+
+    return rc;
+}
+
 typedef struct {
     char *buf;
     size_t len;

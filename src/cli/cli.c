@@ -23,6 +23,7 @@ static const sg_command_info COMMANDS[] = {
     {"tag", "列出、建立或刪除標籤"},
     {"switch", "切換分支"},
     {"restore", "還原檔案或取消暫存"},
+    {"reset", "把目前分支、index（與可選的工作目錄）重設到指定的 commit"},
     {"undo", "列出或還原自動快照"},
     {"repack", "將 loose object 打包成 packfile"},
     {"merge", "合併另一個分支"},
@@ -85,6 +86,8 @@ int sg_cli_run(int argc, char **argv)
         return sg_cmd_switch(argc - 1, argv + 1);
     if (strcmp(argv[1], "restore") == 0)
         return sg_cmd_restore(argc - 1, argv + 1);
+    if (strcmp(argv[1], "reset") == 0)
+        return sg_cmd_reset(argc - 1, argv + 1);
     if (strcmp(argv[1], "undo") == 0)
         return sg_cmd_undo(argc - 1, argv + 1);
     if (strcmp(argv[1], "repack") == 0)
