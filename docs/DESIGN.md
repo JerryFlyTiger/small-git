@@ -229,7 +229,8 @@ REF_DELTA 造成 use-after-free),所以把它系統化成常設的 fuzz harness�
 | 6 | `sg_pack_delta_apply` | target size 是**已解壓 delta stream** 裡的獨立 varint,不受 5 的檢查管轄 |
 
 缺陷 1、2 之所以長期存在,是因為 CI 的 ASan 為了容忍兩個 process 生命週期的
-快取而全域關掉了 leak detection——等於洩漏偵測有個大洞。
+快取而全域關掉了 leak detection——等於洩漏偵測有個大洞。這個洞已在 Phase 11
+補起來(見下)。
 
 缺陷 4 是唯一的記憶體**內容**安全問題(其餘是資源耗盡):宣告大小 `2^32+5`
 時 `avail_out` 被截成 5,壓縮流只要恰好解出 5 bytes,zlib 就回報成功,而呼叫端
@@ -306,3 +307,62 @@ timeout 是 6 小時。因此兩支 fuzzer 的 `main()` 都裝了整體看門狗
 - **只有 pack/idx/index 三個解析器被覆蓋**。`sg_decompress`
   (`src/util/zutil.c`,loose object 的解壓路徑)是「每次滿了就 `cap*2`」的
   無界成長,沒有輸出長度上限,是同類的 zip-bomb 攻擊面,但不在這次範圍內。
+
+## Phase 11:把 CI 的 LeakSanitizer 開回來
+
+Phase 10 留下的第一順位 follow-up。改動只有一行語意:`.github/workflows/ci.yml`
+的 ASan job 從三處 `ASAN_OPTIONS=detect_leaks=0` 改成 `detect_leaks=1`。
+
+### 原本關掉的理由是錯的
+
+當初的說法是「`pack.c:498` 的 mmap pack registry 與 `chunk.c:744` 的 chunk
+keepalive cache 是刻意不釋放的 process 生命週期快取,開了會被誤報」。這個前提
+不成立:兩者都是**檔案層級的全域變數**,而 LeakSanitizer 的可達性分析把全域
+當 root,仍然可達(still-reachable)的記憶體不會被判定成 leak。實測證實了這點
+——`detect_leaks=1` 在 Linux CI 上直接通過,三個矩陣格加 ASan job 全綠,
+**不需要任何 suppression 檔**。
+
+代價是實在的:缺陷 1、2 兩個 `index.c` 的洩漏能活到 Phase 10,靠的是
+`test_fuzz_index` 量 peak RSS 才抓到——比 LSan 鈍得多的工具。
+
+### 綠燈不算證據:植入洩漏的三次實測
+
+「開了之後 CI 還是綠」有兩種解釋:沒有洩漏,或 LSan 根本沒在跑。分不出來就等於
+沒有這道閘門。所以在合併前種了故意的洩漏送 CI,結果值得記下來:
+
+| 植入形態 | CI 結果 | 解讀 |
+|---|---|---|
+| 1 塊 1234 B,指標存進 `sg_cli_run` 的區域變數後設 NULL | **綠**(382/382 通過) | 假陰性 |
+| 100 塊 1234 B,同一位置迴圈 | 紅,`detected memory leaks`,interop 200/382 | LSan 活著 |
+| 1 塊 1234 B,配置在一個會返回的 helper 內 | 紅,`Direct leak of 1234 byte(s) in 1 object(s)` | 單一洩漏抓得到 |
+
+第一列的假陰性不是 LSan 的缺陷,是**植入位置**的問題:那個指標被溢出到
+`sg_cli_run` 自己的堆疊框架,而該框架在整個指令執行期間都是活的祖先框架,
+保守掃描把它當成 root,於是那塊記憶體一直「可達」。真實的洩漏來自**會返回的
+函式**,框架隨即被後續更深的呼叫覆蓋——第三列證明那種形態單一一塊就會被抓到。
+
+教訓一般化:**驗證一個保守式洩漏掃描器時,不要把植入放在會存活到 process
+結束的框架裡**,否則證明出來的是工具沒壞,而不是閘門有效。
+
+### macOS 本機怎麼先驗一輪
+
+Apple 的 ASan 沒有實作 LSan,`detect_leaks=1` 會直接 abort,所以本機測不到。
+替代品是系統內建的 `leaks(1)`:
+
+```bash
+MallocStackLogging=1 leaks --atExit -- build/tests/test_foo
+MallocStackLogging=1 leaks --atExit -- build/sg status
+```
+
+它會印 `N leaks for M total leaked bytes`。用它掃過 22 個測試二進位與 20 種
+CLI 呼叫,全部 0 leak——這是推 CI 前的信心來源。同樣的紀律適用:先用一支故意
+洩漏的小程式確認 `leaks` 會紅(它會印 "Process is not debuggable" 警告,但
+偵測照常運作),再相信那些 0。
+
+### 已知限制
+
+- 覆蓋範圍等於 ASan job 跑到的路徑:`make sanitize` 的單元測試 + `interop.sh`
+  + 兩支解析器 fuzzer。沒被這些跑到的程式碼一樣沒有洩漏偵測。
+- 保守掃描的本質:仍然可達的記憶體不算 leak。刻意留存的快取因此免疫,但
+  「本該釋放卻剛好還被某個全域或活框架指到」的真洩漏也會被漏掉。
+- 這是 Linux 專屬的閘門。macOS 那格 CI 不跑 ASan,本機也無法複製。

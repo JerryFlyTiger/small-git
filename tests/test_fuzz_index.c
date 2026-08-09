@@ -39,13 +39,13 @@
    upper bound excludes the very entry whose path just got malloc'd right
    before the check that sends it to `fail` (index.c:213-222). Neither shows
    up as a wrong return value -- sg_index_read still correctly reports -1 --
-   so a functional/return-code fuzz loop like the one above cannot see it,
-   and this project's CI runs ASan with detect_leaks=0 (see
-   .github/workflows/ci.yml), so leak sanitizer coverage isn't available
-   either (it's disabled globally because of two *intentional*
-   process-lifetime caches elsewhere -- src/storage/pack.c's mmap registry
-   and src/storage/chunk.c's keepalive cache -- not because leaks are
-   welcome). test_index_fail_path_leak works around both gaps with a
+   so a functional/return-code fuzz loop like the one above cannot see it.
+   When this check was written, CI also ran ASan with detect_leaks=0, so
+   there was no leak sanitizer to fall back on; that has since been fixed
+   (LeakSanitizer is on -- see .github/workflows/ci.yml), which makes this
+   check a belt-and-braces backstop rather than the only coverage. It still
+   earns its place: LSan needs a sanitized build, and this runs in the plain
+   fuzz-parse job too. test_index_fail_path_leak works around the gap with a
    poor-man's leak check: parse the same deliberately-malformed index
    (padded_len check fails on its last entry) many times in a row and watch
    getrusage's peak RSS. A build with the leak grows RSS by tens of KB per
@@ -469,11 +469,9 @@ static long rss_kb(void)
    sanitizers job runs `make CC=clang sanitize`, which depends on `test`,
    this false positive would otherwise turn that job red on every run. Skip
    the RSS measurement under ASan; leaks on that build are ASan's job to
-   catch via its own instrumentation (moot here anyway, since CI runs it
-   with detect_leaks=0 -- see .github/workflows/ci.yml -- because of the two
-   *intentional* process-lifetime caches documented in the file header
-   comment above; this probe was never meant to substitute for leak
-   sanitizer, only to cover the gap while it's off). */
+   catch via its own instrumentation, and LeakSanitizer is now enabled there
+   (see .github/workflows/ci.yml), so nothing is lost by skipping. The plain
+   fuzz-parse job is where this probe actually runs. */
 #if defined(__SANITIZE_ADDRESS__)
 #define SG_FUZZ_INDEX_ASAN_BUILD 1
 #elif defined(__has_feature)
@@ -595,9 +593,8 @@ static void test_index_fail_path_leak(const char *git_dir)
            "test_index_fail_path_leak: skipping the RSS growth assertion under "
            "AddressSanitizer (RSS grew by %ld KB, but ASan's allocator quarantine inflates "
            "RSS independent of real leaks -- see the comment above this function). Leak "
-           "coverage on this build is ASan's own instrumentation's job, not this probe's; "
-           "note CI runs it with detect_leaks=0 for unrelated reasons (see "
-           ".github/workflows/ci.yml and this file's header comment).\n",
+           "coverage on this build is ASan's own instrumentation's job, not this probe's -- "
+           "CI enables LeakSanitizer there (see .github/workflows/ci.yml).\n",
            delta);
 #else
     CHECK(delta <= growth_threshold_kb,

@@ -116,7 +116,10 @@ staging 的驗證。本機綠燈不是充分證據。**
 - 記憶體:標準 malloc/free,無 arena。每個複合結構配一個 `_free`。標頭註解會
   寫明 owned 還是 borrowed,新 API 沿用同樣措辭。兩個**故意**不釋放的
   process-lifetime 快取:`pack.c:498` 的 mmap pack registry、`chunk.c:744` 的
-  keepalive cache——所以 CI 的 ASan 關掉了 leak detection。
+  keepalive cache。這兩個曾是 CI 關掉 leak detection 的理由,但那個理由是錯的
+  ——兩者都掛在檔案層級全域變數上,LSan 把全域當 root,still-reachable 不算
+  leak。**CI 的 ASan job 現在開著 `detect_leaks=1`**,新的 process-lifetime
+  快取要照樣掛在全域上,否則會讓 CI 變紅。
 - 新增子指令要動三個地方(**不必改 Makefile**,`src` 是 glob 進去的):新增
   `src/cli/cmd_xxx.c`、在 `include/sg/cli.h` 加宣告、在 `src/cli/cli.c` 的
   `COMMANDS[]`(`:13`)加說明並在派發鏈(`:63` 起)加一組 `strcmp`。若指令會覆寫
