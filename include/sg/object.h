@@ -41,6 +41,17 @@ typedef struct {
    success, -1 on malformed input. */
 int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj);
 
+/* Parses just the "{type} {size}\0" header out of data/data_len -- unlike
+   sg_object_parse(), data need not contain the object's content (or all of
+   it): this is meant for callers that only have a prefix of the decompressed
+   stream, e.g. to learn the declared size before deciding how much more to
+   decompress. *header_len_out is set to the header's length in bytes
+   (data + *header_len_out is where the content would start) and
+   *declared_size_out to the size field's value. Returns 0 on success, -1 if
+   the header isn't fully present in data_len bytes or is malformed. */
+int sg_object_parse_header(const unsigned char *data, size_t data_len, sg_obj_type *type_out,
+                           size_t *header_len_out, size_t *declared_size_out);
+
 /* ---- tree ---- */
 
 typedef struct {
@@ -85,6 +96,19 @@ typedef struct {
 int sg_commit_serialize(const sg_commit *commit, unsigned char **out, size_t *out_len);
 int sg_commit_parse(const unsigned char *content, size_t content_len, sg_commit *out);
 void sg_commit_free(sg_commit *commit);
+
+/* Applies git's default `--cleanup=whitespace` commit/tag message
+   normalization: strips trailing whitespace from each line, collapses runs
+   of blank lines into a single blank line, drops leading and trailing blank
+   lines, and -- if anything is left -- ensures the result ends with exactly
+   one trailing '\n'. Leading whitespace on a line is preserved.
+
+   *out is malloc'd, caller frees. Returns 0 on success (including the case
+   where the message normalizes to nothing, in which case *out is a malloc'd
+   empty string -- callers must check (*out)[0] == '\0' to detect that case;
+   it is distinct from allocation failure). Returns -1 only on OOM, in which
+   case *out is left untouched. */
+int sg_message_cleanup(const char *msg, char **out);
 
 /* ---- tag (annotated) ---- */
 

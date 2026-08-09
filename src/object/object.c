@@ -79,7 +79,92 @@ void sg_object_hash(sg_obj_type type, const void *content, size_t content_len,
     free(formatted);
 }
 
-int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj)
+int sg_message_cleanup(const char *msg, char **out)
+{
+    size_t len = strlen(msg);
+    size_t out_cap = len + 2;
+    char *buf;
+    size_t out_len = 0;
+    size_t i = 0;
+    int have_content = 0;
+    int pending_blank = 0;
+
+    buf = malloc(out_cap);
+    if (buf == NULL)
+        return -1;
+
+    while (i < len) {
+        size_t line_start = i;
+        size_t line_end = line_start;
+        size_t trimmed_end;
+        int is_blank;
+
+        while (line_end < len && msg[line_end] != '\n')
+            line_end++;
+
+        /* Only space, tab and \r are stripped as trailing whitespace here,
+           matching real git's --cleanup=whitespace exactly: \v (0x0B) and
+           \f (0x0C) are NOT considered whitespace by git's own strip logic
+           and are preserved verbatim. Verified directly against git 2.55.0
+           -- `git commit -m $'a\f'` keeps the \f byte in the message
+           segment, and a message consisting of nothing but \f is accepted
+           (not treated as empty). */
+        trimmed_end = line_end;
+        while (trimmed_end > line_start &&
+              (msg[trimmed_end - 1] == ' ' || msg[trimmed_end - 1] == '\t' ||
+               msg[trimmed_end - 1] == '\r'))
+            trimmed_end--;
+
+        is_blank = (trimmed_end == line_start);
+
+        if (is_blank) {
+            if (have_content)
+                pending_blank = 1;
+            /* leading blank lines (have_content == 0) are simply dropped */
+        } else {
+            size_t line_len = trimmed_end - line_start;
+            size_t need = out_len + (pending_blank ? 1 : 0) + line_len + 1;
+
+            if (need > out_cap) {
+                char *tmp;
+
+                out_cap = need + 64;
+                tmp = realloc(buf, out_cap);
+                if (tmp == NULL) {
+                    free(buf);
+                    return -1;
+                }
+                buf = tmp;
+            }
+            if (pending_blank)
+                buf[out_len++] = '\n';
+            pending_blank = 0;
+            memcpy(buf + out_len, msg + line_start, line_len);
+            out_len += line_len;
+            buf[out_len++] = '\n';
+            have_content = 1;
+        }
+
+        i = (line_end < len) ? line_end + 1 : line_end;
+    }
+
+    if (out_len + 1 > out_cap) {
+        char *tmp = realloc(buf, out_len + 1);
+
+        if (tmp == NULL) {
+            free(buf);
+            return -1;
+        }
+        buf = tmp;
+    }
+    buf[out_len] = '\0';
+
+    *out = buf;
+    return 0;
+}
+
+int sg_object_parse_header(const unsigned char *data, size_t data_len, sg_obj_type *type_out,
+                           size_t *header_len_out, size_t *declared_size_out)
 {
     const unsigned char *space;
     const unsigned char *nul;
@@ -109,11 +194,26 @@ int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj)
     if (end != (const char *)nul)
         return -1;
 
-    if ((size_t)(nul + 1 - data) + declared_size != data_len)
+    *type_out = type;
+    *header_len_out = (size_t)(nul + 1 - data);
+    *declared_size_out = declared_size;
+    return 0;
+}
+
+int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj)
+{
+    sg_obj_type type;
+    size_t header_len;
+    size_t declared_size;
+
+    if (sg_object_parse_header(data, data_len, &type, &header_len, &declared_size) != 0)
+        return -1;
+
+    if (header_len + declared_size != data_len)
         return -1;
 
     obj->type = type;
-    obj->content = nul + 1;
+    obj->content = data + header_len;
     obj->content_len = declared_size;
     return 0;
 }

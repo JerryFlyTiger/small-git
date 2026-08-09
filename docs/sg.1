@@ -198,6 +198,15 @@ is required; there is no editor-based message flow, no
 and no way to sign or author-override a commit via flags (see
 .B ENVIRONMENT
 for author/committer identity).
+.I message
+is normalized the same way real git's default
+.B --cleanup=whitespace
+does: trailing whitespace is stripped from each line, runs of blank lines
+are collapsed to one, and leading/trailing blank lines are dropped. If the
+result is empty (including an all-whitespace
+.IR message ),
+.B sg
+refuses to create the commit, matching real git.
 .PP
 Fails if the index has unresolved merge conflicts (stage 1/2/3 entries) or
 if a rebase is currently in progress (use
@@ -355,6 +364,234 @@ A successful deletion prints the deleted tip's full object id \(em because
 .B "sg undo"
 snapshots the working tree and index but not refs, that printed id is the
 only way to recreate the branch.
+.SS tag
+.B sg tag
+.RB [ -a ]
+.RB [ -m
+.IR msg ]
+.RB [ --force | -f ]
+.RB [ -- ]
+.RI [ name
+.RI [ rev ]]
+.br
+.B sg tag
+.RB [ -d | --delete ]
+.I name
+.PP
+With no arguments, lists every tag under
+.BR refs/tags/ ,
+one per line, sorted byte-wise. As with
+.BR "sg branch" ,
+the listing merges the loose files with
+.B packed-refs
+entries, so a tag
+.B "git gc"
+has packed away is still listed.
+.PP
+With
+.IR name ,
+creates a tag named
+.I name
+pointing at
+.I rev
+(a commit, branch, or tag name, or a full 40-hex object id; see
+.B REVISIONS
+below), defaulting to
+.B HEAD
+if
+.I rev
+is omitted. Creating fails if a tag by that name already exists, unless
+.B --force
+(or
+.BR -f )
+is given, in which case the existing tag is overwritten; it also fails if
+.I name
+is not a valid ref name (the same rules
+.B "sg branch"
+enforces).
+.PP
+Without
+.B -a
+or
+.BR -m ,
+the tag is
+.IR lightweight :
+.B refs/tags/\fIname\fR
+is written directly as a ref to the target commit, no tag object is
+created. With
+.B -a
+(annotated) or
+.B -m
+.I msg
+(which implies
+.BR -a ),
+.B sg
+instead builds a
+.B tag
+object \(em recording the target object, its type, the tag name, a tagger
+identity/timestamp, and the message \(em writes it as a loose object, and
+points
+.B refs/tags/\fIname\fR
+at that tag object's id instead of the target directly. The message is
+normalized the same way as
+.BR "sg commit" 's
+(real git's default
+.BR --cleanup=whitespace ),
+but unlike
+.BR "sg commit" ,
+an empty (or all-whitespace) message is
+.I not
+rejected \(em it produces a tag object with an empty message segment,
+matching real git's own
+.B "git tag -a -m ''"
+behavior, which is intentionally asymmetric with
+.BR "git commit -m ''" .
+.B -a
+without
+.B -m
+is a usage error;
+.B sg
+has no editor integration to prompt for a message (same restriction as
+.BR "sg commit" ).
+The tagger identity is read from
+.B GIT_AUTHOR_NAME
+/
+.BR GIT_AUTHOR_EMAIL ,
+defaulting to
+.B small_git
+/
+.BR sg@localhost ,
+with a fixed
+.B +0000
+timezone offset.
+.PP
+With
+.B -d
+(or
+.BR --delete ),
+deletes
+.IR name .
+As with branch deletion, this removes the tag from
+.B both
+the loose file and
+.B packed-refs
+so a stale packed entry cannot resurrect it; deleting a tag that does not
+exist is an error, not a silent success. Unlike branch deletion there is no
+merge check or confirmation prompt \(em a tag is just a name for an object,
+not a line of unique history that could become unreachable.
+.B -d
+combined with any tag-creation option
+.RB ( -a ", " -m ", " --force / -f )
+or a second name argument is a usage error, matching real git; this project
+does not support deleting more than one tag per invocation, but rejects the
+attempt rather than silently deleting only the first name.
+.PP
+.B sg push
+does not transmit tags; it only pushes
+.BR refs/heads/ .
+Since
+.B sg
+is bit-compatible with real git's object and ref formats, a tag created by
+.B sg tag
+can still be pushed with real git's own
+.B "git push --tags"
+against the same repository.
+.SS reset
+.B sg reset
+.RB [ --soft | --mixed | --hard ]
+.RB [ --force | -f ]
+.RI [ rev ]
+.PP
+Moves the current branch to
+.I rev
+(defaulting to
+.BR HEAD ,
+so a bare
+.B sg reset
+re-points the branch at its own current commit \(em a no-op for the branch
+itself, but see the index effects of
+.B --mixed
+below). Fails on a detached
+.B HEAD
+(the same restriction
+.B "sg switch"
+and
+.B "sg branch"
+apply elsewhere: a branch ref is required to move). Unlike
+.BR "sg restore" ,
+.B reset
+has no pathspec form; passing paths after
+.B --
+is rejected with a pointer to
+.B "sg restore --staged"
+instead.
+.PP
+The three modes differ only in how much beyond the branch ref they touch,
+and that difference drives three different safety postures:
+.TP
+.B --soft
+Moves only the branch ref.
+The index and working directory are left exactly as they are, so nothing
+uncommitted is ever at risk \(em there is no confirmation prompt and no
+automatic snapshot, matching real git.
+.B --soft
+refuses outright (exit 1, no changes made) if a merge is unresolved or a
+rebase is paused, since silently abandoning that state out from under a
+soft reset would be surprising and unrecoverable through
+.B --soft
+itself; resolve or abort the merge/rebase first.
+.TP
+.B --mixed
+(the default mode when no
+.BR --soft / --hard
+flag is given) additionally rebuilds the index from
+.IR rev 's
+tree, discarding whatever was staged. That can lose uncommitted staged
+work, but never touches the working directory, so \(em like real git \(em
+there is still no interactive confirmation; instead
+.B sg
+takes an automatic safety snapshot (recoverable via
+.BR "sg undo" )
+before rewriting the index. If a merge is in progress,
+.B --mixed
+also clears
+.BR MERGE_HEAD ,
+ending the merge (matching real git: a later, unrelated
+.B "sg commit"
+must not silently record a bogus merge commit for a merge the user just
+abandoned via reset). It deliberately does
+.B not
+touch an in-progress rebase's sequencer state \(em matching real git, which
+also leaves a paused rebase's on-disk state alone here; only
+.B "sg rebase --abort"
+or a full
+.B --hard
+reset ends that (see the
+.B BUGS
+note below for the one place these two safety layers disagree).
+.TP
+.B --hard
+Additionally overwrites the working directory to match
+.IR rev 's
+tree, via the same
+.B sg_safe_apply_tree
+machinery
+.B "sg switch"
+and
+.B "sg restore"
+use: an interactive confirmation prompt (bypassable with
+.B --force
+/
+.BR -f ,
+real git has no equivalent flag \(em this project's own addition) followed
+by an automatic safety snapshot, since this is the one mode that can
+overwrite uncommitted working-directory changes outright.
+.PP
+Passing more than one of
+.BR --soft / --mixed / --hard
+is a usage error (exit 1) \(em a deliberate divergence from real git, which
+accepts the combination and lets the last flag silently win. An ambiguous
+invocation is rejected here rather than guessed at.
 .SS switch
 .B sg switch
 .RB [ -c ]
@@ -940,3 +1177,20 @@ above and small_git's
 \(dq已知限制\(dq / Known Limitations section); missing flags and
 subcommands found in real git are not oversights to be reported unless
 they contradict what is documented here.
+.PP
+.B sg reset --hard
+clears an in-progress rebase's sequencer state (the same
+.B sg_safe_apply_tree
+machinery
+.B "sg switch"
+and
+.B "sg restore"
+share does this as part of finishing any tree-overwriting apply), whereas
+real git's
+.B "git reset --hard"
+leaves a paused rebase's on-disk state untouched, matching
+.B --mixed
+here. This is a pre-existing, known divergence between the two
+tree-overwriting safety layers in this codebase (not something introduced
+by
+.BR "sg reset" ), left as-is rather than papered over.

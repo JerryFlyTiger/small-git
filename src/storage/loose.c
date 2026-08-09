@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,17 @@
 #include <unistd.h>
 
 #define SG_PATH_MAX 4096
+
+/* Loose object headers are "{type} {size}\0": type is one of the four known
+   names (longest is "commit", 6 bytes) and size is a decimal size_t (at most
+   20 digits on a 64-bit size_t), so 64 bytes is a generous upper bound on any
+   legitimate header -- this isn't a magic cap on object content, just on the
+   header grammar itself, which is fixed by the format. Used to peek at the
+   header before the declared content size is known, so we can bound the real
+   decompression by header_len + declared_size instead of growing without
+   limit (a zip bomb: a tiny compressed loose object file that decompresses
+   to an enormous amount of memory). */
+#define SG_LOOSE_HEADER_PROBE_MAX 64
 
 static void object_paths(const char *git_dir, const char hex[SG_SHA1_HEX_LEN + 1],
                          char dir_path[SG_PATH_MAX], char file_path[SG_PATH_MAX])
@@ -108,6 +120,12 @@ int sg_loose_read(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
     struct stat st;
     unsigned char *raw;
     size_t raw_len;
+    unsigned char probe[SG_LOOSE_HEADER_PROBE_MAX];
+    size_t probe_len;
+    sg_obj_type probe_type;
+    size_t header_len;
+    size_t declared_size;
+    size_t max_out;
     unsigned char *decompressed;
     size_t decompressed_len;
     sg_object obj;
@@ -135,7 +153,34 @@ int sg_loose_read(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
         return -1;
     }
 
-    if (sg_decompress(raw, raw_len, &decompressed, &decompressed_len) != 0) {
+    /* Phase 1: peek at just the header to learn the declared content size,
+       without decompressing the (possibly attacker-controlled) rest of the
+       stream. Bails cleanly if the header itself doesn't fit in the probe
+       window or is malformed -- either way there's no valid object here. */
+    if (sg_decompress_prefix(raw, raw_len, probe, sizeof(probe), &probe_len) != 0) {
+        free(raw);
+        return -1;
+    }
+    if (sg_object_parse_header(probe, probe_len, &probe_type, &header_len, &declared_size) != 0) {
+        free(raw);
+        return -1;
+    }
+    (void)probe_type; /* re-derived by sg_object_parse below along with content */
+
+    /* Phase 2: now that the declared size is known, decompress the whole
+       stream bounded by header_len + declared_size. Anything the stream
+       tries to produce beyond that is rejected instead of grown into --
+       that's the zip-bomb guard. sg_object_parse() below additionally
+       requires the actual decompressed length to equal this exactly, so a
+       stream that under-produces relative to its declared size is rejected
+       too. */
+    if (declared_size > SIZE_MAX - header_len) {
+        free(raw);
+        return -1;
+    }
+    max_out = header_len + declared_size;
+
+    if (sg_decompress_bounded(raw, raw_len, max_out, &decompressed, &decompressed_len) != 0) {
         free(raw);
         return -1;
     }

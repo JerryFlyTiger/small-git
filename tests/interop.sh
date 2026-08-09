@@ -2624,7 +2624,7 @@ check "phase9 case4: delete printed the true (loose) tip in full, recoverable" \
 # case 5: current-branch delete refused (even forced); unmerged delete is
 # refused on a non-tty stdin without --force, succeeds with it
 (cd "$P9B_REPO" && "$SG" branch -d master --force < /dev/null) > /dev/null 2>&1
-check "phase9 case5: deleting the current branch fails even with --force" test $? != 0
+check "phase9 case5: deleting the current branch fails even with --force" test $? = 1
 (cd "$P9B_REPO" && git rev-parse --verify refs/heads/master) > /dev/null 2>&1
 check "phase9 case5: current branch is intact after the refused delete" test $? = 0
 
@@ -2634,7 +2634,7 @@ check "phase9 case5: current branch is intact after the refused delete" test $? 
 P9_UM_TIP=$(cd "$P9B_REPO" && git rev-parse unmerged)
 P9_UM_OUT="$WORKDIR/p9_um_out.txt"
 (cd "$P9B_REPO" && "$SG" branch -d unmerged < /dev/null) > "$P9_UM_OUT" 2>&1
-check "phase9 case5: unmerged delete on non-tty stdin without --force is refused" test $? != 0
+check "phase9 case5: unmerged delete on non-tty stdin without --force is refused" test $? = 1
 check "phase9 case5: the refusal names --force as the way through" \
     grep -q -- "--force" "$P9_UM_OUT"
 check "phase9 case5: branch untouched after the refused unmerged delete" \
@@ -2650,12 +2650,12 @@ check "phase9 case5: unmerged branch gone after the forced delete" test $? != 0
 # check-ref-format agrees every one is invalid
 for bad in 'a..b' 'a b' 'a.lock' 'HEAD' 'a/' '@{x}'; do
     (cd "$P9B_REPO" && "$SG" branch "$bad") > /dev/null 2>&1
-    check "phase9 case6: sg rejects invalid creation name '$bad'" test $? != 0
+    check "phase9 case6: sg rejects invalid creation name '$bad'" test $? = 1
     (cd "$P9B_REPO" && git check-ref-format --branch "$bad") > /dev/null 2>&1
     check "phase9 case6: git check-ref-format agrees '$bad' is invalid" test $? != 0
 done
 (cd "$P9B_REPO" && "$SG" branch -- -lead) > /dev/null 2>&1
-check "phase9 case6: sg rejects leading-dash name '-lead'" test $? != 0
+check "phase9 case6: sg rejects leading-dash name '-lead'" test $? = 1
 (cd "$P9B_REPO" && git check-ref-format --branch -lead) > /dev/null 2>&1
 check "phase9 case6: git check-ref-format agrees '-lead' is invalid" test $? != 0
 
@@ -2663,11 +2663,11 @@ check "phase9 case6: git check-ref-format agrees '-lead' is invalid" test $? != 
 # is loose or lives only in packed-refs
 (cd "$P9B_REPO" && "$SG" branch dupe) > /dev/null 2>&1
 (cd "$P9B_REPO" && "$SG" branch dupe) > /dev/null 2>&1
-check "phase9 case7: creating over an existing loose branch fails" test $? != 0
+check "phase9 case7: creating over an existing loose branch fails" test $? = 1
 check "phase9 case7: precondition -- topic is packed-only by now" \
     test ! -f "$P9B_REPO/.git/refs/heads/topic"
 (cd "$P9B_REPO" && "$SG" branch topic) > /dev/null 2>&1
-check "phase9 case7: creating over a packed-only branch fails" test $? != 0
+check "phase9 case7: creating over a packed-only branch fails" test $? = 1
 
 # case 8: empty repo (no commits): listing is silent success, creating errors
 P9E_REPO="$WORKDIR/phase9_empty_repo"
@@ -2679,7 +2679,165 @@ P9E_RC=$?
 check "phase9 case8: sg branch in an empty repo exits 0" test "$P9E_RC" = 0
 check "phase9 case8: sg branch in an empty repo prints nothing" test ! -s "$P9E_LIST"
 (cd "$P9E_REPO" && "$SG" branch nothing-yet) > /dev/null 2>&1
-check "phase9 case8: creating a branch in an empty repo fails (no commit yet)" test $? != 0
+check "phase9 case8: creating a branch in an empty repo fails (no commit yet)" test $? = 1
+
+echo ""
+
+# --- Phase 12: sg tag -- lightweight/annotated, packed-refs-correct --------
+# Same loose-vs-packed blindness that bit branch deletion applies to tags:
+# packed-only and stale-shadow cases below pin the deletion side, and the
+# annotated-tag object round-trip is the strongest oracle here (git must
+# read a tag object sg wrote, byte for byte).
+P12_REPO="$WORKDIR/phase12_tag_repo"
+mkdir -p "$P12_REPO"
+(cd "$WORKDIR" && "$SG" init phase12_tag_repo) > /dev/null 2>&1
+printf 'tag base\n' > "$P12_REPO/base.txt"
+(cd "$P12_REPO" && "$SG" add base.txt) > /dev/null 2>&1
+(cd "$P12_REPO" && "$SG" commit -m "p12 base") > /dev/null 2>&1
+P12_HEAD=$(cd "$P12_REPO" && git rev-parse HEAD)
+
+# case 1: lightweight tag at HEAD -- real git agrees it's a plain ref to the commit
+(cd "$P12_REPO" && "$SG" tag light) > /dev/null 2>&1
+check "phase12 case1: sg tag <name> exits 0" test $? = 0
+check "phase12 case1: git rev-parse of the lightweight tag equals HEAD" \
+    test "$(cd "$P12_REPO" && git rev-parse light)" = "$P12_HEAD"
+(cd "$P12_REPO" && git cat-file -t light) 2>/dev/null | grep -q "^commit\$"
+check "phase12 case1: git sees the lightweight tag's object type as commit (no tag object)" test $? = 0
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^light\$"
+check "phase12 case1: git tag -l lists the sg-created lightweight tag" test $? = 0
+
+# case 2: annotated tag -- git must read the tag object sg wrote
+(cd "$P12_REPO" && "$SG" tag -a -m "hello annotated" ann) > /dev/null 2>&1
+check "phase12 case2: sg tag -a -m <msg> <name> exits 0" test $? = 0
+(cd "$P12_REPO" && git cat-file -t ann) 2>/dev/null | grep -q "^tag\$"
+check "phase12 case2: git cat-file -t sees the annotated tag as a tag object" test $? = 0
+(cd "$P12_REPO" && git cat-file -p ann) 2>/dev/null | grep -q "^hello annotated\$"
+check "phase12 case2: git cat-file -p shows the annotated tag's message" test $? = 0
+check "phase12 case2: git rev-parse ann^{commit} peels to the tagged commit" \
+    test "$(cd "$P12_REPO" && git rev-parse 'ann^{commit}' 2>/dev/null)" = "$P12_HEAD"
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^ann\$"
+check "phase12 case2: git tag -l lists the sg-created annotated tag" test $? = 0
+(cd "$P12_REPO" && git fsck) > /dev/null 2>&1
+check "phase12 case2: git fsck is clean after sg tag -a" test $? = 0
+
+# case 2 (cont.): -m without -a also produces an annotated tag (measured
+# against real git: `git tag -m x name` creates an annotated tag)
+(cd "$P12_REPO" && "$SG" tag -m "implicit annotated" implicit) > /dev/null 2>&1
+check "phase12 case2: sg tag -m <msg> <name> (no -a) exits 0" test $? = 0
+(cd "$P12_REPO" && git cat-file -t implicit) 2>/dev/null | grep -q "^tag\$"
+check "phase12 case2: -m without -a still creates an annotated tag object" test $? = 0
+
+# case 2 (cont.): -a without -m is a usage error
+(cd "$P12_REPO" && "$SG" tag -a noamsg) > /dev/null 2>&1
+check "phase12 case2: sg tag -a without -m is rejected" test $? = 1
+
+# case 3: reverse direction -- a real-git-made annotated tag is listed by sg
+# and resolvable as a revision (sg_rev_parse_commit must peel it). Exercised
+# through `sg tag <newname> <rev>`, which is the only CLI surface for
+# sg_rev_parse_commit today: a lightweight tag created FROM the real-git
+# annotated tag must land on the peeled commit, not the tag object's own id.
+(cd "$P12_REPO" && git tag -a -m "git made this" gitmade) 2>/dev/null
+(cd "$P12_REPO" && "$SG" tag) 2>/dev/null | grep -q "^gitmade\$"
+check "phase12 case3: sg tag lists a tag created by real git" test $? = 0
+(cd "$P12_REPO" && "$SG" tag from-gitmade gitmade) > /dev/null 2>&1
+check "phase12 case3: sg tag <name> <rev> using a real-git annotated tag as <rev> exits 0" test $? = 0
+check "phase12 case3: sg peeled the real-git annotated tag to the tagged commit, not the tag object id" \
+    test "$(cd "$P12_REPO" && git rev-parse from-gitmade)" = "$P12_HEAD"
+
+# case 4: listing order matches git tag -l (byte-wise sort)
+P12_SG_LIST="$WORKDIR/p12_sg_list.txt"
+P12_GIT_LIST="$WORKDIR/p12_git_list.txt"
+(cd "$P12_REPO" && "$SG" tag) 2>/dev/null > "$P12_SG_LIST"
+(cd "$P12_REPO" && git tag -l) 2>/dev/null > "$P12_GIT_LIST"
+check "phase12 case4: sg tag listing matches git tag -l exactly (order included)" \
+    cmp -s "$P12_SG_LIST" "$P12_GIT_LIST"
+
+# case 5: packed-only tag (post pack-refs, no loose file at all)
+(cd "$P12_REPO" && "$SG" tag packed-only) > /dev/null 2>&1
+(cd "$P12_REPO" && git pack-refs --all) 2>/dev/null
+check "phase12 case5: precondition -- pack-refs removed the loose file" \
+    test ! -f "$P12_REPO/.git/refs/tags/packed-only"
+(cd "$P12_REPO" && "$SG" tag) 2>/dev/null | grep -q "^packed-only\$"
+check "phase12 case5: packed-only tag is still listed by sg tag" test $? = 0
+(cd "$P12_REPO" && "$SG" tag -d packed-only) > /dev/null 2>&1
+check "phase12 case5: sg tag -d deletes a packed-only tag" test $? = 0
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^packed-only\$"
+check "phase12 case5: git tag -l no longer shows the packed-only tag" test $? != 0
+grep -q "refs/tags/packed-only" "$P12_REPO/.git/packed-refs" 2>/dev/null
+check "phase12 case5: packed-refs has no line left for the deleted tag" test $? != 0
+
+# case 6: STALE SHADOW -- pack, then force-move the tag so a newer loose
+# file shadows the stale packed line; deleting must purge BOTH
+(cd "$P12_REPO" && "$SG" tag shadow) > /dev/null 2>&1
+(cd "$P12_REPO" && git pack-refs --all) 2>/dev/null
+P12_STALE=$(cd "$P12_REPO" && git rev-parse shadow)
+(cd "$P12_REPO" && printf 'shadow work\n' > shadow.txt \
+    && git add shadow.txt && git commit -q -m "shadow commit") 2>/dev/null
+(cd "$P12_REPO" && git tag -f shadow) > /dev/null 2>&1
+P12_SHADOW_TIP=$(cd "$P12_REPO" && git rev-parse shadow)
+check "phase12 case6: precondition -- loose shadow tag advanced past the stale packed entry" \
+    sh -c "test -f '$P12_REPO/.git/refs/tags/shadow' \
+        && test '$P12_SHADOW_TIP' != '$P12_STALE' \
+        && grep -q '$P12_STALE refs/tags/shadow' '$P12_REPO/.git/packed-refs'"
+(cd "$P12_REPO" && "$SG" tag -d shadow) > /dev/null 2>&1
+check "phase12 case6: delete of the stale-shadow tag exits 0" test $? = 0
+(cd "$P12_REPO" && git rev-parse --verify refs/tags/shadow) > /dev/null 2>&1
+check "phase12 case6: shadow tag fully gone, NOT resurrected at the stale packed sha" test $? != 0
+grep -q "refs/tags/shadow" "$P12_REPO/.git/packed-refs" 2>/dev/null
+check "phase12 case6: stale packed line purged as part of the delete" test $? != 0
+
+# case 7: invalid creation names -- sg rejects each, and real git's
+# check-ref-format --tag agrees every one is invalid
+for bad in 'a..b' 'a b' 'a.lock' 'HEAD' 'a/' '@{x}'; do
+    (cd "$P12_REPO" && "$SG" tag "$bad") > /dev/null 2>&1
+    check "phase12 case7: sg rejects invalid creation name '$bad'" test $? = 1
+    (cd "$P12_REPO" && git check-ref-format --tag "$bad") > /dev/null 2>&1
+    check "phase12 case7: git check-ref-format --tag agrees '$bad' is invalid" test $? != 0
+done
+
+# case 8: overwriting an existing tag fails without --force, succeeds with it
+(cd "$P12_REPO" && "$SG" tag dupe) > /dev/null 2>&1
+(cd "$P12_REPO" && "$SG" tag dupe) > /dev/null 2>&1
+check "phase12 case8: creating over an existing tag without --force fails" test $? = 1
+(cd "$P12_REPO" && "$SG" tag --force dupe) > /dev/null 2>&1
+check "phase12 case8: creating over an existing tag with --force succeeds" test $? = 0
+
+# case 9: deleting a nonexistent tag fails, not a silent success
+(cd "$P12_REPO" && "$SG" tag -d does-not-exist) > /dev/null 2>&1
+check "phase12 case9: deleting a nonexistent tag fails" test $? = 1
+
+# case 10: -d combined with tag-creation options is a usage error, not a
+# silent delete -- verified directly against real git: `git tag -d -a -m x
+# name` prints usage and deletes nothing, exit 129 (sg's own convention is
+# only ever exit 0/1, so only the "deletes nothing, non-zero exit" half of
+# that is checked here).
+(cd "$P12_REPO" && "$SG" tag dcombo) > /dev/null 2>&1
+(cd "$P12_REPO" && "$SG" tag -d -a -m "x" dcombo) > /dev/null 2>&1
+check "phase12 case10: sg tag -d -a -m <name> is rejected" test $? = 1
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dcombo\$"
+check "phase12 case10: -d -a -m rejection did not delete the tag" test $? = 0
+(cd "$P12_REPO" && git tag -d -a -m x dcombo) > /dev/null 2>&1
+check "phase12 case10: real git also rejects tag -d -a -m <name> (sanity check on the test itself)" \
+    test $? != 0
+
+(cd "$P12_REPO" && "$SG" tag -d --force dcombo) > /dev/null 2>&1
+check "phase12 case10: sg tag -d --force <name> is rejected" test $? = 1
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dcombo\$"
+check "phase12 case10: -d --force rejection did not delete the tag" test $? = 0
+(cd "$P12_REPO" && git tag -d --force dcombo) > /dev/null 2>&1
+check "phase12 case10: real git also rejects tag -d --force <name> (sanity check on the test itself)" \
+    test $? != 0
+
+# case 11: -d with a second name argument is a usage error, not a silent
+# partial delete (this project doesn't support multi-name delete, but must
+# not silently drop the second name and delete only the first).
+(cd "$P12_REPO" && "$SG" tag dmulti1 && "$SG" tag dmulti2) > /dev/null 2>&1
+(cd "$P12_REPO" && "$SG" tag -d dmulti1 dmulti2) > /dev/null 2>&1
+check "phase12 case11: sg tag -d <name1> <name2> is rejected" test $? = 1
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dmulti1\$"
+check "phase12 case11: rejection did not delete the first name either" test $? = 0
+(cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dmulti2\$"
+check "phase12 case11: rejection did not delete the second name" test $? = 0
 
 # --- Phase 9: gitignore conformance sweep -- sg status vs git status -------
 # The strongest oracle in this phase: one tree whose paths exercise every
@@ -2853,7 +3011,7 @@ printf 'build/\n' > "$P9D_REPO/.gitignore"
 mkdir -p "$P9D_REPO/build"
 printf 'o\n' > "$P9D_REPO/build/out.txt"
 (cd "$P9D_REPO" && "$SG" add build) > /dev/null 2>&1
-check "phase9 force: explicitly adding an ignored directory fails" test $? != 0
+check "phase9 force: explicitly adding an ignored directory fails" test $? = 1
 (cd "$P9D_REPO" && git ls-files) | grep -q "build/out.txt"
 check "phase9 force: nothing staged after the refused directory add" test $? != 0
 (cd "$P9D_REPO" && "$SG" add -f build) > /dev/null 2>&1
@@ -2878,7 +3036,7 @@ check "phase9 paths: files outside the subdirectory were NOT staged" \
     sh -c "! grep -q '^top\.txt\$' '$P9S_LS'"
 
 (cd "$P9S_REPO" && "$SG" add nosuch) > /dev/null 2>&1
-check "phase9 paths: sg add nosuch still errors with a nonzero exit" test $? != 0
+check "phase9 paths: sg add nosuch still errors with a nonzero exit" test $? = 1
 
 (cd "$P9S_REPO" && "$SG" add sub2/) > /dev/null 2>&1
 check "phase9 paths: sg add dir/ (trailing slash) exits 0" test $? = 0
@@ -3052,6 +3210,588 @@ else
     check "phase9 branch delete: a failed deletion leaves the branch at its real tip, not a stale packed one" \
         sh -c "[ \"\$(cd '$P9BD' && git rev-parse victim 2>/dev/null)\" = '$P9BD_TIP' ]"
 fi
+
+# --- Phase 12: commit/tag message normalization must be bit-identical to
+# --- real git's default `--cleanup=whitespace`. Earlier interop coverage
+# --- never compared the raw bytes of the message segment, so sg producing
+# --- "msg" (no trailing newline) where git produces "msg\n" went unnoticed
+# --- even though both are valid, fsck-clean objects -- the object ids just
+# --- silently diverge. Each case below is a row of the normalization table
+# --- verified directly against a real `git commit`/`git tag`.
+#
+# extract_msg_segment: strips the header lines (everything up to and
+# including the first blank line) from `git cat-file <type> <id>` output,
+# leaving the message segment's exact bytes for a byte-for-byte cmp.
+extract_msg_segment() {
+    sed '1,/^$/d'
+}
+
+P12_SG_BASE="$WORKDIR/phase12_msg_sg"
+P12_GIT_BASE="$WORKDIR/phase12_msg_git"
+mkdir -p "$P12_SG_BASE" "$P12_GIT_BASE"
+P12_N=0
+
+# Runs a single commit-message case: $1 = human label, $2 = the raw -m
+# argument, $3 = 1 if real git is expected to reject this input (empty
+# message), 0 otherwise.
+p12_commit_case() {
+    case_label="$1"
+    msg="$2"
+    expect_reject="$3"
+
+    P12_N=$((P12_N + 1))
+    sgrepo="$P12_SG_BASE/c$P12_N"
+    gitrepo="$P12_GIT_BASE/c$P12_N"
+    mkdir -p "$sgrepo"
+    (cd "$P12_SG_BASE" && "$SG" init "c$P12_N") > /dev/null 2>&1
+    git init -q "$gitrepo"
+    (cd "$gitrepo" && git config user.email "a@b.c" && git config user.name "a")
+
+    printf 'x\n' > "$sgrepo/f.txt"
+    printf 'x\n' > "$gitrepo/f.txt"
+    (cd "$sgrepo" && "$SG" add f.txt && "$SG" commit -m "$msg") > /dev/null 2>&1
+    sg_rc=$?
+    (cd "$gitrepo" && git add f.txt && git commit -q -m "$msg") > /dev/null 2>&1
+    git_rc=$?
+
+    if [ "$expect_reject" = 1 ]; then
+        check "phase12 commit message ($case_label): real git rejects this input (sanity check on the test itself)" \
+            test "$git_rc" != 0
+        check "phase12 commit message ($case_label): sg rejects it too" test "$sg_rc" != 0
+        return
+    fi
+
+    check "phase12 commit message ($case_label): real git accepted this input (sanity check on the test itself)" \
+        test "$git_rc" = 0
+    check "phase12 commit message ($case_label): sg commit exits 0" test "$sg_rc" = 0
+
+    sg_id=$(cd "$sgrepo" && git rev-parse HEAD 2>/dev/null)
+    git_id=$(cd "$gitrepo" && git rev-parse HEAD 2>/dev/null)
+    sg_msg_file="$WORKDIR/p12_sg_msg_$P12_N.bin"
+    git_msg_file="$WORKDIR/p12_git_msg_$P12_N.bin"
+    (cd "$sgrepo" && git cat-file commit "$sg_id") | extract_msg_segment > "$sg_msg_file"
+    (cd "$gitrepo" && git cat-file commit "$git_id") | extract_msg_segment > "$git_msg_file"
+
+    check "phase12 commit message ($case_label): message segment byte-identical to real git" \
+        cmp -s "$sg_msg_file" "$git_msg_file"
+}
+
+# $(...) strips ALL trailing newlines from its output, which would corrupt
+# any case whose raw -m argument is meant to end in one or more '\n' bytes.
+# p12_mk appends a sentinel after the printf output and strips it back off,
+# which protects genuine trailing newlines from that stripping.
+p12_mk() {
+    tail_with_marker=$(printf '%sEND_MARK' "$1")
+    printf '%s' "${tail_with_marker%END_MARK}"
+}
+
+p12_commit_case "plain" "x" 0
+p12_commit_case "leading whitespace preserved" "  x  " 0
+p12_commit_case "already newline-terminated" "$(p12_mk 'x
+')" 0
+p12_commit_case "trailing blank lines removed" "$(p12_mk 'x
+
+
+')" 0
+p12_commit_case "leading blank lines removed" "$(printf '\n\nx')" 0
+p12_commit_case "single interior blank line preserved" "$(printf 'a\n\nb')" 0
+p12_commit_case "consecutive blank lines collapsed" "$(printf 'a\n\n\nb')" 0
+p12_commit_case "trailing whitespace stripped per line" "$(printf 'a   \nb')" 0
+p12_commit_case "leading tab preserved, trailing tab stripped" "$(printf '\tx\t')" 0
+p12_commit_case "empty message" "" 1
+p12_commit_case "whitespace-only message" "   " 1
+
+# --- same normalization table, but for annotated tag messages (`sg tag -a
+# --- -m` vs `git tag -a -m`). Reuses one base commit per sg/git pair so the
+# --- tag's target-object line is identical and only the message segment
+# --- (everything after "tag <name>\n...\ntagger ...\n\n") is compared.
+p12_tag_case() {
+    case_label="$1"
+    msg="$2"
+    expect_reject="$3"
+
+    P12_N=$((P12_N + 1))
+    sgrepo="$P12_SG_BASE/t$P12_N"
+    gitrepo="$P12_GIT_BASE/t$P12_N"
+    mkdir -p "$sgrepo"
+    (cd "$P12_SG_BASE" && "$SG" init "t$P12_N") > /dev/null 2>&1
+    git init -q "$gitrepo"
+    (cd "$gitrepo" && git config user.email "a@b.c" && git config user.name "a")
+
+    printf 'x\n' > "$sgrepo/f.txt"
+    printf 'x\n' > "$gitrepo/f.txt"
+    (cd "$sgrepo" && "$SG" add f.txt && "$SG" commit -m base) > /dev/null 2>&1
+    (cd "$gitrepo" && git add f.txt && git commit -q -m base) > /dev/null 2>&1
+
+    (cd "$sgrepo" && "$SG" tag -a -m "$msg" v1) > /dev/null 2>&1
+    sg_rc=$?
+    (cd "$gitrepo" && git tag -a -m "$msg" v1) > /dev/null 2>&1
+    git_rc=$?
+
+    if [ "$expect_reject" = 1 ]; then
+        check "phase12 tag message ($case_label): real git rejects this input (sanity check on the test itself)" \
+            test "$git_rc" != 0
+        check "phase12 tag message ($case_label): sg rejects it too" test "$sg_rc" != 0
+        return
+    fi
+
+    check "phase12 tag message ($case_label): real git accepted this input (sanity check on the test itself)" \
+        test "$git_rc" = 0
+    check "phase12 tag message ($case_label): sg tag exits 0" test "$sg_rc" = 0
+
+    sg_id=$(cd "$sgrepo" && git rev-parse v1 2>/dev/null)
+    git_id=$(cd "$gitrepo" && git rev-parse v1 2>/dev/null)
+    sg_msg_file="$WORKDIR/p12_sg_tagmsg_$P12_N.bin"
+    git_msg_file="$WORKDIR/p12_git_tagmsg_$P12_N.bin"
+    (cd "$sgrepo" && git cat-file tag "$sg_id") | extract_msg_segment > "$sg_msg_file"
+    (cd "$gitrepo" && git cat-file tag "$git_id") | extract_msg_segment > "$git_msg_file"
+
+    check "phase12 tag message ($case_label): message segment byte-identical to real git" \
+        cmp -s "$sg_msg_file" "$git_msg_file"
+}
+
+p12_tag_case "plain" "x" 0
+p12_tag_case "leading whitespace preserved" "  x  " 0
+p12_tag_case "already newline-terminated" "$(p12_mk 'x
+')" 0
+p12_tag_case "trailing blank lines removed" "$(p12_mk 'x
+
+
+')" 0
+p12_tag_case "leading blank lines removed" "$(printf '\n\nx')" 0
+p12_tag_case "single interior blank line preserved" "$(printf 'a\n\nb')" 0
+p12_tag_case "consecutive blank lines collapsed" "$(printf 'a\n\n\nb')" 0
+p12_tag_case "trailing whitespace stripped per line" "$(printf 'a   \nb')" 0
+p12_tag_case "leading tab preserved, trailing tab stripped" "$(printf '\tx\t')" 0
+# NOTE (verified directly against git 2.55.0, not assumed): `git commit -m`
+# and `git tag -a -m` are asymmetric here. `git commit -m ""` refuses to
+# create a commit ("aborting commit due to empty commit message"), but
+# `git tag -a -m ""` (or any message that normalizes to empty, like
+# whitespace-only) happily creates a tag object with an empty message
+# segment, exit 0. sg mirrors this asymmetry: sg_cmd_commit rejects an
+# empty-after-cleanup message, sg_cmd_tag does not. Don't "fix" this to be
+# symmetric later without re-checking real git -- it really is inconsistent
+# upstream, and interop is the oracle, not intuition.
+p12_tag_case "empty message accepted, empty message segment" "" 0
+p12_tag_case "whitespace-only message accepted, empty message segment" "   " 0
+
+# ============================================================
+# Phase 13: sg reset
+#
+# For each case, an identical 2-commit history (+ a lightweight tag "v1" at
+# the first commit) is built twice -- once with sg, once with real git --
+# then an identical scenario (staged/unstaged/untracked changes) is layered
+# on top of both, and finally `sg reset <mode> <rev>` / `git reset <mode>
+# <rev>` (same flag syntax on both sides) is run. Blob and tree object ids
+# are content-addressed (no timestamps involved), so they are directly
+# comparable across the two independently-built repos even though the
+# commit ids themselves differ (different wall-clock commit times) -- that's
+# what the tree-hash check below relies on. `git status --porcelain` and
+# `git ls-files -s` are run against BOTH repos with real git itself (both sg
+# and real-git repos are plain git repos on disk), so a line-for-line diff
+# of their output is the actual interop oracle for whether sg's index/
+# workdir end up in the state real git would produce.
+# ============================================================
+
+P12R_SG_BASE="$WORKDIR/phase12_reset_sg"
+P12R_GIT_BASE="$WORKDIR/phase12_reset_git"
+mkdir -p "$P12R_SG_BASE" "$P12R_GIT_BASE"
+P12R_N=0
+
+# Builds a 2-commit history in $1 using binary $2 ("$SG" or "git"):
+#   c1: file1.txt, sub/file2.txt, tagged "v1"
+#   c2: file1.txt modified, file3.txt added
+p12r_base() {
+    dir="$1"
+    bin="$2"
+
+    if [ "$bin" = "$SG" ]; then
+        mkdir -p "$(dirname "$dir")"
+        (cd "$(dirname "$dir")" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    else
+        git init -q "$dir"
+        (cd "$dir" && git config user.email "a@b.c" && git config user.name "a")
+    fi
+
+    mkdir -p "$dir/sub"
+    printf 'content1\n' > "$dir/file1.txt"
+    printf 'content2\n' > "$dir/sub/file2.txt"
+    (cd "$dir" && "$bin" add file1.txt sub/file2.txt && "$bin" commit -m "c1") > /dev/null 2>&1
+    (cd "$dir" && "$bin" tag v1) > /dev/null 2>&1
+
+    printf 'content1-v2\n' > "$dir/file1.txt"
+    printf 'content3\n' > "$dir/file3.txt"
+    (cd "$dir" && "$bin" add file1.txt file3.txt && "$bin" commit -m "c2") > /dev/null 2>&1
+}
+
+p12r_setup_clean() { :; }
+
+p12r_setup_staged() {
+    dir="$1"
+    bin="$2"
+    printf 'content1-staged\n' > "$dir/file1.txt"
+    (cd "$dir" && "$bin" add file1.txt) > /dev/null 2>&1
+}
+
+p12r_setup_unstaged() {
+    dir="$1"
+    printf 'content1-unstaged\n' > "$dir/file1.txt"
+}
+
+p12r_setup_staged_and_unstaged() {
+    dir="$1"
+    bin="$2"
+    printf 'staged new content\n' > "$dir/staged-new.txt"
+    (cd "$dir" && "$bin" add staged-new.txt) > /dev/null 2>&1
+    printf 'content2-unstaged\n' > "$dir/sub/file2.txt"
+}
+
+p12r_setup_untracked_survives() {
+    dir="$1"
+    bin="$2"
+    printf 'staged new content\n' > "$dir/staged-new.txt"
+    (cd "$dir" && "$bin" add staged-new.txt) > /dev/null 2>&1
+    printf 'content2-unstaged\n' > "$dir/sub/file2.txt"
+    printf 'never added\n' > "$dir/untracked.txt"
+}
+
+p12r_setup_deleted_staged() {
+    dir="$1"
+    bin="$2"
+    rm -f "$dir/file3.txt"
+    (cd "$dir" && "$bin" add file3.txt) > /dev/null 2>&1
+}
+
+p12r_setup_deleted_unstaged() {
+    dir="$1"
+    rm -f "$dir/file3.txt"
+}
+
+p12r_setup_nested() {
+    dir="$1"
+    bin="$2"
+    printf 'nested new\n' > "$dir/sub/newnested.txt"
+    (cd "$dir" && "$bin" add sub/newnested.txt) > /dev/null 2>&1
+    printf 'content2-unstaged\n' > "$dir/sub/file2.txt"
+}
+
+# $1 = label, $2 = reset mode ("--soft"/"--mixed"/"--hard"), $3 = rev
+# ("HEAD~1" or "v1"), $4 = name of a p12r_setup_* function.
+p12r_case() {
+    case_label="$1"
+    mode="$2"
+    rev="$3"
+    setup_fn="$4"
+
+    P12R_N=$((P12R_N + 1))
+    sgrepo="$P12R_SG_BASE/n$P12R_N"
+    gitrepo="$P12R_GIT_BASE/n$P12R_N"
+
+    p12r_base "$sgrepo" "$SG"
+    p12r_base "$gitrepo" git
+    "$setup_fn" "$sgrepo" "$SG"
+    "$setup_fn" "$gitrepo" git
+
+    sg_target=$(cd "$sgrepo" && git rev-parse "$rev" 2>/dev/null)
+    git_target=$(cd "$gitrepo" && git rev-parse "$rev" 2>/dev/null)
+
+    # --force is only meaningful (and only accepted) on sg's side: --hard is
+    # the one mode sg gates behind a confirmation prompt (real git's `reset`
+    # never prompts, and has no --force flag at all), and a non-interactive
+    # stdin auto-declines an unconfirmed dangerous op -- these scenarios are
+    # deliberately dirty, so without --force a --hard case here would abort
+    # instead of resetting. Passing --force for --soft/--mixed too is a
+    # harmless no-op (sg only reads it in the --hard path).
+    (cd "$sgrepo" && "$SG" reset "$mode" --force "$rev") > /dev/null 2>&1
+    sg_rc=$?
+    (cd "$gitrepo" && git reset "$mode" "$rev") > /dev/null 2>&1
+    git_rc=$?
+
+    check "phase12 reset ($case_label): sg reset exits 0" test "$sg_rc" = 0
+    check "phase12 reset ($case_label): real git reset exits 0 (sanity check on the test itself)" \
+        test "$git_rc" = 0
+
+    sg_head=$(cd "$sgrepo" && git rev-parse HEAD 2>/dev/null)
+    git_head=$(cd "$gitrepo" && git rev-parse HEAD 2>/dev/null)
+    check "phase12 reset ($case_label): sg moved the branch to the requested rev" \
+        test "$sg_head" = "$sg_target"
+    check "phase12 reset ($case_label): real git moved the branch to the requested rev (sanity check)" \
+        test "$git_head" = "$git_target"
+
+    sg_tree=$(cd "$sgrepo" && git rev-parse HEAD^{tree} 2>/dev/null)
+    git_tree=$(cd "$gitrepo" && git rev-parse HEAD^{tree} 2>/dev/null)
+    check "phase12 reset ($case_label): HEAD's tree is content-identical to real git's" \
+        test -n "$sg_tree" -a "$sg_tree" = "$git_tree"
+
+    sg_porcelain="$WORKDIR/p12r_sg_porcelain_$P12R_N.txt"
+    git_porcelain="$WORKDIR/p12r_git_porcelain_$P12R_N.txt"
+    (cd "$sgrepo" && git status --porcelain) | sort > "$sg_porcelain"
+    (cd "$gitrepo" && git status --porcelain) | sort > "$git_porcelain"
+    check "phase12 reset ($case_label): git status --porcelain matches real git (index + workdir oracle)" \
+        cmp -s "$sg_porcelain" "$git_porcelain"
+
+    sg_lsfiles="$WORKDIR/p12r_sg_lsfiles_$P12R_N.txt"
+    git_lsfiles="$WORKDIR/p12r_git_lsfiles_$P12R_N.txt"
+    (cd "$sgrepo" && git ls-files -s) | sort > "$sg_lsfiles"
+    (cd "$gitrepo" && git ls-files -s) | sort > "$git_lsfiles"
+    check "phase12 reset ($case_label): git ls-files -s matches real git" \
+        cmp -s "$sg_lsfiles" "$git_lsfiles"
+
+    check "phase12 reset ($case_label): working directory content matches real git" \
+        diff -rq --exclude=.git "$sgrepo" "$gitrepo" > /dev/null 2>&1
+}
+
+p12r_case "clean workdir, mixed, HEAD~1" "--mixed" "HEAD~1" p12r_setup_clean
+p12r_case "staged only, mixed, HEAD~1" "--mixed" "HEAD~1" p12r_setup_staged
+p12r_case "unstaged only, mixed, HEAD~1" "--mixed" "HEAD~1" p12r_setup_unstaged
+p12r_case "staged+unstaged, mixed, HEAD~1" "--mixed" "HEAD~1" p12r_setup_staged_and_unstaged
+p12r_case "clean workdir, soft, HEAD~1" "--soft" "HEAD~1" p12r_setup_clean
+p12r_case "staged+unstaged, soft, HEAD~1 (soft must not touch index/workdir)" "--soft" "HEAD~1" \
+    p12r_setup_staged_and_unstaged
+p12r_case "clean workdir, hard, HEAD~1" "--hard" "HEAD~1" p12r_setup_clean
+p12r_case "staged+unstaged, hard, HEAD~1" "--hard" "HEAD~1" p12r_setup_staged_and_unstaged
+p12r_case "untracked file survives, mixed, HEAD~1" "--mixed" "HEAD~1" p12r_setup_untracked_survives
+p12r_case "untracked file survives, hard, HEAD~1" "--hard" "HEAD~1" p12r_setup_untracked_survives
+p12r_case "deleted file staged, mixed, HEAD~1" "--mixed" "HEAD~1" p12r_setup_deleted_staged
+p12r_case "deleted file unstaged, hard, HEAD~1" "--hard" "HEAD~1" p12r_setup_deleted_unstaged
+p12r_case "nested directory file, mixed, tag v1" "--mixed" "v1" p12r_setup_nested
+p12r_case "staged+unstaged, hard, tag v1" "--hard" "v1" p12r_setup_staged_and_unstaged
+
+# --- rescue path: sg undo must recover both --hard and --mixed resets ---
+
+P12R_UNDO_HARD="$P12R_SG_BASE/undo_hard"
+p12r_base "$P12R_UNDO_HARD" "$SG"
+printf 'about to be reset away\n' > "$P12R_UNDO_HARD/file1.txt"
+(cd "$P12R_UNDO_HARD" && "$SG" add file1.txt) > /dev/null 2>&1
+(cd "$P12R_UNDO_HARD" && "$SG" reset --hard --force HEAD~1) > /dev/null 2>&1
+check "phase12 reset undo: sg reset --hard exits 0" test $? = 0
+(cd "$P12R_UNDO_HARD" && "$SG" undo 1 --force) > /dev/null 2>&1
+check "phase12 reset undo: sg undo 1 --force exits 0 after a --hard reset" test $? = 0
+UNDO_HARD_CONTENT=$(cat "$P12R_UNDO_HARD/file1.txt" 2>/dev/null)
+check "phase12 reset undo: undo restores the workdir content that --hard reset overwrote" \
+    test "$UNDO_HARD_CONTENT" = "about to be reset away"
+
+# NOTE: undo only ever touches the workdir/index (sg_apply_tree_to_workdir's
+# documented contract) -- it deliberately does not move HEAD/the branch back
+# to c2, so `git diff --cached` here is against c1 (where --hard left the
+# branch), not the pre-reset c2, and would show file1.txt as "staged" no
+# matter what content undo restored. Read the index's blob directly instead.
+UNDO_HARD_STAGED_CONTENT=$(cd "$P12R_UNDO_HARD" && git show :file1.txt 2>/dev/null)
+check "phase12 reset undo: undo restores the staged index content that --hard reset discarded" \
+    test "$UNDO_HARD_STAGED_CONTENT" = "about to be reset away"
+
+P12R_UNDO_MIXED="$P12R_SG_BASE/undo_mixed"
+p12r_base "$P12R_UNDO_MIXED" "$SG"
+printf 'staged before mixed reset\n' > "$P12R_UNDO_MIXED/file1.txt"
+(cd "$P12R_UNDO_MIXED" && "$SG" add file1.txt) > /dev/null 2>&1
+(cd "$P12R_UNDO_MIXED" && "$SG" reset) > /dev/null 2>&1
+check "phase12 reset undo: bare sg reset (mixed HEAD) exits 0" test $? = 0
+UNDO_MIXED_AFTER_RESET=$(cd "$P12R_UNDO_MIXED" && git diff --cached --name-only)
+check "phase12 reset undo: bare sg reset actually unstaged file1.txt" test -z "$UNDO_MIXED_AFTER_RESET"
+(cd "$P12R_UNDO_MIXED" && "$SG" undo 1 --force) > /dev/null 2>&1
+check "phase12 reset undo: sg undo 1 --force exits 0 after a --mixed reset" test $? = 0
+UNDO_MIXED_STAGED=$(cd "$P12R_UNDO_MIXED" && git diff --cached --name-only)
+check "phase12 reset undo: undo re-stages the change that bare (--mixed) reset unstaged" \
+    test "$UNDO_MIXED_STAGED" = "file1.txt"
+
+# --- the stat-field guard in sg_index_reset_to_tree, with real git as the judge ---
+#
+# --mixed rewrites the index without touching the working tree, so an index
+# entry's stat fields have no fresh stat() to come from. Reusing the previous
+# entry's stat for a path whose blob actually changed produces an index that
+# describes the file as up to date while recording a different sha -- and real
+# git, which trusts stat as a shortcut, then reports a clean tree over a file
+# that differs. sg_index_reset_to_tree therefore only carries stat fields over
+# when the sha is unchanged, and zeroes them otherwise.
+#
+# The mtime has to be pushed into the past for this to be observable at all:
+# when a file's mtime matches the index's own mtime, git calls the entry
+# racily clean and re-hashes the content regardless of what stat says, which
+# masks the bug. Every other check in this section writes its files in the
+# same second it writes the index, so none of them can see this.
+P12R_RACY="$P12R_SG_BASE/racy"
+p12r_base "$P12R_RACY" "$SG"
+printf 'content1-changed\n' > "$P12R_RACY/file1.txt"
+touch -t 202001010000 "$P12R_RACY/file1.txt"
+(cd "$P12R_RACY" && "$SG" add file1.txt && "$SG" commit -m "racy c2") > /dev/null 2>&1
+touch -t 202001010000 "$P12R_RACY/file1.txt"
+(cd "$P12R_RACY" && "$SG" reset --mixed HEAD~1) > /dev/null 2>&1
+check "phase12 reset stat guard: bare reset over a stale-mtime file exits 0" test $? = 0
+RACY_STATUS=$(cd "$P12R_RACY" && git status --porcelain)
+check "phase12 reset stat guard: real git still sees the file as modified (not falsely clean)" \
+    test "$RACY_STATUS" = " M file1.txt"
+
+# --- rejection paths ---
+
+P12R_DETACHED="$P12R_SG_BASE/detached"
+p12r_base "$P12R_DETACHED" "$SG"
+DETACH_TARGET=$(cd "$P12R_DETACHED" && git rev-parse HEAD~1)
+(cd "$P12R_DETACHED" && git checkout -q --detach "$DETACH_TARGET")
+# Deliberately target "v1" (a real, resolvable ref), not "HEAD" -- HEAD
+# itself already fails to resolve on a detached checkout for an unrelated
+# reason (sg_ref_resolve_head only ever follows "ref: refs/heads/..."
+# indirection, so a raw-sha HEAD file is simply unsupported there), which
+# would make this case pass even if the dedicated detached-HEAD rejection in
+# sg_cmd_reset were missing entirely. "v1" resolves fine on its own, so
+# reaching a non-zero exit here actually exercises that dedicated check.
+(cd "$P12R_DETACHED" && "$SG" reset --mixed v1) > /dev/null 2>&1
+check "phase12 reset reject: sg reset on a detached HEAD exits non-zero" test $? = 1
+
+P12R_PATHSPEC="$P12R_SG_BASE/pathspec"
+p12r_base "$P12R_PATHSPEC" "$SG"
+PATHSPEC_ERR="$WORKDIR/p12r_pathspec_err.txt"
+(cd "$P12R_PATHSPEC" && "$SG" reset HEAD -- file1.txt) > /dev/null 2> "$PATHSPEC_ERR"
+check "phase12 reset reject: sg reset with a pathspec exits non-zero" test $? = 1
+check "phase12 reset reject: the pathspec error mentions 'sg restore --staged'" \
+    grep -q "restore --staged" "$PATHSPEC_ERR"
+
+P12R_MULTIMODE="$P12R_SG_BASE/multimode"
+p12r_base "$P12R_MULTIMODE" "$SG"
+(cd "$P12R_MULTIMODE" && "$SG" reset --soft --hard) > /dev/null 2>&1
+check "phase12 reset reject: sg reset --soft --hard (two modes) exits non-zero" test $? = 1
+
+P12R_BADREV="$P12R_SG_BASE/badrev"
+p12r_base "$P12R_BADREV" "$SG"
+(cd "$P12R_BADREV" && "$SG" reset no-such-rev-xyz) > /dev/null 2>&1
+check "phase12 reset reject: sg reset with an invalid rev exits non-zero" test $? = 1
+
+P12R_BADFLAG="$P12R_SG_BASE/badflag"
+p12r_base "$P12R_BADFLAG" "$SG"
+P12R_BADFLAG_ERR="$WORKDIR/p12r_badflag_err.txt"
+(cd "$P12R_BADFLAG" && "$SG" reset --Hard) > /dev/null 2> "$P12R_BADFLAG_ERR"
+check "phase12 reset reject: sg reset --Hard (unrecognized flag) exits non-zero" test $? = 1
+check "phase12 reset reject: unrecognized flag is reported as a usage error, not 'invalid reference'" \
+    sh -c "! grep -q 'invalid reference' '$P12R_BADFLAG_ERR'"
+
+# ============================================================
+# Phase 13 (cont.): sg reset vs. an in-progress merge or rebase
+#
+# Real git's behavior (verified directly, see the task writeup this was
+# checked against): --soft refuses outright (exit 128) whether a merge is
+# unresolved or a rebase is paused. --mixed and --hard both clear MERGE_HEAD
+# when a merge is in progress, but leave a paused rebase's on-disk state
+# completely untouched (only `rebase --abort`/`--continue` end it). sg's own
+# --hard is a documented, pre-existing exception to that last point (it
+# clears BOTH MERGE_HEAD and sg-rebase/ via sg_safe_apply_tree, matching
+# neither mode exactly for the rebase case) -- not re-tested for the rebase
+# side here, only --soft and --mixed, which is what this ticket's fix
+# actually touches.
+# ============================================================
+
+# --- merge conflict in progress ---
+
+p12r_conflict_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    printf 'orig1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c feature) > /dev/null 2>&1
+    printf 'feature1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+    printf 'master1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+}
+
+P12R_SOFT_MERGE="$WORKDIR/p12r_soft_merge"
+p12r_conflict_repo "$P12R_SOFT_MERGE"
+check "phase12 reset/merge: precondition -- MERGE_HEAD present after the sg-made conflict" \
+    test -f "$P12R_SOFT_MERGE/.git/MERGE_HEAD"
+(cd "$P12R_SOFT_MERGE" && "$SG" reset --soft) > /dev/null 2>&1
+check "phase12 reset/merge: sg reset --soft during an unresolved merge is rejected" test $? = 1
+check "phase12 reset/merge: --soft rejection left MERGE_HEAD in place" \
+    test -f "$P12R_SOFT_MERGE/.git/MERGE_HEAD"
+
+P12R_MIXED_MERGE="$WORKDIR/p12r_mixed_merge"
+p12r_conflict_repo "$P12R_MIXED_MERGE"
+(cd "$P12R_MIXED_MERGE" && "$SG" reset) > /dev/null 2>&1
+check "phase12 reset/merge: bare sg reset (mixed) during an unresolved merge exits 0" test $? = 0
+check "phase12 reset/merge: --mixed cleared MERGE_HEAD" \
+    test ! -f "$P12R_MIXED_MERGE/.git/MERGE_HEAD"
+
+# end-to-end assertion: this is what a user actually gets bitten by -- an
+# ordinary commit made after the reset must NOT come out as a 2-parent merge
+# commit for the merge that was just abandoned.
+printf 'resolved\norig2\n' > "$P12R_MIXED_MERGE/c.txt"
+(cd "$P12R_MIXED_MERGE" && "$SG" add c.txt && "$SG" commit -m "an ordinary commit") > /dev/null 2>&1
+check "phase12 reset/merge: sg commit after the mixed reset exits 0" test $? = 0
+P12R_MIXED_PARENTS=$(cd "$P12R_MIXED_MERGE" && git cat-file -p HEAD | grep -c '^parent ')
+check "phase12 reset/merge: the follow-up commit has exactly one parent (not a bogus merge commit)" \
+    test "$P12R_MIXED_PARENTS" = 1
+
+P12R_HARD_MERGE="$WORKDIR/p12r_hard_merge"
+p12r_conflict_repo "$P12R_HARD_MERGE"
+(cd "$P12R_HARD_MERGE" && "$SG" reset --hard --force) > /dev/null 2>&1
+check "phase12 reset/merge: sg reset --hard during an unresolved merge exits 0" test $? = 0
+check "phase12 reset/merge: --hard cleared MERGE_HEAD" \
+    test ! -f "$P12R_HARD_MERGE/.git/MERGE_HEAD"
+
+# --- rebase paused on a conflict ---
+
+p12r_rebase_paused_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    printf 'orig1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c feature) > /dev/null 2>&1
+    printf 'feature1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+    printf 'master1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+    (cd "$dir" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+}
+
+P12R_SOFT_REBASE="$WORKDIR/p12r_soft_rebase"
+p12r_rebase_paused_repo "$P12R_SOFT_REBASE"
+check "phase12 reset/rebase: precondition -- sg-rebase/ present after the paused rebase" \
+    test -d "$P12R_SOFT_REBASE/.git/sg-rebase"
+(cd "$P12R_SOFT_REBASE" && "$SG" reset --soft) > /dev/null 2>&1
+check "phase12 reset/rebase: sg reset --soft during a paused rebase is rejected" test $? = 1
+check "phase12 reset/rebase: --soft rejection left sg-rebase/ in place" \
+    test -d "$P12R_SOFT_REBASE/.git/sg-rebase"
+
+P12R_MIXED_REBASE="$WORKDIR/p12r_mixed_rebase"
+p12r_rebase_paused_repo "$P12R_MIXED_REBASE"
+(cd "$P12R_MIXED_REBASE" && "$SG" reset) > /dev/null 2>&1
+check "phase12 reset/rebase: bare sg reset (mixed) during a paused rebase exits 0" test $? = 0
+check "phase12 reset/rebase: --mixed does NOT clear sg-rebase/ (matches real git leaving a paused rebase alone)" \
+    test -d "$P12R_MIXED_REBASE/.git/sg-rebase"
+
+# --- --soft must not need to be able to resolve the target commit's tree ---
+#
+# resolve_commit_tree() used to run unconditionally before the three modes
+# were dispatched, so --soft (which never reads target_tree_id) would still
+# fail if the target commit's own content couldn't be parsed into a tree id
+# -- even though nothing about --soft's actual job (moving the branch ref)
+# needs that. Real git's own hash-object refuses to write a commit object
+# whose content fails its "tree <hex>" line check (fsck-on-write), so this
+# specific shape can't be constructed through real git at all -- sg's own
+# hash-object has no such validation, which is exactly what makes this
+# reachable through sg's own CLI (a self-check, not an sg-vs-git comparison
+# like the rest of this phase).
+P12R_BADTREE_REPO="$WORKDIR/p12r_badtree"
+mkdir -p "$P12R_BADTREE_REPO"
+(cd "$WORKDIR" && "$SG" init p12r_badtree) > /dev/null 2>&1
+printf 'content\n' > "$P12R_BADTREE_REPO/f.txt"
+(cd "$P12R_BADTREE_REPO" && "$SG" add f.txt && "$SG" commit -m "only commit") > /dev/null 2>&1
+
+P12R_BADCOMMIT_SRC="$WORKDIR/p12r_badcommit_src.txt"
+printf 'nottree 0000000000000000000000000000000000000000\nauthor a <a@b.c> 0 +0000\ncommitter a <a@b.c> 0 +0000\n\nmsg\n' \
+    > "$P12R_BADCOMMIT_SRC"
+P12R_BAD_SHA=$(cd "$P12R_BADTREE_REPO" && "$SG" hash-object -t commit -w "$P12R_BADCOMMIT_SRC" 2>/dev/null)
+check "phase12 reset reset --soft (unparsable tree line): precondition -- sg hash-object wrote the malformed commit" \
+    test -n "$P12R_BAD_SHA"
+(cd "$P12R_BADTREE_REPO" && "$SG" reset --soft "$P12R_BAD_SHA") > /dev/null 2>&1
+check "phase12 reset reset --soft (unparsable tree line): sg reset --soft still succeeds (it never needs the tree)" \
+    test $? = 0
+P12R_BADTREE_HEAD=$(cd "$P12R_BADTREE_REPO" && git rev-parse HEAD 2>/dev/null)
+check "phase12 reset reset --soft (unparsable tree line): the branch actually moved to the malformed commit" \
+    test "$P12R_BADTREE_HEAD" = "$P12R_BAD_SHA"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

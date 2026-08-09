@@ -603,6 +603,7 @@ static int keep_alive_add(const char *git_dir, unsigned char (*new_ids)[SG_SHA1_
     unsigned char *commit_content = NULL;
     size_t commit_len = 0;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
+    char *cleaned_message = NULL;
     char lock_path[SG_PATH_MAX];
     int lock_held = 0;
     size_t i;
@@ -679,7 +680,10 @@ static int keep_alive_add(const char *git_dir, unsigned char (*new_ids)[SG_SHA1_
     commit.committer_email = (char *)env_or("GIT_COMMITTER_EMAIL", commit.author_email);
     commit.committer_time = commit.author_time;
     strcpy(commit.committer_tz, "+0000");
-    commit.message = (char *)"sg chunk keep-alive\n";
+
+    if (sg_message_cleanup("sg chunk keep-alive\n", &cleaned_message) != 0)
+        goto done;
+    commit.message = cleaned_message;
 
     if (sg_commit_serialize(&commit, &commit_content, &commit_len) != 0)
         goto done;
@@ -693,6 +697,7 @@ static int keep_alive_add(const char *git_dir, unsigned char (*new_ids)[SG_SHA1_
 done:
     free(tree_content);
     free(commit_content);
+    free(cleaned_message);
     for (i = 0; i < entry_count; i++)
         free(entries[i].name);
     free(entries);

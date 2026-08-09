@@ -40,4 +40,27 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
    Returns 0 if clean, 1 otherwise (message already printed to stderr). */
 int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const char *what);
 
+/* Rewrites the on-disk index to exactly match tree_id (sha1 + mode of every
+   path), WITHOUT touching the working directory or HEAD/refs -- the "only
+   rewrite the index" half of sg_apply_tree_to_workdir that `sg reset --mixed`
+   needs and nothing existing exposes. Paths tracked in the current index but
+   absent from tree_id are dropped.
+
+   Per-entry stat metadata (ctime/mtime/dev/ino/uid/gid/file_size) is copied
+   from the current index's entry at that path only if that entry's sha1
+   already equals the tree's -- content genuinely didn't change, so the old
+   stat is still accurate. Otherwise every stat field is zeroed rather than
+   populated from a workdir stat() call: this function never reads the
+   working tree, and stat()-ing the workdir file here would be actively wrong
+   whenever it differs from the tree being reset to (it would record the
+   *new* sha1 next to the *current file's* mtime/size, and any future
+   consumer that trusts stat over content would then see a false "clean").
+   As of this writing sg_status_diff_unstaged always re-hashes file content
+   and never shortcuts on stat alone, so zeroing is a defensive convention
+   rather than a fix for an observed bug -- kept anyway in case that changes.
+
+   Returns 0 on success (index file updated), -1 on failure (nothing
+   written: the tree/index reads happen before any write). */
+int sg_index_reset_to_tree(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW_LEN]);
+
 #endif

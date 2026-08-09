@@ -102,6 +102,7 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
     unsigned char *serialized;
     size_t serialized_len;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
+    char *cleaned_message = NULL;
     const char *name;
     const char *email;
     char undo_dir[SG_PATH_MAX];
@@ -194,14 +195,23 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
     commit.committer_email = (char *)email;
     commit.committer_time = commit.author_time;
     strcpy(commit.committer_tz, "+0000");
-    commit.message = (char *)label;
+
+    if (sg_message_cleanup(label, &cleaned_message) != 0) {
+        free(commit.parents);
+        goto out_free_entries;
+    }
+    commit.message = cleaned_message;
 
     if (sg_commit_serialize(&commit, &serialized, &serialized_len) != 0) {
         free(commit.parents);
+        free(cleaned_message);
+        cleaned_message = NULL;
         goto out_free_entries;
     }
     free(commit.parents);
     commit.parents = NULL;
+    free(cleaned_message);
+    cleaned_message = NULL;
 
     if (sg_loose_write(git_dir, SG_OBJ_COMMIT, serialized, serialized_len, commit_id) != 0) {
         free(serialized);
