@@ -14,11 +14,17 @@
               | <40-char hex sha1>
      <rev>  ::= <base> ( "~" [N] | "^" [N] )*
 
-   Base resolution order is HEAD, then tag, then branch, then full hex --
-   real git's own gitrevisions disambiguation order (refs/<name> ->
-   refs/tags/<name> -> refs/heads/<name> -> ...; measured against real
-   git, a branch and a tag sharing a name resolve to the TAG's target,
-   with git printing a "refname is ambiguous" warning). "~" and "^"
+   Base resolution order is full hex, then HEAD, then tag, then branch --
+   real git's own gitrevisions disambiguation order (full SHA-1 object
+   name first, then refs/<name> -> refs/tags/<name> -> refs/heads/<name>
+   -> ...). Measured against real git for both halves of that order: a
+   branch and a tag sharing a name resolve to the TAG's target (git prints
+   a "refname is ambiguous" warning); and a branch literally NAMED like a
+   full 40-hex sha1 that points somewhere else is still shadowed by the
+   literal object id -- `git rev-parse <hex>` returns `<hex>` itself, not
+   the branch's target, even though the branch exists. See resolve_base's
+   comment in revparse.c for the exact commands this was checked against.
+   "~" and "^"
    suffixes chain left to right and may repeat/mix freely (e.g.
    "HEAD~2^2~1"); a bare "~"/"^" means N=1. "~N" walks N generations via
    first parents; "^N" takes the Nth parent (1-based) of the current commit.

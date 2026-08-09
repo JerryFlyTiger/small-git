@@ -89,42 +89,70 @@ static int commit_nth_parent(const char *git_dir, const unsigned char id[SG_SHA1
 }
 
 /* Parses the (possibly empty) run of decimal digits [s, s+len) that follows
-   a '~' or '^'. An empty run means the implicit N=1. Longer than 9 digits
-   is rejected outright -- no real history is anywhere near that deep, and
-   it keeps the accumulation below comfortably under overflow regardless of
-   `unsigned long`'s width. */
+   a '~' or '^'. An empty run means the implicit N=1. Leading zeros are
+   legal and don't count against the digit-count guard below -- measured
+   against real git, "HEAD~0000000001" works and means the same as
+   "HEAD~1" -- so the guard is applied to the number of SIGNIFICANT digits
+   (after skipping leading zeros, always keeping at least one digit so
+   "000" still parses as 0), not the raw character count. More than 9
+   significant digits is rejected outright -- no real history is anywhere
+   near that deep, and it keeps the accumulation below comfortably under
+   overflow regardless of `unsigned long`'s width. */
 static int parse_suffix_number(const char *s, size_t len, unsigned long *out)
 {
     size_t i;
+    size_t start;
     unsigned long v = 0;
 
     if (len == 0) {
         *out = 1;
         return 0;
     }
-    if (len > 9)
-        return -1;
     for (i = 0; i < len; i++) {
         if (s[i] < '0' || s[i] > '9')
             return -1;
-        v = v * 10 + (unsigned long)(s[i] - '0');
     }
+    start = 0;
+    while (start < len - 1 && s[start] == '0')
+        start++;
+    if (len - start > 9)
+        return -1;
+    for (i = start; i < len; i++)
+        v = v * 10 + (unsigned long)(s[i] - '0');
     *out = v;
     return 0;
 }
 
 /* Resolves just the <base> part of the grammar (see revparse.h) to a raw
-   object id, trying HEAD, then tag, then branch, then a literal 40-hex
-   sha1, in that order -- the first that matches wins. This is real git's
-   own gitrevisions disambiguation order (refs/<name> -> refs/tags/<name> ->
-   refs/heads/<name> -> ...), measured against real git: with a branch and
-   a tag both named "foo", `git rev-parse foo` resolves to the TAG's
-   target (with a "refname is ambiguous" warning), not the branch's --
-   tag beats branch, not the other way around. Does not peel tags or apply
-   ~/^ suffixes. Returns 0 on success. */
+   object id, trying a literal 40-hex sha1, then HEAD, then tag, then
+   branch, in that order -- the first that matches wins. This is real
+   git's own gitrevisions disambiguation order (full SHA-1 object name,
+   then refs/<name> -> refs/tags/<name> -> refs/heads/<name> -> ...);
+   measured against real git for both halves of this order:
+
+     - a branch and a tag both named "foo" -- `git rev-parse foo` resolves
+       to the TAG's target (with a "refname is ambiguous" warning), not
+       the branch's; tag beats branch.
+     - a branch literally NAMED like a full hex sha1 (e.g. `git branch
+       "$C1_HEX" "$C2"`, so refs/heads/<C1_hex> points at C2) --
+       `git rev-parse "$C1_HEX"` resolves to C1_HEX ITSELF (the literal
+       object id), not to C2, even though a same-named branch exists. Full
+       hex wins over everything, including a branch whose name happens to
+       collide with it, which is the counter-intuitive case worth calling
+       out here.
+
+   Consistent with that: once base looks like a full 40-hex sha1 (right
+   length, all hex digits), that IS the answer -- if the object doesn't
+   exist, this returns failure without falling back to a same-named ref,
+   matching `git rev-parse --verify` on a well-formed-but-absent sha1.
+
+   Does not peel tags or apply ~/^ suffixes. Returns 0 on success. */
 static int resolve_base(const char *git_dir, const char *base, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
     char ref_path[SG_REVPARSE_PATH_MAX];
+
+    if (strlen(base) == SG_SHA1_HEX_LEN)
+        return sg_hex_to_sha1(base, id_out);
 
     if (strcmp(base, "HEAD") == 0)
         return sg_ref_resolve_head(git_dir, id_out);
@@ -134,9 +162,6 @@ static int resolve_base(const char *git_dir, const char *base, unsigned char id_
         return 0;
 
     if (sg_ref_read_branch(git_dir, base, id_out) == 0)
-        return 0;
-
-    if (strlen(base) == SG_SHA1_HEX_LEN && sg_hex_to_sha1(base, id_out) == 0)
         return 0;
 
     return -1;

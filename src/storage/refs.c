@@ -160,10 +160,17 @@ int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id
     if (!sg_ref_branch_name_is_safe(branch))
         return -1;
 
-    snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
+    /* branch comes from argv (or, since resolve_base's phase12 addition, a
+       user-supplied rev-parse base): a name long enough to truncate either
+       path below would make this look up some OTHER branch/ref, so treat
+       truncation the same as "not found" rather than silently reading the
+       wrong one. */
+    if (snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch) >= (int)sizeof(path))
+        return -1;
     content = read_small_file(path);
     if (content == NULL) {
-        snprintf(ref_name, sizeof(ref_name), "refs/heads/%s", branch);
+        if (snprintf(ref_name, sizeof(ref_name), "refs/heads/%s", branch) >= (int)sizeof(ref_name))
+            return -1;
         return read_packed_ref(git_dir, ref_name, id_out);
     }
 

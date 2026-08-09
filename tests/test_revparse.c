@@ -250,6 +250,33 @@ static void test_precedence_tag_over_branch(void)
     free(git_dir);
 }
 
+/* A full 40-hex sha1 wins over EVERY ref, even a branch whose name happens
+   to literally be that hex string pointing somewhere else -- the most
+   counter-intuitive corner of the precedence order. Measured against real
+   git: `git branch "$C1_hex" "$C2"` (a branch literally named after C1's
+   own hex, but pointing at C2) followed by `git rev-parse "$C1_hex"`
+   returns C1_hex itself, not C2. */
+static void test_precedence_hex_over_branch_with_colliding_name(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char c1[SG_SHA1_RAW_LEN], c2[SG_SHA1_RAW_LEN];
+    unsigned char out[SG_SHA1_RAW_LEN];
+    char c1_hex[SG_SHA1_HEX_LEN + 1];
+
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    make_commit(git_dir, "c2", NULL, 0, c2);
+    sg_sha1_to_hex(c1, c1_hex);
+
+    /* A branch literally named after c1's own hex, pointing at c2. */
+    write_branch(git_dir, c1_hex, c2);
+
+    CHECK(sg_rev_parse_commit(git_dir, c1_hex, out) == 0, "hex-named base should still resolve");
+    CHECK(memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
+         "the literal hex must win over a same-named branch pointing elsewhere");
+
+    free(git_dir);
+}
+
 static void test_tilde_and_caret_chains(void)
 {
     char *git_dir = make_tmp_repo();
@@ -294,6 +321,72 @@ static void test_tilde_and_caret_chains(void)
     /* chained further: mid~1 -> root */
     CHECK(sg_rev_parse_commit(git_dir, "master^2~1~1", out) == 0, "master^2~1~1 should resolve");
     CHECK(memcmp(out, root, SG_SHA1_RAW_LEN) == 0, "master^2~1~1 should be root");
+
+    free(git_dir);
+}
+
+/* Leading zeros in a ~/^ suffix are legal, not a length violation -- the
+   9-significant-digit overflow guard applies to the number's value, not
+   its raw character count. Measured against real git: `git rev-parse
+   HEAD~0000000001` succeeds and means the same as `HEAD~1` (10 raw
+   characters, only 1 significant digit). */
+static void test_leading_zeros_in_suffix(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char c1[SG_SHA1_RAW_LEN], c2[SG_SHA1_RAW_LEN];
+    unsigned char out[SG_SHA1_RAW_LEN];
+
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    make_commit(git_dir, "c2", (const unsigned char (*)[SG_SHA1_RAW_LEN])c1, 1, c2);
+    set_master(git_dir, c2);
+
+    CHECK(sg_rev_parse_commit(git_dir, "HEAD~0000000001", out) == 0,
+         "a 10-char, 1-significant-digit suffix should resolve");
+    CHECK(memcmp(out, c1, SG_SHA1_RAW_LEN) == 0, "HEAD~0000000001 should equal HEAD~1");
+
+    free(git_dir);
+}
+
+/* ~0 and ^0 both mean "this commit itself" -- measured against real git,
+   `git rev-parse HEAD^0` and `git rev-parse HEAD~0` both print HEAD's own
+   id. They must also compose with further suffixes (e.g. HEAD~1^0). */
+static void test_zero_suffix_is_identity(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char c1[SG_SHA1_RAW_LEN], c2[SG_SHA1_RAW_LEN];
+    unsigned char out[SG_SHA1_RAW_LEN];
+
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    make_commit(git_dir, "c2", (const unsigned char (*)[SG_SHA1_RAW_LEN])c1, 1, c2);
+    set_master(git_dir, c2);
+
+    CHECK(sg_rev_parse_commit(git_dir, "HEAD^0", out) == 0, "HEAD^0 should resolve");
+    CHECK(memcmp(out, c2, SG_SHA1_RAW_LEN) == 0, "HEAD^0 should be HEAD itself");
+
+    CHECK(sg_rev_parse_commit(git_dir, "HEAD~0", out) == 0, "HEAD~0 should resolve");
+    CHECK(memcmp(out, c2, SG_SHA1_RAW_LEN) == 0, "HEAD~0 should be HEAD itself");
+
+    CHECK(sg_rev_parse_commit(git_dir, "HEAD~1^0", out) == 0, "HEAD~1^0 should resolve");
+    CHECK(memcmp(out, c1, SG_SHA1_RAW_LEN) == 0, "HEAD~1^0 should be c1 (^0 is a no-op)");
+
+    free(git_dir);
+}
+
+/* An oversized rev string (bigger than resolve_base's fixed-size `base`
+   buffer) must fail cleanly, not overrun the stack buffer that holds the
+   base name -- this is exactly the check ASan is best positioned to catch,
+   so it's worth having even though the assertion itself is trivial. */
+static void test_oversized_rev_string_fails(void)
+{
+    char *git_dir = make_tmp_repo();
+    char huge[4200];
+    unsigned char out[SG_SHA1_RAW_LEN];
+
+    memset(huge, 'a', sizeof(huge) - 1);
+    huge[sizeof(huge) - 1] = '\0';
+
+    CHECK(sg_rev_parse_commit(git_dir, huge, out) != 0,
+         "a rev string longer than the internal base buffer must fail cleanly");
 
     free(git_dir);
 }
@@ -472,7 +565,11 @@ int main(void)
 {
     test_head_and_branch_and_hex();
     test_precedence_tag_over_branch();
+    test_precedence_hex_over_branch_with_colliding_name();
     test_tilde_and_caret_chains();
+    test_leading_zeros_in_suffix();
+    test_zero_suffix_is_identity();
+    test_oversized_rev_string_fails();
     test_annotated_tag_peel();
     test_broken_tag_chain_fails();
     test_forged_tag_cycle_fails();
