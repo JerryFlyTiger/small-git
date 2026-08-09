@@ -528,25 +528,112 @@ static int write_ref_file(const char *git_dir, const char *ref_path,
     return sg_write_file_mkdirs(full_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, 0644);
 }
 
+/* ---- what to push: one or more refs (a single branch, a single tag, or
+   every tag under refs/tags/ with --tags) -- decided before any network
+   round trip or pack is built. `entries` (the final send list, built after
+   the remote's ref advertisement is known) each own their own malloc'd
+   name/ref_path, kept alive until sg_transport_push returns since
+   sg_push_ref_update.ref_name is borrowed (transport.h:88-89); they are
+   freed only at the very end of sg_cmd_push. */
+typedef struct {
+    char *name;     /* malloc'd short name (branch or tag), owned */
+    char *ref_path; /* malloc'd "refs/heads/<name>" or "refs/tags/<name>", owned */
+    int is_tag;
+    int is_new;  /* remote had no such ref before this push */
+    int forced;  /* tag only: overwrote a differing remote tag via --force */
+    unsigned char old_id[SG_SHA1_RAW_LEN];
+    unsigned char new_id[SG_SHA1_RAW_LEN];
+} push_entry;
+
+static void push_entry_free_all(push_entry *entries, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        free(entries[i].name);
+        free(entries[i].ref_path);
+    }
+    free(entries);
+}
+
+static int push_entries_push(push_entry **entries, size_t *count, size_t *cap, const push_entry *e)
+{
+    if (*count == *cap) {
+        size_t new_cap = *cap == 0 ? 4 : *cap * 2;
+        push_entry *grown = realloc(*entries, new_cap * sizeof(*grown));
+
+        if (grown == NULL)
+            return -1;
+        *entries = grown;
+        *cap = new_cap;
+    }
+    (*entries)[(*count)++] = *e;
+    return 0;
+}
+
+/* Builds a single-branch candidate (name + "refs/heads/<name>" + its current
+   commit id) and appends it to *candidates. Shared by the "explicit branch
+   name given" and "no name given, use the current branch" cases, which used
+   to duplicate this. Returns 0 on success, -1 on failure (message already
+   printed to stderr, matching the pre-Phase-13 wording exactly). */
+static int build_branch_candidate(const char *git_dir, const char *branch, push_entry **candidates,
+                                  size_t *count, size_t *cap)
+{
+    unsigned char id[SG_SHA1_RAW_LEN];
+    push_entry cand;
+    char path[SG_PATH_MAX];
+
+    if (sg_ref_read_branch(git_dir, branch, id) != 0) {
+        fprintf(stderr, "sg: 分支 '%s' 尚無任何 commit，沒有東西可以推送\n", branch);
+        return -1;
+    }
+    snprintf(path, sizeof(path), "refs/heads/%s", branch);
+    memset(&cand, 0, sizeof(cand));
+    cand.name = strdup(branch);
+    cand.ref_path = strdup(path);
+    cand.is_tag = 0;
+    memcpy(cand.new_id, id, SG_SHA1_RAW_LEN);
+    if (cand.name == NULL || cand.ref_path == NULL ||
+       push_entries_push(candidates, count, cap, &cand) != 0) {
+        free(cand.name);
+        free(cand.ref_path);
+        fprintf(stderr, "sg: out of memory\n");
+        return -1;
+    }
+    return 0;
+}
+
+static void free_string_array(char **arr, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++)
+        free(arr[i]);
+    free(arr);
+}
+
 int sg_cmd_push(int argc, char **argv)
 {
     const char *remote = "origin";
-    char *branch_arg = NULL;
+    char *name_arg = NULL;
     int force = 0;
+    int tags_flag = 0;
     char *git_dir = NULL;
     char *url = NULL;
     char *safe_url = NULL;
     char *current_branch = NULL;
-    const char *branch;
-    char ref_name[SG_PATH_MAX];
-    unsigned char local_id[SG_SHA1_RAW_LEN];
-    unsigned char remote_old_id[SG_SHA1_RAW_LEN];
-    int remote_ref_exists = 0;
+    char **tag_names = NULL;
+    size_t tag_name_count = 0;
     sg_ref_adv adv;
     int have_adv = 0;
     unsigned char(*diff_ids)[SG_SHA1_RAW_LEN] = NULL;
+    push_entry *candidates = NULL;
+    size_t candidate_count = 0, candidate_cap = 0;
+    push_entry *entries = NULL;
+    size_t entry_count = 0, entry_cap = 0;
+    int had_rejection = 0;
     /* refs/sg/chunks propagation (see the phase 6 push-side durability fix):
-       populated below, right after the fast-forward check, only when this
+       populated below, right after the ref-update decisions, only when this
        repo has ever genuinely used chunked storage locally. */
     int send_chunks_update = 0;
     unsigned char chunks_old_id[SG_SHA1_RAW_LEN];
@@ -561,30 +648,40 @@ int sg_cmd_push(int argc, char **argv)
         for (i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) {
                 force = 1;
+            } else if (strcmp(argv[i], "--tags") == 0) {
+                tags_flag = 1;
             } else if (argv[i][0] == '-') {
-                fprintf(stderr, "usage: sg push [<remote>] [<branch>] [--force|-f]\n");
+                fprintf(stderr, "usage: sg push [<remote>] [<name>] [--tags] [--force|-f]\n");
                 return 1;
             } else if (npos < 2) {
                 positional[npos++] = argv[i];
             } else {
-                fprintf(stderr, "usage: sg push [<remote>] [<branch>] [--force|-f]\n");
+                fprintf(stderr, "usage: sg push [<remote>] [<name>] [--tags] [--force|-f]\n");
                 return 1;
             }
         }
         if (npos >= 1)
             remote = positional[0];
         if (npos >= 2) {
-            branch_arg = strdup(positional[1]);
-            if (branch_arg == NULL) {
+            name_arg = strdup(positional[1]);
+            if (name_arg == NULL) {
                 fprintf(stderr, "sg: out of memory\n");
                 return 1;
             }
         }
     }
 
-    git_dir = sg_require_git_dir();
-    if (git_dir == NULL)
+    if (tags_flag && name_arg != NULL) {
+        fprintf(stderr, "usage: sg push [<remote>] [<name>] [--tags] [--force|-f]\n");
+        free(name_arg);
         return 1;
+    }
+
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL) {
+        free(name_arg);
+        return 1;
+    }
 
     url = sg_repo_read_remote_url(git_dir, remote);
     if (url == NULL) {
@@ -594,8 +691,78 @@ int sg_cmd_push(int argc, char **argv)
     }
     safe_url = sg_url_redact(url);
 
-    if (branch_arg != NULL) {
-        branch = branch_arg;
+    /* ---- decide what to push, entirely from local state ---- */
+
+    if (tags_flag) {
+        size_t i;
+
+        if (sg_ref_list_under(git_dir, "refs/tags/", &tag_names, &tag_name_count) != 0) {
+            fprintf(stderr, "sg: 無法列出本地的 tag\n");
+            goto done;
+        }
+        /* tag_name_count == 0 is deliberately NOT an early return here: even
+           with no tags to push, this is a real push invocation that must
+           still contact the remote (sg_transport_ls_refs_push below) and
+           still evaluate refs/sg/chunks propagation -- returning early would
+           silently skip both, exactly like `sg push origin` with nothing new
+           to send still round-trips to the remote instead of no-opping
+           purely from local state. candidates simply stays empty; the
+           unified "nothing to send" check after ls_refs_push (further down)
+           is what actually prints "Everything up-to-date." here. */
+        for (i = 0; i < tag_name_count; i++) {
+            push_entry cand;
+            char path[SG_PATH_MAX];
+
+            snprintf(path, sizeof(path), "refs/tags/%s", tag_names[i]);
+            memset(&cand, 0, sizeof(cand));
+            if (sg_ref_read_path(git_dir, path, cand.new_id) != 0) {
+                fprintf(stderr, "sg: 無法讀取 tag '%s'\n", tag_names[i]);
+                goto done;
+            }
+            cand.name = strdup(tag_names[i]);
+            cand.ref_path = strdup(path);
+            cand.is_tag = 1;
+            if (cand.name == NULL || cand.ref_path == NULL ||
+               push_entries_push(&candidates, &candidate_count, &candidate_cap, &cand) != 0) {
+                free(cand.name);
+                free(cand.ref_path);
+                fprintf(stderr, "sg: out of memory\n");
+                goto done;
+            }
+        }
+    } else if (name_arg != NULL) {
+        unsigned char tag_id[SG_SHA1_RAW_LEN];
+        char tag_path[SG_PATH_MAX];
+        int tag_exists;
+        int br_exists;
+
+        snprintf(tag_path, sizeof(tag_path), "refs/tags/%s", name_arg);
+        tag_exists = (sg_ref_read_path(git_dir, tag_path, tag_id) == 0);
+        br_exists = sg_ref_branch_exists(git_dir, name_arg);
+
+        if (tag_exists && br_exists) {
+            fprintf(stderr, "sg: src refspec '%s' matches more than one\n", name_arg);
+            goto done;
+        } else if (tag_exists) {
+            push_entry cand;
+
+            memset(&cand, 0, sizeof(cand));
+            cand.name = strdup(name_arg);
+            cand.ref_path = strdup(tag_path);
+            cand.is_tag = 1;
+            memcpy(cand.new_id, tag_id, SG_SHA1_RAW_LEN);
+            if (cand.name == NULL || cand.ref_path == NULL ||
+               push_entries_push(&candidates, &candidate_count, &candidate_cap, &cand) != 0) {
+                free(cand.name);
+                free(cand.ref_path);
+                fprintf(stderr, "sg: out of memory\n");
+                goto done;
+            }
+        } else {
+            if (build_branch_candidate(git_dir, name_arg, &candidates, &candidate_count,
+                                       &candidate_cap) != 0)
+                goto done;
+        }
     } else {
         current_branch = sg_ref_current_branch(git_dir);
         if (current_branch == NULL) {
@@ -603,49 +770,113 @@ int sg_cmd_push(int argc, char **argv)
                    remote);
             goto done;
         }
-        branch = current_branch;
+        if (build_branch_candidate(git_dir, current_branch, &candidates, &candidate_count,
+                                   &candidate_cap) != 0)
+            goto done;
     }
-
-    if (sg_ref_read_branch(git_dir, branch, local_id) != 0) {
-        fprintf(stderr, "sg: 分支 '%s' 尚無任何 commit，沒有東西可以推送\n", branch);
-        goto done;
-    }
-    snprintf(ref_name, sizeof(ref_name), "refs/heads/%s", branch);
 
     if (sg_transport_ls_refs_push(url, &adv) != 0)
         goto done;
     have_adv = 1;
 
+    /* ---- resolve each candidate against the remote's advertisement into
+       the final list of ref updates to actually send ---- */
     {
-        size_t i;
+        size_t ci;
 
-        for (i = 0; i < adv.count; i++) {
-            if (strcmp(adv.refs[i].name, ref_name) == 0) {
-                memcpy(remote_old_id, adv.refs[i].id, SG_SHA1_RAW_LEN);
-                remote_ref_exists = 1;
-                break;
+        for (ci = 0; ci < candidate_count; ci++) {
+            push_entry *cand = &candidates[ci];
+            unsigned char remote_old_id[SG_SHA1_RAW_LEN];
+            int remote_ref_exists = 0;
+            size_t j;
+
+            for (j = 0; j < adv.count; j++) {
+                if (strcmp(adv.refs[j].name, cand->ref_path) == 0) {
+                    memcpy(remote_old_id, adv.refs[j].id, SG_SHA1_RAW_LEN);
+                    remote_ref_exists = 1;
+                    break;
+                }
             }
-        }
-    }
-    if (!remote_ref_exists)
-        memset(remote_old_id, 0, sizeof(remote_old_id));
+            if (!remote_ref_exists)
+                memset(remote_old_id, 0, sizeof(remote_old_id));
 
-    {
-        sg_push_ff_status status = check_fast_forward(git_dir, remote_old_id, local_id, remote_ref_exists);
+            if (!cand->is_tag) {
+                sg_push_ff_status status =
+                    check_fast_forward(git_dir, remote_old_id, cand->new_id, remote_ref_exists);
+                push_entry e;
 
-        if (status == SG_PUSH_UNKNOWN_REMOTE) {
-            fprintf(stderr,
-                   "sg: 拒絕推送：遠端的 %s 有我們不知道的 commit，"
-                   "無法判斷是否會覆蓋別人的工作，請先執行 sg fetch\n",
-                   branch);
-            goto done;
-        }
-        if (status == SG_PUSH_NON_FF && !force) {
-            fprintf(stderr, "sg: 拒絕推送：這不是 fast-forward，會讓遠端 %s 上的以下 commit 遺失：\n",
-                   branch);
-            print_lost_commits(git_dir, remote_old_id, local_id);
-            fprintf(stderr, "sg: 請先 sg fetch 後 sg merge 整合變更，或確定要覆蓋就加上 --force 重新執行\n");
-            goto done;
+                if (status == SG_PUSH_UNKNOWN_REMOTE) {
+                    fprintf(stderr,
+                           "sg: 拒絕推送：遠端的 %s 有我們不知道的 commit，"
+                           "無法判斷是否會覆蓋別人的工作，請先執行 sg fetch\n",
+                           cand->name);
+                    goto done;
+                }
+                if (status == SG_PUSH_NON_FF && !force) {
+                    fprintf(stderr,
+                           "sg: 拒絕推送：這不是 fast-forward，會讓遠端 %s 上的以下 commit 遺失：\n",
+                           cand->name);
+                    print_lost_commits(git_dir, remote_old_id, cand->new_id);
+                    fprintf(stderr,
+                           "sg: 請先 sg fetch 後 sg merge 整合變更，或確定要覆蓋就加上 --force 重新執行\n");
+                    goto done;
+                }
+                if (remote_ref_exists && memcmp(remote_old_id, cand->new_id, SG_SHA1_RAW_LEN) == 0)
+                    continue; /* already up to date -- nothing to send for this ref */
+
+                memset(&e, 0, sizeof(e));
+                e.name = strdup(cand->name);
+                e.ref_path = strdup(cand->ref_path);
+                e.is_tag = 0;
+                e.is_new = !remote_ref_exists;
+                memcpy(e.old_id, remote_old_id, SG_SHA1_RAW_LEN);
+                memcpy(e.new_id, cand->new_id, SG_SHA1_RAW_LEN);
+                if (e.name == NULL || e.ref_path == NULL ||
+                   push_entries_push(&entries, &entry_count, &entry_cap, &e) != 0) {
+                    free(e.name);
+                    free(e.ref_path);
+                    fprintf(stderr, "sg: out of memory\n");
+                    goto done;
+                }
+                continue;
+            }
+
+            /* tag: unlike a branch, never fast-forward-checked or merge-based
+               -- an existing remote tag pointing somewhere else is always
+               rejected outright unless --force says to overwrite it, and a
+               rejection here only skips this one tag rather than aborting
+               the whole push (so `--tags` can still land the rest). */
+            if (!remote_ref_exists || memcmp(remote_old_id, cand->new_id, SG_SHA1_RAW_LEN) != 0) {
+                if (remote_ref_exists && !force) {
+                    fprintf(stderr,
+                           "sg: tag '%s' already exists on the remote (use --force to overwrite)\n",
+                           cand->name);
+                    had_rejection = 1;
+                    continue;
+                }
+
+                {
+                    push_entry e;
+
+                    memset(&e, 0, sizeof(e));
+                    e.name = strdup(cand->name);
+                    e.ref_path = strdup(cand->ref_path);
+                    e.is_tag = 1;
+                    e.is_new = !remote_ref_exists;
+                    e.forced = remote_ref_exists;
+                    memcpy(e.old_id, remote_old_id, SG_SHA1_RAW_LEN);
+                    memcpy(e.new_id, cand->new_id, SG_SHA1_RAW_LEN);
+                    if (e.name == NULL || e.ref_path == NULL ||
+                       push_entries_push(&entries, &entry_count, &entry_cap, &e) != 0) {
+                        free(e.name);
+                        free(e.ref_path);
+                        fprintf(stderr, "sg: out of memory\n");
+                        goto done;
+                    }
+                }
+            }
+            /* else: remote already has this exact tag id -- already up to
+               date, nothing to send. */
         }
     }
 
@@ -720,20 +951,31 @@ int sg_cmd_push(int argc, char **argv)
         }
     }
 
+    if (entry_count == 0 && !send_chunks_update) {
+        if (!had_rejection) {
+            printf("Everything up-to-date.\n");
+            rc = 0;
+        }
+        goto done;
+    }
+
     {
         id_set have_set, send_set;
         size_t diff_count = 0;
         int build_ok = 1;
+        size_t i;
 
         id_set_init(&have_set);
         id_set_init(&send_set);
 
         if (build_have_set(git_dir, &adv, &have_set) != 0)
             build_ok = 0;
-        if (build_ok && walk_add_object(git_dir, local_id, &send_set) < 0)
-            build_ok = 0;
+        for (i = 0; build_ok && i < entry_count; i++) {
+            if (walk_add_object(git_dir, entries[i].new_id, &send_set) < 0)
+                build_ok = 0;
+        }
         /* The (possibly newly merged) keep-alive commit is deliberately
-           parentless and ref-only -- never reachable from the branch
+           parentless and ref-only -- never reachable from any branch/tag
            history walked just above -- so its tree/entries (the actual raw
            chunk blobs, not the pointer blobs that name them) must be walked
            into send_set separately, or the remote would end up with
@@ -751,13 +993,6 @@ int sg_cmd_push(int argc, char **argv)
             goto done;
         }
 
-        if (diff_count == 0 && !send_chunks_update && remote_ref_exists &&
-           memcmp(remote_old_id, local_id, SG_SHA1_RAW_LEN) == 0) {
-            printf("Everything up-to-date.\n");
-            rc = 0;
-            goto done;
-        }
-
         {
             unsigned char *pack_data = NULL;
             size_t pack_len = 0;
@@ -766,37 +1001,45 @@ int sg_cmd_push(int argc, char **argv)
             int use_atomic = 0;
             sg_push_report report;
             int push_rc;
+            sg_push_ref_update *updates;
+            size_t update_count = 0;
 
             if (sg_pack_build_buf(git_dir, diff_ids, diff_count, &pack_data, &pack_len) != 0) {
                 fprintf(stderr, "sg: 建立要推送的 packfile 失敗\n");
                 goto done;
             }
 
-            {
-                sg_push_ref_update updates[2];
-                size_t update_count = 1;
-
-                memcpy(updates[0].old_id, remote_old_id, SG_SHA1_RAW_LEN);
-                memcpy(updates[0].new_id, local_id, SG_SHA1_RAW_LEN);
-                updates[0].ref_name = ref_name;
-
-                if (send_chunks_update) {
-                    memcpy(updates[1].old_id, chunks_old_id, SG_SHA1_RAW_LEN);
-                    memcpy(updates[1].new_id, chunks_new_id, SG_SHA1_RAW_LEN);
-                    updates[1].ref_name = SG_CHUNK_KEEPALIVE_REF;
-                    update_count = 2;
-                }
-
-                /* Only meaningful with more than one command, and only when
-                   the server offered it: the branch tip and refs/sg/chunks
-                   must not be able to land separately. */
-                use_atomic = update_count > 1 && adv.capabilities != NULL &&
-                             strstr(adv.capabilities, "atomic") != NULL;
-
-                memset(&report, 0, sizeof(report));
-                push_rc = sg_transport_push(url, updates, update_count, use_sb64k, use_atomic,
-                                           pack_data, pack_len, &report);
+            updates = malloc((entry_count + (send_chunks_update ? 1 : 0)) * sizeof(*updates));
+            if (updates == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
+                free(pack_data);
+                goto done;
             }
+
+            for (i = 0; i < entry_count; i++) {
+                memcpy(updates[update_count].old_id, entries[i].old_id, SG_SHA1_RAW_LEN);
+                memcpy(updates[update_count].new_id, entries[i].new_id, SG_SHA1_RAW_LEN);
+                updates[update_count].ref_name = entries[i].ref_path;
+                update_count++;
+            }
+            if (send_chunks_update) {
+                memcpy(updates[update_count].old_id, chunks_old_id, SG_SHA1_RAW_LEN);
+                memcpy(updates[update_count].new_id, chunks_new_id, SG_SHA1_RAW_LEN);
+                updates[update_count].ref_name = SG_CHUNK_KEEPALIVE_REF;
+                update_count++;
+            }
+
+            /* Only meaningful with more than one command, and only when the
+               server offered it: several refs (a branch, refs/sg/chunks, or
+               multiple tags with --tags) must not be able to land
+               separately. */
+            use_atomic = update_count > 1 && adv.capabilities != NULL &&
+                         strstr(adv.capabilities, "atomic") != NULL;
+
+            memset(&report, 0, sizeof(report));
+            push_rc = sg_transport_push(url, updates, update_count, use_sb64k, use_atomic, pack_data,
+                                        pack_len, &report);
+            free(updates);
             free(pack_data);
 
             if (push_rc != 0) {
@@ -812,41 +1055,55 @@ int sg_cmd_push(int argc, char **argv)
             }
 
             {
-                size_t i;
                 int any_ng = 0;
-                int found_our_ref = 0;
                 int chunks_ref_ok = 0;
 
                 printf("To %s\n", safe_url != NULL ? safe_url : "(remote)");
-                for (i = 0; i < report.ref_count; i++) {
-                    if (strcmp(report.refs[i].ref_name, ref_name) == 0) {
-                        found_our_ref = 1;
+                for (i = 0; i < entry_count; i++) {
+                    push_entry *e = &entries[i];
+                    size_t j;
+                    int found = 0;
 
-                        if (report.refs[i].ok) {
-                            if (!remote_ref_exists) {
-                                printf(" * [new branch]      %s -> %s/%s\n", branch, remote, branch);
+                    for (j = 0; j < report.ref_count; j++) {
+                        if (strcmp(report.refs[j].ref_name, e->ref_path) != 0)
+                            continue;
+                        found = 1;
+
+                        if (report.refs[j].ok) {
+                            if (e->is_new) {
+                                printf(" * [new %s]%s%s -> %s/%s\n", e->is_tag ? "tag" : "branch",
+                                      e->is_tag ? "         " : "      ", e->name, remote, e->name);
                             } else {
                                 char old_hex[SG_SHA1_HEX_LEN + 1];
                                 char new_hex[SG_SHA1_HEX_LEN + 1];
 
-                                sg_sha1_to_hex(remote_old_id, old_hex);
-                                sg_sha1_to_hex(local_id, new_hex);
-                                printf("   %.7s..%.7s  %s -> %s/%s\n", old_hex, new_hex, branch, remote,
-                                      branch);
+                                sg_sha1_to_hex(e->old_id, old_hex);
+                                sg_sha1_to_hex(e->new_id, new_hex);
+                                printf("   %.7s..%.7s  %s -> %s/%s%s\n", old_hex, new_hex, e->name,
+                                      remote, e->name, e->forced ? " (forced update)" : "");
                             }
                         } else {
-                            const char *why = report.refs[i].message;
+                            const char *why = report.refs[j].message;
 
                             any_ng = 1;
-                            fprintf(stderr, "sg: 遠端拒絕更新 %s: ", ref_name);
+                            fprintf(stderr, "sg: 遠端拒絕更新 %s: ", e->ref_path);
                             if (why != NULL)
                                 sg_print_remote_text((const unsigned char *)why, strlen(why), stderr);
                             else
                                 fputs("(未知原因)", stderr);
                             fputc('\n', stderr);
                         }
-                    } else if (send_chunks_update &&
-                              strcmp(report.refs[i].ref_name, SG_CHUNK_KEEPALIVE_REF) == 0) {
+                        break;
+                    }
+
+                    if (!found) {
+                        fprintf(stderr, "sg: 遠端回應未包含 %s 的結果\n", e->ref_path);
+                        any_ng = 1;
+                    }
+                }
+
+                for (i = 0; i < report.ref_count; i++) {
+                    if (send_chunks_update && strcmp(report.refs[i].ref_name, SG_CHUNK_KEEPALIVE_REF) == 0) {
                         if (report.refs[i].ok) {
                             chunks_ref_ok = 1;
                         } else {
@@ -864,10 +1121,6 @@ int sg_cmd_push(int argc, char **argv)
 
                 sg_push_report_free(&report);
 
-                if (!found_our_ref) {
-                    fprintf(stderr, "sg: 遠端回應未包含 %s 的結果\n", ref_name);
-                    goto done;
-                }
                 if (any_ng)
                     goto done;
                 /* Both a missing entry (server silently didn't apply it) and
@@ -875,9 +1128,9 @@ int sg_cmd_push(int argc, char **argv)
                    as failure here -- this is the CRITICAL bug this whole
                    change exists to fix: a chunked file whose protective ref
                    didn't verifiably land on the remote must never be
-                   reported as a successful push, even though the branch ref
-                   itself may well have gone through (git applies each ref
-                   update independently). */
+                   reported as a successful push, even though the other refs
+                   may well have gone through (git applies each ref update
+                   independently). */
                 if (send_chunks_update && !chunks_ref_ok) {
                     fprintf(stderr,
                            "sg: chunk 資料的保護 ref (%s) 未能推送，遠端的分塊檔案將無法還原\n",
@@ -886,26 +1139,35 @@ int sg_cmd_push(int argc, char **argv)
                 }
             }
 
-            {
-                char remote_ref_path[SG_PATH_MAX];
+            /* Real git never creates a remote-tracking ref for a pushed tag
+               -- only for the (at most one) branch entry in this push. */
+            for (i = 0; i < entry_count; i++) {
+                if (!entries[i].is_tag) {
+                    char remote_ref_path[SG_PATH_MAX];
 
-                snprintf(remote_ref_path, sizeof(remote_ref_path), "refs/remotes/%s/%s", remote, branch);
-                if (write_ref_file(git_dir, remote_ref_path, local_id) != 0) {
-                    fprintf(stderr, "sg: push 成功，但更新本地的 %s 失敗\n", remote_ref_path);
-                    goto done;
+                    snprintf(remote_ref_path, sizeof(remote_ref_path), "refs/remotes/%s/%s", remote,
+                            entries[i].name);
+                    if (write_ref_file(git_dir, remote_ref_path, entries[i].new_id) != 0) {
+                        fprintf(stderr, "sg: push 成功，但更新本地的 %s 失敗\n", remote_ref_path);
+                        goto done;
+                    }
+                    break;
                 }
             }
         }
     }
 
-    rc = 0;
+    rc = had_rejection ? 1 : 0;
 
 done:
     if (have_adv)
         sg_ref_adv_free(&adv);
     free(diff_ids);
+    push_entry_free_all(candidates, candidate_count);
+    push_entry_free_all(entries, entry_count);
+    free_string_array(tag_names, tag_name_count);
     free(current_branch);
-    free(branch_arg);
+    free(name_arg);
     free(safe_url);
     free(url);
     free(git_dir);

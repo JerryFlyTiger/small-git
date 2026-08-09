@@ -76,7 +76,8 @@ static void test_roundtrip_blob_tree_commit(void)
     unsigned char blob_id[SG_SHA1_RAW_LEN];
     unsigned char tree_id[SG_SHA1_RAW_LEN];
     unsigned char commit_id[SG_SHA1_RAW_LEN];
-    unsigned char ids[3][SG_SHA1_RAW_LEN];
+    unsigned char tag_id[SG_SHA1_RAW_LEN];
+    unsigned char ids[4][SG_SHA1_RAW_LEN];
     const char *blob_content = "hello from a packed blob\n";
     unsigned char tree_content[64];
     size_t tree_content_len;
@@ -86,6 +87,9 @@ static void test_roundtrip_blob_tree_commit(void)
         "committer A <a@example.com> 1700000000 +0000\n"
         "\n"
         "test commit\n";
+    char tag_content[256];
+    size_t tag_content_len;
+    char commit_hex[SG_SHA1_HEX_LEN + 1];
 
     repo_dir = make_tmp_repo();
     CHECK(repo_dir != NULL, "failed to create tmp repo");
@@ -116,11 +120,27 @@ static void test_roundtrip_blob_tree_commit(void)
                          commit_id) == 0,
          "failed to write commit");
 
+    /* an annotated tag object pointing at the commit above -- Phase 13 added
+       tag support to `sg push`'s object walk/pack, but nothing previously
+       exercised SG_OBJ_TAG through a pack round trip */
+    sg_sha1_to_hex(commit_id, commit_hex);
+    tag_content_len = (size_t)snprintf(tag_content, sizeof(tag_content),
+                                       "object %s\n"
+                                       "type commit\n"
+                                       "tag v1\n"
+                                       "tagger A <a@example.com> 1700000000 +0000\n"
+                                       "\n"
+                                       "a packed tag\n",
+                                       commit_hex);
+    CHECK(sg_loose_write(git_dir, SG_OBJ_TAG, tag_content, tag_content_len, tag_id) == 0,
+         "failed to write tag");
+
     memcpy(ids[0], blob_id, SG_SHA1_RAW_LEN);
     memcpy(ids[1], tree_id, SG_SHA1_RAW_LEN);
     memcpy(ids[2], commit_id, SG_SHA1_RAW_LEN);
+    memcpy(ids[3], tag_id, SG_SHA1_RAW_LEN);
 
-    CHECK(sg_pack_write(git_dir, ids, 3) == 0, "sg_pack_write failed");
+    CHECK(sg_pack_write(git_dir, ids, 4) == 0, "sg_pack_write failed");
 
     {
         sg_obj_type type;
@@ -152,6 +172,15 @@ static void test_roundtrip_blob_tree_commit(void)
         CHECK(content_len == strlen(commit_content) &&
                  memcmp(content, commit_content, content_len) == 0,
              "commit content mismatch");
+        free(content);
+
+        CHECK(sg_pack_read(git_dir, tag_id, &type, &content, &content_len) == 0,
+             "sg_pack_read failed for tag");
+        CHECK(type == SG_OBJ_TAG, "tag type mismatch");
+        CHECK(content_len == tag_content_len, "tag content_len mismatch");
+        CHECK(content_len == tag_content_len &&
+                 memcmp(content, tag_content, content_len) == 0,
+             "tag content mismatch");
         free(content);
     }
 
@@ -216,7 +245,7 @@ static void test_roundtrip_blob_tree_commit(void)
                     CHECK(be32(idx_data + 4) == 2, "idx version should be 2");
 
                     count = be32(idx_data + 8 + 255 * 4);
-                    CHECK(count == 3, "expected fanout[255] == 3, got %u", count);
+                    CHECK(count == 4, "expected fanout[255] == 4, got %u", count);
 
                     /* fanout must be non-decreasing and end at count */
                     {
@@ -252,7 +281,7 @@ static void test_roundtrip_blob_tree_commit(void)
                         unsigned char(*want)[SG_SHA1_RAW_LEN] = ids;
                         size_t w;
 
-                        for (w = 0; w < 3; w++) {
+                        for (w = 0; w < 4; w++) {
                             int present = 0;
 
                             for (i = 0; i < count; i++) {

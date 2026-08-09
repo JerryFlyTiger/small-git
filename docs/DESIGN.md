@@ -80,6 +80,7 @@ small_git/
 | 8 | 文件、打包、跨平台收尾 | 完成 | README、man page、`make release`/`install`;CI 設定為在 Linux(gcc/clang)與 macOS 上建置並跑完整測試 |
 | 9 | 可用性補完:`.gitignore`、`sg add` 遞迴、`sg branch` | 完成 | 見下方 Phase 9;以真 git 為 oracle 的 600 次隨機模糊測試零分歧 |
 | 12 | revision 解析、`sg tag`、`sg reset`、訊息正規化、loose 解壓上限 | 完成 | 見下方 Phase 12;interop 從 382 增至 642 項,全部以真 git 為 oracle |
+| 13 | `sg push` 推送 tag(`--tags`、名稱同時查 heads/tags) | 完成 | 見下方 Phase 13;interop 從 642 增至 680 項,以真 git 為 oracle |
 
 Phase 7 的內容與原規劃不同,原因記錄在此以免日後誤解:原本列的是 commit-graph、multi-pack-index、平行化。實測後發現真正的瓶頸完全不在那裡——是物件查找每次都重讀整個 pack(見下方 Phase 7a)。修好之後 `sg log` 已與 `git log` 同級,commit-graph 的邊際效益因此大幅下降,故未實作,留待有實際需求時再評估。原規劃的三項都尚未完成。
 
@@ -379,15 +380,13 @@ annotated(已用真 git 實測確認)。與 `sg branch` 共用
 `sg_ref_list_under`/`sg_ref_delete_under`(loose+packed 合併/清除)及
 `sg_ref_name_valid_for_create`。
 
-### 已知限制:`sg push` 不推送 tag
+### 已知限制:`sg push` 不推送 tag(**已於 Phase 13 解除,見下方**)
 
-`sg push` 目前寫死只推送 `refs/heads/`(`src/cli/cmd_push.c:611`)——不論本地
-是否有 `sg tag` 或真 git 建立的 tag,`sg push` 都不會把它們傳到遠端,也不會
-報錯或警告,是靜默的範圍限制。因為 `sg` 與真 git 位元相容,使用者可以直接用
-真 git 的 `git push --tags` 對同一個 repo 補推 tag,繞過這個限制;這也是
-`docs/sg.1` 的 `tag` 小節裡明講的原因。要讓 `sg push` 自己支援 tag,需要擴充
-`cmd_push.c` 的 ref 列舉範圍與 pack 打包對象(annotated tag 物件本身也要進
-pack),留待有實際需求時再評估,不在本階段範圍內。
+`sg push` 當時寫死只推送 `refs/heads/`——不論本地是否有 `sg tag` 或真 git
+建立的 tag,`sg push` 都不會把它們傳到遠端,也不會報錯或警告,是靜默的範圍
+限制。因為 `sg` 與真 git 位元相容,使用者可以用真 git 的 `git push --tags`
+對同一個 repo 補推 tag 繞過。這一段保留下來是因為 Phase 13 的實作範圍正是
+由它界定的;現況以 Phase 13 為準。
 
 ### `sg reset`:三種模式,三道不同的安全閘門
 
@@ -488,3 +487,114 @@ git 的 racily-clean 規則遮住——所有其他檢查都在同一秒內寫�
 - **`loose.c` 的溢位保護與「無進度即判定卡死」防線都沒有能鑑別的測試。**
   前者需要 `declared_size` 接近 `SIZE_MAX` 的案例,後者需要一段病態的 deflate
   串流,兩者都不容易自然構造。如實記錄,不假裝有覆蓋。
+
+## Phase 13:`sg push` 推送 tag
+
+`sg push` 從只認 `refs/heads/` 擴充到能推 tag。三種模式:不給名稱維持原本的
+「推當前分支」;給了名稱時**同時查 `refs/heads/<name>` 與 `refs/tags/<name>`**,
+兩邊都命中就報 `src refspec '<name>' matches more than one` 並拒絕;`--tags`
+推送 `refs/tags/` 底下全部。
+
+### 要改的比預期少
+
+踏勘的結論推翻了 Phase 12 對工作量的估計。當時記的是「需要擴充 ref 列舉範圍
+**與 pack 打包對象**(annotated tag 物件本身也要進 pack)」——後半句是錯的:
+
+- `cmd_push.c` 的 `walk_add_object` 早就是型別無關的,`SG_OBJ_TAG` 分支一直
+  存在且會走 `tag.object` 那條邊。餵一個 annotated tag 物件 id 進去,tag 物件
+  本身加它指向的 commit 與整棵樹都會被正確收進 send set。
+- `sg_pack_build_buf` 對 `SG_OBJ_TAG` 沒有任何排除或特判,與 blob/tree/commit
+  走同一條路。
+- 網路層(`sg_transport_push`、pkt-line 組包、report-status 解析)對 ref 命名
+  空間完全無知。`sg_ref_name_is_safe` 只用來過濾**遠端**廣播,不擋本地要送出
+  的 ref 名稱。
+
+於是整個里程碑的產品程式碼改動都落在 `src/cli/cmd_push.c` 一支函式裡。這是
+「先派人測繪再開規格」直接省下工作量的一次:照 Phase 12 的估計去做,會有一半
+的力氣花在改根本不需要改的 pack 與網路層上。
+
+### tag 的更新規則不是 fast-forward
+
+真 git 對 tag **不算祖先關係**:遠端已有同名 tag 而 id 不同,一律拒絕
+(`! [rejected] lw -> lw (already exists)`),`--force` 才覆寫。這是實測出來的,
+不是回想的。
+
+這件事直接決定了實作:tag **不走** `check_fast_forward`,tag 的 id 也不流進
+`sg_merge_base`。踏勘時發現「把 tag 物件 id 餵進 `sg_merge_base` 會被判成
+unrelated,於是變成 non-ff,於是要求 `--force`」——結果**碰巧**與真 git 一致。
+碰巧一致的路徑不能留:`sg_merge_base` 走的是 commit parent 鏈,它對非 commit
+輸入的行為沒有任何人保證過,而正確答案根本不需要它。tag 的規則寫成獨立分支:
+遠端沒有就新增、id 相同就跳過、id 不同看 `--force`。
+
+另外兩件也是實測而非記憶:遠端的 `refs/tags/<name>` 對 annotated tag 指向
+**tag 物件 id,不 peel**(所以本地 id 要用 `sg_ref_read_path` 讀原始值,不能
+用會 peel 的 `sg_rev_parse_commit`);push tag **不建立**
+`refs/remotes/<remote>/<tag>`,那個命名空間只屬於分支。
+
+### 部分成功
+
+`--tags` 推多個 tag 時,其中一個因為已存在而被拒,其餘照樣送出,最終退出碼
+為 1——與真 git 一致。這使得原本的 `updates[2]` stack 陣列(1 分支 + 1 chunks
+ref)不夠用,改成動態配置,並且 report 解析從「比對單一 ref_name」推廣成逐一
+比對所有送出的 update。`sg_push_ref_update.ref_name` 是 borrowed 指標,所以
+持有字串的 entry 陣列必須活到 `sg_transport_push` 回來為止。
+
+### 審查抓到的:零個 tag 時連遠端都不碰
+
+第一版在 `--tags` 模式取得 tag 清單後,若一個 tag 都沒有就直接印
+`Everything up-to-date.` 退出 0。問題是這發生在 `sg_transport_ls_refs_push`
+**之前**,於是連帶跳過了整個 `refs/sg/chunks` keepalive 傳播區塊——而其他每
+一條 push 路徑都會走到那段。實測可觀測:零 tag 的 repo 對連不上的遠端下
+`sg push origin --tags` 得到 `Everything up-to-date.` 與退出碼 0、零連線嘗試,
+同一個遠端下 `sg push origin` 則正確報連線失敗。
+
+一個用了分塊儲存但當下沒有任何 tag 的 repo,會在 `sg push --tags` 時靜默跳過
+chunk 可達性的同步。修法是移除那個提早返回:零 tag 只是讓候選集合保持空的,
+照常做 ls-refs、照常評估 chunks,最後由既有的統一判斷
+`entry_count == 0 && !send_chunks_update` 決定要不要印
+`Everything up-to-date.`。
+
+教訓的形狀值得記下來:**「沒有東西要做」與「不必問對方」是兩回事**。前者只有
+在問過遠端之後才成立,而這個專案有一個真 git 沒有的、掛在遠端狀態上的不變量
+(chunks keepalive),任何從純本地狀態就提早返回的捷徑都會把它漏掉。
+
+### 測試紀律:否定式斷言需要定向 mutation
+
+新增 38 項 interop 檢查(642 → 680),全部以真 git 為 oracle。驗證分兩層,
+兩層都由主對話執行:
+
+**全面還原**——把 `cmd_push.c` 還原成改動前、保留新測試,26 項第一批檢查裡
+**21 項變紅**。剩下 5 項不紅,但它們並非都沒有鑑別力:其中 3 項是**否定式
+斷言**(「沒有建立 remote-tracking ref」「遠端沒有多出這個 tag」),在什麼都
+沒推成功的情況下自然成立。全面還原對這類斷言結構性地無效。
+
+**定向 mutation**——那 3 項要靠針對性的改動才看得出來,實跑確認:拿掉
+`if (!entries[i].is_tag)` 守衛 → 667/668,只有「不建立 remote-tracking ref」
+變紅;把 ambiguity 判斷改成 `if (0)` → 665/668,三項具名檢查變紅。修復輪的
+三處也各自實跑:重新植回提早返回 → 678/680;`rc = had_rejection ? 1 : 0;`
+改成 `rc = 0;` → 679/680;usage 守衛的 `return 1` 改成 `return 0` → 679/680。
+每一條都只有目標檢查變紅,沒有連帶災情——乾淨的 mutation 才是有效證據
+(Phase 12 已經吃過一次「改壞的 mutation 給出更漂亮的紅」的虧)。
+
+實作者最初回報「5 項空洞檢查」,冷讀的審查者只數到 2 項。兩邊都不完全對:
+正確的區分是「全面還原時不紅」(5 項)與「任何定向 mutation 都測不到」(2 項),
+這兩個數字量的不是同一件事。
+
+### 已知限制
+
+- **沒有 refspec 語法。** 不支援 `src:dst`、`+force` 前綴、`--delete`。名稱
+  一律同時解讀為分支或 tag,同名就拒絕而不是猜。
+- **`--tags` 與明確名稱不能併用**,是用法錯誤。真 git 兩者可以並存,這裡刻意
+  收斂:模糊的呼叫寧可拒絕(與 Phase 12 的 `sg reset --soft --hard` 同一個
+  取捨)。
+- **「只有 chunks 落後」的防線沒有能鑑別的測試。** 把
+  `entry_count == 0 && !send_chunks_update` 改成 `if (entry_count == 0)`,
+  680 項檢查照樣全綠。要覆蓋它得建構出「推過一次之後,分支與 tag 都沒變、
+  只有 `refs/sg/chunks` 動了」的第二次 push,現有的 chunks push 檢查都伴隨著
+  真實的新 commit 一起送出。這是 Phase 13 之前就存在的缺口,不是這次引入的;
+  如實記錄,不假裝有覆蓋。
+- **annotated tag 的 `object_type` 在本地建立時恆為 commit**
+  (`cmd_tag.c` 走 `sg_rev_parse_commit`,一定 peel 到 commit),所以 `sg` 自己
+  建不出指向 tree 或 blob 的 annotated tag。push 端不依賴這個假設(它推的是
+  ref 裡的原始 id,不看 `object_type`),從真 git clone 來的這類 tag 能正常
+  推送,但這條路徑沒有測試覆蓋——要造出這種 tag 需要真 git 參與。
