@@ -229,6 +229,103 @@ static void test_message_cleanup(void)
     expect_cleanup("   \n\n  \n", "", "whitespace-only input normalizes to empty output");
 }
 
+static void test_parse_header(void)
+{
+    const char *good = "blob 33\0content-does-not-matter-here";
+    sg_obj_type type;
+    size_t header_len;
+    size_t declared_size;
+
+    /* memchr-based length below has to cover the embedded NUL, so build the
+       buffer explicitly rather than relying on strlen() stopping early */
+    unsigned char buf[64];
+    size_t buf_len = 8 + 29; /* "blob 33\0" (8 bytes) + 29 bytes of arbitrary content */
+
+    memcpy(buf, good, 8);
+    memset(buf + 8, 'x', 29);
+
+    CHECK(sg_object_parse_header(buf, buf_len, &type, &header_len, &declared_size) == 0,
+         "well-formed header should parse");
+    CHECK(type == SG_OBJ_BLOB, "wrong type");
+    CHECK(header_len == 8, "wrong header_len: got %zu", header_len);
+    CHECK(declared_size == 33, "wrong declared_size: got %zu", declared_size);
+
+    /* header parsing only needs the header itself present -- unlike
+       sg_object_parse(), it must NOT require the declared content to
+       actually follow in full (that's the whole point: it lets a caller
+       learn the declared size from a short prefix before deciding how much
+       more to decompress). */
+    CHECK(sg_object_parse_header(buf, 8, &type, &header_len, &declared_size) == 0,
+         "header-only prefix (no content) should still parse");
+    CHECK(declared_size == 33, "declared_size should still be 33 from header-only prefix");
+
+    /* malformed: no space separator */
+    {
+        const unsigned char no_space[] = "blob33\0xxxx";
+        CHECK(sg_object_parse_header(no_space, sizeof(no_space) - 1, &type, &header_len,
+                                     &declared_size) != 0,
+             "missing space separator should fail");
+    }
+
+    /* malformed: unknown type name */
+    {
+        const unsigned char bad_type[] = "bogus 5\0xxxxx";
+        CHECK(sg_object_parse_header(bad_type, sizeof(bad_type) - 1, &type, &header_len,
+                                     &declared_size) != 0,
+             "unknown type name should fail");
+    }
+
+    /* malformed: no NUL terminator within the buffer given */
+    {
+        const unsigned char no_nul[] = "blob 5xxxxx";
+        CHECK(sg_object_parse_header(no_nul, sizeof(no_nul) - 1, &type, &header_len,
+                                     &declared_size) != 0,
+             "missing NUL should fail");
+    }
+
+    /* malformed: non-numeric size field */
+    {
+        const unsigned char bad_size[] = "blob abc\0xxxxx";
+        CHECK(sg_object_parse_header(bad_size, sizeof(bad_size) - 1, &type, &header_len,
+                                     &declared_size) != 0,
+             "non-numeric size should fail");
+    }
+}
+
+/* sg_object_parse() must reject a stream whose declared size doesn't match the
+   actual content length that follows the header -- both when there's more
+   content than declared and when there's less. This guards against a loose
+   object whose header lies about its size, whichever direction the lie goes
+   (a corrupt/hostile stream that decompresses to more or fewer bytes than
+   its own header claims). */
+static void test_parse_size_mismatch(void)
+{
+    sg_object obj;
+
+    /* declared size (5) is larger than the actual content that follows (3
+       bytes) -- must fail, not silently accept the short content. */
+    {
+        const unsigned char data[] = "blob 5\0xyz";
+        CHECK(sg_object_parse(data, sizeof(data) - 1, &obj) != 0,
+             "declared-larger-than-actual should fail");
+    }
+
+    /* declared size (2) is smaller than the actual content that follows (5
+       bytes) -- must fail, not silently truncate. */
+    {
+        const unsigned char data[] = "blob 2\0abcde";
+        CHECK(sg_object_parse(data, sizeof(data) - 1, &obj) != 0,
+             "declared-smaller-than-actual should fail");
+    }
+
+    /* exact match must still succeed */
+    {
+        const unsigned char data[] = "blob 3\0abc";
+        CHECK(sg_object_parse(data, sizeof(data) - 1, &obj) == 0, "exact match should succeed");
+        CHECK(obj.content_len == 3, "wrong content_len");
+    }
+}
+
 int main(void)
 {
     test_blob_vectors();
@@ -237,6 +334,8 @@ int main(void)
     test_commit_vectors();
     test_commit_with_parents_roundtrip();
     test_message_cleanup();
+    test_parse_header();
+    test_parse_size_mismatch();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

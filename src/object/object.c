@@ -157,7 +157,8 @@ int sg_message_cleanup(const char *msg, char **out)
     return 0;
 }
 
-int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj)
+int sg_object_parse_header(const unsigned char *data, size_t data_len, sg_obj_type *type_out,
+                           size_t *header_len_out, size_t *declared_size_out)
 {
     const unsigned char *space;
     const unsigned char *nul;
@@ -187,11 +188,26 @@ int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj)
     if (end != (const char *)nul)
         return -1;
 
-    if ((size_t)(nul + 1 - data) + declared_size != data_len)
+    *type_out = type;
+    *header_len_out = (size_t)(nul + 1 - data);
+    *declared_size_out = declared_size;
+    return 0;
+}
+
+int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj)
+{
+    sg_obj_type type;
+    size_t header_len;
+    size_t declared_size;
+
+    if (sg_object_parse_header(data, data_len, &type, &header_len, &declared_size) != 0)
+        return -1;
+
+    if (header_len + declared_size != data_len)
         return -1;
 
     obj->type = type;
-    obj->content = nul + 1;
+    obj->content = data + header_len;
     obj->content_len = declared_size;
     return 0;
 }

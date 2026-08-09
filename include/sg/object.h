@@ -41,6 +41,17 @@ typedef struct {
    success, -1 on malformed input. */
 int sg_object_parse(const unsigned char *data, size_t data_len, sg_object *obj);
 
+/* Parses just the "{type} {size}\0" header out of data/data_len -- unlike
+   sg_object_parse(), data need not contain the object's content (or all of
+   it): this is meant for callers that only have a prefix of the decompressed
+   stream, e.g. to learn the declared size before deciding how much more to
+   decompress. *header_len_out is set to the header's length in bytes
+   (data + *header_len_out is where the content would start) and
+   *declared_size_out to the size field's value. Returns 0 on success, -1 if
+   the header isn't fully present in data_len bytes or is malformed. */
+int sg_object_parse_header(const unsigned char *data, size_t data_len, sg_obj_type *type_out,
+                           size_t *header_len_out, size_t *declared_size_out);
+
 /* ---- tree ---- */
 
 typedef struct {
