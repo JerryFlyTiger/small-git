@@ -15,6 +15,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Writes the "Dropped ..." line for pop and drop. Real git echoes the user's
+   spec back only when it already reads as stash@{N}; a bare "0" or no
+   argument at all resolves to the fully-qualified ref instead. Measured on
+   2.55.0:
+
+     git stash drop            -> Dropped refs/stash@{0} (...)
+     git stash drop stash@{0}  -> Dropped stash@{0} (...)
+     git stash drop 0          -> Dropped refs/stash@{0} (...)
+     git stash pop             -> Dropped refs/stash@{0} (...)
+     git stash pop stash@{0}   -> Dropped stash@{0} (...)
+
+   So this is not a pop-versus-drop distinction, which is how it first looked
+   when only the no-argument pop and the explicit-spec drop had been sampled.
+   Both subcommands share the one rule below. */
+static void print_dropped(const char *spec, size_t index, const char *hex)
+{
+    if (spec != NULL && strncmp(spec, "stash@{", 7) == 0)
+        printf("Dropped %s (%s)\n", spec, hex);
+    else
+        printf("Dropped refs/stash@{%zu} (%s)\n", index, hex);
+}
+
 static int cmd_stash_push(int argc, char **argv, const char *usage)
 {
     const char *message = NULL;
@@ -249,7 +271,7 @@ static int cmd_stash_drop(int argc, char **argv)
     }
 
     sg_sha1_to_hex(commit_id, hex);
-    printf("Dropped stash@{%zu} (%s)\n", index, hex);
+    print_dropped(spec, index, hex);
 
     free(git_dir);
     return 0;
@@ -422,7 +444,7 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
             free(repo_root);
             return 1;
         }
-        printf("Dropped stash@{%zu} (%s)\n", index, hex);
+        print_dropped(spec, index, hex);
     }
 
     free(git_dir);

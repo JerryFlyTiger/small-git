@@ -4713,6 +4713,68 @@ check "phase15 apply: the refused pop left the entry alone" \
 check "phase15 apply/pop contrast: popping the same entry DOES remove it" \
     sh -c "! (cd '$P15_APPLY' && git stash list) | grep -q 'survives apply'"
 
+# --- How the "Dropped ..." line names the entry. Real git echoes the spec
+# back only when it already reads as stash@{N}; a bare "0" and no argument
+# at all both resolve to the fully-qualified refs/stash@{N}. That is one
+# rule for pop and drop alike -- it first looked like a pop-versus-drop
+# difference because the two sampled invocations happened to differ in
+# whether they passed a spec. Each form is pinned against real git rather
+# than a hard-coded string, so the day git changes its mind this says so.
+# The oid is never compared: sg's commit ids can never equal git's (fixed
+# "+0000", time(NULL)), only the wording is.
+#
+# The oracle runs under LC_ALL=C on purpose. git translates this message (a
+# zh_TW machine prints "捨棄了 refs/stash@{0}（...）", full-width parentheses
+# and all) while CI runners default to C -- without pinning the locale this
+# check would pass in CI and fail locally, the worst way for a check to be
+# wrong. ---
+p15_drop_wording() {
+    # $1 = repo dir, $2 = "sg"|"git", $3 = subcommand, $4 = spec ("" for none)
+    _d="$1"; _impl="$2"; _sub="$3"; _spec="$4"
+    printf 'wording %s\n' "$_sub$_spec" > "$_d/a.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_d" && "$SG" stash push -m "wording") > /dev/null 2>&1
+        if [ -z "$_spec" ]; then
+            (cd "$_d" && LC_ALL=C "$SG" stash "$_sub") 2>&1
+        else
+            (cd "$_d" && LC_ALL=C "$SG" stash "$_sub" "$_spec") 2>&1
+        fi
+    else
+        (cd "$_d" && git stash push -q -m "wording") > /dev/null 2>&1
+        if [ -z "$_spec" ]; then
+            (cd "$_d" && LC_ALL=C git stash "$_sub") 2>&1
+        else
+            (cd "$_d" && LC_ALL=C git stash "$_sub" "$_spec") 2>&1
+        fi
+    fi
+}
+
+P15_DROPMSG="$WORKDIR/p15_dropmsg"
+p15_base_repo "$P15_DROPMSG"
+P15_DROPMSG_GIT="$WORKDIR/p15_dropmsg_git"
+mkdir -p "$P15_DROPMSG_GIT"
+(cd "$P15_DROPMSG_GIT" && git init -q . && git config user.email "a@b.c" && git config user.name "git user")
+printf 'a\n' > "$P15_DROPMSG_GIT/a.txt"
+(cd "$P15_DROPMSG_GIT" && git add a.txt && git commit -q -m base)
+
+for p15_case in "drop::refs/stash@{0}" "drop:stash@{0}:stash@{0}" "drop:0:refs/stash@{0}" \
+                "pop::refs/stash@{0}" "pop:stash@{0}:stash@{0}" "pop:0:refs/stash@{0}"; do
+    p15_sub=$(echo "$p15_case" | cut -d: -f1)
+    p15_spec=$(echo "$p15_case" | cut -d: -f2)
+    p15_want=$(echo "$p15_case" | cut -d: -f3)
+    # Captured to files, never interpolated into an `sh -c` string: pop's
+    # output carries a full status block containing double quotes (`use "git
+    # add"`), which silently shreds an embedded-and-requoted command line.
+    # drop's single line has no quotes, so only half the cases would have
+    # misfired -- the kind of harness bug that reads as a product bug.
+    p15_drop_wording "$P15_DROPMSG_GIT" git "$p15_sub" "$p15_spec" > "$WORKDIR/p15_w_git.txt" 2>&1
+    p15_drop_wording "$P15_DROPMSG" sg "$p15_sub" "$p15_spec" > "$WORKDIR/p15_w_sg.txt" 2>&1
+    check "phase15 drop wording oracle: git stash $p15_sub '$p15_spec' names it $p15_want" \
+        grep -qF "Dropped $p15_want (" "$WORKDIR/p15_w_git.txt"
+    check "phase15 drop wording: sg stash $p15_sub '$p15_spec' names it $p15_want, same as git" \
+        grep -qF "Dropped $p15_want (" "$WORKDIR/p15_w_sg.txt"
+done
+
 # --- push refuses an unmerged index. Real git's rule is about the index,
 # not about which operation left it that way (measured: a merge conflict and
 # a rebase conflict are refused identically, while a paused rebase with a
