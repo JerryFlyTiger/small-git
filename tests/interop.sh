@@ -4629,6 +4629,31 @@ check "phase15 apply: the refused pop left the entry alone" \
 check "phase15 apply/pop contrast: popping the same entry DOES remove it" \
     sh -c "! (cd '$P15_APPLY' && git stash list) | grep -q 'survives apply'"
 
+# --- A path that fails to reach the working tree must fail the whole apply.
+# pop drops the entry as soon as apply reports success, so treating a
+# per-path read failure as a warning costs the user the file AND its only
+# backup, while exiting 0. Measured on a repo whose stashed blob was deleted:
+# with the failure demoted to a warning, pop exits 0, prints
+# "Dropped stash@{0}", leaves a.txt at its pre-stash content and empties the
+# stash list. Every assertion below is the opposite of that outcome. ---
+P15_LOSTBLOB="$WORKDIR/p15_lostblob"
+p15_base_repo "$P15_LOSTBLOB"
+printf 'stashed content\n' > "$P15_LOSTBLOB/a.txt"
+P15_LOSTBLOB_ID=$(cd "$P15_LOSTBLOB" && git hash-object a.txt)
+(cd "$P15_LOSTBLOB" && "$SG" stash push -m "blob goes missing") > /dev/null 2>&1
+P15_LOSTBLOB_OBJ="$P15_LOSTBLOB/.git/objects/$(echo "$P15_LOSTBLOB_ID" | cut -c1-2)/$(echo "$P15_LOSTBLOB_ID" | cut -c3-)"
+check "phase15 lost blob: precondition -- the stashed blob is a loose object" \
+    test -f "$P15_LOSTBLOB_OBJ"
+rm -f "$P15_LOSTBLOB_OBJ"
+(cd "$P15_LOSTBLOB" && "$SG" stash pop) > /dev/null 2>&1
+check "phase15 lost blob: pop fails instead of reporting success" test $? != 0
+check "phase15 lost blob: the entry was NOT dropped" \
+    sh -c "(cd '$P15_LOSTBLOB' && git stash list) | grep -q 'blob goes missing'"
+P15_LOSTBLOB_REF=$(cd "$P15_LOSTBLOB" && git rev-parse refs/stash 2>/dev/null)
+P15_LOSTBLOB_TIP=$(cd "$P15_LOSTBLOB" && tail -1 .git/logs/refs/stash 2>/dev/null | cut -d' ' -f2)
+check "phase15 lost blob: the tip invariant survived the failed pop" \
+    sh -c "[ -n \"$P15_LOSTBLOB_REF\" ] && [ \"$P15_LOSTBLOB_REF\" = \"$P15_LOSTBLOB_TIP\" ]"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

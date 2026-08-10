@@ -895,24 +895,36 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
             int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &content, &content_len, &missing);
 
             if (read_rc == 0) {
-                if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0)
+                if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0) {
                     fprintf(stderr, "sg: failed to write '%s'\n", e->path);
+                    content_missing = 1;
+                }
                 free(content);
             } else if (read_rc == -2) {
                 sg_chunk_print_missing_error(e->path, &missing);
                 content_missing = 1;
             } else {
+                /* -1: the object behind this sha1 could not be read at all
+                   (see sg/chunk.h). The file never reached the working tree,
+                   yet the index entry below records it as present at this
+                   sha1 -- exactly the "silently dropped a path" state this
+                   function promises never to hand back. Fatal, like -2. */
                 fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
+                content_missing = 1;
             }
             if (add_resolved_entry(repo_root, index_out, e->path, e->mode, e->sha1) != 0)
                 index_ok = 0;
         }
     }
 
-    /* A chunked file whose data actually can't be recovered, or an index
-       that couldn't be built completely (allocation failure), must abort
-       the whole apply -- there's nothing left to do except refuse to hand
-       back a state that silently drops content or paths. */
+    /* Any path that failed to reach the working tree -- unrecoverable chunk
+       data, an unreadable object, or a failed write -- or an index that
+       couldn't be built completely (allocation failure), must abort the
+       whole apply. There's nothing left to do except refuse to hand back a
+       state that silently drops content or paths. The distinction matters
+       most to sg_stash_apply's caller: `sg stash pop` drops the entry once
+       apply reports success, so a per-path failure reported as success
+       would cost the user both the file and its only backup. */
     if (content_missing || !index_ok) {
         sg_index_free(index_out);
         memset(index_out, 0, sizeof(*index_out));
