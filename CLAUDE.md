@@ -63,11 +63,11 @@ staging 的驗證。本機綠燈不是充分證據。**
 | `object/` | 物件的序列化/解析,純記憶體,不碰 fs | hash |
 | `index/` | index v2 二進位讀寫與有序條目操作,不讀物件 | hash |
 | `util/` | zlib、SHA-1、levenshtein、LCS 表 | — |
-| `storage/` | 物件與 ref 落磁碟:loose、pack、chunk、refs、repo、revparse | object, workdir |
+| `storage/` | 物件與 ref 落磁碟:loose、pack、chunk、refs、reflog、repo、revparse | object, workdir |
 | `net/` | smart-HTTP:libcurl 封裝、pkt-line、transport | — |
 | `workdir/` | 工作目錄:路徑/檔案 I/O、ignore、status、apply、merge、tree_build | 幾乎全部 |
-| `safety/` | snapshot(可救回的備份 ref)、rebase 序列器狀態 | storage, workdir |
-| `cli/` | 21 個 `sg_cmd_*` + 派發器,唯一的組裝點 | 全部 |
+| `safety/` | snapshot(可救回的備份 ref)、rebase 序列器狀態、stash | storage, workdir |
+| `cli/` | 23 個 `sg_cmd_*` + 派發器,唯一的組裝點 | 全部 |
 
 - **讀物件一律走 `sg_object_read`**(`include/sg/objstore.h:16`):先 loose 再 pack。
   除了 `loose.c`/`pack.c` 自己以外不要直接呼叫底層。
@@ -77,9 +77,16 @@ staging 的驗證。本機綠燈不是充分證據。**
   `workdir.h`,不要去 `util/`,也不要自己再寫一份。
 - 已知重複(碰到時順手收斂,不要再增加下一份):`path_join` 逐字重複於
   `src/cli/cmd_add.c:174` 與 `src/cli/cmd_status.c:118`;小型 strbuf 重複於
-  `src/workdir/apply.c:175` 與 `src/cli/cmd_restore.c:104`;`resolve_commit_tree`
-  **已經有五份逐字複本**(`cmd_switch.c`、`cmd_merge.c`、`cmd_rebase.c`、
-  `cmd_clone.c`、`cmd_reset.c`)——這份最該收,新指令不要再抄第六份。
+  `src/workdir/apply.c:175` 與 `src/cli/cmd_restore.c:104`。`resolve_commit_tree`
+  的六份逐字複本(`cmd_switch.c`、`cmd_merge.c`、`cmd_rebase.c`、`cmd_clone.c`、
+  `cmd_reset.c`、`workdir/apply.c`)已在 Phase 15 收斂成
+  `sg_commit_tree_of`(`include/sg/objstore.h`);讀 commit 拿它的 tree id 一律
+  呼叫這支,不要再手刻一份。index→tree 的兩種建法也已抽成
+  `sg_tree_build_from_index`/`sg_tree_build_from_workdir`
+  (`include/sg/tree_build.h`),前者只吃 index 的 stage-0 條目、後者會重新雜湊
+  工作目錄;新程式碼要哪一種先看標頭註解,不要在呼叫端重寫這段邏輯。
+  merge/rebase/stash 共用的「把 `sg_merge_result` 落地成工作目錄+index」迴圈
+  也已抽成 `sg_merge_result_apply`(`include/sg/merge.h`)。
 - 遠端/使用者字串轉成檔案路徑前必須先過閘門函式:`sg_ref_name_is_safe`
   (`include/sg/transport.h:38`)、`sg_ref_branch_name_is_safe`(`include/sg/refs.h:13`)。
   **建立**新 ref 時的 check-ref-format 驗證另有一支
@@ -135,13 +142,24 @@ staging 的驗證。本機綠燈不是充分證據。**
   快取要照樣掛在全域上,否則會讓 CI 變紅。
 - 新增子指令要動三個地方(**不必改 Makefile**,`src` 是 glob 進去的):新增
   `src/cli/cmd_xxx.c`、在 `include/sg/cli.h` 加宣告、在 `src/cli/cli.c` 的
-  `COMMANDS[]`(`:13`)加說明並在派發鏈(`:63` 起)加一組 `strcmp`。若指令會覆寫
-  工作目錄,走 `sg_safe_apply_tree`(`include/sg/apply.h`)而不是自己拼
-  confirm/snapshot。它會清 `MERGE_HEAD`,但**刻意不碰進行中的 rebase 序列器
-  狀態**——真 git 只讓 rebase 自己的子指令結束一個 rebase(Phase 14 實測)。
-  所以任何會覆寫工作目錄的新指令,要嘛比照 `cmd_switch.c`/`cmd_merge.c` 在
-  rebase 進行中直接拒絕,要嘛比照 `cmd_reset.c --hard` 讓狀態原封不動;只有
-  `cmd_undo.c` 例外(沒有真 git 對應物),它在回傳後自己清。
+  `COMMANDS[]`(`:13`)加說明並在派發鏈(`:63` 起)加一組 `strcmp`。
+
+  會覆寫工作目錄的新指令要分開決定兩件事,不要當成同一個選擇:
+
+  **(1) 閘門**——髒工作目錄/進行中的 rebase 該不該擋?
+  - `switch`/`merge`/`stash pop`:直接拒絕。
+  - `reset --hard`:走 `sg_safe_apply_tree`(確認 + 快照)。
+  - `stash push`:**不擋**——「工作目錄是髒的」是它的輸入而不是危險,所以它
+    直接呼叫 `sg_apply_tree_to_workdir` 並自己先 `sg_snapshot_create`;用
+    `sg_safe_apply_tree` 會因為 `apply.c:311-312` 把 rebase 狀態算成 dirty
+    而在 rebase 中誤擋,而且非互動時會要求 `--force`。
+
+  **(2) 收尾**——結束哪些進行中的狀態?
+  - `MERGE_HEAD`:任何覆寫工作目錄的操作都清掉(真 git 2.55.0 實測;
+    `stash push` 也清,且不警告——sg 額外印一行 stderr,狀態仍完全一致)。
+  - rebase 序列器狀態:**除了 rebase 自己的子指令,誰都不准動**
+    (Phase 14 實測)。`stash push` 是「不擋也不清、原封不動」的代表案例。
+  - `cmd_undo.c` 仍是唯一例外(無真 git 對應物),它在回傳後自己清。
 
 ## 測試慣例
 
