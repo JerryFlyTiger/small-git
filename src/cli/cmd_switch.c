@@ -4,6 +4,7 @@
 #include "sg/hash.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/workdir.h"
@@ -86,6 +87,21 @@ int sg_cmd_switch(int argc, char **argv)
     if (repo_root == NULL) {
         fprintf(stderr, "sg: failed to determine repository root\n");
         free(git_dir);
+        return 1;
+    }
+
+    /* Measured against real git 2.55.0: `switch` during a paused rebase is
+       refused outright, even with --force -- rebase's sequencer state can
+       only be ended by rebase's own subcommands (--abort, a completed run,
+       --quit). This must run before any side effect, in particular before
+       -c below would create a new branch: real git also leaves the new
+       branch un-created when the switch is refused. */
+    if (sg_rebase_state_exists(git_dir)) {
+        fprintf(stderr,
+               "sg: 目前有一個進行中的 rebase，無法切換分支\n"
+               "請先完成它（sg rebase --continue）或執行 sg rebase --abort 放棄\n");
+        free(git_dir);
+        free(repo_root);
         return 1;
     }
 

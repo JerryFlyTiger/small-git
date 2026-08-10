@@ -329,7 +329,8 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
         if (sg_index_has_unmerged(&idx))
             strbuf_append(&msg, "sg: 目前有一個尚未完成的合併，繼續會放棄它\n");
         if (sg_rebase_state_exists(git_dir))
-            strbuf_append(&msg, "sg: 目前有一個進行中的 rebase，繼續會放棄它\n");
+            strbuf_append(&msg, "sg: 目前有一個進行中的 rebase，繼續會覆蓋工作目錄裡的衝突解決內容\n"
+                          "sg: 要結束這個 rebase 請用 `sg rebase --abort`\n");
 
         confirmed = sg_confirm_dangerous(msg.buf != NULL ? msg.buf : "", force);
         free(msg.buf);
@@ -359,20 +360,29 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
     {
         unsigned char merge_head[SG_SHA1_RAW_LEN];
         int merge_in_progress = sg_merge_head_read(git_dir, merge_head) == 0;
-        int rebase_in_progress = sg_rebase_state_exists(git_dir);
 
         if (sg_apply_tree_to_workdir(git_dir, repo_root, tree_id) != 0)
             return -1;
 
         /* The apply above rebuilt the index from tree_id, wiping any conflict
-           stages -- whatever merge or rebase was in flight is over. Leaving
-           MERGE_HEAD/sg-rebase behind would make the next unrelated `sg
-           commit` silently record a bogus merge commit, or make a later `sg
-           rebase --continue` resume a sequence that no longer makes sense. */
+           stages -- whatever merge was in flight is over. Leaving MERGE_HEAD
+           behind would make the next unrelated `sg commit` silently record a
+           bogus merge commit. Real git 2.55.0 behaves the same way: any
+           operation that resets the working directory (e.g. `reset --hard`)
+           clears MERGE_HEAD.
+
+           A paused rebase's sequencer state, in contrast, is deliberately
+           left alone here. Measured against real git 2.55.0: `reset --hard`
+           during a paused rebase keeps `.git/rebase-merge` intact (and a
+           later `rebase --abort`/`--continue` still works), while `switch`
+           (even with `--force`) is refused outright instead of clobbering it.
+           Only rebase's own subcommands (--abort, a completed run, --quit)
+           are allowed to end a sequence. Callers of sg_safe_apply_tree that
+           need the old "always wipe rebase state" behavior (currently only
+           `sg undo`, which has no git equivalent to use as an oracle) clear
+           it themselves after this call returns. */
         if (merge_in_progress && sg_merge_head_remove(git_dir) != 0)
             fprintf(stderr, "sg: warning: 未能清除 MERGE_HEAD\n");
-        if (rebase_in_progress && sg_rebase_state_remove(git_dir) != 0)
-            fprintf(stderr, "sg: warning: 未能清除進行中的 rebase 狀態\n");
         return 0;
     }
 }

@@ -557,13 +557,13 @@ must not silently record a bogus merge commit for a merge the user just
 abandoned via reset). It deliberately does
 .B not
 touch an in-progress rebase's sequencer state \(em matching real git, which
-also leaves a paused rebase's on-disk state alone here; only
-.B "sg rebase --abort"
-or a full
-.B --hard
-reset ends that (see the
-.B BUGS
-note below for the one place these two safety layers disagree).
+also leaves a paused rebase's on-disk state alone here. No mode of
+.B reset
+ends a rebase; only
+.BR "sg rebase --abort" ,
+a run that completes, or
+.B "sg undo"
+does.
 .TP
 .B --hard
 Additionally overwrites the working directory to match
@@ -581,6 +581,16 @@ use: an interactive confirmation prompt (bypassable with
 real git has no equivalent flag \(em this project's own addition) followed
 by an automatic safety snapshot, since this is the one mode that can
 overwrite uncommitted working-directory changes outright.
+.IP
+A paused rebase's sequencer state survives
+.BR --hard ,
+exactly as it survives
+.BR --mixed ,
+matching real git: only
+.BR rebase 's
+own subcommands end a rebase. A conflicted merge's
+.B MERGE_HEAD
+is cleared, also matching real git.
 .PP
 Passing more than one of
 .BR --soft / --mixed / --hard
@@ -604,9 +614,24 @@ creates
 before switching to it; it is an error if a branch by that name already
 exists, or if the current branch has no commits yet.
 .PP
-If switching would discard uncommitted changes (staged or unstaged), or
-would abandon an in-progress merge or rebase, the affected paths are listed
-and confirmation is required before proceeding (an automatic safety
+While a rebase is paused on a conflict,
+.B switch
+is refused outright \(em including with
+.BR --force ,
+which cannot override it. Finish the rebase with
+.B "sg rebase --continue"
+or end it with
+.BR "sg rebase --abort" .
+This matches real git, whose
+.B "git switch"
+likewise refuses (\(dqcannot switch branch while rebasing\(dq) rather than
+clobbering the sequencer state, and leaves the new branch un-created when
+.B -c
+was given.
+.PP
+Otherwise, if switching would discard uncommitted changes (staged or
+unstaged), or would abandon an in-progress merge, the affected paths are
+listed and confirmation is required before proceeding (an automatic safety
 snapshot is taken first \(em see
 .B undo
 below); pass
@@ -674,6 +699,21 @@ can itself be undone);
 (or
 .BR -f )
 skips the confirmation prompt.
+.PP
+Restoring a snapshot while a rebase is paused
+.I does
+abandon that rebase's sequencer state, and says so on standard error. This
+is the one place
+.B sg
+deliberately ends a rebase from outside
+.BR rebase 's
+own subcommands: unlike
+.BR switch " and " reset --hard ,
+.B undo
+has no real-git equivalent to take behaviour from, and resuming a rebase on
+top of a working tree that
+.B undo
+just rewound out from under it would not be meaningful.
 .PP
 Snapshots are created automatically by
 .BR switch ,
@@ -1201,20 +1241,3 @@ above and small_git's
 \(dq已知限制\(dq / Known Limitations section); missing flags and
 subcommands found in real git are not oversights to be reported unless
 they contradict what is documented here.
-.PP
-.B sg reset --hard
-clears an in-progress rebase's sequencer state (the same
-.B sg_safe_apply_tree
-machinery
-.B "sg switch"
-and
-.B "sg restore"
-share does this as part of finishing any tree-overwriting apply), whereas
-real git's
-.B "git reset --hard"
-leaves a paused rebase's on-disk state untouched, matching
-.B --mixed
-here. This is a pre-existing, known divergence between the two
-tree-overwriting safety layers in this codebase (not something introduced
-by
-.BR "sg reset" ), left as-is rather than papered over.
