@@ -1,11 +1,9 @@
 #include "sg/snapshot.h"
 
-#include "sg/chunk.h"
 #include "sg/loose.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
-#include "sg/repo.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -93,8 +91,6 @@ static int write_ref(const char *ref_path, const unsigned char id[SG_SHA1_RAW_LE
 int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_index *idx,
                        const char *label, unsigned char commit_id_out[SG_SHA1_RAW_LEN])
 {
-    sg_flat_entry *entries = NULL;
-    size_t entry_count = 0;
     unsigned char tree_id[SG_SHA1_RAW_LEN];
     unsigned char parent_id[SG_SHA1_RAW_LEN];
     int has_parent;
@@ -110,69 +106,12 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
     char ref_name[SG_SNAPSHOT_SLUG_MAX + 64];
     char ref_path[SG_PATH_MAX];
     long long ts;
-    size_t i;
     int rc = -1;
-    int chunk_enabled = 0;
-    size_t chunk_threshold = SG_CHUNK_DEFAULT_THRESHOLD;
 
     memset(&commit, 0, sizeof(commit));
 
-    if (idx->count > 0) {
-        entries = malloc(idx->count * sizeof(*entries));
-        if (entries == NULL)
-            return -1;
-    }
-
-    sg_repo_read_chunk_config(git_dir, &chunk_enabled, &chunk_threshold);
-
-    for (i = 0; i < idx->count; i++) {
-        char abspath[SG_PATH_MAX];
-        unsigned char *content = NULL;
-        size_t content_len = 0;
-        unsigned char blob_id[SG_SHA1_RAW_LEN];
-
-        /* idx may hold several stage 1/2/3 entries for the same path while a
-           conflict is unresolved (there is no separate stage-0 entry then).
-           Entries are sorted by (path, stage), so duplicates are contiguous
-           and the first one seen is stage 0 if one exists, otherwise the
-           lowest of whatever conflict stages are present -- either way,
-           exactly one representative per path is snapshotted, using
-           whatever content currently sits in the working tree (e.g. the
-           conflict-marked content), never producing a tree with two entries
-           sharing a name. */
-        if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
-            continue;
-
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx->entries[i].path);
-        if (sg_read_file(abspath, &content, &content_len) == 0) {
-            int write_ok;
-
-            if (chunk_enabled) {
-                int chunked;
-
-                write_ok = sg_chunk_store_blob(git_dir, content, content_len, chunk_threshold,
-                                              blob_id, &chunked) == 0;
-            } else {
-                write_ok = sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, blob_id) == 0;
-            }
-
-            free(content);
-            if (!write_ok)
-                goto out_free_entries;
-        } else {
-            /* working-tree file gone or unreadable: fall back to the blob the
-               index already recorded, so this entry still resolves */
-            memcpy(blob_id, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
-        }
-
-        entries[entry_count].path = idx->entries[i].path; /* transient view, not owned */
-        entries[entry_count].mode = idx->entries[i].mode;
-        memcpy(entries[entry_count].sha1, blob_id, SG_SHA1_RAW_LEN);
-        entry_count++;
-    }
-
-    if (sg_tree_build(git_dir, entries, entry_count, tree_id) != 0)
-        goto out_free_entries;
+    if (sg_tree_build_from_workdir(git_dir, repo_root, idx, tree_id) != 0)
+        return -1;
 
     has_parent = (sg_ref_resolve_head(git_dir, parent_id) == 0);
 
@@ -183,7 +122,7 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
     if (has_parent) {
         commit.parents = malloc(sizeof(*commit.parents));
         if (commit.parents == NULL)
-            goto out_free_entries;
+            return -1;
         memcpy(commit.parents[0], parent_id, SG_SHA1_RAW_LEN);
         commit.parent_count = 1;
     }
@@ -198,7 +137,7 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
 
     if (sg_message_cleanup(label, &cleaned_message) != 0) {
         free(commit.parents);
-        goto out_free_entries;
+        return -1;
     }
     commit.message = cleaned_message;
 
@@ -206,7 +145,7 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
         free(commit.parents);
         free(cleaned_message);
         cleaned_message = NULL;
-        goto out_free_entries;
+        return -1;
     }
     free(commit.parents);
     commit.parents = NULL;
@@ -215,7 +154,7 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
 
     if (sg_loose_write(git_dir, SG_OBJ_COMMIT, serialized, serialized_len, commit_id) != 0) {
         free(serialized);
-        goto out_free_entries;
+        return -1;
     }
     free(serialized);
 
@@ -223,18 +162,16 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
     slugify(label, slug, sizeof(slug));
     ts = (long long)time(NULL);
     if (pick_unique_ref_name(undo_dir, ts, slug, ref_name, sizeof(ref_name)) != 0)
-        goto out_free_entries;
+        return -1;
 
     snprintf(ref_path, sizeof(ref_path), "%s/%s", undo_dir, ref_name);
     if (write_ref(ref_path, commit_id) != 0)
-        goto out_free_entries;
+        return -1;
 
     if (commit_id_out != NULL)
         memcpy(commit_id_out, commit_id, SG_SHA1_RAW_LEN);
     rc = 0;
 
-out_free_entries:
-    free(entries);
     return rc;
 }
 

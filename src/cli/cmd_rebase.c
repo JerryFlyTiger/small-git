@@ -676,7 +676,6 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
     size_t content_len;
     sg_commit orig_commit;
     unsigned char tree_id[SG_SHA1_RAW_LEN];
-    sg_flat_entry *flat = NULL;
     int rc;
 
     if (!sg_rebase_state_exists(git_dir)) {
@@ -723,32 +722,13 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
         return 1;
     }
 
-    if (idx.count > 0) {
-        size_t i;
-
-        flat = malloc(idx.count * sizeof(*flat));
-        if (flat == NULL) {
-            fprintf(stderr, "sg: out of memory\n");
-            sg_commit_free(&orig_commit);
-            sg_index_free(&idx);
-            sg_rebase_state_free(&state);
-            return 1;
-        }
-        for (i = 0; i < idx.count; i++) {
-            flat[i].path = idx.entries[i].path;
-            flat[i].mode = idx.entries[i].mode;
-            memcpy(flat[i].sha1, idx.entries[i].sha1, SG_SHA1_RAW_LEN);
-        }
-    }
-    if (sg_tree_build(git_dir, flat, idx.count, tree_id) != 0) {
+    if (sg_tree_build_from_index(git_dir, &idx, tree_id) != 0) {
         fprintf(stderr, "sg: failed to build tree from index\n");
-        free(flat);
         sg_commit_free(&orig_commit);
         sg_index_free(&idx);
         sg_rebase_state_free(&state);
         return 1;
     }
-    free(flat);
     sg_index_free(&idx);
 
     {

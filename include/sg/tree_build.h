@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "sg/hash.h"
+#include "sg/index.h"
 
 typedef struct {
     char *path; /* malloc'd, owned; repo-root-relative, '/'-separated */
@@ -28,5 +29,24 @@ int sg_tree_flatten(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW
                     sg_flat_list *out);
 
 void sg_flat_list_free(sg_flat_list *list);
+
+/* Builds a tree from the index's stage-0 entries exactly as they stand (no
+   working-tree access, no re-hashing). Returns 0, or -1 on allocation
+   failure or if idx contains any stage 1/2/3 entry -- an unmerged index has
+   no single tree, and silently picking one stage would record a tree the
+   caller never asked for. Callers already gate on sg_index_has_unmerged;
+   this makes that gate load-bearing rather than advisory. */
+int sg_tree_build_from_index(const char *git_dir, const sg_index *idx,
+                             unsigned char tree_id_out[SG_SHA1_RAW_LEN]);
+
+/* For every path idx covers, hashes the WORKING TREE's current content into
+   the object store (chunk-aware, honouring the repo's chunk config exactly
+   as sg add does) and builds a tree from the results, falling back to the
+   blob the index already records when the working-tree file is missing or
+   unreadable, so every entry always resolves. When idx holds several stage
+   1/2/3 entries for one path, exactly one representative is emitted, so the
+   result never has two entries sharing a name. Returns 0, -1 on failure. */
+int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
+                               unsigned char tree_id_out[SG_SHA1_RAW_LEN]);
 
 #endif

@@ -46,7 +46,6 @@ int sg_cmd_commit(int argc, char **argv)
     char *cleaned_message = NULL;
     char *git_dir;
     sg_index idx;
-    sg_flat_entry *flat = NULL;
     unsigned char tree_id[SG_SHA1_RAW_LEN];
     unsigned char parent_id[SG_SHA1_RAW_LEN];
     int has_parent;
@@ -129,31 +128,13 @@ int sg_cmd_commit(int argc, char **argv)
 
     is_merge_commit = (sg_merge_head_read(git_dir, merge_head_id) == 0);
 
-    if (idx.count > 0) {
-        flat = malloc(idx.count * sizeof(*flat));
-        if (flat == NULL) {
-            fprintf(stderr, "sg: out of memory\n");
-            sg_index_free(&idx);
-            free(git_dir);
-            free(cleaned_message);
-            return 1;
-        }
-        for (i = 0; i < idx.count; i++) {
-            flat[i].path = idx.entries[i].path; /* not owned, transient view */
-            flat[i].mode = idx.entries[i].mode;
-            memcpy(flat[i].sha1, idx.entries[i].sha1, SG_SHA1_RAW_LEN);
-        }
-    }
-
-    if (sg_tree_build(git_dir, flat, idx.count, tree_id) != 0) {
+    if (sg_tree_build_from_index(git_dir, &idx, tree_id) != 0) {
         fprintf(stderr, "sg: failed to build tree from index\n");
-        free(flat);
         sg_index_free(&idx);
         free(git_dir);
         free(cleaned_message);
         return 1;
     }
-    free(flat);
     sg_index_free(&idx);
 
     has_parent = (sg_ref_resolve_head(git_dir, parent_id) == 0);
