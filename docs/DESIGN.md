@@ -598,3 +598,103 @@ chunk 可達性的同步。修法是移除那個提早返回:零 tag 只是讓�
   建不出指向 tree 或 blob 的 annotated tag。push 端不依賴這個假設(它推的是
   ref 裡的原始 id,不看 `object_type`),從真 git clone 來的這類 tag 能正常
   推送,但這條路徑沒有測試覆蓋——要造出這種 tag 需要真 git 參與。
+
+## Phase 14:paused rebase 不再被 `reset --hard` 與 `switch` 終結
+
+Phase 12 留下的已知 divergence:`sg reset --hard` 會清掉進行中的 rebase 序列
+器狀態,真 git 不會。當時記在 `docs/sg.1` 的 BUGS 段落沒有修,因為根源在
+`sg_safe_apply_tree`——四個指令共用的那層安全包裝——不屬於 `sg reset` 的範圍。
+
+### 先量,再改
+
+開工第一件事是把真 git 2.55.0 的行為量出來,不是回想。六格結果:
+
+| 情境 | 真 git |
+|---|---|
+| `reset --hard`(含帶 commit 參數)在 paused rebase 期間 | 允許,**保留** `.git/rebase-merge`;之後 `--abort`/`--continue` 都還能用 |
+| `reset --hard` 在衝突 merge 期間 | 允許,**清掉** `MERGE_HEAD` |
+| `switch` / `switch --force` / `switch --discard-changes` | **拒絕**,exit 128,狀態原封不動 |
+| `switch -c <new>` | 一樣拒絕,而且**新分支不會被建立** |
+| `checkout -f` 在 rebase 期間 | 允許切換,**保留** rebase 狀態 |
+| `reset`(mixed)在 paused rebase 期間 | 保留(sg 原本就已做對) |
+
+歸納成一條規則:**`MERGE_HEAD` 會被任何重設工作目錄的操作清掉;rebase 序列器
+狀態只有 rebase 自己的子指令能結束。**
+
+這條規則直接改變了里程碑的範圍。原本以為是「`reset --hard` 那一行不要清」,
+但 `sg_safe_apply_tree` 一旦不清了,`sg switch` 若照舊放行,就會留下一份指向
+另一個分支的殘留 rebase 狀態——**比修法前更糟**。所以 switch 必須同時改成拒
+絕。這不是範圍蔓延,是同一條規則的另一半。
+
+### 三個呼叫端,三種答案
+
+- `cmd_reset.c`(`--hard`):保留狀態。真 git 如此。
+- `cmd_switch.c`:直接拒絕,`--force` 繞不過(真 git 的 `--force` 也繞不過),
+  且閘門必須在 `-c` 建立分支之前。
+- `cmd_undo.c`:**維持清除**,但改由呼叫端自己做。`sg undo` 沒有真 git 對應
+  物,沒有 oracle 可抄;把工作目錄倒回快照之後留著序列器狀態,`rebase
+  --continue` 會在一棵被抽掉的樹上續作,語意不通。
+- `cmd_merge.c`(fast-forward):不需要改,`cmd_merge.c:511-518` 早就在上游擋
+  掉 rebase 進行中。
+
+於是 `sg_safe_apply_tree` 的職責收斂成一句可以寫進標頭的話:清 `MERGE_HEAD`,
+不碰 rebase 狀態,需要舊行為的呼叫端自己在回傳後處理。
+
+### mutation 實測:9 條檢查裡只有 1 條有鑑別力
+
+新增的 interop 檢查裡有 9 條跟 switch 有關。把 `cmd_switch.c` 的閘門停用後
+重跑,**只有 1 條變紅**(`sg switch --force ... is still rejected`)。
+
+原因是既有機制搶先一步:`sg_safe_apply_tree` 的 dirty 判斷(`apply.c:312`)
+本來就含 `sg_rebase_state_exists`,而 interop 在非 tty 下跑,
+`sg_confirm_dangerous` 會自動拒絕。於是沒有 `--force` 的 switch **在閘門存在
+與否兩種情況下退出碼都是 1**——只是理由完全不同。退出碼相同讓 8 條檢查看起來
+綠得很有信心,實際上什麼都沒守住。
+
+修法是對這些案例額外斷言 stderr 的**訊息內容**(閘門的專屬字串),而不只是退
+出碼。教訓的形狀:**當被測行為與既有的保護機制在可觀測結果上重疊時,斷言必須
+往下探到「理由」那一層,否則覆蓋率是假的。**這與 Phase 10 記過的「加固前後回
+傳值完全一樣,只有 sanitizer 看得出差別」是同一類問題的不同外衣。
+
+### 審查抓到的:確認提示對 `sg undo` 說謊
+
+`sg_safe_apply_tree` 的確認提示是四個呼叫端共用的。第一版寫「但 rebase 本身
+會保留,要結束它請用 `sg rebase --abort`」——對 `reset --hard` 為真,對
+`sg undo` 為假:使用者在同一個提示裡被承諾保留,按下 y 之後它被刪掉。
+
+`switch` 和 `merge` 都在自己的閘門就被擋掉,永遠走不到這個提示,所以 `undo`
+是唯一會看到這句謊話的呼叫端。修法是把共用訊息降級成中性的真話(只講「會覆蓋
+衝突解決內容」),由 `cmd_undo.c` 在呼叫**之前**自己印出「會放棄 rebase」的告
+知——順序上會出現在確認提示之前,使用者決定 y/N 時就看得到。
+
+這條原本測不到:interop 裡每一個 `sg undo` 都帶 `--force`,而 `force=1` 的
+`sg_confirm_dangerous` 會提早返回,**根本不印 message**。非 tty 且無 force
+那條分支才會把訊息印到 stderr(`confirm.c:18-21`),補測試要走那條路徑。
+
+### `reset --hard <另一個 commit>` 之後 continue
+
+原本所有案例都只用裸 `reset --hard`(等於原地不動),沒測過帶參數的版本。實測
+兩邊一致:剩下的 commit 會疊在 **reset 的目標** 之上,不是原本的 onto。sg 的
+`rebase --continue` 從 `sg_ref_resolve_head` 取父節點,真 git 的 sequencer 也
+是,所以碰巧一致——但這次是量過才寫下來的。
+
+順帶記一個沒有處理的既有 divergence:sg 的 rebase 進行中 **HEAD 仍指在分支
+上**,真 git 是 detached。上面那組案例的最終 graph 兩邊相同,所以沒有動它。
+
+### 正規化過頭的比對,與否定式斷言
+
+第二輪冷讀抓到 `reset --hard <另一個 commit>` 那組的 graph 比對**正規化過頭**:
+把 `%P` 的 40-hex 全部換成 `X` 之後,線性歷史的每一行都塌成
+「`<subject> X`」,實際上只驗到「每個 commit 有幾個 parent」——而這組案例真正
+要驗的性質(重放出來的 commit 疊在 **reset 目標** 而不是原本的 onto)恰好被抹
+平掉了。跨 repo 比對必須正規化 sha(兩邊的 commit id 必然不同),但正規化的
+範圍要剛好停在「無法比較的部分」。補的是直接斷言 parent 身分:在各自的 repo
+裡驗 `feature^` 等於各自的 base sha,再加一條「不是 master 的後代」,真 git
+那側也照驗一次而不是預設它對。
+
+否定式斷言(「提示不得承諾 rebase 會保留」)照 Phase 12 的教訓需要自己的
+mutation:把新句子留著、只把舊承諾**附加**回去,肯定式那條照樣綠,只有否定式
+那條變紅。這證明它不是多餘的。
+
+最終 `tests/interop.sh` 726 項檢查(Phase 13 結束時是 680),八條定向 mutation
+每一條都至少讓一條檢查變紅。
