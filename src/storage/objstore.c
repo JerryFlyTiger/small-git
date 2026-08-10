@@ -22,9 +22,12 @@ int sg_commit_tree_of(const char *git_dir, const unsigned char commit_id[SG_SHA1
     size_t content_len;
     sg_commit commit;
 
-    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
-       type != SG_OBJ_COMMIT)
+    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0)
         return -1;
+    if (type != SG_OBJ_COMMIT) {
+        free(content);
+        return -1;
+    }
     if (sg_commit_parse(content, content_len, &commit) != 0) {
         free(content);
         return -1;

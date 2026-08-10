@@ -32,7 +32,8 @@ void sg_flat_list_free(sg_flat_list *list);
 
 /* Builds a tree from the index's stage-0 entries exactly as they stand (no
    working-tree access, no re-hashing). Returns 0, or -1 on allocation
-   failure or if idx contains any stage 1/2/3 entry -- an unmerged index has
+   failure, if sg_tree_build itself fails (e.g. a loose object write fails),
+   or if idx contains any stage 1/2/3 entry -- an unmerged index has
    no single tree, and silently picking one stage would record a tree the
    caller never asked for. Callers already gate on sg_index_has_unmerged;
    this makes that gate load-bearing rather than advisory. */
