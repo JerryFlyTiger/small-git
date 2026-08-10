@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -180,6 +181,43 @@ static void test_missing_file_is_not_an_error(void)
     free(git_dir);
 }
 
+/* ---- unreadable (not missing) file -> -1, never treated as "empty" ----- */
+
+/* A file that EXISTS but cannot be opened (permission denied) is a real I/O
+   failure, not "no reflog yet" -- sg_reflog_read must distinguish the two
+   (ENOENT vs. everything else), per its header comment. Chmod'ing the file
+   itself to 0000 forces exactly that: sg_read_file's fopen fails with
+   EACCES, not ENOENT. */
+static void test_unreadable_file_is_an_error(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char old_id[SG_SHA1_RAW_LEN];
+    unsigned char new_id[SG_SHA1_RAW_LEN];
+    char path[4096];
+    sg_reflog log;
+
+    if (geteuid() == 0) {
+        /* root ignores file modes; the test would be meaningless */
+        free(git_dir);
+        return;
+    }
+
+    fill_id(old_id, 0x00);
+    fill_id(new_id, 0x01);
+    CHECK(sg_reflog_append(git_dir, "refs/stash", old_id, new_id, "entry", NULL) == 0, "append failed");
+
+    snprintf(path, sizeof(path), "%s/logs/refs/stash", git_dir);
+    CHECK(chmod(path, 0000) == 0, "chmod 0000 failed");
+
+    log.entries = (sg_reflog_entry *)0x1; /* poison */
+    log.count = 99;
+    CHECK(sg_reflog_read(git_dir, "refs/stash", &log) == -1,
+         "an unreadable-but-present reflog file must be reported as -1, not treated as empty");
+
+    chmod(path, 0644); /* restore before cleanup */
+    free(git_dir);
+}
+
 /* ---- 39-hex oid -> -1 --------------------------------------------------- */
 
 static void test_short_oid_is_malformed(void)
@@ -329,6 +367,7 @@ int main(void)
     test_read_hand_written_git_format();
     test_last_line_without_newline();
     test_missing_file_is_not_an_error();
+    test_unreadable_file_is_an_error();
     test_short_oid_is_malformed();
     test_message_normalization();
     test_rewrite_rechains_and_preserves_ident();

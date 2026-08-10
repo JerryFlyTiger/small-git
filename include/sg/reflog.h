@@ -22,11 +22,13 @@ typedef struct {
     size_t count;
 } sg_reflog;
 
-/* Reads git_dir/logs/<ref_path>. A missing file is not an error: returns 0
-   with an empty *out (count 0, entries NULL) -- "no stash has ever been
-   pushed" is a normal state, not a failure. Returns -1 on I/O failure or on
-   a malformed line (shorter than 81 bytes, or either oid field not 40 hex
-   digits). A missing newline on the final line is accepted; real git
+/* Reads git_dir/logs/<ref_path>. A missing file (ENOENT) is not an error:
+   returns 0 with an empty *out (count 0, entries NULL) -- "no stash has ever
+   been pushed" is a normal state, not a failure. Any OTHER I/O failure
+   (permission denied, a read error mid-file, ...) returns -1, same as a
+   malformed line (shorter than 81 bytes, or either oid field not 40 hex
+   digits) -- a caller must not treat "cannot read the reflog" as "the stash
+   is empty". A missing newline on the final line is accepted; real git
    tolerates it (measured) and a file truncated mid-write should not make the
    surviving entries unreadable. ref_path is validated with the same
    path-safety rule as sg_ref_read_path. */

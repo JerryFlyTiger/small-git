@@ -4,6 +4,7 @@
 #include "sg/workdir.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,8 +115,16 @@ int sg_reflog_read(const char *git_dir, const char *ref_path, sg_reflog *out)
     if (snprintf(full_path, sizeof(full_path), "%s/logs/%s", git_dir, ref_path) >= (int)sizeof(full_path))
         return -1;
 
-    if (sg_read_file(full_path, &content, &content_len) != 0)
-        return 0; /* missing file: no reflog yet, not an error */
+    if (sg_read_file(full_path, &content, &content_len) != 0) {
+        /* Only "the file has never existed" is a normal empty-stack state.
+           Any other I/O failure (permission denied, read error mid-file,
+           ...) must be reported as -1 per the header contract -- otherwise
+           sg stash list/drop/clear would silently behave as if the stash
+           were empty instead of surfacing the real problem. */
+        if (errno == ENOENT)
+            return 0;
+        return -1;
+    }
 
     while (pos < content_len) {
         const char *nl = memchr((const char *)content + pos, '\n', content_len - pos);
