@@ -23,7 +23,7 @@ jobs:
           - os: macos-latest
             cc: clang
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The interop suite drives the real `git` binary alongside sg, and some
       # of those steps commit. A bare CI runner has no identity configured,
@@ -75,7 +75,7 @@ jobs:
     name: ASan + UBSan (ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The interop suite drives the real `git` binary alongside sg, and some
       # of those steps commit. A bare CI runner has no identity configured,
@@ -134,7 +134,7 @@ jobs:
     name: gitignore conformance fuzzer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
@@ -162,7 +162,7 @@ jobs:
     name: packfile / index parser fuzzer
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies
         run: |
