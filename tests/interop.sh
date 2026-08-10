@@ -4246,6 +4246,350 @@ P12R_BADTREE_HEAD=$(cd "$P12R_BADTREE_REPO" && git rev-parse HEAD 2>/dev/null)
 check "phase12 reset reset --soft (unparsable tree line): the branch actually moved to the malformed commit" \
     test "$P12R_BADTREE_HEAD" = "$P12R_BAD_SHA"
 
+# ============================================================
+# Phase 15: sg stash
+#
+# Bit-compatibility boundary (see docs/DESIGN.md): sg's commit timestamps
+# come from time(NULL) with a fixed "+0000" literal, so a stash commit's oid
+# can NEVER be compared between sg and real git for equal content -- every
+# check below asserts on git's INTERPRETATION of sg's bytes (list text,
+# cat-file structure, worktree/porcelain after pop) or vice versa, never on
+# an oid equality.
+# ============================================================
+
+p15_base_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    (cd "$dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'a\n' > "$dir/a.txt"
+    (cd "$dir" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+}
+
+# --- 8.2 (1)-(4): sg pushes, real git reads it back ---
+P15_SG2GIT="$WORKDIR/p15_sg2git"
+p15_base_repo "$P15_SG2GIT"
+printf 'changed\n' > "$P15_SG2GIT/a.txt"
+printf 'new file\n' > "$P15_SG2GIT/b.txt"
+(cd "$P15_SG2GIT" && "$SG" add b.txt) > /dev/null 2>&1
+P15_SG2GIT_PRE_PORCELAIN=$(cd "$P15_SG2GIT" && git status --porcelain)
+P15_SG2GIT_ATXT="$WORKDIR/p15_sg2git_a_before.txt"
+cp "$P15_SG2GIT/a.txt" "$P15_SG2GIT_ATXT"
+P15_SG2GIT_BTXT="$WORKDIR/p15_sg2git_b_before.txt"
+cp "$P15_SG2GIT/b.txt" "$P15_SG2GIT_BTXT"
+
+(cd "$P15_SG2GIT" && "$SG" stash push -m "phase15 msg1") > /dev/null 2>&1
+check "phase15 sg->git: sg stash push exits 0" test $? = 0
+
+P15_SG2GIT_LIST_TXT="$WORKDIR/p15_sg2git_list.txt"
+(cd "$P15_SG2GIT" && git stash list) > "$P15_SG2GIT_LIST_TXT" 2>&1
+check "phase15 sg->git: git stash list shows the push" \
+    grep -q '^stash@{0}: On master: phase15 msg1$' "$P15_SG2GIT_LIST_TXT"
+
+check "phase15 sg->git: refs/stash resolves as a 2-parent commit (git cat-file)" \
+    sh -c "[ \"\$(cd '$P15_SG2GIT' && git cat-file -p refs/stash | grep -c '^parent ')\" = 2 ]"
+
+check "phase15 sg->git: git fsck is clean after sg's stash push" \
+    sh -c "(cd '$P15_SG2GIT' && git fsck) > /dev/null 2>&1"
+
+(cd "$P15_SG2GIT" && git stash pop) > /dev/null 2>&1
+check "phase15 sg->git: git stash pop exits 0 on sg's stash" test $? = 0
+check "phase15 sg->git: git stash pop restored a.txt's exact bytes" \
+    cmp -s "$P15_SG2GIT/a.txt" "$P15_SG2GIT_ATXT"
+check "phase15 sg->git: git stash pop restored b.txt's exact bytes" \
+    cmp -s "$P15_SG2GIT/b.txt" "$P15_SG2GIT_BTXT"
+check "phase15 sg->git: post-pop porcelain matches pre-push porcelain exactly" \
+    sh -c "test \"\$(cd '$P15_SG2GIT' && git status --porcelain)\" = \"$P15_SG2GIT_PRE_PORCELAIN\""
+
+# --- 8.2 (5)-(7): git builds, sg reads / mixed stack ---
+
+# (6) sg pop on a git-created stash
+P15_GIT2SG_POP="$WORKDIR/p15_git2sg_pop"
+p15_base_repo "$P15_GIT2SG_POP"
+printf 'gitchange\n' > "$P15_GIT2SG_POP/a.txt"
+(cd "$P15_GIT2SG_POP" && git add a.txt && git stash push -q -m "git built") > /dev/null 2>&1
+check "phase15 git->sg: precondition -- git stash push left a clean worktree" \
+    sh -c "test -z \"\$(cd '$P15_GIT2SG_POP' && git status --porcelain)\""
+(cd "$P15_GIT2SG_POP" && "$SG" stash pop) > /dev/null 2>&1
+check "phase15 git->sg: sg stash pop on a git-created stash exits 0" test $? = 0
+check "phase15 git->sg: sg stash pop restored git's stashed content" \
+    sh -c "grep -q gitchange '$P15_GIT2SG_POP/a.txt'"
+check "phase15 git->sg: sg stash pop dropped the stash (git stash list now empty)" \
+    sh -c "[ -z \"\$(cd '$P15_GIT2SG_POP' && git stash list)\" ]"
+
+# (5)+(7) mixed stack: sg, git, sg -- list identity, then drop the git-built
+# middle entry through sg and check identity again, which also exercises
+# ident/timestamp preservation for the surviving entries (§4.1).
+P15_MIX="$WORKDIR/p15_mix"
+p15_base_repo "$P15_MIX"
+printf 'c1\n' > "$P15_MIX/a.txt"
+(cd "$P15_MIX" && "$SG" add a.txt && "$SG" stash push -m sgone) > /dev/null 2>&1
+printf 'c2\n' > "$P15_MIX/a.txt"
+(cd "$P15_MIX" && git add a.txt && git stash push -q -m gittwo) > /dev/null 2>&1
+printf 'c3\n' > "$P15_MIX/a.txt"
+(cd "$P15_MIX" && "$SG" add a.txt && "$SG" stash push -m sgthree) > /dev/null 2>&1
+
+P15_MIX_GIT_LIST1="$WORKDIR/p15_mix_git_list1.txt"
+P15_MIX_SG_LIST1="$WORKDIR/p15_mix_sg_list1.txt"
+(cd "$P15_MIX" && git stash list) > "$P15_MIX_GIT_LIST1" 2>&1
+(cd "$P15_MIX" && "$SG" stash list) > "$P15_MIX_SG_LIST1" 2>&1
+check "phase15 mixed stack: sg stash list is byte-identical to git stash list" \
+    cmp -s "$P15_MIX_GIT_LIST1" "$P15_MIX_SG_LIST1"
+
+(cd "$P15_MIX" && "$SG" stash drop 'stash@{1}') > /dev/null 2>&1
+check "phase15 mixed stack: sg stash drop of the git-built entry exits 0" test $? = 0
+
+P15_MIX_GIT_LIST2="$WORKDIR/p15_mix_git_list2.txt"
+P15_MIX_SG_LIST2="$WORKDIR/p15_mix_sg_list2.txt"
+(cd "$P15_MIX" && git stash list) > "$P15_MIX_GIT_LIST2" 2>&1
+(cd "$P15_MIX" && "$SG" stash list) > "$P15_MIX_SG_LIST2" 2>&1
+check "phase15 mixed stack: after the drop, sg and git list agree with each other" \
+    cmp -s "$P15_MIX_GIT_LIST2" "$P15_MIX_SG_LIST2"
+check "phase15 mixed stack: after the drop, the list actually changed (not a no-op)" \
+    sh -c "! cmp -s '$P15_MIX_GIT_LIST1' '$P15_MIX_GIT_LIST2'"
+
+P15_MIX_REFSTASH=$(cd "$P15_MIX" && git rev-parse refs/stash)
+P15_MIX_REFLOG_LAST_NEW=$(tail -1 "$P15_MIX/.git/logs/refs/stash" | cut -d' ' -f2)
+check "phase15 mixed stack: refs/stash equals the last reflog line's new-oid after drop" \
+    test "$P15_MIX_REFSTASH" = "$P15_MIX_REFLOG_LAST_NEW"
+check "phase15 mixed stack: git stash show stash@{0} still exits 0 after the drop" \
+    sh -c "(cd '$P15_MIX' && git stash show 'stash@{0}') > /dev/null 2>&1"
+check "phase15 mixed stack: git stash show stash@{1} still exits 0 after the drop" \
+    sh -c "(cd '$P15_MIX' && git stash show 'stash@{1}') > /dev/null 2>&1"
+
+# --- extra: multi-line -m normalization (§4.1's copy_reflog_msg) -- targets
+# a broken sg_reflog_append that writes the raw message instead of
+# normalizing it, which would forge extra reflog lines and break `git stash
+# list`'s parse entirely, not just the text of one entry. ---
+P15_MULTILINE="$WORKDIR/p15_multiline"
+p15_base_repo "$P15_MULTILINE"
+printf 'c1\n' > "$P15_MULTILINE/a.txt"
+(cd "$P15_MULTILINE" && "$SG" add a.txt) > /dev/null 2>&1
+P15_MULTILINE_MSG=$(printf 'line1\nline2\twith tab')
+(cd "$P15_MULTILINE" && "$SG" stash push -m "$P15_MULTILINE_MSG") > /dev/null 2>&1
+P15_MULTILINE_GIT_LIST="$WORKDIR/p15_multiline_git_list.txt"
+P15_MULTILINE_SG_LIST="$WORKDIR/p15_multiline_sg_list.txt"
+(cd "$P15_MULTILINE" && git stash list) > "$P15_MULTILINE_GIT_LIST" 2>&1
+(cd "$P15_MULTILINE" && "$SG" stash list) > "$P15_MULTILINE_SG_LIST" 2>&1
+check "phase15 multi-line -m: sg stash list matches git stash list byte-for-byte" \
+    cmp -s "$P15_MULTILINE_GIT_LIST" "$P15_MULTILINE_SG_LIST"
+check "phase15 multi-line -m: the reflog subject is collapsed to a single line" \
+    grep -q '^stash@{0}: On master: line1 line2 with tab$' "$P15_MULTILINE_GIT_LIST"
+
+# --- extra: the WIP form's abbreviated hash must match real git's own
+# --short=7 for the same commit (Risks §9.1). ---
+P15_WIP="$WORKDIR/p15_wip"
+p15_base_repo "$P15_WIP"
+printf 'c1\n' > "$P15_WIP/a.txt"
+(cd "$P15_WIP" && "$SG" add a.txt) > /dev/null 2>&1
+(cd "$P15_WIP" && "$SG" stash push) > /dev/null 2>&1
+P15_WIP_SHORT=$(cd "$P15_WIP" && git rev-parse --short=7 HEAD)
+P15_WIP_LIST="$WORKDIR/p15_wip_list.txt"
+(cd "$P15_WIP" && git stash list) > "$P15_WIP_LIST" 2>&1
+check "phase15 WIP form: reflog subject embeds real git's own --short=7 abbreviation" \
+    grep -q "^stash@{0}: WIP on master: $P15_WIP_SHORT base\$" "$P15_WIP_LIST"
+
+# --- extra: drop of the last remaining entry empties the stack the same way
+# `git stash clear`/`git stash drop` (last entry) does -- both ref AND
+# reflog file gone, not just one of the two. ---
+P15_DROPLAST="$WORKDIR/p15_droplast"
+p15_base_repo "$P15_DROPLAST"
+printf 'c1\n' > "$P15_DROPLAST/a.txt"
+(cd "$P15_DROPLAST" && "$SG" add a.txt && "$SG" stash push -m onlyone) > /dev/null 2>&1
+(cd "$P15_DROPLAST" && "$SG" stash drop) > /dev/null 2>&1
+check "phase15 drop last entry: exits 0" test $? = 0
+check "phase15 drop last entry: refs/stash is gone" \
+    sh -c "! (cd '$P15_DROPLAST' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+check "phase15 drop last entry: logs/refs/stash is gone" \
+    test ! -e "$P15_DROPLAST/.git/logs/refs/stash"
+
+# ============================================================
+# 8.3: the same-exit-code traps (Phase 14's lesson) -- each row below is
+# exit-code-identical between a correct and a broken implementation, so
+# every check asserts at the "reason" layer, never on exit code alone.
+# ============================================================
+
+# --- row 1: nothing to save -- both a correct impl and a no-op stub exit 0
+# and print the same line; the only observable difference is whether
+# anything was actually written. ---
+P15_NOTHING="$WORKDIR/p15_nothing"
+p15_base_repo "$P15_NOTHING"
+P15_NOTHING_OUT="$WORKDIR/p15_nothing_out.txt"
+(cd "$P15_NOTHING" && "$SG" stash push) > "$P15_NOTHING_OUT" 2>&1
+check "phase15 row1 (nothing to save): exit 0" test $? = 0
+check "phase15 row1 (nothing to save): stdout says so" \
+    grep -q "^No local changes to save$" "$P15_NOTHING_OUT"
+check "phase15 row1 (nothing to save): refs/stash was never created" \
+    sh -c "! (cd '$P15_NOTHING' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+check "phase15 row1 (nothing to save): logs/refs/stash was never created" \
+    test ! -e "$P15_NOTHING/.git/logs/refs/stash"
+
+# --- row 2: push during a paused rebase -- both "proceed" and a broken gate
+# that silently no-ops the rebase state exit 0; assert the sequencer state
+# is not just PRESENT but still USABLE (a later --continue completes). ---
+P15_REBASE_PUSH="$WORKDIR/p15_rebase_push"
+p15_base_repo "$P15_REBASE_PUSH"
+(cd "$P15_REBASE_PUSH" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\n' >> "$P15_REBASE_PUSH/a.txt"
+(cd "$P15_REBASE_PUSH" && "$SG" add a.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P15_REBASE_PUSH" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\n' >> "$P15_REBASE_PUSH/a.txt"
+(cd "$P15_REBASE_PUSH" && "$SG" add a.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P15_REBASE_PUSH" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+(cd "$P15_REBASE_PUSH" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+check "phase15 row2 (rebase push): precondition -- rebase is paused on a conflict" \
+    test -d "$P15_REBASE_PUSH/.git/sg-rebase"
+printf 'resolved\n' > "$P15_REBASE_PUSH/a.txt"
+(cd "$P15_REBASE_PUSH" && "$SG" add a.txt) > /dev/null 2>&1
+check "phase15 row2 (rebase push): precondition -- index is clean, rebase still paused" \
+    sh -c "[ -z \"\$(cd '$P15_REBASE_PUSH' && git ls-files -u)\" ]"
+(cd "$P15_REBASE_PUSH" && "$SG" stash push -m "during rebase") > /dev/null 2>&1
+check "phase15 row2 (rebase push): push during a paused rebase exits 0" test $? = 0
+check "phase15 row2 (rebase push): sequencer state is still present" \
+    test -d "$P15_REBASE_PUSH/.git/sg-rebase"
+(cd "$P15_REBASE_PUSH" && "$SG" rebase --continue < /dev/null) > /dev/null 2>&1
+check "phase15 row2 (rebase push): the paused rebase is still USABLE -- continue completes" \
+    test $? = 0
+check "phase15 row2 (rebase push): continue actually finished the rebase" \
+    test ! -d "$P15_REBASE_PUSH/.git/sg-rebase"
+
+# --- row 3: push clears MERGE_HEAD -- both "clear it" and "leave a stale
+# MERGE_HEAD referring to an object that's about to be reset away" can exit
+# 0; assert absence AND that the stash still applies cleanly afterward. ---
+P15_MERGEHEAD="$WORKDIR/p15_mergehead"
+p15_base_repo "$P15_MERGEHEAD"
+(cd "$P15_MERGEHEAD" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\n' >> "$P15_MERGEHEAD/a.txt"
+(cd "$P15_MERGEHEAD" && "$SG" add a.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P15_MERGEHEAD" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\n' >> "$P15_MERGEHEAD/a.txt"
+(cd "$P15_MERGEHEAD" && "$SG" add a.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P15_MERGEHEAD" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+check "phase15 row3 (MERGE_HEAD): precondition -- merge left MERGE_HEAD and a conflict" \
+    test -f "$P15_MERGEHEAD/.git/MERGE_HEAD"
+printf 'resolved\n' > "$P15_MERGEHEAD/a.txt"
+(cd "$P15_MERGEHEAD" && "$SG" add a.txt) > /dev/null 2>&1
+(cd "$P15_MERGEHEAD" && "$SG" stash push -m "clears merge head") > /dev/null 2>&1
+check "phase15 row3 (MERGE_HEAD): push during an in-progress merge exits 0" test $? = 0
+check "phase15 row3 (MERGE_HEAD): MERGE_HEAD is gone" \
+    test ! -f "$P15_MERGEHEAD/.git/MERGE_HEAD"
+(cd "$P15_MERGEHEAD" && "$SG" stash pop) > /dev/null 2>&1
+check "phase15 row3 (MERGE_HEAD): the stash it took still applies cleanly afterward" \
+    test $? = 0
+
+# --- row 4: untracked files are not stashed -- "stashed it AND also left a
+# copy behind" would also pass a bytes-unchanged check, so additionally
+# assert the object never made it into refs/stash's tree at all. ---
+P15_UNTRACKED="$WORKDIR/p15_untracked"
+p15_base_repo "$P15_UNTRACKED"
+printf 'untracked content\n' > "$P15_UNTRACKED/u.txt"
+printf 'tracked change\n' > "$P15_UNTRACKED/a.txt"
+(cd "$P15_UNTRACKED" && "$SG" add a.txt) > /dev/null 2>&1
+P15_UNTRACKED_BEFORE="$WORKDIR/p15_untracked_before.txt"
+cp "$P15_UNTRACKED/u.txt" "$P15_UNTRACKED_BEFORE"
+(cd "$P15_UNTRACKED" && "$SG" stash push -m "leaves untracked alone") > /dev/null 2>&1
+check "phase15 row4 (untracked): push exits 0" test $? = 0
+check "phase15 row4 (untracked): u.txt is untouched bytes" \
+    cmp -s "$P15_UNTRACKED/u.txt" "$P15_UNTRACKED_BEFORE"
+check "phase15 row4 (untracked): refs/stash's tree does not contain u.txt" \
+    sh -c "! (cd '$P15_UNTRACKED' && git ls-tree -r refs/stash) | grep -q 'u\.txt'"
+
+# --- row 5: pop's index rule -- assert the EXACT porcelain string in one
+# run, since a rule that got only one of "M" or "A" right could still pass
+# a check that looked at either alone. ---
+P15_POPINDEX="$WORKDIR/p15_popindex"
+p15_base_repo "$P15_POPINDEX"
+printf 'tracked change\n' > "$P15_POPINDEX/a.txt"
+printf 'brand new\n' > "$P15_POPINDEX/newfile.txt"
+(cd "$P15_POPINDEX" && "$SG" add a.txt newfile.txt) > /dev/null 2>&1
+(cd "$P15_POPINDEX" && "$SG" stash push -m "index rule") > /dev/null 2>&1
+(cd "$P15_POPINDEX" && "$SG" stash pop) > /dev/null 2>&1
+P15_POPINDEX_PORCELAIN=$(cd "$P15_POPINDEX" && git status --porcelain | sort)
+P15_POPINDEX_EXPECT=$(printf 'A  newfile.txt\n M a.txt\n' | sort)
+check "phase15 row5 (pop index rule): exact porcelain -- ' M a.txt' AND 'A  newfile.txt' together" \
+    test "$P15_POPINDEX_PORCELAIN" = "$P15_POPINDEX_EXPECT"
+
+# --- row 6: drop stash@{0} re-points refs/stash -- git stash list looks
+# identical either way for a "delete the line, leave the ref" bug, since
+# list never consults refs/stash (measured, §4.2's sg_stash_list_read
+# comment); only the ref/reflog tip invariant and `git stash show` expose
+# it. ---
+P15_DROP0="$WORKDIR/p15_drop0"
+p15_base_repo "$P15_DROP0"
+printf 'c1\n' > "$P15_DROP0/a.txt"
+(cd "$P15_DROP0" && "$SG" add a.txt && "$SG" stash push -m first) > /dev/null 2>&1
+printf 'c2\n' > "$P15_DROP0/a.txt"
+(cd "$P15_DROP0" && "$SG" add a.txt && "$SG" stash push -m second) > /dev/null 2>&1
+(cd "$P15_DROP0" && "$SG" stash drop) > /dev/null 2>&1
+check "phase15 row6 (drop re-points ref): drop stash@{0} exits 0" test $? = 0
+P15_DROP0_REFSTASH=$(cd "$P15_DROP0" && git rev-parse refs/stash 2>/dev/null)
+P15_DROP0_REFLOG_LAST=$(tail -1 "$P15_DROP0/.git/logs/refs/stash" | cut -d' ' -f2)
+check "phase15 row6 (drop re-points ref): refs/stash equals the surviving entry's new-oid" \
+    test "$P15_DROP0_REFSTASH" = "$P15_DROP0_REFLOG_LAST"
+check "phase15 row6 (drop re-points ref): git stash show stash@{0} exits 0 (the naive line-delete bug's tell)" \
+    sh -c "(cd '$P15_DROP0' && git stash show 'stash@{0}') > /dev/null 2>&1"
+
+# --- row 7: clear after `git gc` -- a loose-only unlink leaves refs/stash
+# resurrectable from packed-refs; both a correct clear and that bug leave
+# git stash list looking empty (list walks the reflog, which is also gone),
+# so assert the ref itself is unresolvable. ---
+P15_GCCLEAR="$WORKDIR/p15_gcclear"
+p15_base_repo "$P15_GCCLEAR"
+printf 'c1\n' > "$P15_GCCLEAR/a.txt"
+(cd "$P15_GCCLEAR" && "$SG" add a.txt && "$SG" stash push -m first) > /dev/null 2>&1
+(cd "$P15_GCCLEAR" && git gc -q) > /dev/null 2>&1
+check "phase15 row7 (clear after gc): precondition -- refs/stash survives gc in packed-refs" \
+    sh -c "(cd '$P15_GCCLEAR' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+(cd "$P15_GCCLEAR" && "$SG" stash clear) > /dev/null 2>&1
+check "phase15 row7 (clear after gc): sg stash clear exits 0" test $? = 0
+check "phase15 row7 (clear after gc): refs/stash is unresolvable even though it was packed" \
+    sh -c "! (cd '$P15_GCCLEAR' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+
+# --- row 8: a conflicting pop -- "refuse and drop the stash anyway" would
+# also exit 1, so assert the stash survives, the marker TEXT is the literal
+# git strings (not branch names -- a passed-branch-name bug also exits 1
+# with markers present, just the wrong ones), MERGE_HEAD stays absent, and
+# the index actually has three stages. ---
+P15_POPCONFLICT="$WORKDIR/p15_popconflict"
+p15_base_repo "$P15_POPCONFLICT"
+printf 'base line\n' > "$P15_POPCONFLICT/c.txt"
+(cd "$P15_POPCONFLICT" && "$SG" add c.txt && "$SG" commit -m "c base") > /dev/null 2>&1
+printf 'stash change\n' > "$P15_POPCONFLICT/c.txt"
+(cd "$P15_POPCONFLICT" && "$SG" add c.txt && "$SG" stash push -m "will conflict") > /dev/null 2>&1
+printf 'head change\n' > "$P15_POPCONFLICT/c.txt"
+(cd "$P15_POPCONFLICT" && "$SG" add c.txt && "$SG" commit -m "head changes c") > /dev/null 2>&1
+(cd "$P15_POPCONFLICT" && "$SG" stash pop) > /dev/null 2>&1
+check "phase15 row8 (conflicting pop): exits 1" test $? != 0
+check "phase15 row8 (conflicting pop): the stash is still listed" \
+    sh -c "(cd '$P15_POPCONFLICT' && git stash list) | grep -q 'will conflict'"
+check "phase15 row8 (conflicting pop): conflict markers use the literal upstream label" \
+    grep -q '<<<<<<< Updated upstream' "$P15_POPCONFLICT/c.txt"
+check "phase15 row8 (conflicting pop): conflict markers use the literal stash label" \
+    grep -q '>>>>>>> Stashed changes' "$P15_POPCONFLICT/c.txt"
+check "phase15 row8 (conflicting pop): MERGE_HEAD was not written" \
+    test ! -f "$P15_POPCONFLICT/.git/MERGE_HEAD"
+P15_POPCONFLICT_STAGES=$(cd "$P15_POPCONFLICT" && git ls-files -u c.txt | awk '{print $3}')
+check "phase15 row8 (conflicting pop): index has all three stages for c.txt" \
+    sh -c "echo \"$P15_POPCONFLICT_STAGES\" | sort -u | tr -d '\n' | grep -qx '123'"
+
+# --- row 9: popping a `-u` stash -- "silently drop the untracked half and
+# pop the rest" would also exit non-zero on some unrelated path in a sloppy
+# implementation, or worse, exit 0 having lost the untracked file; assert
+# the stash SURVIVES and the untracked file was never created. ---
+P15_POPU="$WORKDIR/p15_popu"
+p15_base_repo "$P15_POPU"
+printf 'tracked change\n' > "$P15_POPU/a.txt"
+printf 'untracked content\n' > "$P15_POPU/u.txt"
+(cd "$P15_POPU" && git add a.txt && git stash push -q -u -m "has untracked") > /dev/null 2>&1
+check "phase15 row9 (pop -u stash): precondition -- u.txt is gone (git -u stashed it)" \
+    test ! -e "$P15_POPU/u.txt"
+(cd "$P15_POPU" && "$SG" stash pop) > /dev/null 2>&1
+check "phase15 row9 (pop -u stash): sg refuses (exit 1)" test $? != 0
+check "phase15 row9 (pop -u stash): the stash is still listed" \
+    sh -c "[ -n \"\$(cd '$P15_POPU' && git stash list)\" ]"
+check "phase15 row9 (pop -u stash): the untracked file was not created" \
+    test ! -e "$P15_POPU/u.txt"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
