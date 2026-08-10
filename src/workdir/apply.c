@@ -18,27 +18,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-static int resolve_commit_tree(const char *git_dir, const unsigned char commit_id[SG_SHA1_RAW_LEN],
-                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
-{
-    sg_obj_type type;
-    unsigned char *content;
-    size_t content_len;
-    sg_commit commit;
-
-    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
-       type != SG_OBJ_COMMIT)
-        return -1;
-    if (sg_commit_parse(content, content_len, &commit) != 0) {
-        free(content);
-        return -1;
-    }
-    free(content);
-    memcpy(tree_id_out, commit.tree, SG_SHA1_RAW_LEN);
-    sg_commit_free(&commit);
-    return 0;
-}
-
 static int flat_find(const sg_flat_list *list, const char *path)
 {
     size_t lo = 0;
@@ -408,7 +387,7 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
     if (sg_ref_resolve_head(git_dir, head_id) == 0) {
         unsigned char tree_id[SG_SHA1_RAW_LEN];
 
-        if (resolve_commit_tree(git_dir, head_id, tree_id) == 0)
+        if (sg_commit_tree_of(git_dir, head_id, tree_id) == 0)
             sg_tree_flatten(git_dir, tree_id, &head_flat);
     }
 

@@ -19,27 +19,6 @@
 
 typedef enum { RESET_SOFT, RESET_MIXED, RESET_HARD } sg_reset_mode;
 
-static int resolve_commit_tree(const char *git_dir, const unsigned char commit_id[SG_SHA1_RAW_LEN],
-                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
-{
-    sg_obj_type type;
-    unsigned char *content;
-    size_t content_len;
-    sg_commit commit;
-
-    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
-       type != SG_OBJ_COMMIT)
-        return -1;
-    if (sg_commit_parse(content, content_len, &commit) != 0) {
-        free(content);
-        return -1;
-    }
-    free(content);
-    memcpy(tree_id_out, commit.tree, SG_SHA1_RAW_LEN);
-    sg_commit_free(&commit);
-    return 0;
-}
-
 int sg_cmd_reset(int argc, char **argv)
 {
     static const char usage[] = "usage: sg reset [--soft|--mixed|--hard] [--force|-f] [<rev>]\n";
@@ -170,7 +149,7 @@ int sg_cmd_reset(int argc, char **argv)
         unsigned char merge_head_scratch[SG_SHA1_RAW_LEN];
         int merge_in_progress;
 
-        if (resolve_commit_tree(git_dir, target_commit_id, target_tree_id) != 0) {
+        if (sg_commit_tree_of(git_dir, target_commit_id, target_tree_id) != 0) {
             fprintf(stderr, "sg: corrupt commit for '%s'\n", rev_arg);
             free(current_branch);
             free(git_dir);
@@ -234,7 +213,7 @@ int sg_cmd_reset(int argc, char **argv)
         char label[256];
         int apply_rc;
 
-        if (resolve_commit_tree(git_dir, target_commit_id, target_tree_id) != 0) {
+        if (sg_commit_tree_of(git_dir, target_commit_id, target_tree_id) != 0) {
             fprintf(stderr, "sg: corrupt commit for '%s'\n", rev_arg);
             free(current_branch);
             free(git_dir);

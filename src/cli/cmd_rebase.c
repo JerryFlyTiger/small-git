@@ -28,27 +28,6 @@ static const char *env_or(const char *name, const char *fallback)
     return (v != NULL && v[0] != '\0') ? v : fallback;
 }
 
-static int resolve_commit_tree(const char *git_dir, const unsigned char commit_id[SG_SHA1_RAW_LEN],
-                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
-{
-    sg_obj_type type;
-    unsigned char *content;
-    size_t content_len;
-    sg_commit commit;
-
-    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
-       type != SG_OBJ_COMMIT)
-        return -1;
-    if (sg_commit_parse(content, content_len, &commit) != 0) {
-        free(content);
-        return -1;
-    }
-    free(content);
-    memcpy(tree_id_out, commit.tree, SG_SHA1_RAW_LEN);
-    sg_commit_free(&commit);
-    return 0;
-}
-
 static void short_hex(const unsigned char id[SG_SHA1_RAW_LEN], char out[8])
 {
     char hex[SG_SHA1_HEX_LEN + 1];
@@ -199,8 +178,8 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
     }
     memcpy(parent_id, commit.parents[0], SG_SHA1_RAW_LEN);
 
-    if (resolve_commit_tree(git_dir, parent_id, base_tree) != 0 ||
-       resolve_commit_tree(git_dir, new_head, ours_tree) != 0) {
+    if (sg_commit_tree_of(git_dir, parent_id, base_tree) != 0 ||
+       sg_commit_tree_of(git_dir, new_head, ours_tree) != 0) {
         sg_commit_free(&commit);
         return PICK_ERROR;
     }
@@ -552,7 +531,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         sg_index idx;
         char label[300];
 
-        if (resolve_commit_tree(git_dir, upstream_commit, upstream_tree) != 0) {
+        if (sg_commit_tree_of(git_dir, upstream_commit, upstream_tree) != 0) {
             fprintf(stderr, "sg: corrupt commit for branch '%s'\n", upstream_arg);
             free(current_branch);
             return 1;
@@ -652,7 +631,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
     {
         unsigned char upstream_tree[SG_SHA1_RAW_LEN];
 
-        if (resolve_commit_tree(git_dir, upstream_commit, upstream_tree) != 0 ||
+        if (sg_commit_tree_of(git_dir, upstream_commit, upstream_tree) != 0 ||
            sg_apply_tree_to_workdir(git_dir, repo_root, upstream_tree) != 0) {
             fprintf(stderr, "sg: 還原工作目錄失敗\n");
             sg_rebase_state_free(&state);
@@ -775,7 +754,7 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
     {
         unsigned char ours_tree[SG_SHA1_RAW_LEN];
 
-        if (resolve_commit_tree(git_dir, new_head, ours_tree) == 0 &&
+        if (sg_commit_tree_of(git_dir, new_head, ours_tree) == 0 &&
            memcmp(tree_id, ours_tree, SG_SHA1_RAW_LEN) == 0) {
             /* Conflict resolved down to "no actual change" -- same empty-
                commit rule as the automatic path: don't record a no-op. */
@@ -888,7 +867,7 @@ static int do_rebase_skip(const char *git_dir, const char *repo_root)
     }
 
     if (sg_ref_resolve_head(git_dir, head_commit) != 0 ||
-       resolve_commit_tree(git_dir, head_commit, head_tree) != 0) {
+       sg_commit_tree_of(git_dir, head_commit, head_tree) != 0) {
         fprintf(stderr, "sg: 無法讀取目前分支\n");
         sg_rebase_state_free(&state);
         return 1;
@@ -964,7 +943,7 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
     }
     sg_index_free(&idx);
 
-    if (resolve_commit_tree(git_dir, state.orig_head, orig_head_tree) != 0) {
+    if (sg_commit_tree_of(git_dir, state.orig_head, orig_head_tree) != 0) {
         fprintf(stderr, "sg: 無法讀取 rebase 前的 commit\n");
         sg_rebase_state_free(&state);
         return 1;

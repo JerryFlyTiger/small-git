@@ -29,27 +29,6 @@ static const char *env_or(const char *name, const char *fallback)
     return (v != NULL && v[0] != '\0') ? v : fallback;
 }
 
-static int resolve_commit_tree(const char *git_dir, const unsigned char commit_id[SG_SHA1_RAW_LEN],
-                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
-{
-    sg_obj_type type;
-    unsigned char *content;
-    size_t content_len;
-    sg_commit commit;
-
-    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
-       type != SG_OBJ_COMMIT)
-        return -1;
-    if (sg_commit_parse(content, content_len, &commit) != 0) {
-        free(content);
-        return -1;
-    }
-    free(content);
-    memcpy(tree_id_out, commit.tree, SG_SHA1_RAW_LEN);
-    sg_commit_free(&commit);
-    return 0;
-}
-
 static int do_fast_forward(const char *git_dir, const char *repo_root, const char *current_branch,
                            const char *branch_arg, const unsigned char theirs_commit[SG_SHA1_RAW_LEN],
                            const unsigned char theirs_tree[SG_SHA1_RAW_LEN], int force)
@@ -155,8 +134,8 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     int content_missing = 0;
     int rc = 1;
 
-    if (resolve_commit_tree(git_dir, ours_commit, ours_tree) != 0 ||
-       resolve_commit_tree(git_dir, base_commit, base_tree) != 0) {
+    if (sg_commit_tree_of(git_dir, ours_commit, ours_tree) != 0 ||
+       sg_commit_tree_of(git_dir, base_commit, base_tree) != 0) {
         fprintf(stderr, "sg: corrupt commit while resolving merge\n");
         return 1;
     }
@@ -407,7 +386,7 @@ static int do_merge_abort(const char *git_dir, const char *repo_root)
         return 1;
     }
     if (sg_ref_resolve_head(git_dir, head_id) != 0 ||
-       resolve_commit_tree(git_dir, head_id, head_tree) != 0) {
+       sg_commit_tree_of(git_dir, head_id, head_tree) != 0) {
         fprintf(stderr, "sg: 無法讀取目前分支的 commit\n");
         return 1;
     }
@@ -546,7 +525,7 @@ int sg_cmd_merge(int argc, char **argv)
             return 1;
         }
 
-        if (resolve_commit_tree(git_dir, theirs_commit, theirs_tree) != 0) {
+        if (sg_commit_tree_of(git_dir, theirs_commit, theirs_tree) != 0) {
             fprintf(stderr, "sg: corrupt commit for branch '%s'\n", branch_arg);
             free(current_branch);
             free(git_dir);
