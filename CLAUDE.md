@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(680 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(726 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 26 個單元測試二進位,任一失敗即整體失敗
+make test                         # 28 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -137,11 +137,15 @@ staging 的驗證。本機綠燈不是充分證據。**
   `src/cli/cmd_xxx.c`、在 `include/sg/cli.h` 加宣告、在 `src/cli/cli.c` 的
   `COMMANDS[]`(`:13`)加說明並在派發鏈(`:63` 起)加一組 `strcmp`。若指令會覆寫
   工作目錄,走 `sg_safe_apply_tree`(`include/sg/apply.h`)而不是自己拼
-  confirm/snapshot。
+  confirm/snapshot。它會清 `MERGE_HEAD`,但**刻意不碰進行中的 rebase 序列器
+  狀態**——真 git 只讓 rebase 自己的子指令結束一個 rebase(Phase 14 實測)。
+  所以任何會覆寫工作目錄的新指令,要嘛比照 `cmd_switch.c`/`cmd_merge.c` 在
+  rebase 進行中直接拒絕,要嘛比照 `cmd_reset.c --hard` 讓狀態原封不動;只有
+  `cmd_undo.c` 例外(沒有真 git 對應物),它在回傳後自己清。
 
 ## 測試慣例
 
-- 26 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 28 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。
