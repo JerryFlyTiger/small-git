@@ -13,7 +13,8 @@
 int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
                             const unsigned char tree_id[SG_SHA1_RAW_LEN]);
 
-/* The full safety wrapper shared by switch/restore/undo: checks whether the
+/* The full safety wrapper shared by switch/reset --hard/merge (fast-forward)/
+   undo: checks whether the
    working directory is dirty (same sg_status_diff_staged/unstaged logic as
    the Phase 3 confirmation gate, including its out-of-memory-means-dirty
    fallback) -> if dirty, gates on sg_confirm_dangerous (force only skips the
@@ -25,7 +26,16 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
    changed); -1 if the snapshot or apply step hit an I/O error (if
    sg_confirm_dangerous was never satisfied, nothing was changed either; if
    the failure happened during apply, the same partial-change caveat as
-   sg_apply_tree_to_workdir applies). */
+   sg_apply_tree_to_workdir applies).
+
+   After a successful apply, MERGE_HEAD is cleared if present (matches real
+   git 2.55.0: any operation that resets the working directory clears an
+   in-progress merge). A paused rebase's sequencer state is deliberately
+   left untouched -- also matching real git, which only lets rebase's own
+   subcommands (--abort, a completed run, --quit) end a sequence; even
+   `switch --force` is refused rather than clobbering it (see cmd_switch.c).
+   Callers that need the old "always wipe rebase state" behavior must do so
+   themselves after this call returns. */
 int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
                        const unsigned char tree_id[SG_SHA1_RAW_LEN],
                        const char *label, int force);

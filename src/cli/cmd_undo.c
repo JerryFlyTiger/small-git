@@ -2,6 +2,7 @@
 
 #include "sg/apply.h"
 #include "sg/hash.h"
+#include "sg/rebase.h"
 #include "sg/repo.h"
 #include "sg/snapshot.h"
 #include "sg/workdir.h"
@@ -78,6 +79,7 @@ int sg_cmd_undo(int argc, char **argv)
         char label[64];
         int apply_rc;
         int rc = 0;
+        int rebase_in_progress;
 
         n = strtol(num_arg, &end, 10);
         if (*end != '\0' || end == num_arg || n <= 0) {
@@ -114,6 +116,19 @@ int sg_cmd_undo(int argc, char **argv)
             return 1;
         }
 
+        /* Recorded before the apply below, same convention as the MERGE_HEAD
+           check inside sg_safe_apply_tree: the apply currently leaves rebase
+           state alone, but recording this ahead of time doesn't depend on
+           that staying true. `sg undo` has no real-git equivalent to use as
+           an oracle -- unlike switch/reset, it deliberately still wipes a
+           paused rebase's sequencer state below, because resuming a rebase
+           on top of a tree that undo just rewound from under it makes no
+           sense. */
+        rebase_in_progress = sg_rebase_state_exists(git_dir);
+        if (rebase_in_progress)
+            fprintf(stderr, "sg: 注意：undo 會放棄目前進行中的 rebase"
+                           "（工作目錄將還原到快照，不必再執行 sg rebase --abort）\n");
+
         snprintf(label, sizeof(label), "undo (restore snapshot #%ld)", n);
         apply_rc = sg_safe_apply_tree(git_dir, repo_root, tree_id, label, force);
         if (apply_rc == 1) {
@@ -123,6 +138,12 @@ int sg_cmd_undo(int argc, char **argv)
             rc = 1;
         } else {
             printf("Restored snapshot #%ld\n", n);
+            if (rebase_in_progress) {
+                if (sg_rebase_state_remove(git_dir) != 0)
+                    fprintf(stderr, "sg: warning: 未能清除進行中的 rebase 狀態\n");
+                else
+                    fprintf(stderr, "sg: 進行中的 rebase 已放棄（工作目錄已還原到快照）\n");
+            }
         }
 
         free(repo_root);

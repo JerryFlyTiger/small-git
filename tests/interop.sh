@@ -3938,6 +3938,283 @@ check "phase12 reset/rebase: bare sg reset (mixed) during a paused rebase exits 
 check "phase12 reset/rebase: --mixed does NOT clear sg-rebase/ (matches real git leaving a paused rebase alone)" \
     test -d "$P12R_MIXED_REBASE/.git/sg-rebase"
 
+# --- Phase 14: reset --hard / switch during a paused rebase ---
+#
+# Measured against real git 2.55.0: `reset --hard` (including `reset --hard
+# <commit>`) during a paused rebase keeps the rebase sequencer state intact
+# (rebase-merge/ for git, .git/sg-rebase/ for sg) -- a later `rebase
+# --abort`/`--continue` still works normally afterward. `switch` (even with
+# --force, even with -c) is refused outright instead of clobbering the
+# paused rebase; a refused `switch -c` does not create the new branch.
+
+p14_rebase_paused_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    printf 'orig1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c feature) > /dev/null 2>&1
+    printf 'feature1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+    printf 'master1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+}
+
+# case A: reset --hard keeps the paused rebase, and abort still restores the
+# exact pre-rebase branch position afterward.
+P14_HARD_ABORT="$WORKDIR/p14_hard_abort"
+p14_rebase_paused_repo "$P14_HARD_ABORT"
+P14_PRE_REBASE_FEATURE=$(cd "$P14_HARD_ABORT" && git rev-parse feature)
+(cd "$P14_HARD_ABORT" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+
+check "phase14: precondition -- sg-rebase/ present after the paused rebase" \
+    test -d "$P14_HARD_ABORT/.git/sg-rebase"
+
+(cd "$P14_HARD_ABORT" && "$SG" reset --hard --force) > /dev/null 2>&1
+check "phase14: sg reset --hard during a paused rebase exits 0" test $? = 0
+check "phase14: sg reset --hard does NOT clear sg-rebase/ (matches real git leaving rebase-merge/ alone)" \
+    test -d "$P14_HARD_ABORT/.git/sg-rebase"
+
+(cd "$P14_HARD_ABORT" && "$SG" rebase --abort < /dev/null) > /dev/null 2>&1
+check "phase14: sg rebase --abort after reset --hard exits 0" test $? = 0
+check "phase14: .git/sg-rebase is gone after --abort" test ! -d "$P14_HARD_ABORT/.git/sg-rebase"
+P14_POST_ABORT_FEATURE=$(cd "$P14_HARD_ABORT" && git rev-parse feature)
+check "phase14: rebase --abort after reset --hard restores feature to its exact pre-rebase commit" \
+    test "$P14_POST_ABORT_FEATURE" = "$P14_PRE_REBASE_FEATURE"
+
+# real-git oracle for the same reset --hard + abort sequence: rebase-merge/
+# must survive reset --hard, and abort must restore the original branch tip.
+P14_GIT_HARD_ABORT="$WORKDIR/p14_git_hard_abort"
+mkdir -p "$P14_GIT_HARD_ABORT"
+(cd "$WORKDIR" && git init -q p14_git_hard_abort)
+(cd "$P14_GIT_HARD_ABORT" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'orig1\norig2\n' > "$P14_GIT_HARD_ABORT/c.txt"
+(cd "$P14_GIT_HARD_ABORT" && git add c.txt && git commit -q -m "base")
+(cd "$P14_GIT_HARD_ABORT" && git switch -q -c feature)
+printf 'feature1\norig2\n' > "$P14_GIT_HARD_ABORT/c.txt"
+(cd "$P14_GIT_HARD_ABORT" && git add c.txt && git commit -q -m "feature change")
+(cd "$P14_GIT_HARD_ABORT" && git switch -q master)
+printf 'master1\norig2\n' > "$P14_GIT_HARD_ABORT/c.txt"
+(cd "$P14_GIT_HARD_ABORT" && git add c.txt && git commit -q -m "master change")
+(cd "$P14_GIT_HARD_ABORT" && git switch -q feature)
+P14_GIT_PRE_REBASE_FEATURE=$(cd "$P14_GIT_HARD_ABORT" && git rev-parse feature)
+(cd "$P14_GIT_HARD_ABORT" && git rebase master) > /dev/null 2>&1
+(cd "$P14_GIT_HARD_ABORT" && git reset --hard) > /dev/null 2>&1
+check "phase14 oracle: real git reset --hard during a paused rebase exits 0" test $? = 0
+check "phase14 oracle: real git reset --hard does NOT clear rebase-merge/" \
+    test -d "$P14_GIT_HARD_ABORT/.git/rebase-merge"
+(cd "$P14_GIT_HARD_ABORT" && git rebase --abort) > /dev/null 2>&1
+check "phase14 oracle: real git rebase --abort after reset --hard exits 0" test $? = 0
+P14_GIT_POST_ABORT_FEATURE=$(cd "$P14_GIT_HARD_ABORT" && git rev-parse feature)
+check "phase14 oracle: real git abort after reset --hard restores feature to its exact pre-rebase commit" \
+    test "$P14_GIT_POST_ABORT_FEATURE" = "$P14_GIT_PRE_REBASE_FEATURE"
+
+# case B: reset --hard, then resolve the conflict and --continue to
+# completion; compare sg's final tree against real git's final tree for the
+# identical workflow (shas differ due to committer timestamps, so compare
+# content instead).
+P14_HARD_CONTINUE="$WORKDIR/p14_hard_continue"
+p14_rebase_paused_repo "$P14_HARD_CONTINUE"
+(cd "$P14_HARD_CONTINUE" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+(cd "$P14_HARD_CONTINUE" && "$SG" reset --hard --force) > /dev/null 2>&1
+printf 'resolved1\norig2\n' > "$P14_HARD_CONTINUE/c.txt"
+(cd "$P14_HARD_CONTINUE" && "$SG" add c.txt) > /dev/null 2>&1
+(cd "$P14_HARD_CONTINUE" && "$SG" rebase --continue < /dev/null) > /dev/null 2>&1
+check "phase14: sg rebase --continue after reset --hard exits 0" test $? = 0
+check "phase14: .git/sg-rebase is gone after --continue" test ! -d "$P14_HARD_CONTINUE/.git/sg-rebase"
+
+P14_GIT_HARD_CONTINUE="$WORKDIR/p14_git_hard_continue"
+mkdir -p "$P14_GIT_HARD_CONTINUE"
+(cd "$WORKDIR" && git init -q p14_git_hard_continue)
+(cd "$P14_GIT_HARD_CONTINUE" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'orig1\norig2\n' > "$P14_GIT_HARD_CONTINUE/c.txt"
+(cd "$P14_GIT_HARD_CONTINUE" && git add c.txt && git commit -q -m "base")
+(cd "$P14_GIT_HARD_CONTINUE" && git switch -q -c feature)
+printf 'feature1\norig2\n' > "$P14_GIT_HARD_CONTINUE/c.txt"
+(cd "$P14_GIT_HARD_CONTINUE" && git add c.txt && git commit -q -m "feature change")
+(cd "$P14_GIT_HARD_CONTINUE" && git switch -q master)
+printf 'master1\norig2\n' > "$P14_GIT_HARD_CONTINUE/c.txt"
+(cd "$P14_GIT_HARD_CONTINUE" && git add c.txt && git commit -q -m "master change")
+(cd "$P14_GIT_HARD_CONTINUE" && git switch -q feature)
+(cd "$P14_GIT_HARD_CONTINUE" && git rebase master) > /dev/null 2>&1
+(cd "$P14_GIT_HARD_CONTINUE" && git reset --hard) > /dev/null 2>&1
+printf 'resolved1\norig2\n' > "$P14_GIT_HARD_CONTINUE/c.txt"
+(cd "$P14_GIT_HARD_CONTINUE" && git add c.txt) > /dev/null 2>&1
+(cd "$P14_GIT_HARD_CONTINUE" && git -c core.editor=true rebase --continue) > /dev/null 2>&1
+
+check "phase14: sg and real git agree on final c.txt content after reset --hard + continue" \
+    cmp -s "$P14_HARD_CONTINUE/c.txt" "$P14_GIT_HARD_CONTINUE/c.txt"
+
+# commit graph shape after reset --hard + continue: same subject sequence and
+# same commit count on both sides (shas differ due to committer timestamps,
+# so compare subjects/count instead -- same convention as phase4c case1/2).
+P14_HARD_CONTINUE_SUBJECTS="$WORKDIR/p14_hard_continue_subjects.txt"
+(cd "$P14_HARD_CONTINUE" && git log --format=%s) > "$P14_HARD_CONTINUE_SUBJECTS" 2>&1
+P14_GIT_HARD_CONTINUE_SUBJECTS="$WORKDIR/p14_git_hard_continue_subjects.txt"
+(cd "$P14_GIT_HARD_CONTINUE" && git log --format=%s) > "$P14_GIT_HARD_CONTINUE_SUBJECTS" 2>&1
+check "phase14: sg and real git agree on commit subjects/order after reset --hard + continue" \
+    cmp -s "$P14_HARD_CONTINUE_SUBJECTS" "$P14_GIT_HARD_CONTINUE_SUBJECTS"
+
+P14_HARD_CONTINUE_PARENTS="$WORKDIR/p14_hard_continue_parents.txt"
+(cd "$P14_HARD_CONTINUE" && git log --format='%s %P' | sed -E 's/[0-9a-f]{40}/X/g') > "$P14_HARD_CONTINUE_PARENTS" 2>&1
+P14_GIT_HARD_CONTINUE_PARENTS="$WORKDIR/p14_git_hard_continue_parents.txt"
+(cd "$P14_GIT_HARD_CONTINUE" && git log --format='%s %P' | sed -E 's/[0-9a-f]{40}/X/g') > "$P14_GIT_HARD_CONTINUE_PARENTS" 2>&1
+check "phase14: sg and real git agree on parent-count shape (each commit's number of parents) after reset --hard + continue" \
+    cmp -s "$P14_HARD_CONTINUE_PARENTS" "$P14_GIT_HARD_CONTINUE_PARENTS"
+
+# case B2: reset --hard <another commit> (not a no-op reset to HEAD) during a
+# paused rebase, then resolve and --continue -- measured against real git
+# 2.55.0: the remaining commits get replayed on top of the reset target, not
+# the original onto commit. Both sides do the identical operation sequence
+# so shas differ only by committer timestamp; compare subjects/parent shape
+# and final file content.
+P14_HARD_RETARGET="$WORKDIR/p14_hard_retarget"
+p14_rebase_paused_repo "$P14_HARD_RETARGET"
+P14_RETARGET_BASE=$(cd "$P14_HARD_RETARGET" && git rev-parse master~1)
+(cd "$P14_HARD_RETARGET" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+(cd "$P14_HARD_RETARGET" && "$SG" reset --hard "$P14_RETARGET_BASE" --force) > /dev/null 2>&1
+check "phase14: sg reset --hard <other commit> during a paused rebase exits 0" test $? = 0
+printf 'resolved1\norig2\n' > "$P14_HARD_RETARGET/c.txt"
+(cd "$P14_HARD_RETARGET" && "$SG" add c.txt) > /dev/null 2>&1
+(cd "$P14_HARD_RETARGET" && "$SG" rebase --continue < /dev/null) > /dev/null 2>&1
+check "phase14: sg rebase --continue after reset --hard <other commit> exits 0" test $? = 0
+check "phase14: .git/sg-rebase is gone after --continue (retarget case)" \
+    test ! -d "$P14_HARD_RETARGET/.git/sg-rebase"
+
+P14_GIT_HARD_RETARGET="$WORKDIR/p14_git_hard_retarget"
+mkdir -p "$P14_GIT_HARD_RETARGET"
+(cd "$WORKDIR" && git init -q p14_git_hard_retarget)
+(cd "$P14_GIT_HARD_RETARGET" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'orig1\norig2\n' > "$P14_GIT_HARD_RETARGET/c.txt"
+(cd "$P14_GIT_HARD_RETARGET" && git add c.txt && git commit -q -m "base")
+(cd "$P14_GIT_HARD_RETARGET" && git switch -q -c feature)
+printf 'feature1\norig2\n' > "$P14_GIT_HARD_RETARGET/c.txt"
+(cd "$P14_GIT_HARD_RETARGET" && git add c.txt && git commit -q -m "feature change")
+(cd "$P14_GIT_HARD_RETARGET" && git switch -q master)
+printf 'master1\norig2\n' > "$P14_GIT_HARD_RETARGET/c.txt"
+(cd "$P14_GIT_HARD_RETARGET" && git add c.txt && git commit -q -m "master change")
+(cd "$P14_GIT_HARD_RETARGET" && git switch -q feature)
+P14_GIT_RETARGET_BASE=$(cd "$P14_GIT_HARD_RETARGET" && git rev-parse master~1)
+(cd "$P14_GIT_HARD_RETARGET" && git rebase master) > /dev/null 2>&1
+(cd "$P14_GIT_HARD_RETARGET" && git reset --hard "$P14_GIT_RETARGET_BASE") > /dev/null 2>&1
+printf 'resolved1\norig2\n' > "$P14_GIT_HARD_RETARGET/c.txt"
+(cd "$P14_GIT_HARD_RETARGET" && git add c.txt) > /dev/null 2>&1
+(cd "$P14_GIT_HARD_RETARGET" && git -c core.editor=true rebase --continue) > /dev/null 2>&1
+
+check "phase14: sg and real git agree on final c.txt content after reset --hard <other commit> + continue" \
+    cmp -s "$P14_HARD_RETARGET/c.txt" "$P14_GIT_HARD_RETARGET/c.txt"
+
+P14_HARD_RETARGET_SUBJECTS="$WORKDIR/p14_hard_retarget_subjects.txt"
+(cd "$P14_HARD_RETARGET" && git log --format=%s) > "$P14_HARD_RETARGET_SUBJECTS" 2>&1
+P14_GIT_HARD_RETARGET_SUBJECTS="$WORKDIR/p14_git_hard_retarget_subjects.txt"
+(cd "$P14_GIT_HARD_RETARGET" && git log --format=%s) > "$P14_GIT_HARD_RETARGET_SUBJECTS" 2>&1
+check "phase14: sg and real git agree on commit subjects/order after reset --hard <other commit> + continue" \
+    cmp -s "$P14_HARD_RETARGET_SUBJECTS" "$P14_GIT_HARD_RETARGET_SUBJECTS"
+
+P14_HARD_RETARGET_PARENTS="$WORKDIR/p14_hard_retarget_parents.txt"
+(cd "$P14_HARD_RETARGET" && git log --format='%s %P' | sed -E 's/[0-9a-f]{40}/X/g') > "$P14_HARD_RETARGET_PARENTS" 2>&1
+P14_GIT_HARD_RETARGET_PARENTS="$WORKDIR/p14_git_hard_retarget_parents.txt"
+(cd "$P14_GIT_HARD_RETARGET" && git log --format='%s %P' | sed -E 's/[0-9a-f]{40}/X/g') > "$P14_GIT_HARD_RETARGET_PARENTS" 2>&1
+check "phase14: sg and real git agree on parent-count shape after reset --hard <other commit> + continue" \
+    cmp -s "$P14_HARD_RETARGET_PARENTS" "$P14_GIT_HARD_RETARGET_PARENTS"
+
+# The two comparisons above normalize every 40-hex sha to X, so for a linear
+# history they only really assert "one parent each" -- they cannot tell
+# whether the replayed commit landed on the reset target or on the original
+# onto. That distinction is the entire point of this case, so assert the
+# parent identity directly, in each repo against its own base sha. Real git
+# is checked the same way rather than trusted: it is the oracle for the
+# claim, not an assumption.
+check "phase14: sg replayed the commit onto the reset target, not the original onto" \
+    sh -c "test \"\$(cd '$P14_HARD_RETARGET' && git rev-parse feature^)\" = '$P14_RETARGET_BASE'"
+check "phase14: real git also replayed onto the reset target (oracle for the check above)" \
+    sh -c "test \"\$(cd '$P14_GIT_HARD_RETARGET' && git rev-parse feature^)\" = '$P14_GIT_RETARGET_BASE'"
+check "phase14: sg's rebased feature is NOT descended from master after the retarget" \
+    sh -c "! (cd '$P14_HARD_RETARGET' && git merge-base --is-ancestor master feature)"
+check "phase14: real git's rebased feature is NOT descended from master either" \
+    sh -c "! (cd '$P14_GIT_HARD_RETARGET' && git merge-base --is-ancestor master feature)"
+
+# case C: sg switch <other> is refused during a paused rebase, --force does
+# not bypass it, and -c does not create the new branch either.
+P14_SWITCH="$WORKDIR/p14_switch"
+p14_rebase_paused_repo "$P14_SWITCH"
+(cd "$P14_SWITCH" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+P14_SWITCH_HEAD_BEFORE=$(cd "$P14_SWITCH" && git rev-parse HEAD)
+P14_SWITCH_STATUS_BEFORE=$(cd "$P14_SWITCH" && git status --porcelain)
+
+P14_SWITCH_ERR="$WORKDIR/p14_switch_err.txt"
+(cd "$P14_SWITCH" && "$SG" switch master < /dev/null) > "$P14_SWITCH_ERR" 2>&1
+check "phase14: sg switch during a paused rebase is rejected" test $? != 0
+check "phase14: switch rejection left sg-rebase/ in place" test -d "$P14_SWITCH/.git/sg-rebase"
+check "phase14: switch rejection left HEAD unchanged" \
+    sh -c "test \"\$(cd '$P14_SWITCH' && git rev-parse HEAD)\" = '$P14_SWITCH_HEAD_BEFORE'"
+check "phase14: switch rejection left the working directory unchanged" \
+    sh -c "test \"\$(cd '$P14_SWITCH' && git status --porcelain)\" = '$P14_SWITCH_STATUS_BEFORE'"
+check "phase14: switch rejection is due to the rebase gate, not the dirty-workdir prompt" \
+    grep -q "無法切換分支" "$P14_SWITCH_ERR"
+
+P14_SWITCH_FORCE_ERR="$WORKDIR/p14_switch_force_err.txt"
+(cd "$P14_SWITCH" && "$SG" switch --force master < /dev/null) > "$P14_SWITCH_FORCE_ERR" 2>&1
+check "phase14: sg switch --force during a paused rebase is still rejected" test $? != 0
+check "phase14: --force rejection left sg-rebase/ in place" test -d "$P14_SWITCH/.git/sg-rebase"
+check "phase14: --force rejection is due to the rebase gate, not skipped by --force" \
+    grep -q "無法切換分支" "$P14_SWITCH_FORCE_ERR"
+
+P14_SWITCH_C_ERR="$WORKDIR/p14_switch_c_err.txt"
+(cd "$P14_SWITCH" && "$SG" switch -c newbranch < /dev/null) > "$P14_SWITCH_C_ERR" 2>&1
+check "phase14: sg switch -c during a paused rebase is rejected" test $? != 0
+check "phase14: -c rejection left sg-rebase/ in place" test -d "$P14_SWITCH/.git/sg-rebase"
+check "phase14: switch -c rejection did NOT create the new branch (matches real git)" \
+    sh -c "! (cd '$P14_SWITCH' && git rev-parse --verify refs/heads/newbranch) > /dev/null 2>&1"
+check "phase14: -c rejection is due to the rebase gate, not the dirty-workdir prompt" \
+    grep -q "無法切換分支" "$P14_SWITCH_C_ERR"
+
+# case D: sg undo has no real-git equivalent to use as an oracle -- it
+# deliberately still clears a paused rebase's sequencer state (sg-specific
+# behavior: resuming a rebase on a tree undo just rewound from under it
+# would make no sense).
+P14_UNDO="$WORKDIR/p14_undo"
+p14_rebase_paused_repo "$P14_UNDO"
+(cd "$P14_UNDO" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+check "phase14: precondition -- sg-rebase/ present before undo" test -d "$P14_UNDO/.git/sg-rebase"
+(cd "$P14_UNDO" && "$SG" reset --hard --force) > /dev/null 2>&1
+check "phase14: precondition -- sg-rebase/ still present after the snapshot-taking reset --hard" \
+    test -d "$P14_UNDO/.git/sg-rebase"
+(cd "$P14_UNDO" && "$SG" undo 1 --force) > /dev/null 2>&1
+check "phase14: sg undo during a paused rebase exits 0" test $? = 0
+check "phase14: sg undo clears sg-rebase/ (sg-specific: no real-git equivalent to use as an oracle)" \
+    test ! -d "$P14_UNDO/.git/sg-rebase"
+
+# case E: the confirmation prompt must not promise something undo then takes
+# away. sg_safe_apply_tree's dirty-prompt text is shared by every caller, so
+# it may not claim the rebase survives -- true for reset --hard, false for
+# undo, which wipes it right after. undo therefore says so itself, and must
+# do it BEFORE sg_safe_apply_tree runs so the warning reaches the user while
+# the y/N decision is still open.
+#
+# Run without --force: sg_confirm_dangerous only prints the message on the
+# non-tty/no-force branch (force=1 returns early and prints nothing), and
+# that branch also refuses. That refusal is what makes the ordering
+# observable -- a notice emitted from undo's success path instead would not
+# appear here at all.
+P14_MSG="$WORKDIR/p14_undo_msg"
+P14_MSG_ERR="$WORKDIR/p14_undo_msg.err"
+p14_rebase_paused_repo "$P14_MSG"
+(cd "$P14_MSG" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+(cd "$P14_MSG" && "$SG" reset --hard --force) > /dev/null 2>&1
+check "phase14: precondition -- sg-rebase/ present before the message check" \
+    test -d "$P14_MSG/.git/sg-rebase"
+(cd "$P14_MSG" && "$SG" undo 1 < /dev/null) > "$P14_MSG_ERR" 2>&1
+check "phase14: undo warns it will abandon the rebase before the confirmation is decided" \
+    grep -q "undo 會放棄" "$P14_MSG_ERR"
+check "phase14: the shared dirty prompt does not promise the rebase survives" \
+    sh -c "! grep -q 'rebase 本身會保留' '$P14_MSG_ERR'"
+check "phase14: the shared dirty prompt says what it actually does" \
+    grep -q "覆蓋工作目錄裡的衝突解決內容" "$P14_MSG_ERR"
+check "phase14: a declined undo left sg-rebase/ alone" test -d "$P14_MSG/.git/sg-rebase"
+
 # --- --soft must not need to be able to resolve the target commit's tree ---
 #
 # resolve_commit_tree() used to run unconditionally before the three modes
