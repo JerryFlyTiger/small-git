@@ -33,6 +33,7 @@ static const sg_command_info COMMANDS[] = {
     {"fetch", "從遠端取得新的 commit 與 ref"},
     {"push", "將本地分支推送到遠端"},
     {"chunk-info", "顯示檔案/物件的分塊儲存診斷資訊"},
+    {"stash", "暫存工作目錄與 index 的變更，之後可以還原"},
 };
 #define COMMANDS_COUNT (sizeof(COMMANDS) / sizeof(COMMANDS[0]))
 
@@ -106,6 +107,8 @@ int sg_cli_run(int argc, char **argv)
         return sg_cmd_push(argc - 1, argv + 1);
     if (strcmp(argv[1], "chunk-info") == 0)
         return sg_cmd_chunk_info(argc - 1, argv + 1);
+    if (strcmp(argv[1], "stash") == 0)
+        return sg_cmd_stash(argc - 1, argv + 1);
 
     {
         size_t i;

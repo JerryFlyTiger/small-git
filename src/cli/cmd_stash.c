@@ -1,0 +1,392 @@
+#include "sg/cli.h"
+
+#include "sg/apply.h"
+#include "sg/hash.h"
+#include "sg/index.h"
+#include "sg/merge.h"
+#include "sg/object.h"
+#include "sg/objstore.h"
+#include "sg/rebase.h"
+#include "sg/repo.h"
+#include "sg/stash.h"
+#include "sg/workdir.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int cmd_stash_push(int argc, char **argv, const char *usage)
+{
+    const char *message = NULL;
+    int i0 = 1;
+    int i;
+    char *git_dir;
+    char *repo_root;
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    int rc;
+
+    if (argc >= 2 && strcmp(argv[1], "push") == 0)
+        i0 = 2;
+
+    for (i = i0; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0) {
+            if (i + 1 >= argc) {
+                fputs(usage, stderr);
+                return 1;
+            }
+            message = argv[++i];
+        } else {
+            fputs(usage, stderr);
+            return 1;
+        }
+    }
+
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
+        return 1;
+    repo_root = sg_repo_root(git_dir);
+    if (repo_root == NULL) {
+        fprintf(stderr, "sg: failed to determine repository root\n");
+        free(git_dir);
+        return 1;
+    }
+
+    rc = sg_stash_push(git_dir, repo_root, message, commit_id);
+    if (rc == 1) {
+        printf("No local changes to save\n");
+        free(git_dir);
+        free(repo_root);
+        return 0;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "sg: 無法建立 stash（未初始化的 HEAD，或 index 有未解決的衝突？）\n");
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+
+    /* MERGE_HEAD cleanup is deliberately the CLI layer's job -- see the
+       sg_stash_push header comment in sg/stash.h. */
+    {
+        unsigned char merge_head_id[SG_SHA1_RAW_LEN];
+
+        if (sg_merge_head_read(git_dir, merge_head_id) == 0) {
+            if (sg_merge_head_remove(git_dir) != 0)
+                fprintf(stderr, "sg: warning: stash 成功，但清除 MERGE_HEAD 失敗\n");
+            else
+                fprintf(stderr, "sg: 已清除進行中的合併狀態（MERGE_HEAD）\n");
+        }
+    }
+
+    {
+        sg_stash_list list;
+
+        if (sg_stash_list_read(git_dir, &list) == 0 && list.count > 0) {
+            printf("Saved working directory and index state %s\n", list.entries[0].message);
+            sg_stash_list_free(&list);
+        } else {
+            char hex[SG_SHA1_HEX_LEN + 1];
+
+            sg_sha1_to_hex(commit_id, hex);
+            printf("Saved working directory and index state %s\n", hex);
+        }
+    }
+
+    free(git_dir);
+    free(repo_root);
+    return 0;
+}
+
+static int cmd_stash_list(int argc, char **argv)
+{
+    char *git_dir;
+    sg_stash_list list;
+    size_t i;
+
+    (void)argv;
+    if (argc != 2) {
+        fputs("usage: sg stash list\n", stderr);
+        return 1;
+    }
+
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
+        return 1;
+
+    if (sg_stash_list_read(git_dir, &list) != 0) {
+        fprintf(stderr, "sg: failed to read stash list（reflog 損壞？）\n");
+        free(git_dir);
+        return 1;
+    }
+
+    for (i = 0; i < list.count; i++)
+        printf("stash@{%zu}: %s\n", i, list.entries[i].message);
+
+    sg_stash_list_free(&list);
+    free(git_dir);
+    return 0;
+}
+
+static int cmd_stash_clear(int argc, char **argv)
+{
+    char *git_dir;
+
+    (void)argv;
+    if (argc != 2) {
+        fputs("usage: sg stash clear\n", stderr);
+        return 1;
+    }
+
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
+        return 1;
+
+    if (sg_stash_clear(git_dir) != 0) {
+        fprintf(stderr, "sg: failed to clear stash\n");
+        free(git_dir);
+        return 1;
+    }
+
+    free(git_dir);
+    return 0;
+}
+
+static int cmd_stash_drop(int argc, char **argv)
+{
+    static const char usage[] = "usage: sg stash drop [<stash>]\n";
+    const char *spec = NULL;
+    char *git_dir;
+    size_t index;
+    sg_stash_list list;
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    char hex[SG_SHA1_HEX_LEN + 1];
+
+    if (argc == 3)
+        spec = argv[2];
+    else if (argc != 2) {
+        fputs(usage, stderr);
+        return 1;
+    }
+
+    if (sg_stash_parse_spec(spec, &index) != 0) {
+        fprintf(stderr, "sg: invalid stash spec: %s\n", spec != NULL ? spec : "");
+        return 1;
+    }
+
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
+        return 1;
+
+    if (sg_stash_list_read(git_dir, &list) != 0) {
+        fprintf(stderr, "sg: failed to read stash list\n");
+        free(git_dir);
+        return 1;
+    }
+    if (index >= list.count) {
+        fprintf(stderr, "sg: %s: log for 'stash' only has %zu entries\n",
+               spec != NULL ? spec : "stash@{0}", list.count);
+        sg_stash_list_free(&list);
+        free(git_dir);
+        return 1;
+    }
+    memcpy(commit_id, list.entries[index].commit_id, SG_SHA1_RAW_LEN);
+    sg_stash_list_free(&list);
+
+    if (sg_stash_drop(git_dir, index) != 0) {
+        fprintf(stderr, "sg: failed to drop stash@{%zu}\n", index);
+        free(git_dir);
+        return 1;
+    }
+
+    sg_sha1_to_hex(commit_id, hex);
+    printf("Dropped stash@{%zu} (%s)\n", index, hex);
+
+    free(git_dir);
+    return 0;
+}
+
+static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
+{
+    const char *cmd_name = is_pop ? "pop" : "apply";
+    char usage[64];
+    const char *spec = NULL;
+    char *git_dir;
+    char *repo_root;
+    sg_index idx;
+    size_t index;
+    sg_stash_list list;
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    sg_obj_type type;
+    unsigned char *content = NULL;
+    size_t content_len;
+    sg_commit commit;
+    int rc;
+
+    snprintf(usage, sizeof(usage), "usage: sg stash %s [<stash>]\n", cmd_name);
+
+    if (argc == 3)
+        spec = argv[2];
+    else if (argc != 2) {
+        fputs(usage, stderr);
+        return 1;
+    }
+
+    if (sg_stash_parse_spec(spec, &index) != 0) {
+        fprintf(stderr, "sg: invalid stash spec: %s\n", spec != NULL ? spec : "");
+        return 1;
+    }
+
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
+        return 1;
+    repo_root = sg_repo_root(git_dir);
+    if (repo_root == NULL) {
+        fprintf(stderr, "sg: failed to determine repository root\n");
+        free(git_dir);
+        return 1;
+    }
+
+    if (sg_index_read(git_dir, &idx) != 0) {
+        fprintf(stderr, "sg: failed to read index (corrupt?)\n");
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    if (sg_index_has_unmerged(&idx)) {
+        fprintf(stderr, "sg: 尚有未解決的衝突，無法 stash %s\n", cmd_name);
+        sg_index_free(&idx);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    sg_index_free(&idx);
+
+    {
+        char what[64];
+
+        snprintf(what, sizeof(what), "sg stash %s", cmd_name);
+        if (sg_require_clean_workdir(git_dir, repo_root, what) != 0) {
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+    }
+
+    /* Deliberate divergence from real git (which allows this): pop/apply
+       during a paused rebase is refused, consistent with switch/merge, and
+       leaves the sequencer state untouched. See CLAUDE.md's rebase-gate
+       rule and sg/stash.h's sg_stash_apply header comment. */
+    if (sg_rebase_state_exists(git_dir)) {
+        fprintf(stderr,
+               "sg: 目前有一個進行中的 rebase，無法 stash %s\n"
+               "請先完成它（sg rebase --continue）或執行 sg rebase --abort 放棄\n",
+               cmd_name);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+
+    if (sg_stash_list_read(git_dir, &list) != 0) {
+        fprintf(stderr, "sg: failed to read stash list\n");
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    if (index >= list.count) {
+        fprintf(stderr, "sg: %s: log for 'stash' only has %zu entries\n",
+               spec != NULL ? spec : "stash@{0}", list.count);
+        sg_stash_list_free(&list);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    memcpy(commit_id, list.entries[index].commit_id, SG_SHA1_RAW_LEN);
+    sg_stash_list_free(&list);
+
+    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 || type != SG_OBJ_COMMIT) {
+        fprintf(stderr, "sg: stash@{%zu} 已損壞（不是有效的 commit）\n", index);
+        free(content);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    if (sg_commit_parse(content, content_len, &commit) != 0) {
+        fprintf(stderr, "sg: stash@{%zu} 已損壞（無法解析 commit）\n", index);
+        free(content);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    free(content);
+    if (commit.parent_count < 2) {
+        fprintf(stderr, "sg: stash@{%zu}: not a stash-like commit\n", index);
+        sg_commit_free(&commit);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    if (commit.parent_count > 2) {
+        fprintf(stderr, "sg: 這個 stash 含有未追蹤檔案（git stash -u 建立），sg 目前無法還原\n");
+        sg_commit_free(&commit);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    sg_commit_free(&commit);
+
+    rc = sg_stash_apply(git_dir, repo_root, index);
+    if (rc == 1) {
+        fprintf(stderr, "自動合併失敗，工作目錄與 index 留下衝突標記（Updated upstream / Stashed "
+                        "changes）：\n"
+                        "請編輯衝突檔案並執行 `sg add <file>...` 標記為已解決；stash 本身沒有被丟棄\n");
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "sg: stash %s 失敗\n", cmd_name);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+
+    if (is_pop) {
+        char hex[SG_SHA1_HEX_LEN + 1];
+
+        sg_sha1_to_hex(commit_id, hex);
+        if (sg_stash_drop(git_dir, index) != 0) {
+            fprintf(stderr, "sg: 套用成功，但刪除 stash@{%zu} 失敗\n", index);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+        printf("Dropped stash@{%zu} (%s)\n", index, hex);
+    }
+
+    free(git_dir);
+    free(repo_root);
+    return 0;
+}
+
+int sg_cmd_stash(int argc, char **argv)
+{
+    static const char usage[] = "usage: sg stash [push] [-m <msg>]\n"
+                                "   or: sg stash list\n"
+                                "   or: sg stash apply [<stash>]\n"
+                                "   or: sg stash pop [<stash>]\n"
+                                "   or: sg stash drop [<stash>]\n"
+                                "   or: sg stash clear\n";
+
+    if (argc >= 2 && strcmp(argv[1], "list") == 0)
+        return cmd_stash_list(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "clear") == 0)
+        return cmd_stash_clear(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "apply") == 0)
+        return cmd_stash_apply_or_pop(argc, argv, 0);
+    if (argc >= 2 && strcmp(argv[1], "pop") == 0)
+        return cmd_stash_apply_or_pop(argc, argv, 1);
+    if (argc >= 2 && strcmp(argv[1], "drop") == 0)
+        return cmd_stash_drop(argc, argv);
+
+    return cmd_stash_push(argc, argv, usage);
+}

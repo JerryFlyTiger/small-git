@@ -27,6 +27,7 @@ int sg_cmd_clone(int argc, char **argv);
 int sg_cmd_fetch(int argc, char **argv);
 int sg_cmd_push(int argc, char **argv);
 int sg_cmd_chunk_info(int argc, char **argv);
+int sg_cmd_stash(int argc, char **argv);
 
 int sg_cli_run(int argc, char **argv);
 
