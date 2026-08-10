@@ -4583,12 +4583,21 @@ printf 'untracked content\n' > "$P15_POPU/u.txt"
 (cd "$P15_POPU" && git add a.txt && git stash push -q -u -m "has untracked") > /dev/null 2>&1
 check "phase15 row9 (pop -u stash): precondition -- u.txt is gone (git -u stashed it)" \
     test ! -e "$P15_POPU/u.txt"
-(cd "$P15_POPU" && "$SG" stash pop) > /dev/null 2>&1
+P15_POPU_ERR="$WORKDIR/p15_popu_err.txt"
+(cd "$P15_POPU" && "$SG" stash pop) > /dev/null 2> "$P15_POPU_ERR"
 check "phase15 row9 (pop -u stash): sg refuses (exit 1)" test $? != 0
 check "phase15 row9 (pop -u stash): the stash is still listed" \
     sh -c "[ -n \"\$(cd '$P15_POPU' && git stash list)\" ]"
 check "phase15 row9 (pop -u stash): the untracked file was not created" \
     test ! -e "$P15_POPU/u.txt"
+# The three assertions above cannot tell the -u guard from any other
+# failure: the parent-count check exists at both the CLI and the library
+# layer, and disabling either one leaves the other returning the same exit
+# 1, the same surviving stash and the same absent file. Measured -- with
+# cmd_stash.c's `parent_count > 2` branch removed, all 798 checks stayed
+# green. Only the message names which guard actually spoke.
+check "phase15 row9 (pop -u stash): the refusal names the untracked half, not a generic failure" \
+    grep -q '未追蹤檔案' "$P15_POPU_ERR"
 
 # --- apply vs pop: the ONLY thing separating the two subcommands is whether
 # the entry survives, and "it survived" is a negative assertion -- an apply
@@ -4628,6 +4637,41 @@ check "phase15 apply: the refused pop left the entry alone" \
 (cd "$P15_APPLY" && "$SG" stash pop) > /dev/null 2>&1
 check "phase15 apply/pop contrast: popping the same entry DOES remove it" \
     sh -c "! (cd '$P15_APPLY' && git stash list) | grep -q 'survives apply'"
+
+# --- push refuses an unmerged index. Real git's rule is about the index,
+# not about which operation left it that way (measured: a merge conflict and
+# a rebase conflict are refused identically, while a paused rebase with a
+# clean index is allowed). Assert the message, not just the exit code: the
+# guard exists at both the CLI and the library layer, and a third backstop
+# sits in sg_tree_build_from_index, so each one masks the others -- removing
+# cmd_stash.c's sg_index_has_unmerged branch alone left all 798 checks
+# green. ---
+P15_UNMERGED="$WORKDIR/p15_unmerged"
+p15_base_repo "$P15_UNMERGED"
+printf 'base line\n' > "$P15_UNMERGED/m.txt"
+(cd "$P15_UNMERGED" && "$SG" add m.txt && "$SG" commit -m "m base") > /dev/null 2>&1
+(cd "$P15_UNMERGED" && "$SG" branch side) > /dev/null 2>&1
+printf 'master side\n' > "$P15_UNMERGED/m.txt"
+(cd "$P15_UNMERGED" && "$SG" add m.txt && "$SG" commit -m "master edits m") > /dev/null 2>&1
+(cd "$P15_UNMERGED" && "$SG" switch side) > /dev/null 2>&1
+printf 'other side\n' > "$P15_UNMERGED/m.txt"
+(cd "$P15_UNMERGED" && "$SG" add m.txt && "$SG" commit -m "side edits m") > /dev/null 2>&1
+(cd "$P15_UNMERGED" && "$SG" merge master) > /dev/null 2>&1
+check "phase15 unmerged push: precondition -- the index really has unmerged stages" \
+    sh -c "[ -n \"\$(cd '$P15_UNMERGED' && git ls-files -u)\" ]"
+P15_UNMERGED_ERR="$WORKDIR/p15_unmerged_err.txt"
+(cd "$P15_UNMERGED" && "$SG" stash push -m "should be refused") > /dev/null 2> "$P15_UNMERGED_ERR"
+check "phase15 unmerged push: sg refuses (exit 1)" test $? != 0
+# Match the CLI guard's own wording, not just the words "unresolved
+# conflict": the library-layer fallback message speculates "...or does the
+# index have unresolved conflicts?" and contains that phrase too, so the
+# looser pattern passed with the CLI guard removed. Measured.
+check "phase15 unmerged push: the refusal is the specific guard, not the generic fallback" \
+    grep -q '尚有未解決的衝突' "$P15_UNMERGED_ERR"
+check "phase15 unmerged push: no stash was created" \
+    sh -c "! (cd '$P15_UNMERGED' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+check "phase15 unmerged push: the conflicted state was left intact" \
+    sh -c "[ -n \"\$(cd '$P15_UNMERGED' && git ls-files -u)\" ]"
 
 # --- A path that fails to reach the working tree must fail the whole apply.
 # pop drops the entry as soon as apply reports success, so treating a

@@ -51,6 +51,27 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         return 1;
     }
 
+    /* sg_stash_push refuses an unmerged index, but it is a library function
+       and reports that as a bare -1 alongside every other failure. Ask the
+       question here so the answer can be stated instead of guessed: a user
+       sitting in a conflicted merge should be told what is wrong, not handed
+       the fallback below with a question mark on the end. */
+    {
+        sg_index idx;
+
+        if (sg_index_read(git_dir, &idx) == 0) {
+            int unmerged = sg_index_has_unmerged(&idx);
+
+            sg_index_free(&idx);
+            if (unmerged) {
+                fprintf(stderr, "sg: 尚有未解決的衝突，無法 stash push\n");
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
+        }
+    }
+
     rc = sg_stash_push(git_dir, repo_root, message, commit_id);
     if (rc == 1) {
         printf("No local changes to save\n");
