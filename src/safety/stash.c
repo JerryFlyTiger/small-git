@@ -441,10 +441,9 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
     sg_merge_result result;
     sg_flat_list head_flat;
     sg_index new_idx;
+    char **conflict_paths = NULL;
+    size_t conflict_count = 0;
     size_t i;
-    int has_conflict = 0;
-    int index_ok = 1;
-    int content_missing = 0;
     int untracked_collision = 0;
 
     if (sg_stash_list_read(git_dir, &list) != 0)
@@ -515,88 +514,63 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
         return -1;
     }
 
-    memset(&new_idx, 0, sizeof(new_idx));
-
-    /* Seed with HEAD's own entries (index == HEAD, the default git leaves
-       when popping without --index), skipping any path that ends up
-       conflicted -- a conflicted path must carry ONLY stage 1/2/3 entries,
-       never a stage-0 one alongside them. */
-    for (i = 0; i < head_flat.count; i++) {
-        if (path_is_conflict(&result, head_flat.entries[i].path))
-            continue;
-        if (add_stage_entry(&new_idx, head_flat.entries[i].path, 0, head_flat.entries[i].mode,
-                            head_flat.entries[i].sha1) != 0)
-            index_ok = 0;
-    }
-
-    for (i = 0; i < result.count; i++) {
-        sg_merge_result_entry *e = &result.entries[i];
-        char abspath[4096];
-
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, e->path);
-
-        if (e->conflict) {
-            int mode = e->ours_present ? (int)(e->ours_mode & 0777)
-                                       : (e->theirs_present ? (int)(e->theirs_mode & 0777) : 0644);
-
-            has_conflict = 1;
-            /* best effort: a workdir write failure here doesn't abort the
-               index update, matching the analogous loop in cmd_merge.c */
-            (void)sg_write_file_mkdirs(abspath, e->conflict_content, e->conflict_content_len, mode);
-
-            if (e->base_present &&
-               add_stage_entry(&new_idx, e->path, 1, e->base_mode, e->base_sha1) != 0)
-                index_ok = 0;
-            if (e->ours_present &&
-               add_stage_entry(&new_idx, e->path, 2, e->ours_mode, e->ours_sha1) != 0)
-                index_ok = 0;
-            if (e->theirs_present &&
-               add_stage_entry(&new_idx, e->path, 3, e->theirs_mode, e->theirs_sha1) != 0)
-                index_ok = 0;
-        } else if (e->deleted) {
-            remove(abspath);
-            /* index entry (if any) was already seeded from HEAD above and is
-               left untouched: an unstaged deletion, matching real git. */
-        } else {
-            unsigned char *blob_content;
-            size_t blob_content_len;
-            sg_chunk_missing_info missing;
-            int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &blob_content, &blob_content_len, &missing);
-
-            if (read_rc == 0) {
-                sg_write_file_mkdirs(abspath, blob_content, blob_content_len, (int)(e->mode & 0777));
-                free(blob_content);
-            } else {
-                content_missing = 1;
-            }
-
-            if (flat_find(&head_flat, e->path) == NULL) {
-                /* absent from HEAD: stays staged, per the measured fixup. */
-                if (add_stage_entry(&new_idx, e->path, 0, e->mode, e->sha1) != 0)
-                    index_ok = 0;
-            }
-            /* present in HEAD: leave the HEAD-seeded entry alone (unstaged
-               modification). */
-        }
-    }
-
-    sg_flat_list_free(&head_flat);
-
-    if (content_missing || !index_ok) {
-        sg_index_free(&new_idx);
+    /* Materializes the merge result into the working tree and a fresh
+       index; a -1 here means either a chunked blob's data was unrecoverable
+       or the index could not be built completely. */
+    if (sg_merge_result_apply(git_dir, repo_root, &result, &new_idx, &conflict_paths, &conflict_count) !=
+       0) {
+        sg_flat_list_free(&head_flat);
         sg_merge_result_free(&result);
         return -1;
     }
 
+    /* Default pop index rule (measured): the index ends up equal to HEAD's
+       tree, except that a path the merge result introduced but HEAD never
+       had stays staged. Re-stage every HEAD path that isn't part of a
+       conflict -- path_is_conflict consults the merge result (not the
+       index), so this is correct even for a path sg_merge_result_apply left
+       with no stage-0 entry at all (HEAD had it, the stash cleanly deleted
+       it: re-staging it here is exactly the "unstaged deletion" real git
+       leaves behind). A conflicted path must carry ONLY the stage 1/2/3
+       entries sg_merge_result_apply already wrote, never a stage-0 one
+       alongside them, so those are skipped. */
+    for (i = 0; i < head_flat.count; i++) {
+        if (path_is_conflict(&result, head_flat.entries[i].path))
+            continue;
+        if (add_stage_entry(&new_idx, head_flat.entries[i].path, 0, head_flat.entries[i].mode,
+                            head_flat.entries[i].sha1) != 0) {
+            size_t j;
+
+            sg_flat_list_free(&head_flat);
+            sg_index_free(&new_idx);
+            sg_merge_result_free(&result);
+            for (j = 0; j < conflict_count; j++)
+                free(conflict_paths[j]);
+            free(conflict_paths);
+            return -1;
+        }
+    }
+    sg_flat_list_free(&head_flat);
+
     if (sg_index_write(git_dir, &new_idx) != 0) {
         sg_index_free(&new_idx);
         sg_merge_result_free(&result);
+        for (i = 0; i < conflict_count; i++)
+            free(conflict_paths[i]);
+        free(conflict_paths);
         return -1;
     }
     sg_index_free(&new_idx);
     sg_merge_result_free(&result);
 
-    return has_conflict ? 1 : 0;
+    {
+        int has_conflict = conflict_count > 0;
+
+        for (i = 0; i < conflict_count; i++)
+            free(conflict_paths[i]);
+        free(conflict_paths);
+        return has_conflict ? 1 : 0;
+    }
 }
 
 /* ---- drop / clear ------------------------------------------------------------ */

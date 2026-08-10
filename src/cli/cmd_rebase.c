@@ -50,51 +50,6 @@ static char *first_line_dup(const char *message)
     return out;
 }
 
-static int add_stage_entry(sg_index *idx, const char *path, unsigned int stage, unsigned int mode,
-                           const unsigned char sha1[SG_SHA1_RAW_LEN])
-{
-    sg_index_entry entry;
-
-    memset(&entry, 0, sizeof(entry));
-    entry.mode = mode;
-    entry.stage = stage;
-    memcpy(entry.sha1, sha1, SG_SHA1_RAW_LEN);
-    entry.path = (char *)path;
-    return sg_index_upsert(idx, &entry);
-}
-
-static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *path,
-                              unsigned int mode, const unsigned char sha1[SG_SHA1_RAW_LEN])
-{
-    char abspath[4096];
-    struct stat st;
-    sg_index_entry entry;
-
-    memset(&entry, 0, sizeof(entry));
-    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, path);
-    if (stat(abspath, &st) == 0) {
-        entry.ctime_sec = (unsigned int)st.st_ctime;
-        entry.mtime_sec = (unsigned int)st.st_mtime;
-#if defined(__APPLE__)
-        entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
-#else
-        entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
-#endif
-        entry.dev = (unsigned int)st.st_dev;
-        entry.ino = (unsigned int)st.st_ino;
-        entry.uid = (unsigned int)st.st_uid;
-        entry.gid = (unsigned int)st.st_gid;
-        entry.file_size = (unsigned int)st.st_size;
-    }
-    entry.mode = mode;
-    entry.stage = 0;
-    memcpy(entry.sha1, sha1, SG_SHA1_RAW_LEN);
-    entry.path = (char *)path;
-    return sg_index_upsert(idx, &entry);
-}
-
 static void print_conflict_message(const unsigned char commit_id[SG_SHA1_RAW_LEN],
                                    const char *commit_message, char **conflict_paths,
                                    size_t conflict_count)
@@ -146,13 +101,9 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
     sg_commit commit;
     sg_merge_result result;
     sg_index new_idx;
-    sg_flat_entry *flat_entries = NULL;
-    size_t flat_count = 0;
     char **conflict_paths = NULL;
     size_t conflict_count = 0;
-    int has_conflict = 0;
-    int index_ok = 1;
-    int content_missing = 0;
+    int has_conflict;
     char short_sha[8];
     char theirs_label[300];
     pick_rc rc = PICK_ERROR;
@@ -199,91 +150,16 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
         return PICK_ERROR;
     }
 
-    memset(&new_idx, 0, sizeof(new_idx));
-    flat_entries = result.count > 0 ? malloc(result.count * sizeof(*flat_entries)) : NULL;
-    if (result.count > 0 && flat_entries == NULL) {
-        fprintf(stderr, "sg: out of memory\n");
-        sg_merge_result_free(&result);
-        sg_commit_free(&commit);
-        return PICK_ERROR;
-    }
-
-    for (i = 0; i < result.count; i++) {
-        sg_merge_result_entry *e = &result.entries[i];
-        char abspath[4096];
-
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, e->path);
-
-        if (e->conflict) {
-            int mode = e->ours_present ? (int)(e->ours_mode & 0777)
-                                       : (e->theirs_present ? (int)(e->theirs_mode & 0777) : 0644);
-            char **grown;
-
-            has_conflict = 1;
-            if (sg_write_file_mkdirs(abspath, e->conflict_content, e->conflict_content_len, mode) != 0)
-                fprintf(stderr, "sg: failed to write conflicted '%s'\n", e->path);
-
-            if (e->base_present && add_stage_entry(&new_idx, e->path, 1, e->base_mode,
-                                                   e->base_sha1) != 0)
-                index_ok = 0;
-            if (e->ours_present && add_stage_entry(&new_idx, e->path, 2, e->ours_mode,
-                                                   e->ours_sha1) != 0)
-                index_ok = 0;
-            if (e->theirs_present && add_stage_entry(&new_idx, e->path, 3, e->theirs_mode,
-                                                     e->theirs_sha1) != 0)
-                index_ok = 0;
-
-            grown = realloc(conflict_paths, (conflict_count + 1) * sizeof(*grown));
-            if (grown != NULL) {
-                conflict_paths = grown;
-                conflict_paths[conflict_count] = strdup(e->path);
-                if (conflict_paths[conflict_count] != NULL)
-                    conflict_count++;
-            }
-        } else if (e->deleted) {
-            remove(abspath);
-        } else {
-            unsigned char *blob_content;
-            size_t blob_len;
-            sg_chunk_missing_info missing;
-            int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &blob_content, &blob_len, &missing);
-
-            if (read_rc == 0) {
-                if (sg_write_file_mkdirs(abspath, blob_content, blob_len, (int)(e->mode & 0777)) != 0)
-                    fprintf(stderr, "sg: failed to write '%s'\n", e->path);
-                free(blob_content);
-            } else if (read_rc == -2) {
-                sg_chunk_print_missing_error(e->path, &missing);
-                content_missing = 1;
-            } else {
-                fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
-            }
-            if (add_resolved_entry(repo_root, &new_idx, e->path, e->mode, e->sha1) != 0)
-                index_ok = 0;
-
-            flat_entries[flat_count].path = e->path; /* transient view, not owned */
-            flat_entries[flat_count].mode = e->mode;
-            memcpy(flat_entries[flat_count].sha1, e->sha1, SG_SHA1_RAW_LEN);
-            flat_count++;
-        }
-    }
-
-    /* A chunked file whose data actually can't be recovered (as opposed to a
-       plain missing-blob defensive check, which "can't happen" in practice)
-       must abort this pick outright -- sg_chunk_print_missing_error already
-       explained why for every affected path above, so there's nothing left
-       to do here except refuse to record a commit/index that silently drops
-       the content. */
-    if (content_missing) {
+    /* Materializes the merge result into the working tree and a fresh
+       index; a -1 here means either a chunked blob's data was unrecoverable
+       or the index couldn't be built completely -- refuse to record a
+       commit/index that silently drops content or paths. */
+    if (sg_merge_result_apply(git_dir, repo_root, &result, &new_idx, &conflict_paths,
+                              &conflict_count) != 0) {
         rc = PICK_ERROR;
         goto done;
     }
-
-    if (!index_ok) {
-        fprintf(stderr, "sg: out of memory building the merged index; 沒有寫入 index\n");
-        rc = PICK_ERROR;
-        goto done;
-    }
+    has_conflict = conflict_count > 0;
 
     if (has_conflict) {
         if (sg_index_write(git_dir, &new_idx) != 0) {
@@ -304,7 +180,7 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
     {
         unsigned char merged_tree[SG_SHA1_RAW_LEN];
 
-        if (sg_tree_build(git_dir, flat_entries, flat_count, merged_tree) != 0) {
+        if (sg_tree_build_from_index(git_dir, &new_idx, merged_tree) != 0) {
             fprintf(stderr, "sg: failed to build tree while cherry-picking %s\n", short_sha);
             rc = PICK_ERROR;
             goto done;
@@ -385,7 +261,6 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
 
 done:
     sg_merge_result_free(&result);
-    free(flat_entries);
     for (i = 0; i < conflict_count; i++)
         free(conflict_paths[i]);
     free(conflict_paths);

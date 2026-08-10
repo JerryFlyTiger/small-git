@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "sg/hash.h"
+#include "sg/index.h"
 
 /* ---- merge base (common ancestor) ---- */
 
@@ -83,6 +84,22 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
                    const char *theirs_label, sg_merge_result *out);
 
 void sg_merge_result_free(sg_merge_result *result);
+
+/* Materializes a sg_merge_result into the working tree and into a fresh
+   in-memory index: clean entries are written as files and staged at stage 0,
+   deleted entries are removed, conflicted entries get their marker-laden
+   content written and index stages 1/2/3 (only for the sides actually
+   present). Does NOT write the index to disk, does not touch HEAD/refs, and
+   does not write MERGE_HEAD -- callers own all of that. *index_out is owned
+   by the caller (sg_index_free). *conflict_count_out is the number of
+   conflicted paths; *conflict_paths_out is a malloc'd array of malloc'd
+   paths (caller frees both) or NULL when there are none. Returns 0 on
+   success, -1 if a chunked blob's data is unrecoverable or the index could
+   not be built completely -- in which case the working tree may already be
+   partially updated (same caveat as sg_apply_tree_to_workdir) and the caller
+   must abort rather than record a state that silently dropped paths. */
+int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_merge_result *result,
+                          sg_index *index_out, char ***conflict_paths_out, size_t *conflict_count_out);
 
 /* ---- MERGE_HEAD (in-progress merge state) ---- */
 

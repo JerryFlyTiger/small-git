@@ -7,11 +7,13 @@
 #include "sg/objstore.h"
 #include "sg/repo.h"
 #include "sg/tree_build.h"
+#include "sg/workdir.h"
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* ==================== merge base ==================== */
 
@@ -793,6 +795,140 @@ void sg_merge_result_free(sg_merge_result *result)
     free(result->entries);
     result->entries = NULL;
     result->count = 0;
+}
+
+/* ==================== materializing a merge result ==================== */
+
+static int add_stage_entry(sg_index *idx, const char *path, unsigned int stage, unsigned int mode,
+                           const unsigned char sha1[SG_SHA1_RAW_LEN])
+{
+    sg_index_entry entry;
+
+    memset(&entry, 0, sizeof(entry));
+    entry.mode = mode;
+    entry.stage = stage;
+    memcpy(entry.sha1, sha1, SG_SHA1_RAW_LEN);
+    entry.path = (char *)path;
+    return sg_index_upsert(idx, &entry);
+}
+
+static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *path,
+                              unsigned int mode, const unsigned char sha1[SG_SHA1_RAW_LEN])
+{
+    char abspath[4096];
+    struct stat st;
+    sg_index_entry entry;
+
+    memset(&entry, 0, sizeof(entry));
+    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, path);
+    if (stat(abspath, &st) == 0) {
+        entry.ctime_sec = (unsigned int)st.st_ctime;
+        entry.mtime_sec = (unsigned int)st.st_mtime;
+#if defined(__APPLE__)
+        entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
+        entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
+#else
+        entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
+        entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
+#endif
+        entry.dev = (unsigned int)st.st_dev;
+        entry.ino = (unsigned int)st.st_ino;
+        entry.uid = (unsigned int)st.st_uid;
+        entry.gid = (unsigned int)st.st_gid;
+        entry.file_size = (unsigned int)st.st_size;
+    }
+    entry.mode = mode;
+    entry.stage = 0;
+    memcpy(entry.sha1, sha1, SG_SHA1_RAW_LEN);
+    entry.path = (char *)path;
+    return sg_index_upsert(idx, &entry);
+}
+
+int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_merge_result *result,
+                          sg_index *index_out, char ***conflict_paths_out, size_t *conflict_count_out)
+{
+    char **conflict_paths = NULL;
+    size_t conflict_count = 0;
+    size_t i;
+    int index_ok = 1;
+    int content_missing = 0;
+
+    memset(index_out, 0, sizeof(*index_out));
+
+    for (i = 0; i < result->count; i++) {
+        sg_merge_result_entry *e = &result->entries[i];
+        char abspath[4096];
+
+        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, e->path);
+
+        if (e->conflict) {
+            int mode = e->ours_present ? (int)(e->ours_mode & 0777)
+                                       : (e->theirs_present ? (int)(e->theirs_mode & 0777) : 0644);
+            char **grown;
+
+            if (sg_write_file_mkdirs(abspath, e->conflict_content, e->conflict_content_len, mode) != 0)
+                fprintf(stderr, "sg: failed to write conflicted '%s'\n", e->path);
+
+            if (e->base_present && add_stage_entry(index_out, e->path, 1, e->base_mode,
+                                                   e->base_sha1) != 0)
+                index_ok = 0;
+            if (e->ours_present && add_stage_entry(index_out, e->path, 2, e->ours_mode,
+                                                   e->ours_sha1) != 0)
+                index_ok = 0;
+            if (e->theirs_present && add_stage_entry(index_out, e->path, 3, e->theirs_mode,
+                                                     e->theirs_sha1) != 0)
+                index_ok = 0;
+
+            grown = realloc(conflict_paths, (conflict_count + 1) * sizeof(*grown));
+            if (grown != NULL) {
+                conflict_paths = grown;
+                conflict_paths[conflict_count] = strdup(e->path);
+                if (conflict_paths[conflict_count] != NULL)
+                    conflict_count++;
+            }
+        } else if (e->deleted) {
+            remove(abspath);
+        } else {
+            unsigned char *content;
+            size_t content_len;
+            sg_chunk_missing_info missing;
+            int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &content, &content_len, &missing);
+
+            if (read_rc == 0) {
+                if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0)
+                    fprintf(stderr, "sg: failed to write '%s'\n", e->path);
+                free(content);
+            } else if (read_rc == -2) {
+                sg_chunk_print_missing_error(e->path, &missing);
+                content_missing = 1;
+            } else {
+                fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
+            }
+            if (add_resolved_entry(repo_root, index_out, e->path, e->mode, e->sha1) != 0)
+                index_ok = 0;
+        }
+    }
+
+    /* A chunked file whose data actually can't be recovered, or an index
+       that couldn't be built completely (allocation failure), must abort
+       the whole apply -- there's nothing left to do except refuse to hand
+       back a state that silently drops content or paths. */
+    if (content_missing || !index_ok) {
+        sg_index_free(index_out);
+        memset(index_out, 0, sizeof(*index_out));
+        for (i = 0; i < conflict_count; i++)
+            free(conflict_paths[i]);
+        free(conflict_paths);
+        return -1;
+    }
+
+    if (conflict_count == 0) {
+        free(conflict_paths);
+        conflict_paths = NULL;
+    }
+    *conflict_paths_out = conflict_paths;
+    *conflict_count_out = conflict_count;
+    return 0;
 }
 
 /* ==================== MERGE_HEAD ==================== */
