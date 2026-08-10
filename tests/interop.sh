@@ -4590,6 +4590,45 @@ check "phase15 row9 (pop -u stash): the stash is still listed" \
 check "phase15 row9 (pop -u stash): the untracked file was not created" \
     test ! -e "$P15_POPU/u.txt"
 
+# --- apply vs pop: the ONLY thing separating the two subcommands is whether
+# the entry survives, and "it survived" is a negative assertion -- an apply
+# that also dropped would restore the same bytes and exit 0 just the same,
+# so asserting the working tree alone proves nothing. Assert the stash is
+# still addressable afterwards (both by sg and by real git, since a
+# half-done drop could leave the reflog and refs/stash disagreeing), then
+# pop the same entry and assert it is gone -- the contrast is what makes
+# either half meaningful. ---
+P15_APPLY="$WORKDIR/p15_apply"
+p15_base_repo "$P15_APPLY"
+printf 'apply me\n' > "$P15_APPLY/a.txt"
+(cd "$P15_APPLY" && "$SG" stash push -m "survives apply") > /dev/null 2>&1
+(cd "$P15_APPLY" && "$SG" stash apply) > /dev/null 2>&1
+check "phase15 apply: exits 0" test $? = 0
+check "phase15 apply: the working tree content was restored" \
+    grep -q 'apply me' "$P15_APPLY/a.txt"
+check "phase15 apply: the entry is STILL listed by sg (apply must not drop)" \
+    sh -c "(cd '$P15_APPLY' && '$SG' stash list) | grep -q 'survives apply'"
+check "phase15 apply: the entry is STILL listed by real git too" \
+    sh -c "(cd '$P15_APPLY' && git stash list) | grep -q 'survives apply'"
+check "phase15 apply: refs/stash still resolves after apply" \
+    sh -c "(cd '$P15_APPLY' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+P15_APPLY_REF=$(cd "$P15_APPLY" && git rev-parse refs/stash 2>/dev/null)
+P15_APPLY_LOGTIP=$(cd "$P15_APPLY" && tail -1 .git/logs/refs/stash 2>/dev/null | cut -d' ' -f2)
+check "phase15 apply: the tip invariant still holds after apply" \
+    test "$P15_APPLY_REF" = "$P15_APPLY_LOGTIP"
+# A successful apply necessarily leaves the working tree dirty, and Phase 15
+# deliberately requires a clean tree to pop (a documented divergence from real
+# git, which would three-way merge here). Pin that refusal rather than working
+# around it silently, then clean up and pop for real.
+(cd "$P15_APPLY" && "$SG" stash pop) > /dev/null 2>&1
+check "phase15 apply: popping onto the tree apply just dirtied is refused" test $? != 0
+check "phase15 apply: the refused pop left the entry alone" \
+    sh -c "(cd '$P15_APPLY' && git stash list) | grep -q 'survives apply'"
+(cd "$P15_APPLY" && git checkout -q -- a.txt) > /dev/null 2>&1
+(cd "$P15_APPLY" && "$SG" stash pop) > /dev/null 2>&1
+check "phase15 apply/pop contrast: popping the same entry DOES remove it" \
+    sh -c "! (cd '$P15_APPLY' && git stash list) | grep -q 'survives apply'"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
