@@ -13,8 +13,9 @@
 可以做什麼,而不是丟一串術語。支援 `.gitignore`(逐目錄規則、否定、`**`、字元類等完整
 `gitignore(5)` 語意),`sg add .` 遞迴整個目錄樹,`sg branch` 列出/建立/刪除分支。
 
-**危險操作沒有救援。** 會造成資料遺失的操作(`switch`、`restore`、`merge`、`rebase`)在執行前
-自動建立快照,存在 `refs/small-git/undo/`,用 `sg undo` 列出、`sg undo <編號>` 還原。
+**危險操作沒有救援。** 會造成資料遺失的操作(`switch`、`restore`、`merge`、`rebase`、
+`stash push`)在執行前自動建立快照,存在 `refs/small-git/undo/`,用 `sg undo` 列出、
+`sg undo <編號>` 還原。
 `--force` 只跳過「確認提問」,不跳過快照——所以按 `--force` 一路做下去仍然救得回來。
 
 **大型/二進位檔案。** 內建內容定義分塊(CDC),超過門檻的檔案切成 chunk 去重,概念類似不需要
@@ -92,6 +93,7 @@ sg undo 1                     # 內容回來了
 | `merge` | 合併另一個分支(`--abort` 中止) |
 | `merge-base` | 找出兩個 commit 的最近共同祖先 |
 | `rebase` | 重新套用到另一個分支之上(`--continue`/`--skip`/`--abort`) |
+| `stash` | 暫存工作進度並回到乾淨狀態(`push`/`list`/`apply`/`pop`/`drop`/`clear`) |
 | `clone` | 從遠端複製 repository(smart HTTP) |
 | `fetch` | 從遠端取得新的 commit 與 ref |
 | `push` | 將本地分支或 tag 推送到遠端(`--tags` 推送全部 tag) |
@@ -108,7 +110,7 @@ sg undo 1                     # 內容回來了
 - `sg` 建立的 repo 可以直接用 `git` 操作,通過 `git fsck --strict`;`git` 建立的 repo 也可以
   直接用 `sg` 操作,包含 `git gc` 之後把 ref 收進 `packed-refs`、把物件打包成 pack 的狀態。
 - 網路端實作 smart HTTP,可與真實的 git 伺服器互通(clone/fetch/push)。
-- 測試套件 `tests/interop.sh` 有 680 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
+- 測試套件 `tests/interop.sh` 有 826 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
   (含一個本機 `git http-backend` 伺服器)來驗證,而不是自己跟自己比對。
 
 **唯一的例外是啟用分塊之後**——那時 tree 裡放的是指標 blob,`git checkout` 會拿到指標文字。
@@ -129,6 +131,11 @@ sg undo 1                     # 內容回來了
 - **寫入端不產生超過 2GB 的 pack**(會明確報錯而非產生壞檔);讀取端支援。
 - **啟用分塊後 `refs/sg/chunks` 不可刪除**,所有 chunk 靠它在物件圖中保持可達,刪掉之後
   `git gc` 會清掉資料。`sg` 偵測到這個狀態會硬失敗,不會靜默寫出指標文字。
+- **`sg stash` 只實作核心子集**:`push`/`list`/`apply`/`pop`/`drop`/`clear`。
+  不支援 `-u`(未追蹤檔案)、`show`、`--index`、`--keep-index` 與 pathspec。
+  `pop`/`apply` 要求工作目錄乾淨(真 git 會做三方合併),rebase 進行中則直接拒絕。
+  格式本身完全相容——`sg` 建的 stash 真 `git` 讀得到、反之亦然,`stash@{n}` 走的是
+  與真 git 逐位元組相同的 reflog。
 - **未實作 commit-graph 與 multi-pack-index**。原本規劃在 Phase 7,但物件存取層修好之後
   `sg log` 已與 `git log` 同級,邊際效益不高,留待有實際需求再評估。
 
