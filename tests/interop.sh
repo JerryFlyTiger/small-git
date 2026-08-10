@@ -4453,6 +4453,81 @@ check "phase15 row2 (rebase push): the paused rebase is still USABLE -- continue
 check "phase15 row2 (rebase push): continue actually finished the rebase" \
     test ! -d "$P15_REBASE_PUSH/.git/sg-rebase"
 
+# --- row 2 oracle: real git 2.55.0 behaves IDENTICALLY here (measured) --
+# `stash push` while a rebase is paused resets the index/workdir back to
+# HEAD, so `--continue` decides the paused commit's change is already
+# upstream and silently skips it, leaving the work only in the stash. sg is
+# not "fixing" this -- it is matching real git -- so this runs the identical
+# scenario through real git in its own repo and asserts the two end states
+# agree with EACH OTHER (git is the oracle here, not a hard-coded
+# expectation). Commit ids are never compared (sg's committer timestamp/tz
+# differ from real git's), only content, counts, and presence. ---
+P15_REBASE_PUSH_GIT="$WORKDIR/p15_rebase_push_git"
+mkdir -p "$P15_REBASE_PUSH_GIT"
+(cd "$WORKDIR" && git init -q p15_rebase_push_git)
+(cd "$P15_REBASE_PUSH_GIT" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'a\n' > "$P15_REBASE_PUSH_GIT/a.txt"
+(cd "$P15_REBASE_PUSH_GIT" && git add a.txt && git commit -q -m base)
+(cd "$P15_REBASE_PUSH_GIT" && git switch -q -c feature)
+printf 'feature1\n' >> "$P15_REBASE_PUSH_GIT/a.txt"
+(cd "$P15_REBASE_PUSH_GIT" && git add a.txt && git commit -q -m "feature change")
+(cd "$P15_REBASE_PUSH_GIT" && git switch -q master)
+printf 'master1\n' >> "$P15_REBASE_PUSH_GIT/a.txt"
+(cd "$P15_REBASE_PUSH_GIT" && git add a.txt && git commit -q -m "master change")
+(cd "$P15_REBASE_PUSH_GIT" && git switch -q feature)
+(cd "$P15_REBASE_PUSH_GIT" && git rebase master) > /dev/null 2>&1
+printf 'resolved\n' > "$P15_REBASE_PUSH_GIT/a.txt"
+(cd "$P15_REBASE_PUSH_GIT" && git add a.txt)
+(cd "$P15_REBASE_PUSH_GIT" && git stash push -m "during rebase") > /dev/null 2>&1
+check "phase15 row2 oracle: real git stash push during a paused rebase exits 0" test $? = 0
+(cd "$P15_REBASE_PUSH_GIT" && git rebase --continue) > /dev/null 2>&1
+check "phase15 row2 oracle: real git rebase --continue exits 0" test $? = 0
+check "phase15 row2 oracle: real git's rebase sequencer state is gone (continue finished)" \
+    sh -c "test ! -d '$P15_REBASE_PUSH_GIT/.git/rebase-merge' && test ! -d '$P15_REBASE_PUSH_GIT/.git/rebase-apply'"
+
+P15_REBASE_PUSH_ATXT="$WORKDIR/p15_rebase_push_atxt.txt"
+P15_REBASE_PUSH_GIT_ATXT="$WORKDIR/p15_rebase_push_git_atxt.txt"
+cp "$P15_REBASE_PUSH/a.txt" "$P15_REBASE_PUSH_ATXT"
+cp "$P15_REBASE_PUSH_GIT/a.txt" "$P15_REBASE_PUSH_GIT_ATXT"
+check "phase15 row2 equivalence: sg and real git end up with byte-identical a.txt after continue" \
+    cmp -s "$P15_REBASE_PUSH_ATXT" "$P15_REBASE_PUSH_GIT_ATXT"
+check "phase15 row2 equivalence: neither side's final a.txt contains the feature-only text" \
+    sh -c "! grep -q feature1 '$P15_REBASE_PUSH_ATXT' && ! grep -q feature1 '$P15_REBASE_PUSH_GIT_ATXT'"
+
+P15_REBASE_PUSH_LOGCOUNT=$(cd "$P15_REBASE_PUSH" && git rev-list --count HEAD)
+P15_REBASE_PUSH_GIT_LOGCOUNT=$(cd "$P15_REBASE_PUSH_GIT" && git rev-list --count HEAD)
+check "phase15 row2 equivalence: sg and real git end up with the same commit count on HEAD (both lost the feature commit)" \
+    test "$P15_REBASE_PUSH_LOGCOUNT" = "$P15_REBASE_PUSH_GIT_LOGCOUNT"
+
+check "phase15 row2 equivalence: sg's stash still has the parked work" \
+    sh -c "[ -n \"\$(cd '$P15_REBASE_PUSH' && git stash list)\" ]"
+check "phase15 row2 equivalence: real git's stash still has the parked work" \
+    sh -c "[ -n \"\$(cd '$P15_REBASE_PUSH_GIT' && git stash list)\" ]"
+
+# --- row 2 warning (fix 1(b)): sg's stash push warns on stderr when a
+# rebase is paused, since the workdir-reset consequence above is easy to
+# trip over unknowingly. The message must not change the behavior above --
+# assert the sequencer state is still exactly as untouched as row 2 already
+# proved. ---
+P15_REBASE_PUSH_WARN="$WORKDIR/p15_rebase_push_warn"
+p15_base_repo "$P15_REBASE_PUSH_WARN"
+(cd "$P15_REBASE_PUSH_WARN" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\n' >> "$P15_REBASE_PUSH_WARN/a.txt"
+(cd "$P15_REBASE_PUSH_WARN" && "$SG" add a.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P15_REBASE_PUSH_WARN" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\n' >> "$P15_REBASE_PUSH_WARN/a.txt"
+(cd "$P15_REBASE_PUSH_WARN" && "$SG" add a.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P15_REBASE_PUSH_WARN" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+(cd "$P15_REBASE_PUSH_WARN" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+printf 'resolved\n' > "$P15_REBASE_PUSH_WARN/a.txt"
+(cd "$P15_REBASE_PUSH_WARN" && "$SG" add a.txt) > /dev/null 2>&1
+P15_REBASE_PUSH_WARN_ERR="$WORKDIR/p15_rebase_push_warn_err.txt"
+(cd "$P15_REBASE_PUSH_WARN" && "$SG" stash push -m warned) > /dev/null 2> "$P15_REBASE_PUSH_WARN_ERR"
+check "phase15 row2 warning: stash push during a paused rebase prints a stderr warning" \
+    grep -q "rebase" "$P15_REBASE_PUSH_WARN_ERR"
+check "phase15 row2 warning: the sequencer state is untouched (a warning, not a behavior change)" \
+    test -d "$P15_REBASE_PUSH_WARN/.git/sg-rebase"
+
 # --- row 3: push clears MERGE_HEAD -- both "clear it" and "leave a stale
 # MERGE_HEAD referring to an object that's about to be reset away" can exit
 # 0; assert absence AND that the stash still applies cleanly afterward. ---

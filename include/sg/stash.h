@@ -47,10 +47,15 @@ int sg_stash_parse_spec(const char *spec, size_t *index_out);
    Returns 0 when a stash was created, 1 when there was nothing to save
    (working tree and index both already equal HEAD -- nothing on disk was
    touched, and the caller prints "No local changes to save" and exits 0,
-   matching git), -1 on failure. Refuses (-1) on an unborn HEAD or an
-   unmerged index. Deliberately does NOT touch a paused rebase's sequencer
-   state, and does NOT remove MERGE_HEAD -- both are the CLI layer's job (see
-   cmd_stash.c). */
+   matching git), -1 on failure before anything durable was written (refuses
+   this way on an unborn HEAD or an unmerged index -- the caller may report
+   "nothing happened"). Returns -2 when the stash commit + refs/stash were
+   already written durably (so it IS on `sg stash list`) but a later step --
+   the snapshot or the working-tree reset back to HEAD -- failed; the caller
+   must not claim nothing was created, and should tell the user the entry
+   exists and the working tree may not have been reset. Deliberately does NOT
+   touch a paused rebase's sequencer state, and does NOT remove MERGE_HEAD --
+   both are the CLI layer's job (see cmd_stash.c). */
 int sg_stash_push(const char *git_dir, const char *repo_root, const char *message,
                   unsigned char commit_id_out[SG_SHA1_RAW_LEN]);
 

@@ -370,17 +370,20 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const char *messag
 
     /* Destructive from here on: the stash object + ref are durable, so a
        failure past this point leaves the user's work safely recoverable via
-       `sg stash apply` even if the working tree reset itself fails. */
+       `sg stash apply` even if the working tree reset itself fails. That is
+       exactly why these two return -2 instead of -1: the caller must not
+       claim "nothing was created" once the stash entry is already listed in
+       `sg stash list`. */
     if (sg_snapshot_create(git_dir, repo_root, &idx, "stash push", NULL) != 0) {
         free(branch);
         sg_index_free(&idx);
-        return -1;
+        return -2;
     }
     sg_index_free(&idx);
 
     if (sg_apply_tree_to_workdir(git_dir, repo_root, head_tree) != 0) {
         free(branch);
-        return -1;
+        return -2;
     }
 
     memcpy(commit_id_out, stash_commit_id, SG_SHA1_RAW_LEN);
@@ -595,11 +598,20 @@ int sg_stash_drop(const char *git_dir, size_t index)
     new_count = log.count - 1;
 
     if (new_count == 0) {
+        if (sg_reflog_rewrite(git_dir, "refs/stash", NULL, 0) != 0) {
+            sg_reflog_free(&log);
+            return -1;
+        }
+        if (sg_ref_delete_under(git_dir, "refs/", "stash") == -1) {
+            /* Best effort: put the reflog we just wiped back so refs/stash
+               (still pointing at the pre-drop tip) doesn't end up without
+               the reflog line backing it -- the "log for ref refs/stash
+               unexpectedly ended" state the header warns about. */
+            sg_reflog_rewrite(git_dir, "refs/stash", log.entries, log.count);
+            sg_reflog_free(&log);
+            return -1;
+        }
         sg_reflog_free(&log);
-        if (sg_reflog_rewrite(git_dir, "refs/stash", NULL, 0) != 0)
-            return -1;
-        if (sg_ref_delete_under(git_dir, "refs/", "stash") == -1)
-            return -1;
         return 0;
     }
 
@@ -615,8 +627,15 @@ int sg_stash_drop(const char *git_dir, size_t index)
     }
 
     rc = sg_reflog_rewrite(git_dir, "refs/stash", new_entries, new_count);
-    if (rc == 0)
+    if (rc == 0) {
         rc = sg_ref_write_path(git_dir, "refs/stash", new_entries[new_count - 1].new_id);
+        if (rc != 0) {
+            /* refs/stash still points at the pre-drop tip; restore the
+               original reflog (still in `log`) so the tip invariant holds
+               instead of leaving a rewritten reflog the ref disagrees with. */
+            sg_reflog_rewrite(git_dir, "refs/stash", log.entries, log.count);
+        }
+    }
 
     free(new_entries);
     sg_reflog_free(&log);
@@ -625,9 +644,27 @@ int sg_stash_drop(const char *git_dir, size_t index)
 
 int sg_stash_clear(const char *git_dir)
 {
-    if (sg_reflog_rewrite(git_dir, "refs/stash", NULL, 0) != 0)
+    sg_reflog log;
+    int have_log = (sg_reflog_read(git_dir, "refs/stash", &log) == 0);
+
+    if (sg_reflog_rewrite(git_dir, "refs/stash", NULL, 0) != 0) {
+        if (have_log)
+            sg_reflog_free(&log);
         return -1;
-    if (sg_ref_delete_under(git_dir, "refs/", "stash") == -1)
+    }
+    if (sg_ref_delete_under(git_dir, "refs/", "stash") == -1) {
+        /* Best effort: put the reflog we just wiped back so refs/stash
+           (still pointing at the pre-clear tip) isn't left without the
+           reflog line backing it. Skipped when we could not read the
+           original reflog in the first place (have_log == 0) -- there is
+           nothing to restore. */
+        if (have_log && log.count > 0)
+            sg_reflog_rewrite(git_dir, "refs/stash", log.entries, log.count);
+        if (have_log)
+            sg_reflog_free(&log);
         return -1;
+    }
+    if (have_log)
+        sg_reflog_free(&log);
     return 0;
 }

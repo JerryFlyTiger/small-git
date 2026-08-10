@@ -72,12 +72,41 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         }
     }
 
+    /* Real git behaves identically here (measured against git 2.55.0): a
+       stash push while a rebase is paused resets the working tree and index
+       back to HEAD, which can make `sg rebase --continue` decide the paused
+       commit's change is already upstream and silently skip it. sg does not
+       change that behavior -- it matches git -- but it does not warn about
+       it either, so say so. The rebase sequencer state itself is untouched
+       by this (see sg_stash_push's header comment). */
+    if (sg_rebase_state_exists(git_dir)) {
+        fprintf(stderr, "sg: 目前有一個進行中的 rebase；這次 stash push 會把工作目錄與 index 重設回 "
+                        "HEAD，之後 `sg rebase --continue` 可能因此略過目前這個 commit\n");
+    }
+
     rc = sg_stash_push(git_dir, repo_root, message, commit_id);
     if (rc == 1) {
         printf("No local changes to save\n");
         free(git_dir);
         free(repo_root);
         return 0;
+    }
+    if (rc == -2) {
+        /* The stash commit + refs/stash were already written durably (it IS
+           on `sg stash list`) -- only the snapshot or the working-tree reset
+           back to HEAD failed after that. Saying "無法建立 stash" here would
+           be a lie: the entry exists, only its cleanup step is in doubt. */
+        sg_stash_list list;
+
+        fprintf(stderr, "sg: stash 已建立，但後續步驟失敗（快照或還原工作目錄回 HEAD）；"
+                        "請自行確認工作目錄狀態\n");
+        if (sg_stash_list_read(git_dir, &list) == 0 && list.count > 0) {
+            fprintf(stderr, "sg: 該 stash 為 stash@{0}: %s\n", list.entries[0].message);
+            sg_stash_list_free(&list);
+        }
+        free(git_dir);
+        free(repo_root);
+        return 1;
     }
     if (rc != 0) {
         fprintf(stderr, "sg: 無法建立 stash（未初始化的 HEAD，或 index 有未解決的衝突？）\n");
@@ -369,6 +398,18 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
         free(git_dir);
         free(repo_root);
         return 1;
+    }
+
+    /* Real git prints the working-tree status (identical to `git status`)
+       after a clean apply or pop (measured `git stash apply`/`git stash
+       pop` against git 2.55.0) -- sg previously printed nothing at all on a
+       clean apply. Reuse sg_cmd_status wholesale rather than duplicating its
+       formatting. */
+    {
+        char *status_argv[1];
+
+        status_argv[0] = (char *)"status";
+        sg_cmd_status(1, status_argv);
     }
 
     if (is_pop) {
