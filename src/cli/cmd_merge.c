@@ -29,27 +29,6 @@ static const char *env_or(const char *name, const char *fallback)
     return (v != NULL && v[0] != '\0') ? v : fallback;
 }
 
-static int resolve_commit_tree(const char *git_dir, const unsigned char commit_id[SG_SHA1_RAW_LEN],
-                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
-{
-    sg_obj_type type;
-    unsigned char *content;
-    size_t content_len;
-    sg_commit commit;
-
-    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
-       type != SG_OBJ_COMMIT)
-        return -1;
-    if (sg_commit_parse(content, content_len, &commit) != 0) {
-        free(content);
-        return -1;
-    }
-    free(content);
-    memcpy(tree_id_out, commit.tree, SG_SHA1_RAW_LEN);
-    sg_commit_free(&commit);
-    return 0;
-}
-
 static int do_fast_forward(const char *git_dir, const char *repo_root, const char *current_branch,
                            const char *branch_arg, const unsigned char theirs_commit[SG_SHA1_RAW_LEN],
                            const unsigned char theirs_tree[SG_SHA1_RAW_LEN], int force)
@@ -73,51 +52,6 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
 
     printf("Fast-forward\n");
     return 0;
-}
-
-static int add_stage_entry(sg_index *idx, const char *path, unsigned int stage, unsigned int mode,
-                           const unsigned char sha1[SG_SHA1_RAW_LEN])
-{
-    sg_index_entry entry;
-
-    memset(&entry, 0, sizeof(entry));
-    entry.mode = mode;
-    entry.stage = stage;
-    memcpy(entry.sha1, sha1, SG_SHA1_RAW_LEN);
-    entry.path = (char *)path;
-    return sg_index_upsert(idx, &entry);
-}
-
-static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *path,
-                              unsigned int mode, const unsigned char sha1[SG_SHA1_RAW_LEN])
-{
-    char abspath[4096];
-    struct stat st;
-    sg_index_entry entry;
-
-    memset(&entry, 0, sizeof(entry));
-    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, path);
-    if (stat(abspath, &st) == 0) {
-        entry.ctime_sec = (unsigned int)st.st_ctime;
-        entry.mtime_sec = (unsigned int)st.st_mtime;
-#if defined(__APPLE__)
-        entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
-#else
-        entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
-#endif
-        entry.dev = (unsigned int)st.st_dev;
-        entry.ino = (unsigned int)st.st_ino;
-        entry.uid = (unsigned int)st.st_uid;
-        entry.gid = (unsigned int)st.st_gid;
-        entry.file_size = (unsigned int)st.st_size;
-    }
-    entry.mode = mode;
-    entry.stage = 0;
-    memcpy(entry.sha1, sha1, SG_SHA1_RAW_LEN);
-    entry.path = (char *)path;
-    return sg_index_upsert(idx, &entry);
 }
 
 static void print_conflict_message(char **conflict_paths, size_t conflict_count)
@@ -145,18 +79,14 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     sg_index idx;
     sg_merge_result result;
     sg_index new_idx;
-    sg_flat_entry *flat_entries = NULL;
-    size_t flat_count = 0;
     char **conflict_paths = NULL;
     size_t conflict_count = 0;
     size_t i;
-    int has_conflict = 0;
-    int index_ok = 1;
-    int content_missing = 0;
+    int has_conflict;
     int rc = 1;
 
-    if (resolve_commit_tree(git_dir, ours_commit, ours_tree) != 0 ||
-       resolve_commit_tree(git_dir, base_commit, base_tree) != 0) {
+    if (sg_commit_tree_of(git_dir, ours_commit, ours_tree) != 0 ||
+       sg_commit_tree_of(git_dir, base_commit, base_tree) != 0) {
         fprintf(stderr, "sg: corrupt commit while resolving merge\n");
         return 1;
     }
@@ -191,109 +121,31 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         return 1;
     }
 
-    memset(&new_idx, 0, sizeof(new_idx));
-    flat_entries = result.count > 0 ? malloc(result.count * sizeof(*flat_entries)) : NULL;
-    if (result.count > 0 && flat_entries == NULL) {
-        fprintf(stderr, "sg: out of memory\n");
+    /* Materializes the merge result into the working tree and a fresh
+       index; a -1 here means either a chunked blob's data was unrecoverable
+       or the index couldn't be built completely -- refuse to record an
+       index/commit that silently drops content or paths. */
+    if (sg_merge_result_apply(git_dir, repo_root, &result, &new_idx, &conflict_paths,
+                              &conflict_count) != 0) {
         sg_merge_result_free(&result);
         return 1;
     }
-
-    for (i = 0; i < result.count; i++) {
-        sg_merge_result_entry *e = &result.entries[i];
-        char abspath[4096];
-
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, e->path);
-
-        if (e->conflict) {
-            int mode = e->ours_present ? (int)(e->ours_mode & 0777)
-                                       : (e->theirs_present ? (int)(e->theirs_mode & 0777) : 0644);
-            char **grown;
-
-            has_conflict = 1;
-            if (sg_write_file_mkdirs(abspath, e->conflict_content, e->conflict_content_len, mode) != 0)
-                fprintf(stderr, "sg: failed to write conflicted '%s'\n", e->path);
-
-            if (e->base_present && add_stage_entry(&new_idx, e->path, 1, e->base_mode,
-                                                   e->base_sha1) != 0)
-                index_ok = 0;
-            if (e->ours_present && add_stage_entry(&new_idx, e->path, 2, e->ours_mode,
-                                                   e->ours_sha1) != 0)
-                index_ok = 0;
-            if (e->theirs_present && add_stage_entry(&new_idx, e->path, 3, e->theirs_mode,
-                                                     e->theirs_sha1) != 0)
-                index_ok = 0;
-
-            grown = realloc(conflict_paths, (conflict_count + 1) * sizeof(*grown));
-            if (grown != NULL) {
-                conflict_paths = grown;
-                conflict_paths[conflict_count] = strdup(e->path);
-                if (conflict_paths[conflict_count] != NULL)
-                    conflict_count++;
-            }
-        } else if (e->deleted) {
-            remove(abspath);
-        } else {
-            unsigned char *content;
-            size_t content_len;
-            sg_chunk_missing_info missing;
-            int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &content, &content_len, &missing);
-
-            if (read_rc == 0) {
-                if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0)
-                    fprintf(stderr, "sg: failed to write '%s'\n", e->path);
-                free(content);
-            } else if (read_rc == -2) {
-                sg_chunk_print_missing_error(e->path, &missing);
-                content_missing = 1;
-            } else {
-                fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
-            }
-            if (add_resolved_entry(repo_root, &new_idx, e->path, e->mode, e->sha1) != 0)
-                index_ok = 0;
-
-            flat_entries[flat_count].path = e->path; /* transient view, not owned */
-            flat_entries[flat_count].mode = e->mode;
-            memcpy(flat_entries[flat_count].sha1, e->sha1, SG_SHA1_RAW_LEN);
-            flat_count++;
-        }
-    }
-
-    /* A chunked file whose data actually can't be recovered must abort the
-       merge outright -- sg_chunk_print_missing_error already explained why
-       for every affected path above; there's nothing left to do here except
-       refuse to record an index/commit that silently drops the content. */
-    if (content_missing) {
-        sg_index_free(&new_idx);
-        rc = 1;
-        goto done;
-    }
-
-    /* An index missing entries would be silently wrong on disk -- refuse to
-       write a partial one rather than record a merge state that lost paths. */
-    if (!index_ok) {
-        fprintf(stderr, "sg: out of memory building the merged index; 沒有寫入 index\n");
-        sg_index_free(&new_idx);
-        rc = 1;
-        goto done;
-    }
+    has_conflict = conflict_count > 0;
 
     if (sg_index_write(git_dir, &new_idx) != 0) {
         fprintf(stderr, "sg: failed to write index\n");
         sg_index_free(&new_idx);
         sg_merge_result_free(&result);
-        free(flat_entries);
         for (i = 0; i < conflict_count; i++)
             free(conflict_paths[i]);
         free(conflict_paths);
         return 1;
     }
-    sg_index_free(&new_idx);
 
     if (sg_merge_head_write(git_dir, theirs_commit) != 0) {
         fprintf(stderr, "sg: failed to write MERGE_HEAD\n");
+        sg_index_free(&new_idx);
         sg_merge_result_free(&result);
-        free(flat_entries);
         for (i = 0; i < conflict_count; i++)
             free(conflict_paths[i]);
         free(conflict_paths);
@@ -321,7 +173,7 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         }
 
         memset(&commit, 0, sizeof(commit));
-        if (sg_tree_build(git_dir, flat_entries, flat_count, commit.tree) != 0) {
+        if (sg_tree_build_from_index(git_dir, &new_idx, commit.tree) != 0) {
             fprintf(stderr, "sg: failed to build merge tree\n");
             free(cleaned_message);
             rc = 1;
@@ -387,8 +239,8 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     }
 
 done:
+    sg_index_free(&new_idx);
     sg_merge_result_free(&result);
-    free(flat_entries);
     for (i = 0; i < conflict_count; i++)
         free(conflict_paths[i]);
     free(conflict_paths);
@@ -407,7 +259,7 @@ static int do_merge_abort(const char *git_dir, const char *repo_root)
         return 1;
     }
     if (sg_ref_resolve_head(git_dir, head_id) != 0 ||
-       resolve_commit_tree(git_dir, head_id, head_tree) != 0) {
+       sg_commit_tree_of(git_dir, head_id, head_tree) != 0) {
         fprintf(stderr, "sg: 無法讀取目前分支的 commit\n");
         return 1;
     }
@@ -546,7 +398,7 @@ int sg_cmd_merge(int argc, char **argv)
             return 1;
         }
 
-        if (resolve_commit_tree(git_dir, theirs_commit, theirs_tree) != 0) {
+        if (sg_commit_tree_of(git_dir, theirs_commit, theirs_tree) != 0) {
             fprintf(stderr, "sg: corrupt commit for branch '%s'\n", branch_arg);
             free(current_branch);
             free(git_dir);

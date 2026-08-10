@@ -963,6 +963,148 @@ stored: whether it is chunked, its original size, its chunk count, and (if
 chunked) how many of its chunks are also referenced by some other chunked
 blob in the repository (\(dqshared chunks\(dq). This is a read-only
 diagnostic command; it does not modify anything.
+.SS stash
+.B sg stash
+.RB [ push ]
+.RB [ -m
+.IR message ]
+.br
+.B sg stash list
+.br
+.B sg stash apply
+.RI [ stash ]
+.br
+.B sg stash pop
+.RI [ stash ]
+.br
+.B sg stash drop
+.RI [ stash ]
+.br
+.B sg stash clear
+.PP
+Saves the current index and working-directory changes away, resetting both
+back to
+.BR HEAD ,
+so they can be restored later. Backed by a real reflog file at
+.BR .git/logs/refs/stash ,
+the same on-disk mechanism real git uses \(em a repository stashed with
+.B sg
+is fully readable by
+.B git stash list / show / pop
+and vice versa; see
+.B FILES
+below.
+.PP
+.I stash
+identifies an entry as
+.BR stash@{ N } ,
+a bare
+.IR N
+(equivalent to
+.BR stash@{ N } ),
+or, if omitted, the most recent entry
+.RB ( stash@{0} ).
+.PP
+With no subcommand, or with an explicit
+.BR push ,
+saves the change and reports
+.RB \(dq "No local changes to save" \(dq
+(exit 0, nothing written) if the working tree and index already match
+.BR HEAD .
+.B -m
+.I message
+sets the entry's description to \(dqOn
+.IR branch : message\(dq;
+without it, the description is the \(dqWIP on
+.IR branch : short-hash
+subject\(dq form real git uses. Untracked files are never stashed and are
+left untouched. A conflicted (unmerged) index refuses the push outright.
+.PP
+An in-progress rebase does
+.B not
+block
+.BR push ,
+matching real git \(em but resetting the working tree and index back to
+.B HEAD
+while a rebase is paused can make a later
+.B "sg rebase --continue"
+decide the paused commit's change already exists upstream and silently
+skip it (measured identical to real git 2.55.0: the behavior itself is
+intentional and left alone).
+.B sg
+prints an extra warning to standard error when this situation is detected;
+real git does not warn, but the resulting state is the same on both.
+A
+.B MERGE_HEAD
+left over from an in-progress merge is always removed by a successful
+push, with an advisory line on standard error (real git removes it
+silently).
+.PP
+.B apply
+and
+.B pop
+three-way merge the stashed entry back into the working tree and index,
+using conflict markers labelled \(dqUpdated upstream\(dq / \(dqStashed
+changes\(dq (matching real git's literal wording, not the current branch
+names).
+.B pop
+additionally drops the entry once the merge succeeds without conflict;
+.B apply
+leaves it on the stack either way. On conflict, the stash entry is
+.I never
+dropped and the working tree and index are left with stages 1/2/3 for the
+conflicted paths, same as a conflicted
+.BR merge .
+.PP
+Unlike real git, which will attempt a three-way merge against pre-existing
+dirty changes,
+.B apply
+and
+.B pop
+require a clean working directory and index first (no unmerged entries,
+nothing staged or modified relative to
+.BR HEAD ),
+consistent with
+.BR "sg merge" \(cqs
+existing requirement. An in-progress rebase also refuses
+.B apply
+/
+.B pop
+outright, a deliberate divergence from real git (which allows it) taken
+for consistency with
+.BR switch / merge .
+A stash created by
+.B "git stash -u"
+(which has more than two parents) is refused by
+.B apply
+/
+.B pop
+without being dropped;
+.B sg
+cannot currently restore its untracked half.
+.PP
+.B drop
+removes an entry from the stack without applying it.
+.B clear
+empties the whole stack. Both are no-ops (exit 0) if invoked with nothing
+to remove.
+.PP
+Stdout messages that are scraped by scripts are copied verbatim from real
+git:
+.RB \(dq "No local changes to save" \(dq ,
+.RB \(dq "Saved working directory and index state ..." \(dq ,
+.RB \(dq "stash@{" N "}: ..." \(dq ,
+and
+.RB \(dq "Dropped ... (...hex...)" \(dq .
+Error messages use
+.BR sg 's
+own (Chinese) wording and always exit 1;
+.B sg
+has no exit 128, so situations where real git uses 128 (e.g.
+.RB \(dq "log for 'stash' only has N entries" \(dq )
+become an
+.B sg
+style message with exit 1 instead.
 .SH FILES
 .TP
 .B .gitignore
@@ -1136,6 +1278,24 @@ todo list). Present only while a rebase is paused or running; removed
 automatically when the rebase finishes, is skipped to completion, or is
 aborted. Not intended to be edited by hand \(em use
 .BR "sg rebase --continue|--skip|--abort" .
+.TP
+.B refs/stash \fR(and\fP .git/logs/refs/stash\fR)\fP
+Where
+.B "sg stash"
+keeps the stash stack: the ref points at the newest stash commit, and the
+reflog file (one line per entry, oldest first) is the actual index used by
+.BR stash@{ N } .
+Both are the same real-git on-disk format \(em not
+.BR sg -specific
+\(em so entries created by
+.B git stash
+are readable by
+.B "sg stash"
+and vice versa. Not intended to be edited by hand; use
+.B "sg stash"
+/
+.B "git stash"
+to inspect or modify them.
 .SH ENVIRONMENT
 .TP
 .B GIT_AUTHOR_NAME
@@ -1241,3 +1401,23 @@ above and small_git's
 \(dq已知限制\(dq / Known Limitations section); missing flags and
 subcommands found in real git are not oversights to be reported unless
 they contradict what is documented here.
+.SH CAVEATS
+Running
+.B "sg stash"
+(or
+.BR push )
+while an
+.B sg rebase
+is paused resets the working tree and index back to
+.BR HEAD ,
+which can make a subsequent
+.B "sg rebase --continue"
+conclude that the currently paused commit's change is already present
+upstream and skip it \(em the commit silently disappears from the
+resulting history, with the work preserved only inside the stash. This is
+not an
+.B sg
+defect: real git 2.55.0 exhibits the identical behavior for
+.B "git stash"
+under the same circumstances (measured). Pop the stash back out, or finish
+the rebase first, if this matters for a given commit.

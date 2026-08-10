@@ -70,27 +70,6 @@ static int target_dir_is_usable(const char *dir)
     return empty;
 }
 
-static int resolve_commit_tree(const char *git_dir, const unsigned char commit_id[SG_SHA1_RAW_LEN],
-                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
-{
-    sg_obj_type type;
-    unsigned char *content;
-    size_t content_len;
-    sg_commit commit;
-
-    if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 ||
-       type != SG_OBJ_COMMIT)
-        return -1;
-    if (sg_commit_parse(content, content_len, &commit) != 0) {
-        free(content);
-        return -1;
-    }
-    free(content);
-    memcpy(tree_id_out, commit.tree, SG_SHA1_RAW_LEN);
-    sg_commit_free(&commit);
-    return 0;
-}
-
 /* Writes a single ref file (e.g. refs/remotes/origin/<name> or
    refs/heads/<name>) as "<40-hex-id>\n", creating any parent directories a
    slash-containing ref name needs (e.g. "feature/x"). */
@@ -438,7 +417,7 @@ int sg_cmd_clone(int argc, char **argv)
     {
         unsigned char tree_id[SG_SHA1_RAW_LEN];
 
-        if (resolve_commit_tree(git_dir, target_commit_id, tree_id) != 0) {
+        if (sg_commit_tree_of(git_dir, target_commit_id, tree_id) != 0) {
             fprintf(stderr, "sg: corrupt commit for branch '%s'\n", default_branch);
             goto done;
         }

@@ -1,13 +1,18 @@
 #include "sg/tree_build.h"
 
+#include "sg/chunk.h"
 #include "sg/loose.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/repo.h"
+#include "sg/workdir.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define SG_TREE_DIR_MODE 040000
+#define SG_TREE_BUILD_PATH_MAX 4096
 
 static int build_level(const char *git_dir, const sg_flat_entry *entries, size_t count,
                        unsigned char tree_id_out[SG_SHA1_RAW_LEN])
@@ -234,4 +239,103 @@ void sg_flat_list_free(sg_flat_list *list)
     free(list->entries);
     list->entries = NULL;
     list->count = 0;
+}
+
+int sg_tree_build_from_index(const char *git_dir, const sg_index *idx,
+                             unsigned char tree_id_out[SG_SHA1_RAW_LEN])
+{
+    sg_flat_entry *flat = NULL;
+    size_t i;
+    int rc;
+
+    for (i = 0; i < idx->count; i++) {
+        if (idx->entries[i].stage != 0)
+            return -1;
+    }
+
+    if (idx->count > 0) {
+        flat = malloc(idx->count * sizeof(*flat));
+        if (flat == NULL)
+            return -1;
+        for (i = 0; i < idx->count; i++) {
+            flat[i].path = idx->entries[i].path; /* not owned, transient view */
+            flat[i].mode = idx->entries[i].mode;
+            memcpy(flat[i].sha1, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
+        }
+    }
+
+    rc = sg_tree_build(git_dir, flat, idx->count, tree_id_out);
+    free(flat);
+    return rc;
+}
+
+int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
+                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
+{
+    sg_flat_entry *entries = NULL;
+    size_t entry_count = 0;
+    size_t i;
+    int rc = -1;
+    int chunk_enabled = 0;
+    size_t chunk_threshold = SG_CHUNK_DEFAULT_THRESHOLD;
+
+    if (idx->count > 0) {
+        entries = malloc(idx->count * sizeof(*entries));
+        if (entries == NULL)
+            return -1;
+    }
+
+    sg_repo_read_chunk_config(git_dir, &chunk_enabled, &chunk_threshold);
+
+    for (i = 0; i < idx->count; i++) {
+        char abspath[SG_TREE_BUILD_PATH_MAX];
+        unsigned char *content = NULL;
+        size_t content_len = 0;
+        unsigned char blob_id[SG_SHA1_RAW_LEN];
+
+        /* idx may hold several stage 1/2/3 entries for the same path while a
+           conflict is unresolved (there is no separate stage-0 entry then).
+           Entries are sorted by (path, stage), so duplicates are contiguous
+           and the first one seen is stage 0 if one exists, otherwise the
+           lowest of whatever conflict stages are present -- either way,
+           exactly one representative per path is emitted, using whatever
+           content currently sits in the working tree (e.g. the
+           conflict-marked content), never producing a tree with two entries
+           sharing a name. */
+        if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
+            continue;
+
+        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx->entries[i].path);
+        if (sg_read_file(abspath, &content, &content_len) == 0) {
+            int write_ok;
+
+            if (chunk_enabled) {
+                int chunked;
+
+                write_ok = sg_chunk_store_blob(git_dir, content, content_len, chunk_threshold,
+                                              blob_id, &chunked) == 0;
+            } else {
+                write_ok = sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, blob_id) == 0;
+            }
+
+            free(content);
+            if (!write_ok)
+                goto out_free_entries;
+        } else {
+            /* working-tree file gone or unreadable: fall back to the blob the
+               index already recorded, so this entry still resolves */
+            memcpy(blob_id, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
+        }
+
+        entries[entry_count].path = idx->entries[i].path; /* transient view, not owned */
+        entries[entry_count].mode = idx->entries[i].mode;
+        memcpy(entries[entry_count].sha1, blob_id, SG_SHA1_RAW_LEN);
+        entry_count++;
+    }
+
+    rc = sg_tree_build(git_dir, entries, entry_count, tree_id_out);
+
+out_free_entries:
+    free(entries);
+    return rc;
 }

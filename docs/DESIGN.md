@@ -698,3 +698,177 @@ mutation:把新句子留著、只把舊承諾**附加**回去,肯定式那條照
 
 最終 `tests/interop.sh` 726 項檢查(Phase 13 結束時是 680),八條定向 mutation
 每一條都至少讓一條檢查變紅。
+
+## Phase 15:`sg stash`
+
+### 架構決策:為什麼實作真 reflog
+
+`stash@{N}` 完全建立在 reflog 上——這是實測結論,不是設計偏好。刪掉
+`.git/logs/refs/stash` 只留 `refs/stash`,真 git 的 `stash list` 變空、`pop`
+直接失敗且不 fallback。走「從 snapshot 長出一個 stash 堆疊,不碰 reflog」的
+路會產生真 git 完全看不見的 stash——比不實作更糟,因為它讓使用者以為變更被
+保存了。這條路直接違反專案第一原則:`tests/interop.sh` 拿真 `git` 當 oracle,
+一個 git 讀不到的 stash 沒有任何東西能測它。
+
+決定性證據:手工偽造一個 sg 風格的 stash(身分 `small_git <sg@localhost>`、
+固定 `+0000` 時區、全零 old-oid、手寫 reflog 行),**真 git 全盤接受**——
+`list`/`show`/`pop` 都正常,產出正確的工作目錄與 index。於是 reflog 不是一個
+子系統,是「一行一筆的文字檔 + 一條硬性不變量」,详见下一節。
+
+`sg_reflog_*`(`include/sg/reflog.h`)的 `ref_path` 刻意是**參數**而不是寫死
+的 `"refs/stash"`——格式層與「每次 ref 更新都寫一筆」的呼叫端覆蓋是兩件事,
+Phase 15 只做前者、只呼叫一次(`"refs/stash"`),日後的 HEAD reflog 直接重用
+同一個檔案層,把預算花在呼叫端覆蓋上。
+
+### 兩條硬性不變量(實測)
+
+- **`refs/stash` 必須等於 reflog 最後一行的 new-oid**,否則真 git 報
+  `log for ref refs/stash unexpectedly ended`,後續**所有** `stash@{N}` 一併
+  失效——不是只有出問題的那一筆。
+- **stash commit 必須有 ≥2 個 parent**。手工偽造的 1-parent 版本 `list` 看得到
+  (list 只讀 reflog,不驗證 commit 結構),但 `show`/`apply`/`pop` 全部以
+  `not a stash-like commit` 死掉。所以「index commit(parent 2)是必需品」不是
+  Phase 16 的加分項,`sg_stash_push` 無條件寫它。
+
+### 位元相容的界線(兩個方向要求不同)
+
+真 git 讀 sg 的 stash 只要求**結構有效**,不要求身分一致(上面的偽造測試已
+證明:`+0000`、`small_git`、全零 old-oid 全部被接受,git 從不驗證 commit 的
+author/committer 身分,只驗上面兩條不變量)。
+
+sg 讀真 git 的 stash 要求**寬容解析**:任意名字(含空格、`<`、`>`)、任意時區
+(`+0800`)、3-parent(`git stash -u`)、以及 `git gc` 之後活在 packed-refs 裡
+的 `refs/stash`。`sg_commit_parse`(`src/object/commit.c`)本就會成長 parent
+陣列,3 parent 免費解析;`sg_ref_read_path` 本就會 fallback 到 packed-refs。
+
+因為 sg 的時區是固定字面量 `"+0000"`、時間戳來自 `time(NULL)`、不理會
+`GIT_AUTHOR_DATE`,**sg 的 stash commit id 永遠不可能等於真 git 對同樣內容
+產生的 id**——這不是 Phase 15 引入的新讓步,`sg` 寫的每一個 commit 本來就是
+這樣,只是 stash 是第一個「兩邊互相讀對方產出物」的功能,所以第一次必須把它
+寫進規格,免得日後有人設計出注定失敗的 oid 相等檢查。**因此任何 interop 檢查
+都不准比對兩邊的 commit id。** 最強的 oracle 是 `sg stash list` 與
+`git stash list` 逐位元組相同——這個字串來自 sg 自己寫的 reflog message,
+是唯一一處兩邊「應該」相同的東西。
+
+### 「Dropped」訊息的規則被記錯又改正的經過
+
+最初抽樣兩個案例,記成「pop 帶 `refs/` 前綴、drop 不帶」。那是抽樣假象——
+碰巧那次 pop 沒帶參數而 drop 帶了。測完全部六種組合(pop/drop × {無參數,
+裸 `0`,`stash@{0}`})之後,真正的規則是**兩個子指令共用同一條**:git 只在
+參數已經是 `stash@{N}` 形式時原樣回印,無參數與裸 `0` 都解析成完整的
+`refs/stash@{N}`。
+
+六種組合現在都有 interop 檢查,每條 sg 斷言都配一條 git oracle 斷言,這樣真
+git 改變行為時是 oracle 那一半先變紅,而不是檢查悄悄凍結一個過時的認知。
+過程中也踩到兩個與規則本身無關但值得記的坑:oracle 必須固定 `LC_ALL=C`
+(git 會翻譯這句訊息,`zh_TW` 環境印出全形括號的中文,CI 預設 `C`——不釘住
+會「CI 過、本機紅」);pop 的輸出含雙引號(`use "git add"` 狀態區塊),塞進
+`sh -c` 字串會被截斷成一半案例誤判,drop 的單行輸出沒有這問題——六案例正好
+一半一半誤判,像是個真的 product bug。
+
+### 與真 git 一致的危險行為
+
+**rebase 暫停中執行 `stash push` 會讓正在 rebase 的 commit 消失**——實測 sg
+與真 git 2.55.0 **行為完全相同**:push exit 0;`rebase --continue` 印
+「Successfully rebased」exit 0;那個正在重放的 commit 從 log 消失;工作只留
+在 stash 裡。原因是 push 把 index 與工作目錄重設回 HEAD,`--continue` 於是
+判定「這個變更已經存在於 upstream」而跳過它。sg 不改這個行為(改了反而是與
+git 分歧),但**多印一行 stderr 告知**使用者,並用兩邊各跑一次的 interop
+檢查釘住「行為等價」(exit code、log 是否消失、stash 是否保住工作)。
+
+### 刻意的偏離(列表)
+
+- **pop/apply 要求工作目錄乾淨**,真 git 會嘗試三方合併已存在的骯髒變更。
+  比 git 嚴格,與 `sg merge` 既有先例一致(`merge_require_clean`)——乾淨的
+  工作目錄讓 apply 可以直接把 `sg_merge_trees` 的 ours 設成 HEAD 樹,不需要
+  額外一層合併邏輯。
+- **rebase 進行中 pop/apply 拒絕**(真 git 允許),比照 `cmd_switch.c`/
+  `cmd_merge.c` 的既有閘門先例,而不是新發明一條規則。
+- **sg 沒有 exit 128**,真 git 在「reflog 條目不存在」之類的情況用 128,
+  sg 一律用自己風格的訊息 + exit 1。
+- `sg stash apply`/`pop` 成功時印 `sg status` 的內容(真 git 印同等的 status
+  區塊,但 sg 的用詞是中文、提示裡是 `sg` 指令而非 `git`)。
+
+### 明確不做(Phase 16+)
+
+| 項目 | 為什麼這個切點乾淨 |
+|---|---|
+| `-u`(儲存未追蹤檔案) | 需要把 `collect_untracked`(`cmd_status.c`,目前 `static`、回傳裸 `char **`)升格成公開 API、回傳 `sg_flat_entry`,加第三個 parent,加 overwrite 拒絕。純加法,commit builder 本就吃 parents 陣列,reflog 層完全不用動;但**這次已經加了強制守衛**:Phase 15 遇到 3-parent stash 一律拒絕,絕不悄悄只還原追蹤的那半而丟掉未追蹤檔案。 |
+| `show` | 唯一需要全新輸出格式器的子指令:git 預設 `--stat`,而 `sg diff` 沒有任何 flag、沒有 tree-vs-tree 模式。沒有其他東西依賴它,`git stash show` 對 sg 建的 stash 現在就能正常用。 |
+| `--keep-index` / `--index` | `--keep-index` 便宜但會讓 flag 矩陣變複雜;`--index` 不便宜——git 對 index 樹另外做合併,有自己的失敗模式。兩者都是純加法,不影響已寫的部分。 |
+| `--patch`、`--staged`、pathspec、`stash branch/create/store` | 各自獨立的介面,不影響已寫的部分。 |
+| 髒工作目錄下 apply | 見上面「刻意的偏離」,是本階段最不情願的取捨,但它是讓 apply 能直接重用 `sg_merge_trees` 而不必另寫一層的前提。 |
+| 通用 reflog(`HEAD@{N}`、`sg reflog`、branch 更新寫 reflog) | 檔案層(`src/storage/reflog.c`)這次就落地了,expensive 的一半——每個 ref 更新點都要接上呼叫——留給獨立的一個 phase。 |
+
+### mutation 實測結果
+
+| mutation | 變紅的檢查數 |
+|---|---|
+| push 的 unmerged 守衛 | 原本 **0 條紅** → 補斷言後 1 條 |
+| drop 不重指 `refs/stash` | 1 條 |
+| push 寫 ref 但跳過 reflog append | 30 條 |
+| `-u` 三 parent 守衛 | 原本 **0 條紅** → 補斷言後 1 條 |
+| 衝突標籤換成分支名 | 2 條 |
+| push 改用 `sg_safe_apply_tree` | 9 條 |
+| pop 的 index 修正 | 11 條 |
+| clear 用 unlink 取代 `sg_ref_delete_under` | 1 條 |
+| list 順序反轉 | 2 條 |
+| `sg stash apply` 也去 drop | 5 條(**補之前 59 條全部沒抓到**) |
+| reflog message normalization 關掉 | 6 條 |
+| reflog rewrite 重新蓋 ident | 3 條 |
+| reflog count-0 寫空檔而非刪檔 | 1 條 |
+| reflog rewrite 不重新串接 old-id | 2 條(預先設計時就記成「應該測不到」,實測是唯二能測到的——見下方基礎設施小節的更正) |
+| `read_rc == -1` 降級成警告 | 3 條 |
+| `print_dropped` 一律加前綴 | 2 條 |
+
+**最有價值的兩條要特別寫一段。** push 的 unmerged 守衛與 `-u` 三 parent 守衛
+原本都是**0 條紅**,原因與 Phase 14 記過的教訓是同一個形狀:守衛存在於 CLI
+與 library 兩層,**任一層單獨關掉都由另一層接手**,退出碼相同,只是理由不
+同。修法也一樣——斷言要探到 stderr 的專屬訊息那一層,不能只看退出碼。
+
+查 unmerged 守衛時還發現 push 路徑**根本沒有 CLI 層守衛**:library 拒絕
+之後,CLI 印的是既有的 catch-all 訊息「無法建立 stash(未初始化的 HEAD,
+或 index 有未解決的衝突?)」——一個問號,而使用者當下正卡在合併衝突中,
+明明知道答案卻只給猜測。修法是把檢查搬到「已經知道答案」的地方,直接給出
+陳述句而非問句,interop 斷言釘住那句具體訊息。這個斷言本身也踩過一次坑:
+第一版 grep 的是「unresolved conflict」,而 catch-all 訊息裡剛好也含這個
+片段,所以拿掉守衛之後這條檢查照樣綠——收斂成比對守衛自己專屬的措辭才有
+鑑別力。
+
+### 已知無覆蓋(誠實記錄,比照 Phase 10/12 的既有寫法)
+
+- **reflog 的 82-byte 最小行長守衛**:被後續的 hex 與格式驗證整個包住。試過
+  兩種構造(含正好 81 bytes、兩個 oid 都是合法 hex、緊接著截斷),普通 build
+  與 `make sanitize` **都不會紅**。與 `index.c` 的 `nentries` cap 同類缺口。
+- **`chunk_enabled` 的初始值**:`sg_repo_read_chunk_config`
+  (`src/storage/repo.c`)進門就無條件 `*enabled_out = 0`,呼叫端傳什麼都會
+  被覆寫,是個 dead store,與 stash 無關但踏勘時順手發現,記在這裡免得散佚。
+- **`sg_write_file_mkdirs` 失敗分支**:已補上單元測試(用同名目錄擋住寫入
+  路徑觸發 `EISDIR`),這條不再是缺口,但觸發手法值得記下來:目標路徑先建成
+  一個同名目錄,寫入時 `open()` 回 `EISDIR`,不必真的耗盡磁碟或權限。
+
+### 測試基礎設施本身的教訓
+
+跑 mutation 的過程中,**mutation 腳本自己出過三次錯**,每次都會偽造出「守衛
+有覆蓋」或「守衛沒覆蓋」的假結論:
+
+1. 字串替換版的 mutation 先命中了 `free(entries[i].ident)` 那一行的
+   `entries[i].ident`,把它換成別的表達式後變成 free 一個字串常數而直接
+   abort——腳本以為這是「守衛消失」的效果,其實只是把程式碼改壞了。
+2. `sg_ref_delete_under` 在原始碼裡有兩處呼叫,腳本打到 drop 那一處而不是
+   `sg_stash_clear` 那一處,於是「clear 用 unlink 取代」這條 mutation 一開始
+   量到的其實是 drop 的行為。
+3. `make && interop.sh` 串接執行,編譯失敗時 interop 沒有真的跑,而舊的
+   log 檔沒被清掉,腳本讀到的是上一輪殘留的結果,誤判成「這輪也綠」。
+
+結論:**mutation 腳本與被測程式碼一樣需要驗證**——至少要確認編譯成功、確認
+改動的那一行真的命中預期的那一處(不是同名字串在別處的另一次出現)、每輪都
+清掉舊產出再重新產生新的。
+
+interop 檢查本身也出過兩個同類問題,細節寫在程式碼註解裡:`LC_ALL` 未固定
+會讓某條檢查「在 CI 過、在本機紅」(見上面「Dropped」訊息那節);把含雙引號
+的輸出塞進 `sh -c` 字串會炸開命令列,只讓一半案例被正確判斷。
+
+最終 `tests/interop.sh` 826 項檢查(Phase 14 結束時是 726),單元測試新增
+`tests/test_reflog.c`、`tests/test_stash.c`、`tests/test_objstore.c` 三支,
+`make test` 31 支二進位全過,`make sanitize` 乾淨。

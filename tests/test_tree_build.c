@@ -1,5 +1,6 @@
 #include "sg/tree_build.h"
 
+#include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/repo.h"
@@ -134,10 +135,76 @@ static void test_empty_tree(void)
     free(git_dir);
 }
 
+/* sg_tree_build_from_index refuses an index that still holds conflict stages.
+   The two halves differ in exactly one byte of input -- the stage field -- so a
+   -1 from the second half can only be the guard talking, not a build failure
+   that would have happened anyway. */
+static void test_from_index_refuses_conflict_stages(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char blob1[SG_SHA1_RAW_LEN], blob2[SG_SHA1_RAW_LEN];
+    sg_index_entry entries[2];
+    sg_index idx;
+    unsigned char clean_id[SG_SHA1_RAW_LEN], mutated_id[SG_SHA1_RAW_LEN];
+
+    hex_raw("ce013625030ba8dba906f756967f9e9ca394464a", blob1); /* "hello\n" */
+    hex_raw("04fea06420ca60892f73becee3614f6d023a4b7f", blob2); /* "world" */
+
+    memset(entries, 0, sizeof(entries));
+    entries[0].path = strdup("a.txt");
+    entries[0].mode = 0100644;
+    entries[0].stage = 0;
+    memcpy(entries[0].sha1, blob1, SG_SHA1_RAW_LEN);
+
+    entries[1].path = strdup("dir/b.txt");
+    entries[1].mode = 0100644;
+    entries[1].stage = 0;
+    memcpy(entries[1].sha1, blob2, SG_SHA1_RAW_LEN);
+
+    idx.entries = entries;
+    idx.count = 2;
+
+    /* positive half: an all-stage-0 index builds, and builds the same tree the
+       raw flat-list builder produces from the same rows */
+    CHECK(sg_tree_build_from_index(git_dir, &idx, clean_id) == 0,
+         "stage-0 index should build a tree");
+    {
+        sg_flat_entry flat[2];
+
+        flat[0].path = entries[0].path;
+        flat[0].mode = entries[0].mode;
+        memcpy(flat[0].sha1, entries[0].sha1, SG_SHA1_RAW_LEN);
+        flat[1].path = entries[1].path;
+        flat[1].mode = entries[1].mode;
+        memcpy(flat[1].sha1, entries[1].sha1, SG_SHA1_RAW_LEN);
+
+        CHECK(sg_tree_build(git_dir, flat, 2, mutated_id) == 0, "reference build failed");
+        CHECK(memcmp(clean_id, mutated_id, SG_SHA1_RAW_LEN) == 0,
+             "from_index should agree with sg_tree_build on identical rows");
+    }
+
+    /* negative half: flip one entry to a conflict stage, change nothing else */
+    entries[1].stage = 2;
+    CHECK(sg_tree_build_from_index(git_dir, &idx, mutated_id) == -1,
+         "an index holding a stage 1/2/3 entry must be refused, not silently "
+         "collapsed to one stage");
+
+    /* stage 1 and 3 are refused for the same reason */
+    entries[1].stage = 1;
+    CHECK(sg_tree_build_from_index(git_dir, &idx, mutated_id) == -1, "stage 1 must be refused");
+    entries[1].stage = 3;
+    CHECK(sg_tree_build_from_index(git_dir, &idx, mutated_id) == -1, "stage 3 must be refused");
+
+    free(entries[0].path);
+    free(entries[1].path);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_build_matches_known_hash();
     test_empty_tree();
+    test_from_index_refuses_conflict_stages();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
