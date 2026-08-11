@@ -2,6 +2,7 @@
 
 #include "sg/apply.h"
 #include "sg/hash.h"
+#include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/rebase.h"
@@ -79,6 +80,32 @@ int sg_cmd_switch(int argc, char **argv)
         fprintf(stderr,
                "sg: 目前有一個進行中的 rebase，無法切換分支\n"
                "請先完成它（sg rebase --continue）或執行 sg rebase --abort 放棄\n");
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+
+    /* Same shape as the rebase gate above, one subsystem over. Measured
+       against real git 2.55.0: `switch` during an in-progress merge is
+       refused ("cannot switch branch while merging"), and --force does not
+       override it -- unlike `checkout -f`, which does succeed and clears
+       MERGE_HEAD. sg has no `checkout`, so `switch`'s rule is the one to
+       match. The refusal is unconditional on MERGE_HEAD's mere existence:
+       it fires whether or not the index still has conflicts, with -c, and
+       even when the target is the branch already checked out.
+
+       Without this, sg only refused by accident -- via sg_safe_apply_tree's
+       dirty-worktree confirmation, which is exactly what --force bypasses,
+       so `sg switch --force` would silently clear MERGE_HEAD and abandon
+       the merge. Like the rebase gate, this must run before any side
+       effect. The binding one is sg_safe_apply_tree below, which both
+       overwrites the working tree and clears MERGE_HEAD; the -c block in
+       between only validates, and does not write the new branch ref until
+       after that call succeeds. */
+    if (sg_merge_head_exists(git_dir)) {
+        fprintf(stderr,
+               "sg: 目前有一個進行中的合併，無法切換分支\n"
+               "請先完成它（sg commit）或執行 sg merge --abort 放棄\n");
         free(git_dir);
         free(repo_root);
         return 1;
