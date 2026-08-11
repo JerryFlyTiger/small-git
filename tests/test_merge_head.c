@@ -145,6 +145,11 @@ int main(void)
     CHECK(sg_merge_head_remove(git_dir) == 0, "remove should be a no-op when already gone");
     CHECK(sg_merge_head_exists(git_dir) == 0, "exists should still be 0 after the no-op remove");
 
+    /* One free per make_tmp_repo(), same as every other test here. CI runs
+       the sanitizer build with detect_leaks=1, so an unfreed path is a hard
+       failure there even though macOS cannot see it locally. */
+    free(repo);
+
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
