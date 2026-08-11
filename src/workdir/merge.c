@@ -950,6 +950,20 @@ static int merge_head_path(const char *git_dir, char *out, size_t out_size)
     return (size_t)snprintf(out, out_size, "%s/MERGE_HEAD", git_dir) < out_size ? 0 : -1;
 }
 
+int sg_merge_head_exists(const char *git_dir)
+{
+    char path[4096];
+    struct stat st;
+
+    if (merge_head_path(git_dir, path, sizeof(path)) != 0)
+        return 0;
+    /* lstat, and no S_ISREG filter: real git gates on file_exists(), which is
+       an lstat that only asks whether *something* is there. Measured -- git
+       refuses to switch even when MERGE_HEAD is a directory. A dangling
+       symlink is the same story, which is why this is lstat and not stat. */
+    return lstat(path, &st) == 0;
+}
+
 int sg_merge_head_read(const char *git_dir, unsigned char out[SG_SHA1_RAW_LEN])
 {
     char path[4096];
