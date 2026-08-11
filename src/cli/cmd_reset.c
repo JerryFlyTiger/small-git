@@ -117,7 +117,6 @@ int sg_cmd_reset(int argc, char **argv)
     }
 
     if (mode == RESET_SOFT) {
-        unsigned char merge_head_scratch[SG_SHA1_RAW_LEN];
 
         /* Real git refuses `reset --soft` outright while a merge or rebase
            is in progress ("cannot do a soft reset in the middle of a
@@ -125,7 +124,7 @@ int sg_cmd_reset(int argc, char **argv)
            sequencer state the way --mixed/--hard do. Verified directly
            against git: both an unresolved merge conflict and a paused
            rebase produce this same rejection, exit 128. */
-        if (sg_merge_head_read(git_dir, merge_head_scratch) == 0 || sg_rebase_state_exists(git_dir)) {
+        if (sg_merge_head_exists(git_dir) || sg_rebase_state_exists(git_dir)) {
             fprintf(stderr, "sg: 合併或 rebase 進行中，無法執行 soft reset\n");
             free(current_branch);
             free(git_dir);
@@ -146,7 +145,6 @@ int sg_cmd_reset(int argc, char **argv)
     } else if (mode == RESET_MIXED) {
         sg_index idx;
         char label[256];
-        unsigned char merge_head_scratch[SG_SHA1_RAW_LEN];
         int merge_in_progress;
 
         if (sg_commit_tree_of(git_dir, target_commit_id, target_tree_id) != 0) {
@@ -181,7 +179,7 @@ int sg_cmd_reset(int argc, char **argv)
         }
         sg_index_free(&idx);
 
-        merge_in_progress = sg_merge_head_read(git_dir, merge_head_scratch) == 0;
+        merge_in_progress = sg_merge_head_exists(git_dir);
 
         if (sg_index_reset_to_tree(git_dir, target_tree_id) != 0) {
             free(current_branch);

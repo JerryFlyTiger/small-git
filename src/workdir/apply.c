@@ -337,8 +337,12 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
     sg_index_free(&idx);
 
     {
-        unsigned char merge_head[SG_SHA1_RAW_LEN];
-        int merge_in_progress = sg_merge_head_read(git_dir, merge_head) == 0;
+        /* Existence, not parseability -- the value is never used, only the
+           fact that a merge is in flight. Measured against real git 2.55.0:
+           `reset --hard` clears a malformed MERGE_HEAD just as readily as a
+           well-formed one. sg_merge_head_read would silently leave a corrupt
+           one behind, which `switch` then refuses to move past forever. */
+        int merge_in_progress = sg_merge_head_exists(git_dir);
 
         if (sg_apply_tree_to_workdir(git_dir, repo_root, tree_id) != 0)
             return -1;

@@ -245,7 +245,6 @@ int sg_cmd_status(int argc, char **argv)
     size_t untracked_count = 0;
     size_t untracked_cap = 0;
     size_t unmerged_count;
-    unsigned char merge_head_id[SG_SHA1_RAW_LEN];
     size_t i;
     static const char *staged_hints[] = {
         "use \"sg restore --staged <file>...\" to unstage",
@@ -315,7 +314,11 @@ int sg_cmd_status(int argc, char **argv)
         }
     }
 
-    if (sg_merge_head_read(git_dir, merge_head_id) == 0) {
+    /* Existence, not parseability: real git reports a corrupt MERGE_HEAD as
+       an ongoing merge in `status` just like a well-formed one (measured,
+       2.55.0), and status must agree with the gates in switch/commit about
+       whether a merge is in flight. */
+    if (sg_merge_head_exists(git_dir)) {
         if (sg_index_has_unmerged(&idx))
             printf("You have unmerged paths.\n");
         else

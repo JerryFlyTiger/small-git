@@ -249,12 +249,18 @@ done:
 
 static int do_merge_abort(const char *git_dir, const char *repo_root)
 {
-    unsigned char merge_head_id[SG_SHA1_RAW_LEN];
     unsigned char head_id[SG_SHA1_RAW_LEN];
     unsigned char head_tree[SG_SHA1_RAW_LEN];
     sg_index idx;
 
-    if (sg_merge_head_read(git_dir, merge_head_id) != 0) {
+    /* Existence, not parseability: abort never needs MERGE_HEAD's value (it
+       resets to HEAD), and a corrupt MERGE_HEAD is precisely the state a
+       user most needs to abort out of. Real git 2.55.0 clears a malformed
+       MERGE_HEAD here without complaint (measured). Using
+       sg_merge_head_read would refuse instead, and -- now that `switch`
+       gates on the same file -- would leave the repository with no way out
+       short of deleting .git/MERGE_HEAD by hand. */
+    if (!sg_merge_head_exists(git_dir)) {
         fprintf(stderr, "sg: 目前不在合併狀態（找不到 MERGE_HEAD）\n");
         return 1;
     }
@@ -339,14 +345,13 @@ int sg_cmd_merge(int argc, char **argv)
         unsigned char ours_commit[SG_SHA1_RAW_LEN];
         unsigned char theirs_tree[SG_SHA1_RAW_LEN];
         unsigned char base_commit[SG_SHA1_RAW_LEN];
-        unsigned char in_progress[SG_SHA1_RAW_LEN];
         int has_head;
         char *current_branch;
         int mb_rc;
 
         /* Starting a second merge on top of an unfinished one would drop the
            first one's MERGE_HEAD and conflict staging on the floor. */
-        if (sg_merge_head_read(git_dir, in_progress) == 0) {
+        if (sg_merge_head_exists(git_dir)) {
             fprintf(stderr,
                    "sg: 目前有一個尚未完成的合併\n"
                    "請先完成它（解決衝突後 sg add <file>... 再 sg commit），"

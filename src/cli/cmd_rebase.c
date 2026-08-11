@@ -328,7 +328,6 @@ static int run_rebase_todo(const char *git_dir, const char *repo_root, const cha
 
 static int do_rebase_start(const char *git_dir, const char *repo_root, const char *upstream_arg)
 {
-    unsigned char merge_head_id[SG_SHA1_RAW_LEN];
     char *current_branch;
     unsigned char head_commit[SG_SHA1_RAW_LEN];
     unsigned char upstream_commit[SG_SHA1_RAW_LEN];
@@ -345,7 +344,13 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
                "請先執行 sg rebase --continue 完成它，或 sg rebase --abort 放棄\n");
         return 1;
     }
-    if (sg_merge_head_read(git_dir, merge_head_id) == 0) {
+    /* Existence, not parseability -- see sg_merge_head_exists. This
+       particular refusal has no real-git oracle: measured against git
+       2.55.0, `git rebase` with a clean working tree ignores MERGE_HEAD
+       entirely (valid or malformed) and simply clears it. sg refuses on
+       purpose instead, and that refusal must cover a corrupt MERGE_HEAD
+       too, or the two states disagree about whether a merge is in flight. */
+    if (sg_merge_head_exists(git_dir)) {
         fprintf(stderr,
                "sg: 目前有一個尚未完成的合併\n"
                "請先完成它，或執行 sg merge --abort 放棄\n");
