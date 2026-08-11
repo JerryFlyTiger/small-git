@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(726 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(909 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 28 個單元測試二進位,任一失敗即整體失敗
+make test                         # 32 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -146,8 +146,12 @@ staging 的驗證。本機綠燈不是充分證據。**
 
   會覆寫工作目錄的新指令要分開決定兩件事,不要當成同一個選擇:
 
-  **(1) 閘門**——髒工作目錄/進行中的 rebase 該不該擋?
-  - `switch`/`merge`/`stash pop`:直接拒絕。
+  **(1) 閘門**——髒工作目錄/進行中的 rebase/進行中的 merge 該不該擋?
+  - `switch`/`merge`/`stash pop`:直接拒絕。`switch` 對 rebase 與 merge 各有
+    一道**明確**閘門(`cmd_switch.c`,Phase 14 與 Phase 16),都在任何副作用
+    之前、`--force` 繞不過、`-c` 也不會建出分支。**不要靠
+    `sg_safe_apply_tree` 的髒確認代打**——`--force` 正好繞過它,Phase 16 的
+    bug 就是這樣來的。
   - `reset --hard`:走 `sg_safe_apply_tree`(確認 + 快照)。
   - `stash push`:**不擋**——「工作目錄是髒的」是它的輸入而不是危險,所以它
     直接呼叫 `sg_apply_tree_to_workdir` 並自己先 `sg_snapshot_create`;用
@@ -155,15 +159,26 @@ staging 的驗證。本機綠燈不是充分證據。**
     而在 rebase 中誤擋,而且非互動時會要求 `--force`。
 
   **(2) 收尾**——結束哪些進行中的狀態?
-  - `MERGE_HEAD`:任何覆寫工作目錄的操作都清掉(真 git 2.55.0 實測;
-    `stash push` 也清,且不警告——sg 額外印一行 stderr,狀態仍完全一致)。
+  - `MERGE_HEAD`:任何**真的執行下去**的覆寫工作目錄操作都清掉(真 git
+    2.55.0 實測;`stash push` 也清,且不警告——sg 額外印一行 stderr,狀態仍
+    完全一致)。`switch` 不在此列:它在上面那道閘門就拒絕了,永遠走不到收尾
+    (真 git 的 `switch` 也拒絕,會清的是 `checkout -f`,而 sg 沒有
+    `checkout`)。
   - rebase 序列器狀態:**除了 rebase 自己的子指令,誰都不准動**
     (Phase 14 實測)。`stash push` 是「不擋也不清、原封不動」的代表案例。
   - `cmd_undo.c` 仍是唯一例外(無真 git 對應物),它在回傳後自己清。
 
+  **「merge 是否進行中」一律用 `sg_merge_head_exists`**(`include/sg/merge.h`)。
+  `sg_merge_head_read` 把「沒有 merge」與「狀態損壞」壓成同一個 -1,拿它當
+  判斷式會讓損壞的 `MERGE_HEAD` 被當成「沒有 merge」——結果是 switch 永久拒絕
+  而沒有任何指令清得掉它。`src/` 裡 `sg_merge_head_read` **只剩 `cmd_commit.c`
+  一個呼叫端**,因為只有它真的需要那個值(第二個 parent);它先問 `_exists`
+  再問 `_read`,讀不出來就照真 git 拒絕,不會靜默產出單 parent 的 commit。
+  新增「問 merge 在不在」的地方不要再引入第二個 `_read` 呼叫端(Phase 16)。
+
 ## 測試慣例
 
-- 28 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 32 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。
