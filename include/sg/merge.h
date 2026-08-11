@@ -103,6 +103,16 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
 
 /* ---- MERGE_HEAD (in-progress merge state) ---- */
 
+/* True iff git_dir/MERGE_HEAD exists in any form (a merge is in progress).
+   Deliberately does not parse, or even stat through, the path: real git
+   gates on file_exists(), an lstat that only asks whether something is
+   there, and refuses when MERGE_HEAD is empty, malformed, or a directory
+   (all three measured, git 2.55.0). Use this -- not sg_merge_head_read --
+   to decide whether a merge is in flight: the read below cannot tell "no
+   merge" from "corrupt", so a gate built on it would let a corrupt merge
+   state through. */
+int sg_merge_head_exists(const char *git_dir);
+
 /* Reads git_dir/MERGE_HEAD (the "theirs" commit id of an in-progress merge)
    into out. Returns 0 on success, -1 if there is no merge in progress or the
    file is malformed. */

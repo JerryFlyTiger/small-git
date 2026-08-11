@@ -126,7 +126,24 @@ int sg_cmd_commit(int argc, char **argv)
         return 1;
     }
 
-    is_merge_commit = (sg_merge_head_read(git_dir, merge_head_id) == 0);
+    /* This is the one caller that genuinely needs MERGE_HEAD's *value* (it
+       becomes the second parent), so existence alone is not enough -- but
+       the two questions must still be asked separately. Folding them into
+       one `read() == 0` made a corrupt MERGE_HEAD look like "no merge at
+       all", and the commit silently came out with a single parent: the
+       merge quietly vanished from the graph while sg reported success.
+       Real git 2.55.0 refuses outright here ("Corrupt MERGE_HEAD file"),
+       which is the behavior worth matching -- a wrong commit graph is
+       exactly the kind of divergence this project exists to avoid. */
+    is_merge_commit = sg_merge_head_exists(git_dir);
+    if (is_merge_commit && sg_merge_head_read(git_dir, merge_head_id) != 0) {
+        fprintf(stderr, "sg: 損壞的 MERGE_HEAD 檔案，無法建立 merge commit\n"
+                       "請修正 .git/MERGE_HEAD，或執行 sg merge --abort 放棄這次合併\n");
+        sg_index_free(&idx);
+        free(git_dir);
+        free(cleaned_message);
+        return 1;
+    }
 
     if (sg_tree_build_from_index(git_dir, &idx, tree_id) != 0) {
         fprintf(stderr, "sg: failed to build tree from index\n");

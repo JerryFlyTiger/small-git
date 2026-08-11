@@ -140,9 +140,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
     /* MERGE_HEAD cleanup is deliberately the CLI layer's job -- see the
        sg_stash_push header comment in sg/stash.h. */
     {
-        unsigned char merge_head_id[SG_SHA1_RAW_LEN];
-
-        if (sg_merge_head_read(git_dir, merge_head_id) == 0) {
+        if (sg_merge_head_exists(git_dir)) {
             if (sg_merge_head_remove(git_dir) != 0)
                 fprintf(stderr, "sg: warning: stash 成功，但清除 MERGE_HEAD 失敗\n");
             else

@@ -214,7 +214,15 @@ if a rebase is currently in progress (use
 instead). If a merge is in progress (\c
 .B MERGE_HEAD
 present) and all conflicts are resolved, the resulting commit is a merge
-commit with two parents.
+commit with two parents. If
+.B MERGE_HEAD
+is present but its contents cannot be parsed as a commit id, the commit is
+refused outright rather than quietly recorded with a single parent \(em a
+merge silently vanishing from the history is a worse outcome than a failed
+command. Real git refuses the same way (\(dqCorrupt MERGE_HEAD file\(dq).
+Use
+.B "sg merge --abort"
+to discard the broken merge state.
 .SS log
 .B sg log
 .PP
@@ -629,10 +637,35 @@ clobbering the sequencer state, and leaves the new branch un-created when
 .B -c
 was given.
 .PP
+An in-progress merge is refused the same way. Once
+.B "sg merge"
+has stopped on a conflict,
+.B switch
+is refused until the merge is concluded \(em finish it with
+.B "sg commit"
+or end it with
+.BR "sg merge --abort" .
+.B --force
+does not override this either, and
+.B -c
+leaves the new branch un-created. The refusal keys on the presence of
+.BR MERGE_HEAD ,
+not on the index still holding conflicted stages: resolving every conflict
+and staging the result still leaves the merge in progress, and
+.B switch
+still refuses. Real git behaves identically (\(dqcannot switch branch while
+merging\(dq); note that real git's
+.B "git checkout -f"
+does allow it, but
+.B sg
+has no
+.B checkout
+subcommand and follows
+.BR "git switch" .
+.PP
 Otherwise, if switching would discard uncommitted changes (staged or
-unstaged), or would abandon an in-progress merge, the affected paths are
-listed and confirmation is required before proceeding (an automatic safety
-snapshot is taken first \(em see
+unstaged), the affected paths are listed and confirmation is required
+before proceeding (an automatic safety snapshot is taken first \(em see
 .B undo
 below); pass
 .B --force
@@ -721,9 +754,13 @@ Snapshots are created automatically by
 .BR merge ,
 and
 .B rebase
-whenever they are about to overwrite uncommitted work or abandon an
-in-progress merge/rebase; there is no manual \(dqtake a snapshot now\(dq
-command. See
+whenever they are about to overwrite uncommitted work; there is no manual
+\(dqtake a snapshot now\(dq command.
+.B switch
+never snapshots its way past an in-progress merge or a paused rebase \(em
+it refuses both outright (see
+.B switch
+above). See
 .B FILES
 for where snapshots are stored.
 .SS repack
@@ -771,7 +808,14 @@ pre-merge
 .B HEAD
 and removing
 .BR MERGE_HEAD ,
-also taking an automatic safety snapshot first.
+also taking an automatic safety snapshot first. It only needs
+.B MERGE_HEAD
+to exist, not to be readable: a corrupt one is exactly the state most in
+need of aborting, and it is cleared here (and by
+.BR "reset --hard" / --mixed
+and
+.BR "stash push" )
+just as real git clears it.
 .SS merge-base
 .B sg merge-base
 .I commit-a commit-b

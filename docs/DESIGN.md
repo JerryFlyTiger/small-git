@@ -872,3 +872,143 @@ interop 檢查本身也出過兩個同類問題,細節寫在程式碼註解裡:`
 最終 `tests/interop.sh` 826 項檢查(Phase 14 結束時是 726),單元測試新增
 `tests/test_reflog.c`、`tests/test_stash.c`、`tests/test_objstore.c` 三支,
 `make test` 31 支二進位全過,`make sanitize` 乾淨。
+
+## Phase 16:進行中的 merge 不再被 `switch` 終結
+
+Phase 15 交接時記著的追蹤項第一條:`sg switch --force` 在衝突 merge 期間會
+成功切走並清掉 `MERGE_HEAD`,真 git 拒絕。這是 Phase 14 修過的那個 bug 的
+同一個形狀,只是換一個子系統——rebase 換成 merge。
+
+### 先量,再改
+
+照 Phase 12 留下的規矩,開工第一件事是量真 git 2.55.0,不是回想:
+
+| 情境 | 真 git |
+|---|---|
+| `git switch <other>` 在衝突 merge 期間 | **拒絕**,exit 128 |
+| `git switch --force <other>` | **一樣拒絕**,`--force` 蓋不過 |
+| `git switch -c <new>` | 一樣拒絕,而且**新分支不會被建立** |
+| `git switch <目前已經在的分支>` | 一樣拒絕 |
+| 衝突已解決並 `git add`(index 乾淨、`MERGE_HEAD` 還在) | 一樣拒絕 |
+| `MERGE_HEAD` 內容壞掉 / 空檔 / 是一個目錄 | 一樣拒絕 |
+| `git checkout -f <other>` | **允許**,並清掉 `MERGE_HEAD` |
+
+歸納:**閘門看的是 `MERGE_HEAD` 存不存在,不是 index 還有沒有衝突**,而且
+`switch` 與 `checkout -f` 在這件事上是分裂的。sg 沒有 `checkout`,所以要對
+齊的是 `switch` 那一半。
+
+### 這條閘門為什麼原本「看起來」是對的
+
+修法前 sg 並不是完全不擋——沒有 `--force` 的 `sg switch` 在衝突 merge 期間
+照樣退出 1。但理由是 `sg_safe_apply_tree` 的髒工作目錄確認,而 interop 在非
+tty 下跑,`sg_confirm_dangerous` 自動拒絕。**`--force` 正好是用來繞過這一層
+的**,於是唯一真正需要擋的那條路徑反而是唯一沒被擋住的。
+
+這與 Phase 14 記過的教訓完全同型,而且這次是**在 mutation 裡再次現形**:把
+新閘門整個拿掉重跑,「plain switch 被拒絕」「拒絕後 `MERGE_HEAD` 還在」
+「HEAD 沒動」這幾條**照樣是綠的**,只有斷言 stderr 專屬字串的那幾條變紅。
+退出碼層級的斷言在這裡是假覆蓋,第二次驗證了同一件事。
+
+### `exists` 不是 `read`
+
+`sg_merge_head_read` 把「沒有 merge」與「merge 狀態損壞」壓進同一個 -1,拿
+它當閘門會讓損壞的 merge 狀態直接放行。所以新增了
+`sg_merge_head_exists`(`include/sg/merge.h`),與 `sg_rebase_state_exists`
+對稱,只問路徑上有沒有東西。
+
+實作用 `lstat` 且**不加** `S_ISREG` 過濾,因為真 git 用的是 `file_exists()`
+——實測連「`MERGE_HEAD` 是一個目錄」都照樣拒絕。第一版寫成
+`stat() == 0 && S_ISREG(...)`,是量了目錄那一格才改掉的。
+
+這個決定有專屬的鑑別測試,不然它與 `read` 版在其他所有案例上結果完全相同:
+interop 的 `phase16 corrupt` 四條,以及 `tests/test_merge_head.c` 直接並排
+比對兩支 API 在「壞掉/空/截斷/目錄」四種狀態下的分歧。定向 mutation 驗過:
+把 `exists` 改成委派給 `read`,單元測試紅 4 條、interop 紅 4 條,其餘全綠。
+
+### 兩個閘門的順序:量到「測不到」,就記下來
+
+`cmd_switch.c` 現在有兩道閘門(rebase 在前、merge 在後)。想寫一條檢查釘住
+順序,結果把兩者對調之後**整份 875 項全綠**。
+
+原因量出來了:paused rebase **不會**寫 `MERGE_HEAD`(sg 只留
+`.git/sg-rebase/`,真 git 留 `rebase-merge/` 加 `REBASE_HEAD`,兩邊都不寫
+`MERGE_HEAD`)。兩個條件從任何可達路徑都不可能同時成立,只有手工偽造兩份狀
+態檔才到得了,而那個狀態真 git 也沒有,沒有 oracle。
+
+所以順序是**真的不可觀測**。照本專案既有的作法,把它記進「已知測不到的守衛」
+而不是假裝有覆蓋,並改成釘住那條真正撐住結論的事實:paused rebase 期間
+`MERGE_HEAD` 不存在(sg 與真 git 各驗一次)。
+
+### fixture 汙染:過度反應的 mutation 會為錯的理由變紅
+
+「閘門不可過度觸發」那組檢查(merge 結束後 switch 要恢復正常)第一版用
+`sg switch` 建 fixture 的分支結構。把閘門改成永遠觸發之後那組確實變紅了——
+但**是 fixture 自己沒建起來**,precondition 就先掛了,根本沒走到被測行為。
+這正是「結果相同、理由不同」的另一種版本,只是這次假的是紅燈而不是綠燈。
+
+修法是那組改用真 git 建分支結構,只留 merge 與最後那次 switch 給 sg。再跑
+一次同樣的 mutation,precondition 全綠、只有四條「應該恢復正常」變紅。
+
+### 沒有動的東西
+
+`reset --hard` 照舊清 `MERGE_HEAD`(Phase 14 定下的規則沒變),新閘門只在
+`cmd_switch.c`,沒有下沉到 `sg_safe_apply_tree`——後者是四個呼叫端共用的,
+下沉會連 `reset --hard` 一起擋掉。`phase16 reset` 那組就是釘這件事的。
+
+### 冷讀抓到的:新閘門把既有的不一致變成了死路
+
+reviewer 冷讀時指出:`sg_merge_head_exists` 只用在 `switch` 一個呼叫端,其餘
+八處判斷「merge 是否進行中」的地方仍然用 `sg_merge_head_read(...) == 0`——
+而那正是新標頭註解自己點名的缺陷。獨立重現後確認成立,而且比回報的更嚴重。
+
+`MERGE_HEAD` 損壞時(空檔、非法內容、目錄),量到的分歧:
+
+| 指令 | 真 git 2.55.0 | 修法前的 sg |
+|---|---|---|
+| `merge --abort` | rc 0,**清掉** | rc 1,**留著** |
+| `reset --hard` | rc 0,**清掉** | rc 0,**留著** |
+| `reset --mixed` | rc 0,**清掉** | rc 0,**留著** |
+| `reset --soft` | **拒絕** | **放行** |
+| `stash push` | rc 0,**清掉** | rc 0,**留著** |
+| `status` | 報告「有尚未合併的路徑」 | **不報告** |
+| `commit` | **大聲拒絕**「損壞的 MERGE_HEAD 檔案」 | rc 0,**靜默產出單 parent commit** |
+
+最後一列最嚴重:merge 語意從 commit graph 裡悄悄消失,而 sg 回報成功。這正是
+本專案存在的理由要擋的那類分歧,而且**單看退出碼永遠測不到**——所以那組測試
+除了斷言 exit != 0,還斷言「沒有產生任何新 commit」。
+
+前六列合起來構成一個死路:新閘門讓 `switch` 永久拒絕,而沒有任何指令清得掉那
+個檔案,連 `switch` 自己印的錯誤訊息建議的兩條路(`sg commit`、
+`sg merge --abort`)都走不通,唯一出路是手動 `rm .git/MERGE_HEAD`。**這個死路
+是新閘門造成的**:修法前 `switch --force` 至少還走得掉(雖然行為是錯的)。
+
+修法是把「merge 是否進行中」的判斷全部收斂到 `sg_merge_head_exists`。收斂後
+`sg_merge_head_read` 在 `src/` 裡只剩**一個**呼叫端——`cmd_commit.c`,唯一真
+正需要那個「值」(第二個 parent)的地方,而它現在把兩個問題分開問:先問存不
+存在,再問讀不讀得出來,讀不出來就照真 git 拒絕。
+
+`cmd_rebase.c` 那道是唯一沒有 oracle 的:實測 `git rebase` 在乾淨工作樹下**根
+本不看 `MERGE_HEAD`**(合法或損壞都一樣,直接跑完並清掉它),sg 是刻意拒絕。
+既然刻意拒絕,就必須連損壞狀態一起涵蓋,否則 rebase 與 switch 會對「有沒有
+merge 在進行」給出不同答案。這一點寫在註解裡。
+
+### 這一輪的 mutation
+
+- 把**除了 switch 以外**全部八處還原成 `read`:18 條變紅,涵蓋每一列;而
+  「合法 merge 仍然產出雙 parent commit」保持綠,證明拒絕是針對損壞而不是針
+  對 merge 本身。
+- 只還原 `cmd_commit.c`:精準 3 條紅,全在 commit 那組——逐處歸屬成立。
+- 加回 `S_ISREG`:第一版只有單元測試會紅,interop 全綠(reviewer 指出這個覆蓋
+  缺口)。補上「`MERGE_HEAD` 是目錄」的 CLI + oracle 案例後,同一條 mutation
+  現在讓 interop 也紅 2 條。
+
+教訓的形狀:**收斂一個判斷式的時候,沒被收斂的呼叫端不是「維持現狀」,而是
+與新行為產生互動**。這裡的互動剛好是最壞的一種——新守衛把舊的寬鬆行為變成了
+無法脫身的狀態。範圍看起來只有一個檔案的修法,實際邊界是「所有問同一個問題的
+地方」。
+
+最終 `tests/interop.sh` 909 項檢查(Phase 15 結束時是 826),單元測試新增
+`tests/test_merge_head.c`,`make test` 32 支二進位全過,`make sanitize` 乾淨。
+八條定向 mutation(拿掉閘門、`exists`→`read`、永遠觸發、對調順序、
+`exists` 委派 `read`、加回 `S_ISREG`、還原全部非 switch 呼叫端、只還原
+`cmd_commit.c`)每一條的紅燈範圍都逐條核對過。
