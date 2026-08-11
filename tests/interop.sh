@@ -4835,6 +4835,501 @@ P15_LOSTBLOB_TIP=$(cd "$P15_LOSTBLOB" && tail -1 .git/logs/refs/stash 2>/dev/nul
 check "phase15 lost blob: the tip invariant survived the failed pop" \
     sh -c "[ -n \"$P15_LOSTBLOB_REF\" ] && [ \"$P15_LOSTBLOB_REF\" = \"$P15_LOSTBLOB_TIP\" ]"
 
+# --- Phase 16: switch during an in-progress merge ---
+#
+# Measured against real git 2.55.0: `git switch <other>` during an
+# in-progress merge is refused ("cannot switch branch while merging", exit
+# 128) and --force does NOT override it. The refusal keys on MERGE_HEAD's
+# mere existence -- it fires whether or not the index still holds conflicts,
+# it fires for `-c`, and it even fires when the target is the branch already
+# checked out. (`git checkout -f` does succeed and clears MERGE_HEAD, but sg
+# has no `checkout`, so `switch`'s rule is the one to match.)
+#
+# Same shape as the Phase 14 rebase gate, one subsystem over. Before this,
+# sg refused only by accident, via sg_safe_apply_tree's dirty-worktree
+# confirmation -- exactly what --force bypasses, so `sg switch --force`
+# silently cleared MERGE_HEAD and abandoned the merge.
+#
+# NOTE on discrimination: the rebase gate and the merge gate share the
+# "無法切換分支" wording, so grepping for that alone would pass even if the
+# merge gate did not exist. Every rejection below is pinned to the
+# merge-specific "進行中的合併" instead, which no other refusal emits.
+
+p16_merge_conflict_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    printf 'orig1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c other < /dev/null) > /dev/null 2>&1
+    printf 'sidefile\n' > "$dir/o.txt"
+    (cd "$dir" && "$SG" add o.txt && "$SG" commit -m "other change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c feature < /dev/null) > /dev/null 2>&1
+    printf 'feature1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+    printf 'master1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+}
+
+p16_git_merge_conflict_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && git init -q "$(basename "$dir")")
+    (cd "$dir" && git config user.email "a@b.c" && git config user.name "git user")
+    (cd "$dir" && git symbolic-ref HEAD refs/heads/master)
+    printf 'orig1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && git add c.txt && git commit -q -m "base")
+    (cd "$dir" && git switch -q -c other)
+    printf 'sidefile\n' > "$dir/o.txt"
+    (cd "$dir" && git add o.txt && git commit -q -m "other change")
+    (cd "$dir" && git switch -q master)
+    (cd "$dir" && git switch -q -c feature)
+    printf 'feature1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && git add c.txt && git commit -q -m "feature change")
+    (cd "$dir" && git switch -q master)
+    printf 'master1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && git add c.txt && git commit -q -m "master change")
+    (cd "$dir" && git merge feature) > /dev/null 2>&1
+}
+
+# case A: plain switch, --force, and -c are all refused; nothing moves.
+P16_SWITCH="$WORKDIR/p16_switch"
+p16_merge_conflict_repo "$P16_SWITCH"
+check "phase16: precondition -- the merge left MERGE_HEAD behind" \
+    test -f "$P16_SWITCH/.git/MERGE_HEAD"
+P16_MERGE_HEAD_BEFORE=$(cat "$P16_SWITCH/.git/MERGE_HEAD")
+P16_HEAD_BEFORE=$(cd "$P16_SWITCH" && git rev-parse HEAD)
+P16_STATUS_BEFORE=$(cd "$P16_SWITCH" && git status --porcelain)
+
+P16_SWITCH_ERR="$WORKDIR/p16_switch_err.txt"
+(cd "$P16_SWITCH" && "$SG" switch other < /dev/null) > "$P16_SWITCH_ERR" 2>&1
+check "phase16: sg switch during an in-progress merge is rejected" test $? != 0
+check "phase16: switch rejection left MERGE_HEAD in place" test -f "$P16_SWITCH/.git/MERGE_HEAD"
+check "phase16: switch rejection left MERGE_HEAD's contents untouched" \
+    sh -c "test \"\$(cat '$P16_SWITCH/.git/MERGE_HEAD')\" = '$P16_MERGE_HEAD_BEFORE'"
+check "phase16: switch rejection left HEAD unchanged" \
+    sh -c "test \"\$(cd '$P16_SWITCH' && git rev-parse HEAD)\" = '$P16_HEAD_BEFORE'"
+check "phase16: switch rejection left the working directory and index unchanged" \
+    sh -c "test \"\$(cd '$P16_SWITCH' && git status --porcelain)\" = '$P16_STATUS_BEFORE'"
+check "phase16: switch rejection is due to the merge gate, not the rebase gate or the dirty-workdir prompt" \
+    grep -q "進行中的合併" "$P16_SWITCH_ERR"
+
+P16_SWITCH_FORCE_ERR="$WORKDIR/p16_switch_force_err.txt"
+(cd "$P16_SWITCH" && "$SG" switch --force other < /dev/null) > "$P16_SWITCH_FORCE_ERR" 2>&1
+check "phase16: sg switch --force during an in-progress merge is still rejected" test $? != 0
+check "phase16: --force rejection left MERGE_HEAD in place" test -f "$P16_SWITCH/.git/MERGE_HEAD"
+check "phase16: --force rejection left HEAD unchanged" \
+    sh -c "test \"\$(cd '$P16_SWITCH' && git rev-parse HEAD)\" = '$P16_HEAD_BEFORE'"
+check "phase16: --force rejection is due to the merge gate, not skipped by --force" \
+    grep -q "進行中的合併" "$P16_SWITCH_FORCE_ERR"
+
+P16_SWITCH_C_ERR="$WORKDIR/p16_switch_c_err.txt"
+(cd "$P16_SWITCH" && "$SG" switch -c newbranch < /dev/null) > "$P16_SWITCH_C_ERR" 2>&1
+check "phase16: sg switch -c during an in-progress merge is rejected" test $? != 0
+check "phase16: -c rejection left MERGE_HEAD in place" test -f "$P16_SWITCH/.git/MERGE_HEAD"
+check "phase16: switch -c rejection did NOT create the new branch (matches real git)" \
+    sh -c "! (cd '$P16_SWITCH' && git rev-parse --verify refs/heads/newbranch) > /dev/null 2>&1"
+check "phase16: -c rejection is due to the merge gate" \
+    grep -q "進行中的合併" "$P16_SWITCH_C_ERR"
+
+# Real git refuses the same three, so the oracle agrees this is a refusal
+# rather than sg inventing a restriction git does not have.
+P16_GIT_SWITCH="$WORKDIR/p16_git_switch"
+p16_git_merge_conflict_repo "$P16_GIT_SWITCH"
+check "phase16 oracle: precondition -- real git's merge left MERGE_HEAD behind" \
+    test -f "$P16_GIT_SWITCH/.git/MERGE_HEAD"
+(cd "$P16_GIT_SWITCH" && git switch other) > /dev/null 2>&1
+check "phase16 oracle: real git switch during an in-progress merge is rejected too" test $? != 0
+(cd "$P16_GIT_SWITCH" && git switch --force other) > /dev/null 2>&1
+check "phase16 oracle: real git switch --force is rejected too (--force does not override)" test $? != 0
+(cd "$P16_GIT_SWITCH" && git switch -c newbranch) > /dev/null 2>&1
+check "phase16 oracle: real git switch -c is rejected too" test $? != 0
+check "phase16 oracle: real git left MERGE_HEAD in place" test -f "$P16_GIT_SWITCH/.git/MERGE_HEAD"
+check "phase16 oracle: real git did NOT create the new branch either" \
+    sh -c "! (cd '$P16_GIT_SWITCH' && git rev-parse --verify refs/heads/newbranch) > /dev/null 2>&1"
+
+# case B: the gate keys on MERGE_HEAD alone, not on the index still being
+# conflicted. Resolving every conflict and staging it leaves a clean index
+# with MERGE_HEAD still present -- real git refuses here too, and so must sg.
+# This is what separates the gate from the dirty-worktree prompt it used to
+# hide behind: with the index clean there is nothing for that prompt to
+# object to, so a missing gate shows up as a *successful* switch.
+P16_RESOLVED="$WORKDIR/p16_resolved"
+p16_merge_conflict_repo "$P16_RESOLVED"
+printf 'resolved1\norig2\n' > "$P16_RESOLVED/c.txt"
+(cd "$P16_RESOLVED" && "$SG" add c.txt) > /dev/null 2>&1
+check "phase16 resolved: precondition -- MERGE_HEAD still present after staging the resolution" \
+    test -f "$P16_RESOLVED/.git/MERGE_HEAD"
+check "phase16 resolved: precondition -- the index no longer holds a conflicted stage" \
+    sh -c "! (cd '$P16_RESOLVED' && git status --porcelain) | grep -q '^UU'"
+P16_RESOLVED_ERR="$WORKDIR/p16_resolved_err.txt"
+(cd "$P16_RESOLVED" && "$SG" switch other < /dev/null) > "$P16_RESOLVED_ERR" 2>&1
+check "phase16 resolved: sg switch is still rejected once conflicts are resolved but uncommitted" test $? != 0
+check "phase16 resolved: rejection is due to the merge gate" \
+    grep -q "進行中的合併" "$P16_RESOLVED_ERR"
+(cd "$P16_RESOLVED" && "$SG" switch --force other < /dev/null) > /dev/null 2>&1
+check "phase16 resolved: --force is still rejected once conflicts are resolved but uncommitted" test $? != 0
+check "phase16 resolved: MERGE_HEAD survived both attempts" test -f "$P16_RESOLVED/.git/MERGE_HEAD"
+
+P16_GIT_RESOLVED="$WORKDIR/p16_git_resolved"
+p16_git_merge_conflict_repo "$P16_GIT_RESOLVED"
+printf 'resolved1\norig2\n' > "$P16_GIT_RESOLVED/c.txt"
+(cd "$P16_GIT_RESOLVED" && git add c.txt) > /dev/null 2>&1
+(cd "$P16_GIT_RESOLVED" && git switch other) > /dev/null 2>&1
+check "phase16 oracle: real git also refuses once conflicts are resolved but uncommitted" test $? != 0
+
+# case C: the gate tests for MERGE_HEAD's existence, not its parseability.
+# sg_merge_head_read cannot tell "no merge" from "corrupt", so a gate built
+# on it would wave a corrupt merge state straight through; real git refuses
+# on an empty or malformed MERGE_HEAD just the same. This is the only check
+# that separates sg_merge_head_exists from sg_merge_head_read.
+P16_CORRUPT="$WORKDIR/p16_corrupt"
+p16_merge_conflict_repo "$P16_CORRUPT"
+printf 'not-a-sha\n' > "$P16_CORRUPT/.git/MERGE_HEAD"
+P16_CORRUPT_ERR="$WORKDIR/p16_corrupt_err.txt"
+(cd "$P16_CORRUPT" && "$SG" switch --force other < /dev/null) > "$P16_CORRUPT_ERR" 2>&1
+check "phase16 corrupt: sg switch --force is rejected on a malformed MERGE_HEAD" test $? != 0
+check "phase16 corrupt: rejection is due to the merge gate, not a parse error elsewhere" \
+    grep -q "進行中的合併" "$P16_CORRUPT_ERR"
+: > "$P16_CORRUPT/.git/MERGE_HEAD"
+P16_EMPTY_ERR="$WORKDIR/p16_empty_err.txt"
+(cd "$P16_CORRUPT" && "$SG" switch --force other < /dev/null) > "$P16_EMPTY_ERR" 2>&1
+check "phase16 corrupt: sg switch --force is rejected on an empty MERGE_HEAD" test $? != 0
+check "phase16 corrupt: empty-MERGE_HEAD rejection is due to the merge gate" \
+    grep -q "進行中的合併" "$P16_EMPTY_ERR"
+
+# a directory at the path is the third shape, and the one an S_ISREG filter
+# would wrongly let through. Real git refuses here too (measured), so this
+# goes through the CLI with an oracle rather than living only in
+# tests/test_merge_head.c's API-level comparison.
+P16_DIRMH="$WORKDIR/p16_dirmh"
+p16_merge_conflict_repo "$P16_DIRMH"
+rm -f "$P16_DIRMH/.git/MERGE_HEAD"
+mkdir "$P16_DIRMH/.git/MERGE_HEAD"
+P16_DIRMH_ERR="$WORKDIR/p16_dirmh_err.txt"
+(cd "$P16_DIRMH" && "$SG" switch --force other < /dev/null) > "$P16_DIRMH_ERR" 2>&1
+check "phase16 corrupt: sg switch --force is rejected when MERGE_HEAD is a directory" test $? != 0
+check "phase16 corrupt: directory-MERGE_HEAD rejection is due to the merge gate" \
+    grep -q "進行中的合併" "$P16_DIRMH_ERR"
+
+P16_GIT_DIRMH="$WORKDIR/p16_git_dirmh"
+p16_git_merge_conflict_repo "$P16_GIT_DIRMH"
+rm -f "$P16_GIT_DIRMH/.git/MERGE_HEAD"
+mkdir "$P16_GIT_DIRMH/.git/MERGE_HEAD"
+(cd "$P16_GIT_DIRMH" && git switch --force other) > /dev/null 2>&1
+check "phase16 oracle: real git also refuses when MERGE_HEAD is a directory" test $? != 0
+
+P16_GIT_CORRUPT="$WORKDIR/p16_git_corrupt"
+p16_git_merge_conflict_repo "$P16_GIT_CORRUPT"
+printf 'not-a-sha\n' > "$P16_GIT_CORRUPT/.git/MERGE_HEAD"
+(cd "$P16_GIT_CORRUPT" && git switch --force other) > /dev/null 2>&1
+check "phase16 oracle: real git also refuses on a malformed MERGE_HEAD" test $? != 0
+: > "$P16_GIT_CORRUPT/.git/MERGE_HEAD"
+(cd "$P16_GIT_CORRUPT" && git switch --force other) > /dev/null 2>&1
+check "phase16 oracle: real git also refuses on an empty MERGE_HEAD" test $? != 0
+
+# case D: the gate must not over-fire. Once the merge is finished -- by
+# committing it or by aborting it -- switch works normally again. Without
+# this, a gate that simply always refused would pass every check above.
+#
+# The branch structure here is built with real git, not sg, on purpose:
+# p16_merge_conflict_repo uses `sg switch` to move between branches, so an
+# always-refusing gate would break the fixture itself and these checks would
+# go red for the wrong reason -- a refusal never reached, rather than a
+# refusal that should not have happened. Verified by mutation: with the
+# fixture built by sg, an always-firing gate reddened the *preconditions*;
+# built by git, it reddens exactly the two "works again" checks. Only the
+# merge and the final switch below are sg's.
+p16_gitbuilt_merge_conflict_repo() {
+    dir="$1"
+    mkdir -p "$dir"
+    (cd "$WORKDIR" && git init -q "$(basename "$dir")")
+    (cd "$dir" && git config user.email "a@b.c" && git config user.name "git user")
+    (cd "$dir" && git symbolic-ref HEAD refs/heads/master)
+    printf 'orig1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && git add c.txt && git commit -q -m "base")
+    (cd "$dir" && git switch -q -c other)
+    printf 'sidefile\n' > "$dir/o.txt"
+    (cd "$dir" && git add o.txt && git commit -q -m "other change")
+    (cd "$dir" && git switch -q master)
+    (cd "$dir" && git switch -q -c feature)
+    printf 'feature1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && git add c.txt && git commit -q -m "feature change")
+    (cd "$dir" && git switch -q master)
+    printf 'master1\norig2\n' > "$dir/c.txt"
+    (cd "$dir" && git add c.txt && git commit -q -m "master change")
+    (cd "$dir" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+}
+
+P16_DONE="$WORKDIR/p16_done"
+p16_gitbuilt_merge_conflict_repo "$P16_DONE"
+check "phase16 done: precondition -- sg's merge on a git-built repo left MERGE_HEAD behind" \
+    test -f "$P16_DONE/.git/MERGE_HEAD"
+printf 'resolved1\norig2\n' > "$P16_DONE/c.txt"
+(cd "$P16_DONE" && "$SG" add c.txt && "$SG" commit -m "merge feature") > /dev/null 2>&1
+check "phase16 done: committing the merge cleared MERGE_HEAD" test ! -f "$P16_DONE/.git/MERGE_HEAD"
+(cd "$P16_DONE" && "$SG" switch other < /dev/null) > /dev/null 2>&1
+check "phase16 done: sg switch works again after the merge is committed" test $? = 0
+check "phase16 done: HEAD really moved to the target branch" \
+    sh -c "test \"\$(cd '$P16_DONE' && git symbolic-ref HEAD)\" = 'refs/heads/other'"
+
+P16_ABORTED="$WORKDIR/p16_aborted"
+p16_gitbuilt_merge_conflict_repo "$P16_ABORTED"
+check "phase16 aborted: precondition -- MERGE_HEAD present before the abort" \
+    test -f "$P16_ABORTED/.git/MERGE_HEAD"
+(cd "$P16_ABORTED" && "$SG" merge --abort) > /dev/null 2>&1
+check "phase16 aborted: merge --abort cleared MERGE_HEAD" test ! -f "$P16_ABORTED/.git/MERGE_HEAD"
+(cd "$P16_ABORTED" && "$SG" switch other < /dev/null) > /dev/null 2>&1
+check "phase16 aborted: sg switch works again after merge --abort" test $? = 0
+check "phase16 aborted: HEAD really moved to the target branch" \
+    sh -c "test \"\$(cd '$P16_ABORTED' && git symbolic-ref HEAD)\" = 'refs/heads/other'"
+
+# case E: reset --hard must keep clearing MERGE_HEAD. The new gate sits in
+# cmd_switch.c only; if it ever migrated down into sg_safe_apply_tree it
+# would break reset --hard's documented behavior, and this is what would
+# notice. (P12R_HARD_MERGE pins the same rule from the reset side; this
+# checks it still holds now that a sibling command refuses instead.)
+P16_RESET="$WORKDIR/p16_reset"
+p16_merge_conflict_repo "$P16_RESET"
+check "phase16 reset: precondition -- MERGE_HEAD present before reset --hard" \
+    test -f "$P16_RESET/.git/MERGE_HEAD"
+(cd "$P16_RESET" && "$SG" reset --hard --force) > /dev/null 2>&1
+check "phase16 reset: sg reset --hard during a merge still exits 0" test $? = 0
+check "phase16 reset: sg reset --hard still clears MERGE_HEAD (not gated like switch)" \
+    test ! -f "$P16_RESET/.git/MERGE_HEAD"
+
+# case F: the merge gate must not swallow the rebase gate's diagnosis. A
+# paused rebase writes no MERGE_HEAD -- measured on both sides, sg leaves
+# only .git/sg-rebase/ and real git leaves rebase-merge/ plus REBASE_HEAD,
+# neither writes MERGE_HEAD -- so mid-rebase the merge gate stays silent and
+# the rebase gate is what reports. That absence is the load-bearing fact,
+# so it is checked directly rather than inferred from the message.
+#
+# NOT COVERED, deliberately: which of the two gates wins when both apply.
+# The conditions are never simultaneously true through any reachable path
+# (only hand-forging both state files gets there), and real git has no such
+# state to serve as an oracle, so their relative order in cmd_switch.c is
+# unobservable. Confirmed by mutation: swapping the two gates leaves the
+# whole suite green. Recorded here rather than pretended covered.
+P16_REBASE_ERR="$WORKDIR/p16_rebase_err.txt"
+P16_REBASE="$WORKDIR/p16_rebase"
+p14_rebase_paused_repo "$P16_REBASE"
+(cd "$P16_REBASE" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+check "phase16 gates: precondition -- the rebase really is paused" \
+    test -d "$P16_REBASE/.git/sg-rebase"
+check "phase16 gates: a paused sg rebase writes no MERGE_HEAD (so the merge gate cannot fire)" \
+    test ! -f "$P16_REBASE/.git/MERGE_HEAD"
+(cd "$P16_REBASE" && "$SG" switch --force master < /dev/null) > "$P16_REBASE_ERR" 2>&1
+check "phase16 gates: a paused rebase still reports the rebase gate, not the merge gate" \
+    sh -c "grep -q '進行中的 rebase' '$P16_REBASE_ERR' && ! grep -q '進行中的合併' '$P16_REBASE_ERR'"
+
+P16_GIT_REBASE="$WORKDIR/p16_git_rebase"
+mkdir -p "$P16_GIT_REBASE"
+(cd "$WORKDIR" && git init -q p16_git_rebase)
+(cd "$P16_GIT_REBASE" && git config user.email "a@b.c" && git config user.name "git user")
+(cd "$P16_GIT_REBASE" && git symbolic-ref HEAD refs/heads/master)
+printf 'orig1\norig2\n' > "$P16_GIT_REBASE/c.txt"
+(cd "$P16_GIT_REBASE" && git add c.txt && git commit -q -m "base")
+(cd "$P16_GIT_REBASE" && git switch -q -c feature)
+printf 'feature1\norig2\n' > "$P16_GIT_REBASE/c.txt"
+(cd "$P16_GIT_REBASE" && git add c.txt && git commit -q -m "feature change")
+(cd "$P16_GIT_REBASE" && git switch -q master)
+printf 'master1\norig2\n' > "$P16_GIT_REBASE/c.txt"
+(cd "$P16_GIT_REBASE" && git add c.txt && git commit -q -m "master change")
+(cd "$P16_GIT_REBASE" && git switch -q feature)
+(cd "$P16_GIT_REBASE" && git rebase master) > /dev/null 2>&1
+check "phase16 oracle: real git's paused rebase writes no MERGE_HEAD either" \
+    sh -c "test -d '$P16_GIT_REBASE/.git/rebase-merge' && test ! -f '$P16_GIT_REBASE/.git/MERGE_HEAD'"
+
+# --- Phase 16: a corrupt MERGE_HEAD must not become a dead end ---
+#
+# The switch gate above keys on MERGE_HEAD existing. That is only safe if
+# every way of *ending* a merge keys on the same thing -- otherwise a
+# MERGE_HEAD that exists but cannot be parsed refuses `switch` forever while
+# no command will clear it, and the only way out is deleting the file by
+# hand. Before this was fixed, `merge --abort` refused, `reset --hard` and
+# `stash push` silently left the file behind, and `commit` quietly produced
+# a SINGLE-PARENT commit while reporting success -- the merge vanished from
+# the graph, which is exactly the class of divergence this suite exists to
+# catch.
+#
+# Real git 2.55.0, measured for each row below: merge --abort clears it,
+# reset --hard/--mixed clear it, reset --soft refuses, stash push clears it,
+# status still reports an ongoing merge, and commit refuses outright
+# ("Corrupt MERGE_HEAD file") rather than degrading to a normal commit.
+
+p16_corrupt_repo() {
+    dir="$1"
+    p16_merge_conflict_repo "$dir"
+    printf 'not-a-sha\n' > "$dir/.git/MERGE_HEAD"
+}
+
+p16_git_corrupt_repo() {
+    dir="$1"
+    p16_git_merge_conflict_repo "$dir"
+    printf 'not-a-sha\n' > "$dir/.git/MERGE_HEAD"
+}
+
+# row 1: merge --abort is an escape route, and switch works afterwards.
+P16_ESC_ABORT="$WORKDIR/p16_esc_abort"
+p16_corrupt_repo "$P16_ESC_ABORT"
+(cd "$P16_ESC_ABORT" && "$SG" merge --abort) > /dev/null 2>&1
+check "phase16 escape: sg merge --abort succeeds on a corrupt MERGE_HEAD" test $? = 0
+check "phase16 escape: merge --abort cleared the corrupt MERGE_HEAD" \
+    test ! -f "$P16_ESC_ABORT/.git/MERGE_HEAD"
+(cd "$P16_ESC_ABORT" && "$SG" switch other < /dev/null) > /dev/null 2>&1
+check "phase16 escape: sg switch works again after aborting a corrupt merge" test $? = 0
+
+P16_GIT_ESC_ABORT="$WORKDIR/p16_git_esc_abort"
+p16_git_corrupt_repo "$P16_GIT_ESC_ABORT"
+(cd "$P16_GIT_ESC_ABORT" && git merge --abort) > /dev/null 2>&1
+check "phase16 oracle: real git merge --abort also succeeds on a corrupt MERGE_HEAD" test $? = 0
+check "phase16 oracle: real git merge --abort also cleared it" \
+    test ! -f "$P16_GIT_ESC_ABORT/.git/MERGE_HEAD"
+
+# row 2: reset --hard is the other escape route.
+P16_ESC_HARD="$WORKDIR/p16_esc_hard"
+p16_corrupt_repo "$P16_ESC_HARD"
+(cd "$P16_ESC_HARD" && "$SG" reset --hard --force) > /dev/null 2>&1
+check "phase16 escape: sg reset --hard succeeds on a corrupt MERGE_HEAD" test $? = 0
+check "phase16 escape: reset --hard cleared the corrupt MERGE_HEAD" \
+    test ! -f "$P16_ESC_HARD/.git/MERGE_HEAD"
+(cd "$P16_ESC_HARD" && "$SG" switch other < /dev/null) > /dev/null 2>&1
+check "phase16 escape: sg switch works again after reset --hard cleared it" test $? = 0
+
+P16_GIT_ESC_HARD="$WORKDIR/p16_git_esc_hard"
+p16_git_corrupt_repo "$P16_GIT_ESC_HARD"
+(cd "$P16_GIT_ESC_HARD" && git reset --hard) > /dev/null 2>&1
+check "phase16 oracle: real git reset --hard also cleared the corrupt MERGE_HEAD" \
+    test ! -f "$P16_GIT_ESC_HARD/.git/MERGE_HEAD"
+
+# row 3: reset --mixed clears it too; reset --soft refuses. Both measured.
+P16_ESC_MIXED="$WORKDIR/p16_esc_mixed"
+p16_corrupt_repo "$P16_ESC_MIXED"
+(cd "$P16_ESC_MIXED" && "$SG" reset HEAD) > /dev/null 2>&1
+check "phase16 escape: sg reset --mixed cleared the corrupt MERGE_HEAD" \
+    test ! -f "$P16_ESC_MIXED/.git/MERGE_HEAD"
+
+P16_GIT_ESC_MIXED="$WORKDIR/p16_git_esc_mixed"
+p16_git_corrupt_repo "$P16_GIT_ESC_MIXED"
+(cd "$P16_GIT_ESC_MIXED" && git reset) > /dev/null 2>&1
+check "phase16 oracle: real git reset --mixed also cleared it" \
+    test ! -f "$P16_GIT_ESC_MIXED/.git/MERGE_HEAD"
+
+P16_SOFT="$WORKDIR/p16_soft"
+p16_corrupt_repo "$P16_SOFT"
+P16_SOFT_ERR="$WORKDIR/p16_soft_err.txt"
+(cd "$P16_SOFT" && "$SG" reset --soft HEAD) > "$P16_SOFT_ERR" 2>&1
+check "phase16 escape: sg reset --soft still refuses on a corrupt MERGE_HEAD" test $? != 0
+check "phase16 escape: the --soft refusal is the merge/rebase guard" \
+    grep -q "無法執行 soft reset" "$P16_SOFT_ERR"
+
+P16_GIT_SOFT="$WORKDIR/p16_git_soft"
+p16_git_corrupt_repo "$P16_GIT_SOFT"
+(cd "$P16_GIT_SOFT" && git reset --soft HEAD) > /dev/null 2>&1
+check "phase16 oracle: real git reset --soft also refuses on a corrupt MERGE_HEAD" test $? != 0
+
+# row 4: commit must REFUSE, not silently drop the second parent. This is
+# the check that matters most -- the old behavior exited 0 and wrote a
+# single-parent commit, so an exit-code-only assertion would have passed
+# while the commit graph was already wrong. Assert all three: it fails, it
+# says why, and no commit was created.
+P16_CCOMMIT="$WORKDIR/p16_ccommit"
+p16_corrupt_repo "$P16_CCOMMIT"
+P16_CCOMMIT_HEAD_BEFORE=$(cd "$P16_CCOMMIT" && git rev-parse HEAD)
+printf 'resolved1\norig2\n' > "$P16_CCOMMIT/c.txt"
+(cd "$P16_CCOMMIT" && "$SG" add c.txt) > /dev/null 2>&1
+P16_CCOMMIT_ERR="$WORKDIR/p16_ccommit_err.txt"
+(cd "$P16_CCOMMIT" && "$SG" commit -m "merge feature") > "$P16_CCOMMIT_ERR" 2>&1
+check "phase16 corrupt commit: sg commit refuses on a corrupt MERGE_HEAD" test $? != 0
+check "phase16 corrupt commit: the refusal names the corrupt MERGE_HEAD" \
+    grep -q "損壞的 MERGE_HEAD" "$P16_CCOMMIT_ERR"
+check "phase16 corrupt commit: no commit was created" \
+    sh -c "test \"\$(cd '$P16_CCOMMIT' && git rev-parse HEAD)\" = '$P16_CCOMMIT_HEAD_BEFORE'"
+check "phase16 corrupt commit: MERGE_HEAD was left alone for the user to fix" \
+    test -f "$P16_CCOMMIT/.git/MERGE_HEAD"
+
+P16_GIT_CCOMMIT="$WORKDIR/p16_git_ccommit"
+p16_git_corrupt_repo "$P16_GIT_CCOMMIT"
+P16_GIT_CCOMMIT_HEAD_BEFORE=$(cd "$P16_GIT_CCOMMIT" && git rev-parse HEAD)
+printf 'resolved1\norig2\n' > "$P16_GIT_CCOMMIT/c.txt"
+(cd "$P16_GIT_CCOMMIT" && git add c.txt) > /dev/null 2>&1
+(cd "$P16_GIT_CCOMMIT" && git commit -m "merge feature") > /dev/null 2>&1
+check "phase16 oracle: real git commit also refuses on a corrupt MERGE_HEAD" test $? != 0
+check "phase16 oracle: real git created no commit either" \
+    sh -c "test \"\$(cd '$P16_GIT_CCOMMIT' && git rev-parse HEAD)\" = '$P16_GIT_CCOMMIT_HEAD_BEFORE'"
+
+# A well-formed MERGE_HEAD must still produce a real two-parent merge commit
+# -- the refusal above must key on corruption, not on merging at all.
+P16_GOODCOMMIT="$WORKDIR/p16_goodcommit"
+p16_merge_conflict_repo "$P16_GOODCOMMIT"
+printf 'resolved1\norig2\n' > "$P16_GOODCOMMIT/c.txt"
+(cd "$P16_GOODCOMMIT" && "$SG" add c.txt) > /dev/null 2>&1
+(cd "$P16_GOODCOMMIT" && "$SG" commit -m "merge feature") > /dev/null 2>&1
+check "phase16 corrupt commit: a well-formed merge still commits (exit 0)" test $? = 0
+check "phase16 corrupt commit: and it really has two parents" \
+    sh -c "test \"\$(cd '$P16_GOODCOMMIT' && git cat-file -p HEAD | grep -c '^parent ')\" = '2'"
+
+# row 5: stash push clears it (real git does too, measured on a clean index).
+P16_ESC_STASH="$WORKDIR/p16_esc_stash"
+p16_corrupt_repo "$P16_ESC_STASH"
+printf 'resolved1\norig2\n' > "$P16_ESC_STASH/c.txt"
+(cd "$P16_ESC_STASH" && "$SG" add c.txt) > /dev/null 2>&1
+(cd "$P16_ESC_STASH" && "$SG" stash push -m "corrupt merge") > /dev/null 2>&1
+check "phase16 escape: sg stash push cleared the corrupt MERGE_HEAD" \
+    test ! -f "$P16_ESC_STASH/.git/MERGE_HEAD"
+
+P16_GIT_ESC_STASH="$WORKDIR/p16_git_esc_stash"
+p16_git_corrupt_repo "$P16_GIT_ESC_STASH"
+printf 'resolved1\norig2\n' > "$P16_GIT_ESC_STASH/c.txt"
+(cd "$P16_GIT_ESC_STASH" && git add c.txt) > /dev/null 2>&1
+(cd "$P16_GIT_ESC_STASH" && git stash push -m "corrupt merge") > /dev/null 2>&1
+check "phase16 oracle: real git stash push also cleared it" \
+    test ! -f "$P16_GIT_ESC_STASH/.git/MERGE_HEAD"
+
+# row 6: status must agree with the gates that a merge is in flight.
+P16_CSTATUS="$WORKDIR/p16_cstatus"
+p16_corrupt_repo "$P16_CSTATUS"
+P16_CSTATUS_OUT="$WORKDIR/p16_cstatus_out.txt"
+(cd "$P16_CSTATUS" && "$SG" status) > "$P16_CSTATUS_OUT" 2>&1
+check "phase16 corrupt status: sg status still reports the merge" \
+    grep -q "unmerged paths" "$P16_CSTATUS_OUT"
+
+P16_GIT_CSTATUS="$WORKDIR/p16_git_cstatus"
+p16_git_corrupt_repo "$P16_GIT_CSTATUS"
+P16_GIT_CSTATUS_OUT="$WORKDIR/p16_git_cstatus_out.txt"
+(cd "$P16_GIT_CSTATUS" && LC_ALL=C git status) > "$P16_GIT_CSTATUS_OUT" 2>&1
+check "phase16 oracle: real git status also reports an ongoing merge" \
+    grep -qi "unmerged paths" "$P16_GIT_CSTATUS_OUT"
+
+# row 7: starting a second merge on top of a corrupt one is refused, so the
+# unfinished merge is never silently dropped.
+P16_CSECOND="$WORKDIR/p16_csecond"
+p16_corrupt_repo "$P16_CSECOND"
+P16_CSECOND_ERR="$WORKDIR/p16_csecond_err.txt"
+(cd "$P16_CSECOND" && "$SG" merge other < /dev/null) > "$P16_CSECOND_ERR" 2>&1
+check "phase16 corrupt second merge: sg refuses to start a second merge" test $? != 0
+check "phase16 corrupt second merge: the refusal is the unfinished-merge guard" \
+    grep -q "尚未完成的合併" "$P16_CSECOND_ERR"
+check "phase16 corrupt second merge: the corrupt MERGE_HEAD was left intact" \
+    test -f "$P16_CSECOND/.git/MERGE_HEAD"
+
+# row 8: sg-specific, NO real-git oracle. Measured: `git rebase` with a
+# clean working tree ignores MERGE_HEAD entirely (valid or malformed) and
+# just clears it. sg refuses on purpose instead; the point of this check is
+# only that the refusal covers a corrupt MERGE_HEAD too, so rebase and
+# switch cannot disagree about whether a merge is in flight.
+P16_CREBASE="$WORKDIR/p16_crebase"
+p16_corrupt_repo "$P16_CREBASE"
+P16_CREBASE_ERR="$WORKDIR/p16_crebase_err.txt"
+(cd "$P16_CREBASE" && "$SG" rebase other < /dev/null) > "$P16_CREBASE_ERR" 2>&1
+check "phase16 corrupt rebase: sg refuses to start a rebase (sg-specific, no git oracle)" test $? != 0
+check "phase16 corrupt rebase: the refusal is the unfinished-merge guard" \
+    grep -q "尚未完成的合併" "$P16_CREBASE_ERR"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
