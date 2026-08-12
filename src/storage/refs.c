@@ -1,5 +1,6 @@
 #include "sg/refs.h"
 
+#include "sg/reflog.h"
 #include "sg/workdir.h"
 
 #include <dirent.h>
@@ -197,24 +198,14 @@ int sg_ref_resolve_head(const char *git_dir, unsigned char id_out[SG_SHA1_RAW_LE
 
 int sg_ref_update_branch(const char *git_dir, const char *branch, const unsigned char id[SG_SHA1_RAW_LEN])
 {
-    char path[SG_PATH_MAX];
-    char hex[SG_SHA1_HEX_LEN + 1];
-    FILE *f;
+    char ref_path[SG_PATH_MAX];
 
     if (!sg_ref_branch_name_is_safe(branch))
         return -1;
-
-    snprintf(path, sizeof(path), "%s/refs/heads/%s", git_dir, branch);
-    sg_sha1_to_hex(id, hex);
-
-    f = fopen(path, "wb");
-    if (f == NULL)
+    if (snprintf(ref_path, sizeof(ref_path), "%s%s", BRANCH_PREFIX, branch) >= (int)sizeof(ref_path))
         return -1;
-    if (fprintf(f, "%s\n", hex) < 0) {
-        fclose(f);
-        return -1;
-    }
-    return fclose(f) == 0 ? 0 : -1;
+
+    return sg_ref_update(git_dir, ref_path, id, NULL);
 }
 
 int sg_ref_branch_exists(const char *git_dir, const char *branch)
@@ -234,7 +225,13 @@ int sg_ref_branch_exists(const char *git_dir, const char *branch)
     return sg_ref_read_branch(git_dir, branch, id) == 0;
 }
 
-int sg_ref_write_path(const char *git_dir, const char *ref_path, const unsigned char id[SG_SHA1_RAW_LEN])
+/* The actual ref-file writer, shared by sg_ref_write_path and sg_ref_update
+   (which both, ultimately, only ever write a ref through here) -- named
+   separately so sg_ref_update's NULL-message fast path can call it directly
+   instead of going through sg_ref_write_path, which would recurse right
+   back into sg_ref_update. */
+static int write_ref_path_raw(const char *git_dir, const char *ref_path,
+                              const unsigned char id[SG_SHA1_RAW_LEN])
 {
     char full_path[SG_PATH_MAX];
     char content[SG_SHA1_HEX_LEN + 2];
@@ -247,6 +244,11 @@ int sg_ref_write_path(const char *git_dir, const char *ref_path, const unsigned 
     content[SG_SHA1_HEX_LEN] = '\n';
     content[SG_SHA1_HEX_LEN + 1] = '\0';
     return sg_write_file_mkdirs(full_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, 0644);
+}
+
+int sg_ref_write_path(const char *git_dir, const char *ref_path, const unsigned char id[SG_SHA1_RAW_LEN])
+{
+    return sg_ref_update(git_dir, ref_path, id, NULL);
 }
 
 /* Parses git's packed-refs file (a plain "<40-hex-sha1> <ref-name>\n" list,
@@ -645,4 +647,124 @@ int sg_ref_delete_under(const char *git_dir, const char *prefix, const char *nam
 int sg_ref_delete_branch(const char *git_dir, const char *branch)
 {
     return sg_ref_delete_under(git_dir, BRANCH_PREFIX, branch);
+}
+
+/* Only these namespaces get a reflog, matching real git (measured against
+   2.55.0): HEAD itself, any branch, any remote-tracking ref, and refs/stash.
+   refs/tags/... and sg's own internal refs (refs/sg/chunks,
+   refs/small-git/undo/...) are deliberately excluded. */
+static int ref_path_reflog_allowed(const char *ref_path)
+{
+    static const char remote_prefix[] = "refs/remotes/";
+
+    if (strcmp(ref_path, "HEAD") == 0)
+        return 1;
+    if (strncmp(ref_path, BRANCH_PREFIX, strlen(BRANCH_PREFIX)) == 0)
+        return 1;
+    if (strncmp(ref_path, remote_prefix, strlen(remote_prefix)) == 0)
+        return 1;
+    if (strcmp(ref_path, "refs/stash") == 0)
+        return 1;
+    return 0;
+}
+
+int sg_ref_update(const char *git_dir, const char *ref_path, const unsigned char new_id[SG_SHA1_RAW_LEN],
+                  const char *reflog_msg)
+{
+    unsigned char old_id[SG_SHA1_RAW_LEN];
+    long long branch_offset = 0;
+    long long head_offset = 0;
+    int wrote_branch_log = 0;
+    int wrote_head_log = 0;
+    int is_current_branch = 0;
+
+    if (reflog_msg == NULL)
+        return write_ref_path_raw(git_dir, ref_path, new_id);
+
+    if (!ref_path_reflog_allowed(ref_path))
+        return -1;
+
+    if (sg_ref_read_path(git_dir, ref_path, old_id) != 0)
+        memset(old_id, 0, SG_SHA1_RAW_LEN); /* no such ref yet (or unreadable): treat as "created" */
+
+    if (strncmp(ref_path, BRANCH_PREFIX, strlen(BRANCH_PREFIX)) == 0) {
+        char *cur = sg_ref_current_branch(git_dir);
+
+        if (cur != NULL) {
+            if (strcmp(cur, ref_path + strlen(BRANCH_PREFIX)) == 0)
+                is_current_branch = 1;
+            free(cur);
+        }
+    }
+
+    /* Rule 1 (measured, asymmetric): a ref's own log suppresses a no-op
+       (old == new) update; logs/HEAD does not. */
+    if (memcmp(old_id, new_id, SG_SHA1_RAW_LEN) != 0) {
+        if (sg_reflog_append(git_dir, ref_path, old_id, new_id, reflog_msg, &branch_offset) != 0)
+            return -1;
+        wrote_branch_log = 1;
+    }
+
+    /* Rule 2 (measured): updating the branch HEAD currently points to also
+       logs to HEAD, with the identical old/new/message, regardless of
+       whether that update was itself a no-op. */
+    if (is_current_branch) {
+        if (sg_reflog_append(git_dir, "HEAD", old_id, new_id, reflog_msg, &head_offset) != 0) {
+            if (wrote_branch_log)
+                sg_reflog_truncate(git_dir, ref_path, branch_offset);
+            return -1;
+        }
+        wrote_head_log = 1;
+    }
+
+    if (write_ref_path_raw(git_dir, ref_path, new_id) != 0) {
+        if (wrote_head_log)
+            sg_reflog_truncate(git_dir, "HEAD", head_offset);
+        if (wrote_branch_log)
+            sg_reflog_truncate(git_dir, ref_path, branch_offset);
+        return -1;
+    }
+
+    return 0;
+}
+
+int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_msg)
+{
+    char path[SG_PATH_MAX];
+    FILE *f;
+    long long offset = 0;
+    int wrote_log = 0;
+    int rc;
+
+    if (reflog_msg != NULL) {
+        unsigned char old_id[SG_SHA1_RAW_LEN];
+        unsigned char new_id[SG_SHA1_RAW_LEN];
+
+        if (sg_ref_resolve_head(git_dir, old_id) != 0)
+            memset(old_id, 0, SG_SHA1_RAW_LEN);
+        if (sg_ref_read_branch(git_dir, branch, new_id) != 0)
+            memset(new_id, 0, SG_SHA1_RAW_LEN); /* target branch has no commits yet (e.g. fresh sg init) */
+
+        if (sg_reflog_append(git_dir, "HEAD", old_id, new_id, reflog_msg, &offset) != 0)
+            return -1;
+        wrote_log = 1;
+    }
+
+    snprintf(path, sizeof(path), "%s/HEAD", git_dir);
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        if (wrote_log)
+            sg_reflog_truncate(git_dir, "HEAD", offset);
+        return -1;
+    }
+    if (fprintf(f, "ref: refs/heads/%s\n", branch) < 0) {
+        fclose(f);
+        if (wrote_log)
+            sg_reflog_truncate(git_dir, "HEAD", offset);
+        return -1;
+    }
+    rc = fclose(f) == 0 ? 0 : -1;
+    if (rc != 0 && wrote_log)
+        sg_reflog_truncate(git_dir, "HEAD", offset);
+    return rc;
 }
