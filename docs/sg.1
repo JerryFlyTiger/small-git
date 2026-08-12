@@ -1149,6 +1149,178 @@ has no exit 128, so situations where real git uses 128 (e.g.
 become an
 .B sg
 style message with exit 1 instead.
+.SS reflog
+.B sg reflog
+.RB [ show ]
+.RI [ ref ]
+.RB [ -n
+.IR count ]
+.PP
+Prints the update history of a single ref, most-recent entry first is
+.I not
+the order used \(em like real git, entries print oldest-shown-last but
+numbered newest-first: each line is
+.RS
+.IP
+.I abbrev ref @{ N }: message
+.RE
+.PP
+where
+.I abbrev
+is a fixed 7 hex digits (real git's
+.B core.abbrev
+auto-lengthens for large repositories;
+.B sg
+does not) of the entry's
+.B new
+object id \(em the value the ref was moved
+.I to
+\(em and
+.I ref
+is echoed back exactly as typed, not normalized (e.g.
+.B "sg reflog heads/topic"
+prints
+.RB \(dq heads/topic@{0}: \(dq ,
+not
+.RB \(dq refs/heads/topic@{0}: \(dq ).
+.I ref
+defaults to
+.B HEAD
+if omitted;
+.B show
+is accepted and ignored, matching real git's default subcommand.
+.B -n
+.I count
+caps the number of entries printed (newest first); without it every entry
+is printed.
+.PP
+If
+.I ref
+does not resolve to anything, exit 1 with an error. If it resolves but has
+no reflog on disk (never been logged, or the log file has been removed),
+exit 0 and print nothing \(em \(dqno history yet\(dq is not an error, the
+same distinction
+.B "sg stash list"
+makes for an empty stack.
+.PP
+This is a read-only subset of real git's
+.BR "git reflog" :
+no
+.BR expire ,
+.BR delete ,
+.BR --date ,
+.BR --format ,
+or
+.BR --all .
+See
+.B REVISIONS
+below for
+.BR "<ref>@{N}" ,
+which resolves a single entry directly rather than listing the whole log.
+.SH REVISIONS
+Anywhere a command above takes a
+.I rev
+(or
+.IR ref ),
+it accepts one of the following, resolved by
+.B sg_rev_parse_commit
+and shared by every command that resolves a revision:
+.TP
+.B HEAD
+The current branch's tip commit.
+.TP
+.I branch\-name\fR,\fP tag\-name
+Resolved against
+.BR refs/heads/ ,
+then
+.BR refs/tags/ ,
+then a bare branch lookup, in that order.
+.TP
+a full 40\-character hex object id
+Abbreviated (partial) hex ids are
+.B not
+supported; this is a deliberate omission, not an oversight \(em the full id
+must be given.
+.PP
+Any of the above may be followed by
+.IR "~N" ,
+.IR "^N" ,
+or
+.IR "@{N}" ,
+and these may be chained (e.g.
+.BR "topic~2^1" ).
+.TP
+.BI ~ N
+The
+.IR N th
+first-parent ancestor (
+.B ~
+alone means
+.BR ~1 ).
+.TP
+.BI ^ N
+The
+.IR N th
+parent of a merge commit (
+.B ^
+alone means
+.BR ^1 ;
+.B ^0
+is the commit itself).
+.TP
+.BI @{ N }
+The
+.IR N th
+most recent entry in
+.IR ref 's
+own reflog, counting back from the current value (
+.B @{0}
+is the value the ref was most recently moved
+.I to
+\(em not the value before that move; see
+.B reflog
+above). Must immediately follow the ref name \(em
+.B topic@{1}~1
+is valid,
+.B topic~1@{1}
+is not, since the base-name scan stops at the first
+.B ~
+or
+.BR ^ ,
+leaving
+.RB \(dq @{1} \(dq
+to be rejected by the
+.BR ~ / ^
+suffix parser instead of read as a reflog selector.
+.IR N
+must be purely decimal digits;
+.B @{}
+(empty),
+.BR @{u} ,
+.BR @{upstream} ,
+and any other non-numeric content inside the braces are rejected outright.
+.B sg
+does not support git's
+.B @{<date>}
+selector \(em a very large
+.I N
+is still read as an index, not a date, so
+.B sg
+and real git can disagree on numbers past roughly 100000000 (real git starts
+treating them as Unix timestamps around then; the exact boundary is a
+heuristic in real git, not a documented cutoff, so
+.B sg
+does not attempt to replicate it and simply always reads
+.I N
+as an index).
+A bare
+.B @{N}
+with no ref name in front of it is rejected \(em in real git this means
+"the current branch", not
+.BR HEAD ,
+and the two can differ, so
+.B sg
+refuses rather than silently substituting the wrong one.
 .SH FILES
 .TP
 .B .gitignore

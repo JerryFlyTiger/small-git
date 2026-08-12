@@ -1024,3 +1024,195 @@ merge 在進行」給出不同答案。這一點寫在註解裡。
 八條定向 mutation(拿掉閘門、`exists`→`read`、永遠觸發、對調順序、
 `exists` 委派 `read`、加回 `S_ISREG`、還原全部非 switch 呼叫端、只還原
 `cmd_commit.c`)每一條的紅燈範圍都逐條核對過。
+
+## Phase 17:通用 reflog(`HEAD@{N}`、`<ref>@{N}`、`sg reflog`)
+
+Phase 15 交接時把「通用 reflog」列成明確留到獨立 phase 的項目:檔案層
+(`src/storage/reflog.c`)那時已經落地,`stash@{N}` 也已經在用它,缺的是「每個
+ref 更新點都要接上呼叫」——本階段做的正是這一半。
+
+### 開工踏勘先推翻了「掛在 refs.c 就好」的預設
+
+原本設想是在 `refs.c` 的寫入函式裡直接呼叫 `sg_reflog_append`。踏勘先發現這
+個假設不成立:**ref 寫入根本沒有收斂點**。`cmd_push.c`/`cmd_fetch.c`/
+`cmd_clone.c` 各自手刻一份逐字複製的 `write_ref_file`,HEAD 的 symbolic 寫入
+在 `cmd_switch.c`/`cmd_clone.c`/`repo.c` 各自手刻,而 `refs.c` 本身**沒有** HEAD
+寫入函式。把 reflog 掛在 `refs.c` 只會靜默漏掉 fetch/push/clone 的 ref 更新與
+所有 HEAD 移動——不是報錯,是那幾行 reflog 悄悄不存在。
+
+決定收斂的理由不是「重複太多讓人不舒服」,而是它是 **ref 後端層的不變式**:
+「old 值該怎麼讀」「哪些 namespace 該記」「HEAD 何時連動記一行」這幾條規則,
+散到十幾個呼叫端各自實作,漏一處不會有任何錯誤訊息,結果只是 reflog 少幾
+行——這與 Phase 16 那個 bug 是同一個形狀(一條該在單一閘門實現的規則被分散到
+多個呼叫端,沒被收斂的那個就是漏洞)。於是先新增
+`sg_ref_update`/`sg_ref_set_head`(`include/sg/refs.h`)作為唯一寫入點,再把六
+個手刻的 ref 寫入呼叫端(push/fetch/clone 的 `write_ref_file`,以及三處 HEAD
+symbolic 寫入)全部改用它。old 值由寫入點自己讀,呼叫端不必再自己記账。收斂
+反而讓後續加 reflog 訊息的 diff 變小:`do_fast_forward`(`cmd_merge.c`)連函式
+簽名都不用改,只多填一個字串參數。順手還修掉 `cmd_push.c` 一個既有的語意
+bug——它原本把 remote-tracking ref 的 old 值記成**遠端廣播的舊值**,但本地
+remote-tracking 檔案該記的是**本地現值**,兩者在別人也推過同一個遠端之後會
+不同;`sg_ref_update` 統一從本地檔案讀 old,這個分歧連帶消失。
+
+### 三條實測規則(真 git 2.55.0)
+
+規則不是回想出來的,是逐條量出來的:
+
+- **不對稱**:具體 ref(如 `refs/heads/master`)的 log 只在 `old != new` 時
+  追加一行;`logs/HEAD` 不論 `old == new` 與否都追加。實測
+  `git reset --hard HEAD`(目標就是自己)→ `logs/HEAD` +1 行、分支自己的
+  log +0 行。
+- **HEAD 連動**:更新 HEAD 目前所指的那個分支時,`logs/HEAD` 會拿到 old/new/
+  message **逐位元組相同**的一行。用 `git update-ref` 繞過所有 porcelain 也
+  照樣發生,證明這是 ref 後端層的不變式,不是某個子指令的特殊行為。反向不
+  成立:更新一個 HEAD 沒有指到的分支,`logs/HEAD` 不動。
+- **政策**:只有 `HEAD`、`refs/heads/*`、`refs/remotes/*`、`refs/stash` 記
+  reflog,tag、`refs/sg/chunks`、`refs/small-git/undo/*` 都不記——與真 git
+  一致(非 bare repo 下 `core.logAllRefUpdates` 預設涵蓋的範圍正是這幾個
+  namespace)。`sg_ref_update` 對政策外的 ref_path 傳非 NULL 訊息一律回 -1、
+  完全不寫任何東西(連 ref 本身都不動),所以「哪些地方不記 log」是一份靠一
+  次 grep 就能稽核的封閉清單,不必到處記憶哪個呼叫端該傳 NULL。
+
+### `<ref>@{N}`
+
+`<ref>@{N}` 名的是該筆 reflog 條目的 **`new_id`**,不是 `old_id`——這個方向
+容易搞反:@{0} 的意思是「最近一次更新把 ref 移動**到**的值」,不是「移動前的
+值」;最舊那一筆的 `old_id` 是全零,取錯方向會在邊界上悄悄回全零而不是第一個
+commit。`HEAD@{N}` 與 `<branch>@{N}` 各讀 `logs/HEAD` 與
+`logs/refs/heads/<branch>` 兩份不同的檔案。
+
+索引與日期選擇器的分界不是語法層面的,是**數值大小**——真 git 對這件事沒有寫
+死的語法規則,是啟發式:實測 `@{10000000}`(1e7)被當成索引,`@{100000000}`
+(1e8)真 git 直接當 Unix 時間戳走 `@{<date>}` 路徑,印「日誌只能回到 <日期>」
+的警告。sg 不支援日期選擇器,所以刻意用**純數字白名單**定義「這是一個索
+引」,其餘內容(含 `@{u}`、`@{now}`、`@{-1}`)一律乾淨拒絕,而不是去模仿一個
+以 1e8 為界、連真 git 自己文件都沒寫明的啟發式。結果是 1e8 以上 sg 拒絕、
+git 接受(當日期解析)——這是刻意記下來的分歧,不是缺陷。
+
+裸 `@{N}`(前面沒有 ref 名)一律拒絕。真 git 的裸 `@{N}` 指的是**當前分支**
+而不是 HEAD——實測兩者在有过 `reset` 之類操作、HEAD 與分支自己的 log 分岔
+之後值不同。把它猜成 HEAD 會是一個**看起來能跑但答案錯誤**的實作,比直接拒
+絕更危險,所以選擇拒絕而不是猜。
+
+### 冷讀抓到的真 bug:`~`/`^` 後綴迴圈從不驗證 `op`
+
+`sg_rev_parse_commit` 的後綴迴圈長年只判斷 `if (op == '~') ... else /* '^' */
+...`,從沒檢查 `op` 究竟是不是 `'~'` 或 `'^'`。這在只有兩種停止字元(`~`/`^`
+/`\0`)時是安全的——**一個由呼叫端保證、卻從未寫進程式碼的不變式**:base 掃描
+只在遇到這三種字元時停下,所以進到後綴迴圈的第一個字元必然是 `~` 或 `^`。
+`@{N}` 合法地讓 base 掃描多了第四種停止條件(`@{`),前提就被打破了:實測
+`sg tag t 'master@{0}x'` 回 0 並把標籤指到 `master@{0}` 的 parent(`x` 被當成
+「非 `~` 即 `^`」的 `^` 分支吃掉了,又因為後面沒有數字,`parse_suffix_number`
+對空字串回傳隱含的 1),真 git 對同一輸入直接報 `ambiguous argument`。
+`sg_rev_parse_commit` 是 `sg reset`(破壞性操作)與 `sg tag` 解析使用者
+revision 字串的唯一入口,打錯一個字元被靜默解到附近但錯誤的 commit,後果不
+是「拒絕」而是「解到別的地方」。修法是在迴圈本身加一個
+`if (op != '~' && op != '^') return -1;`,而不是在 `@{N}` 那段收尾處補丁——
+讓不變式變回迴圈自己的局部性質,不依賴呼叫端多年前的假設繼續成立。
+
+### 刻意的 divergence
+
+1. **三方合併寫 `merge <arg>: Merge made by the 'sg-3way' strategy.`**,真 git
+   是 `'ort'`(或歷史上的 `'recursive'`)。sg 沒有實作 ort 策略,照抄策略名
+   會讓在 sg repo 上跑 `git reflog` 的人被誤導成「這是用 ort 合併的」。保留
+   git 的文法外殼(它自己的策略名本來就會隨版本變,`'recursive'`→`'ort'`就
+   是先例),只把策略名換成誠實的自己的名字。
+2. **detached HEAD 的 `switch` 不寫 reflog 行**。真 git 在這個情境下寫
+   `checkout: moving from <40-hex> to <target>`(實測)。試過照做,行不通:
+   `sg_ref_resolve_head`(`include/sg/refs.h`)對 detached HEAD 直接回
+   -1——它只認 symbolic HEAD,所以 fallback 邏輯從未被觸發過。要做對,要嘛
+   改這支被到處依賴、用來判斷「是不是 detached」的共用函式(波及所有靠它的
+   指令),要嘛在 `cmd_switch.c` 自己解析 `.git/HEAD` 的原始內容繞過它。而
+   sg 在 detached HEAD 這個狀態下本來就整個站不住腳(`sg status` 印
+   `On branch ?`、`No commits yet`,沒有一致的使用者體驗),留給 Phase 18 一
+   併處理,不在這裡單獨補一個沒有配套的角落。
+3. **`sg clone` 不建立 `refs/remotes/<remote>/HEAD`,也不寫它的 log**。真 git
+   clone 之後兩者都有。實作過程中曾一度只寫 log(不建 ref 本身),已經移
+   除——`sg reflog origin/HEAD` 走 `sg_rev_parse_ref_path` 解析 ref 名,而
+   該函式要求 ref 本身存在;ref 不存在,那個 log 檔就永遠讀不到,寫了也是
+   死資料,而且等於宣稱一段這個 repo 從未真正擁有的歷史。
+4. **`sg clone` 不寫 `refs/remotes/<remote>/<branch>` 的 log**——這條反而
+   **與 git 一致**(git 也要等到第一次 `fetch` 才第一次寫那份 log),但因為
+   直覺上「clone 應該把一切都寫好」而顯得反直覺,特地記下來,免得日後有人
+   把它當 bug「修好」。
+5. **rebase 的 reflog 形狀留給 Phase 18**。真 git 的 rebase 全程在 detached
+   HEAD 上重放每個 commit,只在最後一次性把分支搬過去,所以分支自己的 log
+   只有一行、`logs/HEAD` 有 `rebase (start)`/`(pick)`/`(finish)` 一串。sg 的
+   rebase 從不 detach,每 pick 一個 commit 就直接搬一次分支 ref——結構上就
+   無法逐字複製那組訊息序列。Phase 17 的做法是讓 `cmd_rebase.c` 的每個
+   `sg_ref_update_branch` 呼叫維持傳 `NULL`(等同 `sg_ref_update` 的
+   `reflog_msg == NULL` 分支),也就是完全不寫 reflog,而不是寫一組形狀對不
+   上真 git 的假訊息。
+6. **`sg fetch` 的訊息只嵌 remote 名稱**,真 git 嵌入完整的 argv(例如
+   `fetch -q origin: ...`)。sg 的旗標集合與 git 不同,逐字複製 argv 沒有意
+   義;只嵌 remote 名讓 `sg fetch origin` 與 `git fetch origin` 的訊息逐位元
+   組相同(已量測),這是能對齊的最大公約數。
+
+### 測試紀律這一輪學到的
+
+- **`git reflog` 是免費的 oracle**:把磁碟格式做對之後,可以用同一串操作分
+  別在 sg 與真 git 上跑一遍,逐位元組比對兩邊 `git reflog`/`sg reflog` 的
+  message 欄——不必自己猜測措辭,答案就在真 git 的輸出裡。
+- **假覆蓋,實跑才現形**:把 `@{N}` 的「純數字」白名單暫時放寬成「非空即
+  可」,`@{u}`/`@{now}`/`@{-1}` 這幾條看起來在驗「必須是語法正確的索引」的
+  測試**仍然變紅,但理由不對**——非數字字元參與了 char 算術,產生一個巨大
+  的數值,是被無關的越界檢查擋下來的,不是被「必須是數字」這條規則擋下。補
+  了一個刻意構造的 `wideranger@{A}`(先寫 20 筆 log,讓 `'A'-'0'==17` 落在
+  合法索引範圍內)才是真正有鑑別力的案例——它必須能命中「這是合法的
+  reflog 深度」卻因為「不是數字」被拒絕,而不是被別的守衛頂替。
+- **假紅燈**:`master@{1}5` 這條測試在 2-commit 的 fixture 下確實變紅,但原
+  因是 root commit 沒有 parent,`@{1}5` 被誤解析成 `@{1}^5` 之後找 5 層
+  parent 本來就會失敗——與「後綴不合法該被拒絕」這條規則毫無關係,是巧合地
+  紅在同一個退出碼上。把 fixture 延長到 3 個 commit,讓「合法解析但層數不
+  夠」與「非法字元」兩種失敗理由分得開,才確認是後者在生效。**先證明測試會
+  紅還不夠,還要確認紅得有道理。**
+- **冗餘的防禦性檢查會把真正的驗證點藏起來**:`revparse.c` 裡有兩段與既有程
+  式碼邏輯完全重複的檢查,單獨刪掉任何一段都是**零測試變紅**。它們不是多一
+  層安全網,底下的防線(`parse_suffix_number`、`sg_reflog_at`)本來就已經擋
+  住同樣的輸入;真正該打 mutation 的地方是下一層,打在這兩段冗餘檢查上永遠
+  測不出東西。兩段都已經刪除,不留著製造「這裡好像有守衛」的錯覺。
+- **否定式斷言各自需要自己的定向 mutation**:讓 `sg clone` 也對
+  `origin/<branch>` 傳訊息(即偷偷開始寫這個 log)→ 精確 1 條檢查變紅;拿掉
+  `sg_ref_delete_under` 對 log 檔 `unlink` 的 `ENOENT` 容忍 → 3 條變紅(其中
+  一條是既有的 prefix 碰撞測試順帶抓到的)。`sg clone` 那條 mutation 刻意只
+  對 remote-tracking ref 傳訊息、不對 tag 傳——如果無差別地對所有 ref 都傳
+  訊息,tag 會觸發政策閘門(政策外的 ref_path 傳非 NULL 訊息直接 -1),讓整
+  個 clone 失敗,那種紅燈不是「否定式斷言生效」,是「clone 整個掛了」,不算
+  證據。
+- **`logs/HEAD` 的行數斷言**:最初用 `tail -1` 比對最後一行內容,但構造一個
+  「錯誤地寫了兩行相同內容」的 mutation 時,`tail -1` 照樣通過——兩行的最後
+  一行內容確實相同。只有額外斷言**行數**(`wc -l`)才分得出「該有一行」與
+  「多寫了一行」。
+
+### 無法驗證(如實記錄)
+
+- 兩處 malloc 失敗分支(`cmd_commit.c`、`cmd_switch.c` 建構 reflog 訊息字串
+  時的 OOM 路徑)——本專案沒有 malloc 失敗注入機制,只能靠讀碼確認對應的
+  `free` 都在正確的路徑上執行。
+- Phase 14/16 的 switch 閘門在 **reflog 這個維度**不可觀測:那些測試寫在
+  reflog 存在之前,只讀退出碼與工作目錄/index 狀態,「被拒絕的 switch 沒有
+  寫下任何 reflog 行」目前只靠「閘門在任何副作用之前」這個呼叫順序保證,沒
+  有專屬斷言。
+- `sg_ref_delete_under` 刪 log 檔那段路徑的長度截斷分支——需要一個長度剛好
+  卡在 `SG_PATH_MAX` 邊界、讓 `.../logs/...` 比 ref 路徑本身多出的 5 個位元
+  組正好溢出的分支名,構造成本高,沒有補。
+- `sg push` 在「本地 remote-tracking ref 已經等於新值」這個情境下,規則 1
+  (`old == new` 不追加)的抑制分支——沒有專屬案例區分「因為抑制而沒寫」與
+  「單純沒被呼叫到」。
+- `sg fetch` 的快進判斷在「new 的祖先鏈中間有物件缺失」這個邊角情況下的行
+  為:目前的實作會保守地把它標成 forced-update(訊息說謊的方向是安全的,不
+  會把非快進的更新誤標成快進),但沒有構造出這個情境的案例。
+
+### 另外記一句
+
+`sg_ref_update` 有一個已知限制,寫在自己的標頭註解裡:`sg_ref_read_path` 把
+「ref 不存在」與「ref 檔損壞」壓成同一個 -1,所以一個損壞的既有 ref 被更新
+時,它的 reflog 條目會把 `old_id` 記成全零,看起來像是這個 ref 剛被建立,而
+不是「曾經存在但讀不出來」。不為這個情境引入第三態,維持與專案既有的
+「-1 統一表示失敗」慣例一致。
+
+最終 `tests/interop.sh` 998 項檢查(Phase 16 結束時是 909;熱身踏勘先補到
+914,批 A 919、批 B 944、批 C 978、批 D 收尾到 998),`make test` 34 支二進
+位全過(新增 `tests/test_ref_update.c` 與 `tests/test_reflog_messages.c`;
+`tests/test_reflog.c` 是 Phase 15 就有的檔案層測試),
+`make sanitize` 乾淨,子指令從 23 個增加到 24 個(新增 `sg reflog`)。
