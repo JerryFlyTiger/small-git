@@ -587,12 +587,24 @@ chunk 可達性的同步。修法是移除那個提早返回:零 tag 只是讓�
 - **`--tags` 與明確名稱不能併用**,是用法錯誤。真 git 兩者可以並存,這裡刻意
   收斂:模糊的呼叫寧可拒絕(與 Phase 12 的 `sg reset --soft --hard` 同一個
   取捨)。
-- **「只有 chunks 落後」的防線沒有能鑑別的測試。** 把
+- ~~**「只有 chunks 落後」的防線沒有能鑑別的測試。**~~ **2026-08-12 補上**
+  (interop phase6a case 8,5 項檢查,909 → 914)。缺口本身如實記在這裡:把
   `entry_count == 0 && !send_chunks_update` 改成 `if (entry_count == 0)`,
-  680 項檢查照樣全綠。要覆蓋它得建構出「推過一次之後,分支與 tag 都沒變、
-  只有 `refs/sg/chunks` 動了」的第二次 push,現有的 chunks push 檢查都伴隨著
-  真實的新 commit 一起送出。這是 Phase 13 之前就存在的缺口,不是這次引入的;
-  如實記錄,不假裝有覆蓋。
+  當時 680 項檢查照樣全綠,因為現有的 chunks push 檢查都伴隨著真實的新 commit
+  一起送出。
+
+  能鑑別的場景來自一個實測而非推理的事實:`sg add` 在**寫 blob 時**就把
+  chunk 併進 keepalive 樹(`chunk.c` 的 `keep_alive_add`),不是等到 commit。
+  所以推過一次之後再 `sg add` 一個大檔**而不 commit**,分支停在原地、
+  `refs/sg/chunks` 已經往前——正是這道守衛唯一能被觀測到的形狀。
+
+  同一個 mutation 現在殺掉 5 項裡的 3 項(914 → 911),且沒有連帶災情。
+  另外 2 項不紅是對的,而且各有用途:一項是**fixture 前提**(斷言 `sg add`
+  確實動了 keepalive ref 而沒動分支——哪天 `sg add` 改了行為,其餘檢查會
+  因為錯誤的理由變綠);另一項是「第二次 push 退出 0」,在 mutation 下**照樣
+  退出 0**,正好示範了只看退出碼就是假覆蓋。真正有鑑別力的斷言是**遠端自己的
+  `refs/sg/chunks` 有沒有前進到本地的 keepalive commit**,以及新檔案的每個
+  chunk 有沒有實際落到遠端。
 - **annotated tag 的 `object_type` 在本地建立時恆為 commit**
   (`cmd_tag.c` 走 `sg_rev_parse_commit`,一定 peel 到 commit),所以 `sg` 自己
   建不出指向 tree 或 blob 的 annotated tag。push 端不依賴這個假設(它推的是

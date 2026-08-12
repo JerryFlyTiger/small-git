@@ -1721,6 +1721,11 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         skip "phase6a: git fsck exits 0 on the bare repo after pushing a chunked blob"
         skip "phase6a: sg clone over smart HTTP exits 0 for a repo containing a chunked blob"
         skip "phase6a: a second sg clone from the same (plain git) server now recovers the chunk data too, since sg push propagated refs/sg/chunks there"
+        skip "phase6a: sg add of a second chunked file moves refs/sg/chunks but leaves the branch alone"
+        skip "phase6a: a push with only refs/sg/chunks behind exits 0"
+        skip "phase6a: a push with only refs/sg/chunks behind does not short-circuit to Everything up-to-date"
+        skip "phase6a: that push advances the remote's refs/sg/chunks to the local keep-alive commit"
+        skip "phase6a: that push transfers every chunk of the newly added file to the remote"
     else
         P6A_HTTP_BASE_URL="http://127.0.0.1:$P6A_HTTP_PORT/repo.git"
         P6A_HTTP_DEST="$WORKDIR/phase6a_http_dest"
@@ -1791,6 +1796,63 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         check "phase6a: a second sg clone from the same (plain git) server now recovers the chunk data too, since sg push propagated refs/sg/chunks there" \
             cmp -s "$WORKDIR/p6a_http_original.bin" "$P6A_HTTP_CLONE2/big.bin"
 
+        # case 8: the *only* thing behind on the remote is refs/sg/chunks.
+        #
+        # cmd_push.c decides "nothing to send" from `entry_count == 0 &&
+        # !send_chunks_update`; every test above moves a branch or a tag too,
+        # so the second half of that condition never gets to matter -- drop it
+        # and they all still pass. This case discriminates it: `sg add` of a
+        # second large file merges its chunks into the keep-alive tree
+        # immediately (chunk.c's keep_alive_add runs at blob-write time, not
+        # at commit time), so with no commit afterwards the branch is exactly
+        # where the previous push left it while refs/sg/chunks has moved on.
+        # Drop `&& !send_chunks_update` and this push prints "Everything
+        # up-to-date." and leaves the remote's keep-alive ref pointing at a
+        # tree that no longer protects the chunks now sitting on the server.
+        P6A_CHUNKS_REMOTE_BEFORE=$(git -C "$P6A_HTTP_SERVERROOT/repo.git" rev-parse refs/sg/chunks 2>/dev/null)
+        P6A_BRANCH_BEFORE=$(git -C "$P6A_HTTP_DEST" rev-parse HEAD 2>/dev/null)
+
+        head -c 5242880 /dev/urandom > "$P6A_HTTP_DEST/big2.bin" 2>/dev/null
+        (cd "$P6A_HTTP_DEST" && "$SG" add big2.bin) > /dev/null 2>&1
+
+        P6A_CHUNKS_LOCAL_AFTER=$(git -C "$P6A_HTTP_DEST" rev-parse refs/sg/chunks 2>/dev/null)
+        P6A_BRANCH_AFTER=$(git -C "$P6A_HTTP_DEST" rev-parse HEAD 2>/dev/null)
+
+        # Fixture premise, asserted rather than assumed: if `sg add` ever
+        # stopped touching the keep-alive ref (or started moving the branch),
+        # the checks below would go green for the wrong reason.
+        check "phase6a: sg add of a second chunked file moves refs/sg/chunks but leaves the branch alone" \
+            test -n "$P6A_CHUNKS_LOCAL_AFTER" -a \
+                 "$P6A_CHUNKS_LOCAL_AFTER" != "$P6A_CHUNKS_REMOTE_BEFORE" -a \
+                 "$P6A_BRANCH_AFTER" = "$P6A_BRANCH_BEFORE"
+
+        P6A_CHUNKS_PUSH_OUT="$WORKDIR/p6a_chunks_only_push_out.txt"
+        (cd "$P6A_HTTP_DEST" && "$SG" push) > "$P6A_CHUNKS_PUSH_OUT" 2>&1
+        check "phase6a: a push with only refs/sg/chunks behind exits 0" test $? = 0
+
+        check "phase6a: a push with only refs/sg/chunks behind does not short-circuit to Everything up-to-date" \
+            sh -c "! grep -q 'Everything up-to-date' '$P6A_CHUNKS_PUSH_OUT'"
+
+        # The discriminating assertion: the remote's own ref actually advanced
+        # to our keep-alive commit. Exit status alone can't tell "sent it"
+        # from "decided there was nothing to send".
+        P6A_CHUNKS_REMOTE_AFTER=$(git -C "$P6A_HTTP_SERVERROOT/repo.git" rev-parse refs/sg/chunks 2>/dev/null)
+        check "phase6a: that push advances the remote's refs/sg/chunks to the local keep-alive commit" \
+            test -n "$P6A_CHUNKS_REMOTE_AFTER" -a \
+                 "$P6A_CHUNKS_REMOTE_AFTER" = "$P6A_CHUNKS_LOCAL_AFTER"
+
+        # ...and the chunks that ref now protects are physically present there,
+        # same completeness question as case 7 but for a push carrying no
+        # branch update at all.
+        P6A_BLOB2=$(cd "$P6A_HTTP_DEST" && git ls-files -s big2.bin 2>/dev/null | awk '{print $2}')
+        P6A_PTR2_TXT="$WORKDIR/p6a_ptr2.txt"
+        git -C "$P6A_HTTP_DEST" cat-file -p "$P6A_BLOB2" > "$P6A_PTR2_TXT" 2>/dev/null
+        P6A_CHUNK_IDS2="$WORKDIR/p6a_chunk_ids2.txt"
+        grep -E '^[0-9a-f]{40}$' "$P6A_PTR2_TXT" > "$P6A_CHUNK_IDS2"
+        echo "phase6a chunks-only push: $(wc -l < "$P6A_CHUNK_IDS2" | tr -d ' ') chunk ids declared by the newly added pointer blob"
+        check "phase6a: that push transfers every chunk of the newly added file to the remote" \
+            p6a_all_chunks_present_on_remote "$P6A_HTTP_SERVERROOT/repo.git" "$P6A_CHUNK_IDS2"
+
         kill "$HTTP_SERVER_PID" 2>/dev/null
         HTTP_SERVER_PID=""
     fi
@@ -1800,6 +1862,11 @@ else
     skip "phase6a: git fsck exits 0 on the bare repo after pushing a chunked blob"
     skip "phase6a: sg clone over smart HTTP exits 0 for a repo containing a chunked blob"
     skip "phase6a: a second sg clone from the same (plain git) server now recovers the chunk data too, since sg push propagated refs/sg/chunks there"
+    skip "phase6a: sg add of a second chunked file moves refs/sg/chunks but leaves the branch alone"
+    skip "phase6a: a push with only refs/sg/chunks behind exits 0"
+    skip "phase6a: a push with only refs/sg/chunks behind does not short-circuit to Everything up-to-date"
+    skip "phase6a: that push advances the remote's refs/sg/chunks to the local keep-alive commit"
+    skip "phase6a: that push transfers every chunk of the newly added file to the remote"
 fi
 
 # --- Phase 6b: chunk durability (refs/sg/chunks keep-alive) and the
