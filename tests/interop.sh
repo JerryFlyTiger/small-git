@@ -5633,6 +5633,189 @@ P17_UTD_HEAD_AFTER=$(wc -l < "$P17_UTD/.git/logs/HEAD")
 check "phase17: an already-up-to-date merge does not append to logs/HEAD at all" \
     test "$P17_UTD_HEAD_AFTER" -eq "$P17_UTD_HEAD_BEFORE"
 
+# ============================================================
+# Phase 17 batch C: <ref>@{N} in rev-parse, and `sg reflog`.
+#
+# One repo, built ENTIRELY with sg (so logs/HEAD, logs/refs/heads/master and
+# logs/refs/heads/topic all come from real sg command side effects, not
+# hand-forged lines), then read back with the real `git` binary directly --
+# same bit-compatibility premise as the rest of this file.
+#
+# sg has no `rev-parse` subcommand, so `<ref>@{N}` is probed through `sg tag
+# <name> <rev>` (sg_rev_parse_commit's only other read-only CLI entry point
+# besides `sg reset`): a tag never gets its own reflog, so creating one has
+# no side effect on the very reflog state being probed. The tag's target is
+# then read back with `git rev-parse <tagname>` and compared against `git
+# rev-parse` applied directly to the original <rev> expression.
+# ============================================================
+
+P17C="$WORKDIR/p17c_at_notation"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17C")") > /dev/null 2>&1
+(
+    cd "$P17C" || exit 1
+    printf 'a1\n' > a.txt
+    "$SG" add a.txt && "$SG" commit -m c1
+    printf 'a2\n' >> a.txt
+    "$SG" add a.txt && "$SG" commit -m c2
+    "$SG" branch topic
+    "$SG" switch topic < /dev/null
+    printf 'a3\n' >> a.txt
+    "$SG" add a.txt && "$SG" commit -m c3
+    "$SG" switch master < /dev/null
+    printf 'a4\n' >> a.txt
+    "$SG" add a.txt && "$SG" commit -m c4
+    "$SG" tag vtag master
+) > /dev/null 2>&1
+
+# probe(): resolves $2 with real git (the oracle) and with sg (via a
+# throwaway tag named $1). $1 itself is unused beyond that -- NOT stored in
+# a variable named "label", which would silently clobber check()'s own
+# global "label" (this script's functions are plain sh, no "local"), and
+# every PASS/FAIL line here would print $1 verbatim instead of the actual
+# check() label.
+p17c_probe_n=0
+p17c_probe_agree() {
+    expr="$2"
+    p17c_probe_n=$((p17c_probe_n + 1))
+    tagname="p17c_probe_$p17c_probe_n"
+    expected=$(cd "$P17C" && git rev-parse "$expr" 2>/dev/null)
+    expected_rc=$?
+    (cd "$P17C" && "$SG" tag "$tagname" "$expr") > /dev/null 2>&1
+    sg_rc=$?
+    if [ "$expected_rc" -ne 0 ]; then
+        test "$sg_rc" -ne 0
+        return $?
+    fi
+    if [ "$sg_rc" -ne 0 ]; then
+        return 1
+    fi
+    actual=$(cd "$P17C" && git rev-parse "$tagname" 2>/dev/null)
+    test "$actual" = "$expected"
+}
+
+check "phase17c: master@{0} matches git" p17c_probe_agree at0 'master@{0}'
+check "phase17c: master@{1} matches git" p17c_probe_agree at1 'master@{1}'
+check "phase17c: HEAD@{0} matches git" p17c_probe_agree at2 'HEAD@{0}'
+check "phase17c: HEAD@{1} matches git (differs from master@{1} -- logs/HEAD and logs/refs/heads/master are different files)" \
+    p17c_probe_agree at3 'HEAD@{1}'
+check "phase17c: topic@{0} matches git" p17c_probe_agree at4 'topic@{0}'
+check "phase17c: master@{01} (leading zero) matches git" p17c_probe_agree at5 'master@{01}'
+check "phase17c: master@{1}~1 (suffix chained after @{N}) matches git" p17c_probe_agree at6 'master@{1}~1'
+check "phase17c: master@{99} (out of range) is rejected by both sg and git" p17c_probe_agree at7 'master@{99}'
+check "phase17c: vtag@{0} (a tag has no reflog) is rejected by both sg and git" p17c_probe_agree at8 'vtag@{0}'
+check "phase17c: master~1@{1} (@{N} not adjacent to base) is rejected by both sg and git" \
+    p17c_probe_agree at9 'master~1@{1}'
+check "phase17c: master^@{1} (@{N} not adjacent to base) is rejected by both sg and git" \
+    p17c_probe_agree at10 'master^@{1}'
+check "phase17c: master@{} (empty braces) is rejected by both sg and git" p17c_probe_agree at11 'master@{}'
+
+# Deliberate divergence: real git's bare "@{N}" DWIMs to the current
+# branch, sg deliberately does not (see revparse.h's header comment: the
+# value is measurably NOT the same as spelling the branch name out, so
+# guessing would be a wrong answer). Note "@{u}" (upstream) isn't usable as
+# a comparable divergence here -- this repo's master has no upstream
+# configured, so real git rejects it too, just for an unrelated reason; the
+# "@{u}"/"@{now}" rejections are covered by the unit test instead.
+P17C_BARE_GIT_RC=$(cd "$P17C" && git rev-parse '@{1}' > /dev/null 2>&1; echo $?)
+(cd "$P17C" && "$SG" tag p17c_probe_bare '@{1}') > /dev/null 2>&1
+check "phase17c: bare @{1} -- git treats it as the current branch, sg deliberately does not (sg-specific, no shared oracle result)" \
+    test "$P17C_BARE_GIT_RC" -eq 0 -a $? -ne 0
+
+# --- `sg reflog` output, compared line-for-line against `git reflog` on the
+# very same (sg-built) repo. ---
+P17C_SG_MASTER="$WORKDIR/p17c_sg_reflog_master.txt"
+P17C_GIT_MASTER="$WORKDIR/p17c_git_reflog_master.txt"
+(cd "$P17C" && "$SG" reflog show master) > "$P17C_SG_MASTER" 2>/dev/null
+(cd "$P17C" && git reflog show master) > "$P17C_GIT_MASTER" 2>/dev/null
+check "phase17c: 'sg reflog show master' matches 'git reflog show master' byte-for-byte" \
+    cmp -s "$P17C_SG_MASTER" "$P17C_GIT_MASTER"
+
+P17C_SG_HEAD="$WORKDIR/p17c_sg_reflog_head.txt"
+P17C_GIT_HEAD="$WORKDIR/p17c_git_reflog_head.txt"
+(cd "$P17C" && "$SG" reflog) > "$P17C_SG_HEAD" 2>/dev/null
+(cd "$P17C" && git reflog) > "$P17C_GIT_HEAD" 2>/dev/null
+check "phase17c: 'sg reflog' (bare, defaults to HEAD) matches 'git reflog' byte-for-byte" \
+    cmp -s "$P17C_SG_HEAD" "$P17C_GIT_HEAD"
+
+P17C_SG_TOPIC_N1="$WORKDIR/p17c_sg_reflog_topic_n1.txt"
+P17C_GIT_TOPIC_N1="$WORKDIR/p17c_git_reflog_topic_n1.txt"
+(cd "$P17C" && "$SG" reflog show topic -n 1) > "$P17C_SG_TOPIC_N1" 2>/dev/null
+(cd "$P17C" && git reflog show topic -n 1) > "$P17C_GIT_TOPIC_N1" 2>/dev/null
+check "phase17c: 'sg reflog show topic -n 1' matches 'git reflog show topic -n 1' byte-for-byte" \
+    cmp -s "$P17C_SG_TOPIC_N1" "$P17C_GIT_TOPIC_N1"
+
+# `-n` before the ref must be accepted too (documented CLI grammar).
+P17C_SG_TOPIC_N1B="$WORKDIR/p17c_sg_reflog_topic_n1b.txt"
+(cd "$P17C" && "$SG" reflog -n 1 topic) > "$P17C_SG_TOPIC_N1B" 2>/dev/null
+check "phase17c: '-n' before <ref> is accepted and matches the same output as after" \
+    cmp -s "$P17C_SG_TOPIC_N1B" "$P17C_GIT_TOPIC_N1"
+
+check "phase17c: 'sg reflog show <tag>' (a ref that exists but is never logged) prints nothing and exits 0" \
+    sh -c "test -z \"\$(cd '$P17C' && \"$SG\" reflog show vtag 2>/dev/null)\" && (cd '$P17C' && \"$SG\" reflog show vtag > /dev/null 2>&1)"
+check "phase17c: 'sg reflog show <nonexistent ref>' exits nonzero" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog show does-not-exist) > /dev/null 2>&1"
+P17C_STDERR="$WORKDIR/p17c_reflog_stderr.txt"
+(cd "$P17C" && "$SG" reflog show does-not-exist) > /dev/null 2> "$P17C_STDERR"
+check "phase17c: 'sg reflog show <nonexistent ref>' prints an 'sg: ' prefixed error to stderr" \
+    grep -q '^sg: ' "$P17C_STDERR"
+
+# --- fix-round regression: trailing garbage right after "@{N}" (revparse.c's
+# "~"/"^" suffix loop only special-cased '~' and silently treated any OTHER
+# character as '^', so e.g. "master@{0}x" misparsed as an implicit "^1"
+# instead of being rejected). Measured against real git: all three are fatal
+# "ambiguous argument" errors. ---
+check "phase17c: master@{0}x (garbage byte right after @{N}) is rejected by both sg and git" \
+    p17c_probe_agree at12 'master@{0}x'
+check "phase17c: master@{1}5 (garbage byte followed by digits) is rejected by both sg and git" \
+    p17c_probe_agree at13 'master@{1}5'
+check "phase17c: master@{0}0 (garbage byte followed by a single digit) is rejected by both sg and git" \
+    p17c_probe_agree at14 'master@{0}0'
+
+# --- fix-round: "refs/<rest>" as a fully-qualified <base>, agreeing with
+# real git's own gitrevisions "refs/<name>" disambiguation rule. ---
+check "phase17c: refs/heads/topic matches git" p17c_probe_agree at15 'refs/heads/topic'
+check "phase17c: refs/tags/vtag matches git" p17c_probe_agree at16 'refs/tags/vtag'
+check "phase17c: refs/heads/does-not-exist is rejected by both sg and git" \
+    p17c_probe_agree at17 'refs/heads/does-not-exist'
+check "phase17c: refs/heads/topic~1 (suffix chained after a refs/... base) matches git" \
+    p17c_probe_agree at18 'refs/heads/topic~1'
+
+# --- fix-round: `sg reflog` argument-boundary cases, none of which had
+# interop coverage before -- exit codes compared against real git (stdout
+# isn't compared for the error cases since sg's usage/error text doesn't
+# claim to match git's). ---
+P17C_GIT_N0_RC=$(cd "$P17C" && git reflog show master -n 0 > /dev/null 2>&1; echo $?)
+P17C_SG_N0_OUT="$WORKDIR/p17c_sg_reflog_n0.txt"
+(cd "$P17C" && "$SG" reflog show master -n 0) > "$P17C_SG_N0_OUT" 2>/dev/null
+P17C_SG_N0_RC=$?
+check "phase17c: 'sg reflog show master -n 0' exits 0, matching git" \
+    test "$P17C_SG_N0_RC" -eq 0 -a "$P17C_GIT_N0_RC" -eq 0
+check "phase17c: 'sg reflog show master -n 0' prints nothing" \
+    test ! -s "$P17C_SG_N0_OUT"
+
+check "phase17c: 'sg reflog show master -n -1' (negative count) is rejected" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog show master -n -1) > /dev/null 2>&1"
+check "phase17c: 'sg reflog show master -n abc' (non-numeric count) is rejected" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog show master -n abc) > /dev/null 2>&1"
+check "phase17c: 'sg reflog show master -n' (missing value) is rejected" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog show master -n) > /dev/null 2>&1"
+
+# `-n <count>` immediately followed by `show`, i.e. "show" NOT in the first
+# argument position -- the "is this the show subcommand" check only looks at
+# argv[1], so here "show" is consumed as an ordinary (and, in this repo,
+# nonexistent) <ref> name instead, and rejected for "no such ref" rather
+# than being recognized as the `show` keyword.
+check "phase17c: 'sg reflog -n 1 show' ('show' not in first position, read as a bogus <ref> instead) is rejected" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog -n 1 show) > /dev/null 2>&1"
+
+# usage string on a malformed invocation must NOT carry the "sg: " prefix
+# (CLAUDE.md convention: usage errors are bare "usage: ...", unlike runtime
+# errors which get "sg: ").
+P17C_USAGE_STDERR="$WORKDIR/p17c_reflog_usage_stderr.txt"
+(cd "$P17C" && "$SG" reflog show master -n) > /dev/null 2> "$P17C_USAGE_STDERR"
+check "phase17c: 'sg reflog show master -n' (missing value) prints a bare 'usage: ' line, no 'sg: ' prefix" \
+    sh -c "grep -q '^usage: ' '$P17C_USAGE_STDERR' && ! grep -q '^sg: ' '$P17C_USAGE_STDERR'"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

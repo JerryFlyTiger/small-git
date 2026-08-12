@@ -12,7 +12,27 @@
               | <branch name>          (looked up under refs/heads/)
               | <tag name>             (looked up under refs/tags/)
               | <40-char hex sha1>
-     <rev>  ::= <base> ( "~" [N] | "^" [N] )*
+              | "refs/" <rest>         (a fully-qualified ref path, used
+                                         as-is if it exists -- see
+                                         sg_rev_parse_ref_path's header
+                                         comment)
+     <rev>  ::= <base> [ "@{" N "}" ] ( "~" [N] | "^" [N] )*
+
+   "@{N}" is git's reflog notation: it must immediately follow <base> (not
+   after any "~"/"^" suffix -- "topic~1@{1}" is rejected, "topic@{1}~1" is
+   accepted) and resolves to the NEW oid of logs/<ref>'s Nth-from-the-end
+   entry (N=0 is the most recent), i.e. sg_reflog_at(log, N)->new_id. Any
+   "~"/"^" suffixes that follow apply to that commit. The braces' content
+   must be purely decimal digits (leading zeros allowed, "01" == "1") --
+   deliberately NOT supported: git's "@{u}"/"@{upstream}" and date-ish
+   selectors like "@{now}"/"@{2.days.ago}" (no upstream-tracking or reflog
+   date index in this project), and a bare "@{N}"/"@" with no <base> at all
+   (real git treats that as "the current branch"/"HEAD" respectively --
+   measured to NOT be the same value as "HEAD@{N}", so guessing HEAD here
+   would silently be the wrong answer rather than an unsupported feature;
+   left unimplemented instead). A tag has no reflog, so "<tag>@{N}" always
+   fails (an empty/missing logs/refs/tags/<tag> reads as zero entries, which
+   is out of range for any N).
 
    Base resolution order is full hex, then HEAD, then tag, then branch --
    real git's own gitrevisions disambiguation order (full SHA-1 object
@@ -48,5 +68,18 @@
    diagnostic. */
 int sg_rev_parse_commit(const char *git_dir, const char *rev,
                         unsigned char commit_id_out[SG_SHA1_RAW_LEN]);
+
+/* Resolves a short <base> name (see sg_rev_parse_commit's grammar --
+   "HEAD", a branch name, or a tag name; deliberately NOT a 40-hex object id,
+   since an object id has no reflog) to the full ref path under git_dir that
+   a reflog reader (sg_reflog_read, or sg_ref_read_path for anything other
+   than "HEAD") would need: "HEAD" itself, "refs/tags/<name>",
+   "refs/heads/<name>", or -- if name already starts with "refs/" -- name
+   unchanged, PROVIDED that path actually exists. Tried in that order (same
+   disambiguation order as resolve_base in revparse.c, minus the 40-hex
+   case); the first that resolves wins. Returns 0 with out filled in
+   (truncation, i.e. out_size too small, is a failure, not a silent cut), -1
+   if name matches nothing. */
+int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size_t out_size);
 
 #endif
