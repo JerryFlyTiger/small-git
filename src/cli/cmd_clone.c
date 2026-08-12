@@ -273,6 +273,7 @@ int sg_cmd_clone(int argc, char **argv)
     size_t want_count = 0;
     char *default_branch = NULL;
     unsigned char target_commit_id[SG_SHA1_RAW_LEN];
+    char *reflog_msg = NULL;
     int initialized = 0;
     int rc = 1;
 
@@ -370,6 +371,29 @@ int sg_cmd_clone(int argc, char **argv)
         }
     }
 
+    /* "clone: from <url>", the fixed message real git uses (measured against
+       2.55.0). Built once and reused for every reflog line clone writes. */
+    {
+        size_t msg_len = strlen("clone: from ") + strlen(url) + 1;
+
+        reflog_msg = malloc(msg_len);
+        if (reflog_msg == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            goto done;
+        }
+        snprintf(reflog_msg, msg_len, "clone: from %s", url);
+    }
+
+    /* Deliberately NULL here, not reflog_msg: HEAD isn't moved to
+       default_branch until this call, and default_branch's own ref doesn't
+       exist yet either, so sg_ref_set_head's own old/new lookups would both
+       come up empty and log a spurious 0->0 line. The branch-creating
+       sg_ref_update call right below writes logs/HEAD's real (single) line
+       itself, via rule 2 -- is_current_branch is already true by the time it
+       runs, since HEAD was just pointed at default_branch here -- which is
+       exactly what real git's own single-line logs/HEAD after a clone looks
+       like (measured: logs/HEAD and the branch's own log carry the byte-for-
+       byte identical one line, not two). */
     if (sg_ref_set_head(git_dir, default_branch, NULL) != 0) {
         fprintf(stderr, "sg: failed to write HEAD\n");
         goto done;
@@ -379,11 +403,21 @@ int sg_cmd_clone(int argc, char **argv)
         char branch_ref_path[SG_PATH_MAX];
 
         snprintf(branch_ref_path, sizeof(branch_ref_path), "refs/heads/%s", default_branch);
-        if (sg_ref_update(git_dir, branch_ref_path, target_commit_id, NULL) != 0) {
+        if (sg_ref_update(git_dir, branch_ref_path, target_commit_id, reflog_msg) != 0) {
             fprintf(stderr, "sg: failed to create local branch '%s'\n", default_branch);
             goto done;
         }
     }
+
+    /* Not written here, deliberately: refs/remotes/<remote>/HEAD. Real git's
+       clone creates it as a symbolic ref and logs one "clone: from <url>"
+       line to it (measured). sg does not model that ref anywhere in this
+       codebase, and creating it is a separate feature. Writing only its
+       reflog was tried and removed: a log file for a ref that does not exist
+       is unreachable -- `sg reflog origin/HEAD` resolves the name through
+       sg_rev_parse_ref_path, which requires the ref itself -- so it would be
+       a file claiming a history for something the repo does not have.
+       Recorded as a known divergence in docs/DESIGN.md instead. */
 
     if (write_config_stanza(git_dir, url, default_branch) != 0) {
         fprintf(stderr, "sg: failed to write config\n");
@@ -420,6 +454,7 @@ done:
         sg_ref_adv_free(&adv);
     free(want_ids);
     free(default_branch);
+    free(reflog_msg);
     free(repo_root);
     free(target_dir);
     return rc;

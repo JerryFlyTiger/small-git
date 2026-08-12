@@ -1131,7 +1131,15 @@ int sg_cmd_push(int argc, char **argv)
 
                     snprintf(remote_ref_path, sizeof(remote_ref_path), "refs/remotes/%s/%s", remote,
                             entries[i].name);
-                    if (sg_ref_update(git_dir, remote_ref_path, entries[i].new_id, NULL) != 0) {
+                    /* Fixed message, no remote name embedded (measured
+                       against real git 2.55.0: "update by push", not
+                       "push origin: ..."). entries[i].old_id is the
+                       REMOTE-advertised old value, not necessarily this
+                       local remote-tracking ref's current value, so it must
+                       not be passed here -- sg_ref_update reads the real
+                       local old value itself. */
+                    if (sg_ref_update(git_dir, remote_ref_path, entries[i].new_id,
+                                      "update by push") != 0) {
                         fprintf(stderr, "sg: push 成功，但更新本地的 %s 失敗\n", remote_ref_path);
                         goto done;
                     }

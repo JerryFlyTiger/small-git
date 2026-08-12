@@ -641,6 +641,31 @@ int sg_ref_delete_under(const char *git_dir, const char *prefix, const char *nam
     if (unlink(path) != 0 && errno != ENOENT)
         return -1;
 
+    /* Real git also removes the ref's own reflog file when the ref itself
+       goes away (measured: `git branch -D` deletes logs/refs/heads/<branch>
+       too, not just the ref). This function also serves tag deletion
+       (cmd_tag.c's `sg tag -d`), and tags never had a reflog to begin with
+       (ref_path_reflog_allowed excludes refs/tags/...), so logs/<ref_path>
+       is routinely absent here.
+
+       Best-effort on purpose, and this is the one step in this function that
+       cannot report failure. Everything above is ordered so that a failure
+       is inert -- the repository still reads exactly as it did before. By
+       the time we get here the ref is already gone irreversibly, so
+       returning -1 would tell the caller "delete failed" about a delete that
+       succeeded, and `sg branch -d` would print an error for a branch that
+       is no longer there. A leftover log file is cosmetic; a lying exit code
+       is not. Note the path also needs 5 bytes more than the ref path did
+       ("/logs/" vs "/"), so truncation is reachable for a name right at the
+       limit even though the ref write itself fit. */
+    {
+        char log_path[SG_PATH_MAX];
+
+        if (snprintf(log_path, sizeof(log_path), "%s/logs/%s", git_dir, ref_path) <
+           (int)sizeof(log_path))
+            (void)unlink(log_path);
+    }
+
     return 0;
 }
 
