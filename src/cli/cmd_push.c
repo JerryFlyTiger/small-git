@@ -512,22 +512,6 @@ done:
     id_set_free(&visited);
 }
 
-/* Writes a single ref file (e.g. refs/remotes/<remote>/<branch>) as
-   "<40-hex-id>\n" -- same shape as cmd_fetch.c's/cmd_clone.c's own copy of
-   this helper. */
-static int write_ref_file(const char *git_dir, const char *ref_path,
-                          const unsigned char id[SG_SHA1_RAW_LEN])
-{
-    char full_path[SG_PATH_MAX];
-    char content[SG_SHA1_HEX_LEN + 2];
-
-    snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path);
-    sg_sha1_to_hex(id, content);
-    content[SG_SHA1_HEX_LEN] = '\n';
-    content[SG_SHA1_HEX_LEN + 1] = '\0';
-    return sg_write_file_mkdirs(full_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, 0644);
-}
-
 /* ---- what to push: one or more refs (a single branch, a single tag, or
    every tag under refs/tags/ with --tags) -- decided before any network
    round trip or pack is built. `entries` (the final send list, built after
@@ -1147,7 +1131,15 @@ int sg_cmd_push(int argc, char **argv)
 
                     snprintf(remote_ref_path, sizeof(remote_ref_path), "refs/remotes/%s/%s", remote,
                             entries[i].name);
-                    if (write_ref_file(git_dir, remote_ref_path, entries[i].new_id) != 0) {
+                    /* Fixed message, no remote name embedded (measured
+                       against real git 2.55.0: "update by push", not
+                       "push origin: ..."). entries[i].old_id is the
+                       REMOTE-advertised old value, not necessarily this
+                       local remote-tracking ref's current value, so it must
+                       not be passed here -- sg_ref_update reads the real
+                       local old value itself. */
+                    if (sg_ref_update(git_dir, remote_ref_path, entries[i].new_id,
+                                      "update by push") != 0) {
                         fprintf(stderr, "sg: push 成功，但更新本地的 %s 失敗\n", remote_ref_path);
                         goto done;
                     }

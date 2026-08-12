@@ -14,22 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int write_head(const char *git_dir, const char *branch)
-{
-    char path[4096];
-    FILE *f;
-
-    snprintf(path, sizeof(path), "%s/HEAD", git_dir);
-    f = fopen(path, "wb");
-    if (f == NULL)
-        return -1;
-    if (fprintf(f, "ref: refs/heads/%s\n", branch) < 0) {
-        fclose(f);
-        return -1;
-    }
-    return fclose(f) == 0 ? 0 : -1;
-}
-
 int sg_cmd_switch(int argc, char **argv)
 {
     int create = 0;
@@ -41,6 +25,8 @@ int sg_cmd_switch(int argc, char **argv)
     unsigned char target_tree_id[SG_SHA1_RAW_LEN];
     char label[256];
     int apply_rc;
+    char *old_branch;
+    char *checkout_msg = NULL;
     size_t i;
 
     for (i = 1; (int)i < argc; i++) {
@@ -111,12 +97,58 @@ int sg_cmd_switch(int argc, char **argv)
         return 1;
     }
 
+    /* Captured before any write below so the reflog's "moving from <X>" can
+       name the branch HEAD pointed at before this switch. */
+    old_branch = sg_ref_current_branch(git_dir);
+
+    /* Measured against real git 2.55.0: "checkout: moving from <old> to
+       <new>" lands on logs/HEAD for both a plain switch and switch -c. Built
+       here, before sg_safe_apply_tree below touches anything, because an
+       allocation failure must not abort this command *after* the working
+       tree has been overwritten -- that would leave the files on the new
+       branch while HEAD still named the old one, and the next commit on the
+       old branch would swallow the other branch's tree. The message depends
+       only on old_branch and argv, so there is no reason to build it late.
+       Same principle the -c block below already follows.
+
+       old_branch is NULL only for a detached HEAD, and then no line is
+       written at all. Real git names the commit there instead, as a full
+       40-hex ("checkout: moving from 69cceca9a5...aa5ab to master" --
+       measured), and matching that was tried. It does not work and is
+       deliberately not pursued: sg_ref_resolve_head only understands a
+       symbolic HEAD and returns -1 for a detached one, so the label would
+       have to come from a private parse of .git/HEAD, and sg is already
+       incoherent in that state well beyond the reflog (`sg status` reports
+       "On branch ?" and "No commits yet"). Detached HEAD is Phase 18's
+       subject as a whole; writing a correct reflog line for it while the
+       rest of the command still misreads the state would be polishing one
+       corner of something unsupported. Recorded as a known divergence
+       rather than half-supported. */
+    if (old_branch != NULL) {
+        int need = snprintf(NULL, 0, "checkout: moving from %s to %s", old_branch, branch_arg);
+
+        if (need >= 0) {
+            checkout_msg = malloc((size_t)need + 1);
+            if (checkout_msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
+                free(old_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
+            snprintf(checkout_msg, (size_t)need + 1, "checkout: moving from %s to %s", old_branch,
+                    branch_arg);
+        }
+    }
+
     /* Only reads/validates so far -- nothing is created yet. A new branch
        must not be written until sg_safe_apply_tree below actually succeeds,
        otherwise a cancelled switch would leave a dangling empty branch. */
     if (create) {
         if (sg_ref_branch_exists(git_dir, branch_arg)) {
             fprintf(stderr, "sg: a branch named '%s' already exists\n", branch_arg);
+            free(checkout_msg);
+            free(old_branch);
             free(git_dir);
             free(repo_root);
             return 1;
@@ -124,6 +156,8 @@ int sg_cmd_switch(int argc, char **argv)
         if (sg_ref_resolve_head(git_dir, target_commit_id) != 0) {
             fprintf(stderr, "sg: cannot create branch '%s': current branch has no commits yet\n",
                    branch_arg);
+            free(checkout_msg);
+            free(old_branch);
             free(git_dir);
             free(repo_root);
             return 1;
@@ -131,12 +165,16 @@ int sg_cmd_switch(int argc, char **argv)
     } else {
         if (!sg_ref_branch_exists(git_dir, branch_arg)) {
             fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
+            free(checkout_msg);
+            free(old_branch);
             free(git_dir);
             free(repo_root);
             return 1;
         }
         if (sg_ref_read_branch(git_dir, branch_arg, target_commit_id) != 0) {
             fprintf(stderr, "sg: failed to read branch '%s'\n", branch_arg);
+            free(checkout_msg);
+            free(old_branch);
             free(git_dir);
             free(repo_root);
             return 1;
@@ -145,6 +183,8 @@ int sg_cmd_switch(int argc, char **argv)
 
     if (sg_commit_tree_of(git_dir, target_commit_id, target_tree_id) != 0) {
         fprintf(stderr, "sg: corrupt commit for branch '%s'\n", branch_arg);
+        free(checkout_msg);
+        free(old_branch);
         free(git_dir);
         free(repo_root);
         return 1;
@@ -154,31 +194,58 @@ int sg_cmd_switch(int argc, char **argv)
     apply_rc = sg_safe_apply_tree(git_dir, repo_root, target_tree_id, label, force);
     if (apply_rc == 1) {
         fprintf(stderr, "sg: switch aborted\n");
+        free(checkout_msg);
+        free(old_branch);
         free(git_dir);
         free(repo_root);
         return 1;
     }
     if (apply_rc != 0) {
+        free(checkout_msg);
+        free(old_branch);
         free(git_dir);
         free(repo_root);
         return 1;
     }
 
-    if (create && sg_ref_update_branch(git_dir, branch_arg, target_commit_id) != 0) {
-        fprintf(stderr, "sg: failed to create branch '%s'\n", branch_arg);
-        free(git_dir);
-        free(repo_root);
-        return 1;
+    if (create) {
+        /* Measured against real git 2.55.0: `git switch -c <name>` logs
+           "Created from HEAD" for the new branch's own reflog -- literally
+           the string "HEAD", not the branch name HEAD currently resolves
+           to. This is the one asymmetry against `git branch <name>`, which
+           logs "Created from <current branch name>" instead (see
+           cmd_branch.c's create_branch). Written before HEAD moves, same
+           order real git uses. */
+        char ref_path[4096];
+
+        if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch_arg) >= (int)sizeof(ref_path) ||
+           sg_ref_update(git_dir, ref_path, target_commit_id, "branch: Created from HEAD") != 0) {
+            fprintf(stderr, "sg: failed to create branch '%s'\n", branch_arg);
+            free(checkout_msg);
+            free(old_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
     }
 
-    if (write_head(git_dir, branch_arg) != 0) {
-        fprintf(stderr, "sg: failed to update HEAD\n");
-        free(git_dir);
-        free(repo_root);
-        return 1;
+    {
+        /* checkout_msg was built up front, before any side effect -- see the
+           comment where old_branch is captured. NULL here means a detached
+           HEAD, which deliberately gets no reflog line. */
+        if (sg_ref_set_head(git_dir, branch_arg, checkout_msg) != 0) {
+            fprintf(stderr, "sg: failed to update HEAD\n");
+            free(checkout_msg);
+            free(old_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+        free(checkout_msg);
     }
 
     printf("Switched to branch '%s'\n", branch_arg);
+    free(old_branch);
     free(git_dir);
     free(repo_root);
     return 0;

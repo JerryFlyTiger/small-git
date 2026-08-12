@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #define SG_PATH_MAX 4096
 
@@ -352,4 +354,20 @@ int sg_reflog_rewrite(const char *git_dir, const char *ref_path, const sg_reflog
     }
 
     return 0;
+}
+
+void sg_reflog_truncate(const char *git_dir, const char *ref_path, long long offset)
+{
+    char full_path[SG_PATH_MAX];
+
+    if (snprintf(full_path, sizeof(full_path), "%s/logs/%s", git_dir, ref_path) >= (int)sizeof(full_path))
+        return;
+    truncate(full_path, (off_t)offset);
+}
+
+const sg_reflog_entry *sg_reflog_at(const sg_reflog *log, size_t n)
+{
+    if (log == NULL || n >= log->count)
+        return NULL;
+    return &log->entries[log->count - 1 - n];
 }

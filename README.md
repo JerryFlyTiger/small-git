@@ -101,16 +101,23 @@ sg undo 1                     # 內容回來了
 | `hash-object` | 計算(並可選擇寫入)物件的雜湊 |
 | `cat-file` | 檢視 object 內容/型別/大小 |
 | `chunk-info` | 顯示分塊儲存的診斷資訊 |
+| `reflog` | 顯示某個 ref 的更新歷史(`show`/`<ref>`/`-n <count>`) |
 
 `sg --version` 顯示版本,`sg --help` 列出所有指令。
 
 ## 與 git 的相容性
 
 - 物件格式(blob/tree/commit)、index v2、packfile、packed-refs 都是標準格式,位元層級相容。
+- commit、branch、switch、reset、merge、fetch、push、clone、stash 都會寫一筆與真 git 相容的
+  reflog,`git reflog` 可以直接讀 `sg` 產生的歷史,`sg reflog` 也讀得懂 `git` 產生的。
+  `<ref>@{N}` 可在任何吃 revision 的指令中使用(例如 `sg reset master@{2}`)。
+  **`sg rebase` 目前不寫 reflog**——真 git 的 rebase 全程在 detached HEAD 上重放、
+  最後才搬一次分支,而 `sg` 每 replay 一個 commit 就搬一次,兩者的 ref 移動序列
+  本來就不同,硬湊會產生與實際動作矛盾的紀錄。理由詳見 `docs/DESIGN.md` 的 Phase 17。
 - `sg` 建立的 repo 可以直接用 `git` 操作,通過 `git fsck --strict`;`git` 建立的 repo 也可以
   直接用 `sg` 操作,包含 `git gc` 之後把 ref 收進 `packed-refs`、把物件打包成 pack 的狀態。
 - 網路端實作 smart HTTP,可與真實的 git 伺服器互通(clone/fetch/push)。
-- 測試套件 `tests/interop.sh` 有 909 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
+- 測試套件 `tests/interop.sh` 有 998 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
   (含一個本機 `git http-backend` 伺服器)來驗證,而不是自己跟自己比對。
 
 **唯一的例外是啟用分塊之後**——那時 tree 裡放的是指標 blob,`git checkout` 會拿到指標文字。

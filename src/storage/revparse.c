@@ -3,6 +3,7 @@
 #include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/refs.h"
+#include "sg/reflog.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,15 +155,61 @@ static int resolve_base(const char *git_dir, const char *base, unsigned char id_
     if (strlen(base) == SG_SHA1_HEX_LEN)
         return sg_hex_to_sha1(base, id_out);
 
-    if (strcmp(base, "HEAD") == 0)
+    if (sg_rev_parse_ref_path(git_dir, base, ref_path, sizeof(ref_path)) != 0)
+        return -1;
+
+    /* "HEAD" is a symref ("ref: refs/heads/<branch>\n"), not a raw oid file,
+       so it needs sg_ref_resolve_head's indirection rather than
+       sg_ref_read_path (which would try to hex-decode the "ref: ..." line
+       and fail). Every other path sg_rev_parse_ref_path can return
+       (refs/tags/<n>, refs/heads/<n>, or an already-"refs/..."  name) is an
+       ordinary oid file. */
+    if (strcmp(ref_path, "HEAD") == 0)
         return sg_ref_resolve_head(git_dir, id_out);
 
-    if (snprintf(ref_path, sizeof(ref_path), "refs/tags/%s", base) < (int)sizeof(ref_path) &&
-       sg_ref_read_path(git_dir, ref_path, id_out) == 0)
-        return 0;
+    return sg_ref_read_path(git_dir, ref_path, id_out);
+}
 
-    if (sg_ref_read_branch(git_dir, base, id_out) == 0)
+int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size_t out_size)
+{
+    unsigned char tmp[SG_SHA1_RAW_LEN];
+    char candidate[SG_REVPARSE_PATH_MAX];
+
+    if (strcmp(name, "HEAD") == 0) {
+        if (out_size < 5)
+            return -1;
+        memcpy(out, "HEAD", 5);
         return 0;
+    }
+
+    /* Already a full ref path (e.g. "refs/heads/topic" passed straight
+       through by a caller that already qualified it): used as-is, but only
+       if it actually exists -- otherwise this would let a bogus
+       "refs/nonsense/foo" through unchallenged. */
+    if (strncmp(name, "refs/", 5) == 0) {
+        if (sg_ref_read_path(git_dir, name, tmp) != 0)
+            return -1;
+        if (strlen(name) >= out_size)
+            return -1;
+        strcpy(out, name);
+        return 0;
+    }
+
+    if (snprintf(candidate, sizeof(candidate), "refs/tags/%s", name) < (int)sizeof(candidate) &&
+       sg_ref_read_path(git_dir, candidate, tmp) == 0) {
+        if (strlen(candidate) >= out_size)
+            return -1;
+        strcpy(out, candidate);
+        return 0;
+    }
+
+    if (sg_ref_read_branch(git_dir, name, tmp) == 0) {
+        if (snprintf(candidate, sizeof(candidate), "refs/heads/%s", name) >= (int)sizeof(candidate) ||
+           strlen(candidate) >= out_size)
+            return -1;
+        strcpy(out, candidate);
+        return 0;
+    }
 
     return -1;
 }
@@ -179,26 +226,94 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
     if (rev == NULL || rev[0] == '\0')
         return -1;
 
+    /* The base ends at '~', '^', or the start of an "@{N}" reflog suffix
+       ("@" followed immediately by "{" -- an '@' anywhere else, e.g. inside
+       an email-shaped ref name, stays part of the base). */
     base_len = 0;
-    while (rev[base_len] != '\0' && rev[base_len] != '~' && rev[base_len] != '^')
+    while (rev[base_len] != '\0' && rev[base_len] != '~' && rev[base_len] != '^' &&
+          !(rev[base_len] == '@' && rev[base_len + 1] == '{'))
         base_len++;
     if (base_len == 0 || base_len >= sizeof(base))
         return -1;
     memcpy(base, rev, base_len);
     base[base_len] = '\0';
 
-    if (resolve_base(git_dir, base, id) != 0)
-        return -1;
+    pos = base_len;
+
+    if (rev[pos] == '@') {
+        /* rev[pos + 1] == '{', guaranteed by the scan loop above. "@{N}"
+           must immediately follow the base -- "topic~1@{1}" stops the base
+           scan at '~', so "@{1}" is left for the ~/^ suffix loop below,
+           where it fails to parse as a number and is rejected. That is the
+           whole enforcement of "@{N} must be adjacent to the ref name"; no
+           separate check is needed here. */
+        char ref_path[SG_REVPARSE_PATH_MAX];
+        sg_reflog log;
+        const sg_reflog_entry *entry;
+        size_t start;
+        size_t digits;
+        unsigned long idx;
+
+        pos += 2;
+        start = pos;
+        while (rev[pos] != '\0' && rev[pos] != '}')
+            pos++;
+        if (rev[pos] != '}')
+            return -1;
+        digits = pos - start;
+        /* Reject "@{}" outright -- parse_suffix_number would otherwise
+           treat an empty run as the implicit N=1, which is correct for a
+           bare "~"/"^" but wrong here: real git rejects "topic@{}". Content
+           that isn't purely digits (e.g. "@{u}", "@{now}", "@{-1}") is
+           caught by parse_suffix_number's own digit scan -- sg does not
+           support git's upstream/date reflog selectors, so those must fail
+           to parse rather than be silently misread as an index. */
+        if (digits == 0)
+            return -1;
+        if (parse_suffix_number(rev + start, digits, &idx) != 0)
+            return -1;
+        pos++; /* past '}' */
+
+        if (sg_rev_parse_ref_path(git_dir, base, ref_path, sizeof(ref_path)) != 0)
+            return -1;
+        if (sg_reflog_read(git_dir, ref_path, &log) != 0)
+            return -1;
+        /* @{N} names the NEW oid of that log entry -- the value the ref was
+           moved TO, not the value it had before (see sg_reflog_at's header
+           comment; @{0}'s old_id is not "the previous commit", it can be
+           all-zeros for a ref's very first entry). */
+        entry = sg_reflog_at(&log, (size_t)idx);
+        if (entry == NULL) {
+            sg_reflog_free(&log);
+            return -1;
+        }
+        memcpy(id, entry->new_id, SG_SHA1_RAW_LEN);
+        sg_reflog_free(&log);
+    } else {
+        if (resolve_base(git_dir, base, id) != 0)
+            return -1;
+    }
+
     if (peel_to_non_tag(git_dir, id, &type) != 0)
         return -1;
     if (type != SG_OBJ_COMMIT)
         return -1;
 
-    pos = base_len;
     while (rev[pos] != '\0') {
         char op = rev[pos];
         size_t start;
         unsigned long n;
+
+        /* op must genuinely be '~' or '^' -- without this check, any other
+           character reaching this loop (e.g. a trailing garbage byte left
+           over right after an "@{N}" that this function's caller assumed
+           was fully consumed) would silently fall into the '^' branch
+           below, since the code only special-cases '~' and treats
+           "anything else" as '^'. That let "master@{0}x" parse as
+           "master@{0}^1" instead of being rejected -- measured against real
+           git, which rejects it outright ("ambiguous argument"). */
+        if (op != '~' && op != '^')
+            return -1;
 
         pos++;
         start = pos;

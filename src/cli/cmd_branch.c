@@ -40,6 +40,10 @@ static int create_branch(const char *git_dir, const char *name)
 {
     unsigned char head_id[SG_SHA1_RAW_LEN];
     char ref_path[4096];
+    char *current;
+    const char *current_name;
+    char reflog_msg[512];
+    int rc;
 
     if (!sg_ref_name_valid_for_create(name)) {
         fprintf(stderr, "sg: '%s' 不是有效的分支名稱\n", name);
@@ -53,15 +57,30 @@ static int create_branch(const char *git_dir, const char *name)
         fprintf(stderr, "sg: 無法建立分支 '%s'：目前的分支還沒有任何 commit\n", name);
         return 1;
     }
-    /* sg_ref_write_path (not sg_ref_update_branch) so that slash-containing
-       names like feature/x get their parent directories created. The name
-       comes from argv: refusing an over-long one beats silently truncating
-       it into a DIFFERENT (possibly valid) branch name. */
+    /* sg_ref_update (not the old sg_ref_write_path shortcut) so that
+       slash-containing names like feature/x still get their parent
+       directories created (sg_ref_update's ref-writer is the same
+       write_ref_path_raw underneath), while also recording the reflog line.
+       The name comes from argv: refusing an over-long one beats silently
+       truncating it into a DIFFERENT (possibly valid) branch name. */
     if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", name) >= (int)sizeof(ref_path)) {
         fprintf(stderr, "sg: 分支名稱太長\n");
         return 1;
     }
-    if (sg_ref_write_path(git_dir, ref_path, head_id) != 0) {
+
+    /* Measured against real git 2.55.0: `git branch <name>` logs "Created
+       from <current branch>" -- unlike `git switch -c`, which logs "Created
+       from HEAD" instead (verified separately in cmd_switch.c). sg never
+       produces a detached HEAD on its own, but fall back to the literal
+       "HEAD" rather than crash if sg_ref_current_branch ever returns NULL
+       (e.g. a foreign detached state left behind by something else). */
+    current = sg_ref_current_branch(git_dir);
+    current_name = current != NULL ? current : "HEAD";
+    snprintf(reflog_msg, sizeof(reflog_msg), "branch: Created from %s", current_name);
+    free(current);
+
+    rc = sg_ref_update(git_dir, ref_path, head_id, reflog_msg);
+    if (rc != 0) {
         fprintf(stderr, "sg: 無法建立分支 '%s'\n", name);
         return 1;
     }

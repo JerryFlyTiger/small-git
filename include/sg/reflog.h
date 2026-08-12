@@ -72,4 +72,22 @@ int sg_reflog_append(const char *git_dir, const char *ref_path,
 int sg_reflog_rewrite(const char *git_dir, const char *ref_path, const sg_reflog_entry *entries,
                       size_t count);
 
+/* Truncates git_dir/logs/<ref_path> back to `offset` bytes -- used to undo a
+   reflog append when a follow-up ref write fails, so the tip invariant
+   (the ref's value == the last reflog line's new-oid) is never left broken.
+   Best effort: a failure here just leaves a slightly-too-long reflog file,
+   which is far less harmful than a ref/reflog mismatch. Does not validate
+   ref_path with sg_ref_branch_name_is_safe -- callers only ever pass back a
+   path they themselves just built for sg_reflog_append. */
+void sg_reflog_truncate(const char *git_dir, const char *ref_path, long long offset);
+
+/* Returns entries[count - 1 - n] -- i.e. @{n} reflog notation, where @{0} is
+   the most recent entry. The oid this notation refers to is the entry's
+   NEW_ID, not old_id (easy to get backwards: @{0} means "the value the ref
+   was moved TO by the most recent update", not "the value it had before
+   that update"). Returns a borrowed pointer into log->entries (valid until
+   log is freed/mutated), or NULL if n >= log->count (including the
+   count == 0 case). */
+const sg_reflog_entry *sg_reflog_at(const sg_reflog *log, size_t n);
+
 #endif

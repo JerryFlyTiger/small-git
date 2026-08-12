@@ -30,20 +30,6 @@ static const char *env_or(const char *name, const char *fallback)
     return (v != NULL && v[0] != '\0') ? v : fallback;
 }
 
-/* Truncates git_dir/logs/<ref_path> back to `size` bytes -- used to undo a
-   reflog append when the follow-up ref write fails, so the tip invariant
-   (refs/stash == last reflog line's new-oid) is never left broken. Best
-   effort: a failure here just leaves a slightly-too-long reflog file, which
-   is far less harmful than a ref/reflog mismatch. */
-static void truncate_reflog(const char *git_dir, const char *ref_path, long long size)
-{
-    char path[4096];
-
-    if (snprintf(path, sizeof(path), "%s/logs/%s", git_dir, ref_path) >= (int)sizeof(path))
-        return;
-    truncate(path, (off_t)size);
-}
-
 /* Reads commit_id's commit object and fills short_hex_out (7 hex chars +
    NUL) and *subject_out (malloc'd, the first line of the commit message,
    without the newline). Returns 0, -1 on failure. */
@@ -151,7 +137,7 @@ int sg_stash_list_read(const char *git_dir, sg_stash_list *out)
     }
 
     for (i = 0; i < log.count; i++) {
-        sg_reflog_entry *src = &log.entries[log.count - 1 - i];
+        const sg_reflog_entry *src = sg_reflog_at(&log, i);
 
         memcpy(out->entries[i].commit_id, src->new_id, SG_SHA1_RAW_LEN);
         out->entries[i].message = strdup(src->message);
@@ -362,7 +348,7 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const char *messag
     }
 
     if (sg_ref_write_path(git_dir, "refs/stash", stash_commit_id) != 0) {
-        truncate_reflog(git_dir, "refs/stash", appended_at);
+        sg_reflog_truncate(git_dir, "refs/stash", appended_at);
         free(branch);
         sg_index_free(&idx);
         return -1;

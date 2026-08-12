@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(909 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(998 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 32 個單元測試二進位,任一失敗即整體失敗
+make test                         # 34 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -67,10 +67,16 @@ staging 的驗證。本機綠燈不是充分證據。**
 | `net/` | smart-HTTP:libcurl 封裝、pkt-line、transport | — |
 | `workdir/` | 工作目錄:路徑/檔案 I/O、ignore、status、apply、merge、tree_build | 幾乎全部 |
 | `safety/` | snapshot(可救回的備份 ref)、rebase 序列器狀態、stash | storage, workdir |
-| `cli/` | 23 個 `sg_cmd_*` + 派發器,唯一的組裝點 | 全部 |
+| `cli/` | 24 個 `sg_cmd_*` + 派發器,唯一的組裝點 | 全部 |
 
 - **讀物件一律走 `sg_object_read`**(`include/sg/objstore.h:16`):先 loose 再 pack。
   除了 `loose.c`/`pack.c` 自己以外不要直接呼叫底層。
+- **所有 ref 與 HEAD 的寫入一律走 `sg_ref_update` / `sg_ref_set_head`**
+  (`include/sg/refs.h`),不要再手刻 `fopen` 寫 ref 檔、也不要再複製一份
+  `write_ref_file`。reflog 的兩條不對稱規則(具體 ref 的 log 只在
+  `old != new` 時追加;`logs/HEAD` 永遠追加,且與它所指分支的那一行逐位元組
+  相同)與「哪些 namespace 才記 log」的政策閘門都收在這兩支函式裡,繞過去就
+  會靜默漏寫——不會報錯,只是那幾行 reflog 悄悄不存在(Phase 17)。
 - **`util/` 裡沒有字串緩衝區、也沒有路徑處理**。路徑解析、`mkdir -p`、讀寫檔
   在 `include/sg/workdir.h`(`sg_resolve_repo_path`、`sg_mkdir_parents`、
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
@@ -86,17 +92,23 @@ staging 的驗證。本機綠燈不是充分證據。**
   (`include/sg/tree_build.h`),前者只吃 index 的 stage-0 條目、後者會重新雜湊
   工作目錄;新程式碼要哪一種先看標頭註解,不要在呼叫端重寫這段邏輯。
   merge/rebase/stash 共用的「把 `sg_merge_result` 落地成工作目錄+index」迴圈
-  也已抽成 `sg_merge_result_apply`(`include/sg/merge.h`)。
+  也已抽成 `sg_merge_result_apply`(`include/sg/merge.h`)。`env_or()`(讀
+  `GIT_AUTHOR_NAME`/`EMAIL` 帶 fallback)有**八份**逐字複本:`storage/reflog.c`、
+  `storage/chunk.c`、`safety/stash.c`、`safety/snapshot.c`、`cli/cmd_rebase.c`、
+  `cli/cmd_merge.c`、`cli/cmd_tag.c`、`cli/cmd_commit.c`。碰到時順手收斂,
+  不要再增加下一份。
 - 遠端/使用者字串轉成檔案路徑前必須先過閘門函式:`sg_ref_name_is_safe`
   (`include/sg/transport.h:38`)、`sg_ref_branch_name_is_safe`(`include/sg/refs.h:13`)。
   **建立**新 ref 時的 check-ref-format 驗證另有一支
   `sg_ref_name_valid_for_create`(`include/sg/refs.h`),branch 與 tag 共用;
   三者規則不同,標頭註解有寫分工,挑錯會留洞。
 - **使用者給的 revision 字串一律走 `sg_rev_parse_commit`**
-  (`include/sg/revparse.h`):`HEAD`/tag/分支/完整 40-hex 加 `~N`/`^N`,會 peel
-  annotated tag。**不支援縮寫 sha**(刻意)。不要再手刻「分支名或 40-hex」的
-  片段。列舉/刪除任一前綴底下的 ref 用 `sg_ref_list_under`/`sg_ref_delete_under`
-  (`prefix` 必須以 `/` 結尾)。
+  (`include/sg/revparse.h`):`HEAD`/tag/分支/完整 40-hex/完整 `refs/...` 路徑,
+  加 `~N`/`^N`/`@{N}`(Phase 17,reflog 索引,必須緊接在 ref 名之後、純數字、
+  不支援 `@{<date>}`/`@{upstream}`/裸 `@{N}`),會 peel annotated tag。**不支援
+  縮寫 sha**(刻意)。不要再手刻「分支名或 40-hex」的片段。列舉/刪除任一前綴
+  底下的 ref 用 `sg_ref_list_under`/`sg_ref_delete_under`(`prefix` 必須以 `/`
+  結尾)。
 - **使用者給的 commit/tag 訊息一律先過 `sg_message_cleanup`**
   (`include/sg/object.h`),否則產生的物件 id 與真 git 不同。**例外是
   `cmd_rebase.c`**——它轉發既有訊息,必須逐位元組保真,刻意不套用。
@@ -178,7 +190,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 32 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 34 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。

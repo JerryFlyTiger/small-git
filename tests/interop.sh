@@ -667,6 +667,19 @@ RESOLVE_SG_STATUS="$WORKDIR/p4b_resolve_sg_status.txt"
 (cd "$P4B_RESOLVE_REPO" && "$SG" status) > "$RESOLVE_SG_STATUS" 2>&1
 check "phase4b case7: sg status is clean after resolving" grep -q "nothing to commit" "$RESOLVE_SG_STATUS"
 
+# Phase 17 batch B follow-up: the commit that lands a CONFLICTED merge (as
+# opposed to the auto-merge path in p17_seq_sg above, which never touches
+# cmd_commit.c at all) must log "commit (merge): <subject>" -- measured
+# directly against real git 2.55.0 on this exact conflict-then-resolve
+# sequence (git init; base; branch feature; conflicting change on each side;
+# merge; resolve; commit -m "resolved merge" -> logs/HEAD's and the
+# branch's own log's last line both read
+# "commit (merge): resolved merge").
+check "phase17: a commit resolving a CONFLICTED merge logs 'commit (merge): <subject>' on logs/HEAD" \
+    sh -c "tail -1 '$P4B_RESOLVE_REPO/.git/logs/HEAD' | grep -q '	commit (merge): resolved merge\$'"
+check "phase17: same commit logs 'commit (merge): <subject>' on the branch's own reflog" \
+    sh -c "tail -1 '$P4B_RESOLVE_REPO/.git/logs/refs/heads/master' | grep -q '	commit (merge): resolved merge\$'"
+
 # case 9: sg merge --abort restores the pre-merge working tree
 P4B_ABORT_REPO="$WORKDIR/p4b_abort_repo"
 mkdir -p "$P4B_ABORT_REPO"
@@ -1721,6 +1734,11 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         skip "phase6a: git fsck exits 0 on the bare repo after pushing a chunked blob"
         skip "phase6a: sg clone over smart HTTP exits 0 for a repo containing a chunked blob"
         skip "phase6a: a second sg clone from the same (plain git) server now recovers the chunk data too, since sg push propagated refs/sg/chunks there"
+        skip "phase6a: sg add of a second chunked file moves refs/sg/chunks but leaves the branch alone"
+        skip "phase6a: a push with only refs/sg/chunks behind exits 0"
+        skip "phase6a: a push with only refs/sg/chunks behind does not short-circuit to Everything up-to-date"
+        skip "phase6a: that push advances the remote's refs/sg/chunks to the local keep-alive commit"
+        skip "phase6a: that push transfers every chunk of the newly added file to the remote"
     else
         P6A_HTTP_BASE_URL="http://127.0.0.1:$P6A_HTTP_PORT/repo.git"
         P6A_HTTP_DEST="$WORKDIR/phase6a_http_dest"
@@ -1791,6 +1809,63 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         check "phase6a: a second sg clone from the same (plain git) server now recovers the chunk data too, since sg push propagated refs/sg/chunks there" \
             cmp -s "$WORKDIR/p6a_http_original.bin" "$P6A_HTTP_CLONE2/big.bin"
 
+        # case 8: the *only* thing behind on the remote is refs/sg/chunks.
+        #
+        # cmd_push.c decides "nothing to send" from `entry_count == 0 &&
+        # !send_chunks_update`; every test above moves a branch or a tag too,
+        # so the second half of that condition never gets to matter -- drop it
+        # and they all still pass. This case discriminates it: `sg add` of a
+        # second large file merges its chunks into the keep-alive tree
+        # immediately (chunk.c's keep_alive_add runs at blob-write time, not
+        # at commit time), so with no commit afterwards the branch is exactly
+        # where the previous push left it while refs/sg/chunks has moved on.
+        # Drop `&& !send_chunks_update` and this push prints "Everything
+        # up-to-date." and leaves the remote's keep-alive ref pointing at a
+        # tree that no longer protects the chunks now sitting on the server.
+        P6A_CHUNKS_REMOTE_BEFORE=$(git -C "$P6A_HTTP_SERVERROOT/repo.git" rev-parse refs/sg/chunks 2>/dev/null)
+        P6A_BRANCH_BEFORE=$(git -C "$P6A_HTTP_DEST" rev-parse HEAD 2>/dev/null)
+
+        head -c 5242880 /dev/urandom > "$P6A_HTTP_DEST/big2.bin" 2>/dev/null
+        (cd "$P6A_HTTP_DEST" && "$SG" add big2.bin) > /dev/null 2>&1
+
+        P6A_CHUNKS_LOCAL_AFTER=$(git -C "$P6A_HTTP_DEST" rev-parse refs/sg/chunks 2>/dev/null)
+        P6A_BRANCH_AFTER=$(git -C "$P6A_HTTP_DEST" rev-parse HEAD 2>/dev/null)
+
+        # Fixture premise, asserted rather than assumed: if `sg add` ever
+        # stopped touching the keep-alive ref (or started moving the branch),
+        # the checks below would go green for the wrong reason.
+        check "phase6a: sg add of a second chunked file moves refs/sg/chunks but leaves the branch alone" \
+            test -n "$P6A_CHUNKS_LOCAL_AFTER" -a \
+                 "$P6A_CHUNKS_LOCAL_AFTER" != "$P6A_CHUNKS_REMOTE_BEFORE" -a \
+                 "$P6A_BRANCH_AFTER" = "$P6A_BRANCH_BEFORE"
+
+        P6A_CHUNKS_PUSH_OUT="$WORKDIR/p6a_chunks_only_push_out.txt"
+        (cd "$P6A_HTTP_DEST" && "$SG" push) > "$P6A_CHUNKS_PUSH_OUT" 2>&1
+        check "phase6a: a push with only refs/sg/chunks behind exits 0" test $? = 0
+
+        check "phase6a: a push with only refs/sg/chunks behind does not short-circuit to Everything up-to-date" \
+            sh -c "! grep -q 'Everything up-to-date' '$P6A_CHUNKS_PUSH_OUT'"
+
+        # The discriminating assertion: the remote's own ref actually advanced
+        # to our keep-alive commit. Exit status alone can't tell "sent it"
+        # from "decided there was nothing to send".
+        P6A_CHUNKS_REMOTE_AFTER=$(git -C "$P6A_HTTP_SERVERROOT/repo.git" rev-parse refs/sg/chunks 2>/dev/null)
+        check "phase6a: that push advances the remote's refs/sg/chunks to the local keep-alive commit" \
+            test -n "$P6A_CHUNKS_REMOTE_AFTER" -a \
+                 "$P6A_CHUNKS_REMOTE_AFTER" = "$P6A_CHUNKS_LOCAL_AFTER"
+
+        # ...and the chunks that ref now protects are physically present there,
+        # same completeness question as case 7 but for a push carrying no
+        # branch update at all.
+        P6A_BLOB2=$(cd "$P6A_HTTP_DEST" && git ls-files -s big2.bin 2>/dev/null | awk '{print $2}')
+        P6A_PTR2_TXT="$WORKDIR/p6a_ptr2.txt"
+        git -C "$P6A_HTTP_DEST" cat-file -p "$P6A_BLOB2" > "$P6A_PTR2_TXT" 2>/dev/null
+        P6A_CHUNK_IDS2="$WORKDIR/p6a_chunk_ids2.txt"
+        grep -E '^[0-9a-f]{40}$' "$P6A_PTR2_TXT" > "$P6A_CHUNK_IDS2"
+        echo "phase6a chunks-only push: $(wc -l < "$P6A_CHUNK_IDS2" | tr -d ' ') chunk ids declared by the newly added pointer blob"
+        check "phase6a: that push transfers every chunk of the newly added file to the remote" \
+            p6a_all_chunks_present_on_remote "$P6A_HTTP_SERVERROOT/repo.git" "$P6A_CHUNK_IDS2"
+
         kill "$HTTP_SERVER_PID" 2>/dev/null
         HTTP_SERVER_PID=""
     fi
@@ -1800,6 +1875,11 @@ else
     skip "phase6a: git fsck exits 0 on the bare repo after pushing a chunked blob"
     skip "phase6a: sg clone over smart HTTP exits 0 for a repo containing a chunked blob"
     skip "phase6a: a second sg clone from the same (plain git) server now recovers the chunk data too, since sg push propagated refs/sg/chunks there"
+    skip "phase6a: sg add of a second chunked file moves refs/sg/chunks but leaves the branch alone"
+    skip "phase6a: a push with only refs/sg/chunks behind exits 0"
+    skip "phase6a: a push with only refs/sg/chunks behind does not short-circuit to Everything up-to-date"
+    skip "phase6a: that push advances the remote's refs/sg/chunks to the local keep-alive commit"
+    skip "phase6a: that push transfers every chunk of the newly added file to the remote"
 fi
 
 # --- Phase 6b: chunk durability (refs/sg/chunks keep-alive) and the
@@ -5329,6 +5409,622 @@ P16_CREBASE_ERR="$WORKDIR/p16_crebase_err.txt"
 check "phase16 corrupt rebase: sg refuses to start a rebase (sg-specific, no git oracle)" test $? != 0
 check "phase16 corrupt rebase: the refusal is the unfinished-merge guard" \
     grep -q "尚未完成的合併" "$P16_CREBASE_ERR"
+
+# --- Phase 17 batch A: sg switch -c into a not-yet-existing refs/heads/
+# subdirectory (e.g. "feature/x" when "refs/heads/feature/" doesn't exist
+# yet). Batch A moved sg_ref_update_branch onto sg_write_file_mkdirs (which
+# creates missing parent directories) -- an incidental fix for a pre-existing
+# inconsistency: before, `sg branch feature/y` succeeded here (cmd_branch.c
+# already mkdir -p'd its own way) while `sg switch -c feature/x` failed with
+# "failed to create branch 'feature/x'" via a bare fopen(). Real git allows
+# both, so the new behavior is kept (not reverted) and pinned here with git
+# as the oracle.
+P17_MKDIRS="$WORKDIR/p17_switch_c_mkdirs"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17_MKDIRS")") > /dev/null 2>&1
+printf 'base\n' > "$P17_MKDIRS/a.txt"
+(cd "$P17_MKDIRS" && "$SG" add a.txt && "$SG" commit -m "base") > /dev/null 2>&1
+check "phase17: precondition -- refs/heads/feature/ does not exist yet" \
+    sh -c "! test -d '$P17_MKDIRS/.git/refs/heads/feature'"
+(cd "$P17_MKDIRS" && "$SG" switch -c feature/x < /dev/null) > /dev/null 2>&1
+check "phase17: sg switch -c into a new refs/heads/ subdirectory succeeds" test $? = 0
+check "phase17: the new branch is readable back (git oracle)" \
+    sh -c "(cd '$P17_MKDIRS' && git rev-parse --verify refs/heads/feature/x) > /dev/null 2>&1"
+check "phase17: HEAD really moved to the new branch (git oracle)" \
+    sh -c "test \"\$(cd '$P17_MKDIRS' && git symbolic-ref HEAD)\" = 'refs/heads/feature/x'"
+check "phase17: working tree is clean after the switch (git oracle)" \
+    sh -c "test -z \"\$(cd '$P17_MKDIRS' && git status --porcelain)\""
+
+# ============================================================
+# Phase 17 batch B: reflog messages for local history operations
+#
+# Real git 2.55.0 is the oracle (measured directly, not recalled) for every
+# message string below except the three-way merge strategy name, which is a
+# deliberate divergence -- sg is honest that it isn't running git's 'ort'
+# engine (see cmd_merge.c's do_three_way_merge). Both a from-scratch sg repo
+# and a from-scratch git repo run the EXACT SAME sequence of operations
+# below; what's compared is the reflog MESSAGE column (ident/timestamp/oid
+# are expected to differ -- different clocks, different commit hashes) and
+# the reflog LINE COUNT per file (a stand-in for "old/new chain structure":
+# rule 1's no-op suppression either added a line or didn't, in both repos,
+# identically).
+# ============================================================
+
+# Strips everything up to and including the last tab on each line, leaving
+# just the reflog message column.
+p17_msgcol() {
+    sed 's/.*	//' "$1" 2>/dev/null
+}
+
+p17_seq_sg() {
+    dir="$1"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    printf 'base\n' > "$dir/a.txt"
+    (cd "$dir" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+    printf 'second\n' > "$dir/b.txt"
+    (cd "$dir" && "$SG" add b.txt && "$SG" commit -m second) > /dev/null 2>&1
+    (cd "$dir" && "$SG" branch feat) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch feat) > /dev/null 2>&1
+    printf 'onfeat\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m onfeat) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c feat2) > /dev/null 2>&1
+    printf 'onfeat2\n' > "$dir/d.txt"
+    (cd "$dir" && "$SG" add d.txt && "$SG" commit -m onfeat2) > /dev/null 2>&1
+    (cd "$dir" && "$SG" reset --mixed HEAD~1) > /dev/null 2>&1
+    (cd "$dir" && "$SG" reset --hard HEAD) > /dev/null 2>&1
+    # --mixed only touches the index, not the working tree, so d.txt (staged
+    # and committed on feat2, then un-staged by the reset above) is now a
+    # deliberate leftover untracked file -- same as real git. Remove it so
+    # later switches/merges start from a clean working tree, matching every
+    # other phase's convention of asserting cleanliness along the way.
+    rm -f "$dir/d.txt"
+    (cd "$dir" && "$SG" switch master) > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge feat) > /dev/null 2>&1
+    (cd "$dir" && "$SG" branch br1) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch br1) > /dev/null 2>&1
+    printf 'onbr1\n' > "$dir/e.txt"
+    (cd "$dir" && "$SG" add e.txt && "$SG" commit -m onbr1) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master) > /dev/null 2>&1
+    (cd "$dir" && "$SG" branch br2) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch br2) > /dev/null 2>&1
+    printf 'onbr2\n' > "$dir/f.txt"
+    (cd "$dir" && "$SG" add f.txt && "$SG" commit -m onbr2) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master) > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge br1) > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge br2) > /dev/null 2>&1
+}
+
+p17_seq_git() {
+    dir="$1"
+    (cd "$WORKDIR" && git init -q "$(basename "$dir")")
+    (cd "$dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'base\n' > "$dir/a.txt"
+    (cd "$dir" && git add a.txt && git commit -q -m base)
+    printf 'second\n' > "$dir/b.txt"
+    (cd "$dir" && git add b.txt && git commit -q -m second)
+    (cd "$dir" && git branch feat)
+    (cd "$dir" && git switch -q feat)
+    printf 'onfeat\n' > "$dir/c.txt"
+    (cd "$dir" && git add c.txt && git commit -q -m onfeat)
+    (cd "$dir" && git switch -q -c feat2)
+    printf 'onfeat2\n' > "$dir/d.txt"
+    (cd "$dir" && git add d.txt && git commit -q -m onfeat2)
+    (cd "$dir" && git reset --mixed -q HEAD~1)
+    (cd "$dir" && git reset --hard -q HEAD)
+    rm -f "$dir/d.txt"
+    (cd "$dir" && git switch -q master)
+    (cd "$dir" && git merge -q --no-edit feat)
+    (cd "$dir" && git branch br1)
+    (cd "$dir" && git switch -q br1)
+    printf 'onbr1\n' > "$dir/e.txt"
+    (cd "$dir" && git add e.txt && git commit -q -m onbr1)
+    (cd "$dir" && git switch -q master)
+    (cd "$dir" && git branch br2)
+    (cd "$dir" && git switch -q br2)
+    printf 'onbr2\n' > "$dir/f.txt"
+    (cd "$dir" && git add f.txt && git commit -q -m onbr2)
+    (cd "$dir" && git switch -q master)
+    (cd "$dir" && git merge -q --no-edit br1)
+    (cd "$dir" && git merge -q --no-edit br2)
+}
+
+P17_SG="$WORKDIR/p17_reflog_sg"
+P17_GIT="$WORKDIR/p17_reflog_git"
+p17_seq_sg "$P17_SG"
+p17_seq_git "$P17_GIT"
+
+check "phase17: precondition -- sg sequence's working tree is clean at the end (git oracle)" \
+    sh -c "test -z \"\$(cd '$P17_SG' && git status --porcelain)\""
+
+# HEAD: line count (chain-structure proxy) and message column, both must
+# match between the sg-built and git-built repos -- except the very last
+# line (the br2 three-way merge), whose message text sg intentionally
+# diverges on. That line's oid columns are NOT compared here either (they're
+# different commits in different repos by construction); only its presence
+# and everything BEFORE it are.
+P17_SG_HEAD="$WORKDIR/p17_sg_head.txt"
+P17_GIT_HEAD="$WORKDIR/p17_git_head.txt"
+p17_msgcol "$P17_SG/.git/logs/HEAD" > "$P17_SG_HEAD"
+p17_msgcol "$P17_GIT/.git/logs/HEAD" > "$P17_GIT_HEAD"
+
+check "phase17: logs/HEAD has the same number of lines in sg and git (chain structure)" \
+    sh -c "test \"\$(wc -l < '$P17_SG_HEAD')\" = \"\$(wc -l < '$P17_GIT_HEAD')\""
+
+P17_SG_HEAD_BUTLAST="$WORKDIR/p17_sg_head_butlast.txt"
+P17_GIT_HEAD_BUTLAST="$WORKDIR/p17_git_head_butlast.txt"
+sed '$d' "$P17_SG_HEAD" > "$P17_SG_HEAD_BUTLAST"
+sed '$d' "$P17_GIT_HEAD" > "$P17_GIT_HEAD_BUTLAST"
+check "phase17: logs/HEAD message column matches sg vs. git, up to the final (3-way) line" \
+    cmp -s "$P17_SG_HEAD_BUTLAST" "$P17_GIT_HEAD_BUTLAST"
+
+check "phase17: logs/HEAD line 1 is the initial commit ('commit (initial): base', git oracle)" \
+    sh -c "sed -n '1p' '$P17_GIT_HEAD' | grep -q '^commit (initial): base\$'"
+check "phase17: logs/HEAD's final line is sg's own 'sg-3way' strategy string, not git's 'ort'" \
+    sh -c "tail -1 '$P17_SG_HEAD' | grep -q \"^merge br2: Merge made by the 'sg-3way' strategy\\.\\$\""
+
+# Per-branch reflogs: same comparison, message column line-for-line. master
+# needs the same tail-line exception as logs/HEAD above -- br2's three-way
+# merge lands on master's OWN log too (rule 2: the checked-out branch's
+# update is mirrored to logs/HEAD, not the other way around), so master's
+# last line carries the same 'sg-3way'-vs-'ort' divergence.
+for p17_b in master feat feat2 br1 br2; do
+    P17_SG_B="$WORKDIR/p17_sg_${p17_b}.txt"
+    P17_GIT_B="$WORKDIR/p17_git_${p17_b}.txt"
+    p17_msgcol "$P17_SG/.git/logs/refs/heads/$p17_b" > "$P17_SG_B"
+    p17_msgcol "$P17_GIT/.git/logs/refs/heads/$p17_b" > "$P17_GIT_B"
+    check "phase17: refs/heads/$p17_b reflog line count matches sg vs. git (chain structure)" \
+        sh -c "test \"\$(wc -l < '$P17_SG_B')\" = \"\$(wc -l < '$P17_GIT_B')\""
+    if [ "$p17_b" = "master" ]; then
+        P17_SG_B_CMP="$WORKDIR/p17_sg_${p17_b}_butlast.txt"
+        P17_GIT_B_CMP="$WORKDIR/p17_git_${p17_b}_butlast.txt"
+        sed '$d' "$P17_SG_B" > "$P17_SG_B_CMP"
+        sed '$d' "$P17_GIT_B" > "$P17_GIT_B_CMP"
+    else
+        P17_SG_B_CMP="$P17_SG_B"
+        P17_GIT_B_CMP="$P17_GIT_B"
+    fi
+    check "phase17: refs/heads/$p17_b reflog message column matches sg vs. git byte-for-byte" \
+        cmp -s "$P17_SG_B_CMP" "$P17_GIT_B_CMP"
+done
+check "phase17: refs/heads/master's final line is also sg's own 'sg-3way' string (rule 2 mirror)" \
+    sh -c "tail -1 '$WORKDIR/p17_sg_master.txt' | grep -q \"^merge br2: Merge made by the 'sg-3way' strategy\\.\\$\""
+
+check "phase17: refs/heads/feat's own log says 'branch: Created from master' (git oracle)" \
+    grep -q '^branch: Created from master$' "$WORKDIR/p17_sg_feat.txt"
+check "phase17: refs/heads/feat2's own log says 'branch: Created from HEAD', not the branch name" \
+    grep -q '^branch: Created from HEAD$' "$WORKDIR/p17_sg_feat2.txt"
+
+# --- rule 1's asymmetry, isolated: `sg reset --hard HEAD` immediately after
+# a real commit is a genuine no-op (old == new on that branch). logs/HEAD
+# must still grow by one line (unconditional log); the branch's own log must
+# NOT (rule 1's own-log suppression). Re-derived independently of the
+# combined sequence above so a regression here can't hide behind an
+# unrelated line-count coincidence elsewhere in that sequence. ---
+P17_NOOP="$WORKDIR/p17_reset_noop"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17_NOOP")") > /dev/null 2>&1
+printf 'x\n' > "$P17_NOOP/a.txt"
+(cd "$P17_NOOP" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+P17_NOOP_HEAD_BEFORE=$(wc -l < "$P17_NOOP/.git/logs/HEAD")
+P17_NOOP_MASTER_BEFORE=$(wc -l < "$P17_NOOP/.git/logs/refs/heads/master")
+(cd "$P17_NOOP" && "$SG" reset --hard HEAD) > /dev/null 2>&1
+P17_NOOP_HEAD_AFTER=$(wc -l < "$P17_NOOP/.git/logs/HEAD")
+P17_NOOP_MASTER_AFTER=$(wc -l < "$P17_NOOP/.git/logs/refs/heads/master")
+check "phase17 rule1: a no-op 'sg reset --hard HEAD' adds one line to logs/HEAD" \
+    test "$P17_NOOP_HEAD_AFTER" -eq "$((P17_NOOP_HEAD_BEFORE + 1))"
+check "phase17 rule1: the same no-op does NOT add a line to the branch's own log" \
+    test "$P17_NOOP_MASTER_AFTER" -eq "$P17_NOOP_MASTER_BEFORE"
+P17_NOOP_HEAD_MSGCOL="$WORKDIR/p17_noop_head_msgcol.txt"
+p17_msgcol "$P17_NOOP/.git/logs/HEAD" > "$P17_NOOP_HEAD_MSGCOL"
+check "phase17 rule1: the no-op's logs/HEAD line is 'reset: moving to HEAD' (literal arg text)" \
+    sh -c "test \"\$(tail -1 '$P17_NOOP_HEAD_MSGCOL')\" = 'reset: moving to HEAD'"
+
+# --- already-up-to-date merge writes NO ref/reflog update at all (git
+# oracle: real git doesn't call update_ref on that path either) -- confirmed
+# by an unchanged logs/HEAD line count across the no-op merge. ---
+P17_UTD="$WORKDIR/p17_merge_uptodate"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17_UTD")") > /dev/null 2>&1
+printf 'x\n' > "$P17_UTD/a.txt"
+(cd "$P17_UTD" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P17_UTD" && "$SG" branch side) > /dev/null 2>&1
+P17_UTD_HEAD_BEFORE=$(wc -l < "$P17_UTD/.git/logs/HEAD")
+(cd "$P17_UTD" && "$SG" merge side) > /dev/null 2>&1
+check "phase17: 'sg merge' of an already-merged branch exits 0 and prints Already up to date" \
+    sh -c "(cd '$P17_UTD' && \"$SG\" merge side) 2>&1 | grep -q 'Already up to date\\.'"
+P17_UTD_HEAD_AFTER=$(wc -l < "$P17_UTD/.git/logs/HEAD")
+check "phase17: an already-up-to-date merge does not append to logs/HEAD at all" \
+    test "$P17_UTD_HEAD_AFTER" -eq "$P17_UTD_HEAD_BEFORE"
+
+# ============================================================
+# Phase 17 batch C: <ref>@{N} in rev-parse, and `sg reflog`.
+#
+# One repo, built ENTIRELY with sg (so logs/HEAD, logs/refs/heads/master and
+# logs/refs/heads/topic all come from real sg command side effects, not
+# hand-forged lines), then read back with the real `git` binary directly --
+# same bit-compatibility premise as the rest of this file.
+#
+# sg has no `rev-parse` subcommand, so `<ref>@{N}` is probed through `sg tag
+# <name> <rev>` (sg_rev_parse_commit's only other read-only CLI entry point
+# besides `sg reset`): a tag never gets its own reflog, so creating one has
+# no side effect on the very reflog state being probed. The tag's target is
+# then read back with `git rev-parse <tagname>` and compared against `git
+# rev-parse` applied directly to the original <rev> expression.
+# ============================================================
+
+P17C="$WORKDIR/p17c_at_notation"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17C")") > /dev/null 2>&1
+(
+    cd "$P17C" || exit 1
+    printf 'a1\n' > a.txt
+    "$SG" add a.txt && "$SG" commit -m c1
+    printf 'a2\n' >> a.txt
+    "$SG" add a.txt && "$SG" commit -m c2
+    "$SG" branch topic
+    "$SG" switch topic < /dev/null
+    printf 'a3\n' >> a.txt
+    "$SG" add a.txt && "$SG" commit -m c3
+    "$SG" switch master < /dev/null
+    printf 'a4\n' >> a.txt
+    "$SG" add a.txt && "$SG" commit -m c4
+    "$SG" tag vtag master
+) > /dev/null 2>&1
+
+# probe(): resolves $2 with real git (the oracle) and with sg (via a
+# throwaway tag named $1). $1 itself is unused beyond that -- NOT stored in
+# a variable named "label", which would silently clobber check()'s own
+# global "label" (this script's functions are plain sh, no "local"), and
+# every PASS/FAIL line here would print $1 verbatim instead of the actual
+# check() label.
+p17c_probe_n=0
+p17c_probe_agree() {
+    expr="$2"
+    p17c_probe_n=$((p17c_probe_n + 1))
+    tagname="p17c_probe_$p17c_probe_n"
+    expected=$(cd "$P17C" && git rev-parse "$expr" 2>/dev/null)
+    expected_rc=$?
+    (cd "$P17C" && "$SG" tag "$tagname" "$expr") > /dev/null 2>&1
+    sg_rc=$?
+    if [ "$expected_rc" -ne 0 ]; then
+        test "$sg_rc" -ne 0
+        return $?
+    fi
+    if [ "$sg_rc" -ne 0 ]; then
+        return 1
+    fi
+    actual=$(cd "$P17C" && git rev-parse "$tagname" 2>/dev/null)
+    test "$actual" = "$expected"
+}
+
+check "phase17c: master@{0} matches git" p17c_probe_agree at0 'master@{0}'
+check "phase17c: master@{1} matches git" p17c_probe_agree at1 'master@{1}'
+check "phase17c: HEAD@{0} matches git" p17c_probe_agree at2 'HEAD@{0}'
+check "phase17c: HEAD@{1} matches git (differs from master@{1} -- logs/HEAD and logs/refs/heads/master are different files)" \
+    p17c_probe_agree at3 'HEAD@{1}'
+check "phase17c: topic@{0} matches git" p17c_probe_agree at4 'topic@{0}'
+check "phase17c: master@{01} (leading zero) matches git" p17c_probe_agree at5 'master@{01}'
+check "phase17c: master@{1}~1 (suffix chained after @{N}) matches git" p17c_probe_agree at6 'master@{1}~1'
+check "phase17c: master@{99} (out of range) is rejected by both sg and git" p17c_probe_agree at7 'master@{99}'
+check "phase17c: vtag@{0} (a tag has no reflog) is rejected by both sg and git" p17c_probe_agree at8 'vtag@{0}'
+check "phase17c: master~1@{1} (@{N} not adjacent to base) is rejected by both sg and git" \
+    p17c_probe_agree at9 'master~1@{1}'
+check "phase17c: master^@{1} (@{N} not adjacent to base) is rejected by both sg and git" \
+    p17c_probe_agree at10 'master^@{1}'
+check "phase17c: master@{} (empty braces) is rejected by both sg and git" p17c_probe_agree at11 'master@{}'
+
+# Deliberate divergence: real git's bare "@{N}" DWIMs to the current
+# branch, sg deliberately does not (see revparse.h's header comment: the
+# value is measurably NOT the same as spelling the branch name out, so
+# guessing would be a wrong answer). Note "@{u}" (upstream) isn't usable as
+# a comparable divergence here -- this repo's master has no upstream
+# configured, so real git rejects it too, just for an unrelated reason; the
+# "@{u}"/"@{now}" rejections are covered by the unit test instead.
+P17C_BARE_GIT_RC=$(cd "$P17C" && git rev-parse '@{1}' > /dev/null 2>&1; echo $?)
+(cd "$P17C" && "$SG" tag p17c_probe_bare '@{1}') > /dev/null 2>&1
+check "phase17c: bare @{1} -- git treats it as the current branch, sg deliberately does not (sg-specific, no shared oracle result)" \
+    test "$P17C_BARE_GIT_RC" -eq 0 -a $? -ne 0
+
+# --- `sg reflog` output, compared line-for-line against `git reflog` on the
+# very same (sg-built) repo. ---
+P17C_SG_MASTER="$WORKDIR/p17c_sg_reflog_master.txt"
+P17C_GIT_MASTER="$WORKDIR/p17c_git_reflog_master.txt"
+(cd "$P17C" && "$SG" reflog show master) > "$P17C_SG_MASTER" 2>/dev/null
+(cd "$P17C" && git reflog show master) > "$P17C_GIT_MASTER" 2>/dev/null
+check "phase17c: 'sg reflog show master' matches 'git reflog show master' byte-for-byte" \
+    cmp -s "$P17C_SG_MASTER" "$P17C_GIT_MASTER"
+
+P17C_SG_HEAD="$WORKDIR/p17c_sg_reflog_head.txt"
+P17C_GIT_HEAD="$WORKDIR/p17c_git_reflog_head.txt"
+(cd "$P17C" && "$SG" reflog) > "$P17C_SG_HEAD" 2>/dev/null
+(cd "$P17C" && git reflog) > "$P17C_GIT_HEAD" 2>/dev/null
+check "phase17c: 'sg reflog' (bare, defaults to HEAD) matches 'git reflog' byte-for-byte" \
+    cmp -s "$P17C_SG_HEAD" "$P17C_GIT_HEAD"
+
+P17C_SG_TOPIC_N1="$WORKDIR/p17c_sg_reflog_topic_n1.txt"
+P17C_GIT_TOPIC_N1="$WORKDIR/p17c_git_reflog_topic_n1.txt"
+(cd "$P17C" && "$SG" reflog show topic -n 1) > "$P17C_SG_TOPIC_N1" 2>/dev/null
+(cd "$P17C" && git reflog show topic -n 1) > "$P17C_GIT_TOPIC_N1" 2>/dev/null
+check "phase17c: 'sg reflog show topic -n 1' matches 'git reflog show topic -n 1' byte-for-byte" \
+    cmp -s "$P17C_SG_TOPIC_N1" "$P17C_GIT_TOPIC_N1"
+
+# `-n` before the ref must be accepted too (documented CLI grammar).
+P17C_SG_TOPIC_N1B="$WORKDIR/p17c_sg_reflog_topic_n1b.txt"
+(cd "$P17C" && "$SG" reflog -n 1 topic) > "$P17C_SG_TOPIC_N1B" 2>/dev/null
+check "phase17c: '-n' before <ref> is accepted and matches the same output as after" \
+    cmp -s "$P17C_SG_TOPIC_N1B" "$P17C_GIT_TOPIC_N1"
+
+check "phase17c: 'sg reflog show <tag>' (a ref that exists but is never logged) prints nothing and exits 0" \
+    sh -c "test -z \"\$(cd '$P17C' && \"$SG\" reflog show vtag 2>/dev/null)\" && (cd '$P17C' && \"$SG\" reflog show vtag > /dev/null 2>&1)"
+check "phase17c: 'sg reflog show <nonexistent ref>' exits nonzero" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog show does-not-exist) > /dev/null 2>&1"
+P17C_STDERR="$WORKDIR/p17c_reflog_stderr.txt"
+(cd "$P17C" && "$SG" reflog show does-not-exist) > /dev/null 2> "$P17C_STDERR"
+check "phase17c: 'sg reflog show <nonexistent ref>' prints an 'sg: ' prefixed error to stderr" \
+    grep -q '^sg: ' "$P17C_STDERR"
+
+# --- fix-round regression: trailing garbage right after "@{N}" (revparse.c's
+# "~"/"^" suffix loop only special-cased '~' and silently treated any OTHER
+# character as '^', so e.g. "master@{0}x" misparsed as an implicit "^1"
+# instead of being rejected). Measured against real git: all three are fatal
+# "ambiguous argument" errors. ---
+check "phase17c: master@{0}x (garbage byte right after @{N}) is rejected by both sg and git" \
+    p17c_probe_agree at12 'master@{0}x'
+check "phase17c: master@{1}5 (garbage byte followed by digits) is rejected by both sg and git" \
+    p17c_probe_agree at13 'master@{1}5'
+check "phase17c: master@{0}0 (garbage byte followed by a single digit) is rejected by both sg and git" \
+    p17c_probe_agree at14 'master@{0}0'
+
+# --- fix-round: "refs/<rest>" as a fully-qualified <base>, agreeing with
+# real git's own gitrevisions "refs/<name>" disambiguation rule. ---
+check "phase17c: refs/heads/topic matches git" p17c_probe_agree at15 'refs/heads/topic'
+check "phase17c: refs/tags/vtag matches git" p17c_probe_agree at16 'refs/tags/vtag'
+check "phase17c: refs/heads/does-not-exist is rejected by both sg and git" \
+    p17c_probe_agree at17 'refs/heads/does-not-exist'
+check "phase17c: refs/heads/topic~1 (suffix chained after a refs/... base) matches git" \
+    p17c_probe_agree at18 'refs/heads/topic~1'
+
+# --- fix-round: `sg reflog` argument-boundary cases, none of which had
+# interop coverage before -- exit codes compared against real git (stdout
+# isn't compared for the error cases since sg's usage/error text doesn't
+# claim to match git's). ---
+P17C_GIT_N0_RC=$(cd "$P17C" && git reflog show master -n 0 > /dev/null 2>&1; echo $?)
+P17C_SG_N0_OUT="$WORKDIR/p17c_sg_reflog_n0.txt"
+(cd "$P17C" && "$SG" reflog show master -n 0) > "$P17C_SG_N0_OUT" 2>/dev/null
+P17C_SG_N0_RC=$?
+check "phase17c: 'sg reflog show master -n 0' exits 0, matching git" \
+    test "$P17C_SG_N0_RC" -eq 0 -a "$P17C_GIT_N0_RC" -eq 0
+check "phase17c: 'sg reflog show master -n 0' prints nothing" \
+    test ! -s "$P17C_SG_N0_OUT"
+
+check "phase17c: 'sg reflog show master -n -1' (negative count) is rejected" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog show master -n -1) > /dev/null 2>&1"
+check "phase17c: 'sg reflog show master -n abc' (non-numeric count) is rejected" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog show master -n abc) > /dev/null 2>&1"
+check "phase17c: 'sg reflog show master -n' (missing value) is rejected" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog show master -n) > /dev/null 2>&1"
+
+# `-n <count>` immediately followed by `show`, i.e. "show" NOT in the first
+# argument position -- the "is this the show subcommand" check only looks at
+# argv[1], so here "show" is consumed as an ordinary (and, in this repo,
+# nonexistent) <ref> name instead, and rejected for "no such ref" rather
+# than being recognized as the `show` keyword.
+check "phase17c: 'sg reflog -n 1 show' ('show' not in first position, read as a bogus <ref> instead) is rejected" \
+    sh -c "! (cd '$P17C' && \"$SG\" reflog -n 1 show) > /dev/null 2>&1"
+
+# usage string on a malformed invocation must NOT carry the "sg: " prefix
+# (CLAUDE.md convention: usage errors are bare "usage: ...", unlike runtime
+# errors which get "sg: ").
+P17C_USAGE_STDERR="$WORKDIR/p17c_reflog_usage_stderr.txt"
+(cd "$P17C" && "$SG" reflog show master -n) > /dev/null 2> "$P17C_USAGE_STDERR"
+check "phase17c: 'sg reflog show master -n' (missing value) prints a bare 'usage: ' line, no 'sg: ' prefix" \
+    sh -c "grep -q '^usage: ' '$P17C_USAGE_STDERR' && ! grep -q '^sg: ' '$P17C_USAGE_STDERR'"
+
+# ============================================================
+# Phase 17 batch D: reflog messages for fetch/push/clone (the network ref-
+# update paths), and log-file cleanup on ref deletion. No HTTP server needed
+# for the deletion half -- only the fetch/push/clone half is gated on
+# HTTP_AVAILABLE.
+# ============================================================
+
+# --- ref deletion also removes the ref's own reflog file (measured against
+# real git 2.55.0: `git branch -D` deletes logs/refs/heads/<branch> too), but
+# tag deletion -- which shares sg_ref_delete_under with branch deletion --
+# must not fail just because a tag never had a reflog file to unlink. ---
+
+P17D_DELBR="$WORKDIR/p17d_delete_branch"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17D_DELBR")") > /dev/null 2>&1
+printf 'x\n' > "$P17D_DELBR/a.txt"
+(cd "$P17D_DELBR" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P17D_DELBR" && "$SG" branch tobedeleted) > /dev/null 2>&1
+check "phase17d: precondition -- the about-to-be-deleted branch already has a reflog file" \
+    test -f "$P17D_DELBR/.git/logs/refs/heads/tobedeleted"
+(cd "$P17D_DELBR" && "$SG" branch -d tobedeleted < /dev/null) > /dev/null 2>&1
+check "phase17d: sg branch -d exits 0" test $? = 0
+check "phase17d: sg branch -d removed the branch's reflog file" \
+    test ! -f "$P17D_DELBR/.git/logs/refs/heads/tobedeleted"
+check "phase17d: git oracle agrees the branch itself is really gone" \
+    sh -c "! (cd '$P17D_DELBR' && git rev-parse --verify refs/heads/tobedeleted) > /dev/null 2>&1"
+
+P17D_DELTAG="$WORKDIR/p17d_delete_tag"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17D_DELTAG")") > /dev/null 2>&1
+printf 'x\n' > "$P17D_DELTAG/a.txt"
+(cd "$P17D_DELTAG" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P17D_DELTAG" && "$SG" tag sometag) > /dev/null 2>&1
+check "phase17d: precondition -- a freshly created tag never gets a reflog file (git oracle)" \
+    sh -c "test -f '$P17D_DELTAG/.git/refs/tags/sometag' && test ! -f '$P17D_DELTAG/.git/logs/refs/tags/sometag'"
+(cd "$P17D_DELTAG" && "$SG" tag -d sometag) > /dev/null 2>&1
+check "phase17d: sg tag -d succeeds even though the tag never had a reflog file to unlink" test $? = 0
+check "phase17d: git oracle agrees the tag itself is really gone" \
+    sh -c "! (cd '$P17D_DELTAG' && git rev-parse --verify refs/tags/sometag) > /dev/null 2>&1"
+
+# --- network paths: fetch/push/clone reflog messages, isolated smart-HTTP
+# fixtures of their own (not a reuse of phase5b/5c's $HTTP_DEST/$HTTP_SRC) --
+# the forced-update case below needs to rewrite upstream history, which would
+# otherwise corrupt phase5c's later fast-forward assumptions on that same
+# fixture. Mirrors phase6a's own-server structure, including its two-tier
+# skip (server-start timeout vs. HTTP unavailable from the start). ---
+
+if [ "$HTTP_AVAILABLE" = 1 ]; then
+    P17D_GIT_SRC="$WORKDIR/p17d_git_src"
+    mkdir -p "$P17D_GIT_SRC"
+    git init -q "$P17D_GIT_SRC"
+    (cd "$P17D_GIT_SRC" && git config user.email "p17d@example.com" && git config user.name "p17d tester")
+    printf 'seed\n' > "$P17D_GIT_SRC/seed.txt"
+    (cd "$P17D_GIT_SRC" && git add seed.txt && git commit -q -m "seed commit")
+
+    P17D_SERVERROOT="$WORKDIR/p17d_serverroot"
+    mkdir -p "$P17D_SERVERROOT"
+    (cd "$WORKDIR" && git clone --bare -q p17d_git_src "$P17D_SERVERROOT/repo.git") > /dev/null 2>&1
+    (cd "$P17D_SERVERROOT/repo.git" && git config http.receivepack true) > /dev/null 2>&1
+
+    P17D_SERVER_LOG="$WORKDIR/p17d_http_server.log"
+    python3 "$HTTP_SERVER_SCRIPT" "$P17D_SERVERROOT" > "$P17D_SERVER_LOG" 2>&1 &
+    HTTP_SERVER_PID=$!
+
+    P17D_PORT=""
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if [ -s "$P17D_SERVER_LOG" ]; then
+            P17D_PORT=$(awk '/^PORT /{print $2; exit}' "$P17D_SERVER_LOG")
+            if [ -n "$P17D_PORT" ]; then
+                break
+            fi
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    if [ -z "$P17D_PORT" ]; then
+        echo "warning: phase17d HTTP test server 未能在時限內就緒，跳過 phase17d 網路 reflog 測試" >&2
+        skip "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)"
+        skip "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'"
+        skip "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'"
+        skip "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)"
+        skip "phase17d: and no orphan reflog for it either"
+        skip "phase17d: sg clone did NOT write a log for refs/remotes/origin/<branch>"
+        skip "phase17d: sg fetch reflog message: fast-forward"
+        skip "phase17d: git oracle agrees: a real git fetch of the same fast-forward also logs 'fetch origin: fast-forward'"
+        skip "phase17d: precondition -- fetch actually created refs/remotes/origin/p17d-newbranch's log"
+        skip "phase17d: sg fetch reflog message: storing head (brand-new remote-tracking ref)"
+        skip "phase17d: sg fetch reflog message: forced-update"
+        skip "phase17d: precondition -- pushing a brand-new branch created its remote-tracking log"
+        skip "phase17d: sg push reflog message is the fixed 'update by push'"
+    else
+        P17D_BASE_URL="http://127.0.0.1:$P17D_PORT/repo.git"
+        P17D_DEST="$WORKDIR/p17d_dest"
+        P17D_DEST_GIT="$WORKDIR/p17d_dest_git"
+
+        "$SG" clone "$P17D_BASE_URL" "$P17D_DEST" > /dev/null 2>&1
+        (cd "$WORKDIR" && git clone -q "$P17D_BASE_URL" p17d_dest_git) > /dev/null 2>&1
+        P17D_HEAD=$(cd "$P17D_GIT_SRC" && git rev-parse HEAD)
+        P17D_BRANCH=$(cd "$P17D_GIT_SRC" && git rev-parse --abbrev-ref HEAD)
+
+        # --- clone: three log files get the fixed "clone: from <url>"
+        # message, and refs/remotes/origin/<branch> deliberately does NOT
+        # (measured against real git 2.55.0: that log only appears after the
+        # first fetch). ---
+        P17D_HEAD_LOG_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/HEAD" | tail -1)
+        # Exactly one line, not merely the right last line: real git's clone
+        # leaves logs/HEAD with a single entry (measured). If the message
+        # ever gets written both via sg_ref_set_head and via the branch's
+        # sg_ref_update, the second line is byte-identical to the first, so a
+        # tail -1 content check still passes -- only a count catches it.
+        P17D_HEAD_LOG_LINES=$(wc -l < "$P17D_DEST/.git/logs/HEAD" | tr -d ' ')
+        check "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)" \
+            test "$P17D_HEAD_LOG_LINES" = 1
+
+        check "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'" \
+            test "$P17D_HEAD_LOG_MSG" = "clone: from $P17D_BASE_URL"
+
+        P17D_BRANCH_LOG_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/heads/$P17D_BRANCH" | tail -1)
+        check "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'" \
+            test "$P17D_BRANCH_LOG_MSG" = "clone: from $P17D_BASE_URL"
+
+        # Known divergence, asserted so it stays deliberate: real git's clone
+        # creates refs/remotes/origin/HEAD as a symref and logs a line to it.
+        # sg models neither. Writing just the log was tried and removed --
+        # `sg reflog origin/HEAD` resolves names through the ref itself, so a
+        # log without a ref is unreachable and claims a history the repo does
+        # not have. Pinned in both directions: no ref, and no log for it.
+        check "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)" \
+            test ! -e "$P17D_DEST/.git/refs/remotes/origin/HEAD"
+        check "phase17d: and no orphan reflog for it either" \
+            test ! -e "$P17D_DEST/.git/logs/refs/remotes/origin/HEAD"
+
+        # negative assertion: refs/remotes/origin/<branch>'s log must NOT
+        # exist right after clone -- this is the reflog analogue of the file
+        # itself not being written yet, and it is the check most likely to
+        # pass for the wrong reason if the code ever starts writing it
+        # unconditionally.
+        check "phase17d: sg clone did NOT write a log for refs/remotes/origin/<branch> (git oracle: that log only appears after the first fetch)" \
+            test ! -f "$P17D_DEST/.git/logs/refs/remotes/origin/$P17D_BRANCH"
+
+        # --- fetch case 1: fast-forward ---
+        printf 'second line\n' >> "$P17D_GIT_SRC/seed.txt"
+        (cd "$P17D_GIT_SRC" && git add seed.txt && git commit -q -m "second commit")
+        (cd "$P17D_GIT_SRC" && git push -q "$P17D_SERVERROOT/repo.git" "HEAD:refs/heads/$P17D_BRANCH") > /dev/null 2>&1
+
+        (cd "$P17D_DEST" && "$SG" fetch) > /dev/null 2>&1
+        (cd "$P17D_DEST_GIT" && git fetch origin) > /dev/null 2>&1
+
+        P17D_FF_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/remotes/origin/$P17D_BRANCH" | tail -1)
+        check "phase17d: sg fetch reflog message: fast-forward" \
+            test "$P17D_FF_MSG" = "fetch origin: fast-forward"
+
+        P17D_FF_GIT_MSG=$(sed 's/.*	//' "$P17D_DEST_GIT/.git/logs/refs/remotes/origin/$P17D_BRANCH" | tail -1)
+        check "phase17d: git oracle agrees: a real git fetch of the same fast-forward also logs 'fetch origin: fast-forward'" \
+            test "$P17D_FF_GIT_MSG" = "fetch origin: fast-forward"
+
+        # --- fetch case 2: storing head (a remote-tracking ref sg has never
+        # seen before) ---
+        (cd "$P17D_GIT_SRC" && git branch p17d-newbranch) > /dev/null 2>&1
+        (cd "$P17D_GIT_SRC" && git push -q "$P17D_SERVERROOT/repo.git" refs/heads/p17d-newbranch) > /dev/null 2>&1
+        (cd "$P17D_DEST" && "$SG" fetch) > /dev/null 2>&1
+        check "phase17d: precondition -- fetch actually created refs/remotes/origin/p17d-newbranch's log" \
+            test -f "$P17D_DEST/.git/logs/refs/remotes/origin/p17d-newbranch"
+        P17D_NEWHEAD_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/remotes/origin/p17d-newbranch" | tail -1)
+        check "phase17d: sg fetch reflog message: storing head (brand-new remote-tracking ref)" \
+            test "$P17D_NEWHEAD_MSG" = "fetch origin: storing head"
+
+        # --- fetch case 3: forced-update (the remote's branch moved to a
+        # commit that is NOT a descendant of what sg already has recorded for
+        # it -- a genuine history rewrite upstream) ---
+        (cd "$P17D_GIT_SRC" && git reset -q --hard HEAD~1)
+        printf 'rewritten tip\n' >> "$P17D_GIT_SRC/seed.txt"
+        (cd "$P17D_GIT_SRC" && git add seed.txt && git commit -q -m "rewritten tip")
+        (cd "$P17D_GIT_SRC" && git push -q --force "$P17D_SERVERROOT/repo.git" "HEAD:refs/heads/$P17D_BRANCH") > /dev/null 2>&1
+        (cd "$P17D_DEST" && "$SG" fetch) > /dev/null 2>&1
+        P17D_FORCED_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/remotes/origin/$P17D_BRANCH" | tail -1)
+        check "phase17d: sg fetch reflog message: forced-update" \
+            test "$P17D_FORCED_MSG" = "fetch origin: forced-update"
+
+        # --- push: fixed message "update by push", no remote name embedded
+        # (measured against real git 2.55.0) ---
+        (cd "$P17D_DEST" && "$SG" switch -c p17d-push-branch < /dev/null) > /dev/null 2>&1
+        printf 'push content\n' > "$P17D_DEST/pushfile.txt"
+        (cd "$P17D_DEST" && "$SG" add pushfile.txt && "$SG" commit -m "p17d push commit") > /dev/null 2>&1
+        (cd "$P17D_DEST" && "$SG" push origin p17d-push-branch) > /dev/null 2>&1
+        check "phase17d: precondition -- pushing a brand-new branch created its remote-tracking log" \
+            test -f "$P17D_DEST/.git/logs/refs/remotes/origin/p17d-push-branch"
+        P17D_PUSH_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/remotes/origin/p17d-push-branch" | tail -1)
+        check "phase17d: sg push reflog message is the fixed 'update by push'" \
+            test "$P17D_PUSH_MSG" = "update by push"
+
+        kill "$HTTP_SERVER_PID" 2>/dev/null
+        HTTP_SERVER_PID=""
+    fi
+else
+    skip "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)"
+    skip "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'"
+    skip "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'"
+    skip "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)"
+    skip "phase17d: and no orphan reflog for it either"
+    skip "phase17d: sg clone did NOT write a log for refs/remotes/origin/<branch>"
+    skip "phase17d: sg fetch reflog message: fast-forward"
+    skip "phase17d: git oracle agrees: a real git fetch of the same fast-forward also logs 'fetch origin: fast-forward'"
+    skip "phase17d: precondition -- fetch actually created refs/remotes/origin/p17d-newbranch's log"
+    skip "phase17d: sg fetch reflog message: storing head (brand-new remote-tracking ref)"
+    skip "phase17d: sg fetch reflog message: forced-update"
+    skip "phase17d: precondition -- pushing a brand-new branch created its remote-tracking log"
+    skip "phase17d: sg push reflog message is the fixed 'update by push'"
+fi
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

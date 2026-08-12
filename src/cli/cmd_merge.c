@@ -35,6 +35,8 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
 {
     char label[300];
     int apply_rc;
+    char ref_path[4096];
+    char reflog_msg[400];
 
     snprintf(label, sizeof(label), "merge %s (fast-forward)", branch_arg);
     apply_rc = sg_safe_apply_tree(git_dir, repo_root, theirs_tree, label, force);
@@ -45,7 +47,9 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
     if (apply_rc != 0)
         return 1;
 
-    if (sg_ref_update_branch(git_dir, current_branch, theirs_commit) != 0) {
+    snprintf(reflog_msg, sizeof(reflog_msg), "merge %s: Fast-forward", branch_arg);
+    if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", current_branch) >= (int)sizeof(ref_path) ||
+       sg_ref_update(git_dir, ref_path, theirs_commit, reflog_msg) != 0) {
         fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
         return 1;
     }
@@ -217,10 +221,27 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         }
         free(serialized);
 
-        if (sg_ref_update_branch(git_dir, current_branch, new_commit_id) != 0) {
-            fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
-            rc = 1;
-            goto done;
+        {
+            /* Real git logs "Merge made by the 'ort' strategy." here (its
+               merge strategy name has changed release to release --
+               'recursive', then 'ort'). sg keeps that phrasing but is
+               honest about which engine actually ran: it isn't ort, so
+               claiming so would be a straight-up lie the moment someone
+               ran `git reflog` against an sg-built repo. This is a
+               deliberate divergence from real git's exact text, not a gap
+               -- interop coverage for this line asserts sg's own string. */
+            char ref_path[4096];
+            char reflog_msg[400];
+
+            snprintf(reflog_msg, sizeof(reflog_msg), "merge %s: Merge made by the 'sg-3way' strategy.",
+                    branch_arg);
+            if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", current_branch) >=
+                   (int)sizeof(ref_path) ||
+               sg_ref_update(git_dir, ref_path, new_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
+                rc = 1;
+                goto done;
+            }
         }
 
         if (sg_merge_head_remove(git_dir) != 0)

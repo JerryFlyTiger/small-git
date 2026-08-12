@@ -97,4 +97,53 @@ int sg_ref_delete_branch(const char *git_dir, const char *branch);
 int sg_ref_list_under(const char *git_dir, const char *prefix, char ***names_out, size_t *count_out);
 int sg_ref_delete_under(const char *git_dir, const char *prefix, const char *name);
 
+/* The single convergence point for writing an arbitrary ref (branch,
+   remote-tracking, refs/stash, ...), optionally recording a reflog entry.
+
+   reflog_msg == NULL: behaves exactly like sg_ref_write_path -- no log file
+   is touched at all. This is what every batch-A caller passes; the reflog
+   machinery below is otherwise dead code until a later phase starts passing
+   real messages.
+
+   reflog_msg != NULL: ref_path must be "HEAD", or start with "refs/heads/"
+   or "refs/remotes/", or be exactly "refs/stash" -- real git only logs
+   these namespaces (measured; refs/tags/... and other internal refs are not
+   logged). Any other ref_path fails with -1 and nothing is written at all
+   (the ref file included). On an allowed path: the OLD value is read via
+   sg_ref_read_path (missing/unreadable is treated as all-zeros, i.e. "ref
+   didn't exist before"), then:
+     - if old != new, one line is appended to logs/<ref_path>;
+     - if ref_path is "refs/heads/<b>" and HEAD is currently the symbolic
+       ref to that same branch, ANOTHER line -- old/new/message byte-for-
+       byte identical to the one above -- is appended to logs/HEAD,
+       regardless of whether old == new (real git's asymmetric rule: a
+       branch's own log suppresses no-op updates, but logs/HEAD does not,
+       measured against git 2.55.0).
+   The ref file is written last; if that write fails, any reflog line(s)
+   just appended are truncated back off (logs/HEAD first, then the branch
+   log, undoing them in the reverse order they were added) and -1 is
+   returned, leaving ref/reflog consistent with each other.
+
+   Known limitation, not fixed here: sg_ref_read_path collapses "ref does
+   not exist yet" and "ref file is corrupt" into the same -1, so a corrupt
+   existing ref's reflog entry will show an all-zeros old_id as if the ref
+   were being created fresh. Callers needing to tell those apart must not
+   rely on this function alone. */
+int sg_ref_update(const char *git_dir, const char *ref_path,
+                  const unsigned char new_id[SG_SHA1_RAW_LEN], const char *reflog_msg);
+
+/* Writes .git/HEAD as "ref: refs/heads/<branch>\n" -- the detach-free HEAD
+   move used by sg switch/clone/init. reflog_msg == NULL: HEAD is written and
+   nothing else happens. reflog_msg != NULL: BEFORE moving HEAD, the commit
+   it currently resolves to is looked up (sg_ref_resolve_head) for old_id,
+   and branch's tip (sg_ref_read_branch) is looked up for new_id -- either
+   lookup failing (unborn HEAD, or `branch` has no commits yet, which is the
+   normal state right after sg_repo_init) uses all-zeros instead of failing
+   the whole call. One line -- old/new possibly equal -- is unconditionally
+   appended to logs/HEAD (HEAD's log is never no-op-suppressed, same rule as
+   sg_ref_update's asymmetric case). If writing HEAD itself then fails, that
+   reflog line is truncated back off. Returns 0, -1 on failure (allocation,
+   or the HEAD file write). */
+int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_msg);
+
 #endif

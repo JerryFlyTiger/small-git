@@ -2,9 +2,11 @@
 
 #include "sg/chunk.h"
 #include "sg/hash.h"
+#include "sg/merge.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/pack.h"
+#include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/transport.h"
 #include "sg/workdir.h"
@@ -230,6 +232,21 @@ done:
     return rc;
 }
 
+/* Fast-forward means old_id is an ancestor of new_id, i.e. their merge base
+   is old_id itself -- the exact same test cmd_push.c's check_fast_forward
+   already applies on the push side (sg_merge_base is the one shared source
+   of truth for reachability in this codebase); -1 (unrelated history) and -2
+   (criss-cross) both count as "not fast-forward" here, same as any other
+   non-ancestor base. */
+static int fetch_is_fast_forward(const char *git_dir, const unsigned char old_id[SG_SHA1_RAW_LEN],
+                                 const unsigned char new_id[SG_SHA1_RAW_LEN])
+{
+    unsigned char base[SG_SHA1_RAW_LEN];
+
+    return sg_merge_base(git_dir, old_id, new_id, base) == 0 &&
+          memcmp(base, old_id, SG_SHA1_RAW_LEN) == 0;
+}
+
 static int read_ref_file(const char *path, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
     unsigned char *content;
@@ -248,20 +265,6 @@ static int read_ref_file(const char *path, unsigned char id_out[SG_SHA1_RAW_LEN]
     rc = sg_hex_to_sha1(hex, id_out);
     free(content);
     return rc;
-}
-
-static int write_ref_file(const char *git_dir, const char *ref_path,
-                          const unsigned char id[SG_SHA1_RAW_LEN])
-{
-    char full_path[SG_PATH_MAX];
-    char content[SG_SHA1_HEX_LEN + 2];
-
-    snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path);
-    sg_sha1_to_hex(id, content);
-    content[SG_SHA1_HEX_LEN] = '\n';
-    content[SG_SHA1_HEX_LEN + 1] = '\0';
-    return sg_write_file_mkdirs(full_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1,
-                                0644);
 }
 
 int sg_cmd_fetch(int argc, char **argv)
@@ -410,9 +413,38 @@ int sg_cmd_fetch(int argc, char **argv)
         if (had_old && memcmp(old_id, adv.refs[i].id, SG_SHA1_RAW_LEN) == 0)
             continue; /* unchanged */
 
-        if (write_ref_file(git_dir, ref_path, adv.refs[i].id) != 0) {
-            fprintf(stderr, "sg: failed to update %s\n", ref_path);
-            goto done;
+        if (is_tag) {
+            /* refs/tags/... is never logged (ref_path_reflog_allowed), so
+               passing a message here would just make sg_ref_update fail the
+               whole tag update -- keep this NULL, matching every other tag
+               write in this codebase. */
+            if (sg_ref_update(git_dir, ref_path, adv.refs[i].id, NULL) != 0) {
+                fprintf(stderr, "sg: failed to update %s\n", ref_path);
+                goto done;
+            }
+        } else {
+            /* Real git's fetch reflog message is the full argv after
+               "fetch" (e.g. "fetch -q origin" -> "fetch -q origin: ..."),
+               but sg's flags don't match git's, so echoing them back would
+               be meaningless -- sg deliberately embeds just the remote name,
+               which is enough to make `sg fetch origin` and `git fetch
+               origin` produce byte-identical messages (measured against git
+               2.55.0). */
+            char msg[256];
+            const char *result;
+
+            if (!had_old)
+                result = "storing head";
+            else if (fetch_is_fast_forward(git_dir, old_id, adv.refs[i].id))
+                result = "fast-forward";
+            else
+                result = "forced-update";
+            snprintf(msg, sizeof(msg), "fetch %s: %s", remote, result);
+
+            if (sg_ref_update(git_dir, ref_path, adv.refs[i].id, msg) != 0) {
+                fprintf(stderr, "sg: failed to update %s\n", ref_path);
+                goto done;
+            }
         }
         any_updated = 1;
 

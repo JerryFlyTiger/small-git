@@ -69,25 +69,6 @@ static int pick_unique_ref_name(const char *undo_dir, long long ts, const char *
     return -1;
 }
 
-static int write_ref(const char *ref_path, const unsigned char id[SG_SHA1_RAW_LEN])
-{
-    char hex[SG_SHA1_HEX_LEN + 1];
-    FILE *f;
-
-    if (sg_mkdir_parents(ref_path) != 0)
-        return -1;
-
-    sg_sha1_to_hex(id, hex);
-    f = fopen(ref_path, "wb");
-    if (f == NULL)
-        return -1;
-    if (fprintf(f, "%s\n", hex) < 0) {
-        fclose(f);
-        return -1;
-    }
-    return fclose(f) == 0 ? 0 : -1;
-}
-
 int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_index *idx,
                        const char *label, unsigned char commit_id_out[SG_SHA1_RAW_LEN])
 {
@@ -164,8 +145,8 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
     if (pick_unique_ref_name(undo_dir, ts, slug, ref_name, sizeof(ref_name)) != 0)
         return -1;
 
-    snprintf(ref_path, sizeof(ref_path), "%s/%s", undo_dir, ref_name);
-    if (write_ref(ref_path, commit_id) != 0)
+    snprintf(ref_path, sizeof(ref_path), "refs/small-git/undo/%s", ref_name);
+    if (sg_ref_update(git_dir, ref_path, commit_id, NULL) != 0)
         return -1;
 
     if (commit_id_out != NULL)
