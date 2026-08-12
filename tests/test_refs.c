@@ -1,12 +1,14 @@
 #include "sg/refs.h"
 
 #include "sg/hash.h"
+#include "sg/reflog.h"
 #include "sg/repo.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -193,10 +195,97 @@ static void test_delete_does_not_touch_prefix_collision(void)
     free(git_dir);
 }
 
+static int file_exists(const char *path)
+{
+    struct stat st;
+
+    return stat(path, &st) == 0;
+}
+
+/* Deleting a branch must also unlink its own reflog file (logs/<ref_path>),
+   matching real git's `git branch -D` (measured against 2.55.0). Builds the
+   log via a real sg_ref_update(..., "test msg") call first -- a hand-forged
+   file would only prove the unlink path works, not that it targets the
+   SAME path sg_reflog_append actually writes to. */
+static void test_delete_branch_removes_reflog_file(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char id[SG_SHA1_RAW_LEN];
+    char log_path[4096];
+
+    fill_id(id, 0x55);
+    CHECK(sg_ref_update(git_dir, "refs/heads/tobedeleted", id, "test msg") == 0,
+         "sg_ref_update with a reflog message should succeed");
+
+    snprintf(log_path, sizeof(log_path), "%s/logs/refs/heads/tobedeleted", git_dir);
+    CHECK(file_exists(log_path), "precondition: the branch's reflog file must exist before deletion");
+
+    CHECK(sg_ref_delete_branch(git_dir, "tobedeleted") == 0, "branch deletion should succeed");
+    CHECK(!file_exists(log_path), "the branch's reflog file must be gone after sg_ref_delete_branch");
+    CHECK(sg_ref_branch_exists(git_dir, "tobedeleted") == 0, "the branch itself must be gone too");
+
+    free(git_dir);
+}
+
+/* sg_ref_delete_under also serves tag deletion (cmd_tag.c's `sg tag -d`),
+   and a tag never gets a reflog at all (ref_path_reflog_allowed excludes
+   refs/tags/...). Deleting a tag whose logs/refs/tags/<name> file was NEVER
+   created must still return 0 -- unlinking a path that was never there is
+   not a failure. This is the one most likely to be silently "always green":
+   a mutant that turns the ENOENT-tolerant unlink into an unconditional
+   failure would only be caught by asserting the return value here, not by
+   any check on file state (there is no file to check). */
+static void test_delete_under_tag_missing_reflog_still_succeeds(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char id[SG_SHA1_RAW_LEN];
+    char log_path[4096];
+
+    fill_id(id, 0x66);
+    /* sg_ref_write_path -> sg_ref_update(..., NULL): no reflog message, so
+       (unlike test_delete_branch_removes_reflog_file above) no log file is
+       ever written for this tag -- exactly the state a real `sg tag` leaves
+       behind. */
+    CHECK(sg_ref_write_path(git_dir, "refs/tags/sometag", id) == 0, "writing the tag ref should succeed");
+
+    snprintf(log_path, sizeof(log_path), "%s/logs/refs/tags/sometag", git_dir);
+    CHECK(!file_exists(log_path), "precondition: a tag must never have a reflog file to begin with");
+
+    CHECK(sg_ref_delete_under(git_dir, "refs/tags/", "sometag") == 0,
+         "deleting a tag whose reflog file never existed must still return 0, not -1");
+
+    free(git_dir);
+}
+
+/* Same "missing log file is not an error" guarantee, but for a branch whose
+   reflog was never written in the first place (sg_ref_update_branch with no
+   message, i.e. sg_branch's actual code path) -- a second, narrower proof
+   that ENOENT tolerance isn't accidentally scoped to only the tag case. */
+static void test_delete_branch_missing_reflog_still_succeeds(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char id[SG_SHA1_RAW_LEN];
+    char log_path[4096];
+
+    fill_id(id, 0x77);
+    CHECK(sg_ref_update_branch(git_dir, "nolog", id) == 0, "creating the branch should succeed");
+
+    snprintf(log_path, sizeof(log_path), "%s/logs/refs/heads/nolog", git_dir);
+    CHECK(!file_exists(log_path), "precondition: this branch's reflog file must not exist");
+
+    CHECK(sg_ref_delete_branch(git_dir, "nolog") == 0,
+         "deleting a branch whose reflog file never existed must still return 0");
+
+    free(git_dir);
+}
+
 int main(void)
 {
     test_list_excludes_prefix_collision();
     test_delete_does_not_touch_prefix_collision();
+    test_delete_branch_removes_reflog_file();
+    test_delete_under_tag_missing_reflog_still_succeeds();
+    test_delete_branch_missing_reflog_still_succeeds();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

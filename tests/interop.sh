@@ -5816,6 +5816,216 @@ P17C_USAGE_STDERR="$WORKDIR/p17c_reflog_usage_stderr.txt"
 check "phase17c: 'sg reflog show master -n' (missing value) prints a bare 'usage: ' line, no 'sg: ' prefix" \
     sh -c "grep -q '^usage: ' '$P17C_USAGE_STDERR' && ! grep -q '^sg: ' '$P17C_USAGE_STDERR'"
 
+# ============================================================
+# Phase 17 batch D: reflog messages for fetch/push/clone (the network ref-
+# update paths), and log-file cleanup on ref deletion. No HTTP server needed
+# for the deletion half -- only the fetch/push/clone half is gated on
+# HTTP_AVAILABLE.
+# ============================================================
+
+# --- ref deletion also removes the ref's own reflog file (measured against
+# real git 2.55.0: `git branch -D` deletes logs/refs/heads/<branch> too), but
+# tag deletion -- which shares sg_ref_delete_under with branch deletion --
+# must not fail just because a tag never had a reflog file to unlink. ---
+
+P17D_DELBR="$WORKDIR/p17d_delete_branch"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17D_DELBR")") > /dev/null 2>&1
+printf 'x\n' > "$P17D_DELBR/a.txt"
+(cd "$P17D_DELBR" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P17D_DELBR" && "$SG" branch tobedeleted) > /dev/null 2>&1
+check "phase17d: precondition -- the about-to-be-deleted branch already has a reflog file" \
+    test -f "$P17D_DELBR/.git/logs/refs/heads/tobedeleted"
+(cd "$P17D_DELBR" && "$SG" branch -d tobedeleted < /dev/null) > /dev/null 2>&1
+check "phase17d: sg branch -d exits 0" test $? = 0
+check "phase17d: sg branch -d removed the branch's reflog file" \
+    test ! -f "$P17D_DELBR/.git/logs/refs/heads/tobedeleted"
+check "phase17d: git oracle agrees the branch itself is really gone" \
+    sh -c "! (cd '$P17D_DELBR' && git rev-parse --verify refs/heads/tobedeleted) > /dev/null 2>&1"
+
+P17D_DELTAG="$WORKDIR/p17d_delete_tag"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17D_DELTAG")") > /dev/null 2>&1
+printf 'x\n' > "$P17D_DELTAG/a.txt"
+(cd "$P17D_DELTAG" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P17D_DELTAG" && "$SG" tag sometag) > /dev/null 2>&1
+check "phase17d: precondition -- a freshly created tag never gets a reflog file (git oracle)" \
+    sh -c "test -f '$P17D_DELTAG/.git/refs/tags/sometag' && test ! -f '$P17D_DELTAG/.git/logs/refs/tags/sometag'"
+(cd "$P17D_DELTAG" && "$SG" tag -d sometag) > /dev/null 2>&1
+check "phase17d: sg tag -d succeeds even though the tag never had a reflog file to unlink" test $? = 0
+check "phase17d: git oracle agrees the tag itself is really gone" \
+    sh -c "! (cd '$P17D_DELTAG' && git rev-parse --verify refs/tags/sometag) > /dev/null 2>&1"
+
+# --- network paths: fetch/push/clone reflog messages, isolated smart-HTTP
+# fixtures of their own (not a reuse of phase5b/5c's $HTTP_DEST/$HTTP_SRC) --
+# the forced-update case below needs to rewrite upstream history, which would
+# otherwise corrupt phase5c's later fast-forward assumptions on that same
+# fixture. Mirrors phase6a's own-server structure, including its two-tier
+# skip (server-start timeout vs. HTTP unavailable from the start). ---
+
+if [ "$HTTP_AVAILABLE" = 1 ]; then
+    P17D_GIT_SRC="$WORKDIR/p17d_git_src"
+    mkdir -p "$P17D_GIT_SRC"
+    git init -q "$P17D_GIT_SRC"
+    (cd "$P17D_GIT_SRC" && git config user.email "p17d@example.com" && git config user.name "p17d tester")
+    printf 'seed\n' > "$P17D_GIT_SRC/seed.txt"
+    (cd "$P17D_GIT_SRC" && git add seed.txt && git commit -q -m "seed commit")
+
+    P17D_SERVERROOT="$WORKDIR/p17d_serverroot"
+    mkdir -p "$P17D_SERVERROOT"
+    (cd "$WORKDIR" && git clone --bare -q p17d_git_src "$P17D_SERVERROOT/repo.git") > /dev/null 2>&1
+    (cd "$P17D_SERVERROOT/repo.git" && git config http.receivepack true) > /dev/null 2>&1
+
+    P17D_SERVER_LOG="$WORKDIR/p17d_http_server.log"
+    python3 "$HTTP_SERVER_SCRIPT" "$P17D_SERVERROOT" > "$P17D_SERVER_LOG" 2>&1 &
+    HTTP_SERVER_PID=$!
+
+    P17D_PORT=""
+    i=0
+    while [ "$i" -lt 50 ]; do
+        if [ -s "$P17D_SERVER_LOG" ]; then
+            P17D_PORT=$(awk '/^PORT /{print $2; exit}' "$P17D_SERVER_LOG")
+            if [ -n "$P17D_PORT" ]; then
+                break
+            fi
+        fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    if [ -z "$P17D_PORT" ]; then
+        echo "warning: phase17d HTTP test server 未能在時限內就緒，跳過 phase17d 網路 reflog 測試" >&2
+        skip "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)"
+        skip "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'"
+        skip "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'"
+        skip "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)"
+        skip "phase17d: and no orphan reflog for it either"
+        skip "phase17d: sg clone did NOT write a log for refs/remotes/origin/<branch>"
+        skip "phase17d: sg fetch reflog message: fast-forward"
+        skip "phase17d: git oracle agrees: a real git fetch of the same fast-forward also logs 'fetch origin: fast-forward'"
+        skip "phase17d: precondition -- fetch actually created refs/remotes/origin/p17d-newbranch's log"
+        skip "phase17d: sg fetch reflog message: storing head (brand-new remote-tracking ref)"
+        skip "phase17d: sg fetch reflog message: forced-update"
+        skip "phase17d: precondition -- pushing a brand-new branch created its remote-tracking log"
+        skip "phase17d: sg push reflog message is the fixed 'update by push'"
+    else
+        P17D_BASE_URL="http://127.0.0.1:$P17D_PORT/repo.git"
+        P17D_DEST="$WORKDIR/p17d_dest"
+        P17D_DEST_GIT="$WORKDIR/p17d_dest_git"
+
+        "$SG" clone "$P17D_BASE_URL" "$P17D_DEST" > /dev/null 2>&1
+        (cd "$WORKDIR" && git clone -q "$P17D_BASE_URL" p17d_dest_git) > /dev/null 2>&1
+        P17D_HEAD=$(cd "$P17D_GIT_SRC" && git rev-parse HEAD)
+        P17D_BRANCH=$(cd "$P17D_GIT_SRC" && git rev-parse --abbrev-ref HEAD)
+
+        # --- clone: three log files get the fixed "clone: from <url>"
+        # message, and refs/remotes/origin/<branch> deliberately does NOT
+        # (measured against real git 2.55.0: that log only appears after the
+        # first fetch). ---
+        P17D_HEAD_LOG_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/HEAD" | tail -1)
+        # Exactly one line, not merely the right last line: real git's clone
+        # leaves logs/HEAD with a single entry (measured). If the message
+        # ever gets written both via sg_ref_set_head and via the branch's
+        # sg_ref_update, the second line is byte-identical to the first, so a
+        # tail -1 content check still passes -- only a count catches it.
+        P17D_HEAD_LOG_LINES=$(wc -l < "$P17D_DEST/.git/logs/HEAD" | tr -d ' ')
+        check "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)" \
+            test "$P17D_HEAD_LOG_LINES" = 1
+
+        check "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'" \
+            test "$P17D_HEAD_LOG_MSG" = "clone: from $P17D_BASE_URL"
+
+        P17D_BRANCH_LOG_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/heads/$P17D_BRANCH" | tail -1)
+        check "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'" \
+            test "$P17D_BRANCH_LOG_MSG" = "clone: from $P17D_BASE_URL"
+
+        # Known divergence, asserted so it stays deliberate: real git's clone
+        # creates refs/remotes/origin/HEAD as a symref and logs a line to it.
+        # sg models neither. Writing just the log was tried and removed --
+        # `sg reflog origin/HEAD` resolves names through the ref itself, so a
+        # log without a ref is unreachable and claims a history the repo does
+        # not have. Pinned in both directions: no ref, and no log for it.
+        check "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)" \
+            test ! -e "$P17D_DEST/.git/refs/remotes/origin/HEAD"
+        check "phase17d: and no orphan reflog for it either" \
+            test ! -e "$P17D_DEST/.git/logs/refs/remotes/origin/HEAD"
+
+        # negative assertion: refs/remotes/origin/<branch>'s log must NOT
+        # exist right after clone -- this is the reflog analogue of the file
+        # itself not being written yet, and it is the check most likely to
+        # pass for the wrong reason if the code ever starts writing it
+        # unconditionally.
+        check "phase17d: sg clone did NOT write a log for refs/remotes/origin/<branch> (git oracle: that log only appears after the first fetch)" \
+            test ! -f "$P17D_DEST/.git/logs/refs/remotes/origin/$P17D_BRANCH"
+
+        # --- fetch case 1: fast-forward ---
+        printf 'second line\n' >> "$P17D_GIT_SRC/seed.txt"
+        (cd "$P17D_GIT_SRC" && git add seed.txt && git commit -q -m "second commit")
+        (cd "$P17D_GIT_SRC" && git push -q "$P17D_SERVERROOT/repo.git" "HEAD:refs/heads/$P17D_BRANCH") > /dev/null 2>&1
+
+        (cd "$P17D_DEST" && "$SG" fetch) > /dev/null 2>&1
+        (cd "$P17D_DEST_GIT" && git fetch origin) > /dev/null 2>&1
+
+        P17D_FF_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/remotes/origin/$P17D_BRANCH" | tail -1)
+        check "phase17d: sg fetch reflog message: fast-forward" \
+            test "$P17D_FF_MSG" = "fetch origin: fast-forward"
+
+        P17D_FF_GIT_MSG=$(sed 's/.*	//' "$P17D_DEST_GIT/.git/logs/refs/remotes/origin/$P17D_BRANCH" | tail -1)
+        check "phase17d: git oracle agrees: a real git fetch of the same fast-forward also logs 'fetch origin: fast-forward'" \
+            test "$P17D_FF_GIT_MSG" = "fetch origin: fast-forward"
+
+        # --- fetch case 2: storing head (a remote-tracking ref sg has never
+        # seen before) ---
+        (cd "$P17D_GIT_SRC" && git branch p17d-newbranch) > /dev/null 2>&1
+        (cd "$P17D_GIT_SRC" && git push -q "$P17D_SERVERROOT/repo.git" refs/heads/p17d-newbranch) > /dev/null 2>&1
+        (cd "$P17D_DEST" && "$SG" fetch) > /dev/null 2>&1
+        check "phase17d: precondition -- fetch actually created refs/remotes/origin/p17d-newbranch's log" \
+            test -f "$P17D_DEST/.git/logs/refs/remotes/origin/p17d-newbranch"
+        P17D_NEWHEAD_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/remotes/origin/p17d-newbranch" | tail -1)
+        check "phase17d: sg fetch reflog message: storing head (brand-new remote-tracking ref)" \
+            test "$P17D_NEWHEAD_MSG" = "fetch origin: storing head"
+
+        # --- fetch case 3: forced-update (the remote's branch moved to a
+        # commit that is NOT a descendant of what sg already has recorded for
+        # it -- a genuine history rewrite upstream) ---
+        (cd "$P17D_GIT_SRC" && git reset -q --hard HEAD~1)
+        printf 'rewritten tip\n' >> "$P17D_GIT_SRC/seed.txt"
+        (cd "$P17D_GIT_SRC" && git add seed.txt && git commit -q -m "rewritten tip")
+        (cd "$P17D_GIT_SRC" && git push -q --force "$P17D_SERVERROOT/repo.git" "HEAD:refs/heads/$P17D_BRANCH") > /dev/null 2>&1
+        (cd "$P17D_DEST" && "$SG" fetch) > /dev/null 2>&1
+        P17D_FORCED_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/remotes/origin/$P17D_BRANCH" | tail -1)
+        check "phase17d: sg fetch reflog message: forced-update" \
+            test "$P17D_FORCED_MSG" = "fetch origin: forced-update"
+
+        # --- push: fixed message "update by push", no remote name embedded
+        # (measured against real git 2.55.0) ---
+        (cd "$P17D_DEST" && "$SG" switch -c p17d-push-branch < /dev/null) > /dev/null 2>&1
+        printf 'push content\n' > "$P17D_DEST/pushfile.txt"
+        (cd "$P17D_DEST" && "$SG" add pushfile.txt && "$SG" commit -m "p17d push commit") > /dev/null 2>&1
+        (cd "$P17D_DEST" && "$SG" push origin p17d-push-branch) > /dev/null 2>&1
+        check "phase17d: precondition -- pushing a brand-new branch created its remote-tracking log" \
+            test -f "$P17D_DEST/.git/logs/refs/remotes/origin/p17d-push-branch"
+        P17D_PUSH_MSG=$(sed 's/.*	//' "$P17D_DEST/.git/logs/refs/remotes/origin/p17d-push-branch" | tail -1)
+        check "phase17d: sg push reflog message is the fixed 'update by push'" \
+            test "$P17D_PUSH_MSG" = "update by push"
+
+        kill "$HTTP_SERVER_PID" 2>/dev/null
+        HTTP_SERVER_PID=""
+    fi
+else
+    skip "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)"
+    skip "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'"
+    skip "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'"
+    skip "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)"
+    skip "phase17d: and no orphan reflog for it either"
+    skip "phase17d: sg clone did NOT write a log for refs/remotes/origin/<branch>"
+    skip "phase17d: sg fetch reflog message: fast-forward"
+    skip "phase17d: git oracle agrees: a real git fetch of the same fast-forward also logs 'fetch origin: fast-forward'"
+    skip "phase17d: precondition -- fetch actually created refs/remotes/origin/p17d-newbranch's log"
+    skip "phase17d: sg fetch reflog message: storing head (brand-new remote-tracking ref)"
+    skip "phase17d: sg fetch reflog message: forced-update"
+    skip "phase17d: precondition -- pushing a brand-new branch created its remote-tracking log"
+    skip "phase17d: sg push reflog message is the fixed 'update by push'"
+fi
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
