@@ -222,9 +222,42 @@ int sg_cmd_commit(int argc, char **argv)
     }
     free(serialized);
 
-    if (sg_ref_update_branch(git_dir, branch, commit_id) != 0) {
-        fprintf(stderr, "sg: failed to update branch '%s'\n", branch);
-        rc = 1;
+    {
+        /* Reflog message subject is the first line of the (already
+           sg_message_cleanup'd) commit message, prefixed per real git
+           2.55.0's three distinct commit-reflog wordings: a genuinely new
+           branch tip ("initial"), a merge commit landing (MERGE_HEAD was
+           present), or an ordinary commit -- measured directly. */
+        const char *first_line_end = strchr(message, '\n');
+        size_t first_line_len =
+            first_line_end != NULL ? (size_t)(first_line_end - message) : strlen(message);
+        const char *prefix =
+            is_merge_commit ? "commit (merge): " : (has_parent ? "commit: " : "commit (initial): ");
+        char *reflog_msg = NULL;
+        int need = snprintf(NULL, 0, "%s%.*s", prefix, (int)first_line_len, message);
+
+        if (need >= 0) {
+            reflog_msg = malloc((size_t)need + 1);
+            if (reflog_msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
+                free(branch);
+                free(git_dir);
+                free(cleaned_message);
+                return 1;
+            }
+            snprintf(reflog_msg, (size_t)need + 1, "%s%.*s", prefix, (int)first_line_len, message);
+        }
+
+        {
+            char ref_path[4096];
+
+            if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch) >= (int)sizeof(ref_path) ||
+               sg_ref_update(git_dir, ref_path, commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: failed to update branch '%s'\n", branch);
+                rc = 1;
+            }
+        }
+        free(reflog_msg);
     }
 
     if (rc == 0 && is_merge_commit && sg_merge_head_remove(git_dir) != 0)

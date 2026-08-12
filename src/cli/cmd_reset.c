@@ -135,12 +135,20 @@ int sg_cmd_reset(int argc, char **argv)
         /* Neither the index nor the working directory is touched: nothing
            uncommitted is ever at risk, so there is no confirmation gate and
            no automatic snapshot -- same rule real git follows. */
-        if (sg_ref_update_branch(git_dir, current_branch, target_commit_id) != 0) {
-            fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
-            free(current_branch);
-            free(git_dir);
-            free(repo_root);
-            return 1;
+        {
+            char ref_path[4096];
+            char reflog_msg[512];
+
+            snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
+            if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", current_branch) >=
+                   (int)sizeof(ref_path) ||
+               sg_ref_update(git_dir, ref_path, target_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
         }
     } else if (mode == RESET_MIXED) {
         sg_index idx;
@@ -188,12 +196,20 @@ int sg_cmd_reset(int argc, char **argv)
             return 1;
         }
 
-        if (sg_ref_update_branch(git_dir, current_branch, target_commit_id) != 0) {
-            fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
-            free(current_branch);
-            free(git_dir);
-            free(repo_root);
-            return 1;
+        {
+            char ref_path[4096];
+            char reflog_msg[512];
+
+            snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
+            if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", current_branch) >=
+                   (int)sizeof(ref_path) ||
+               sg_ref_update(git_dir, ref_path, target_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
         }
 
         /* Leaving MERGE_HEAD behind would make a later, unrelated `sg
@@ -235,12 +251,20 @@ int sg_cmd_reset(int argc, char **argv)
             return 1;
         }
 
-        if (sg_ref_update_branch(git_dir, current_branch, target_commit_id) != 0) {
-            fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
-            free(current_branch);
-            free(git_dir);
-            free(repo_root);
-            return 1;
+        {
+            char ref_path[4096];
+            char reflog_msg[512];
+
+            snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
+            if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", current_branch) >=
+                   (int)sizeof(ref_path) ||
+               sg_ref_update(git_dir, ref_path, target_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
         }
     }
 
