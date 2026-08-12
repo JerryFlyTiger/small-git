@@ -667,6 +667,19 @@ RESOLVE_SG_STATUS="$WORKDIR/p4b_resolve_sg_status.txt"
 (cd "$P4B_RESOLVE_REPO" && "$SG" status) > "$RESOLVE_SG_STATUS" 2>&1
 check "phase4b case7: sg status is clean after resolving" grep -q "nothing to commit" "$RESOLVE_SG_STATUS"
 
+# Phase 17 batch B follow-up: the commit that lands a CONFLICTED merge (as
+# opposed to the auto-merge path in p17_seq_sg above, which never touches
+# cmd_commit.c at all) must log "commit (merge): <subject>" -- measured
+# directly against real git 2.55.0 on this exact conflict-then-resolve
+# sequence (git init; base; branch feature; conflicting change on each side;
+# merge; resolve; commit -m "resolved merge" -> logs/HEAD's and the
+# branch's own log's last line both read
+# "commit (merge): resolved merge").
+check "phase17: a commit resolving a CONFLICTED merge logs 'commit (merge): <subject>' on logs/HEAD" \
+    sh -c "tail -1 '$P4B_RESOLVE_REPO/.git/logs/HEAD' | grep -q '	commit (merge): resolved merge\$'"
+check "phase17: same commit logs 'commit (merge): <subject>' on the branch's own reflog" \
+    sh -c "tail -1 '$P4B_RESOLVE_REPO/.git/logs/refs/heads/master' | grep -q '	commit (merge): resolved merge\$'"
+
 # case 9: sg merge --abort restores the pre-merge working tree
 P4B_ABORT_REPO="$WORKDIR/p4b_abort_repo"
 mkdir -p "$P4B_ABORT_REPO"
@@ -5420,6 +5433,205 @@ check "phase17: HEAD really moved to the new branch (git oracle)" \
     sh -c "test \"\$(cd '$P17_MKDIRS' && git symbolic-ref HEAD)\" = 'refs/heads/feature/x'"
 check "phase17: working tree is clean after the switch (git oracle)" \
     sh -c "test -z \"\$(cd '$P17_MKDIRS' && git status --porcelain)\""
+
+# ============================================================
+# Phase 17 batch B: reflog messages for local history operations
+#
+# Real git 2.55.0 is the oracle (measured directly, not recalled) for every
+# message string below except the three-way merge strategy name, which is a
+# deliberate divergence -- sg is honest that it isn't running git's 'ort'
+# engine (see cmd_merge.c's do_three_way_merge). Both a from-scratch sg repo
+# and a from-scratch git repo run the EXACT SAME sequence of operations
+# below; what's compared is the reflog MESSAGE column (ident/timestamp/oid
+# are expected to differ -- different clocks, different commit hashes) and
+# the reflog LINE COUNT per file (a stand-in for "old/new chain structure":
+# rule 1's no-op suppression either added a line or didn't, in both repos,
+# identically).
+# ============================================================
+
+# Strips everything up to and including the last tab on each line, leaving
+# just the reflog message column.
+p17_msgcol() {
+    sed 's/.*	//' "$1" 2>/dev/null
+}
+
+p17_seq_sg() {
+    dir="$1"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$dir")") > /dev/null 2>&1
+    printf 'base\n' > "$dir/a.txt"
+    (cd "$dir" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+    printf 'second\n' > "$dir/b.txt"
+    (cd "$dir" && "$SG" add b.txt && "$SG" commit -m second) > /dev/null 2>&1
+    (cd "$dir" && "$SG" branch feat) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch feat) > /dev/null 2>&1
+    printf 'onfeat\n' > "$dir/c.txt"
+    (cd "$dir" && "$SG" add c.txt && "$SG" commit -m onfeat) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch -c feat2) > /dev/null 2>&1
+    printf 'onfeat2\n' > "$dir/d.txt"
+    (cd "$dir" && "$SG" add d.txt && "$SG" commit -m onfeat2) > /dev/null 2>&1
+    (cd "$dir" && "$SG" reset --mixed HEAD~1) > /dev/null 2>&1
+    (cd "$dir" && "$SG" reset --hard HEAD) > /dev/null 2>&1
+    # --mixed only touches the index, not the working tree, so d.txt (staged
+    # and committed on feat2, then un-staged by the reset above) is now a
+    # deliberate leftover untracked file -- same as real git. Remove it so
+    # later switches/merges start from a clean working tree, matching every
+    # other phase's convention of asserting cleanliness along the way.
+    rm -f "$dir/d.txt"
+    (cd "$dir" && "$SG" switch master) > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge feat) > /dev/null 2>&1
+    (cd "$dir" && "$SG" branch br1) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch br1) > /dev/null 2>&1
+    printf 'onbr1\n' > "$dir/e.txt"
+    (cd "$dir" && "$SG" add e.txt && "$SG" commit -m onbr1) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master) > /dev/null 2>&1
+    (cd "$dir" && "$SG" branch br2) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch br2) > /dev/null 2>&1
+    printf 'onbr2\n' > "$dir/f.txt"
+    (cd "$dir" && "$SG" add f.txt && "$SG" commit -m onbr2) > /dev/null 2>&1
+    (cd "$dir" && "$SG" switch master) > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge br1) > /dev/null 2>&1
+    (cd "$dir" && "$SG" merge br2) > /dev/null 2>&1
+}
+
+p17_seq_git() {
+    dir="$1"
+    (cd "$WORKDIR" && git init -q "$(basename "$dir")")
+    (cd "$dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'base\n' > "$dir/a.txt"
+    (cd "$dir" && git add a.txt && git commit -q -m base)
+    printf 'second\n' > "$dir/b.txt"
+    (cd "$dir" && git add b.txt && git commit -q -m second)
+    (cd "$dir" && git branch feat)
+    (cd "$dir" && git switch -q feat)
+    printf 'onfeat\n' > "$dir/c.txt"
+    (cd "$dir" && git add c.txt && git commit -q -m onfeat)
+    (cd "$dir" && git switch -q -c feat2)
+    printf 'onfeat2\n' > "$dir/d.txt"
+    (cd "$dir" && git add d.txt && git commit -q -m onfeat2)
+    (cd "$dir" && git reset --mixed -q HEAD~1)
+    (cd "$dir" && git reset --hard -q HEAD)
+    rm -f "$dir/d.txt"
+    (cd "$dir" && git switch -q master)
+    (cd "$dir" && git merge -q --no-edit feat)
+    (cd "$dir" && git branch br1)
+    (cd "$dir" && git switch -q br1)
+    printf 'onbr1\n' > "$dir/e.txt"
+    (cd "$dir" && git add e.txt && git commit -q -m onbr1)
+    (cd "$dir" && git switch -q master)
+    (cd "$dir" && git branch br2)
+    (cd "$dir" && git switch -q br2)
+    printf 'onbr2\n' > "$dir/f.txt"
+    (cd "$dir" && git add f.txt && git commit -q -m onbr2)
+    (cd "$dir" && git switch -q master)
+    (cd "$dir" && git merge -q --no-edit br1)
+    (cd "$dir" && git merge -q --no-edit br2)
+}
+
+P17_SG="$WORKDIR/p17_reflog_sg"
+P17_GIT="$WORKDIR/p17_reflog_git"
+p17_seq_sg "$P17_SG"
+p17_seq_git "$P17_GIT"
+
+check "phase17: precondition -- sg sequence's working tree is clean at the end (git oracle)" \
+    sh -c "test -z \"\$(cd '$P17_SG' && git status --porcelain)\""
+
+# HEAD: line count (chain-structure proxy) and message column, both must
+# match between the sg-built and git-built repos -- except the very last
+# line (the br2 three-way merge), whose message text sg intentionally
+# diverges on. That line's oid columns are NOT compared here either (they're
+# different commits in different repos by construction); only its presence
+# and everything BEFORE it are.
+P17_SG_HEAD="$WORKDIR/p17_sg_head.txt"
+P17_GIT_HEAD="$WORKDIR/p17_git_head.txt"
+p17_msgcol "$P17_SG/.git/logs/HEAD" > "$P17_SG_HEAD"
+p17_msgcol "$P17_GIT/.git/logs/HEAD" > "$P17_GIT_HEAD"
+
+check "phase17: logs/HEAD has the same number of lines in sg and git (chain structure)" \
+    sh -c "test \"\$(wc -l < '$P17_SG_HEAD')\" = \"\$(wc -l < '$P17_GIT_HEAD')\""
+
+P17_SG_HEAD_BUTLAST="$WORKDIR/p17_sg_head_butlast.txt"
+P17_GIT_HEAD_BUTLAST="$WORKDIR/p17_git_head_butlast.txt"
+sed '$d' "$P17_SG_HEAD" > "$P17_SG_HEAD_BUTLAST"
+sed '$d' "$P17_GIT_HEAD" > "$P17_GIT_HEAD_BUTLAST"
+check "phase17: logs/HEAD message column matches sg vs. git, up to the final (3-way) line" \
+    cmp -s "$P17_SG_HEAD_BUTLAST" "$P17_GIT_HEAD_BUTLAST"
+
+check "phase17: logs/HEAD line 1 is the initial commit ('commit (initial): base', git oracle)" \
+    sh -c "sed -n '1p' '$P17_GIT_HEAD' | grep -q '^commit (initial): base\$'"
+check "phase17: logs/HEAD's final line is sg's own 'sg-3way' strategy string, not git's 'ort'" \
+    sh -c "tail -1 '$P17_SG_HEAD' | grep -q \"^merge br2: Merge made by the 'sg-3way' strategy\\.\\$\""
+
+# Per-branch reflogs: same comparison, message column line-for-line. master
+# needs the same tail-line exception as logs/HEAD above -- br2's three-way
+# merge lands on master's OWN log too (rule 2: the checked-out branch's
+# update is mirrored to logs/HEAD, not the other way around), so master's
+# last line carries the same 'sg-3way'-vs-'ort' divergence.
+for p17_b in master feat feat2 br1 br2; do
+    P17_SG_B="$WORKDIR/p17_sg_${p17_b}.txt"
+    P17_GIT_B="$WORKDIR/p17_git_${p17_b}.txt"
+    p17_msgcol "$P17_SG/.git/logs/refs/heads/$p17_b" > "$P17_SG_B"
+    p17_msgcol "$P17_GIT/.git/logs/refs/heads/$p17_b" > "$P17_GIT_B"
+    check "phase17: refs/heads/$p17_b reflog line count matches sg vs. git (chain structure)" \
+        sh -c "test \"\$(wc -l < '$P17_SG_B')\" = \"\$(wc -l < '$P17_GIT_B')\""
+    if [ "$p17_b" = "master" ]; then
+        P17_SG_B_CMP="$WORKDIR/p17_sg_${p17_b}_butlast.txt"
+        P17_GIT_B_CMP="$WORKDIR/p17_git_${p17_b}_butlast.txt"
+        sed '$d' "$P17_SG_B" > "$P17_SG_B_CMP"
+        sed '$d' "$P17_GIT_B" > "$P17_GIT_B_CMP"
+    else
+        P17_SG_B_CMP="$P17_SG_B"
+        P17_GIT_B_CMP="$P17_GIT_B"
+    fi
+    check "phase17: refs/heads/$p17_b reflog message column matches sg vs. git byte-for-byte" \
+        cmp -s "$P17_SG_B_CMP" "$P17_GIT_B_CMP"
+done
+check "phase17: refs/heads/master's final line is also sg's own 'sg-3way' string (rule 2 mirror)" \
+    sh -c "tail -1 '$WORKDIR/p17_sg_master.txt' | grep -q \"^merge br2: Merge made by the 'sg-3way' strategy\\.\\$\""
+
+check "phase17: refs/heads/feat's own log says 'branch: Created from master' (git oracle)" \
+    grep -q '^branch: Created from master$' "$WORKDIR/p17_sg_feat.txt"
+check "phase17: refs/heads/feat2's own log says 'branch: Created from HEAD', not the branch name" \
+    grep -q '^branch: Created from HEAD$' "$WORKDIR/p17_sg_feat2.txt"
+
+# --- rule 1's asymmetry, isolated: `sg reset --hard HEAD` immediately after
+# a real commit is a genuine no-op (old == new on that branch). logs/HEAD
+# must still grow by one line (unconditional log); the branch's own log must
+# NOT (rule 1's own-log suppression). Re-derived independently of the
+# combined sequence above so a regression here can't hide behind an
+# unrelated line-count coincidence elsewhere in that sequence. ---
+P17_NOOP="$WORKDIR/p17_reset_noop"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17_NOOP")") > /dev/null 2>&1
+printf 'x\n' > "$P17_NOOP/a.txt"
+(cd "$P17_NOOP" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+P17_NOOP_HEAD_BEFORE=$(wc -l < "$P17_NOOP/.git/logs/HEAD")
+P17_NOOP_MASTER_BEFORE=$(wc -l < "$P17_NOOP/.git/logs/refs/heads/master")
+(cd "$P17_NOOP" && "$SG" reset --hard HEAD) > /dev/null 2>&1
+P17_NOOP_HEAD_AFTER=$(wc -l < "$P17_NOOP/.git/logs/HEAD")
+P17_NOOP_MASTER_AFTER=$(wc -l < "$P17_NOOP/.git/logs/refs/heads/master")
+check "phase17 rule1: a no-op 'sg reset --hard HEAD' adds one line to logs/HEAD" \
+    test "$P17_NOOP_HEAD_AFTER" -eq "$((P17_NOOP_HEAD_BEFORE + 1))"
+check "phase17 rule1: the same no-op does NOT add a line to the branch's own log" \
+    test "$P17_NOOP_MASTER_AFTER" -eq "$P17_NOOP_MASTER_BEFORE"
+P17_NOOP_HEAD_MSGCOL="$WORKDIR/p17_noop_head_msgcol.txt"
+p17_msgcol "$P17_NOOP/.git/logs/HEAD" > "$P17_NOOP_HEAD_MSGCOL"
+check "phase17 rule1: the no-op's logs/HEAD line is 'reset: moving to HEAD' (literal arg text)" \
+    sh -c "test \"\$(tail -1 '$P17_NOOP_HEAD_MSGCOL')\" = 'reset: moving to HEAD'"
+
+# --- already-up-to-date merge writes NO ref/reflog update at all (git
+# oracle: real git doesn't call update_ref on that path either) -- confirmed
+# by an unchanged logs/HEAD line count across the no-op merge. ---
+P17_UTD="$WORKDIR/p17_merge_uptodate"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17_UTD")") > /dev/null 2>&1
+printf 'x\n' > "$P17_UTD/a.txt"
+(cd "$P17_UTD" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P17_UTD" && "$SG" branch side) > /dev/null 2>&1
+P17_UTD_HEAD_BEFORE=$(wc -l < "$P17_UTD/.git/logs/HEAD")
+(cd "$P17_UTD" && "$SG" merge side) > /dev/null 2>&1
+check "phase17: 'sg merge' of an already-merged branch exits 0 and prints Already up to date" \
+    sh -c "(cd '$P17_UTD' && \"$SG\" merge side) 2>&1 | grep -q 'Already up to date\\.'"
+P17_UTD_HEAD_AFTER=$(wc -l < "$P17_UTD/.git/logs/HEAD")
+check "phase17: an already-up-to-date merge does not append to logs/HEAD at all" \
+    test "$P17_UTD_HEAD_AFTER" -eq "$P17_UTD_HEAD_BEFORE"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
