@@ -5397,6 +5397,30 @@ check "phase16 corrupt rebase: sg refuses to start a rebase (sg-specific, no git
 check "phase16 corrupt rebase: the refusal is the unfinished-merge guard" \
     grep -q "尚未完成的合併" "$P16_CREBASE_ERR"
 
+# --- Phase 17 batch A: sg switch -c into a not-yet-existing refs/heads/
+# subdirectory (e.g. "feature/x" when "refs/heads/feature/" doesn't exist
+# yet). Batch A moved sg_ref_update_branch onto sg_write_file_mkdirs (which
+# creates missing parent directories) -- an incidental fix for a pre-existing
+# inconsistency: before, `sg branch feature/y` succeeded here (cmd_branch.c
+# already mkdir -p'd its own way) while `sg switch -c feature/x` failed with
+# "failed to create branch 'feature/x'" via a bare fopen(). Real git allows
+# both, so the new behavior is kept (not reverted) and pinned here with git
+# as the oracle.
+P17_MKDIRS="$WORKDIR/p17_switch_c_mkdirs"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P17_MKDIRS")") > /dev/null 2>&1
+printf 'base\n' > "$P17_MKDIRS/a.txt"
+(cd "$P17_MKDIRS" && "$SG" add a.txt && "$SG" commit -m "base") > /dev/null 2>&1
+check "phase17: precondition -- refs/heads/feature/ does not exist yet" \
+    sh -c "! test -d '$P17_MKDIRS/.git/refs/heads/feature'"
+(cd "$P17_MKDIRS" && "$SG" switch -c feature/x < /dev/null) > /dev/null 2>&1
+check "phase17: sg switch -c into a new refs/heads/ subdirectory succeeds" test $? = 0
+check "phase17: the new branch is readable back (git oracle)" \
+    sh -c "(cd '$P17_MKDIRS' && git rev-parse --verify refs/heads/feature/x) > /dev/null 2>&1"
+check "phase17: HEAD really moved to the new branch (git oracle)" \
+    sh -c "test \"\$(cd '$P17_MKDIRS' && git symbolic-ref HEAD)\" = 'refs/heads/feature/x'"
+check "phase17: working tree is clean after the switch (git oracle)" \
+    sh -c "test -z \"\$(cd '$P17_MKDIRS' && git status --porcelain)\""
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
