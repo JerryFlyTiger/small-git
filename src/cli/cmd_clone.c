@@ -6,6 +6,7 @@
 #include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/pack.h"
+#include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/transport.h"
 #include "sg/workdir.h"
@@ -70,23 +71,6 @@ static int target_dir_is_usable(const char *dir)
     return empty;
 }
 
-/* Writes a single ref file (e.g. refs/remotes/origin/<name> or
-   refs/heads/<name>) as "<40-hex-id>\n", creating any parent directories a
-   slash-containing ref name needs (e.g. "feature/x"). */
-static int write_ref_file(const char *git_dir, const char *ref_path,
-                          const unsigned char id[SG_SHA1_RAW_LEN])
-{
-    char full_path[SG_PATH_MAX];
-    char content[SG_SHA1_HEX_LEN + 2];
-
-    snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path);
-    sg_sha1_to_hex(id, content);
-    content[SG_SHA1_HEX_LEN] = '\n';
-    content[SG_SHA1_HEX_LEN + 1] = '\0';
-    return sg_write_file_mkdirs(full_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1,
-                                0644);
-}
-
 /* refs/heads/<name> -> refs/remotes/<remote>/<name>, refs/tags/<name> ->
    refs/tags/<name> (unchanged), and SG_CHUNK_KEEPALIVE_REF -> the same path
    locally (it's
@@ -116,7 +100,7 @@ static int write_remote_and_tag_refs(const char *git_dir, const sg_ref_adv *adv,
         } else {
             continue;
         }
-        if (write_ref_file(git_dir, ref_path, adv->refs[i].id) != 0)
+        if (sg_ref_update(git_dir, ref_path, adv->refs[i].id, NULL) != 0)
             return -1;
 
         /* This clone just received (and locally wrote) another sg repo's own
@@ -386,24 +370,16 @@ int sg_cmd_clone(int argc, char **argv)
         }
     }
 
-    {
-        char head_path[SG_PATH_MAX];
-        FILE *f;
-
-        snprintf(head_path, sizeof(head_path), "%s/HEAD", git_dir);
-        f = fopen(head_path, "wb");
-        if (f == NULL || fprintf(f, "ref: refs/heads/%s\n", default_branch) < 0 ||
-           fclose(f) != 0) {
-            fprintf(stderr, "sg: failed to write HEAD\n");
-            goto done;
-        }
+    if (sg_ref_set_head(git_dir, default_branch, NULL) != 0) {
+        fprintf(stderr, "sg: failed to write HEAD\n");
+        goto done;
     }
 
     {
         char branch_ref_path[SG_PATH_MAX];
 
         snprintf(branch_ref_path, sizeof(branch_ref_path), "refs/heads/%s", default_branch);
-        if (write_ref_file(git_dir, branch_ref_path, target_commit_id) != 0) {
+        if (sg_ref_update(git_dir, branch_ref_path, target_commit_id, NULL) != 0) {
             fprintf(stderr, "sg: failed to create local branch '%s'\n", default_branch);
             goto done;
         }

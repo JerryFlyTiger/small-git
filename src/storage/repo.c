@@ -1,6 +1,7 @@
 #include "sg/repo.h"
 
 #include "sg/chunk.h"
+#include "sg/refs.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -60,8 +61,7 @@ int sg_repo_init(const char *dir)
     if (mkdir_ignore_existing(path) != 0)
         return -1;
 
-    snprintf(path, sizeof(path), "%s/HEAD", git_dir);
-    if (write_file(path, "ref: refs/heads/master\n") != 0)
+    if (sg_ref_set_head(git_dir, "master", NULL) != 0)
         return -1;
 
     snprintf(path, sizeof(path), "%s/config", git_dir);

@@ -5,6 +5,7 @@
 #include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/pack.h"
+#include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/transport.h"
 #include "sg/workdir.h"
@@ -250,20 +251,6 @@ static int read_ref_file(const char *path, unsigned char id_out[SG_SHA1_RAW_LEN]
     return rc;
 }
 
-static int write_ref_file(const char *git_dir, const char *ref_path,
-                          const unsigned char id[SG_SHA1_RAW_LEN])
-{
-    char full_path[SG_PATH_MAX];
-    char content[SG_SHA1_HEX_LEN + 2];
-
-    snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path);
-    sg_sha1_to_hex(id, content);
-    content[SG_SHA1_HEX_LEN] = '\n';
-    content[SG_SHA1_HEX_LEN + 1] = '\0';
-    return sg_write_file_mkdirs(full_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1,
-                                0644);
-}
-
 int sg_cmd_fetch(int argc, char **argv)
 {
     const char *remote = "origin";
@@ -410,7 +397,7 @@ int sg_cmd_fetch(int argc, char **argv)
         if (had_old && memcmp(old_id, adv.refs[i].id, SG_SHA1_RAW_LEN) == 0)
             continue; /* unchanged */
 
-        if (write_ref_file(git_dir, ref_path, adv.refs[i].id) != 0) {
+        if (sg_ref_update(git_dir, ref_path, adv.refs[i].id, NULL) != 0) {
             fprintf(stderr, "sg: failed to update %s\n", ref_path);
             goto done;
         }

@@ -14,22 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int write_head(const char *git_dir, const char *branch)
-{
-    char path[4096];
-    FILE *f;
-
-    snprintf(path, sizeof(path), "%s/HEAD", git_dir);
-    f = fopen(path, "wb");
-    if (f == NULL)
-        return -1;
-    if (fprintf(f, "ref: refs/heads/%s\n", branch) < 0) {
-        fclose(f);
-        return -1;
-    }
-    return fclose(f) == 0 ? 0 : -1;
-}
-
 int sg_cmd_switch(int argc, char **argv)
 {
     int create = 0;
@@ -171,7 +155,7 @@ int sg_cmd_switch(int argc, char **argv)
         return 1;
     }
 
-    if (write_head(git_dir, branch_arg) != 0) {
+    if (sg_ref_set_head(git_dir, branch_arg, NULL) != 0) {
         fprintf(stderr, "sg: failed to update HEAD\n");
         free(git_dir);
         free(repo_root);
