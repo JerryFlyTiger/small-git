@@ -19,6 +19,29 @@ make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
 ```
 
+**前四道一次跑完:`bash tests/gates.sh`**(`--sanitize` 連第四道一起跑,
+`--rebuild` 先 clean)。它印一張摘要表,每一行都附原始 log 的路徑——追不回原始
+輸出的摘要只是一個新的說謊地點。重點不是少打字,是**每次都用同一套抽取規則讀
+結果**:即興 grep 抽錯數字就等於誤讀閘門,而那是本專案最糟的失敗模式。看摘要時
+要認得四件事(腳本註解裡有完整的 WHY):
+
+- 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
+  的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
+- `make test` 那行的 `N/34 個跑到`,N 少於 34 就是**中途中止**(Makefile 在第一
+  個失敗的二進位就停),不是「其他都過了」。
+- 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
+- interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
+  內的 `K skipped` 只要大於 0 就標 `warn`——interop.sh 有 63 個 `skip` 呼叫,
+  少一個 `python3` 或 `git` 就整組 smart-HTTP 互通跳過而它自己照樣退出 0。
+  **`M` 自己也要看**:實測關掉 `HTTP_AVAILABLE` 後 `K` 只有 32,`M` 卻從 998 掉
+  到 886——`skip()` 只加 `SKIP` 不加 `TOTAL`,沒被 `skip()` 明講的那 80 項連數字
+  都不留。只看 `N == M` 會把「少跑了一百多項」讀成滿分。
+
+`warn` 一律不影響退出碼(沒有 `-Werror`,讓 warning 直接判失敗會比下面的完成標準
+更嚴),但四道閘門的 warning 都會數進摘要——包含 `tests/*.c` 自己的,它們是一步
+編譯+連結,不會出現在 `make` 那道的 log 裡。第一點那條「沒量到 ≠ 量到 0」的但書
+同樣套用在 `make test`:沒重編任何測試二進位時它會明說,不會給你一個空的 0。
+
 `tests/test_fuzz_pack.c` 與 `tests/test_fuzz_index.c` 是二進位解析器的 fuzzer,
 已含在 `make test` 裡(預設輪數只要幾秒)。`SG_FUZZ_ITERS` 調輪數、
 `SG_FUZZ_SEED_BASE` 位移種子(第 i 輪用種子 base+i,失敗訊息會印出來,照著跑
