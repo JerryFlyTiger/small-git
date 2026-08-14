@@ -28,6 +28,32 @@ static const char *env_or(const char *name, const char *fallback)
     return (v != NULL && v[0] != '\0') ? v : fallback;
 }
 
+/* One string, two callers (the fast-forward shortcut and the ordinary
+   replay). It was two literals until a directed mutation edited only the
+   first one and left half the paths passing -- the duplication made the
+   verification lie, not the code. */
+static const char REBASE_START_FMT[] = "rebase (start): checkout %s";
+
+/* "<prefix><subject>", where subject is a commit message's first line taken
+   verbatim. Real git's rebase reflog names the commit being replayed this
+   way ("rebase (pick): T1" -- measured, 2.55.0). Heap, not a fixed buffer:
+   a subject long enough to truncate would silently produce a DIFFERENT
+   reflog message than git's. Returns NULL only on allocation failure. */
+static char *reflog_msg_with_subject(const char *prefix, const char *message)
+{
+    size_t subject_len = strcspn(message, "\n");
+    int need = snprintf(NULL, 0, "%s%.*s", prefix, (int)subject_len, message);
+    char *out;
+
+    if (need < 0)
+        return NULL;
+    out = malloc((size_t)need + 1);
+    if (out == NULL)
+        return NULL;
+    snprintf(out, (size_t)need + 1, "%s%.*s", prefix, (int)subject_len, message);
+    return out;
+}
+
 static void short_hex(const unsigned char id[SG_SHA1_RAW_LEN], char out[8])
 {
     char hex[SG_SHA1_HEX_LEN + 1];
@@ -76,19 +102,22 @@ static void print_conflict_message(const unsigned char commit_id[SG_SHA1_RAW_LEN
 /* ==================== single-commit cherry-pick ==================== */
 
 typedef enum {
-    PICK_OK,      /* committed a new commit, branch ref advanced */
+    PICK_OK,      /* committed a new commit, detached HEAD advanced onto it */
     PICK_EMPTY,   /* change already present upstream, silently advanced (nothing written) */
     PICK_CONFLICT, /* paused: workdir/index left with conflict markers/stages */
     PICK_ERROR    /* I/O error, nothing changed for this step */
 } pick_rc;
 
-/* Cherry-picks commit_id onto whatever refs/heads/<current_branch> (== HEAD)
-   currently points to. This is exactly `sg merge`'s three-way merge, reused
-   with base = commit_id's own parent tree, ours = the branch tip we're
-   rebuilding, theirs = commit_id's tree -- the definition of "replay the
-   change commit_id introduced on top of what's already here". */
+/* Cherry-picks commit_id onto wherever the (detached) HEAD currently points.
+   This is exactly `sg merge`'s three-way merge, reused with base =
+   commit_id's own parent tree, ours = the tip we're rebuilding, theirs =
+   commit_id's tree -- the definition of "replay the change commit_id
+   introduced on top of what's already here".
+
+   No branch is involved: the whole replay happens on a detached HEAD and the
+   branch is moved once, by finish_rebase. That is why this needs no branch
+   name, and why an interrupted rebase leaves the branch untouched. */
 static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
-                               const char *current_branch,
                                const unsigned char commit_id[SG_SHA1_RAW_LEN])
 {
     unsigned char new_head[SG_SHA1_RAW_LEN];
@@ -250,10 +279,26 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
             }
             free(serialized);
 
-            if (sg_ref_update_branch(git_dir, current_branch, new_commit_id) != 0) {
-                fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
-                rc = PICK_ERROR;
-                goto done;
+            {
+                /* HEAD moves, the branch does not: it stays where it was
+                   until the whole rebase finishes. That is what lets the
+                   branch's own reflog end up with a single "rebase (finish)"
+                   line instead of one line per replayed commit. */
+                char *msg = reflog_msg_with_subject("rebase (pick): ", commit.message);
+                int urc;
+
+                if (msg == NULL) {
+                    fprintf(stderr, "sg: out of memory\n");
+                    rc = PICK_ERROR;
+                    goto done;
+                }
+                urc = sg_ref_set_head_detached(git_dir, new_commit_id, msg);
+                free(msg);
+                if (urc != 0) {
+                    fprintf(stderr, "sg: failed to update HEAD\n");
+                    rc = PICK_ERROR;
+                    goto done;
+                }
             }
             rc = PICK_OK;
         }
@@ -267,6 +312,55 @@ done:
     sg_commit_free(&commit);
     sg_index_free(&new_idx);
     return rc;
+}
+
+/* Re-attaches HEAD to `branch` at wherever the detached replay ended up, and
+   writes the two reflog lines real git ends a rebase with.
+
+   The ORDER is load-bearing, and the two asymmetric rules in sg_ref_update
+   then produce git's exact shape without any special-casing:
+
+     1. The branch is updated while HEAD is still detached, so
+        is_current_branch is false and rule 2 does NOT mirror the line into
+        logs/HEAD -- the branch gets its single "rebase (finish): <ref> onto
+        <onto>" line and nothing else.
+     2. HEAD is then re-attached with its own message. old == new here (both
+        are the final tip), and logs/HEAD is never no-op-suppressed, so the
+        "returning to" line is written anyway.
+
+   Doing these the other way round would mirror the branch update into
+   logs/HEAD with the wrong message and drop the returning-to line.
+   The message names the ONTO commit in full 40-hex, not the new tip
+   (measured, 2.55.0). */
+static int finish_rebase(const char *git_dir, const char *branch, const sg_rebase_state *state)
+{
+    unsigned char tip[SG_SHA1_RAW_LEN];
+    char ref_path[4096];
+    char onto_hex[SG_SHA1_HEX_LEN + 1];
+    char branch_msg[4096 + 128];
+    char head_msg[4096 + 64];
+
+    if (sg_ref_resolve_head(git_dir, tip) != 0) {
+        fprintf(stderr, "sg: 無法讀取重放後的 HEAD\n");
+        return -1;
+    }
+    if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch) >= (int)sizeof(ref_path)) {
+        fprintf(stderr, "sg: 分支名稱太長\n");
+        return -1;
+    }
+    sg_sha1_to_hex(state->onto, onto_hex);
+    snprintf(branch_msg, sizeof(branch_msg), "rebase (finish): %s onto %s", ref_path, onto_hex);
+    snprintf(head_msg, sizeof(head_msg), "rebase (finish): returning to %s", ref_path);
+
+    if (sg_ref_update(git_dir, ref_path, tip, branch_msg) != 0) {
+        fprintf(stderr, "sg: failed to update branch '%s'\n", branch);
+        return -1;
+    }
+    if (sg_ref_set_head(git_dir, branch, head_msg) != 0) {
+        fprintf(stderr, "sg: 分支已更新，但無法讓 HEAD 重新指回 '%s'\n", branch);
+        return -1;
+    }
+    return 0;
 }
 
 /* ==================== todo loop shared by start/continue/skip ==================== */
@@ -285,7 +379,7 @@ static int run_rebase_todo(const char *git_dir, const char *repo_root, const cha
 
         memcpy(commit_id, state->todo[0], SG_SHA1_RAW_LEN);
 
-        rc = rebase_pick_one(git_dir, repo_root, current_branch, commit_id);
+        rc = rebase_pick_one(git_dir, repo_root, commit_id);
 
         if (rc == PICK_ERROR) {
             fprintf(stderr, "sg: rebase 過程中發生錯誤\n");
@@ -309,6 +403,13 @@ static int run_rebase_todo(const char *git_dir, const char *repo_root, const cha
         if (sg_rebase_state_write(git_dir, state) != 0)
             fprintf(stderr, "sg: warning: 無法寫入 rebase 狀態\n");
     }
+
+    /* Re-attach before clearing the sequencer state: if this fails the
+       rebase is still "in progress" as far as every other command is
+       concerned, which is the accurate description of a repository whose
+       HEAD is detached mid-replay, and --abort can still get out of it. */
+    if (finish_rebase(git_dir, current_branch, state) != 0)
+        return -1;
 
     /* The commits are all replayed at this point, but a leftover
        .git/sg-rebase/ still reads as "a rebase is in progress" to every
@@ -441,10 +542,30 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             free(current_branch);
             return 1;
         }
-        if (sg_ref_update_branch(git_dir, current_branch, upstream_commit) != 0) {
-            fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
-            free(current_branch);
-            return 1;
+        {
+            /* Even a pure fast-forward goes out through a detached HEAD in
+               real git: logs/HEAD gets "(start)" and "(finish)" with NO pick
+               lines in between, and the branch gets its one finish line
+               (measured). Reusing the same detach/re-attach sequence is what
+               makes that fall out, rather than a second, special shape. */
+            sg_rebase_state ff_state;
+            char start_msg[512];
+            int frc;
+
+            memset(&ff_state, 0, sizeof(ff_state));
+            memcpy(ff_state.onto, upstream_commit, SG_SHA1_RAW_LEN);
+
+            snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg);
+            if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
+                fprintf(stderr, "sg: 無法讓 HEAD 指向 '%s'\n", upstream_arg);
+                free(current_branch);
+                return 1;
+            }
+            frc = finish_rebase(git_dir, current_branch, &ff_state);
+            if (frc != 0) {
+                free(current_branch);
+                return 1;
+            }
         }
 
         printf("Fast-forwarded %s to %s.\n", current_branch, upstream_arg);
@@ -523,10 +644,19 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             return 1;
         }
     }
-    if (sg_ref_update_branch(git_dir, state.orig_branch, upstream_commit) != 0) {
-        fprintf(stderr, "sg: failed to update branch '%s'\n", state.orig_branch);
-        sg_rebase_state_free(&state);
-        return 1;
+    {
+        /* Detach at the onto commit instead of dragging the branch there.
+           The branch stays put for the whole replay and moves once, at
+           finish_rebase. "checkout <upstream_arg>" uses the token the user
+           typed, the same way a plain checkout's reflog does. */
+        char start_msg[512];
+
+        snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg);
+        if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
+            fprintf(stderr, "sg: 無法讓 HEAD 指向 '%s'\n", upstream_arg);
+            sg_rebase_state_free(&state);
+            return 1;
+        }
     }
 
     rc = run_rebase_todo(git_dir, repo_root, state.orig_branch, upstream_arg, &state);
@@ -690,11 +820,27 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
         }
         free(serialized);
 
-        if (sg_ref_update_branch(git_dir, state.orig_branch, new_commit_id) != 0) {
-            fprintf(stderr, "sg: failed to update branch '%s'\n", state.orig_branch);
-            sg_commit_free(&orig_commit);
-            sg_rebase_state_free(&state);
-            return 1;
+        {
+            /* A pick finished by hand is logged as "(continue)", not
+               "(pick)" -- measured, and it stays "(continue)" even if the
+               very next pick conflicts again. */
+            char *msg = reflog_msg_with_subject("rebase (continue): ", orig_commit.message);
+            int urc;
+
+            if (msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
+                sg_commit_free(&orig_commit);
+                sg_rebase_state_free(&state);
+                return 1;
+            }
+            urc = sg_ref_set_head_detached(git_dir, new_commit_id, msg);
+            free(msg);
+            if (urc != 0) {
+                fprintf(stderr, "sg: failed to update HEAD\n");
+                sg_commit_free(&orig_commit);
+                sg_rebase_state_free(&state);
+                return 1;
+            }
         }
     }
 
@@ -818,10 +964,21 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
         sg_rebase_state_free(&state);
         return 1;
     }
-    if (sg_ref_update_branch(git_dir, state.orig_branch, state.orig_head) != 0) {
-        fprintf(stderr, "sg: failed to update branch '%s'\n", state.orig_branch);
-        sg_rebase_state_free(&state);
-        return 1;
+    {
+        /* The branch was never moved -- the whole replay happened on a
+           detached HEAD -- so aborting only has to re-attach. Real git
+           writes nothing to the branch's own log here either, and for the
+           same reason: the value is unchanged, and rule 1 suppresses a
+           no-op. Writing it anyway would add a line git does not have. */
+        char abort_msg[4096 + 64];
+
+        snprintf(abort_msg, sizeof(abort_msg), "rebase (abort): returning to refs/heads/%s",
+                state.orig_branch);
+        if (sg_ref_set_head(git_dir, state.orig_branch, abort_msg) != 0) {
+            fprintf(stderr, "sg: 無法讓 HEAD 重新指回 '%s'\n", state.orig_branch);
+            sg_rebase_state_free(&state);
+            return 1;
+        }
     }
     if (sg_rebase_state_remove(git_dir) != 0) {
         fprintf(stderr,

@@ -3883,15 +3883,26 @@ P12R_DETACHED="$P12R_SG_BASE/detached"
 p12r_base "$P12R_DETACHED" "$SG"
 DETACH_TARGET=$(cd "$P12R_DETACHED" && git rev-parse HEAD~1)
 (cd "$P12R_DETACHED" && git checkout -q --detach "$DETACH_TARGET")
-# Deliberately target "v1" (a real, resolvable ref) rather than "HEAD".
-# Originally that was because HEAD did not resolve at all on a detached
-# checkout, which would have made this case pass even with the dedicated
-# rejection in sg_cmd_reset deleted. Phase 18 made a detached HEAD resolve,
-# so that particular way of passing for the wrong reason is gone -- but "v1"
-# is kept anyway, since a target whose own resolution cannot fail is what
-# makes a non-zero exit here attributable to the rejection and nothing else.
+# This case asserted the opposite until Phase 18: reset REFUSED a detached
+# HEAD. That refusal became untenable once rebase started replaying on a
+# detached HEAD -- it would have taken away resetting during a paused rebase,
+# which phase14 established and measured against real git. git allows it for
+# exactly the same reason, its own rebase being detached too.
+#
+# The interesting part is where the write lands: HEAD moves and no branch
+# does. Asserting the exit status alone would not show that.
+P12R_DETACHED_BRANCH_BEFORE=$(cat "$P12R_DETACHED/.git/refs/heads/master")
 (cd "$P12R_DETACHED" && "$SG" reset --mixed v1) > /dev/null 2>&1
-check "phase12 reset reject: sg reset on a detached HEAD exits non-zero" test $? = 1
+check "phase12 reset: sg reset on a detached HEAD succeeds" test $? = 0
+P12R_DETACHED_NOW=$(cd "$P12R_DETACHED" && git rev-parse HEAD)
+P12R_DETACHED_WANT=$(cd "$P12R_DETACHED" && git rev-parse v1)
+check "phase12 reset: ...moving HEAD itself to the target" \
+    test "$P12R_DETACHED_NOW" = "$P12R_DETACHED_WANT"
+check "phase12 reset: ...and leaving master where it was" \
+    test "$(cat "$P12R_DETACHED/.git/refs/heads/master")" = "$P12R_DETACHED_BRANCH_BEFORE"
+P12R_DETACHED_HEADFILE=$(cat "$P12R_DETACHED/.git/HEAD")
+check "phase12 reset: ...with HEAD still detached, not re-attached to a branch" \
+    test "${P12R_DETACHED_HEADFILE#ref: }" = "$P12R_DETACHED_HEADFILE"
 
 P12R_PATHSPEC="$P12R_SG_BASE/pathspec"
 p12r_base "$P12R_PATHSPEC" "$SG"
@@ -6353,17 +6364,27 @@ check "phase18d: sg stash pop works on a detached HEAD" test $? = 0
 #
 # Each is checked for a detached-SPECIFIC message, not merely a non-zero
 # exit: these commands exit 1 for plenty of other reasons, so exit status
-# alone would keep passing if the dedicated check were deleted.
+# alone would keep passing if the dedicated check were deleted. That is not
+# hypothetical -- when reset stopped refusing, the merge case below started
+# reporting a dirty work tree instead, because it ran after a reset that now
+# succeeded and changed the fixture. Both refusals are therefore read BEFORE
+# anything else touches this repo, and neither of them writes.
 (cd "$P18D" && git checkout -q -- . ) > /dev/null 2>&1
-P18D_RESET_ERR=$(cd "$P18D" && "$SG" reset --mixed p18d-side 2>&1 >/dev/null | head -1)
-check "phase18d: sg reset on a detached HEAD refuses, naming the reason (got '$P18D_RESET_ERR')" \
-    test "${P18D_RESET_ERR#sg: 目前是 detached HEAD}" != "$P18D_RESET_ERR"
-P18D_REBASE_ERR=$(cd "$P18D" && "$SG" rebase p18d-side 2>&1 >/dev/null | head -1)
-check "phase18d: sg rebase on a detached HEAD refuses, naming the reason (got '$P18D_REBASE_ERR')" \
-    test "${P18D_REBASE_ERR#sg: 目前是 detached HEAD}" != "$P18D_REBASE_ERR"
 P18D_MERGE_ERR=$(cd "$P18D" && "$SG" merge p18d-side 2>&1 >/dev/null | head -1)
 check "phase18d: sg merge on a detached HEAD refuses, naming the reason (got '$P18D_MERGE_ERR')" \
     test "${P18D_MERGE_ERR#sg: 目前是 detached HEAD}" != "$P18D_MERGE_ERR"
+P18D_REBASE_ERR=$(cd "$P18D" && "$SG" rebase p18d-side 2>&1 >/dev/null | head -1)
+check "phase18d: sg rebase on a detached HEAD refuses, naming the reason (got '$P18D_REBASE_ERR')" \
+    test "${P18D_REBASE_ERR#sg: 目前是 detached HEAD}" != "$P18D_REBASE_ERR"
+
+# reset is NOT in that list any more: it now resets a detached HEAD, moving
+# HEAD and no branch (asserted in phase12, and required so that resetting
+# during a paused rebase keeps working now that a paused rebase is detached).
+P18D_MASTER_BEFORE=$(cat "$P18D/.git/refs/heads/master")
+(cd "$P18D" && "$SG" reset --hard p18d-side) > /dev/null 2>&1
+check "phase18d: sg reset --hard on a detached HEAD succeeds" test $? = 0
+check "phase18d: ...and still did not move master" \
+    test "$(cat "$P18D/.git/refs/heads/master")" = "$P18D_MASTER_BEFORE"
 
 # ============================================================
 # Phase 18e: the switch/status output a cold read caught, which nothing here
@@ -6450,6 +6471,9 @@ printf 'neither a ref nor a sha\n' > "$P18E_C/.git/HEAD"
 # command exits at "remote not configured" and never reaches it -- a check
 # here would pass without executing the line it claims to cover. Reaching it
 # needs a live remote; recorded as uncovered rather than faked.
+#
+# reset no longer refuses a detached HEAD at all (see phase12), so only its
+# corrupt-HEAD branch is left to check -- which is the one this is about.
 for p18e_cmd in reset rebase; do
     case "$p18e_cmd" in
         reset)  P18E_ERR=$(cd "$P18E_C" && "$SG" reset --mixed p18e-other 2>&1 >/dev/null | head -1) ;;
@@ -6457,7 +6481,180 @@ for p18e_cmd in reset rebase; do
     esac
     check "phase18e: sg $p18e_cmd does not blame a detached HEAD for a corrupt one (got '$P18E_ERR')" \
         test "${P18E_ERR#sg: 目前是 detached HEAD}" = "$P18E_ERR"
+    check "phase18e: sg $p18e_cmd names the corrupt HEAD instead (got '$P18E_ERR')" \
+        test "${P18E_ERR#sg: 無法讀取 HEAD}" != "$P18E_ERR"
 done
+
+# ============================================================
+# Phase 18f: rebase's reflog shape
+#
+# Dual-track against real git, the Phase 17 batch B idiom: the identical
+# sequence runs in a from-scratch sg repo and a from-scratch git repo, and
+# the reflog MESSAGE column is compared. Object ids are normalized to <oid>
+# because the two repos cannot share hashes.
+#
+# The shape is a consequence of the model, not of the strings: git rebases on
+# a DETACHED HEAD and moves the branch exactly once, at the end. So logs/HEAD
+# collects "rebase (start)", one line per replayed commit, and "rebase
+# (finish): returning to ...", while the branch's own log gains a single
+# "rebase (finish): <ref> onto <onto>" line no matter how many commits were
+# replayed. sg wrote NO rebase reflog at all before this phase, because it
+# moved the branch itself once per pick and could not have produced that
+# shape by adding message strings.
+#
+# The three structural facts underneath are asserted separately below, since
+# the message comparison alone would still pass if sg reached the same
+# strings by a different route.
+# ============================================================
+
+p18f_msgs() {
+    sed 's/.*	//' "$1" 2>/dev/null | sed 's/[0-9a-f]\{40\}/<oid>/g'
+}
+
+# base -> (topic: T1, T2) with master gaining M1 on a DIFFERENT file, so
+# nothing collapses into an identical commit object. Two commits that share a
+# tree, parent, message and second would be one object, making master an
+# ancestor of topic and turning the rebase into a silent no-op.
+p18f_setup() {
+    p18f_dir="$1"
+    p18f_bin="$2"
+    p18f_conflict="$3"
+    if [ "$p18f_bin" = git ]; then
+        mkdir -p "$p18f_dir" && (cd "$p18f_dir" && git init -q -b master .) > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && "$SG" init "$(basename "$p18f_dir")") > /dev/null 2>&1
+    fi
+    printf 'base\n' > "$p18f_dir/base.txt"
+    (cd "$p18f_dir" && "$p18f_bin" add . && "$p18f_bin" commit -m base) > /dev/null 2>&1
+    (cd "$p18f_dir" && "$p18f_bin" branch topic && "$p18f_bin" switch topic) > /dev/null 2>&1
+    printf 'topic one\n' > "$p18f_dir/shared.txt"
+    (cd "$p18f_dir" && "$p18f_bin" add . && "$p18f_bin" commit -m T1) > /dev/null 2>&1
+    printf 'topic two\n' > "$p18f_dir/t2.txt"
+    (cd "$p18f_dir" && "$p18f_bin" add . && "$p18f_bin" commit -m T2) > /dev/null 2>&1
+    (cd "$p18f_dir" && "$p18f_bin" switch master) > /dev/null 2>&1
+    if [ "$p18f_conflict" = conflict ]; then
+        printf 'master version\n' > "$p18f_dir/shared.txt"   # collides with T1
+    else
+        printf 'master only\n' > "$p18f_dir/m1.txt"
+    fi
+    (cd "$p18f_dir" && "$p18f_bin" add . && "$p18f_bin" commit -m M1) > /dev/null 2>&1
+    (cd "$p18f_dir" && "$p18f_bin" switch topic) > /dev/null 2>&1
+}
+
+p18f_compare() {
+    p18f_label="$1"
+    p18f_s="$2"
+    p18f_g="$3"
+    p18f_msgs "$p18f_s/.git/logs/HEAD" > "$WORKDIR/p18f_s_head.txt"
+    p18f_msgs "$p18f_g/.git/logs/HEAD" > "$WORKDIR/p18f_g_head.txt"
+    p18f_msgs "$p18f_s/.git/logs/refs/heads/topic" > "$WORKDIR/p18f_s_br.txt"
+    p18f_msgs "$p18f_g/.git/logs/refs/heads/topic" > "$WORKDIR/p18f_g_br.txt"
+    p18f_n=$(wc -l < "$WORKDIR/p18f_s_head.txt" | tr -d ' ')
+    check "phase18f ($p18f_label): precondition -- sg's logs/HEAD is non-empty ($p18f_n lines)" \
+        test "$p18f_n" -gt 0
+    check "phase18f ($p18f_label): logs/HEAD messages match git's" \
+        cmp -s "$WORKDIR/p18f_s_head.txt" "$WORKDIR/p18f_g_head.txt"
+    check "phase18f ($p18f_label): topic's own reflog messages match git's" \
+        cmp -s "$WORKDIR/p18f_s_br.txt" "$WORKDIR/p18f_g_br.txt"
+}
+
+# --- a plain two-commit rebase ---
+p18f_setup "$WORKDIR/p18f_plain_sg" "$SG" clean
+p18f_setup "$WORKDIR/p18f_plain_git" git clean
+P18F_BR_BEFORE=$(wc -l < "$WORKDIR/p18f_plain_sg/.git/logs/refs/heads/topic" | tr -d ' ')
+(cd "$WORKDIR/p18f_plain_sg" && "$SG" rebase master) > /dev/null 2>&1
+(cd "$WORKDIR/p18f_plain_git" && git rebase master) > /dev/null 2>&1
+p18f_compare "plain" "$WORKDIR/p18f_plain_sg" "$WORKDIR/p18f_plain_git"
+
+# The structural claim: two commits replayed, ONE line added to the branch.
+P18F_BR_AFTER=$(wc -l < "$WORKDIR/p18f_plain_sg/.git/logs/refs/heads/topic" | tr -d ' ')
+check "phase18f: replaying 2 commits adds exactly 1 line to the branch's reflog ($P18F_BR_BEFORE -> $P18F_BR_AFTER)" \
+    test "$P18F_BR_AFTER" = "$((P18F_BR_BEFORE + 1))"
+# The finish line re-attaches HEAD without moving it, so old == new. This is
+# the one reflog line that only exists because logs/HEAD is never
+# no-op-suppressed; a branch log would have dropped it.
+P18F_LAST=$(tail -1 "$WORKDIR/p18f_plain_sg/.git/logs/HEAD")
+P18F_OLD=$(printf '%s' "$P18F_LAST" | cut -d' ' -f1)
+P18F_NEW=$(printf '%s' "$P18F_LAST" | cut -d' ' -f2)
+check "phase18f: the finish line in logs/HEAD has old == new" test "$P18F_OLD" = "$P18F_NEW"
+check "phase18f: HEAD is re-attached to the branch when the rebase finishes" \
+    test "$(cat "$WORKDIR/p18f_plain_sg/.git/HEAD")" = "ref: refs/heads/topic"
+
+# --- paused on a conflict: the model itself, before any message is written ---
+p18f_setup "$WORKDIR/p18f_pause_sg" "$SG" conflict
+P18F_PAUSE_TIP_BEFORE=$(cat "$WORKDIR/p18f_pause_sg/.git/refs/heads/topic")
+(cd "$WORKDIR/p18f_pause_sg" && "$SG" rebase master) > /dev/null 2>&1
+P18F_PAUSE_HEAD=$(cat "$WORKDIR/p18f_pause_sg/.git/HEAD")
+check "phase18f: HEAD is detached while a rebase is paused on a conflict" \
+    test "${P18F_PAUSE_HEAD#ref: }" = "$P18F_PAUSE_HEAD"
+check "phase18f: the branch has not moved while the rebase is paused" \
+    test "$(cat "$WORKDIR/p18f_pause_sg/.git/refs/heads/topic")" = "$P18F_PAUSE_TIP_BEFORE"
+P18F_PAUSE_MSGS=$(p18f_msgs "$WORKDIR/p18f_pause_sg/.git/logs/HEAD" | tail -1)
+check "phase18f: a conflicting pick writes no reflog line of its own (last is '$P18F_PAUSE_MSGS')" \
+    test "$P18F_PAUSE_MSGS" = "rebase (start): checkout master"
+
+# --- conflict then --continue: logged as (continue), not (pick) ---
+p18f_setup "$WORKDIR/p18f_cont_git" git conflict
+(cd "$WORKDIR/p18f_cont_git" && git rebase master) > /dev/null 2>&1
+printf 'resolved\n' > "$WORKDIR/p18f_cont_git/shared.txt"
+(cd "$WORKDIR/p18f_cont_git" && git add . && git rebase --continue) > /dev/null 2>&1
+printf 'resolved\n' > "$WORKDIR/p18f_pause_sg/shared.txt"
+(cd "$WORKDIR/p18f_pause_sg" && "$SG" add . && "$SG" rebase --continue) > /dev/null 2>&1
+p18f_compare "continue" "$WORKDIR/p18f_pause_sg" "$WORKDIR/p18f_cont_git"
+
+# --- --skip: the skipped commit leaves no trace at all ---
+p18f_setup "$WORKDIR/p18f_skip_sg" "$SG" conflict
+p18f_setup "$WORKDIR/p18f_skip_git" git conflict
+(cd "$WORKDIR/p18f_skip_sg" && "$SG" rebase master && "$SG" rebase --skip) > /dev/null 2>&1
+(cd "$WORKDIR/p18f_skip_sg" && "$SG" rebase --skip) > /dev/null 2>&1
+(cd "$WORKDIR/p18f_skip_git" && git rebase master) > /dev/null 2>&1
+(cd "$WORKDIR/p18f_skip_git" && git rebase --skip) > /dev/null 2>&1
+p18f_compare "skip" "$WORKDIR/p18f_skip_sg" "$WORKDIR/p18f_skip_git"
+
+# --- --abort: one line in logs/HEAD, nothing in the branch's ---
+p18f_setup "$WORKDIR/p18f_abort_sg" "$SG" conflict
+p18f_setup "$WORKDIR/p18f_abort_git" git conflict
+P18F_ABORT_BR_BEFORE=$(wc -l < "$WORKDIR/p18f_abort_sg/.git/logs/refs/heads/topic" | tr -d ' ')
+(cd "$WORKDIR/p18f_abort_sg" && "$SG" rebase master) > /dev/null 2>&1
+(cd "$WORKDIR/p18f_abort_sg" && "$SG" rebase --abort) > /dev/null 2>&1
+(cd "$WORKDIR/p18f_abort_git" && git rebase master) > /dev/null 2>&1
+(cd "$WORKDIR/p18f_abort_git" && git rebase --abort) > /dev/null 2>&1
+p18f_compare "abort" "$WORKDIR/p18f_abort_sg" "$WORKDIR/p18f_abort_git"
+# Over-determined on purpose, and worth saying so: abort restores the branch
+# to the value it already has, so rule 1's no-op suppression would drop the
+# line even if abort DID write one. No mutation of abort's own code makes
+# this red (measured -- one was tried). It is a regression guard on the
+# resulting shape, not evidence that abort chooses not to write.
+check "phase18f: --abort adds nothing to the branch's own reflog" \
+    test "$(wc -l < "$WORKDIR/p18f_abort_sg/.git/logs/refs/heads/topic" | tr -d ' ')" = "$P18F_ABORT_BR_BEFORE"
+
+# --- fast-forward: start and finish, and NO pick lines in between ---
+P18F_FF_SG="$WORKDIR/p18f_ff_sg"
+P18F_FF_GIT="$WORKDIR/p18f_ff_git"
+(cd "$WORKDIR" && "$SG" init p18f_ff_sg) > /dev/null 2>&1
+mkdir -p "$P18F_FF_GIT" && (cd "$P18F_FF_GIT" && git init -q -b master .) > /dev/null 2>&1
+for p18f_pair in "$P18F_FF_SG:$SG" "$P18F_FF_GIT:git"; do
+    p18f_d=${p18f_pair%%:*}
+    p18f_b=${p18f_pair#*:}
+    printf 'base\n' > "$p18f_d/base.txt"
+    (cd "$p18f_d" && "$p18f_b" add . && "$p18f_b" commit -m base) > /dev/null 2>&1
+    (cd "$p18f_d" && "$p18f_b" branch topic) > /dev/null 2>&1
+    printf 'ahead\n' > "$p18f_d/ahead.txt"
+    (cd "$p18f_d" && "$p18f_b" add . && "$p18f_b" commit -m M1) > /dev/null 2>&1
+    (cd "$p18f_d" && "$p18f_b" switch topic && "$p18f_b" rebase master) > /dev/null 2>&1
+done
+p18f_compare "fast-forward" "$P18F_FF_SG" "$P18F_FF_GIT"
+P18F_FF_PICKS=$(p18f_msgs "$P18F_FF_SG/.git/logs/HEAD" | grep -c 'rebase (pick)' || true)
+check "phase18f: a fast-forward writes no pick lines (found $P18F_FF_PICKS)" test "$P18F_FF_PICKS" = 0
+
+# --- already up to date: not one line, in either log ---
+P18F_UTD_HEAD=$(wc -l < "$P18F_FF_SG/.git/logs/HEAD" | tr -d ' ')
+P18F_UTD_BR=$(wc -l < "$P18F_FF_SG/.git/logs/refs/heads/topic" | tr -d ' ')
+(cd "$P18F_FF_SG" && "$SG" rebase master) > /dev/null 2>&1
+check "phase18f: an up-to-date rebase writes nothing to logs/HEAD" \
+    test "$(wc -l < "$P18F_FF_SG/.git/logs/HEAD" | tr -d ' ')" = "$P18F_UTD_HEAD"
+check "phase18f: ...and nothing to the branch's reflog either" \
+    test "$(wc -l < "$P18F_FF_SG/.git/logs/refs/heads/topic" | tr -d ' ')" = "$P18F_UTD_BR"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
