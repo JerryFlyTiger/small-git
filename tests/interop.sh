@@ -123,6 +123,14 @@ check "git status does not complain about an invalid repository" sh -c "! grep -
 export GIT_AUTHOR_NAME="Interop Test"
 export GIT_AUTHOR_EMAIL="interop@example.com"
 
+# Some git commands want an editor and fail without one -- `git rebase
+# --continue` is the one this suite hits. Whether that succeeds must not
+# depend on the developer's shell: this was found the hard way, by a phase18f
+# case that passed locally on a machine that happened to export
+# GIT_EDITOR=true and failed on every CI runner. `true` accepts whatever
+# message git prepared, which is what a non-interactive oracle wants.
+export GIT_EDITOR=true
+
 # --- Phase 2 case 1: sg init/add/commit, real git reads it back ---
 P2_REPO="$WORKDIR/phase2_sg_repo"
 mkdir -p "$P2_REPO/sub"
