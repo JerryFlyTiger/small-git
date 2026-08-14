@@ -50,6 +50,26 @@ char *sg_ref_current_branch(const char *git_dir);
    valid-looking state instead of surfacing it. */
 int sg_ref_head_is_detached(const char *git_dir);
 
+/* Fills buf with real git's one-line description of a detached HEAD:
+   "HEAD detached at <label>" while HEAD still sits on the commit it was
+   detached at, "HEAD detached from <label>" once it has moved on. <label> is
+   the detach POINT, never HEAD's current position.
+
+   The detach point is recovered the way git does it -- the newest
+   "checkout: moving from <x> to <y>" line in logs/HEAD -- so <label> is the
+   token the user originally named, kept only while it still resolves to that
+   same commit (a tag since moved, or an expression like "HEAD~1" that was
+   never a ref, fall back to the abbreviated object id). refs/tags/ and
+   refs/remotes/ are stripped from it; refs/heads/ deliberately is not.
+
+   Returns -1 when logs/HEAD records no checkout at all (or on truncation),
+   which is NOT an error: it means git's own fallback wording applies, and
+   the two callers differ there -- `status` says "Not currently on any
+   branch." and `branch` says "(no branch)" -- so the caller supplies it.
+   Says nothing about whether HEAD is detached; ask sg_ref_head_is_detached
+   first. */
+int sg_ref_detach_description(const char *git_dir, char *buf, size_t buf_size);
+
 int sg_ref_update_branch(const char *git_dir, const char *branch,
                          const unsigned char id[SG_SHA1_RAW_LEN]);
 

@@ -6026,6 +6026,105 @@ else
     skip "phase17d: sg push reflog message is the fixed 'update by push'"
 fi
 
+# ============================================================
+# Phase 18a: a detached HEAD is a state sg understands, not a broken repo
+#
+# Real git is both the tool that CREATES the state (sg could not enter it
+# before this phase) and the oracle for how it is described. Everything below
+# runs inside ONE sg-made repository and compares sg's own output against
+# git's in that same repository, so there is no "different repo, different
+# hashes" slack to hide behind -- the strings have to match exactly.
+#
+# git's wording is recovered from the reflog, not from HEAD: it reports the
+# commit HEAD was DETACHED AT (the newest "checkout: moving from <x> to <y>"
+# line), labelled with the token the user originally typed, and switches
+# "at" -> "from" once HEAD moves off that commit. Three of the cases below
+# are counter-intuitive enough to be worth pinning: a branch name prints as
+# the FULL refs/heads/... path (only refs/tags/ and refs/remotes/ are
+# stripped), a token that no longer resolves to that commit degrades to an
+# abbreviated id, and with no checkout line in logs/HEAD at all git abandons
+# the detached wording entirely.
+#
+# LC_ALL=C on every git call: this comparison is one of the few that reads
+# git's human-facing output, which is translated, while sg's is not.
+# ============================================================
+
+P18_DISP="$WORKDIR/p18_disp"
+(cd "$WORKDIR" && "$SG" init p18_disp) > /dev/null 2>&1
+for p18_i in 1 2 3; do
+    printf 'c%s\n' "$p18_i" > "$P18_DISP/f$p18_i.txt"
+    (cd "$P18_DISP" && "$SG" add . && "$SG" commit -m "C$p18_i") > /dev/null 2>&1
+done
+(cd "$P18_DISP" && git tag p18v1 HEAD~1 && git branch p18other HEAD~2) > /dev/null 2>&1
+
+# Compares the first line of `status` and of `branch` -- the detached
+# pseudo-entry sorts first in both tools -- against real git in the same repo.
+p18_disp_agree() {
+    p18_label="$1"
+    p18_g_status=$(cd "$P18_DISP" && LC_ALL=C git status 2>/dev/null | head -1)
+    p18_s_status=$(cd "$P18_DISP" && "$SG" status 2>/dev/null | head -1)
+    p18_g_branch=$(cd "$P18_DISP" && LC_ALL=C git branch 2>/dev/null | head -1)
+    p18_s_branch=$(cd "$P18_DISP" && "$SG" branch 2>/dev/null | head -1)
+    check "phase18a status: $p18_label -- sg says '$p18_s_status', git says '$p18_g_status'" \
+        test "$p18_s_status" = "$p18_g_status"
+    check "phase18a branch: $p18_label -- sg says '$p18_s_branch', git says '$p18_g_branch'" \
+        test "$p18_s_branch" = "$p18_g_branch"
+}
+
+(cd "$P18_DISP" && git checkout -q --detach p18v1) > /dev/null 2>&1
+p18_disp_agree "detached at a tag keeps the tag name"
+
+(cd "$P18_DISP" && git checkout -q master && git checkout -q --detach p18other) > /dev/null 2>&1
+p18_disp_agree "detached at a branch name keeps the FULL refs/heads/ path"
+
+(cd "$P18_DISP" && git checkout -q master && git checkout -q --detach HEAD~1) > /dev/null 2>&1
+p18_disp_agree "an expression like HEAD~1 was never a ref, so it degrades to an abbreviated id"
+
+# HEAD is moved with git, not sg, on purpose: this section tests the WORDING
+# only, and must not silently become a no-op if sg's own ability to commit
+# while detached regresses. (It did exactly that when first written: sg still
+# refused, no commit happened, and every case below shifted by one while
+# staying green -- which is why p18_disp_agree echoes the strings it compared
+# into the check label.) sg's own detached commit is covered in phase18b.
+printf 'more\n' > "$P18_DISP/p18x.txt"
+(cd "$P18_DISP" && git add . && git commit -qm "p18 detached commit") > /dev/null 2>&1
+p18_disp_agree "committing while detached switches 'at' to 'from', still naming the detach POINT"
+
+(cd "$P18_DISP" && git reset -q --hard HEAD~1) > /dev/null 2>&1
+p18_disp_agree "returning to the detach point switches back to 'at' (a value test, not 'has anything happened')"
+
+# The `git checkout -q master` first is load-bearing, not tidiness: the
+# previous case leaves HEAD detached at exactly the commit p18v1 names, and
+# git writes no reflog line for a checkout that moves nowhere. Without the
+# detour the newest checkout entry stays the one from the HEAD~1 case, and
+# this case degrades to an abbreviated id because "HEAD~1" was never a ref --
+# the right answer for entirely the wrong reason, passing even with the
+# "does this token still name that commit" test deleted (measured).
+(cd "$P18_DISP" && git checkout -q master && git checkout -q --detach p18v1 && \
+    git tag -f p18v1 master) > /dev/null 2>&1
+p18_disp_agree "a tag moved away no longer names that commit, so the label degrades to an abbreviated id"
+
+(cd "$P18_DISP" && git checkout -q --detach master && rm -f .git/logs/HEAD) > /dev/null 2>&1
+p18_disp_agree "with no checkout line in logs/HEAD, git drops the detached wording entirely"
+
+(cd "$P18_DISP" && git checkout -q master) > /dev/null 2>&1
+p18_disp_agree "back on a branch, both tools go back to the ordinary wording"
+
+# A HEAD that is neither a symref nor a well-formed id is CORRUPT, and must
+# not be dressed up as detached: the detached answer is what tells callers
+# they may overwrite HEAD with a raw id, which would launder the corruption
+# into a valid-looking state. Asserted against sg alone -- there is no git
+# behaviour to match here, and exit status alone would not discriminate,
+# since sg exits 0 in both the detached and the fallback wording.
+P18_CORRUPT="$WORKDIR/p18_corrupt"
+(cd "$WORKDIR" && "$SG" init p18_corrupt) > /dev/null 2>&1
+printf 'x\n' > "$P18_CORRUPT/f.txt"
+(cd "$P18_CORRUPT" && "$SG" add . && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'neither a ref nor a sha\n' > "$P18_CORRUPT/.git/HEAD"
+P18_CORRUPT_OUT=$(cd "$P18_CORRUPT" && "$SG" status 2>/dev/null | head -1)
+check "phase18a: a corrupt HEAD is not described as detached (got '$P18_CORRUPT_OUT')" \
+    test "$P18_CORRUPT_OUT" = "Not currently on any branch."
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

@@ -25,6 +25,21 @@ static int list_branches(const char *git_dir)
     }
 
     current = sg_ref_current_branch(git_dir);
+
+    /* A detached HEAD is listed as its own starred pseudo-entry ahead of the
+       real branches, so that `sg branch` never shows an unstarred list that
+       looks like "no branch is checked out". Sorted first by real git too,
+       which puts it before the alphabetical branches rather than in them. */
+    if (current == NULL) {
+        char detached[512];
+
+        if (sg_ref_head_is_detached(git_dir) == 1 &&
+           sg_ref_detach_description(git_dir, detached, sizeof(detached)) == 0)
+            printf("* (%s)\n", detached);
+        else
+            printf("* (no branch)\n");
+    }
+
     for (i = 0; i < count; i++) {
         int is_current = current != NULL && strcmp(names[i], current) == 0;
 

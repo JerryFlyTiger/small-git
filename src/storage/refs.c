@@ -1,6 +1,7 @@
 #include "sg/refs.h"
 
 #include "sg/reflog.h"
+#include "sg/revparse.h"
 #include "sg/workdir.h"
 
 #include <dirent.h>
@@ -213,6 +214,108 @@ int sg_ref_head_is_detached(const char *git_dir)
     rc = sg_hex_to_sha1(content, id) == 0 ? 1 : -1;
     free(content);
     return rc;
+}
+
+/* Real git's grab_1st_switch: scan logs/HEAD newest-first for the first
+   "checkout: moving from <x> to <y>" line and take <y> -- everything after
+   the FIRST " to " in the remainder, so a ref whose own name contains " to "
+   confuses this exactly as much as it confuses git. */
+#define CHECKOUT_PREFIX "checkout: moving from "
+
+static int find_checkout_target(const sg_reflog *log, size_t *index_out, const char **target_out)
+{
+    size_t i;
+
+    for (i = log->count; i > 0; i--) {
+        const char *msg = log->entries[i - 1].message;
+        const char *rest;
+
+        if (strncmp(msg, CHECKOUT_PREFIX, strlen(CHECKOUT_PREFIX)) != 0)
+            continue;
+        rest = strstr(msg + strlen(CHECKOUT_PREFIX), " to ");
+        if (rest == NULL)
+            continue;
+        *index_out = i - 1;
+        *target_out = rest + 4;
+        return 0;
+    }
+    return -1;
+}
+
+static int detach_point(const char *git_dir, unsigned char oid_out[SG_SHA1_RAW_LEN], char **label_out)
+{
+    sg_reflog log;
+    size_t idx;
+    const char *target;
+    const unsigned char *noid;
+    unsigned char resolved[SG_SHA1_RAW_LEN];
+    char ref_path[SG_PATH_MAX];
+    char hex[SG_SHA1_HEX_LEN + 1];
+    char *label = NULL;
+
+    if (sg_reflog_read(git_dir, "HEAD", &log) != 0)
+        return -1;
+    if (find_checkout_target(&log, &idx, &target) != 0) {
+        sg_reflog_free(&log);
+        return -1; /* no checkout ever recorded: real git falls back to "no branch" */
+    }
+
+    noid = log.entries[idx].new_id;
+    memcpy(oid_out, noid, SG_SHA1_RAW_LEN);
+
+    /* The label is the ORIGINAL token only while it still names that same
+       commit: a tag that has since moved, or an expression like "HEAD~1"
+       that was never a ref at all, both fall back to the abbreviated id.
+       refs/tags/ and refs/remotes/ are stripped but refs/heads/ is NOT --
+       git prints "HEAD detached at refs/heads/other" in full (measured,
+       2.55.0). Tag peeling comes free with sg_rev_parse_commit, matching
+       git's lookup_commit_reference_gently second chance. */
+    if (sg_rev_parse_ref_path(git_dir, target, ref_path, sizeof(ref_path)) == 0 &&
+       sg_rev_parse_commit(git_dir, target, resolved) == 0 &&
+       memcmp(resolved, noid, SG_SHA1_RAW_LEN) == 0) {
+        static const char tag_prefix[] = "refs/tags/";
+        static const char remote_prefix[] = "refs/remotes/";
+        const char *shown = ref_path;
+
+        if (strncmp(shown, tag_prefix, strlen(tag_prefix)) == 0)
+            shown += strlen(tag_prefix);
+        else if (strncmp(shown, remote_prefix, strlen(remote_prefix)) == 0)
+            shown += strlen(remote_prefix);
+        label = strdup(shown);
+    } else {
+        sg_sha1_to_hex(noid, hex);
+        hex[7] = '\0';
+        label = strdup(hex);
+    }
+
+    sg_reflog_free(&log);
+    if (label == NULL)
+        return -1;
+    *label_out = label;
+    return 0;
+}
+
+int sg_ref_detach_description(const char *git_dir, char *buf, size_t buf_size)
+{
+    unsigned char point[SG_SHA1_RAW_LEN];
+    unsigned char head[SG_SHA1_RAW_LEN];
+    char *label;
+    int at;
+    int written;
+
+    if (detach_point(git_dir, point, &label) != 0)
+        return -1;
+
+    /* "at" while HEAD still sits on the recorded detach point, "from" once
+       it has moved -- a value comparison, not "has anything happened": real
+       git goes back to "at" after a reset --hard returns HEAD to that commit
+       (measured, 2.55.0). Either way the label describes the DETACH POINT,
+       never where HEAD is now. */
+    at = sg_ref_resolve_head(git_dir, head) == 0 && memcmp(head, point, SG_SHA1_RAW_LEN) == 0;
+
+    written = snprintf(buf, buf_size, "HEAD detached %s %s", at ? "at" : "from", label);
+    free(label);
+    return (written >= 0 && (size_t)written < buf_size) ? 0 : -1;
 }
 
 int sg_ref_resolve_head(const char *git_dir, unsigned char id_out[SG_SHA1_RAW_LEN])

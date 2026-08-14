@@ -287,7 +287,23 @@ int sg_cmd_status(int argc, char **argv)
     }
 
     branch = sg_ref_current_branch(git_dir);
-    printf("On branch %s\n", branch != NULL ? branch : "?");
+    if (branch != NULL) {
+        printf("On branch %s\n", branch);
+    } else {
+        char detached[512];
+
+        /* Only a real detached HEAD gets git's detached wording; a HEAD that
+           is neither a branch symref nor a raw id is corrupt, and claiming
+           it is detached would describe a broken repository as a normal
+           state. Both of the remaining cases land on git's own fallback
+           line, which it also uses for a detached HEAD whose reflog records
+           no checkout (measured, 2.55.0). */
+        if (sg_ref_head_is_detached(git_dir) == 1 &&
+           sg_ref_detach_description(git_dir, detached, sizeof(detached)) == 0)
+            printf("%s\n", detached);
+        else
+            printf("Not currently on any branch.\n");
+    }
     free(branch);
 
     {
