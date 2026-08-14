@@ -8,21 +8,57 @@
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/revparse.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* "<abbrev> <subject>", real git's way of naming a commit when there is no
+   branch name to use ("HEAD is now at 18e16a1 C2" -- measured, 2.55.0).
+   Best-effort: an unreadable commit degrades to the abbreviated id alone
+   rather than failing the switch, since this is only a status line. */
+static void print_commit_line(const char *git_dir, const char *prefix,
+                              const unsigned char id[SG_SHA1_RAW_LEN])
+{
+    char hex[SG_SHA1_HEX_LEN + 1];
+    sg_obj_type type;
+    unsigned char *content;
+    size_t content_len;
+    sg_commit commit;
+
+    sg_sha1_to_hex(id, hex);
+    hex[7] = '\0';
+
+    if (sg_object_read(git_dir, id, &type, &content, &content_len) != 0 || type != SG_OBJ_COMMIT) {
+        printf("%s %s\n", prefix, hex);
+        return;
+    }
+    if (sg_commit_parse(content, content_len, &commit) != 0) {
+        free(content);
+        printf("%s %s\n", prefix, hex);
+        return;
+    }
+    free(content);
+    printf("%s %s %.*s\n", prefix, hex, (int)strcspn(commit.message, "\n"), commit.message);
+    sg_commit_free(&commit);
+}
+
 int sg_cmd_switch(int argc, char **argv)
 {
     int create = 0;
     int force = 0;
+    int detach = 0;
     const char *branch_arg = NULL;
     char *git_dir;
     char *repo_root;
     unsigned char target_commit_id[SG_SHA1_RAW_LEN];
     unsigned char target_tree_id[SG_SHA1_RAW_LEN];
+    /* Where HEAD was, captured before anything writes to it -- the "Previous
+       HEAD position was" line is printed after HEAD has already moved. */
+    unsigned char prev_commit_id[SG_SHA1_RAW_LEN];
+    int have_prev_commit = 0;
     char label[256];
     int apply_rc;
     char *old_branch;
@@ -32,17 +68,25 @@ int sg_cmd_switch(int argc, char **argv)
     for (i = 1; (int)i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0) {
             create = 1;
+        } else if (strcmp(argv[i], "--detach") == 0) {
+            detach = 1;
         } else if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) {
             force = 1;
         } else if (branch_arg == NULL) {
             branch_arg = argv[i];
         } else {
-            fprintf(stderr, "usage: sg switch [-c] [--force|-f] <branch>\n");
+            fprintf(stderr, "usage: sg switch [-c] [--detach] [--force|-f] <branch>\n");
             return 1;
         }
     }
     if (branch_arg == NULL) {
-        fprintf(stderr, "usage: sg switch [-c] [--force|-f] <branch>\n");
+        fprintf(stderr, "usage: sg switch [-c] [--detach] [--force|-f] <branch>\n");
+        return 1;
+    }
+    /* -c names a branch to create, --detach means "point HEAD at a commit and
+       at no branch" -- asking for both is asking for two different HEADs. */
+    if (create && detach) {
+        fprintf(stderr, "sg: -c 與 --detach 不能同時使用\n");
         return 1;
     }
 
@@ -111,33 +155,51 @@ int sg_cmd_switch(int argc, char **argv)
        only on old_branch and argv, so there is no reason to build it late.
        Same principle the -c block below already follows.
 
-       old_branch is NULL only for a detached HEAD, and then no line is
-       written at all. Real git names the commit there instead, as a full
-       40-hex ("checkout: moving from 69cceca9a5...aa5ab to master" --
-       measured), and matching that was tried. It does not work and is
-       deliberately not pursued: sg_ref_resolve_head only understands a
-       symbolic HEAD and returns -1 for a detached one, so the label would
-       have to come from a private parse of .git/HEAD, and sg is already
-       incoherent in that state well beyond the reflog (`sg status` reports
-       "On branch ?" and "No commits yet"). Detached HEAD is Phase 18's
-       subject as a whole; writing a correct reflog line for it while the
-       rest of the command still misreads the state would be polishing one
-       corner of something unsupported. Recorded as a known divergence
-       rather than half-supported. */
-    if (old_branch != NULL) {
-        int need = snprintf(NULL, 0, "checkout: moving from %s to %s", old_branch, branch_arg);
+       When HEAD is already detached there is no branch name to use, and real
+       git writes the full 40-hex of the commit being left instead
+       ("checkout: moving from 69cceca9a5...aa5ab to master" -- measured,
+       full id, not abbreviated). Before Phase 18 that could not be produced
+       (sg_ref_resolve_head returned -1 for a detached HEAD) and the line was
+       skipped entirely; it now resolves, so the divergence is gone.
 
-        if (need >= 0) {
-            checkout_msg = malloc((size_t)need + 1);
-            if (checkout_msg == NULL) {
-                fprintf(stderr, "sg: out of memory\n");
-                free(old_branch);
-                free(git_dir);
-                free(repo_root);
-                return 1;
+       The "to" half is always argv verbatim -- the token the user typed, not
+       what it resolves to (measured: a branch name stays a branch name, a
+       sha stays that sha). sg_ref_detach_description depends on that, since
+       it recovers the detach point's label from exactly this text.
+
+       A HEAD that is neither symbolic nor a well-formed id leaves from_label
+       unset, and then no line is written at all: inventing an all-zeros
+       "from" would put a fabricated chain link into logs/HEAD. */
+    if (old_branch == NULL && sg_ref_head_is_detached(git_dir) == 1 &&
+       sg_ref_resolve_head(git_dir, prev_commit_id) == 0)
+        have_prev_commit = 1;
+
+    {
+        char from_hex[SG_SHA1_HEX_LEN + 1];
+        const char *from = NULL;
+
+        if (old_branch != NULL) {
+            from = old_branch;
+        } else if (have_prev_commit) {
+            sg_sha1_to_hex(prev_commit_id, from_hex);
+            from = from_hex;
+        }
+
+        if (from != NULL) {
+            int need = snprintf(NULL, 0, "checkout: moving from %s to %s", from, branch_arg);
+
+            if (need >= 0) {
+                checkout_msg = malloc((size_t)need + 1);
+                if (checkout_msg == NULL) {
+                    fprintf(stderr, "sg: out of memory\n");
+                    free(old_branch);
+                    free(git_dir);
+                    free(repo_root);
+                    return 1;
+                }
+                snprintf(checkout_msg, (size_t)need + 1, "checkout: moving from %s to %s", from,
+                        branch_arg);
             }
-            snprintf(checkout_msg, (size_t)need + 1, "checkout: moving from %s to %s", old_branch,
-                    branch_arg);
         }
     }
 
@@ -162,9 +224,34 @@ int sg_cmd_switch(int argc, char **argv)
             free(repo_root);
             return 1;
         }
+    } else if (detach) {
+        /* Any revision, not just a branch: --detach's whole point is to check
+           out something that has no branch name. */
+        if (sg_rev_parse_commit(git_dir, branch_arg, target_commit_id) != 0) {
+            fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
+            free(checkout_msg);
+            free(old_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
     } else {
         if (!sg_ref_branch_exists(git_dir, branch_arg)) {
-            fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
+            unsigned char probe[SG_SHA1_RAW_LEN];
+
+            /* A resolvable commit that simply isn't a branch is a different
+               mistake from a typo, and real git says so rather than calling
+               it invalid ("fatal: a branch is expected, got commit '<id>'"
+               plus a --detach hint -- measured). Refusing without --detach is
+               git's behaviour too: `git switch <sha>` does not silently
+               detach. */
+            if (sg_rev_parse_commit(git_dir, branch_arg, probe) == 0)
+                fprintf(stderr,
+                       "sg: '%s' 是一個 commit 而不是分支\n"
+                       "若要讓 HEAD 直接指向它（detached HEAD），請用 sg switch --detach %s\n",
+                       branch_arg, branch_arg);
+            else
+                fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
             free(checkout_msg);
             free(old_branch);
             free(git_dir);
@@ -190,7 +277,7 @@ int sg_cmd_switch(int argc, char **argv)
         return 1;
     }
 
-    snprintf(label, sizeof(label), "switch to '%s'", branch_arg);
+    snprintf(label, sizeof(label), detach ? "detach at '%s'" : "switch to '%s'", branch_arg);
     apply_rc = sg_safe_apply_tree(git_dir, repo_root, target_tree_id, label, force);
     if (apply_rc == 1) {
         fprintf(stderr, "sg: switch aborted\n");
@@ -231,9 +318,17 @@ int sg_cmd_switch(int argc, char **argv)
 
     {
         /* checkout_msg was built up front, before any side effect -- see the
-           comment where old_branch is captured. NULL here means a detached
-           HEAD, which deliberately gets no reflog line. */
-        if (sg_ref_set_head(git_dir, branch_arg, checkout_msg) != 0) {
+           comment where old_branch is captured. NULL here means HEAD was in a
+           state with no honest "moving from" label, and the line is skipped.
+
+           Detaching writes the raw id; both paths log to HEAD identically, so
+           the reflog does not record which of the two shapes HEAD ended in --
+           only the commit. That is what makes the detach point recoverable
+           from the "to" text alone. */
+        int rc = detach ? sg_ref_set_head_detached(git_dir, target_commit_id, checkout_msg)
+                        : sg_ref_set_head(git_dir, branch_arg, checkout_msg);
+
+        if (rc != 0) {
             fprintf(stderr, "sg: failed to update HEAD\n");
             free(checkout_msg);
             free(old_branch);
@@ -244,7 +339,17 @@ int sg_cmd_switch(int argc, char **argv)
         free(checkout_msg);
     }
 
-    printf("Switched to branch '%s'\n", branch_arg);
+    /* Real git names the commit, not the argument, once HEAD has no branch:
+       "HEAD is now at <abbrev> <subject>" on detaching, and "Previous HEAD
+       position was <abbrev> <subject>" before the ordinary line when leaving
+       a detached HEAD (measured, 2.55.0). */
+    if (detach) {
+        print_commit_line(git_dir, "HEAD is now at", target_commit_id);
+    } else {
+        if (have_prev_commit)
+            print_commit_line(git_dir, "Previous HEAD position was", prev_commit_id);
+        printf("Switched to branch '%s'\n", branch_arg);
+    }
     free(old_branch);
     free(git_dir);
     free(repo_root);

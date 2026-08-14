@@ -6125,6 +6125,94 @@ P18_CORRUPT_OUT=$(cd "$P18_CORRUPT" && "$SG" status 2>/dev/null | head -1)
 check "phase18a: a corrupt HEAD is not described as detached (got '$P18_CORRUPT_OUT')" \
     test "$P18_CORRUPT_OUT" = "Not currently on any branch."
 
+# ============================================================
+# Phase 18b: sg can enter and leave a detached HEAD itself
+#
+# Dual-track, the Phase 17 batch B idiom: the same sequence of operations is
+# run against a from-scratch sg repo and a from-scratch git repo, and the
+# reflog MESSAGE column is compared. One difference from batch B: the
+# messages here embed object ids ("moving from <40-hex> to master"), and the
+# two repos necessarily have different ids, so ids are normalized to <oid>
+# before comparing. What survives normalization is the part under test --
+# which token git chose to name each end of the move, and in which form.
+#
+# That normalization would also hide an ABBREVIATED id, so the full length is
+# asserted separately below rather than trusted to the comparison.
+# ============================================================
+
+p18b_msgcol_norm() {
+    sed 's/.*	//' "$1" 2>/dev/null | sed 's/[0-9a-f]\{40\}/<oid>/g'
+}
+
+# `check` echoes its result, so a redirect on the check line would swallow the
+# PASS/FAIL output; matches are reduced to yes/no first instead.
+p18b_matches() {
+    if expr "$1" : "$2" > /dev/null; then echo yes; else echo no; fi
+}
+
+p18b_seq() {
+    p18b_dir="$1"
+    p18b_bin="$2"
+    for p18b_i in 1 2 3; do
+        printf 'c%s\n' "$p18b_i" > "$p18b_dir/f$p18b_i.txt"
+        (cd "$p18b_dir" && "$p18b_bin" add . && "$p18b_bin" commit -m "C$p18b_i") > /dev/null 2>&1
+    done
+    (cd "$p18b_dir" && "$p18b_bin" tag p18bv1 HEAD~1) > /dev/null 2>&1
+    (cd "$p18b_dir" && "$p18b_bin" switch --detach p18bv1) > /dev/null 2>&1
+    (cd "$p18b_dir" && "$p18b_bin" switch master) > /dev/null 2>&1
+}
+
+P18B_SG="$WORKDIR/p18b_sg"
+P18B_GIT="$WORKDIR/p18b_git"
+(cd "$WORKDIR" && "$SG" init p18b_sg) > /dev/null 2>&1
+mkdir -p "$P18B_GIT" && (cd "$P18B_GIT" && git init -q -b master .) > /dev/null 2>&1
+p18b_seq "$P18B_SG" "$SG"
+p18b_seq "$P18B_GIT" git
+
+p18b_msgcol_norm "$P18B_SG/.git/logs/HEAD" > "$WORKDIR/p18b_sg_head.txt"
+p18b_msgcol_norm "$P18B_GIT/.git/logs/HEAD" > "$WORKDIR/p18b_git_head.txt"
+# The line count is asserted before the comparison, not after it: cmp of two
+# empty files succeeds, so a fixture that silently did nothing (a renamed
+# subcommand, a repo that never got created) would otherwise report a clean
+# match. Five lines: three commits, the detach, and the re-attach.
+P18B_SG_LINES=$(wc -l < "$WORKDIR/p18b_sg_head.txt" | tr -d ' ')
+check "phase18b: precondition -- sg's logs/HEAD actually has the 5 expected lines (got $P18B_SG_LINES)" \
+    test "$P18B_SG_LINES" = 5
+check "phase18b: sg's logs/HEAD messages match git's across detach and re-attach" \
+    cmp -s "$WORKDIR/p18b_sg_head.txt" "$WORKDIR/p18b_git_head.txt"
+
+# The detached state itself, on disk, in the form git reads.
+(cd "$P18B_SG" && "$SG" switch --detach p18bv1) > /dev/null 2>&1
+P18B_RAW=$(cat "$P18B_SG/.git/HEAD")
+check "phase18b: sg switch --detach writes HEAD as a bare 40-hex id, no 'ref:' prefix" \
+    test "$(p18b_matches "$P18B_RAW" '[0-9a-f]\{40\}$')" = yes
+P18B_GIT_SEES=$(cd "$P18B_SG" && git rev-parse HEAD)
+P18B_TAG_IS=$(cd "$P18B_SG" && git rev-parse p18bv1)
+check "phase18b: real git resolves the HEAD sg detached, to the same commit" \
+    test "$P18B_GIT_SEES" = "$P18B_TAG_IS"
+
+# Leaving a detached HEAD names the commit in FULL, not abbreviated -- the
+# <oid> normalization above cannot see the difference, so it is checked here.
+(cd "$P18B_SG" && "$SG" switch master) > /dev/null 2>&1
+P18B_LAST=$(sed 's/.*	//' "$P18B_SG/.git/logs/HEAD" | tail -1)
+check "phase18b: leaving a detached HEAD logs the full 40-hex it came from (got '$P18B_LAST')" \
+    test "$(p18b_matches "$P18B_LAST" 'checkout: moving from [0-9a-f]\{40\} to master$')" = yes
+
+# Refusing is part of the contract: `switch <commit>` without --detach must
+# not silently detach, and must not move HEAD at all. Exit status alone would
+# not discriminate a refusal that had already written HEAD, so the HEAD file
+# is compared before and after.
+P18B_BEFORE=$(cat "$P18B_SG/.git/HEAD")
+(cd "$P18B_SG" && "$SG" switch p18bv1) > /dev/null 2>&1
+check "phase18b: sg switch <tag> without --detach is refused" test $? = 1
+check "phase18b: ...and HEAD is untouched by that refusal" \
+    test "$(cat "$P18B_SG/.git/HEAD")" = "$P18B_BEFORE"
+
+(cd "$P18B_SG" && "$SG" switch -c p18bnew --detach) > /dev/null 2>&1
+check "phase18b: sg switch -c together with --detach is refused" test $? = 1
+check "phase18b: ...and no branch was created by that refusal" \
+    test ! -f "$P18B_SG/.git/refs/heads/p18bnew"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
