@@ -3889,7 +3889,13 @@ check "phase12 reset stat guard: real git still sees the file as modified (not f
 
 P12R_DETACHED="$P12R_SG_BASE/detached"
 p12r_base "$P12R_DETACHED" "$SG"
-DETACH_TARGET=$(cd "$P12R_DETACHED" && git rev-parse HEAD~1)
+# Detach at HEAD (c2), NOT at HEAD~1: p12r_base tags v1 at c1, so HEAD~1 IS
+# v1, and resetting to v1 from there is a no-op that moves nothing. Every
+# assertion below then passes on a build where reset never touches HEAD at
+# all -- measured, with a mutation that sent the detached case down the
+# branch path instead. The reset has to actually move HEAD for them to mean
+# anything.
+DETACH_TARGET=$(cd "$P12R_DETACHED" && git rev-parse HEAD)
 (cd "$P12R_DETACHED" && git checkout -q --detach "$DETACH_TARGET")
 # This case asserted the opposite until Phase 18: reset REFUSED a detached
 # HEAD. That refusal became untenable once rebase started replaying on a
@@ -3908,9 +3914,18 @@ check "phase12 reset: ...moving HEAD itself to the target" \
     test "$P12R_DETACHED_NOW" = "$P12R_DETACHED_WANT"
 check "phase12 reset: ...and leaving master where it was" \
     test "$(cat "$P12R_DETACHED/.git/refs/heads/master")" = "$P12R_DETACHED_BRANCH_BEFORE"
+check "phase12 reset: precondition -- the reset target really differs from where HEAD was detached" \
+    test "$P12R_DETACHED_WANT" != "$DETACH_TARGET"
 P12R_DETACHED_HEADFILE=$(cat "$P12R_DETACHED/.git/HEAD")
 check "phase12 reset: ...with HEAD still detached, not re-attached to a branch" \
     test "${P12R_DETACHED_HEADFILE#ref: }" = "$P12R_DETACHED_HEADFILE"
+# Writing to a branch instead of HEAD does not necessarily hit an EXISTING
+# branch: with current_branch NULL, a "refs/heads/%s" build yields
+# "refs/heads/(null)". Comparing master alone would miss that, so the whole
+# branch list is compared.
+P12R_DETACHED_BRANCHES=$(cd "$P12R_DETACHED" && git for-each-ref --format='%(refname)' refs/heads | tr '\n' ' ')
+check "phase12 reset: ...creating no stray branch (got '$P12R_DETACHED_BRANCHES')" \
+    test "$P12R_DETACHED_BRANCHES" = "refs/heads/master "
 
 P12R_PATHSPEC="$P12R_SG_BASE/pathspec"
 p12r_base "$P12R_PATHSPEC" "$SG"
@@ -6389,8 +6404,16 @@ check "phase18d: sg rebase on a detached HEAD refuses, naming the reason (got '$
 # HEAD and no branch (asserted in phase12, and required so that resetting
 # during a paused rebase keeps working now that a paused rebase is detached).
 P18D_MASTER_BEFORE=$(cat "$P18D/.git/refs/heads/master")
+P18D_HEAD_BEFORE=$(cd "$P18D" && git rev-parse HEAD)
 (cd "$P18D" && "$SG" reset --hard p18d-side) > /dev/null 2>&1
 check "phase18d: sg reset --hard on a detached HEAD succeeds" test $? = 0
+# "It exited 0 and master didn't move" is also true of a build that writes to
+# some other branch and never touches HEAD, so the move itself is asserted.
+P18D_HEAD_AFTER=$(cd "$P18D" && git rev-parse HEAD)
+P18D_SIDE=$(cd "$P18D" && git rev-parse p18d-side)
+check "phase18d: precondition -- the reset target differs from where HEAD was" \
+    test "$P18D_HEAD_BEFORE" != "$P18D_SIDE"
+check "phase18d: ...moving HEAD itself onto the target" test "$P18D_HEAD_AFTER" = "$P18D_SIDE"
 check "phase18d: ...and still did not move master" \
     test "$(cat "$P18D/.git/refs/heads/master")" = "$P18D_MASTER_BEFORE"
 

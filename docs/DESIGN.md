@@ -1249,6 +1249,30 @@ rebase 根本沒完成。`git rebase --continue` 要開編輯器,沒有編輯器
 關掉,於是 git 找不到 committer 身分,整個套件在第一步就結束,輸出是空的。**空
 輸出讀起來跟通過一模一樣**,只有實際看行數才會發現。
 
+### 收尾補驗:自己寫的 reset 斷言也是假覆蓋
+
+merge 之後回頭補跑「否定式斷言」的定向 mutation(記憶裡的規則:「沒有做 X」這
+類斷言不能靠全面還原來驗),連帶發現 **Phase 18 自己新加的 reset 斷言是綠得沒有
+鑑別力的**。
+
+把 `move_head_to` 的 detached 分支關掉(讓它在 detached 時照樣去寫
+`refs/heads/%s`,而 `current_branch` 是 NULL,於是產生一個叫
+`refs/heads/(null)` 的分支、完全不碰 HEAD),原本只有 **phase14 的四條**變紅——
+phase12 與 18d 那幾條我為了這個修法新寫的斷言,一條都沒紅。
+
+原因是 fixture 退化:`p12r_base` 在 c1 上打 tag `v1`,而案例在 `HEAD~1`(= c1
+= 就是 v1)detach 之後 `reset --mixed v1` ——**那是個 no-op**。「HEAD 移到目標
+了」在 HEAD 根本沒動的建置上照樣成立。這是本次里程碑第三次踩到同一個形態(前兩
+次是標籤與情境錯開一格、以及「tag 移走」案靠無關理由退回 id)。
+
+改成在 c2 detach、reset 到 v1(真的移動),並補兩件事:一條**前提斷言**確認目標
+與起點不同(否則那條斷言自己就沒有鑑別力),以及一條比對**整份分支清單**而不只
+是 master——寫錯地方不一定會打到既有分支,`refs/heads/(null)` 就不會。同一個
+mutation 現在讓 7 條紅,其中那條新守衛直接把 `refs/heads/(null)` 印出來。
+
+順帶把踩過的 `tests/mutate.sh` 用法陷阱寫進腳本註解:perl 分隔符撞 C 語法
+(`s{}{}` 撞大括號、`s!!!` 撞 `!=`),以及**字面量出現不只一次時一定要加 `/g`**。
+
 ### 無法驗證(如實記錄)
 
 - 兩處 malloc 失敗分支(`cmd_commit.c`、`cmd_switch.c` 建構 reflog 訊息字串
@@ -1460,6 +1484,6 @@ mutation 名字裡有 `/` 會讓 `mkdtemp` 失敗(「No such file or directory�
   HEAD 從分支出發時 `have_prev_commit` 恆為 0,那個 `memcmp` 根本走不到。它是
   重構的迴歸防護,不是新邏輯的覆蓋——標籤已經照實寫。
 
-最終 `tests/interop.sh` 1094 項檢查(Phase 17 結束時是 998),`make test` 35 支
+最終 `tests/interop.sh` 1098 項檢查(Phase 17 結束時是 998),`make test` 35 支
 二進位全過(新增 `tests/test_head_detach.c`),`make sanitize` 乾淨,子指令維持
 24 個(`sg switch` 新增 `--detach`)。
