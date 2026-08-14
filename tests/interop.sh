@@ -6556,6 +6556,17 @@ p18f_compare() {
         cmp -s "$WORKDIR/p18f_s_head.txt" "$WORKDIR/p18f_g_head.txt"
     check "phase18f ($p18f_label): topic's own reflog messages match git's" \
         cmp -s "$WORKDIR/p18f_s_br.txt" "$WORKDIR/p18f_g_br.txt"
+    # A bare "the files differ" is unactionable when the only place it fails
+    # is someone else's machine -- this suite's whole point is being able to
+    # get back to the raw output. Printed only on mismatch.
+    if ! cmp -s "$WORKDIR/p18f_s_head.txt" "$WORKDIR/p18f_g_head.txt" ||
+       ! cmp -s "$WORKDIR/p18f_s_br.txt" "$WORKDIR/p18f_g_br.txt"; then
+        echo "    --- phase18f ($p18f_label) mismatch, git $(git --version | sed 's/git version //') ---"
+        echo "    logs/HEAD   sg | git:"
+        diff "$WORKDIR/p18f_s_head.txt" "$WORKDIR/p18f_g_head.txt" | sed 's/^/      /'
+        echo "    branch log  sg | git:"
+        diff "$WORKDIR/p18f_s_br.txt" "$WORKDIR/p18f_g_br.txt" | sed 's/^/      /'
+    fi
 }
 
 # --- a plain two-commit rebase ---
