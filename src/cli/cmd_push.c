@@ -748,10 +748,17 @@ int sg_cmd_push(int argc, char **argv)
                 goto done;
         }
     } else {
+        /* See cmd_reset.c: a corrupt HEAD is not a detached one. Here the
+           advice differs too -- naming a branch explicitly does work around a
+           detached HEAD, but not a HEAD that cannot be read at all. */
         current_branch = sg_ref_current_branch(git_dir);
         if (current_branch == NULL) {
-            fprintf(stderr, "sg: 目前是 detached HEAD，請明確指定要推送的分支：sg push %s <branch>\n",
-                   remote);
+            if (sg_ref_head_is_detached(git_dir) == 1)
+                fprintf(stderr,
+                       "sg: 目前是 detached HEAD，請明確指定要推送的分支：sg push %s <branch>\n",
+                       remote);
+            else
+                fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
             goto done;
         }
         if (build_branch_candidate(git_dir, current_branch, &candidates, &candidate_count,

@@ -357,9 +357,14 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         return 1;
     }
 
+    /* See cmd_reset.c: a corrupt HEAD is not a detached one, and saying so
+       points at the actual problem. */
     current_branch = sg_ref_current_branch(git_dir);
     if (current_branch == NULL) {
-        fprintf(stderr, "sg: 目前是 detached HEAD，無法 rebase（HEAD 必須指向一個分支）\n");
+        if (sg_ref_head_is_detached(git_dir) == 1)
+            fprintf(stderr, "sg: 目前是 detached HEAD，無法 rebase（HEAD 必須指向一個分支）\n");
+        else
+            fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
         return 1;
     }
 

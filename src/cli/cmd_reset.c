@@ -100,9 +100,15 @@ int sg_cmd_reset(int argc, char **argv)
         return 1;
     }
 
+    /* NULL has two causes, and blaming a detached HEAD for a corrupt one
+       sends the user looking for a checkout to undo instead of at a broken
+       .git/HEAD. Same split as cmd_merge.c's. */
     current_branch = sg_ref_current_branch(git_dir);
     if (current_branch == NULL) {
-        fprintf(stderr, "sg: 目前是 detached HEAD，無法 reset（HEAD 必須指向一個分支）\n");
+        if (sg_ref_head_is_detached(git_dir) == 1)
+            fprintf(stderr, "sg: 目前是 detached HEAD，無法 reset（HEAD 必須指向一個分支）\n");
+        else
+            fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
         free(git_dir);
         free(repo_root);
         return 1;

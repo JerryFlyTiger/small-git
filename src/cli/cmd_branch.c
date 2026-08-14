@@ -31,7 +31,7 @@ static int list_branches(const char *git_dir)
        looks like "no branch is checked out". Sorted first by real git too,
        which puts it before the alphabetical branches rather than in them. */
     if (current == NULL) {
-        char detached[512];
+        char detached[4160]; /* fits any ref path sg can build (SG_PATH_MAX) plus the wording */
 
         if (sg_ref_head_is_detached(git_dir) == 1 &&
            sg_ref_detach_description(git_dir, detached, sizeof(detached)) == 0)

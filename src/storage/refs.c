@@ -270,7 +270,16 @@ static int detach_point(const char *git_dir, unsigned char oid_out[SG_SHA1_RAW_L
        git prints "HEAD detached at refs/heads/other" in full (measured,
        2.55.0). Tag peeling comes free with sg_rev_parse_commit, matching
        git's lookup_commit_reference_gently second chance. */
-    if (sg_rev_parse_ref_path(git_dir, target, ref_path, sizeof(ref_path)) == 0 &&
+    /* "HEAD" is excluded even though sg_rev_parse_ref_path happily maps it to
+       itself: that mapping exists so revparse can handle "HEAD~1", not to
+       claim HEAD is a name for a fixed commit. Real git does not use it as a
+       label either -- `git switch --detach HEAD` reports the abbreviated id,
+       not "HEAD detached at HEAD" (measured, 2.55.0), even though it writes
+       the same "to HEAD" reflog line sg does. Naming the detach point "HEAD"
+       would also be self-referential: it describes where HEAD is by saying
+       "HEAD". */
+    if (strcmp(target, "HEAD") != 0 &&
+       sg_rev_parse_ref_path(git_dir, target, ref_path, sizeof(ref_path)) == 0 &&
        sg_rev_parse_commit(git_dir, target, resolved) == 0 &&
        memcmp(resolved, noid, SG_SHA1_RAW_LEN) == 0) {
         static const char tag_prefix[] = "refs/tags/";
@@ -315,6 +324,23 @@ int sg_ref_detach_description(const char *git_dir, char *buf, size_t buf_size)
 
     written = snprintf(buf, buf_size, "HEAD detached %s %s", at ? "at" : "from", label);
     free(label);
+    if (written >= 0 && (size_t)written < buf_size)
+        return 0;
+
+    /* A ref name too long for the caller's buffer degrades to the
+       abbreviated id, which is the same fallback an unresolvable label
+       already takes. Reporting "no detach point" here instead would make
+       `status` announce "Not currently on any branch." for a HEAD that is
+       plainly detached -- wrong information rather than less of it. Real git
+       has no such limit and always prints the full name; this is sg's own
+       bounded-buffer degradation, not a measured behaviour. */
+    {
+        char hex[SG_SHA1_HEX_LEN + 1];
+
+        sg_sha1_to_hex(point, hex);
+        hex[7] = '\0';
+        written = snprintf(buf, buf_size, "HEAD detached %s %s", at ? "at" : "from", hex);
+    }
     return (written >= 0 && (size_t)written < buf_size) ? 0 : -1;
 }
 

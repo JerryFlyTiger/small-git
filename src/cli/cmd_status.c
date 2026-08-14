@@ -290,7 +290,7 @@ int sg_cmd_status(int argc, char **argv)
     if (branch != NULL) {
         printf("On branch %s\n", branch);
     } else {
-        char detached[512];
+        char detached[4160]; /* fits any ref path sg can build (SG_PATH_MAX) plus the wording */
 
         /* Only a real detached HEAD gets git's detached wording; a HEAD that
            is neither a branch symref nor a raw id is corrupt, and claiming

@@ -343,13 +343,19 @@ int sg_cmd_switch(int argc, char **argv)
        "HEAD is now at <abbrev> <subject>" on detaching, and "Previous HEAD
        position was <abbrev> <subject>" before the ordinary line when leaving
        a detached HEAD (measured, 2.55.0). */
-    if (detach) {
+    /* The "Previous HEAD position" line belongs to LEAVING a detached HEAD,
+       so git prints it for detach-to-detach moves too, not only when
+       arriving on a branch -- but only when the commit actually CHANGES.
+       Measured, 2.55.0, all five combinations: detached->branch at the same
+       commit, detached-at-a-branch-tip->that branch, and detach->detach at
+       the same commit all print nothing extra; only a move that lands
+       somewhere else does. */
+    if (have_prev_commit && memcmp(prev_commit_id, target_commit_id, SG_SHA1_RAW_LEN) != 0)
+        print_commit_line(git_dir, "Previous HEAD position was", prev_commit_id);
+    if (detach)
         print_commit_line(git_dir, "HEAD is now at", target_commit_id);
-    } else {
-        if (have_prev_commit)
-            print_commit_line(git_dir, "Previous HEAD position was", prev_commit_id);
+    else
         printf("Switched to branch '%s'\n", branch_arg);
-    }
     free(old_branch);
     free(git_dir);
     free(repo_root);

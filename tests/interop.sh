@@ -6365,6 +6365,100 @@ P18D_MERGE_ERR=$(cd "$P18D" && "$SG" merge p18d-side 2>&1 >/dev/null | head -1)
 check "phase18d: sg merge on a detached HEAD refuses, naming the reason (got '$P18D_MERGE_ERR')" \
     test "${P18D_MERGE_ERR#sg: 目前是 detached HEAD}" != "$P18D_MERGE_ERR"
 
+# ============================================================
+# Phase 18e: the switch/status output a cold read caught, which nothing here
+# was looking at
+#
+# 18a-18d assert HEAD, the reflogs, refs and `status`/`branch` wording, but
+# not one of them reads `switch`'s own stdout. Three divergences from real git
+# lived in that gap; none was a wrong assertion, all three were an ABSENT one.
+# ============================================================
+
+P18E_G="$WORKDIR/p18e_git"
+P18E_S="$WORKDIR/p18e_sg"
+mkdir -p "$P18E_G" && (cd "$P18E_G" && git init -q -b master .) > /dev/null 2>&1
+(cd "$WORKDIR" && "$SG" init p18e_sg) > /dev/null 2>&1
+for p18e_i in 1 2 3; do
+    printf 'c%s\n' "$p18e_i" > "$P18E_G/f$p18e_i.txt"
+    (cd "$P18E_G" && git add . && git commit -qm "C$p18e_i") > /dev/null 2>&1
+    printf 'c%s\n' "$p18e_i" > "$P18E_S/f$p18e_i.txt"
+    (cd "$P18E_S" && "$SG" add . && "$SG" commit -m "C$p18e_i") > /dev/null 2>&1
+done
+
+# Leaving a detached HEAD prints "Previous HEAD position was ...". That line
+# belongs to the LEAVING, so it appears on a detach-to-detach move too -- and
+# that is the case sg missed, having keyed it off "arriving on a branch".
+# Only the shape is compared (ids differ between the two repos).
+p18e_shape() {
+    sed 's/[0-9a-f]\{7,40\}/<id>/g' | sed 's/[[:space:]]*$//'
+}
+(cd "$P18E_G" && git switch --detach HEAD~2) > /dev/null 2>&1
+P18E_G_OUT=$( (cd "$P18E_G" && LC_ALL=C git switch --detach master) 2>&1 | p18e_shape)
+(cd "$P18E_S" && "$SG" switch --detach HEAD~2) > /dev/null 2>&1
+P18E_S_OUT=$( (cd "$P18E_S" && "$SG" switch --detach master) 2>&1 | p18e_shape)
+check "phase18e: detach-to-detach across different commits prints both lines, like git -- sg gave '$P18E_S_OUT'" \
+    test "$P18E_S_OUT" = "$P18E_G_OUT"
+
+P18E_G_OUT2=$( (cd "$P18E_G" && LC_ALL=C git switch master) 2>&1 | p18e_shape)
+P18E_S_OUT2=$( (cd "$P18E_S" && "$SG" switch master) 2>&1 | p18e_shape)
+check "phase18e: detach-to-branch at the SAME commit prints only the arrival line, like git -- sg gave '$P18E_S_OUT2'" \
+    test "$P18E_S_OUT2" = "$P18E_G_OUT2"
+
+P18E_G_OUT3=$( (cd "$P18E_G" && LC_ALL=C git switch --detach HEAD~1) 2>&1 | p18e_shape)
+P18E_S_OUT3=$( (cd "$P18E_S" && "$SG" switch --detach HEAD~1) 2>&1 | p18e_shape)
+check "phase18e: branch-to-detach prints only the arrival line, like git -- sg gave '$P18E_S_OUT3'" \
+    test "$P18E_S_OUT3" = "$P18E_G_OUT3"
+
+# "HEAD" names no fixed commit, so it is not a usable detach-point label even
+# though sg_rev_parse_ref_path maps it to itself. git degrades to the id here.
+(cd "$P18E_S" && "$SG" switch master && "$SG" switch --detach HEAD) > /dev/null 2>&1
+(cd "$P18E_G" && git switch -q master && git switch -q --detach HEAD) > /dev/null 2>&1
+P18E_S_HEADLBL=$(cd "$P18E_S" && "$SG" status | head -1 | p18e_shape)
+P18E_G_HEADLBL=$(cd "$P18E_G" && LC_ALL=C git status | head -1 | p18e_shape)
+check "phase18e: --detach HEAD degrades to an id, not the self-referential 'at HEAD' (sg: '$P18E_S_HEADLBL')" \
+    test "$P18E_S_HEADLBL" = "$P18E_G_HEADLBL"
+
+# A long ref name must still print in full, exactly as git does. The
+# description buffer used to be 512 bytes, and overflowing it reported
+# "Not currently on any branch." for a plainly detached HEAD -- wrong
+# information rather than less of it. Segments stay under the 255-byte
+# filename limit, since a single 3000-byte component simply cannot be created
+# on either tool.
+P18E_SEG=$(printf 'abcdefghij%.0s' $(seq 1 5))
+P18E_LONG="$P18E_SEG/$P18E_SEG/$P18E_SEG/$P18E_SEG/$P18E_SEG/$P18E_SEG/$P18E_SEG/$P18E_SEG/$P18E_SEG/$P18E_SEG"
+(cd "$P18E_S" && "$SG" switch master && "$SG" branch "$P18E_LONG" && \
+    "$SG" switch --detach "$P18E_LONG") > /dev/null 2>&1
+(cd "$P18E_G" && git switch -q master && git branch "$P18E_LONG" && \
+    git switch -q --detach "$P18E_LONG") > /dev/null 2>&1
+P18E_LONG_S=$(cd "$P18E_S" && "$SG" status | head -1)
+P18E_LONG_G=$(cd "$P18E_G" && LC_ALL=C git status | head -1)
+check "phase18e: precondition -- the long-name branch was actually created and checked out" \
+    test "${P18E_LONG_S#HEAD detached at refs/heads/}" != "$P18E_LONG_S"
+check "phase18e: a ${#P18E_LONG}-char detach label prints in full, same as git" \
+    test "$P18E_LONG_S" = "$P18E_LONG_G"
+
+# A corrupt HEAD is not a detached one -- reset/rebase/push said it was.
+P18E_C="$WORKDIR/p18e_corrupt"
+(cd "$WORKDIR" && "$SG" init p18e_corrupt) > /dev/null 2>&1
+printf 'x\n' > "$P18E_C/f.txt"
+(cd "$P18E_C" && "$SG" add . && "$SG" commit -m c1 && "$SG" branch p18e-other) > /dev/null 2>&1
+printf 'neither a ref nor a sha\n' > "$P18E_C/.git/HEAD"
+#
+# push is NOT checked here even though it carries the same fix. Its HEAD test
+# runs after the remote's ref advertisement (cmd_push.c reads the url, then
+# ls-refs, and only then picks a branch), so with no remote configured the
+# command exits at "remote not configured" and never reaches it -- a check
+# here would pass without executing the line it claims to cover. Reaching it
+# needs a live remote; recorded as uncovered rather than faked.
+for p18e_cmd in reset rebase; do
+    case "$p18e_cmd" in
+        reset)  P18E_ERR=$(cd "$P18E_C" && "$SG" reset --mixed p18e-other 2>&1 >/dev/null | head -1) ;;
+        rebase) P18E_ERR=$(cd "$P18E_C" && "$SG" rebase p18e-other 2>&1 >/dev/null | head -1) ;;
+    esac
+    check "phase18e: sg $p18e_cmd does not blame a detached HEAD for a corrupt one (got '$P18E_ERR')" \
+        test "${P18E_ERR#sg: 目前是 detached HEAD}" = "$P18E_ERR"
+done
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

@@ -58,14 +58,18 @@ int sg_ref_head_is_detached(const char *git_dir);
    The detach point is recovered the way git does it -- the newest
    "checkout: moving from <x> to <y>" line in logs/HEAD -- so <label> is the
    token the user originally named, kept only while it still resolves to that
-   same commit (a tag since moved, or an expression like "HEAD~1" that was
-   never a ref, fall back to the abbreviated object id). refs/tags/ and
-   refs/remotes/ are stripped from it; refs/heads/ deliberately is not.
+   same commit. It falls back to the abbreviated object id otherwise: a tag
+   since moved, an expression like "HEAD~1" that was never a ref, the literal
+   "HEAD" (which names no fixed commit, and which real git does not use as a
+   label either), or a name too long for buf. refs/tags/ and refs/remotes/
+   are stripped from it; refs/heads/ deliberately is not.
 
-   Returns -1 when logs/HEAD records no checkout at all (or on truncation),
-   which is NOT an error: it means git's own fallback wording applies, and
-   the two callers differ there -- `status` says "Not currently on any
-   branch." and `branch` says "(no branch)" -- so the caller supplies it.
+   Returns -1 only when logs/HEAD records no checkout at all, which is NOT an
+   error: it means git's own fallback wording applies, and the two callers
+   differ there -- `status` says "Not currently on any branch." and `branch`
+   says "(no branch)" -- so the caller supplies it. A buffer too small for
+   even the abbreviated form also returns -1, but any buf of ~40 bytes or
+   more is past that.
    Says nothing about whether HEAD is detached; ask sg_ref_head_is_detached
    first. */
 int sg_ref_detach_description(const char *git_dir, char *buf, size_t buf_size);
