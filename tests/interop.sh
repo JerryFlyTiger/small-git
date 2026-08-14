@@ -6406,7 +6406,7 @@ check "phase18e: detach-to-branch at the SAME commit prints only the arrival lin
 
 P18E_G_OUT3=$( (cd "$P18E_G" && LC_ALL=C git switch --detach HEAD~1) 2>&1 | p18e_shape)
 P18E_S_OUT3=$( (cd "$P18E_S" && "$SG" switch --detach HEAD~1) 2>&1 | p18e_shape)
-check "phase18e: branch-to-detach prints only the arrival line, like git -- sg gave '$P18E_S_OUT3'" \
+check "phase18e: regression only -- branch-to-detach is unaffected by the new rule (have_prev_commit is 0 there) -- sg gave '$P18E_S_OUT3'" \
     test "$P18E_S_OUT3" = "$P18E_G_OUT3"
 
 # "HEAD" names no fixed commit, so it is not a usable detach-point label even
