@@ -3883,13 +3883,13 @@ P12R_DETACHED="$P12R_SG_BASE/detached"
 p12r_base "$P12R_DETACHED" "$SG"
 DETACH_TARGET=$(cd "$P12R_DETACHED" && git rev-parse HEAD~1)
 (cd "$P12R_DETACHED" && git checkout -q --detach "$DETACH_TARGET")
-# Deliberately target "v1" (a real, resolvable ref), not "HEAD" -- HEAD
-# itself already fails to resolve on a detached checkout for an unrelated
-# reason (sg_ref_resolve_head only ever follows "ref: refs/heads/..."
-# indirection, so a raw-sha HEAD file is simply unsupported there), which
-# would make this case pass even if the dedicated detached-HEAD rejection in
-# sg_cmd_reset were missing entirely. "v1" resolves fine on its own, so
-# reaching a non-zero exit here actually exercises that dedicated check.
+# Deliberately target "v1" (a real, resolvable ref) rather than "HEAD".
+# Originally that was because HEAD did not resolve at all on a detached
+# checkout, which would have made this case pass even with the dedicated
+# rejection in sg_cmd_reset deleted. Phase 18 made a detached HEAD resolve,
+# so that particular way of passing for the wrong reason is gone -- but "v1"
+# is kept anyway, since a target whose own resolution cannot fail is what
+# makes a non-zero exit here attributable to the rejection and nothing else.
 (cd "$P12R_DETACHED" && "$SG" reset --mixed v1) > /dev/null 2>&1
 check "phase12 reset reject: sg reset on a detached HEAD exits non-zero" test $? = 1
 
@@ -6273,6 +6273,97 @@ printf 'y\n' > "$P18C_CORRUPT/g.txt"
 check "phase18c: sg commit onto a corrupt HEAD is refused" test $? = 1
 check "phase18c: ...and the corrupt HEAD is left as evidence, not overwritten" \
     test "$(cat "$P18C_CORRUPT/.git/HEAD")" = "neither a ref nor a sha"
+
+# ============================================================
+# Phase 18d: the commands that only ever saw a detached HEAD as "this repo
+# has no commits", plus the three that still refuse it on purpose
+#
+# Every read below was already reachable before Phase 18 -- real git can put
+# any sg repository into this state -- and every one of them was WRONG rather
+# than refusing: sg_ref_resolve_head returned -1, which each caller read as
+# "unborn HEAD". They are asserted here because "the root fix repaired them"
+# is a claim about code, not a test.
+#
+# The refusals are asserted too. sg deliberately stops short of merge, reset
+# and rebase on a detached HEAD (real git supports all three); that is a
+# scope decision, so it is pinned rather than left to drift.
+# ============================================================
+
+P18D="$WORKDIR/p18d"
+(cd "$WORKDIR" && "$SG" init p18d) > /dev/null 2>&1
+for p18d_i in 1 2 3; do
+    printf 'c%s\n' "$p18d_i" > "$P18D/f$p18d_i.txt"
+    (cd "$P18D" && "$SG" add . && "$SG" commit -m "C$p18d_i") > /dev/null 2>&1
+done
+(cd "$P18D" && "$SG" branch p18d-side && "$SG" switch --detach HEAD~1) > /dev/null 2>&1
+
+# `sg log` used to print "fatal: your current branch does not have any
+# commits yet" over a perfectly good history.
+P18D_LOG=$(cd "$P18D" && "$SG" log 2>/dev/null | grep -c '^commit ')
+check "phase18d: sg log walks the history from a detached HEAD (found $P18D_LOG commits)" \
+    test "$P18D_LOG" = 2
+
+# The work tree is clean, and status must say so. With has_head miscomputed
+# the HEAD tree came out empty, so every tracked file was reported as a
+# staged addition -- a clean tree looking like a full-repo rewrite.
+P18D_STATUS=$(cd "$P18D" && "$SG" status 2>/dev/null | tail -1)
+check "phase18d: a clean work tree is clean on a detached HEAD (got '$P18D_STATUS')" \
+    test "$P18D_STATUS" = "nothing to commit, working tree clean"
+
+# sg_safe_apply_tree shares that has_head computation, so switching away used
+# the same empty tree to decide what it was about to overwrite.
+(cd "$P18D" && "$SG" switch master) > /dev/null 2>&1
+check "phase18d: switching from a detached HEAD back to a branch succeeds" test $? = 0
+P18D_STATUS2=$(cd "$P18D" && "$SG" status 2>/dev/null | tail -1)
+check "phase18d: ...and leaves a clean work tree (got '$P18D_STATUS2')" \
+    test "$P18D_STATUS2" = "nothing to commit, working tree clean"
+
+# `sg branch <name>` refused with "current branch has no commits yet".
+(cd "$P18D" && "$SG" switch --detach HEAD~1 && "$SG" branch p18d-fromdetached) > /dev/null 2>&1
+check "phase18d: sg branch can create a branch while detached" \
+    test -f "$P18D/.git/refs/heads/p18d-fromdetached"
+P18D_NEW=$(cd "$P18D" && git rev-parse p18d-fromdetached 2>/dev/null)
+P18D_AT=$(cd "$P18D" && git rev-parse HEAD 2>/dev/null)
+check "phase18d: ...pointing at the detached commit, not at some other branch's tip" \
+    test "$P18D_NEW" = "$P18D_AT"
+
+# stash: real git supports it here, and sg's "(no branch)" fallback -- written
+# before the state was reachable -- turns out to match git exactly.
+printf 'dirty\n' >> "$P18D/f1.txt"
+(cd "$P18D" && "$SG" stash push -m p18dprobe) > /dev/null 2>&1
+check "phase18d: sg stash push works on a detached HEAD" test $? = 0
+P18D_STASH=$(cd "$P18D" && "$SG" stash list 2>/dev/null | head -1)
+P18D_STASH_GIT=$(cd "$P18D" && git stash list 2>/dev/null | head -1)
+check "phase18d: sg's stash subject matches git's reading of the same entry (got '$P18D_STASH')" \
+    test "$P18D_STASH" = "$P18D_STASH_GIT"
+# The safety snapshot behind stash resolves HEAD too, and a parentless
+# snapshot would be a rescue point with no history behind it.
+P18D_SNAP=$(cd "$P18D" && git for-each-ref --format='%(refname)' 'refs/small-git/**' 2>/dev/null | head -1)
+if [ -n "$P18D_SNAP" ]; then
+    P18D_SNAP_PARENTS=$(cd "$P18D" && git cat-file -p "$P18D_SNAP" 2>/dev/null | grep -c '^parent')
+    check "phase18d: the safety snapshot taken while detached has a parent, not a root commit" \
+        test "$P18D_SNAP_PARENTS" = 1
+else
+    skip "phase18d: the safety snapshot taken while detached has a parent, not a root commit"
+fi
+(cd "$P18D" && "$SG" stash pop) > /dev/null 2>&1
+check "phase18d: sg stash pop works on a detached HEAD" test $? = 0
+
+# --- the deliberate refusals ---
+#
+# Each is checked for a detached-SPECIFIC message, not merely a non-zero
+# exit: these commands exit 1 for plenty of other reasons, so exit status
+# alone would keep passing if the dedicated check were deleted.
+(cd "$P18D" && git checkout -q -- . ) > /dev/null 2>&1
+P18D_RESET_ERR=$(cd "$P18D" && "$SG" reset --mixed p18d-side 2>&1 >/dev/null | head -1)
+check "phase18d: sg reset on a detached HEAD refuses, naming the reason (got '$P18D_RESET_ERR')" \
+    test "${P18D_RESET_ERR#sg: 目前是 detached HEAD}" != "$P18D_RESET_ERR"
+P18D_REBASE_ERR=$(cd "$P18D" && "$SG" rebase p18d-side 2>&1 >/dev/null | head -1)
+check "phase18d: sg rebase on a detached HEAD refuses, naming the reason (got '$P18D_REBASE_ERR')" \
+    test "${P18D_REBASE_ERR#sg: 目前是 detached HEAD}" != "$P18D_REBASE_ERR"
+P18D_MERGE_ERR=$(cd "$P18D" && "$SG" merge p18d-side 2>&1 >/dev/null | head -1)
+check "phase18d: sg merge on a detached HEAD refuses, naming the reason (got '$P18D_MERGE_ERR')" \
+    test "${P18D_MERGE_ERR#sg: 目前是 detached HEAD}" != "$P18D_MERGE_ERR"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
