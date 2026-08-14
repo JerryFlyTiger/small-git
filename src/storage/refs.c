@@ -184,13 +184,52 @@ int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id
     return rc;
 }
 
+int sg_ref_head_is_detached(const char *git_dir)
+{
+    char path[SG_PATH_MAX];
+    char *content;
+    char *nl;
+    unsigned char id[SG_SHA1_RAW_LEN];
+    int rc;
+
+    snprintf(path, sizeof(path), "%s/HEAD", git_dir);
+    content = read_small_file(path);
+    if (content == NULL)
+        return -1;
+
+    if (strncmp(content, HEAD_PREFIX, strlen(HEAD_PREFIX)) == 0) {
+        free(content);
+        return 0;
+    }
+
+    nl = strchr(content, '\n');
+    if (nl != NULL)
+        *nl = '\0';
+
+    /* Anything that is neither "ref: ..." nor a well-formed raw object id is
+       a corrupt HEAD, and must NOT be reported as detached: callers use a
+       detached answer to decide they may overwrite HEAD with a raw id, which
+       would quietly launder the corruption into a valid-looking state. */
+    rc = sg_hex_to_sha1(content, id) == 0 ? 1 : -1;
+    free(content);
+    return rc;
+}
+
 int sg_ref_resolve_head(const char *git_dir, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
     char *branch = sg_ref_current_branch(git_dir);
     int rc;
 
+    /* No branch name means either a detached HEAD (a raw object id, which
+       sg_ref_read_path parses directly) or a HEAD we cannot make sense of.
+       Before Phase 18 both collapsed into -1 here, which every caller then
+       read as "this repo has no commits yet" -- so on a detached checkout
+       `sg commit` believed it was making a root commit, `sg status` printed
+       "No commits yet", and sg_safe_apply_tree compared the work tree
+       against an empty tree. Resolving the raw id keeps -1 meaning ONLY
+       "unborn HEAD", which is what the header promises callers. */
     if (branch == NULL)
-        return -1;
+        return sg_ref_read_path(git_dir, "HEAD", id_out);
     rc = sg_ref_read_branch(git_dir, branch, id_out);
     free(branch);
     return rc;
@@ -792,4 +831,36 @@ int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_
     if (rc != 0 && wrote_log)
         sg_reflog_truncate(git_dir, "HEAD", offset);
     return rc;
+}
+
+int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
+                             const char *reflog_msg)
+{
+    unsigned char old_id[SG_SHA1_RAW_LEN];
+    long long offset = 0;
+    int wrote_log = 0;
+
+    if (reflog_msg != NULL) {
+        /* The old value MUST come from sg_ref_resolve_head, not from
+           sg_ref_read_path(git_dir, "HEAD", ...): while HEAD is still
+           symbolic its file holds "ref: refs/heads/<b>", whose hex parse
+           necessarily fails, and the all-zeros fallback would record
+           "detached from <commit>" as if the commit had been created from
+           nothing. Real git writes the outgoing commit id there (measured,
+           git 2.55.0). Resolving through the branch is the only way to get
+           it, and is also why this cannot simply call sg_ref_update with a
+           ref_path of "HEAD" even though that would produce the right FILE. */
+        if (sg_ref_resolve_head(git_dir, old_id) != 0)
+            memset(old_id, 0, SG_SHA1_RAW_LEN); /* unborn HEAD: nothing to come from */
+        if (sg_reflog_append(git_dir, "HEAD", old_id, id, reflog_msg, &offset) != 0)
+            return -1;
+        wrote_log = 1;
+    }
+
+    if (write_ref_path_raw(git_dir, "HEAD", id) != 0) {
+        if (wrote_log)
+            sg_reflog_truncate(git_dir, "HEAD", offset);
+        return -1;
+    }
+    return 0;
 }

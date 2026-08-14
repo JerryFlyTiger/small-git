@@ -27,15 +27,28 @@ int sg_ref_branch_name_is_safe(const char *name);
    non-zero if name would be accepted as a new branch/tag name. */
 int sg_ref_name_valid_for_create(const char *name);
 
-/* Resolves HEAD -> refs/heads/<branch> -> that branch's current commit id.
-   Returns -1 if the branch has no commits yet (a brand new repo) -- callers
-   should treat that as "no parent commit", not an error. */
+/* Resolves HEAD to a commit id, through refs/heads/<branch> when HEAD is
+   symbolic and directly when it is detached (a raw object id).
+   Returns -1 only when there is no commit to resolve -- an unborn HEAD (a
+   brand new repo), or a HEAD that is neither form -- which callers should
+   treat as "no parent commit", not an error. Since Phase 18 a detached HEAD
+   resolves successfully; do NOT reintroduce code that reads -1 here as
+   "not on a branch", because those two states are no longer the same. */
 int sg_ref_resolve_head(const char *git_dir, unsigned char id_out[SG_SHA1_RAW_LEN]);
 
-/* The branch name HEAD currently points to (e.g. "master"), malloc'd. Phase 2
-   never produces a detached HEAD, so this always succeeds for a repo made by
-   sg_repo_init / sg switch. Returns NULL on failure. */
+/* The branch name HEAD currently points to (e.g. "master"), malloc'd.
+   Returns NULL when HEAD is detached, unreadable, or points outside
+   refs/heads/ -- use sg_ref_head_is_detached to tell those apart rather
+   than assuming NULL means detached. */
 char *sg_ref_current_branch(const char *git_dir);
+
+/* 1 if .git/HEAD holds a raw object id (detached), 0 if it is the usual
+   "ref: refs/heads/<b>" indirection, -1 if HEAD is missing, unreadable, or
+   holds something that is neither. The corrupt case is deliberately kept
+   distinct from the detached one: a caller that acts on "detached" may
+   overwrite HEAD with a raw id, which would launder a corrupt HEAD into a
+   valid-looking state instead of surfacing it. */
+int sg_ref_head_is_detached(const char *git_dir);
 
 int sg_ref_update_branch(const char *git_dir, const char *branch,
                          const unsigned char id[SG_SHA1_RAW_LEN]);
@@ -145,5 +158,20 @@ int sg_ref_update(const char *git_dir, const char *ref_path,
    reflog line is truncated back off. Returns 0, -1 on failure (allocation,
    or the HEAD file write). */
 int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_msg);
+
+/* Writes .git/HEAD as a raw 40-hex object id, i.e. detaches it. The mirror
+   of sg_ref_set_head, with the same reflog contract: reflog_msg == NULL
+   writes only HEAD; otherwise one line -- old/new possibly equal -- is
+   appended to logs/HEAD first and truncated back off if the HEAD write then
+   fails. old_id comes from sg_ref_resolve_head (all-zeros only for an
+   unborn HEAD), so detaching FROM a branch correctly records the commit
+   being left, which is what real git writes there (measured, git 2.55.0).
+
+   Not expressible via sg_ref_update(git_dir, "HEAD", ...): that produces the
+   same HEAD file, but reads old_id with sg_ref_read_path, which cannot parse
+   a still-symbolic HEAD and so silently logs all-zeros. Returns 0, -1 on
+   failure. */
+int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
+                             const char *reflog_msg);
 
 #endif
