@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(998 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1094 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 34 個單元測試二進位,任一失敗即整體失敗
+make test                         # 35 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -27,14 +27,14 @@ python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
 
 - 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
   的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
-- `make test` 那行的 `N/34 個跑到`,N 少於 34 就是**中途中止**(Makefile 在第一
+- `make test` 那行的 `N/35 個跑到`,N 少於 35 就是**中途中止**(Makefile 在第一
   個失敗的二進位就停),不是「其他都過了」。
 - 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
 - interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
   內的 `K skipped` 只要大於 0 就標 `warn`——interop.sh 有 63 個 `skip` 呼叫,
   少一個 `python3` 或 `git` 就整組 smart-HTTP 互通跳過而它自己照樣退出 0。
-  **`M` 自己也要看**:實測關掉 `HTTP_AVAILABLE` 後 `K` 只有 32,`M` 卻從 998 掉
-  到 886——`skip()` 只加 `SKIP` 不加 `TOTAL`,沒被 `skip()` 明講的那 80 項連數字
+  **`M` 自己也要看**:實測(Phase 17 當時,總數還是 998)關掉 `HTTP_AVAILABLE` 後
+  `K` 只有 32,`M` 卻從 998 掉到 886——`skip()` 只加 `SKIP` 不加 `TOTAL`,沒被 `skip()` 明講的那 80 項連數字
   都不留。只看 `N == M` 會把「少跑了一百多項」讀成滿分。
 
 `warn` 一律不影響退出碼(沒有 `-Werror`,讓 warning 直接判失敗會比下面的完成標準
@@ -94,12 +94,21 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 - **讀物件一律走 `sg_object_read`**(`include/sg/objstore.h:16`):先 loose 再 pack。
   除了 `loose.c`/`pack.c` 自己以外不要直接呼叫底層。
-- **所有 ref 與 HEAD 的寫入一律走 `sg_ref_update` / `sg_ref_set_head`**
-  (`include/sg/refs.h`),不要再手刻 `fopen` 寫 ref 檔、也不要再複製一份
-  `write_ref_file`。reflog 的兩條不對稱規則(具體 ref 的 log 只在
-  `old != new` 時追加;`logs/HEAD` 永遠追加,且與它所指分支的那一行逐位元組
-  相同)與「哪些 namespace 才記 log」的政策閘門都收在這兩支函式裡,繞過去就
-  會靜默漏寫——不會報錯,只是那幾行 reflog 悄悄不存在(Phase 17)。
+- **所有 ref 與 HEAD 的寫入一律走 `sg_ref_update` / `sg_ref_set_head` /
+  `sg_ref_set_head_detached`**(`include/sg/refs.h`),不要再手刻 `fopen` 寫
+  ref 檔、也不要再複製一份 `write_ref_file`。第三支是 Phase 18 加的,把 HEAD
+  寫成裸 40-hex(detached)。**不要改用
+  `sg_ref_update(git_dir, "HEAD", ...)` 走捷徑**——它寫得出同樣的檔案,但取
+  old_id 走 `sg_ref_read_path`,HEAD 還是 symref 時 hex 解析必然失敗、靜默記
+  成全零,於是「從 A 分離到 B」被寫成「憑空建出 B」。
+
+  reflog 的兩條不對稱規則(具體 ref 的 log 只在 `old != new` 時追加;
+  `logs/HEAD` 永遠追加,且與它所指分支的那一行逐位元組相同)與「哪些 namespace
+  才記 log」的政策閘門都收在這三支函式裡,繞過去就會靜默漏寫——不會報錯,只是
+  那幾行 reflog 悄悄不存在(Phase 17)。**那兩條規則不只是要遵守的限制,也是可
+  以拿來用的工具**:Phase 18 的 rebase 收尾就是靠「先更新分支(HEAD 仍
+  detached → 不鏡射)、再接回 HEAD(old==new 但 HEAD 不做 no-op 抑制)」這個
+  順序,不寫任何特例就長出真 git 的 reflog 形狀。
 - **`util/` 裡沒有字串緩衝區、也沒有路徑處理**。路徑解析、`mkdir -p`、讀寫檔
   在 `include/sg/workdir.h`(`sg_resolve_repo_path`、`sg_mkdir_parents`、
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
@@ -125,6 +134,13 @@ staging 的驗證。本機綠燈不是充分證據。**
   **建立**新 ref 時的 check-ref-format 驗證另有一支
   `sg_ref_name_valid_for_create`(`include/sg/refs.h`),branch 與 tag 共用;
   三者規則不同,標頭註解有寫分工,挑錯會留洞。
+- **detached HEAD 是一等狀態(Phase 18)**。`sg_ref_resolve_head` 的 -1 現在
+  **只**代表 unborn HEAD,不再兼指 detached——不要再寫「resolve 失敗 = 不在分
+  支上」的程式碼。要問「是不是 detached」用 `sg_ref_head_is_detached`,它是三
+  態:1 detached、0 symbolic、**-1 損壞**。損壞刻意與 detached 分開,因為
+  detached 這個答案正是呼叫端用來決定「可以把裸 sha 寫進 HEAD」的依據,混在一
+  起會把損壞的 HEAD 洗成看起來正常的狀態。`sg_ref_current_branch` 回 NULL 同
+  樣有這兩種成因,四個會因此拒絕的指令(merge/reset/rebase/push)都已分流。
 - **使用者給的 revision 字串一律走 `sg_rev_parse_commit`**
   (`include/sg/revparse.h`):`HEAD`/tag/分支/完整 40-hex/完整 `refs/...` 路徑,
   加 `~N`/`^N`/`@{N}`(Phase 17,reflog 索引,必須緊接在 ref 名之後、純數字、
@@ -213,7 +229,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 34 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 35 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。

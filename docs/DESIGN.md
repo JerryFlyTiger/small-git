@@ -1117,7 +1117,10 @@ revision 字串的唯一入口,打錯一個字元被靜默解到附近但錯誤�
    會讓在 sg repo 上跑 `git reflog` 的人被誤導成「這是用 ort 合併的」。保留
    git 的文法外殼(它自己的策略名本來就會隨版本變,`'recursive'`→`'ort'`就
    是先例),只把策略名換成誠實的自己的名字。
-2. **detached HEAD 的 `switch` 不寫 reflog 行**。真 git 在這個情境下寫
+2. ~~**detached HEAD 的 `switch` 不寫 reflog 行**~~——**Phase 18 已解決**,
+   底下這段診斷的兩個選項都選了第一個:改共用函式,並逐一盤過 21 個呼叫端。
+   原文保留,因為它對「為什麼當時不該單獨補這個角落」的判斷仍然成立。
+   真 git 在這個情境下寫
    `checkout: moving from <40-hex> to <target>`(實測)。試過照做,行不通:
    `sg_ref_resolve_head`(`include/sg/refs.h`)對 detached HEAD 直接回
    -1——它只認 symbolic HEAD,所以 fallback 邏輯從未被觸發過。要做對,要嘛
@@ -1135,7 +1138,10 @@ revision 字串的唯一入口,打錯一個字元被靜默解到附近但錯誤�
    **與 git 一致**(git 也要等到第一次 `fetch` 才第一次寫那份 log),但因為
    直覺上「clone 應該把一切都寫好」而顯得反直覺,特地記下來,免得日後有人
    把它當 bug「修好」。
-5. **rebase 的 reflog 形狀留給 Phase 18**。真 git 的 rebase 全程在 detached
+5. ~~**rebase 的 reflog 形狀留給 Phase 18**~~——**Phase 18 已完成**,做法正是
+   底下這段所描述的:改成 detached 模型,而不是補一組形狀對不上的假訊息。
+   原文保留,它把「為什麼加訊息字串解決不了」講清楚了。
+   真 git 的 rebase 全程在 detached
    HEAD 上重放每個 commit,只在最後一次性把分支搬過去,所以分支自己的 log
    只有一行、`logs/HEAD` 有 `rebase (start)`/`(pick)`/`(finish)` 一串。sg 的
    rebase 從不 detach,每 pick 一個 commit 就直接搬一次分支 ref——結構上就
@@ -1184,6 +1190,65 @@ revision 字串的唯一入口,打錯一個字元被靜默解到附近但錯誤�
   一行內容確實相同。只有額外斷言**行數**(`wc -l`)才分得出「該有一行」與
   「多寫了一行」。
 
+### 第三輪冷讀:模型改動把 `--abort` 的一個不變式弄壞了
+
+段二交出去冷讀,抓到一個**高嚴重度、而且它自己重現過**的問題,是這次改動直接
+造成的。
+
+`finish_rebase` 是**兩次寫入**:先推進分支,再把 HEAD 接回去。我把 `--abort`
+的分支還原拿掉了,理由是「分支從頭到尾沒被動過」——那個理由只在整場 rebase
+是原子的時候成立。若在那兩次寫入之間被中斷(crash、SIGKILL、`sg_ref_set_head`
+的暫時性 I/O 失敗),分支已經停在 rebase 後的 tip,而 `.git/sg-rebase/` 還在。
+此時 `sg rebase --abort` 會:
+
+- 把工作目錄還原成 **rebase 前**的樹,
+- 把 HEAD 接回分支(而分支**已經**在 rebase 後的 tip),
+- 刪掉序列器狀態、**退出 0**,並印「'topic' is back at <orig>」。
+
+三者互相矛盾,而且是**假成功**。沒有 commit 永久遺失(新 tip 仍由分支可達),
+但工具說了謊。舊版的 `--abort` 無條件把分支重設回 `orig_head`,對任何中間狀態
+都是穩健的;新版依賴一個這條路徑自己就能打破的不變式。
+
+修法剛好不必取捨:`--abort` 恢復成無條件還原分支,而且**不影響 reflog 形狀**
+——`sg_ref_update_branch` 傳 NULL 訊息,永遠不寫 log 行;正常情況下值也沒變。
+寫入順序是「先分支(HEAD 仍 detached,不會鏡射)、再接回 HEAD」。
+
+這個情境**不能靠還原某一行來做 mutation 驗證**(它是缺少的防禦,不是壞掉的既
+有邏輯),但可以**製造那個中斷狀態**來測,interop 就是這樣寫的。把修法拿掉會
+讓那兩條精準變紅。
+
+同一輪還有兩件事:
+
+- **`<oid>` 正規化把 `onto` 的正確性蓋掉了**。分支的 finish 行是唯一嵌入完整
+  40-hex 的 rebase 訊息,而雙軌比對前會把任何 40-hex 換成 `<oid>`——所以把
+  `state->onto` 換成新 tip 或 `orig_head`,**整組 phase18f 都不會紅**。冷讀特別
+  要求主對話實跑這條 mutation 驗證它的預測,實跑確認它說對了。已補一條不經正
+  規化的直接斷言(外加一條前提檢查,確保 onto 與結果 tip 真的不同,否則那條斷
+  言自己就沒有鑑別力)。
+- **fast-forward 路徑的中斷窗口沒有任何標記**。冷讀說它「重跑就自癒」,實測
+  **是錯的**:重跑 `sg rebase <upstream>` 會因為 HEAD 是 detached 而被拒絕、
+  `--abort` 說「沒有進行中的 rebase」,只剩一個要確認的 `sg switch` 能脫身。
+  一般路徑在動任何東西之前就寫序列器狀態,ff 沒有;現在也寫了(純粹為了讓那個
+  窗口可救),收尾再刪掉。
+
+### oracle 的環境本身要被宣告
+
+phase18f 的 `(continue)` 那組本機全綠、**每一台 CI runner 都紅**(Linux 與 macOS
+皆然)。為此加的診斷輸出直接給出答案,而且推翻了原本的假設(「git 在 2.54 與
+2.55 之間改了訊息」):git 那一軌**一行 rebase 紀錄都沒寫**——不是訊息不同,是
+rebase 根本沒完成。`git rebase --continue` 要開編輯器,沒有編輯器就失敗。
+
+本機會過,是因為這台機器的 shell 匯出了 `GIT_EDITOR=true`。
+
+這件事的教訓不是「要設 GIT_EDITOR」,而是:**「拿真 git 當 oracle」這句話,只有
+在 oracle 的執行環境也被測試套件自己決定時才成立**。那次測量是真的,但它是透過
+一個測試從未宣告、剛好存在於開發者 shell 裡的設定取得的。interop.sh 現在自己
+`export GIT_EDITOR=true`,並在註解裡寫明理由。
+
+順帶一提,驗證這個修法時第一次的「乾淨環境」模擬做過頭了——連 git config 一起
+關掉,於是 git 找不到 committer 身分,整個套件在第一步就結束,輸出是空的。**空
+輸出讀起來跟通過一模一樣**,只有實際看行數才會發現。
+
 ### 無法驗證(如實記錄)
 
 - 兩處 malloc 失敗分支(`cmd_commit.c`、`cmd_switch.c` 建構 reflog 訊息字串
@@ -1216,3 +1281,185 @@ revision 字串的唯一入口,打錯一個字元被靜默解到附近但錯誤�
 位全過(新增 `tests/test_ref_update.c` 與 `tests/test_reflog_messages.c`;
 `tests/test_reflog.c` 是 Phase 15 就有的檔案層測試),
 `make sanitize` 乾淨,子指令從 23 個增加到 24 個(新增 `sg reflog`)。
+
+## Phase 18:detached HEAD,與 rebase 的 reflog 形狀
+
+Phase 17 把兩件事留在這裡(見上面「刻意的 divergence」第 2、5 條)。它們看起
+來是兩個題目,實際上是同一個:真 git 的 rebase 全程在 detached HEAD 上重放,
+所以不先把 detached HEAD 變成 sg 真正理解的狀態,rebase 的 reflog 形狀在結構
+上就對不齊。
+
+### 根因:一個 -1 同時表示兩件事
+
+`sg_ref_resolve_head` 在 `sg_ref_current_branch` 回 NULL 時直接回 -1,把
+「HEAD 是 detached」與「HEAD 是 unborn(repo 剛建、還沒有 commit)」壓成同一
+個失敗。**21 個呼叫端全部把它讀成後者**——標頭註解也是這樣寫的。
+
+這不是一個「等 Phase 18 才會發生」的問題。真 git 隨時可以把任何 sg repo 變成
+detached(`git checkout --detach`),而在那個狀態下 sg 不是拒絕,是**安靜地答
+錯**:
+
+- `sg log` 印「fatal: your current branch does not have any commits yet」,
+  下面壓著一整段完好的歷史。
+- `sg status` 把 HEAD 的樹算成空的,於是乾淨的工作目錄被報成「每個追蹤中的
+  檔案都是新增」。
+- `sg_safe_apply_tree` 共用同一段計算,所以 `sg switch` 在覆寫工作目錄前,是
+  拿空樹去判斷它即將蓋掉什麼。
+- `sg branch <name>` 回「目前的分支還沒有任何 commit」而拒絕建分支。
+- `sg stash push`/`pop` 直接失敗;而 `sg_snapshot_create` 會把快照記成 **root
+  commit**——安全網自己把 parent 連結弄丟了。
+
+修法是讓 detached 的 HEAD 真的解出它的裸 sha,-1 只剩「unborn」。21 個呼叫端
+逐一盤過,**沒有任何一處把這個失敗當成 detached 守衛在用**,所以沒有人因此失
+去守衛;三個真的要拒絕 detached 的指令(reset、rebase、push)判斷的是
+`sg_ref_current_branch`,不受影響。
+
+`sg_ref_head_is_detached` 刻意是三態(1/0/-1):**「損壞的 HEAD」不是
+「detached」**。這個區分有實際後果——detached 這個答案正是呼叫端用來決定「我
+可以把裸 sha 寫進 HEAD」的依據,把損壞當成 detached,等於把損壞洗成一個看起來
+正常的狀態。
+
+### 為什麼 detach 不能借用 `sg_ref_update(git_dir, "HEAD", ...)`
+
+Phase 17 收斂 ref 寫入時,`sg_ref_update` 順帶就具備了寫裸 sha 到 HEAD 的能力
+(`ref_path_reflog_allowed` 早就放行 `"HEAD"`,`write_ref_path_raw` 對 ref_path
+一視同仁)。踏勘因此建議直接用它,**那是錯的,而且錯得很安靜**:它取 old_id 走
+`sg_ref_read_path`,而 HEAD 還是 `ref: refs/heads/<b>` 的時候那個 hex 解析必然
+失敗,fallback 是全零——於是「從 commit A 分離到 B」被記成「憑空建出 B」。真
+git 在那一格寫的是離開的那個 commit(實測)。
+
+所以有了 `sg_ref_set_head_detached`,它的 old_id 走**修好之後的**
+`sg_ref_resolve_head`,symbolic 與裸 sha 兩種形狀都解得出來。定向 mutation 把
+它換回 `sg_ref_read_path`,只有「從分支 detach」那條斷言變紅,「從 detached 再
+detach」照樣綠——因為後者 HEAD 已經是裸 sha 了。兩條測試分屬不同來源形狀,缺
+一條就會留下這個死角。
+
+### `at` 還是 `from`:標籤不在 HEAD 裡,在 reflog 裡
+
+`HEAD detached at <x>` / `from <x>` 的 `<x>` **不是**現在的 HEAD,是當初的分離
+點,而分離點要回頭掃 `logs/HEAD` 最後一筆 `checkout: moving from ... to <y>`
+才知道。實測(git 2.55.0)出來的完整規則:
+
+- `<y>` 這個 token 現在**仍然解析到同一個 commit** 時就用它,否則退回縮寫 id。
+  所以移走的 tag、或 `HEAD~1` 這種本來就不是 ref 的運算式,都會退成 id。
+- 剝掉 `refs/tags/` 與 `refs/remotes/` 前綴,**但不剝 `refs/heads/`**——git 真
+  的會印 `HEAD detached at refs/heads/other`。
+- 字面 token `"HEAD"` 不算(`sg switch --detach HEAD` 印的是 id)。用 HEAD 來
+  說明 HEAD 在哪,本來也沒有資訊。
+- `at` 與 `from` 的分界是**值的比較**,不是「有沒有發生過什麼」:`reset --hard`
+  回到分離點會變回 `at`。
+- `logs/HEAD` 裡完全沒有 checkout 條目時,git 放棄這套措辭,改印
+  `Not currently on any branch.` / `* (no branch)`。
+
+### finish 的順序,讓兩條既有規則自己產出 git 的形狀
+
+rebase 改成 detached 模型之後,收尾的兩步順序是有意義的,而且**不需要任何特例**:
+
+1. **先**更新分支。此刻 HEAD 還是 detached,`sg_ref_update` 的 rule 2
+   (`is_current_branch`)因此是 0,那一行**不會**被鏡射進 `logs/HEAD`——分支
+   於是只拿到它該有的那一行 `rebase (finish): <ref> onto <onto>`。
+2. **再**把 HEAD 接回分支。old == new(兩邊都是最終 tip),而 `logs/HEAD` 從不
+   做 no-op 抑制(rule 1 的不對稱性),所以 `returning to` 那行照樣寫得出來。
+
+兩條在 Phase 17 就量好的規則,擺對順序就剛好是 git 的輸出。把兩步對調會讓五條
+檢查變紅,其中包含「finish 那行 old == new」。
+
+`--abort` 因此也變簡單了:分支全程沒被動過,只要把 HEAD 接回去。真 git 的分支
+log 在 abort 後同樣一行未增,理由一模一樣——值沒變,rule 1 抑制掉了。
+
+### 範圍是被逼著改的:`sg reset` 必須支援 detached HEAD
+
+開工時談定的範圍是「merge / reset / 從 detached 起手的 rebase 維持拒絕」。那個
+決定的前提是「detached 只可能由使用者或真 git 造成」。段二把 rebase 改成
+detached 模型之後,前提消失了:**暫停中的 rebase 現在自己就是 detached**,而
+`reset` 拒絕 detached 會直接拿掉「rebase 暫停中可以 reset」——那是 Phase 14 建
+立並對真 git 量過的能力,7 條 interop 因此變紅。真 git 允許它,原因完全相同:
+它自己的 rebase 也是 detached。
+
+所以 `reset` 開了,`merge` 與「從 detached 起手的 rebase」維持拒絕。兩條原本釘
+著「reset 在 detached 下必須拒絕」的既有測試**反過來改寫**——它們現在是錯的。
+順手把 reset 三種 mode 裡逐字重複三次的 ref 寫入收斂成 `move_head_to`。
+
+這件事本身是個教訓:**範圍決定會被後續的實作推翻**,而推翻它的是既有測試變紅,
+不是有人想起來。
+
+### 冷讀抓到的:三個「沒有斷言」而不是「斷言寫錯」
+
+段一交出去冷讀時,18a–18d 已經驗了 HEAD 檔案、兩份 reflog、ref、`status` 與
+`branch` 的措辭——**卻沒有任何一條讀 `switch` 自己的 stdout**。三個與真 git 的
+分歧就活在那個縫裡:
+
+1. `Previous HEAD position was ...` 綁在「切到分支」上,所以 detach→detach 完全
+   不印。它其實屬於「**離開** detached HEAD」。修的時候我又把規則弄錯了一次
+   ——真 git 只在 **commit 真的改變**時才印,同 commit 的三種組合都不印——新測
+   試在一分鐘內抓到。
+2. `sg switch --detach HEAD` 印出 `HEAD detached at HEAD`。
+3. 描述用的緩衝區只有 512 bytes,更長的 ref 名讓整個函式失敗,而 `status` 把那
+   個失敗渲染成 `Not currently on any branch.`——對一個明明 detached 的 HEAD 說
+   「不在任何分支上」,那不是資訊變少,是資訊變錯。
+
+三個都是**缺少斷言**,不是斷言寫錯。這是本專案第一次明確遇到這一類:測試覆蓋
+的維度(檔案內容、退出碼、reflog)全都對,只是少了一整個維度(stdout)。
+
+### 假覆蓋:這一輪抓到四個
+
+1. **標籤與情境錯開一格**:顯示那組案例用 `sg commit` 移動 HEAD,但當時
+   `sg commit` 在 detached 下還被拒絕,commit 根本沒發生,於是後面每個案例都往
+   前挪了一格,「at 應該變 from」被斷言成反的,**而且全部通過**。之所以看得出
+   來,是因為那個 helper 把比較到的字串印進 check 標籤裡。此後改用 git 移動
+   HEAD:這一節測的是措辭,不該因為 sg 的寫入能力退步而靜靜變成 no-op。
+2. **靠無關的理由通過**:「tag 被移走所以退回 id」那個案例,前一案剛好把 HEAD
+   留在目標 commit 上,而 git 對「沒有移動的 checkout」不寫 reflog——於是分離點
+   仍是更早那筆的 `HEAD~1`,退回 id 是因為 `HEAD~1` 本來就不是 ref。答案對,理
+   由完全無關,把被測的守衛刪掉照樣通過。
+3. **`cmp` 兩個空檔會成功**:雙軌比對前先斷言行數,否則一個什麼都沒做的
+   fixture 會報告「完全相符」。
+4. **走不到被測的那行**:`push` 的 detached/corrupt 訊息分流排在遠端 ref 廣播
+   之後,沒有活的 remote 就永遠走不到。第一版斷言在「remote 未設定」就先失敗
+   而通過。已拿掉並記進下面的無法驗證清單。
+
+另外,**重複的字串會讓 mutation 說謊**:`"rebase (start): checkout %s"` 有兩
+份,一次沒加 `/g` 的 mutation 只改到第一份,於是「plain/continue/skip 都沒紅、
+只有 fast-forward 紅」看起來像是覆蓋不足,實際上是驗證工具只改了一半。收斂成
+一個常數。
+
+### 工具:`tests/mutate.sh` 的名字會進 mktemp 樣板
+
+mutation 名字裡有 `/` 會讓 `mkdtemp` 失敗(「No such file or directory」)。腳
+本是大聲失敗的(退出 1),但錯誤訊息看起來像環境問題而不像「你的名字取壞
+了」,實測浪費了兩輪才看懂。名字現在會先過濾成安全字元。
+
+### 刻意維持的 divergence
+
+- **`sg merge` 與「從 detached HEAD 起手的 `sg rebase`」仍然拒絕**。真 git 三
+  者都支援。這是範圍決定,不是做不到,所以用 interop 釘住而不是任其漂移;訊息
+  也從「failed to determine current branch」改成明講 detached——把 detached 說
+  成「讀不到某個東西」,只有在那個狀態不可達的時候才勉強站得住。
+- **`sg status` 沒有 git 那句 `interactive rebase in progress`**。實測發現真
+  git 即使沒加 `-i` 也印 interactive(2.26 起 merge backend 沿用 interactive
+  機制),sg 沒有 `-i`,照抄會是誤導。
+
+### 無法驗證(如實記錄)
+
+- `sg_ref_detach_description` 緩衝區放不下時退回縮寫 id 的那個分支:label 長度
+  上限來自 `ref_path[SG_PATH_MAX]`(4096,而 `sg_rev_parse_ref_path` 對放不下
+  的名字本來就回 -1),加上 `"HEAD detached from "` 共 4116 bytes,兩個呼叫端的
+  緩衝區都是 4160 → **就現有呼叫端而言永遠走不到**。兩輪冷讀各自獨立算過同一
+  條式子。不是結構性死碼(未來若有第三個呼叫端傳入較小的緩衝區就會觸發),所
+  以守衛保留,但如實記成沒有覆蓋。
+- `cmd_push.c` 的 detached / corrupt HEAD 訊息分流:它的 HEAD 檢查排在遠端 ref
+  廣播之後,要一個活的 remote 才走得到。改了但沒有斷言。
+- **「`--abort` 不動分支的 reflog」這條檢查是被規則保證的,不是被程式碼選擇保
+  證的**:abort 把分支還原成它本來就有的值,rule 1 的 no-op 抑制會擋掉任何寫
+  入,所以改 abort 自己的程式碼**沒有任何 mutation 能讓它變紅**(試過一個)。留
+  著當形狀的迴歸守衛,但它不能當成「abort 選擇不寫」的證據。
+- `finish_rebase` 兩次寫入之間、以及 fast-forward 路徑 detach 之後的**中斷
+  窗口本身**無法在測試裡真的觸發(沒有故障注入機制)。做法是**製造**中斷後的
+  磁碟狀態再驗 `--abort` 救得回來,那覆蓋的是復原邏輯,不是窗口的存在。
+- phase18e 的 branch→detach 案例對「commit 有沒有改變」這條新規則是無效覆蓋:
+  HEAD 從分支出發時 `have_prev_commit` 恆為 0,那個 `memcmp` 根本走不到。它是
+  重構的迴歸防護,不是新邏輯的覆蓋——標籤已經照實寫。
+
+最終 `tests/interop.sh` 1094 項檢查(Phase 17 結束時是 998),`make test` 35 支
+二進位全過(新增 `tests/test_head_detach.c`),`make sanitize` 乾淨,子指令維持
+24 個(`sg switch` 新增 `--detach`)。

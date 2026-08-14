@@ -52,7 +52,12 @@ if [ ! -f "$PROJECT_ROOT/$FILE" ]; then
     exit 2
 fi
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/sg_mutate_${NAME}_XXXXXX") || exit 1
+# 名稱只是給人看的標籤,可以有空白、斜線、中文。斜線會被 mkdtemp 當成路徑
+# 分隔而整個失敗("No such file or directory"),所以這裡只取安全字元當目錄名。
+# 失敗是大聲的(mktemp 印錯誤、腳本退出 1),但錯誤訊息看起來像環境問題而不像
+# 「你的名字取壞了」,實測浪費了兩輪才看懂 —— 直接不讓它發生。
+NAME_SLUG=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '_')
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/sg_mutate_${NAME_SLUG}_XXXXXX") || exit 1
 echo "mutation '$NAME' 的工作目錄: $WORK"
 
 # 用工作樹的現況而不是 HEAD:要驗的往往正是還沒 commit 的改動。

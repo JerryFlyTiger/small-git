@@ -416,9 +416,20 @@ int sg_cmd_merge(int argc, char **argv)
 
         has_head = (sg_ref_resolve_head(git_dir, ours_commit) == 0);
 
+        /* Real git can merge on a detached HEAD (it just moves HEAD and no
+           branch); sg deliberately does not, because merge's whole write
+           path below assumes a branch ref to advance. Phase 18 scope stops
+           here on purpose. What it does fix is the wording: this used to say
+           "failed to determine current branch", which described a detached
+           HEAD as an internal failure to read something -- the state was
+           unreachable then, so nobody had to name it. Same phrasing as
+           reset's and rebase's refusals. */
         current_branch = sg_ref_current_branch(git_dir);
         if (current_branch == NULL) {
-            fprintf(stderr, "sg: failed to determine current branch\n");
+            if (sg_ref_head_is_detached(git_dir) == 1)
+                fprintf(stderr, "sg: 目前是 detached HEAD，無法 merge（HEAD 必須指向一個分支）\n");
+            else
+                fprintf(stderr, "sg: failed to determine current branch\n");
             free(git_dir);
             free(repo_root);
             return 1;

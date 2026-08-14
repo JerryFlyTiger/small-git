@@ -86,7 +86,7 @@ sg undo 1                     # 內容回來了
 | `log` | 顯示 commit 歷史 |
 | `status` | 顯示工作目錄狀態 |
 | `diff` | 顯示尚未暫存的變更 |
-| `switch` | 切換分支(`-c` 建立新分支) |
+| `switch` | 切換分支(`-c` 建立新分支,`--detach` 直接指向某個 commit) |
 | `branch` | 列出、建立或刪除分支(`-d` 刪除) |
 | `restore` | 還原檔案或取消暫存(`--staged`) |
 | `undo` | 列出或還原自動快照 |
@@ -111,13 +111,17 @@ sg undo 1                     # 內容回來了
 - commit、branch、switch、reset、merge、fetch、push、clone、stash 都會寫一筆與真 git 相容的
   reflog,`git reflog` 可以直接讀 `sg` 產生的歷史,`sg reflog` 也讀得懂 `git` 產生的。
   `<ref>@{N}` 可在任何吃 revision 的指令中使用(例如 `sg reset master@{2}`)。
-  **`sg rebase` 目前不寫 reflog**——真 git 的 rebase 全程在 detached HEAD 上重放、
-  最後才搬一次分支,而 `sg` 每 replay 一個 commit 就搬一次,兩者的 ref 移動序列
-  本來就不同,硬湊會產生與實際動作矛盾的紀錄。理由詳見 `docs/DESIGN.md` 的 Phase 17。
+  `sg rebase` 的 reflog 形狀也與真 git 一致:全程在 detached HEAD 上重放,
+  `logs/HEAD` 拿到 `rebase (start)` / 每個 commit 一行 / `rebase (finish)`,而分支
+  自己的 log 不論重放幾個 commit 都只增加一行(Phase 18)。
+- **detached HEAD 是一等狀態**:`sg switch --detach <rev>` 進入,`sg switch <branch>`
+  離開;其間 `commit`/`reset`/`branch`/`stash`/`log`/`status` 都正常運作,狀態描述
+  (`HEAD detached at/from <id>`)與真 git 逐字相同。`merge` 與「從 detached 起手的
+  rebase」刻意仍拒絕。
 - `sg` 建立的 repo 可以直接用 `git` 操作,通過 `git fsck --strict`;`git` 建立的 repo 也可以
   直接用 `sg` 操作,包含 `git gc` 之後把 ref 收進 `packed-refs`、把物件打包成 pack 的狀態。
 - 網路端實作 smart HTTP,可與真實的 git 伺服器互通(clone/fetch/push)。
-- 測試套件 `tests/interop.sh` 有 998 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
+- 測試套件 `tests/interop.sh` 有 1094 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
   (含一個本機 `git http-backend` 伺服器)來驗證,而不是自己跟自己比對。
 
 **唯一的例外是啟用分塊之後**——那時 tree 裡放的是指標 blob,`git checkout` 會拿到指標文字。

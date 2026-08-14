@@ -1,6 +1,7 @@
 #include "sg/refs.h"
 
 #include "sg/reflog.h"
+#include "sg/revparse.h"
 #include "sg/workdir.h"
 
 #include <dirent.h>
@@ -184,13 +185,180 @@ int sg_ref_read_branch(const char *git_dir, const char *branch, unsigned char id
     return rc;
 }
 
+int sg_ref_head_is_detached(const char *git_dir)
+{
+    char path[SG_PATH_MAX];
+    char *content;
+    char *nl;
+    unsigned char id[SG_SHA1_RAW_LEN];
+    int rc;
+
+    snprintf(path, sizeof(path), "%s/HEAD", git_dir);
+    content = read_small_file(path);
+    if (content == NULL)
+        return -1;
+
+    if (strncmp(content, HEAD_PREFIX, strlen(HEAD_PREFIX)) == 0) {
+        free(content);
+        return 0;
+    }
+
+    nl = strchr(content, '\n');
+    if (nl != NULL)
+        *nl = '\0';
+
+    /* Anything that is neither "ref: ..." nor a well-formed raw object id is
+       a corrupt HEAD, and must NOT be reported as detached: callers use a
+       detached answer to decide they may overwrite HEAD with a raw id, which
+       would quietly launder the corruption into a valid-looking state. */
+    rc = sg_hex_to_sha1(content, id) == 0 ? 1 : -1;
+    free(content);
+    return rc;
+}
+
+/* Real git's grab_1st_switch: scan logs/HEAD newest-first for the first
+   "checkout: moving from <x> to <y>" line and take <y> -- everything after
+   the FIRST " to " in the remainder, so a ref whose own name contains " to "
+   confuses this exactly as much as it confuses git. */
+#define CHECKOUT_PREFIX "checkout: moving from "
+
+static int find_checkout_target(const sg_reflog *log, size_t *index_out, const char **target_out)
+{
+    size_t i;
+
+    for (i = log->count; i > 0; i--) {
+        const char *msg = log->entries[i - 1].message;
+        const char *rest;
+
+        if (strncmp(msg, CHECKOUT_PREFIX, strlen(CHECKOUT_PREFIX)) != 0)
+            continue;
+        rest = strstr(msg + strlen(CHECKOUT_PREFIX), " to ");
+        if (rest == NULL)
+            continue;
+        *index_out = i - 1;
+        *target_out = rest + 4;
+        return 0;
+    }
+    return -1;
+}
+
+static int detach_point(const char *git_dir, unsigned char oid_out[SG_SHA1_RAW_LEN], char **label_out)
+{
+    sg_reflog log;
+    size_t idx;
+    const char *target;
+    const unsigned char *noid;
+    unsigned char resolved[SG_SHA1_RAW_LEN];
+    char ref_path[SG_PATH_MAX];
+    char hex[SG_SHA1_HEX_LEN + 1];
+    char *label = NULL;
+
+    if (sg_reflog_read(git_dir, "HEAD", &log) != 0)
+        return -1;
+    if (find_checkout_target(&log, &idx, &target) != 0) {
+        sg_reflog_free(&log);
+        return -1; /* no checkout ever recorded: real git falls back to "no branch" */
+    }
+
+    noid = log.entries[idx].new_id;
+    memcpy(oid_out, noid, SG_SHA1_RAW_LEN);
+
+    /* The label is the ORIGINAL token only while it still names that same
+       commit: a tag that has since moved, or an expression like "HEAD~1"
+       that was never a ref at all, both fall back to the abbreviated id.
+       refs/tags/ and refs/remotes/ are stripped but refs/heads/ is NOT --
+       git prints "HEAD detached at refs/heads/other" in full (measured,
+       2.55.0). Tag peeling comes free with sg_rev_parse_commit, matching
+       git's lookup_commit_reference_gently second chance. */
+    /* "HEAD" is excluded even though sg_rev_parse_ref_path happily maps it to
+       itself: that mapping exists so revparse can handle "HEAD~1", not to
+       claim HEAD is a name for a fixed commit. Real git does not use it as a
+       label either -- `git switch --detach HEAD` reports the abbreviated id,
+       not "HEAD detached at HEAD" (measured, 2.55.0), even though it writes
+       the same "to HEAD" reflog line sg does. Naming the detach point "HEAD"
+       would also be self-referential: it describes where HEAD is by saying
+       "HEAD". */
+    if (strcmp(target, "HEAD") != 0 &&
+       sg_rev_parse_ref_path(git_dir, target, ref_path, sizeof(ref_path)) == 0 &&
+       sg_rev_parse_commit(git_dir, target, resolved) == 0 &&
+       memcmp(resolved, noid, SG_SHA1_RAW_LEN) == 0) {
+        static const char tag_prefix[] = "refs/tags/";
+        static const char remote_prefix[] = "refs/remotes/";
+        const char *shown = ref_path;
+
+        if (strncmp(shown, tag_prefix, strlen(tag_prefix)) == 0)
+            shown += strlen(tag_prefix);
+        else if (strncmp(shown, remote_prefix, strlen(remote_prefix)) == 0)
+            shown += strlen(remote_prefix);
+        label = strdup(shown);
+    } else {
+        sg_sha1_to_hex(noid, hex);
+        hex[7] = '\0';
+        label = strdup(hex);
+    }
+
+    sg_reflog_free(&log);
+    if (label == NULL)
+        return -1;
+    *label_out = label;
+    return 0;
+}
+
+int sg_ref_detach_description(const char *git_dir, char *buf, size_t buf_size)
+{
+    unsigned char point[SG_SHA1_RAW_LEN];
+    unsigned char head[SG_SHA1_RAW_LEN];
+    char *label;
+    int at;
+    int written;
+
+    if (detach_point(git_dir, point, &label) != 0)
+        return -1;
+
+    /* "at" while HEAD still sits on the recorded detach point, "from" once
+       it has moved -- a value comparison, not "has anything happened": real
+       git goes back to "at" after a reset --hard returns HEAD to that commit
+       (measured, 2.55.0). Either way the label describes the DETACH POINT,
+       never where HEAD is now. */
+    at = sg_ref_resolve_head(git_dir, head) == 0 && memcmp(head, point, SG_SHA1_RAW_LEN) == 0;
+
+    written = snprintf(buf, buf_size, "HEAD detached %s %s", at ? "at" : "from", label);
+    free(label);
+    if (written >= 0 && (size_t)written < buf_size)
+        return 0;
+
+    /* A ref name too long for the caller's buffer degrades to the
+       abbreviated id, which is the same fallback an unresolvable label
+       already takes. Reporting "no detach point" here instead would make
+       `status` announce "Not currently on any branch." for a HEAD that is
+       plainly detached -- wrong information rather than less of it. Real git
+       has no such limit and always prints the full name; this is sg's own
+       bounded-buffer degradation, not a measured behaviour. */
+    {
+        char hex[SG_SHA1_HEX_LEN + 1];
+
+        sg_sha1_to_hex(point, hex);
+        hex[7] = '\0';
+        written = snprintf(buf, buf_size, "HEAD detached %s %s", at ? "at" : "from", hex);
+    }
+    return (written >= 0 && (size_t)written < buf_size) ? 0 : -1;
+}
+
 int sg_ref_resolve_head(const char *git_dir, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
     char *branch = sg_ref_current_branch(git_dir);
     int rc;
 
+    /* No branch name means either a detached HEAD (a raw object id, which
+       sg_ref_read_path parses directly) or a HEAD we cannot make sense of.
+       Before Phase 18 both collapsed into -1 here, which every caller then
+       read as "this repo has no commits yet" -- so on a detached checkout
+       `sg commit` believed it was making a root commit, `sg status` printed
+       "No commits yet", and sg_safe_apply_tree compared the work tree
+       against an empty tree. Resolving the raw id keeps -1 meaning ONLY
+       "unborn HEAD", which is what the header promises callers. */
     if (branch == NULL)
-        return -1;
+        return sg_ref_read_path(git_dir, "HEAD", id_out);
     rc = sg_ref_read_branch(git_dir, branch, id_out);
     free(branch);
     return rc;
@@ -792,4 +960,36 @@ int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_
     if (rc != 0 && wrote_log)
         sg_reflog_truncate(git_dir, "HEAD", offset);
     return rc;
+}
+
+int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
+                             const char *reflog_msg)
+{
+    unsigned char old_id[SG_SHA1_RAW_LEN];
+    long long offset = 0;
+    int wrote_log = 0;
+
+    if (reflog_msg != NULL) {
+        /* The old value MUST come from sg_ref_resolve_head, not from
+           sg_ref_read_path(git_dir, "HEAD", ...): while HEAD is still
+           symbolic its file holds "ref: refs/heads/<b>", whose hex parse
+           necessarily fails, and the all-zeros fallback would record
+           "detached from <commit>" as if the commit had been created from
+           nothing. Real git writes the outgoing commit id there (measured,
+           git 2.55.0). Resolving through the branch is the only way to get
+           it, and is also why this cannot simply call sg_ref_update with a
+           ref_path of "HEAD" even though that would produce the right FILE. */
+        if (sg_ref_resolve_head(git_dir, old_id) != 0)
+            memset(old_id, 0, SG_SHA1_RAW_LEN); /* unborn HEAD: nothing to come from */
+        if (sg_reflog_append(git_dir, "HEAD", old_id, id, reflog_msg, &offset) != 0)
+            return -1;
+        wrote_log = 1;
+    }
+
+    if (write_ref_path_raw(git_dir, "HEAD", id) != 0) {
+        if (wrote_log)
+            sg_reflog_truncate(git_dir, "HEAD", offset);
+        return -1;
+    }
+    return 0;
 }

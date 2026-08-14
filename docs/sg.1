@@ -1,4 +1,4 @@
-.TH SG 1 "2026-08-04" "small_git 0.1" "User Commands"
+.TH SG 1 "2026-08-14" "small_git 0.1" "User Commands"
 .SH NAME
 sg \- small_git: a git-object-format-compatible version control tool
 .SH SYNOPSIS
@@ -514,13 +514,16 @@ so a bare
 re-points the branch at its own current commit \(em a no-op for the branch
 itself, but see the index effects of
 .B --mixed
-below). Fails on a detached
+below). On a detached
 .B HEAD
-(the same restriction
-.B "sg switch"
-and
-.B "sg branch"
-apply elsewhere: a branch ref is required to move). Unlike
+it moves
+.B HEAD
+itself and leaves every branch alone, matching real git. This is also what
+makes it usable while a rebase is paused, since a paused rebase is a detached
+.BR HEAD .
+A
+.B HEAD
+that is neither a branch nor a commit id is corrupt, and is refused. Unlike
 .BR "sg restore" ,
 .B reset
 has no pathspec form; passing paths after
@@ -608,6 +611,7 @@ invocation is rejected here rather than guessed at.
 .SS switch
 .B sg switch
 .RB [ -c ]
+.RB [ --detach ]
 .RB [ --force | -f ]
 .I branch
 .PP
@@ -621,6 +625,41 @@ creates
 .BR HEAD )
 before switching to it; it is an error if a branch by that name already
 exists, or if the current branch has no commits yet.
+.PP
+.B --detach
+points
+.B HEAD
+directly at a commit instead of at a branch, and accepts any revision rather
+than only a branch name. Without it, naming something that resolves to a
+commit but is not a branch is refused with a pointer to this flag \(em real
+.B "git switch"
+refuses there too rather than detaching silently.
+.B -c
+and
+.B --detach
+together are a usage error: they ask for two different
+.BR HEAD s.
+Leaving a detached
+.B HEAD
+prints \(dqPrevious HEAD position was ...\(dq first, but only when the commit
+actually changes.
+.PP
+While detached,
+.BR "sg commit" ,
+.BR "sg reset" ,
+.BR "sg branch" ,
+.BR "sg stash" ,
+.B "sg log"
+and
+.B "sg status"
+all work, and the state is reported the way real git reports it
+(\(dqHEAD detached at <id>\(dq, becoming \(dqfrom\(dq once
+.B HEAD
+moves off the commit it was detached at).
+.B "sg merge"
+and starting a
+.B "sg rebase"
+are refused, a deliberate limit rather than a technical one.
 .PP
 While a rebase is paused on a conflict,
 .B switch

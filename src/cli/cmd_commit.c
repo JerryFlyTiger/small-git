@@ -50,6 +50,7 @@ int sg_cmd_commit(int argc, char **argv)
     unsigned char parent_id[SG_SHA1_RAW_LEN];
     int has_parent;
     char *branch;
+    int detached;
     sg_commit commit;
     unsigned char *serialized;
     size_t serialized_len;
@@ -163,8 +164,21 @@ int sg_cmd_commit(int argc, char **argv)
         return 1;
     }
 
+    /* A detached HEAD commits onto HEAD itself and touches no branch at all
+       (measured: real git leaves every branch under refs/heads untouched).
+       It is only a
+       legitimate state when HEAD really holds a raw object id -- a HEAD that
+       is neither that nor a branch symref is corrupt, and committing onto it
+       would overwrite the evidence with a valid-looking id.
+
+       has_parent above and this must move together: before Phase 18 both the
+       parent lookup and this test failed on a detached HEAD, and the refusal
+       was what stopped the wrong parent from mattering. Relaxing only one of
+       them would write a parentless commit here, silently orphaning the
+       history the checkout came from. */
     branch = sg_ref_current_branch(git_dir);
-    if (branch == NULL) {
+    detached = (branch == NULL);
+    if (detached && sg_ref_head_is_detached(git_dir) != 1) {
         fprintf(stderr, "sg: failed to determine current branch\n");
         free(git_dir);
         free(cleaned_message);
@@ -248,7 +262,15 @@ int sg_cmd_commit(int argc, char **argv)
             snprintf(reflog_msg, (size_t)need + 1, "%s%.*s", prefix, (int)first_line_len, message);
         }
 
-        {
+        if (detached) {
+            /* HEAD moves, no branch does. The reflog message is the same one
+               a branch commit would get: git does not mark a detached commit
+               differently in logs/HEAD (measured). */
+            if (sg_ref_set_head_detached(git_dir, commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: failed to update HEAD\n");
+                rc = 1;
+            }
+        } else {
             char ref_path[4096];
 
             if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch) >= (int)sizeof(ref_path) ||
@@ -272,8 +294,10 @@ int sg_cmd_commit(int argc, char **argv)
 
         memcpy(short_hex, commit_hex, 7);
         short_hex[7] = '\0';
-        printf("[%s%s %s] %.*s\n", branch, has_parent ? "" : " (root-commit)", short_hex,
-              (int)first_line_len, message);
+        /* Real git puts the literal words "detached HEAD" where the branch
+           name goes: "[detached HEAD e066662] subject" (measured). */
+        printf("[%s%s %s] %.*s\n", detached ? "detached HEAD" : branch,
+              has_parent ? "" : " (root-commit)", short_hex, (int)first_line_len, message);
     }
 
     free(branch);
