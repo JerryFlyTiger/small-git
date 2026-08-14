@@ -6213,6 +6213,67 @@ check "phase18b: sg switch -c together with --detach is refused" test $? = 1
 check "phase18b: ...and no branch was created by that refusal" \
     test ! -f "$P18B_SG/.git/refs/heads/p18bnew"
 
+# ============================================================
+# Phase 18c: committing on a detached HEAD
+#
+# The interesting property is not that it works -- it is WHERE it writes.
+# HEAD advances and no branch moves; and the commit gets its parent, which is
+# the half that used to be impossible: sg_ref_resolve_head failed on a
+# detached HEAD, so the parent lookup came back "no commits yet" and would
+# have produced a ROOT commit, orphaning the history the checkout came from.
+# The refusal that used to sit here was the only thing preventing that, which
+# is why the parent count is asserted directly rather than inferred from a
+# clean exit.
+# ============================================================
+
+P18C="$WORKDIR/p18c"
+(cd "$WORKDIR" && "$SG" init p18c) > /dev/null 2>&1
+for p18c_i in 1 2 3; do
+    printf 'c%s\n' "$p18c_i" > "$P18C/f$p18c_i.txt"
+    (cd "$P18C" && "$SG" add . && "$SG" commit -m "C$p18c_i") > /dev/null 2>&1
+done
+P18C_MASTER_BEFORE=$(cat "$P18C/.git/refs/heads/master")
+P18C_MASTERLOG_BEFORE=$(wc -l < "$P18C/.git/logs/refs/heads/master" | tr -d ' ')
+
+(cd "$P18C" && "$SG" switch --detach HEAD~1) > /dev/null 2>&1
+printf 'detached\n' > "$P18C/p18c_new.txt"
+(cd "$P18C" && "$SG" add . && "$SG" commit -m "p18c detached commit") > /dev/null 2>&1
+check "phase18c: sg commit on a detached HEAD succeeds" test $? = 0
+
+P18C_HEAD_RAW=$(cat "$P18C/.git/HEAD")
+check "phase18c: HEAD is still a bare id afterwards, not re-attached to a branch" \
+    test "$(p18b_matches "$P18C_HEAD_RAW" '[0-9a-f]\{40\}$')" = yes
+check "phase18c: master's tip did not move" \
+    test "$(cat "$P18C/.git/refs/heads/master")" = "$P18C_MASTER_BEFORE"
+check "phase18c: master's reflog gained no line either" \
+    test "$(wc -l < "$P18C/.git/logs/refs/heads/master" | tr -d ' ')" = "$P18C_MASTERLOG_BEFORE"
+
+# The load-bearing one: a parent, not a root commit.
+P18C_PARENTS=$(cd "$P18C" && git cat-file -p HEAD | grep -c '^parent')
+check "phase18c: the detached commit has exactly one parent, i.e. it is NOT a root commit" \
+    test "$P18C_PARENTS" = 1
+P18C_PARENT_IS=$(cd "$P18C" && git rev-parse 'HEAD^')
+P18C_DETACHED_AT=$(cd "$P18C" && git rev-parse 'master^')
+check "phase18c: and that parent is the commit that was checked out" \
+    test "$P18C_PARENT_IS" = "$P18C_DETACHED_AT"
+
+P18C_MSG=$(sed 's/.*	//' "$P18C/.git/logs/HEAD" | tail -1)
+check "phase18c: logs/HEAD records it with the ordinary commit wording (got '$P18C_MSG')" \
+    test "$P18C_MSG" = "commit: p18c detached commit"
+
+# A corrupt HEAD is not a detached one, and must still be refused rather than
+# overwritten with a plausible id.
+P18C_CORRUPT="$WORKDIR/p18c_corrupt"
+(cd "$WORKDIR" && "$SG" init p18c_corrupt) > /dev/null 2>&1
+printf 'x\n' > "$P18C_CORRUPT/f.txt"
+(cd "$P18C_CORRUPT" && "$SG" add . && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'neither a ref nor a sha\n' > "$P18C_CORRUPT/.git/HEAD"
+printf 'y\n' > "$P18C_CORRUPT/g.txt"
+(cd "$P18C_CORRUPT" && "$SG" add . && "$SG" commit -m c2) > /dev/null 2>&1
+check "phase18c: sg commit onto a corrupt HEAD is refused" test $? = 1
+check "phase18c: ...and the corrupt HEAD is left as evidence, not overwritten" \
+    test "$(cat "$P18C_CORRUPT/.git/HEAD")" = "neither a ref nor a sha"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
