@@ -554,15 +554,46 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
 
             memset(&ff_state, 0, sizeof(ff_state));
             memcpy(ff_state.onto, upstream_commit, SG_SHA1_RAW_LEN);
+            memcpy(ff_state.orig_head, head_commit, SG_SHA1_RAW_LEN);
+            ff_state.orig_branch = current_branch; /* borrowed: freed by this function, not the state */
 
-            snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg);
+            if (snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg) >=
+                   (int)sizeof(start_msg)) {
+                fprintf(stderr, "sg: upstream 名稱太長\n");
+                free(current_branch);
+                return 1;
+            }
+
+            /* The sequencer state is written even though a fast-forward
+               replays nothing, purely so the detached window below is
+               recoverable. Between the detach and finish_rebase there is a
+               moment with HEAD detached and the branch not yet moved; with
+               no state on disk the user is stuck there -- `sg rebase
+               <upstream>` refuses (detached HEAD), `--abort` says there is no
+               rebase in progress, and only a confirmed `sg switch` gets out.
+               Measured, not reasoned: that is what the previous version did.
+               The ordinary replay path has always written its state before
+               touching anything for the same reason. */
+            if (sg_rebase_state_write(git_dir, &ff_state) != 0) {
+                fprintf(stderr, "sg: 無法寫入 rebase 狀態\n");
+                free(current_branch);
+                return 1;
+            }
             if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
                 fprintf(stderr, "sg: 無法讓 HEAD 指向 '%s'\n", upstream_arg);
+                sg_rebase_state_remove(git_dir);
                 free(current_branch);
                 return 1;
             }
             frc = finish_rebase(git_dir, current_branch, &ff_state);
             if (frc != 0) {
+                free(current_branch);
+                return 1;
+            }
+            if (sg_rebase_state_remove(git_dir) != 0) {
+                fprintf(stderr,
+                       "sg: 分支已快進，但未能清除 .git/sg-rebase/\n"
+                       "sg: 在手動刪除該目錄之前，rebase 會被視為仍在進行中\n");
                 free(current_branch);
                 return 1;
             }
@@ -651,7 +682,16 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
            typed, the same way a plain checkout's reflog does. */
         char start_msg[512];
 
-        snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg);
+        /* Checked, not silently truncated: upstream_arg is argv, and a
+           truncated "checkout <arg>" would be a reflog line that quietly
+           disagrees with what was actually checked out -- the same reason
+           reflog_msg_with_subject allocates instead of using a fixed buffer. */
+        if (snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg) >=
+               (int)sizeof(start_msg)) {
+            fprintf(stderr, "sg: upstream 名稱太長\n");
+            sg_rebase_state_free(&state);
+            return 1;
+        }
         if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
             fprintf(stderr, "sg: 無法讓 HEAD 指向 '%s'\n", upstream_arg);
             sg_rebase_state_free(&state);
@@ -965,13 +1005,31 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
         return 1;
     }
     {
-        /* The branch was never moved -- the whole replay happened on a
-           detached HEAD -- so aborting only has to re-attach. Real git
-           writes nothing to the branch's own log here either, and for the
-           same reason: the value is unchanged, and rule 1 suppresses a
-           no-op. Writing it anyway would add a line git does not have. */
+        /* The branch is restored unconditionally, even though the replay
+           happens on a detached HEAD and normally leaves it alone.
+           "Normally" is the problem: finish_rebase advances the branch and
+           THEN re-attaches HEAD, so an interruption between those two writes
+           leaves the branch already at the rebased tip with the sequencer
+           state still on disk. An --abort that only re-attached would put
+           HEAD back on a branch pointing at the rebase's result, restore the
+           work tree to the pre-rebase content, delete the state, and report
+           "back at <orig>" -- exit 0, three-way inconsistent, no warning.
+           (Reproduced against the built binary before this was written.)
+
+           Doing it unconditionally costs nothing in the ordinary case and
+           does not change the reflog shape: sg_ref_update_branch passes a
+           NULL message, so no line is ever appended to the branch's log --
+           which is what real git also ends up with, there because the value
+           is unchanged and rule 1 suppresses the no-op. The branch is
+           written while HEAD is still detached, so nothing mirrors into
+           logs/HEAD either. Then, and only then, HEAD is re-attached. */
         char abort_msg[4096 + 64];
 
+        if (sg_ref_update_branch(git_dir, state.orig_branch, state.orig_head) != 0) {
+            fprintf(stderr, "sg: 無法把分支 '%s' 還原到 rebase 前的位置\n", state.orig_branch);
+            sg_rebase_state_free(&state);
+            return 1;
+        }
         snprintf(abort_msg, sizeof(abort_msg), "rebase (abort): returning to refs/heads/%s",
                 state.orig_branch);
         if (sg_ref_set_head(git_dir, state.orig_branch, abort_msg) != 0) {

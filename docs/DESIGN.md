@@ -1190,6 +1190,47 @@ revision 字串的唯一入口,打錯一個字元被靜默解到附近但錯誤�
   一行內容確實相同。只有額外斷言**行數**(`wc -l`)才分得出「該有一行」與
   「多寫了一行」。
 
+### 第三輪冷讀:模型改動把 `--abort` 的一個不變式弄壞了
+
+段二交出去冷讀,抓到一個**高嚴重度、而且它自己重現過**的問題,是這次改動直接
+造成的。
+
+`finish_rebase` 是**兩次寫入**:先推進分支,再把 HEAD 接回去。我把 `--abort`
+的分支還原拿掉了,理由是「分支從頭到尾沒被動過」——那個理由只在整場 rebase
+是原子的時候成立。若在那兩次寫入之間被中斷(crash、SIGKILL、`sg_ref_set_head`
+的暫時性 I/O 失敗),分支已經停在 rebase 後的 tip,而 `.git/sg-rebase/` 還在。
+此時 `sg rebase --abort` 會:
+
+- 把工作目錄還原成 **rebase 前**的樹,
+- 把 HEAD 接回分支(而分支**已經**在 rebase 後的 tip),
+- 刪掉序列器狀態、**退出 0**,並印「'topic' is back at <orig>」。
+
+三者互相矛盾,而且是**假成功**。沒有 commit 永久遺失(新 tip 仍由分支可達),
+但工具說了謊。舊版的 `--abort` 無條件把分支重設回 `orig_head`,對任何中間狀態
+都是穩健的;新版依賴一個這條路徑自己就能打破的不變式。
+
+修法剛好不必取捨:`--abort` 恢復成無條件還原分支,而且**不影響 reflog 形狀**
+——`sg_ref_update_branch` 傳 NULL 訊息,永遠不寫 log 行;正常情況下值也沒變。
+寫入順序是「先分支(HEAD 仍 detached,不會鏡射)、再接回 HEAD」。
+
+這個情境**不能靠還原某一行來做 mutation 驗證**(它是缺少的防禦,不是壞掉的既
+有邏輯),但可以**製造那個中斷狀態**來測,interop 就是這樣寫的。把修法拿掉會
+讓那兩條精準變紅。
+
+同一輪還有兩件事:
+
+- **`<oid>` 正規化把 `onto` 的正確性蓋掉了**。分支的 finish 行是唯一嵌入完整
+  40-hex 的 rebase 訊息,而雙軌比對前會把任何 40-hex 換成 `<oid>`——所以把
+  `state->onto` 換成新 tip 或 `orig_head`,**整組 phase18f 都不會紅**。冷讀特別
+  要求主對話實跑這條 mutation 驗證它的預測,實跑確認它說對了。已補一條不經正
+  規化的直接斷言(外加一條前提檢查,確保 onto 與結果 tip 真的不同,否則那條斷
+  言自己就沒有鑑別力)。
+- **fast-forward 路徑的中斷窗口沒有任何標記**。冷讀說它「重跑就自癒」,實測
+  **是錯的**:重跑 `sg rebase <upstream>` 會因為 HEAD 是 detached 而被拒絕、
+  `--abort` 說「沒有進行中的 rebase」,只剩一個要確認的 `sg switch` 能脫身。
+  一般路徑在動任何東西之前就寫序列器狀態,ff 沒有;現在也寫了(純粹為了讓那個
+  窗口可救),收尾再刪掉。
+
 ### 無法驗證(如實記錄)
 
 - 兩處 malloc 失敗分支(`cmd_commit.c`、`cmd_switch.c` 建構 reflog 訊息字串
@@ -1394,10 +1435,13 @@ mutation 名字裡有 `/` 會讓 `mkdtemp` 失敗(「No such file or directory�
   證的**:abort 把分支還原成它本來就有的值,rule 1 的 no-op 抑制會擋掉任何寫
   入,所以改 abort 自己的程式碼**沒有任何 mutation 能讓它變紅**(試過一個)。留
   著當形狀的迴歸守衛,但它不能當成「abort 選擇不寫」的證據。
+- `finish_rebase` 兩次寫入之間、以及 fast-forward 路徑 detach 之後的**中斷
+  窗口本身**無法在測試裡真的觸發(沒有故障注入機制)。做法是**製造**中斷後的
+  磁碟狀態再驗 `--abort` 救得回來,那覆蓋的是復原邏輯,不是窗口的存在。
 - phase18e 的 branch→detach 案例對「commit 有沒有改變」這條新規則是無效覆蓋:
   HEAD 從分支出發時 `have_prev_commit` 恆為 0,那個 `memcmp` 根本走不到。它是
   重構的迴歸防護,不是新邏輯的覆蓋——標籤已經照實寫。
 
-最終 `tests/interop.sh` 1085 項檢查(Phase 17 結束時是 998),`make test` 35 支
+最終 `tests/interop.sh` 1094 項檢查(Phase 17 結束時是 998),`make test` 35 支
 二進位全過(新增 `tests/test_head_detach.c`),`make sanitize` 乾淨,子指令維持
 24 個(`sg switch` 新增 `--detach`)。

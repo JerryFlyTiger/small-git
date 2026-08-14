@@ -6580,6 +6580,20 @@ check "phase18f: the finish line in logs/HEAD has old == new" test "$P18F_OLD" =
 check "phase18f: HEAD is re-attached to the branch when the rebase finishes" \
     test "$(cat "$WORKDIR/p18f_plain_sg/.git/HEAD")" = "ref: refs/heads/topic"
 
+# The finish line embeds a full 40-hex id, and the <oid> normalization above
+# turns ANY well-formed id into the same token -- so the message comparison
+# would equally accept the new tip, or orig-head, in that slot. Which commit
+# it names is checked here, unnormalized: it is the ONTO commit (master's tip
+# at the time), not the rebase's result.
+P18F_ONTO_LOGGED=$(sed 's/.*	//' "$WORKDIR/p18f_plain_sg/.git/logs/refs/heads/topic" | tail -1 |
+    sed 's/.* onto //')
+P18F_ONTO_WANT=$(cd "$WORKDIR/p18f_plain_sg" && git rev-parse master)
+P18F_TIP_NOW=$(cd "$WORKDIR/p18f_plain_sg" && git rev-parse topic)
+check "phase18f: the finish line names the onto commit (logged '$P18F_ONTO_LOGGED')" \
+    test "$P18F_ONTO_LOGGED" = "$P18F_ONTO_WANT"
+check "phase18f: precondition -- onto and the resulting tip really differ, so that check discriminates" \
+    test "$P18F_ONTO_WANT" != "$P18F_TIP_NOW"
+
 # --- paused on a conflict: the model itself, before any message is written ---
 p18f_setup "$WORKDIR/p18f_pause_sg" "$SG" conflict
 P18F_PAUSE_TIP_BEFORE=$(cat "$WORKDIR/p18f_pause_sg/.git/refs/heads/topic")
@@ -6605,7 +6619,10 @@ p18f_compare "continue" "$WORKDIR/p18f_pause_sg" "$WORKDIR/p18f_cont_git"
 # --- --skip: the skipped commit leaves no trace at all ---
 p18f_setup "$WORKDIR/p18f_skip_sg" "$SG" conflict
 p18f_setup "$WORKDIR/p18f_skip_git" git conflict
-(cd "$WORKDIR/p18f_skip_sg" && "$SG" rebase master && "$SG" rebase --skip) > /dev/null 2>&1
+# Two separate invocations, matching git's: `rebase master` exits 1 here (it
+# pauses on the conflict), so chaining --skip after it with && would never run
+# the skip at all.
+(cd "$WORKDIR/p18f_skip_sg" && "$SG" rebase master) > /dev/null 2>&1
 (cd "$WORKDIR/p18f_skip_sg" && "$SG" rebase --skip) > /dev/null 2>&1
 (cd "$WORKDIR/p18f_skip_git" && git rebase master) > /dev/null 2>&1
 (cd "$WORKDIR/p18f_skip_git" && git rebase --skip) > /dev/null 2>&1
@@ -6628,6 +6645,45 @@ p18f_compare "abort" "$WORKDIR/p18f_abort_sg" "$WORKDIR/p18f_abort_git"
 check "phase18f: --abort adds nothing to the branch's own reflog" \
     test "$(wc -l < "$WORKDIR/p18f_abort_sg/.git/logs/refs/heads/topic" | tr -d ' ')" = "$P18F_ABORT_BR_BEFORE"
 
+# --- interrupted between finish_rebase's two writes ---
+#
+# finish_rebase advances the branch and then re-attaches HEAD. A crash
+# between those two leaves the branch already at the rebased tip with the
+# sequencer state still on disk -- a state no mutation of a single line
+# produces, so it is manufactured here instead.
+#
+# --abort must restore the branch even though it "was never moved": the
+# version that only re-attached put HEAD back onto a branch pointing at the
+# rebase's RESULT, restored the work tree to the pre-rebase content, deleted
+# the state and printed "back at <orig>", exiting 0 with all three
+# disagreeing. Asserting the exit status alone would not have caught it --
+# that version exited 0 too.
+P18F_INT="$WORKDIR/p18f_interrupted"
+p18f_setup "$P18F_INT" "$SG" clean
+P18F_INT_ORIG=$(cat "$P18F_INT/.git/refs/heads/topic")
+(cd "$P18F_INT" && "$SG" rebase master) > /dev/null 2>&1
+P18F_INT_TIP=$(cat "$P18F_INT/.git/refs/heads/topic")
+P18F_INT_BRLOG=$(wc -l < "$P18F_INT/.git/logs/refs/heads/topic" | tr -d ' ')
+# Rewind to the moment between the two writes: branch advanced, HEAD still
+# detached at the new tip, sequencer state present.
+printf '%s\n' "$P18F_INT_TIP" > "$P18F_INT/.git/HEAD"
+mkdir -p "$P18F_INT/.git/sg-rebase"
+(cd "$P18F_INT" && git rev-parse master) > "$P18F_INT/.git/sg-rebase/onto"
+printf '%s\n' "$P18F_INT_ORIG" > "$P18F_INT/.git/sg-rebase/orig-head"
+printf 'topic\n' > "$P18F_INT/.git/sg-rebase/orig-branch"
+: > "$P18F_INT/.git/sg-rebase/todo"
+check "phase18f: precondition -- the manufactured state really has the branch ahead of orig-head" \
+    test "$P18F_INT_TIP" != "$P18F_INT_ORIG"
+(cd "$P18F_INT" && "$SG" rebase --abort) > /dev/null 2>&1
+check "phase18f: --abort recovers from an interruption between finish's two writes" test $? = 0
+check "phase18f: ...restoring the branch to its pre-rebase commit, not leaving it at the result" \
+    test "$(cat "$P18F_INT/.git/refs/heads/topic")" = "$P18F_INT_ORIG"
+P18F_INT_STATUS=$(cd "$P18F_INT" && "$SG" status | tail -1)
+check "phase18f: ...leaving the work tree consistent with it (got '$P18F_INT_STATUS')" \
+    test "$P18F_INT_STATUS" = "nothing to commit, working tree clean"
+check "phase18f: ...and still writing no line to the branch's reflog" \
+    test "$(wc -l < "$P18F_INT/.git/logs/refs/heads/topic" | tr -d ' ')" = "$P18F_INT_BRLOG"
+
 # --- fast-forward: start and finish, and NO pick lines in between ---
 P18F_FF_SG="$WORKDIR/p18f_ff_sg"
 P18F_FF_GIT="$WORKDIR/p18f_ff_git"
@@ -6646,6 +6702,13 @@ done
 p18f_compare "fast-forward" "$P18F_FF_SG" "$P18F_FF_GIT"
 P18F_FF_PICKS=$(p18f_msgs "$P18F_FF_SG/.git/logs/HEAD" | grep -c 'rebase (pick)' || true)
 check "phase18f: a fast-forward writes no pick lines (found $P18F_FF_PICKS)" test "$P18F_FF_PICKS" = 0
+# The fast-forward path writes sequencer state solely to make its own
+# detached window recoverable, so it must also clean it up -- a leftover
+# directory reads as "a rebase is in progress" to every later command.
+check "phase18f: a fast-forward leaves no sequencer state behind" \
+    test ! -d "$P18F_FF_SG/.git/sg-rebase"
+check "phase18f: ...and HEAD re-attached" \
+    test "$(cat "$P18F_FF_SG/.git/HEAD")" = "ref: refs/heads/topic"
 
 # --- already up to date: not one line, in either log ---
 P18F_UTD_HEAD=$(wc -l < "$P18F_FF_SG/.git/logs/HEAD" | tr -d ' ')

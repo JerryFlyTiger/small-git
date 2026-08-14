@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1085 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1094 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -100,10 +100,15 @@ staging 的驗證。本機綠燈不是充分證據。**
   寫成裸 40-hex(detached)。**不要改用
   `sg_ref_update(git_dir, "HEAD", ...)` 走捷徑**——它寫得出同樣的檔案,但取
   old_id 走 `sg_ref_read_path`,HEAD 還是 symref 時 hex 解析必然失敗、靜默記
-  成全零,於是「從 A 分離到 B」被寫成「憑空建出 B」。reflog 的兩條不對稱規則(具體 ref 的 log 只在
-  `old != new` 時追加;`logs/HEAD` 永遠追加,且與它所指分支的那一行逐位元組
-  相同)與「哪些 namespace 才記 log」的政策閘門都收在這兩支函式裡,繞過去就
-  會靜默漏寫——不會報錯,只是那幾行 reflog 悄悄不存在(Phase 17)。
+  成全零,於是「從 A 分離到 B」被寫成「憑空建出 B」。
+
+  reflog 的兩條不對稱規則(具體 ref 的 log 只在 `old != new` 時追加;
+  `logs/HEAD` 永遠追加,且與它所指分支的那一行逐位元組相同)與「哪些 namespace
+  才記 log」的政策閘門都收在這三支函式裡,繞過去就會靜默漏寫——不會報錯,只是
+  那幾行 reflog 悄悄不存在(Phase 17)。**那兩條規則不只是要遵守的限制,也是可
+  以拿來用的工具**:Phase 18 的 rebase 收尾就是靠「先更新分支(HEAD 仍
+  detached → 不鏡射)、再接回 HEAD(old==new 但 HEAD 不做 no-op 抑制)」這個
+  順序,不寫任何特例就長出真 git 的 reflog 形狀。
 - **`util/` 裡沒有字串緩衝區、也沒有路徑處理**。路徑解析、`mkdir -p`、讀寫檔
   在 `include/sg/workdir.h`(`sg_resolve_repo_path`、`sg_mkdir_parents`、
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
