@@ -1626,8 +1626,16 @@ segfault,rebase 根本沒機會寫出多餘的 finish 行。那條專門驗「�
   既有分歧,phase4b 釘著,Phase 19 沒有動它——只有 detached 時因為沒有分支可
   用,才落到與 git 相同的 `HEAD`。
 - **`Fast-forwarded HEAD to <upstream>.` 等訊息是 sg 自己的措辭**,不是 git 的。
-  git 在對應情境印 `Successfully rebased and updated detached HEAD.`。sg 在分支
-  上本來就用自己的句子,detached 只是沿用同一套措辭,沒有理由只在這裡改抄 git。
+  sg 在分支上本來就用自己的句子,detached 只是沿用同一套措辭,沒有理由只在這裡
+  改抄 git。
+
+  冷讀時被問過一次:五句 detached 訊息裡,為什麼只有
+  `Successfully rebased and updated detached HEAD onto '%s'.` 講了 "detached",
+  其餘四句都只說 `HEAD`?看起來像不一致,實際上規則是**逐句對照 git**:
+  `HEAD is up to date.` 與 `...updated detached HEAD` 都是 git 的原句照抄(git
+  自己就是一句說 detached、一句不說);另外三句 git 根本沒有對應輸出,是 sg 自
+  己的句子,那裡用 `HEAD` 就夠——沒有分支名這件事本身已經傳達了 detached。
+  統一成同一個詞會讓前兩句離開 oracle,那個代價比表面的一致性大。
 
 ### 無法驗證(如實記錄)
 
