@@ -993,3 +993,17 @@ int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1
     }
     return 0;
 }
+
+int sg_ref_move_head(const char *git_dir, const char *branch,
+                     const unsigned char target[SG_SHA1_RAW_LEN],
+                     const char *reflog_msg)
+{
+    char ref_path[SG_PATH_MAX];
+
+    if (branch == NULL)
+        return sg_ref_set_head_detached(git_dir, target, reflog_msg);
+    if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch) >=
+           (int)sizeof(ref_path))
+        return -1;
+    return sg_ref_update(git_dir, ref_path, target, reflog_msg);
+}

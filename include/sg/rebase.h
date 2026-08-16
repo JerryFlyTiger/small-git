@@ -13,7 +13,10 @@
 typedef struct {
     unsigned char onto[SG_SHA1_RAW_LEN];      /* rebase target base commit */
     unsigned char orig_head[SG_SHA1_RAW_LEN]; /* HEAD before the rebase started, for --abort */
-    char *orig_branch;                        /* malloc'd: branch rebase was started on */
+    char *orig_branch;                        /* malloc'd: branch rebase was started on, or
+                                                  NULL if HEAD was detached when it started
+                                                  (on disk: the literal sentinel "detached
+                                                  HEAD", mirroring real git's head-name file) */
     unsigned char (*todo)[SG_SHA1_RAW_LEN];   /* malloc'd, oldest-to-newest, not yet replayed */
     size_t todo_count;
     unsigned char current[SG_SHA1_RAW_LEN]; /* commit paused on a conflict, valid iff has_current */
@@ -25,14 +28,23 @@ int sg_rebase_state_exists(const char *git_dir);
 
 /* Reads and validates git_dir/sg-rebase/. Every field is format-checked (hex
    fields must be exactly 40 hex chars, todo lines each exactly 40 hex chars,
-   orig-branch must pass the same branch-name safety check refs.c uses) --
-   any violation is treated as a corrupted sequencer state. Returns 0 on
-   success, -1 if no rebase is in progress or the state is malformed/corrupt
-   (caller should tell the user to run `sg rebase --abort`). */
+   orig-branch must either be the literal sentinel "detached HEAD" -- read
+   back as out->orig_branch == NULL -- or pass the same branch-name safety
+   check refs.c uses) -- any violation is treated as a corrupted sequencer
+   state. A MISSING orig-branch file is corruption too, never "detached
+   HEAD": a rebase that reached this state always wrote something there, so
+   absence means something else destroyed the file, not that HEAD started
+   detached. Returns 0 on success, -1 if no rebase is in progress or the
+   state is malformed/corrupt (caller should tell the user to run
+   `sg rebase --abort`). */
 int sg_rebase_state_read(const char *git_dir, sg_rebase_state *out);
 
 /* Writes st to git_dir/sg-rebase/, creating the directory if needed.
-   Overwrites any previous state. If st->has_current is 0, an existing
+   Overwrites any previous state. orig_branch == NULL (rebase started on a
+   detached HEAD) writes the literal sentinel "detached HEAD" instead of an
+   empty/NULL line; it cannot collide with a real branch since branch names
+   containing a space are rejected at creation time (sg_ref_name_valid_for_create,
+   and real git's check-ref-format). If st->has_current is 0, an existing
    `current` file is removed so a stale value can't linger across a
    --skip/--continue. Returns 0 on success, -1 on I/O failure. */
 int sg_rebase_state_write(const char *git_dir, const sg_rebase_state *st);

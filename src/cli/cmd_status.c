@@ -317,8 +317,11 @@ int sg_cmd_status(int argc, char **argv)
             sg_sha1_to_hex(rstate.onto, onto_hex);
             memcpy(onto_short, onto_hex, 7);
             onto_short[7] = '\0';
-            printf("You are currently rebasing branch '%s' onto %s.\n", rstate.orig_branch,
-                  onto_short);
+            if (rstate.orig_branch != NULL)
+                printf("You are currently rebasing branch '%s' onto %s.\n", rstate.orig_branch,
+                      onto_short);
+            else
+                printf("You are currently rebasing.\n");
             printf("（還剩 %zu 個 commit 待處理）\n", remaining);
             if (rstate.has_current) {
                 printf("  (fix conflicts and run \"sg rebase --continue\")\n"

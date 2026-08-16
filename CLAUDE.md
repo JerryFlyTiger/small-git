@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1098 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1165 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -109,6 +109,12 @@ staging 的驗證。本機綠燈不是充分證據。**
   以拿來用的工具**:Phase 18 的 rebase 收尾就是靠「先更新分支(HEAD 仍
   detached → 不鏡射)、再接回 HEAD(old==new 但 HEAD 不做 no-op 抑制)」這個
   順序,不寫任何特例就長出真 git 的 reflog 形狀。
+
+  「把 HEAD 所指的東西移到某個 commit」這個組合(detached 就寫 HEAD、否則寫
+  `refs/heads/<branch>`)已經抽成 **`sg_ref_move_head`**(Phase 19),
+  `commit`/`reset`/`merge` 三處共用。呼叫端傳 `branch == NULL` 表示 detached,
+  **損壞的 HEAD 要由呼叫端先擋掉**——NULL 自己分不出這兩者,函式若擅自猜測就
+  等於把 Phase 18 費力建立的區分洗掉。
 - **`util/` 裡沒有字串緩衝區、也沒有路徑處理**。路徑解析、`mkdir -p`、讀寫檔
   在 `include/sg/workdir.h`(`sg_resolve_repo_path`、`sg_mkdir_parents`、
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
@@ -140,7 +146,27 @@ staging 的驗證。本機綠燈不是充分證據。**
   態:1 detached、0 symbolic、**-1 損壞**。損壞刻意與 detached 分開,因為
   detached 這個答案正是呼叫端用來決定「可以把裸 sha 寫進 HEAD」的依據,混在一
   起會把損壞的 HEAD 洗成看起來正常的狀態。`sg_ref_current_branch` 回 NULL 同
-  樣有這兩種成因,四個會因此拒絕的指令(merge/reset/rebase/push)都已分流。
+  樣有這兩種成因,四個曾因此拒絕的指令(merge/reset/rebase/push)都已分流。
+  其中 **merge 與 rebase 在 Phase 19 已改成放行 detached、只拒絕損壞**,現在只
+  剩 push 還一律拒絕(它的 HEAD 檢查排在遠端 ref 廣播之後,沒有活的 remote 就
+  走不到,因此無法測試)。
+
+  **`current_branch == NULL` 現在會流過 merge/rebase 的整條路徑**,新增或修改
+  那兩支的程式碼時,任何把它餵給 `%s` 的地方都要自己守衛。Phase 19 為此修了三
+  處:`sg_merge_trees` 的 `ours_label`(NULL 會在寫衝突標記時 segfault)、
+  `cmd_status.c` 的 rebase 描述、以及 `cmd_rebase.c` 的 fast-forward 捷徑
+  ——**最後那處印出 `Fast-forwarded (null) to master.` 而整套測試全綠**,因為
+  該捷徑在其他路徑之前就 return、而測試把 stdout 丟掉了。這個平台的 `%s` 吃到
+  NULL 只印 `(null)` 不崩潰,連退出碼都是 0,所以三格 CI 都會靜默通過。
+  **新增 detached 專屬訊息時要一併加 stdout 斷言**,只驗檔案與 reflog 會漏掉
+  整個維度。
+
+  detached 時 merge 與 rebase 都**不碰任何分支 ref**;rebase 更是連
+  `rebase (finish)` 那行 reflog 都不寫(`finish_rebase` 對 `branch == NULL`
+  直接 return 0)。這不是特例,是「先搬分支、再接回 HEAD」那個兩步模型在沒有
+  分支時的自然退化——真 git 實測就是這個形狀。rebase 序列器用磁碟 sentinel
+  `detached HEAD`(與真 git 的 `head-name` 同字串)表示起手時 detached,記憶體
+  是 NULL;**`orig-branch` 檔案缺席仍算損壞**,不可以當成 detached。
 - **使用者給的 revision 字串一律走 `sg_rev_parse_commit`**
   (`include/sg/revparse.h`):`HEAD`/tag/分支/完整 40-hex/完整 `refs/...` 路徑,
   加 `~N`/`^N`/`@{N}`(Phase 17,reflog 索引,必須緊接在 ref 名之後、純數字、

@@ -6310,7 +6310,7 @@ check "phase18c: ...and the corrupt HEAD is left as evidence, not overwritten" \
 
 # ============================================================
 # Phase 18d: the commands that only ever saw a detached HEAD as "this repo
-# has no commits", plus the three that still refuse it on purpose
+# has no commits"
 #
 # Every read below was already reachable before Phase 18 -- real git can put
 # any sg repository into this state -- and every one of them was WRONG rather
@@ -6318,9 +6318,11 @@ check "phase18c: ...and the corrupt HEAD is left as evidence, not overwritten" \
 # "unborn HEAD". They are asserted here because "the root fix repaired them"
 # is a claim about code, not a test.
 #
-# The refusals are asserted too. sg deliberately stops short of merge, reset
-# and rebase on a detached HEAD (real git supports all three); that is a
-# scope decision, so it is pinned rather than left to drift.
+# This block used to end by pinning three deliberate refusals -- merge, reset
+# and rebase. None is left: reset opened in phase12, and merge and rebase in
+# phase19, which asserts what they now DO instead. The refusals were a scope
+# boundary rather than a rule, so they were pinned to keep them from drifting
+# silently, and removing a pinned check is how that boundary is meant to move.
 # ============================================================
 
 P18D="$WORKDIR/p18d"
@@ -6383,26 +6385,21 @@ fi
 (cd "$P18D" && "$SG" stash pop) > /dev/null 2>&1
 check "phase18d: sg stash pop works on a detached HEAD" test $? = 0
 
-# --- the deliberate refusals ---
-#
-# Each is checked for a detached-SPECIFIC message, not merely a non-zero
-# exit: these commands exit 1 for plenty of other reasons, so exit status
-# alone would keep passing if the dedicated check were deleted. That is not
-# hypothetical -- when reset stopped refusing, the merge case below started
-# reporting a dirty work tree instead, because it ran after a reset that now
-# succeeded and changed the fixture. Both refusals are therefore read BEFORE
-# anything else touches this repo, and neither of them writes.
+# The merge and rebase refusals that used to be read here are gone (phase19
+# asserts the behaviour that replaced them). They were deliberately read
+# BEFORE anything else touched this repo and deliberately did not write,
+# because a refusal that stops refusing starts MUTATING the fixture: when
+# reset opened up in phase12, the merge check began reporting a dirty work
+# tree instead, having run after a reset that now succeeded. Removing them
+# had exactly that effect on the reset case below -- the merge and rebase
+# now run to completion and move HEAD -- which is why this restore stays and
+# why the reset block re-reads its own preconditions rather than trusting
+# the fixture to be where the setup left it.
 (cd "$P18D" && git checkout -q -- . ) > /dev/null 2>&1
-P18D_MERGE_ERR=$(cd "$P18D" && "$SG" merge p18d-side 2>&1 >/dev/null | head -1)
-check "phase18d: sg merge on a detached HEAD refuses, naming the reason (got '$P18D_MERGE_ERR')" \
-    test "${P18D_MERGE_ERR#sg: 目前是 detached HEAD}" != "$P18D_MERGE_ERR"
-P18D_REBASE_ERR=$(cd "$P18D" && "$SG" rebase p18d-side 2>&1 >/dev/null | head -1)
-check "phase18d: sg rebase on a detached HEAD refuses, naming the reason (got '$P18D_REBASE_ERR')" \
-    test "${P18D_REBASE_ERR#sg: 目前是 detached HEAD}" != "$P18D_REBASE_ERR"
 
-# reset is NOT in that list any more: it now resets a detached HEAD, moving
-# HEAD and no branch (asserted in phase12, and required so that resetting
-# during a paused rebase keeps working now that a paused rebase is detached).
+# reset resets a detached HEAD, moving HEAD and no branch (asserted in
+# phase12, and required so that resetting during a paused rebase keeps
+# working now that a paused rebase is detached).
 P18D_MASTER_BEFORE=$(cat "$P18D/.git/refs/heads/master")
 P18D_HEAD_BEFORE=$(cd "$P18D" && git rev-parse HEAD)
 (cd "$P18D" && "$SG" reset --hard p18d-side) > /dev/null 2>&1
@@ -6760,6 +6757,473 @@ check "phase18f: an up-to-date rebase writes nothing to logs/HEAD" \
     test "$(wc -l < "$P18F_FF_SG/.git/logs/HEAD" | tr -d ' ')" = "$P18F_UTD_HEAD"
 check "phase18f: ...and nothing to the branch's reflog either" \
     test "$(wc -l < "$P18F_FF_SG/.git/logs/refs/heads/topic" | tr -d ' ')" = "$P18F_UTD_BR"
+
+# ============================================================
+# Phase 19: merge, and a rebase STARTED on a detached HEAD
+#
+# Phase 18d pinned both of these as deliberate refusals. Real git supports
+# them, so the refusals were a scope boundary rather than a rule, and this
+# phase removes them; the two checks that named them are gone from 18d.
+#
+# The shape both features have to produce is the same one Phase 17 measured
+# and Phase 18 built the rebase model on: sg_ref_update mirrors a branch's
+# reflog line into logs/HEAD only while HEAD is the symref to that branch, so
+# with HEAD detached there is nothing to mirror -- a detached merge writes
+# ONE line, to logs/HEAD, and moves no branch, and a detached rebase never
+# reaches finish_rebase's two writes at all. Neither needed a special case;
+# both are what the existing rules degrade to when there is no branch. That
+# is exactly why the branch refs are asserted to be untouched below: "the
+# reflog looks right" would also be true of a build that moved a branch and
+# happened to log the same text.
+#
+# Dual-track against real git, the Phase 17/18f idiom -- but only over the
+# lines the operation under test ADDS. Comparing whole logs would also be
+# comparing the fixture's own checkout lines, which belong to `switch` and
+# are pinned in 18b/18e; a failure there would land on these checks and name
+# the wrong feature.
+# ============================================================
+
+# Message column only, object ids normalized: the two repos cannot share
+# hashes. The merge strategy name is normalized too -- sg's 3-way merge is
+# its own implementation and says so, and that difference is not what these
+# checks are about.
+p19_msgs() {
+    sed 's/.*	//' "$1" 2>/dev/null |
+        sed 's/[0-9a-f]\{40\}/<oid>/g' |
+        sed "s/'ort'/'<strategy>'/; s/'sg-3way'/'<strategy>'/"
+}
+
+# The lines $2 (a count taken before the operation) onward -- i.e. what the
+# operation appended.
+p19_added() {
+    p19_msgs "$1" | tail -n "+$(( $2 + 1 ))"
+}
+
+p19_lines() {
+    wc -l < "$1" 2>/dev/null | tr -d ' '
+}
+
+# base -> master:M1, topic:T1 on different files, so neither is an ancestor
+# of the other and the merge is a real three-way one. $3 = conflict makes T1
+# collide with M1 instead.
+p19_setup() {
+    p19_dir="$1"
+    p19_bin="$2"
+    p19_mode="$3"
+    if [ "$p19_bin" = git ]; then
+        mkdir -p "$p19_dir" && (cd "$p19_dir" && git init -q -b master .) > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && "$SG" init "$(basename "$p19_dir")") > /dev/null 2>&1
+    fi
+    printf 'base\n' > "$p19_dir/base.txt"
+    (cd "$p19_dir" && "$p19_bin" add . && "$p19_bin" commit -m base) > /dev/null 2>&1
+    (cd "$p19_dir" && "$p19_bin" branch topic && "$p19_bin" switch topic) > /dev/null 2>&1
+    if [ "$p19_mode" = conflict ]; then
+        printf 'topic version\n' > "$p19_dir/shared.txt"
+    else
+        printf 'topic one\n' > "$p19_dir/t1.txt"
+    fi
+    (cd "$p19_dir" && "$p19_bin" add . && "$p19_bin" commit -m T1) > /dev/null 2>&1
+    (cd "$p19_dir" && "$p19_bin" switch master) > /dev/null 2>&1
+    if [ "$p19_mode" = conflict ]; then
+        printf 'master version\n' > "$p19_dir/shared.txt"
+    else
+        printf 'master only\n' > "$p19_dir/m1.txt"
+    fi
+    (cd "$p19_dir" && "$p19_bin" add . && "$p19_bin" commit -m M1) > /dev/null 2>&1
+}
+
+p19_detach() {   # $1 dir, $2 bin, $3 rev
+    if [ "$2" = git ]; then
+        (cd "$1" && git switch -q --detach "$3") > /dev/null 2>&1
+    else
+        (cd "$1" && "$SG" switch --detach "$3") > /dev/null 2>&1
+    fi
+}
+
+# ------------------------------------------------------------
+# Phase 19a: a three-way merge on a detached HEAD
+# ------------------------------------------------------------
+P19A_S="$WORKDIR/p19a_sg"
+P19A_G="$WORKDIR/p19a_git"
+p19_setup "$P19A_S" "$SG" clean
+p19_setup "$P19A_G" git clean
+p19_detach "$P19A_S" "$SG" master
+p19_detach "$P19A_G" git master
+P19A_S_HEADN=$(p19_lines "$P19A_S/.git/logs/HEAD")
+P19A_G_HEADN=$(p19_lines "$P19A_G/.git/logs/HEAD")
+P19A_MASTER_BEFORE=$(cat "$P19A_S/.git/refs/heads/master")
+P19A_TOPIC_BEFORE=$(cat "$P19A_S/.git/refs/heads/topic")
+P19A_MASTER_LOGN=$(p19_lines "$P19A_S/.git/logs/refs/heads/master")
+
+# $? is saved to a variable on its own line, before the check. Putting a
+# command substitution in a check's MESSAGE overwrites $? while the argument
+# list is being built, so `check "... $(...)" test $? = 0` reads the status of
+# the substitution instead of the command under test -- a check that passes
+# no matter what sg did. Re-running the command to get its status instead is
+# worse, not better: the second merge would be an already-up-to-date no-op
+# and would exit 0 even if the first one had failed.
+P19A_OUT=$( (cd "$P19A_S" && "$SG" merge topic) 2>&1 )
+P19A_RC=$?
+check "phase19a: sg merge on a detached HEAD succeeds (said '$(printf '%s' "$P19A_OUT" | head -1)')" \
+    test "$P19A_RC" = 0
+(cd "$P19A_G" && git merge topic --no-edit) > /dev/null 2>&1
+
+# The whole point: HEAD moved, and it moved as a detached HEAD.
+P19A_HEAD_RAW=$(cat "$P19A_S/.git/HEAD")
+check "phase19a: HEAD is still detached afterwards, holding a bare id (got '$P19A_HEAD_RAW')" \
+    test -n "$(printf '%s' "$P19A_HEAD_RAW" | grep '^[0-9a-f]\{40\}$')"
+P19A_TIP=$(cd "$P19A_S" && git rev-parse HEAD 2>/dev/null)
+check "phase19a: ...at a NEW commit, not at either side (precondition for the rest)" \
+    test "$P19A_TIP" != "$P19A_MASTER_BEFORE" -a "$P19A_TIP" != "$P19A_TOPIC_BEFORE"
+
+# A build that merged onto the branch instead would also move HEAD, because
+# HEAD would follow the branch. Both refs are read back to rule that out.
+check "phase19a: master did not move" \
+    test "$(cat "$P19A_S/.git/refs/heads/master")" = "$P19A_MASTER_BEFORE"
+check "phase19a: topic did not move" \
+    test "$(cat "$P19A_S/.git/refs/heads/topic")" = "$P19A_TOPIC_BEFORE"
+check "phase19a: master's own reflog gained no line" \
+    test "$(p19_lines "$P19A_S/.git/logs/refs/heads/master")" = "$P19A_MASTER_LOGN"
+
+# Real git is the oracle for the message text, not sg's own idea of it.
+p19_added "$P19A_S/.git/logs/HEAD" "$P19A_S_HEADN" > "$WORKDIR/p19a_s.txt"
+p19_added "$P19A_G/.git/logs/HEAD" "$P19A_G_HEADN" > "$WORKDIR/p19a_g.txt"
+check "phase19a: precondition -- the merge appended exactly one logs/HEAD line" \
+    test "$(wc -l < "$WORKDIR/p19a_s.txt" | tr -d ' ')" = 1
+check "phase19a: that line's message matches git's" \
+    cmp -s "$WORKDIR/p19a_s.txt" "$WORKDIR/p19a_g.txt"
+if ! cmp -s "$WORKDIR/p19a_s.txt" "$WORKDIR/p19a_g.txt"; then
+    echo "    --- phase19a mismatch, git $(git --version | sed 's/git version //') ---"
+    diff "$WORKDIR/p19a_s.txt" "$WORKDIR/p19a_g.txt" | sed 's/^/      /'
+fi
+
+# Real git reading sg's repository: the object has to be a genuine merge.
+P19A_PARENTS=$(cd "$P19A_S" && git rev-list --parents -1 HEAD 2>/dev/null | wc -w | tr -d ' ')
+check "phase19a: the commit sg wrote has two parents (got $((P19A_PARENTS - 1)))" \
+    test "$P19A_PARENTS" = 3
+P19A_SUBJ=$(cd "$P19A_S" && git log -1 --format=%s 2>/dev/null)
+P19A_SUBJ_G=$(cd "$P19A_G" && git log -1 --format=%s 2>/dev/null)
+check "phase19a: its subject names HEAD, not a branch, exactly as git's does (got '$P19A_SUBJ')" \
+    test "$P19A_SUBJ" = "$P19A_SUBJ_G"
+P19A_STATUS=$(cd "$P19A_S" && "$SG" status 2>/dev/null | tail -1)
+check "phase19a: the work tree is clean afterwards (got '$P19A_STATUS')" \
+    test "$P19A_STATUS" = "nothing to commit, working tree clean"
+# stdout is asserted for every message this phase gave a detached-HEAD
+# wording, here and in 19f/19g. Reading only files and reflogs is how a
+# "Fast-forwarded (null) to master." survived a full green run: the branch
+# name reaches the user through a channel nothing was looking at.
+check "phase19a: it names HEAD in its summary line, having no branch to name (said '$P19A_OUT')" \
+    test "$P19A_OUT" = "Merge made by 'topic' [$(cd "$P19A_S" && git rev-parse --short=7 HEAD)] into HEAD."
+
+# ------------------------------------------------------------
+# Phase 19b: a fast-forward merge, and an already-up-to-date one
+# ------------------------------------------------------------
+P19B_S="$WORKDIR/p19b_sg"
+P19B_G="$WORKDIR/p19b_git"
+p19_setup "$P19B_S" "$SG" clean
+p19_setup "$P19B_G" git clean
+# Detach at base: master is strictly ahead, so merging it fast-forwards.
+p19_detach "$P19B_S" "$SG" master~1
+p19_detach "$P19B_G" git master~1
+P19B_S_HEADN=$(p19_lines "$P19B_S/.git/logs/HEAD")
+P19B_G_HEADN=$(p19_lines "$P19B_G/.git/logs/HEAD")
+P19B_MASTER_BEFORE=$(cat "$P19B_S/.git/refs/heads/master")
+(cd "$P19B_S" && "$SG" merge master) > /dev/null 2>&1
+check "phase19b: a fast-forward merge on a detached HEAD succeeds" test $? = 0
+(cd "$P19B_G" && git merge master --no-edit) > /dev/null 2>&1
+check "phase19b: HEAD fast-forwarded onto the target, still detached" \
+    test "$(cat "$P19B_S/.git/HEAD")" = "$P19B_MASTER_BEFORE"
+p19_added "$P19B_S/.git/logs/HEAD" "$P19B_S_HEADN" > "$WORKDIR/p19b_s.txt"
+p19_added "$P19B_G/.git/logs/HEAD" "$P19B_G_HEADN" > "$WORKDIR/p19b_g.txt"
+check "phase19b: its logs/HEAD line matches git's (got '$(cat "$WORKDIR/p19b_s.txt")')" \
+    cmp -s "$WORKDIR/p19b_s.txt" "$WORKDIR/p19b_g.txt"
+
+# Merging it again is a no-op, and a no-op writes nothing at all.
+P19B_HEADN2=$(p19_lines "$P19B_S/.git/logs/HEAD")
+P19B_OUT=$( (cd "$P19B_S" && "$SG" merge master) 2>&1 )
+check "phase19b: an already-up-to-date merge on a detached HEAD exits 0" test $? = 0
+check "phase19b: ...saying so (got '$P19B_OUT')" test "$P19B_OUT" = "Already up to date."
+check "phase19b: ...and writing not one reflog line" \
+    test "$(p19_lines "$P19B_S/.git/logs/HEAD")" = "$P19B_HEADN2"
+
+# ------------------------------------------------------------
+# Phase 19c: a conflicting merge on a detached HEAD, resolved with sg commit
+#
+# cmd_commit.c already handled MERGE_HEAD and already handled a detached
+# HEAD, but never both at once -- nothing could reach the combination while
+# merge refused to start. The commit it produces must still have two parents.
+# ------------------------------------------------------------
+P19C_S="$WORKDIR/p19c_sg"
+P19C_G="$WORKDIR/p19c_git"
+p19_setup "$P19C_S" "$SG" conflict
+p19_setup "$P19C_G" git conflict
+p19_detach "$P19C_S" "$SG" master
+p19_detach "$P19C_G" git master
+P19C_HEAD_BEFORE=$(cat "$P19C_S/.git/HEAD")
+P19C_HEADN=$(p19_lines "$P19C_S/.git/logs/HEAD")
+P19C_G_HEADN=$(p19_lines "$P19C_G/.git/logs/HEAD")
+(cd "$P19C_S" && "$SG" merge topic) > /dev/null 2>&1
+check "phase19c: a conflicting merge on a detached HEAD exits 1" test $? = 1
+# git's side runs here, while its work tree is still untouched -- resolving
+# sg's copy first and only then merging git's would hand git a dirty tree and
+# it would refuse to start, silently costing the comparison its other track.
+(cd "$P19C_G" && git merge topic --no-edit) > /dev/null 2>&1
+check "phase19c: ...leaving MERGE_HEAD behind" test -f "$P19C_S/.git/MERGE_HEAD"
+check "phase19c: ...naming the other side in it" \
+    test "$(cat "$P19C_S/.git/MERGE_HEAD")" = "$(cat "$P19C_S/.git/refs/heads/topic")"
+check "phase19c: ...and not moving HEAD yet" \
+    test "$(cat "$P19C_S/.git/HEAD")" = "$P19C_HEAD_BEFORE"
+check "phase19c: ...nor writing a reflog line yet" \
+    test "$(p19_lines "$P19C_S/.git/logs/HEAD")" = "$P19C_HEADN"
+
+printf 'resolved\n' > "$P19C_S/shared.txt"
+printf 'resolved\n' > "$P19C_G/shared.txt"
+(cd "$P19C_S" && "$SG" add shared.txt && "$SG" commit -m "merged while detached") > /dev/null 2>&1
+check "phase19c: sg commit finishes the merge from a detached HEAD" test $? = 0
+(cd "$P19C_G" && git add shared.txt && git commit -qm "merged while detached") > /dev/null 2>&1
+check "phase19c: MERGE_HEAD is gone" test ! -f "$P19C_S/.git/MERGE_HEAD"
+P19C_HEAD_AFTER=$(cat "$P19C_S/.git/HEAD")
+check "phase19c: HEAD is still detached, at the resolved commit (got '$P19C_HEAD_AFTER')" \
+    test -n "$(printf '%s' "$P19C_HEAD_AFTER" | grep '^[0-9a-f]\{40\}$')" \
+    -a "$P19C_HEAD_AFTER" != "$P19C_HEAD_BEFORE"
+P19C_PARENTS=$(cd "$P19C_S" && git rev-list --parents -1 HEAD 2>/dev/null | wc -w | tr -d ' ')
+check "phase19c: the resolved commit has two parents, not one (got $((P19C_PARENTS - 1)))" \
+    test "$P19C_PARENTS" = 3
+p19_added "$P19C_S/.git/logs/HEAD" "$P19C_HEADN" > "$WORKDIR/p19c_s.txt"
+p19_added "$P19C_G/.git/logs/HEAD" "$P19C_G_HEADN" > "$WORKDIR/p19c_g.txt"
+check "phase19c: the reflog lines the whole sequence wrote match git's" \
+    cmp -s "$WORKDIR/p19c_s.txt" "$WORKDIR/p19c_g.txt"
+if ! cmp -s "$WORKDIR/p19c_s.txt" "$WORKDIR/p19c_g.txt"; then
+    echo "    --- phase19c mismatch ---"
+    diff "$WORKDIR/p19c_s.txt" "$WORKDIR/p19c_g.txt" | sed 's/^/      /'
+fi
+
+# merge --abort never had a detached gate in front of it, so it was already
+# reachable in theory and untested in practice.
+P19C2_S="$WORKDIR/p19c2_sg"
+p19_setup "$P19C2_S" "$SG" conflict
+p19_detach "$P19C2_S" "$SG" master
+P19C2_HEAD=$(cat "$P19C2_S/.git/HEAD")
+(cd "$P19C2_S" && "$SG" merge topic) > /dev/null 2>&1
+(cd "$P19C2_S" && "$SG" merge --abort) > /dev/null 2>&1
+check "phase19c: sg merge --abort works from a detached HEAD" test $? = 0
+check "phase19c: ...leaving HEAD where it was" test "$(cat "$P19C2_S/.git/HEAD")" = "$P19C2_HEAD"
+check "phase19c: ...and removing MERGE_HEAD" test ! -f "$P19C2_S/.git/MERGE_HEAD"
+P19C2_STATUS=$(cd "$P19C2_S" && "$SG" status 2>/dev/null | tail -1)
+check "phase19c: ...with a clean work tree (got '$P19C2_STATUS')" \
+    test "$P19C2_STATUS" = "nothing to commit, working tree clean"
+
+# ------------------------------------------------------------
+# Phase 19d: a rebase STARTED on a detached HEAD
+#
+# The structural claim is the absence of finish_rebase's two writes: with no
+# branch to move, logs/HEAD ends at the last pick and no branch reflog gains
+# anything. An implementation that reattached HEAD to some branch would still
+# produce a plausible-looking logs/HEAD, so the branch refs are read back.
+# ------------------------------------------------------------
+P19D_S="$WORKDIR/p19d_sg"
+P19D_G="$WORKDIR/p19d_git"
+p18f_setup "$P19D_S" "$SG" clean          # base -> topic:T1,T2 ; master:M1
+p18f_setup "$P19D_G" git clean
+p19_detach "$P19D_S" "$SG" topic
+p19_detach "$P19D_G" git topic
+P19D_TOPIC_BEFORE=$(cat "$P19D_S/.git/refs/heads/topic")
+P19D_TOPIC_LOGN=$(p19_lines "$P19D_S/.git/logs/refs/heads/topic")
+P19D_S_HEADN=$(p19_lines "$P19D_S/.git/logs/HEAD")
+P19D_G_HEADN=$(p19_lines "$P19D_G/.git/logs/HEAD")
+
+# Not `... | tail -1` inside the substitution: a pipeline's status is the LAST
+# stage's, so tail would report 0 however sg exited (same trap as 19a).
+P19D_OUT=$( (cd "$P19D_S" && "$SG" rebase master) 2>&1 )
+P19D_RC=$?
+check "phase19d: sg rebase started on a detached HEAD succeeds (said '$(printf '%s' "$P19D_OUT" | tail -1)')" \
+    test "$P19D_RC" = 0
+check "phase19d: ...and says so without naming a branch it never had" \
+    test "$(printf '%s' "$P19D_OUT" | tail -1)" = "Successfully rebased and updated detached HEAD onto 'master'."
+(cd "$P19D_G" && git rebase master) > /dev/null 2>&1
+
+check "phase19d: HEAD is still detached afterwards (got '$(cat "$P19D_S/.git/HEAD")')" \
+    test -n "$(sed 's/[0-9a-f]\{40\}/<oid>/' "$P19D_S/.git/HEAD" | grep '^<oid>$')"
+check "phase19d: topic did not move -- finish_rebase's branch write never ran" \
+    test "$(cat "$P19D_S/.git/refs/heads/topic")" = "$P19D_TOPIC_BEFORE"
+check "phase19d: ...and topic's reflog gained no line either" \
+    test "$(p19_lines "$P19D_S/.git/logs/refs/heads/topic")" = "$P19D_TOPIC_LOGN"
+check "phase19d: the sequencer state is cleaned up" test ! -d "$P19D_S/.git/sg-rebase"
+
+p19_added "$P19D_S/.git/logs/HEAD" "$P19D_S_HEADN" > "$WORKDIR/p19d_s.txt"
+p19_added "$P19D_G/.git/logs/HEAD" "$P19D_G_HEADN" > "$WORKDIR/p19d_g.txt"
+check "phase19d: the reflog lines it wrote match git's, start and picks and no finish" \
+    cmp -s "$WORKDIR/p19d_s.txt" "$WORKDIR/p19d_g.txt"
+if ! cmp -s "$WORKDIR/p19d_s.txt" "$WORKDIR/p19d_g.txt"; then
+    echo "    --- phase19d mismatch, git $(git --version | sed 's/git version //') ---"
+    diff "$WORKDIR/p19d_s.txt" "$WORKDIR/p19d_g.txt" | sed 's/^/      /'
+fi
+# Named separately: the comparison above would still pass if BOTH grew a
+# finish line, and this is the line the whole model change is about.
+P19D_FIN=$(grep -c 'rebase (finish)' "$WORKDIR/p19d_s.txt" || true)
+check "phase19d: no 'rebase (finish)' line is written when there is no branch (found $P19D_FIN)" \
+    test "$P19D_FIN" = 0
+# Real git reading sg's result: the replayed commits must sit on master.
+P19D_BASE=$(cd "$P19D_S" && git merge-base HEAD master 2>/dev/null)
+check "phase19d: the rebased HEAD really sits on master" \
+    test "$P19D_BASE" = "$(cat "$P19D_S/.git/refs/heads/master")"
+
+# ------------------------------------------------------------
+# Phase 19e: paused on a conflict, then --continue -- from detached
+# ------------------------------------------------------------
+P19E_S="$WORKDIR/p19e_sg"
+P19E_G="$WORKDIR/p19e_git"
+p18f_setup "$P19E_S" "$SG" conflict
+p18f_setup "$P19E_G" git conflict
+p19_detach "$P19E_S" "$SG" topic
+p19_detach "$P19E_G" git topic
+P19E_ORIG=$(cd "$P19E_S" && git rev-parse HEAD 2>/dev/null)
+P19E_S_HEADN=$(p19_lines "$P19E_S/.git/logs/HEAD")
+P19E_G_HEADN=$(p19_lines "$P19E_G/.git/logs/HEAD")
+(cd "$P19E_S" && "$SG" rebase master) > /dev/null 2>&1
+check "phase19e: the rebase pauses on the conflict" test -d "$P19E_S/.git/sg-rebase"
+
+# The sentinel is the whole reason a paused detached rebase can be resumed at
+# all: orig-branch has to say "there was no branch" in a way that a missing
+# or empty file does not, since those mean corruption.
+check "phase19e: orig-branch records the detached start with git's own sentinel (got '$(cat "$P19E_S/.git/sg-rebase/orig-branch" 2>/dev/null)')" \
+    test "$(cat "$P19E_S/.git/sg-rebase/orig-branch" 2>/dev/null)" = "detached HEAD"
+P19E_STATUS=$(cd "$P19E_S" && "$SG" status 2>/dev/null | grep 'currently rebasing')
+check "phase19e: sg status describes it without inventing a branch name (got '$P19E_STATUS')" \
+    test "$P19E_STATUS" = "You are currently rebasing."
+
+(cd "$P19E_G" && git rebase master) > /dev/null 2>&1
+printf 'resolved\n' > "$P19E_S/shared.txt"
+printf 'resolved\n' > "$P19E_G/shared.txt"
+(cd "$P19E_S" && "$SG" add shared.txt && "$SG" rebase --continue) > /dev/null 2>&1
+check "phase19e: sg rebase --continue finishes it" test $? = 0
+(cd "$P19E_G" && git add shared.txt && git -c core.editor=true rebase --continue) > /dev/null 2>&1
+check "phase19e: HEAD is still detached at the end" \
+    test -n "$(sed 's/[0-9a-f]\{40\}/<oid>/' "$P19E_S/.git/HEAD" | grep '^<oid>$')"
+check "phase19e: the sequencer state is gone" test ! -d "$P19E_S/.git/sg-rebase"
+p19_added "$P19E_S/.git/logs/HEAD" "$P19E_S_HEADN" > "$WORKDIR/p19e_s.txt"
+p19_added "$P19E_G/.git/logs/HEAD" "$P19E_G_HEADN" > "$WORKDIR/p19e_g.txt"
+check "phase19e: its reflog lines match git's (start, continue, no finish)" \
+    cmp -s "$WORKDIR/p19e_s.txt" "$WORKDIR/p19e_g.txt"
+if ! cmp -s "$WORKDIR/p19e_s.txt" "$WORKDIR/p19e_g.txt"; then
+    echo "    --- phase19e mismatch ---"
+    diff "$WORKDIR/p19e_s.txt" "$WORKDIR/p19e_g.txt" | sed 's/^/      /'
+fi
+
+# ------------------------------------------------------------
+# Phase 19f: --abort from a detached start
+#
+# The branch path restores the branch unconditionally, to survive an
+# interruption between finish_rebase's two writes. There is no such window
+# here -- finish writes nothing -- so abort's whole job is putting HEAD back,
+# and it must put it back DETACHED rather than onto whatever branch happens
+# to point at the same commit.
+# ------------------------------------------------------------
+P19F_S="$WORKDIR/p19f_sg"
+P19F_G="$WORKDIR/p19f_git"
+p18f_setup "$P19F_S" "$SG" conflict
+p18f_setup "$P19F_G" git conflict
+p19_detach "$P19F_S" "$SG" topic
+p19_detach "$P19F_G" git topic
+P19F_HEAD_BEFORE=$(cat "$P19F_S/.git/HEAD")
+P19F_TOPIC_BEFORE=$(cat "$P19F_S/.git/refs/heads/topic")
+P19F_S_HEADN=$(p19_lines "$P19F_S/.git/logs/HEAD")
+P19F_G_HEADN=$(p19_lines "$P19F_G/.git/logs/HEAD")
+(cd "$P19F_S" && "$SG" rebase master) > /dev/null 2>&1
+(cd "$P19F_G" && git rebase master) > /dev/null 2>&1
+P19F_ABORT_OUT=$( (cd "$P19F_S" && "$SG" rebase --abort) 2>&1 )
+P19F_ABORT_RC=$?
+check "phase19f: sg rebase --abort works from a detached start" test "$P19F_ABORT_RC" = 0
+check "phase19f: ...saying HEAD is back, with no branch to name (said '$P19F_ABORT_OUT')" \
+    test "$P19F_ABORT_OUT" = "Rebase aborted; HEAD is back at $(printf '%s' "$P19F_HEAD_BEFORE" | cut -c1-7)."
+(cd "$P19F_G" && git rebase --abort) > /dev/null 2>&1
+# topic points at the same commit HEAD started on, so "HEAD holds that id" is
+# also true of a build that reattached to topic. The raw file is read.
+check "phase19f: HEAD is back at the original commit, still detached (got '$(cat "$P19F_S/.git/HEAD")')" \
+    test "$(cat "$P19F_S/.git/HEAD")" = "$P19F_HEAD_BEFORE"
+check "phase19f: precondition -- topic pointed at that same commit, so the check above is about the FORM" \
+    test "$P19F_TOPIC_BEFORE" = "$P19F_HEAD_BEFORE"
+check "phase19f: topic is untouched" \
+    test "$(cat "$P19F_S/.git/refs/heads/topic")" = "$P19F_TOPIC_BEFORE"
+check "phase19f: the sequencer state is gone" test ! -d "$P19F_S/.git/sg-rebase"
+P19F_STATUS=$(cd "$P19F_S" && "$SG" status 2>/dev/null | tail -1)
+check "phase19f: the work tree is restored (got '$P19F_STATUS')" \
+    test "$P19F_STATUS" = "nothing to commit, working tree clean"
+p19_added "$P19F_S/.git/logs/HEAD" "$P19F_S_HEADN" > "$WORKDIR/p19f_s.txt"
+p19_added "$P19F_G/.git/logs/HEAD" "$P19F_G_HEADN" > "$WORKDIR/p19f_g.txt"
+check "phase19f: its reflog lines match git's, including what abort returns to" \
+    cmp -s "$WORKDIR/p19f_s.txt" "$WORKDIR/p19f_g.txt"
+if ! cmp -s "$WORKDIR/p19f_s.txt" "$WORKDIR/p19f_g.txt"; then
+    echo "    --- phase19f mismatch ---"
+    diff "$WORKDIR/p19f_s.txt" "$WORKDIR/p19f_g.txt" | sed 's/^/      /'
+fi
+
+# ------------------------------------------------------------
+# Phase 19g: the two shortcuts -- up to date, and fast-forward
+# ------------------------------------------------------------
+P19G_S="$WORKDIR/p19g_sg"
+p18f_setup "$P19G_S" "$SG" clean
+p19_detach "$P19G_S" "$SG" master
+P19G_HEADN=$(p19_lines "$P19G_S/.git/logs/HEAD")
+P19G_OUT=$( (cd "$P19G_S" && "$SG" rebase master) 2>&1 )
+check "phase19g: an up-to-date rebase on a detached HEAD exits 0" test $? = 0
+check "phase19g: ...saying so without naming a branch (got '$P19G_OUT')" \
+    test "$P19G_OUT" = "HEAD is up to date."
+check "phase19g: ...and writing not one reflog line" \
+    test "$(p19_lines "$P19G_S/.git/logs/HEAD")" = "$P19G_HEADN"
+check "phase19g: ...and leaving no sequencer state" test ! -d "$P19G_S/.git/sg-rebase"
+
+P19G2_S="$WORKDIR/p19g2_sg"
+P19G2_G="$WORKDIR/p19g2_git"
+p18f_setup "$P19G2_S" "$SG" clean
+p18f_setup "$P19G2_G" git clean
+# Detach at base: master is strictly ahead, so the rebase fast-forwards.
+p19_detach "$P19G2_S" "$SG" master~1
+p19_detach "$P19G2_G" git master~1
+P19G2_MASTER=$(cat "$P19G2_S/.git/refs/heads/master")
+P19G2_S_HEADN=$(p19_lines "$P19G2_S/.git/logs/HEAD")
+P19G2_G_HEADN=$(p19_lines "$P19G2_G/.git/logs/HEAD")
+P19G2_OUT=$( (cd "$P19G2_S" && "$SG" rebase master) 2>&1 )
+P19G2_RC=$?
+check "phase19g: a fast-forward rebase from a detached HEAD succeeds" test "$P19G2_RC" = 0
+# This exact line printed "Fast-forwarded (null) to master." while every
+# other check in this block was green: the fast-forward shortcut returns
+# before the code paths the rest of the phase touched, so it kept the one
+# unguarded current_branch left in the file. Discarding stdout is what let
+# it through -- on this libc a NULL %s prints "(null)" rather than
+# crashing, so even the exit status stayed 0.
+check "phase19g: ...naming HEAD rather than a branch it does not have (said '$P19G2_OUT')" \
+    test "$P19G2_OUT" = "Fast-forwarded HEAD to master."
+(cd "$P19G2_G" && git rebase master) > /dev/null 2>&1
+check "phase19g: ...moving HEAD onto the upstream, still detached" \
+    test "$(cat "$P19G2_S/.git/HEAD")" = "$P19G2_MASTER"
+check "phase19g: ...and leaving no sequencer state behind" test ! -d "$P19G2_S/.git/sg-rebase"
+p19_added "$P19G2_S/.git/logs/HEAD" "$P19G2_S_HEADN" > "$WORKDIR/p19g_s.txt"
+p19_added "$P19G2_G/.git/logs/HEAD" "$P19G2_G_HEADN" > "$WORKDIR/p19g_g.txt"
+check "phase19g: ...writing only the start line git writes (got '$(cat "$WORKDIR/p19g_s.txt")')" \
+    cmp -s "$WORKDIR/p19g_s.txt" "$WORKDIR/p19g_g.txt"
+
+# ------------------------------------------------------------
+# Phase 19h: a corrupt HEAD is still not a detached one
+#
+# 18e made this point for reset and rebase while merge was still refusing
+# every detached HEAD -- a refusal that hid the distinction. Now that both
+# commands accept a detached HEAD, mistaking a corrupt one for it would
+# write a bare sha into a HEAD file nobody could interpret.
+# ------------------------------------------------------------
+P19H="$WORKDIR/p19h_corrupt"
+(cd "$WORKDIR" && "$SG" init p19h_corrupt) > /dev/null 2>&1
+printf 'x\n' > "$P19H/f.txt"
+(cd "$P19H" && "$SG" add . && "$SG" commit -m c1 && "$SG" branch p19h-other) > /dev/null 2>&1
+printf 'neither a ref nor a sha\n' > "$P19H/.git/HEAD"
+for p19h_cmd in merge rebase; do
+    P19H_ERR=$(cd "$P19H" && "$SG" "$p19h_cmd" p19h-other 2>&1 >/dev/null | head -1)
+    check "phase19h: sg $p19h_cmd refuses a corrupt HEAD, naming it (got '$P19H_ERR')" \
+        test "${P19H_ERR#sg: 無法讀取 HEAD}" != "$P19H_ERR"
+    check "phase19h: sg $p19h_cmd leaves the corrupt HEAD as evidence" \
+        test "$(cat "$P19H/.git/HEAD")" = "neither a ref nor a sha"
+done
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

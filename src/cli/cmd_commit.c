@@ -262,22 +262,13 @@ int sg_cmd_commit(int argc, char **argv)
             snprintf(reflog_msg, (size_t)need + 1, "%s%.*s", prefix, (int)first_line_len, message);
         }
 
-        if (detached) {
-            /* HEAD moves, no branch does. The reflog message is the same one
-               a branch commit would get: git does not mark a detached commit
-               differently in logs/HEAD (measured). */
-            if (sg_ref_set_head_detached(git_dir, commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: failed to update HEAD\n");
-                rc = 1;
-            }
-        } else {
-            char ref_path[4096];
-
-            if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch) >= (int)sizeof(ref_path) ||
-               sg_ref_update(git_dir, ref_path, commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: failed to update branch '%s'\n", branch);
-                rc = 1;
-            }
+        /* HEAD moves; a branch moves too unless detached. The reflog message
+           is the same one a branch commit would get: git does not mark a
+           detached commit differently in logs/HEAD (measured). */
+        if (sg_ref_move_head(git_dir, branch, commit_id, reflog_msg) != 0) {
+            fprintf(stderr, detached ? "sg: failed to update HEAD\n"
+                                     : "sg: failed to update branch '%s'\n", branch);
+            rc = 1;
         }
         free(reflog_msg);
     }

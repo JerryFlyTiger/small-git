@@ -14,6 +14,13 @@
 
 #define SG_PATH_MAX 4096
 
+/* What orig-branch holds when the rebase started on a detached HEAD, read
+   back as orig_branch == NULL. One definition, because two copies of a
+   string a mutation has to hit is one copy the mutation silently misses --
+   the reader and the writer would still agree with each other while both
+   drifted away from the format the tests pin. */
+static const char DETACHED_SENTINEL[] = "detached HEAD";
+
 static int state_dir_path(const char *git_dir, char *out, size_t out_size)
 {
     return (size_t)snprintf(out, out_size, "%s/sg-rebase", git_dir) < out_size ? 0 : -1;
@@ -233,11 +240,30 @@ int sg_rebase_state_read(const char *git_dir, sg_rebase_state *out)
     if (state_file_path(git_dir, "orig-branch", path, sizeof(path)) != 0)
         return -1;
     branch = read_line_file(path);
-    if (branch == NULL || !sg_ref_branch_name_is_safe(branch)) {
-        free(branch);
+    if (branch == NULL) {
+        /* Absence is corruption, not "detached at start" -- a rebase that
+           got this far always wrote SOME orig-branch file (a real branch
+           name or the "detached HEAD" sentinel below), so a missing file
+           means something else destroyed it. Treating a missing file as
+           "detached" would launder that loss into a legitimate state. */
         return -1;
     }
-    out->orig_branch = branch;
+    if (strcmp(branch, DETACHED_SENTINEL) == 0) {
+        /* Sentinel for "rebase started on a detached HEAD" (mirrors real
+           git's .git/rebase-merge/head-name, oracle-measured: git 2.55.0
+           writes the literal string "detached HEAD" there too). It can
+           never collide with a real branch name: sg_ref_name_valid_for_create
+           rejects names containing a space at creation time, and real git's
+           check-ref-format does the same, so no branch called "detached
+           HEAD" can ever exist to be confused with this. */
+        free(branch);
+        out->orig_branch = NULL;
+    } else if (!sg_ref_branch_name_is_safe(branch)) {
+        free(branch);
+        return -1;
+    } else {
+        out->orig_branch = branch;
+    }
 
     if (state_file_path(git_dir, "todo", path, sizeof(path)) != 0 ||
        read_todo_file(path, &out->todo, &out->todo_count) != 0) {
@@ -285,7 +311,7 @@ int sg_rebase_state_write(const char *git_dir, const sg_rebase_state *st)
        write_hex_file(path, st->orig_head) != 0)
         return -1;
     if (state_file_path(git_dir, "orig-branch", path, sizeof(path)) != 0 ||
-       write_line_file(path, st->orig_branch) != 0)
+       write_line_file(path, st->orig_branch != NULL ? st->orig_branch : DETACHED_SENTINEL) != 0)
         return -1;
     if (state_file_path(git_dir, "todo", path, sizeof(path)) != 0 ||
        write_todo_file(path, st->todo, st->todo_count) != 0)
