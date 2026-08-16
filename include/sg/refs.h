@@ -198,4 +198,14 @@ int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_
 int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
                              const char *reflog_msg);
 
+/* Moves whatever HEAD names to target: the current branch, or -- when HEAD is
+   detached -- HEAD itself, leaving every branch alone. branch NULL means
+   detached; a corrupt HEAD is the CALLER's job to reject first (use
+   sg_ref_head_is_detached), because "NULL" alone cannot tell the two apart.
+   reflog_msg follows the same rules as sg_ref_update / sg_ref_set_head_detached.
+   Returns 0 on success, -1 on failure. */
+int sg_ref_move_head(const char *git_dir, const char *branch,
+                     const unsigned char target[SG_SHA1_RAW_LEN],
+                     const char *reflog_msg);
+
 #endif

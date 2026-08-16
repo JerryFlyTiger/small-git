@@ -19,25 +19,12 @@
 
 typedef enum { RESET_SOFT, RESET_MIXED, RESET_HARD } sg_reset_mode;
 
-/* Moves whatever HEAD names to target: the current branch, or -- when HEAD
-   is detached -- HEAD itself, leaving every branch alone. All three reset
-   modes end in exactly this step and differ only in what they do to the
-   index and working tree first, so it lives here rather than being spelled
-   out three times (it already was, verbatim, before the detached case made
-   each copy longer). current_branch NULL means detached; a corrupt HEAD is
-   rejected by the caller before this is reached. */
-static int move_head_to(const char *git_dir, const char *current_branch,
-                        const unsigned char target[SG_SHA1_RAW_LEN], const char *reflog_msg)
-{
-    char ref_path[4096];
-
-    if (current_branch == NULL)
-        return sg_ref_set_head_detached(git_dir, target, reflog_msg);
-    if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", current_branch) >=
-           (int)sizeof(ref_path))
-        return -1;
-    return sg_ref_update(git_dir, ref_path, target, reflog_msg);
-}
+/* All three reset modes end by moving whatever HEAD names to the target
+   commit and differ only in what they do to the index and working tree
+   first -- that shared final step is sg_ref_move_head (include/sg/refs.h):
+   it moves the current branch, or -- when HEAD is detached -- HEAD itself,
+   leaving every branch alone. current_branch NULL means detached; a corrupt
+   HEAD is rejected by this file before that point is reached. */
 
 int sg_cmd_reset(int argc, char **argv)
 {
@@ -165,7 +152,7 @@ int sg_cmd_reset(int argc, char **argv)
             char reflog_msg[512];
 
             snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
-            if (move_head_to(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
+            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
                 fprintf(stderr, "sg: 無法更新 %s\n",
                        current_branch != NULL ? current_branch : "HEAD");
                 free(current_branch);
@@ -224,7 +211,7 @@ int sg_cmd_reset(int argc, char **argv)
             char reflog_msg[512];
 
             snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
-            if (move_head_to(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
+            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
                 fprintf(stderr, "sg: 無法更新 %s\n",
                        current_branch != NULL ? current_branch : "HEAD");
                 free(current_branch);
@@ -277,7 +264,7 @@ int sg_cmd_reset(int argc, char **argv)
             char reflog_msg[512];
 
             snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
-            if (move_head_to(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
+            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
                 fprintf(stderr, "sg: 無法更新 %s\n",
                        current_branch != NULL ? current_branch : "HEAD");
                 free(current_branch);
