@@ -181,6 +181,99 @@ static void test_state_roundtrip(void)
     free(git_dir);
 }
 
+/* ==================== detached-start state ==================== */
+
+static void test_state_roundtrip_detached(void)
+{
+    char *git_dir = make_tmp_repo();
+    sg_rebase_state st, read_back;
+    unsigned char onto[SG_SHA1_RAW_LEN], orig_head[SG_SHA1_RAW_LEN];
+    unsigned char c1[SG_SHA1_RAW_LEN];
+    char path[4096];
+    char *sentinel_line;
+    FILE *f;
+    char buf[256];
+
+    make_commit(git_dir, "onto", NULL, 0, onto);
+    make_commit(git_dir, "orig-head", NULL, 0, orig_head);
+    make_commit(git_dir, "c1", NULL, 0, c1);
+
+    memset(&st, 0, sizeof(st));
+    memcpy(st.onto, onto, SG_SHA1_RAW_LEN);
+    memcpy(st.orig_head, orig_head, SG_SHA1_RAW_LEN);
+    st.orig_branch = NULL; /* detached start */
+    st.todo = malloc(sizeof(*st.todo));
+    memcpy(st.todo[0], c1, SG_SHA1_RAW_LEN);
+    st.todo_count = 1;
+    st.has_current = 0;
+
+    CHECK(sg_rebase_state_write(git_dir, &st) == 0, "state write with NULL orig_branch should succeed");
+
+    /* Pin the on-disk format directly: round-trip alone would still pass if
+       the sentinel string were something else entirely, as long as read and
+       write agreed with each other. */
+    snprintf(path, sizeof(path), "%s/sg-rebase/orig-branch", git_dir);
+    f = fopen(path, "rb");
+    CHECK(f != NULL, "orig-branch file should exist after write");
+    sentinel_line = (f != NULL) ? fgets(buf, sizeof(buf), f) : NULL;
+    CHECK(sentinel_line != NULL && strcmp(buf, "detached HEAD\n") == 0,
+         "orig-branch on disk should be the literal sentinel 'detached HEAD', got '%s'",
+         sentinel_line != NULL ? buf : "(read failed)");
+    if (f != NULL)
+        fclose(f);
+
+    memset(&read_back, 0, sizeof(read_back));
+    CHECK(sg_rebase_state_read(git_dir, &read_back) == 0, "state read should succeed");
+    CHECK(read_back.orig_branch == NULL, "orig_branch should read back as NULL for a detached start");
+    CHECK(memcmp(read_back.onto, onto, SG_SHA1_RAW_LEN) == 0, "onto round-trips");
+    CHECK(memcmp(read_back.orig_head, orig_head, SG_SHA1_RAW_LEN) == 0, "orig_head round-trips");
+    CHECK(read_back.todo_count == 1, "todo_count round-trips (got %zu)", read_back.todo_count);
+    CHECK(read_back.todo != NULL && memcmp(read_back.todo[0], c1, SG_SHA1_RAW_LEN) == 0,
+         "todo[0] round-trips");
+    CHECK(read_back.has_current == 0, "has_current round-trips");
+    sg_rebase_state_free(&read_back);
+
+    free(st.todo);
+    free(git_dir);
+}
+
+static void test_missing_orig_branch_is_corruption(void)
+{
+    char *git_dir = make_tmp_repo();
+    sg_rebase_state st, read_back;
+    unsigned char onto[SG_SHA1_RAW_LEN], orig_head[SG_SHA1_RAW_LEN];
+    char path[4096];
+
+    make_commit(git_dir, "onto", NULL, 0, onto);
+    make_commit(git_dir, "orig-head", NULL, 0, orig_head);
+
+    memset(&st, 0, sizeof(st));
+    memcpy(st.onto, onto, SG_SHA1_RAW_LEN);
+    memcpy(st.orig_head, orig_head, SG_SHA1_RAW_LEN);
+    st.orig_branch = strdup("master");
+    st.todo = NULL;
+    st.todo_count = 0;
+    st.has_current = 0;
+
+    CHECK(sg_rebase_state_write(git_dir, &st) == 0, "initial state write should succeed");
+
+    snprintf(path, sizeof(path), "%s/sg-rebase/orig-branch", git_dir);
+    CHECK(remove(path) == 0, "removing orig-branch file should succeed");
+
+    memset(&read_back, 0, sizeof(read_back));
+    CHECK(sg_rebase_state_read(git_dir, &read_back) == -1,
+         "a missing orig-branch file must be corruption, not a legitimate 'detached start'");
+    /* Nothing is asserted about read_back's fields here on purpose. The
+       contract says nothing about them after a rejected read, and the
+       obvious extra check -- "orig_branch is still NULL" -- cannot fail:
+       read_back was memset to zero above and the read returns before it
+       ever reaches that field. An assertion that passes by construction is
+       coverage this suite has been fooled by twice. */
+
+    free(st.orig_branch);
+    free(git_dir);
+}
+
 /* ==================== corrupted state is rejected ==================== */
 
 static void test_corrupt_onto_rejected(void)
@@ -365,6 +458,8 @@ static void test_compute_todo_rejects_merge_commit(void)
 int main(void)
 {
     test_state_roundtrip();
+    test_state_roundtrip_detached();
+    test_missing_orig_branch_is_corruption();
     test_corrupt_onto_rejected();
     test_corrupt_todo_line_length_rejected();
     test_corrupt_orig_branch_dotdot_rejected();

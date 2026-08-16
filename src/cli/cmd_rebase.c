@@ -331,7 +331,17 @@ done:
    Doing these the other way round would mirror the branch update into
    logs/HEAD with the wrong message and drop the returning-to line.
    The message names the ONTO commit in full 40-hex, not the new tip
-   (measured, 2.55.0). */
+   (measured, 2.55.0).
+
+   branch == NULL means the rebase started on a detached HEAD: this function
+   then does NOTHING and returns 0 immediately, not a degenerate one-step
+   version of the above. Throughout the replay, HEAD stayed detached and is
+   already sitting on the right commit -- there is no branch to advance and
+   no HEAD to re-attach. Oracle-measured (git 2.55.0, R1/R5): a detached-start
+   rebase adds NO "rebase (finish)" line to logs/HEAD and touches no branch
+   reflog at all. This is not a special case bolted on top of the two-step
+   model above; it is that same model degenerating correctly once there is no
+   branch to do step 1 with. */
 static int finish_rebase(const char *git_dir, const char *branch, const sg_rebase_state *state)
 {
     unsigned char tip[SG_SHA1_RAW_LEN];
@@ -339,6 +349,9 @@ static int finish_rebase(const char *git_dir, const char *branch, const sg_rebas
     char onto_hex[SG_SHA1_HEX_LEN + 1];
     char branch_msg[4096 + 128];
     char head_msg[4096 + 64];
+
+    if (branch == NULL)
+        return 0;
 
     if (sg_ref_resolve_head(git_dir, tip) != 0) {
         fprintf(stderr, "sg: 無法讀取重放後的 HEAD\n");
@@ -421,7 +434,10 @@ static int run_rebase_todo(const char *git_dir, const char *repo_root, const cha
                "sg: 在手動刪除該目錄之前，rebase 會被視為仍在進行中\n");
         return 1;
     }
-    printf("Successfully rebased and updated '%s' onto '%s'.\n", current_branch, upstream_arg);
+    if (current_branch != NULL)
+        printf("Successfully rebased and updated '%s' onto '%s'.\n", current_branch, upstream_arg);
+    else
+        printf("Successfully rebased and updated detached HEAD onto '%s'.\n", upstream_arg);
     return 0;
 }
 
@@ -459,13 +475,13 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
     }
 
     /* See cmd_reset.c: a corrupt HEAD is not a detached one, and saying so
-       points at the actual problem. */
+       points at the actual problem. Real git rebases fine from a detached
+       HEAD (measured, git 2.55.0) -- it just replays onto HEAD itself and
+       never touches a branch ref -- so current_branch NULL from here on
+       means exactly that, not a refusal. */
     current_branch = sg_ref_current_branch(git_dir);
-    if (current_branch == NULL) {
-        if (sg_ref_head_is_detached(git_dir) == 1)
-            fprintf(stderr, "sg: 目前是 detached HEAD，無法 rebase（HEAD 必須指向一個分支）\n");
-        else
-            fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
+    if (current_branch == NULL && sg_ref_head_is_detached(git_dir) != 1) {
+        fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
         return 1;
     }
 
@@ -506,7 +522,10 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
     if (memcmp(base_commit, upstream_commit, SG_SHA1_RAW_LEN) == 0) {
         /* upstream is already an ancestor of HEAD: every commit here is
            already built directly on top of it, nothing to replay. */
-        printf("Current branch %s is up to date.\n", current_branch);
+        if (current_branch != NULL)
+            printf("Current branch %s is up to date.\n", current_branch);
+        else
+            printf("HEAD is up to date.\n");
         free(current_branch);
         return 0;
     }
@@ -627,7 +646,10 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         /* Not expected given the base==upstream / base==head checks above
            already cover every case where nothing needs replaying, but stay
            safe rather than fall through into an empty rebase. */
-        printf("Current branch %s is up to date.\n", current_branch);
+        if (current_branch != NULL)
+            printf("Current branch %s is up to date.\n", current_branch);
+        else
+            printf("HEAD is up to date.\n");
         free(state.todo);
         free(current_branch);
         return 0;
@@ -1004,7 +1026,23 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
         sg_rebase_state_free(&state);
         return 1;
     }
-    {
+    if (state.orig_branch == NULL) {
+        /* Started on a detached HEAD: finish_rebase is a no-op for that
+           case (it never advances any branch), so the two-write window the
+           branch case guards against below never opens -- there is nothing
+           that could be left half-restored. Putting HEAD back at orig_head
+           is the entire recovery. */
+        char abort_msg[SG_SHA1_HEX_LEN + 64];
+        char orig_head_hex[SG_SHA1_HEX_LEN + 1];
+
+        sg_sha1_to_hex(state.orig_head, orig_head_hex);
+        snprintf(abort_msg, sizeof(abort_msg), "rebase (abort): returning to %s", orig_head_hex);
+        if (sg_ref_set_head_detached(git_dir, state.orig_head, abort_msg) != 0) {
+            fprintf(stderr, "sg: 無法讓 HEAD 重新指回 %s\n", orig_head_hex);
+            sg_rebase_state_free(&state);
+            return 1;
+        }
+    } else {
         /* The branch is restored unconditionally, even though the replay
            happens on a detached HEAD and normally leaves it alone.
            "Normally" is the problem: finish_rebase advances the branch and
@@ -1022,7 +1060,12 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
            which is what real git also ends up with, there because the value
            is unchanged and rule 1 suppresses the no-op. The branch is
            written while HEAD is still detached, so nothing mirrors into
-           logs/HEAD either. Then, and only then, HEAD is re-attached. */
+           logs/HEAD either. Then, and only then, HEAD is re-attached.
+
+           (When state.orig_branch is NULL instead -- rebase started on a
+           detached HEAD -- this whole branch-restore step is skipped: see
+           the other arm of this if. finish_rebase never touched a branch in
+           that case either, so there is nothing to restore here.) */
         char abort_msg[4096 + 64];
 
         if (sg_ref_update_branch(git_dir, state.orig_branch, state.orig_head) != 0) {
@@ -1047,7 +1090,10 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
     }
 
     short_hex(state.orig_head, short_sha);
-    printf("Rebase aborted; '%s' is back at %s.\n", state.orig_branch, short_sha);
+    if (state.orig_branch != NULL)
+        printf("Rebase aborted; '%s' is back at %s.\n", state.orig_branch, short_sha);
+    else
+        printf("Rebase aborted; HEAD is back at %s.\n", short_sha);
     sg_rebase_state_free(&state);
     return 0;
 }
