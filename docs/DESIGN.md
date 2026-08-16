@@ -1455,10 +1455,11 @@ mutation 名字裡有 `/` 會讓 `mkdtemp` 失敗(「No such file or directory�
 
 ### 刻意維持的 divergence
 
-- **`sg merge` 與「從 detached HEAD 起手的 `sg rebase`」仍然拒絕**。真 git 三
-  者都支援。這是範圍決定,不是做不到,所以用 interop 釘住而不是任其漂移;訊息
-  也從「failed to determine current branch」改成明講 detached——把 detached 說
-  成「讀不到某個東西」,只有在那個狀態不可達的時候才勉強站得住。
+- ~~**`sg merge` 與「從 detached HEAD 起手的 `sg rebase`」仍然拒絕**~~——
+  **Phase 19 已放行**,見下一節。當時的理由仍然成立:那是範圍決定而不是做不到,
+  所以用 interop 釘住而不是任其漂移。釘住的代價與收益都在 Phase 19 兌現了:移
+  動這個邊界就是刪掉那兩條被釘住的檢查,而那個刪除動作本身連帶弄壞了第三條,
+  正好證明它們原本擋住的漂移是真的。
 - **`sg status` 沒有 git 那句 `interactive rebase in progress`**。實測發現真
   git 即使沒加 `-i` 也印 interactive(2.26 起 merge backend 沿用 interactive
   機制),sg 沒有 `-i`,照抄會是誤導。
@@ -1487,3 +1488,161 @@ mutation 名字裡有 `/` 會讓 `mkdtemp` 失敗(「No such file or directory�
 最終 `tests/interop.sh` 1098 項檢查(Phase 17 結束時是 998),`make test` 35 支
 二進位全過(新增 `tests/test_head_detach.c`),`make sanitize` 乾淨,子指令維持
 24 個(`sg switch` 新增 `--detach`)。
+
+---
+
+## Phase 19:merge 與 rebase 也接受 detached HEAD
+
+Phase 18 把 detached HEAD 變成一等狀態,但刻意在三個指令前停住:merge、reset、
+rebase。reset 在 Phase 18 進行中就被自己的測試逼著放行了(暫停中的 rebase 變成
+detached,7 條既有 interop 因此紅)。剩下兩個是這一節。
+
+真 git 兩者都支援,所以這裡沒有設計自由度——目標行為完全由實測決定。
+
+### 拿真 git 當 oracle:先量,再寫
+
+開工第一件事是把兩個指令在 detached 下的全部行為量一遍(git 2.55.0),存成一張
+對照表:HEAD 檔案內容、`logs/HEAD` 追加了什麼、分支 reflog 追加了什麼、stdout
+逐字、以及 commit 物件的形狀。merge 四個場景(true merge / fast-forward /
+up-to-date / 衝突後 commit),rebase 五個(plain / 衝突後 continue / abort /
+up-to-date / fast-forward),每個都再跑一次**分支起手**的版本當對照組。
+
+有對照組這件事是關鍵。單看 detached 的輸出無從判斷「這一行是本來就有的、還是
+detached 才有的」;並排之後,差異塌縮成很小的一張表:
+
+| 面向 | 分支起手 | detached 起手 |
+|---|---|---|
+| rebase 成功訊息 | `...updated refs/heads/topic.` | `...updated detached HEAD.` |
+| rebase up-to-date | `Current branch topic is up to date.` | `HEAD is up to date.` |
+| `logs/HEAD` 收尾行 | `rebase (finish): returning to refs/heads/topic` | **沒有** |
+| 分支 reflog 收尾行 | `rebase (finish): refs/heads/topic onto <onto>` | **沒有** |
+| `--abort` 的 log | `returning to refs/heads/topic` | `returning to <orig-head 40-hex>` |
+| 狀態檔 `head-name` | `refs/heads/topic` | 字面 `detached HEAD` |
+| `rebase (start)` / `(pick)` / `(continue)` | 逐字相同 | 逐字相同 |
+
+**踩到的第一個坑與程式無關**:git 預設用系統 locale 輸出,量到的是
+「更新 d42fa44..466da28」而不是 `Updating ...`。訊息字串一定要先鎖 `LC_ALL=C`
+再量,否則抄進測試的期望值在 CI 上必紅。這是 Phase 18 那條「oracle 的環境要自
+己宣告」的同一個教訓換一個面貌出現。
+
+### 結構性的觀察:這不是特例,是退化
+
+把上表讀成「detached 要多寫七個特例」是錯的讀法。正確的讀法是:
+
+Phase 18 的 `finish_rebase` 是兩步——先更新分支(HEAD 仍 detached,rule 2 不鏡
+射)、再接回 HEAD(old==new,但 `logs/HEAD` 不做 no-op 抑制)。**沒有分支的時候,
+這兩步各自沒有對象**:沒有分支要搬,也沒有 HEAD 要接回去(HEAD 從頭到尾就是
+detached,而且已經停在正確的 commit 上)。所以 `finish_rebase` 在
+`branch == NULL` 時整支 `return 0`,一個位元組都不寫——而真 git 量到的正是「什麼
+都沒寫」。
+
+merge 同理:分支路徑是「更新分支 ref,rule 2 順便鏡射一行進 `logs/HEAD`」;
+detached 路徑是「直接寫 HEAD,它自己就記一行」。兩條路徑都只有一行 log,位置也
+都對,沒有任何一行是為了對齊 git 而特別寫的。
+
+這是 Phase 17 那兩條不對稱規則第二次當成**工具**而不是限制來用(第一次是 Phase
+18 的 `finish_rebase` 順序)。規則選得好的時候,新狀態不需要新規則。
+
+### sentinel:磁碟上要說「這裡沒有分支」
+
+序列器狀態的 `orig_branch` 原本一定是分支名,`sg_rebase_state_read` 讀不到就判
+損壞。detached 起手需要表達「沒有分支」,而這個表達必須與「損壞」分得開。
+
+做法:記憶體用 `NULL`,磁碟寫字面字串 `detached HEAD`——與真 git 的
+`.git/rebase-merge/head-name` 同一個 sentinel。它撞不到真的分支名,因為
+`sg_ref_name_valid_for_create` 與真 git 的 check-ref-format 都拒絕含空白的 ref
+名,所以叫這個名字的分支根本建不出來。
+
+**刻意不採用的做法是「檔案不存在 = detached」。** 走到可以被 resume 的狀態時,
+rebase 一定寫過那個檔案,所以檔案不見了代表有東西把它弄掉了。把缺席讀成一個合
+法狀態,等於把資料遺失洗成正常運作——與 `sg_ref_head_is_detached` 堅持把損壞和
+detached 分開是同一條原則。缺席仍然回 -1,而且有一條專門的單元測試釘住。
+
+### 兩個 bug,都是測試抓的,都不是移植錯誤
+
+**衝突合併在 detached 上 segfault。** `current_branch` 被原封不動傳進
+`sg_merge_trees` 當 `ours_label`,而那個 label 會被格式化進 `<<<<<<< %s` 衝突標
+記。NULL 進去就是崩潰,而且崩在使用者最容易走到的路徑上。修法是把「NULL → 
+`HEAD`」算成一個 `ours_label` 區域變數,衝突標記、merge 訊息本文、摘要行三處共
+用。副作用是 detached 時標記變成 `<<<<<<< HEAD`——正好就是真 git 一律用的字
+(sg 在分支上用分支名,那是既有分歧,phase4b 釘著,沒動)。
+
+**損壞 HEAD 被怪到工作目錄頭上。** merge 的「工作目錄要乾淨」閘門排在 HEAD 閘門
+之前,而比對工作目錄與 HEAD 本來就得先讀 HEAD;HEAD 壞掉時比對結果變成「每個檔
+案都是新增」,於是使用者被告知工作目錄髒——唯一沒問題的那部分被指控了。把 HEAD
+診斷移到最前面。**這是先前就存在的**,不是這次改出來的:在 Phase 19 之前 merge
+對損壞 HEAD 同樣印工作目錄髒,只是每個 detached HEAD 都在更早被拒絕,沒有測試
+走得到這個組合。
+
+### 第三個 bug:整套綠燈之下的 `(null)`
+
+冷讀在 `cmd_rebase.c` 的 fast-forward 捷徑找到最後一個沒守衛的 `current_branch`:
+
+```
+Fast-forwarded (null) to master.
+```
+
+那條路徑**有**測試走到(phase19g 的 fast-forward 案例精確打中它),而且退出碼是
+0、ref 與 reflog 全部正確——因為測試把 stdout 丟進了 `/dev/null`。這個平台的
+`printf("%s", NULL)` 只印 `(null)` 不崩潰,所以三格 CI 都會靜默通過。
+
+缺的不是一條檢查,是**一整個維度**。18a–18d 曾經因為沒有任何一條讀 `switch` 的
+stdout 而漏掉三個分歧;這次一模一樣的形狀又出現一次,只是換到 rebase。現在這一
+批新增的每一句 detached 專屬訊息都有 stdout 斷言:merge 摘要行、rebase 成功
+行、fast-forward 行、abort 行。
+
+一個推論值得記下來:**「覆蓋率高」與「維度齊全」是兩回事**。Phase 19 對 HEAD 檔
+案、reflog、ref、commit 形狀、退出碼的斷言都很密,密到看起來不可能有洞——洞就
+在唯一沒人看的那一欄。
+
+### mutation 驗證:紅了還要紅得有道理
+
+七條定向 mutation,六條一次命中預測。第七條(`finish_rebase` 的 `if (0)`)**被
+抓到了,但理由是錯的**:NULL 分支往下走會在 `snprintf("refs/heads/%s")` 直接
+segfault,rebase 根本沒機會寫出多餘的 finish 行。那條專門驗「不寫 finish 行」的
+檢查因此**始終是綠的**——mutation 表面上成功,實際上什麼都沒驗到。
+
+換成一條不會崩的 mutation(讓 `finish_rebase` 對 NULL 分支改寫一行假的
+`rebase (finish)` 進 `logs/HEAD`)之後,才真的紅在該紅的地方,失敗訊息是
+`no 'rebase (finish)' line is written when there is no branch (found 1)`。
+
+同樣的紀律也用在剛修好的 `(null)` bug 上:把 bug 種回去,恰好一條檢查變紅,而
+且失敗訊息逐字印出 `Fast-forwarded (null) to master.`。
+
+另外 sentinel 那條 mutation 值得單獨記:sentinel 收斂成單一常數之後,改掉它會讓
+**讀和寫同時改變**,round-trip 測試照樣綠——只有直接讀磁碟內容的那條斷言抓得到。
+這是 Phase 18「重複的字串會讓 mutation 說謊」的反面:常數只有一份的時候,能抓到
+它的必須是一條驗格式而不是驗自洽的斷言,那條斷言就是為此加的。
+
+### 順手收斂
+
+`cmd_reset.c` 的 `move_head_to` 與 `cmd_commit.c` 的 inline 版本是同一段邏輯的
+兩份複本,merge 需要第三份。抽成 `sg_ref_move_head`(`include/sg/refs.h`)。
+分支與 detached 的二選一容易用同一種方式錯兩次,值得只有一個地方。
+
+### 刻意維持的 divergence
+
+- **conflict marker 的 ours 標籤在分支上仍是分支名**,真 git 一律用 `HEAD`。
+  既有分歧,phase4b 釘著,Phase 19 沒有動它——只有 detached 時因為沒有分支可
+  用,才落到與 git 相同的 `HEAD`。
+- **`Fast-forwarded HEAD to <upstream>.` 等訊息是 sg 自己的措辭**,不是 git 的。
+  git 在對應情境印 `Successfully rebased and updated detached HEAD.`。sg 在分支
+  上本來就用自己的句子,detached 只是沿用同一套措辭,沒有理由只在這裡改抄 git。
+
+### 無法驗證(如實記錄)
+
+- **detached 起手的 rebase 在「寫完 state、還沒 detach HEAD」之間被中斷**時的可
+  恢復性沒有測試覆蓋。shell 沒辦法精準砍在那個點,而 Phase 18 用的替代手法(製
+  造中斷後的磁碟狀態再驗 `--abort`)在這裡沒有對應物,因為 detached 路徑的
+  `finish_rebase` 什麼都不寫、根本沒有「兩次寫入之間」那個窗口可以製造。邏輯上
+  自洽(冷讀逐行追過),但只有人工推理背書。
+- **`sg_ref_branch_name_is_safe` 不拒絕空白字元**,所以手動把
+  `.git/sg-rebase/orig-branch` 改成 `Detached HEAD`(大小寫不同)會被當成合法分
+  支名,而不是判成損壞。只有直接竄改磁碟才碰得到,不經任何 `sg` 指令可達;那支
+  函式的用途本來就是路徑安全而非完整驗證。不是 Phase 19 的迴歸,但 sentinel 機
+  制新增了一個依賴它不誤判的地方,記著。
+- **`sg merge --abort` 在 detached 下**現在有 interop 覆蓋(phase19c),但它從來
+  就沒有 detached 閘門——先前它在理論上可達、實際上沒有任何測試走過。
+
+最終 `tests/interop.sh` 1165 項檢查(Phase 18 結束時是 1098),`make test` 35 支
+二進位全過,`make sanitize` 乾淨,子指令維持 24 個。

@@ -1,4 +1,4 @@
-.TH SG 1 "2026-08-14" "small_git 0.1" "User Commands"
+.TH SG 1 "2026-08-16" "small_git 0.1" "User Commands"
 .SH NAME
 sg \- small_git: a git-object-format-compatible version control tool
 .SH SYNOPSIS
@@ -821,7 +821,20 @@ and no garbage collection of unreachable objects.
 .PP
 Merges
 .I branch
-into the current branch. If the current branch is a strict ancestor of
+into whatever
+.B HEAD
+names. On a detached
+.B HEAD
+that is
+.B HEAD
+itself: no branch ref moves, the single reflog line goes to
+.B logs/HEAD
+alone, and the generated merge message and conflict markers say
+.B HEAD
+where they would otherwise name the branch \(em all matching real git. If
+what
+.B HEAD
+names is a strict ancestor of
 .I branch
 (or has no commits yet), this is a fast-forward. Otherwise a three-way
 merge is attempted using the merge base; conflicting files are written to
@@ -917,8 +930,15 @@ Rebase state is stored under
 reports an in-progress rebase and the commands above are the only supported
 way to leave that state. Requires the current branch (\c
 .BR HEAD )
-to not be detached. Refuses to start on top of an in-progress merge, and
-refuses ordinary
+to be readable, but it need not be on a branch: started from a detached
+.BR HEAD ,
+the replay happens exactly as it always does and simply has no branch to move
+at the end, so no branch ref and no branch reflog is touched and
+.B logs/HEAD
+ends at the last replayed commit with no
+.B rebase (finish)
+line \(em matching real git. Refuses to start on top of an in-progress merge,
+and refuses ordinary
 .B commit
 while a rebase is in progress.
 .SS clone
