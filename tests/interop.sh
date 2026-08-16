@@ -6909,6 +6909,12 @@ check "phase19a: its subject names HEAD, not a branch, exactly as git's does (go
 P19A_STATUS=$(cd "$P19A_S" && "$SG" status 2>/dev/null | tail -1)
 check "phase19a: the work tree is clean afterwards (got '$P19A_STATUS')" \
     test "$P19A_STATUS" = "nothing to commit, working tree clean"
+# stdout is asserted for every message this phase gave a detached-HEAD
+# wording, here and in 19f/19g. Reading only files and reflogs is how a
+# "Fast-forwarded (null) to master." survived a full green run: the branch
+# name reaches the user through a channel nothing was looking at.
+check "phase19a: it names HEAD in its summary line, having no branch to name (said '$P19A_OUT')" \
+    test "$P19A_OUT" = "Merge made by 'topic' [$(cd "$P19A_S" && git rev-parse --short=7 HEAD)] into HEAD."
 
 # ------------------------------------------------------------
 # Phase 19b: a fast-forward merge, and an already-up-to-date one
@@ -7033,6 +7039,8 @@ P19D_OUT=$( (cd "$P19D_S" && "$SG" rebase master) 2>&1 )
 P19D_RC=$?
 check "phase19d: sg rebase started on a detached HEAD succeeds (said '$(printf '%s' "$P19D_OUT" | tail -1)')" \
     test "$P19D_RC" = 0
+check "phase19d: ...and says so without naming a branch it never had" \
+    test "$(printf '%s' "$P19D_OUT" | tail -1)" = "Successfully rebased and updated detached HEAD onto 'master'."
 (cd "$P19D_G" && git rebase master) > /dev/null 2>&1
 
 check "phase19d: HEAD is still detached afterwards (got '$(cat "$P19D_S/.git/HEAD")')" \
@@ -7124,8 +7132,11 @@ P19F_S_HEADN=$(p19_lines "$P19F_S/.git/logs/HEAD")
 P19F_G_HEADN=$(p19_lines "$P19F_G/.git/logs/HEAD")
 (cd "$P19F_S" && "$SG" rebase master) > /dev/null 2>&1
 (cd "$P19F_G" && git rebase master) > /dev/null 2>&1
-(cd "$P19F_S" && "$SG" rebase --abort) > /dev/null 2>&1
-check "phase19f: sg rebase --abort works from a detached start" test $? = 0
+P19F_ABORT_OUT=$( (cd "$P19F_S" && "$SG" rebase --abort) 2>&1 )
+P19F_ABORT_RC=$?
+check "phase19f: sg rebase --abort works from a detached start" test "$P19F_ABORT_RC" = 0
+check "phase19f: ...saying HEAD is back, with no branch to name (said '$P19F_ABORT_OUT')" \
+    test "$P19F_ABORT_OUT" = "Rebase aborted; HEAD is back at $(printf '%s' "$P19F_HEAD_BEFORE" | cut -c1-7)."
 (cd "$P19F_G" && git rebase --abort) > /dev/null 2>&1
 # topic points at the same commit HEAD started on, so "HEAD holds that id" is
 # also true of a build that reattached to topic. The raw file is read.
@@ -7173,8 +7184,17 @@ p19_detach "$P19G2_G" git master~1
 P19G2_MASTER=$(cat "$P19G2_S/.git/refs/heads/master")
 P19G2_S_HEADN=$(p19_lines "$P19G2_S/.git/logs/HEAD")
 P19G2_G_HEADN=$(p19_lines "$P19G2_G/.git/logs/HEAD")
-(cd "$P19G2_S" && "$SG" rebase master) > /dev/null 2>&1
-check "phase19g: a fast-forward rebase from a detached HEAD succeeds" test $? = 0
+P19G2_OUT=$( (cd "$P19G2_S" && "$SG" rebase master) 2>&1 )
+P19G2_RC=$?
+check "phase19g: a fast-forward rebase from a detached HEAD succeeds" test "$P19G2_RC" = 0
+# This exact line printed "Fast-forwarded (null) to master." while every
+# other check in this block was green: the fast-forward shortcut returns
+# before the code paths the rest of the phase touched, so it kept the one
+# unguarded current_branch left in the file. Discarding stdout is what let
+# it through -- on this libc a NULL %s prints "(null)" rather than
+# crashing, so even the exit status stayed 0.
+check "phase19g: ...naming HEAD rather than a branch it does not have (said '$P19G2_OUT')" \
+    test "$P19G2_OUT" = "Fast-forwarded HEAD to master."
 (cd "$P19G2_G" && git rebase master) > /dev/null 2>&1
 check "phase19g: ...moving HEAD onto the upstream, still detached" \
     test "$(cat "$P19G2_S/.git/HEAD")" = "$P19G2_MASTER"

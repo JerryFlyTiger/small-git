@@ -618,7 +618,10 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             }
         }
 
-        printf("Fast-forwarded %s to %s.\n", current_branch, upstream_arg);
+        if (current_branch != NULL)
+            printf("Fast-forwarded %s to %s.\n", current_branch, upstream_arg);
+        else
+            printf("Fast-forwarded HEAD to %s.\n", upstream_arg);
         free(current_branch);
         return 0;
     }
