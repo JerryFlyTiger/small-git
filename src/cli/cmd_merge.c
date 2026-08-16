@@ -29,13 +29,15 @@ static const char *env_or(const char *name, const char *fallback)
     return (v != NULL && v[0] != '\0') ? v : fallback;
 }
 
+/* current_branch may be NULL (detached HEAD): sg_ref_move_head then moves
+   HEAD itself instead of a branch, leaving every branch ref untouched, same
+   as real git measured against a detached fast-forward merge. */
 static int do_fast_forward(const char *git_dir, const char *repo_root, const char *current_branch,
                            const char *branch_arg, const unsigned char theirs_commit[SG_SHA1_RAW_LEN],
                            const unsigned char theirs_tree[SG_SHA1_RAW_LEN], int force)
 {
     char label[300];
     int apply_rc;
-    char ref_path[4096];
     char reflog_msg[400];
 
     snprintf(label, sizeof(label), "merge %s (fast-forward)", branch_arg);
@@ -48,9 +50,8 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
         return 1;
 
     snprintf(reflog_msg, sizeof(reflog_msg), "merge %s: Fast-forward", branch_arg);
-    if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", current_branch) >= (int)sizeof(ref_path) ||
-       sg_ref_update(git_dir, ref_path, theirs_commit, reflog_msg) != 0) {
-        fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
+    if (sg_ref_move_head(git_dir, current_branch, theirs_commit, reflog_msg) != 0) {
+        fprintf(stderr, "sg: failed to update HEAD\n");
         return 1;
     }
 
@@ -88,6 +89,14 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     size_t i;
     int has_conflict;
     int rc = 1;
+    /* What "our" side is called: in conflict markers, in the generated merge
+       message, and in the summary line. sg names the branch where real git
+       always writes HEAD -- a pre-existing divergence pinned by phase4b --
+       but with HEAD detached there is no branch to name and git's own answer
+       is the only one available. Computed once: passing current_branch
+       straight through is what made a conflicting detached merge write NULL
+       into the "<<<<<<< %s" marker and crash. */
+    const char *ours_label = (current_branch != NULL) ? current_branch : "HEAD";
 
     if (sg_commit_tree_of(git_dir, ours_commit, ours_tree) != 0 ||
        sg_commit_tree_of(git_dir, base_commit, base_tree) != 0) {
@@ -119,7 +128,7 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     }
     sg_index_free(&idx);
 
-    if (sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, current_branch, branch_arg,
+    if (sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, ours_label, branch_arg,
                        &result) != 0) {
         fprintf(stderr, "sg: 合併過程中發生錯誤\n");
         return 1;
@@ -169,7 +178,7 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         const char *name = env_or("GIT_AUTHOR_NAME", "small_git");
         const char *email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
 
-        snprintf(message, sizeof(message), "Merge branch '%s' into %s\n", branch_arg, current_branch);
+        snprintf(message, sizeof(message), "Merge branch '%s' into %s\n", branch_arg, ours_label);
         if (sg_message_cleanup(message, &cleaned_message) != 0) {
             fprintf(stderr, "sg: out of memory\n");
             rc = 1;
@@ -230,15 +239,12 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
                ran `git reflog` against an sg-built repo. This is a
                deliberate divergence from real git's exact text, not a gap
                -- interop coverage for this line asserts sg's own string. */
-            char ref_path[4096];
             char reflog_msg[400];
 
             snprintf(reflog_msg, sizeof(reflog_msg), "merge %s: Merge made by the 'sg-3way' strategy.",
                     branch_arg);
-            if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", current_branch) >=
-                   (int)sizeof(ref_path) ||
-               sg_ref_update(git_dir, ref_path, new_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: failed to update branch '%s'\n", current_branch);
+            if (sg_ref_move_head(git_dir, current_branch, new_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: failed to update HEAD\n");
                 rc = 1;
                 goto done;
             }
@@ -254,7 +260,10 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
             sg_sha1_to_hex(new_commit_id, commit_hex);
             memcpy(short_hex, commit_hex, 7);
             short_hex[7] = '\0';
-            printf("Merge made by '%s' [%s] into '%s'.\n", branch_arg, short_hex, current_branch);
+            if (current_branch != NULL)
+                printf("Merge made by '%s' [%s] into '%s'.\n", branch_arg, short_hex, current_branch);
+            else
+                printf("Merge made by '%s' [%s] into HEAD.\n", branch_arg, short_hex);
         }
         rc = 0;
     }
@@ -395,7 +404,31 @@ int sg_cmd_merge(int argc, char **argv)
             return 1;
         }
 
+        /* Real git merges fine on a detached HEAD (measured, git 2.55.0):
+           it just moves HEAD itself and leaves every branch ref alone.
+           current_branch NULL from here on means exactly that -- "detached,
+           legitimate" -- not a failure; only a corrupt HEAD (neither a
+           branch nor a resolvable commit) is refused, same phrasing as
+           reset's and rebase's refusals so phase18e's loop can tell the two
+           apart by prefix.
+
+           This runs BEFORE the clean-work-tree check, not after it as the
+           refusal it replaced did. Everything that compares the work tree
+           against HEAD has to read HEAD first, so with HEAD corrupt the
+           comparison comes back "every tracked file is a new addition" and
+           the user is told their work tree is dirty -- blaming the one part
+           of the repository that is fine. Diagnosing HEAD first is what
+           makes the message name the actual problem. */
+        current_branch = sg_ref_current_branch(git_dir);
+        if (current_branch == NULL && sg_ref_head_is_detached(git_dir) != 1) {
+            fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+
         if (sg_require_clean_workdir(git_dir, repo_root, "sg merge") != 0) {
+            free(current_branch);
             free(git_dir);
             free(repo_root);
             return 1;
@@ -403,37 +436,20 @@ int sg_cmd_merge(int argc, char **argv)
 
         if (!sg_ref_branch_exists(git_dir, branch_arg)) {
             fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
+            free(current_branch);
             free(git_dir);
             free(repo_root);
             return 1;
         }
         if (sg_ref_read_branch(git_dir, branch_arg, theirs_commit) != 0) {
             fprintf(stderr, "sg: failed to read branch '%s'\n", branch_arg);
+            free(current_branch);
             free(git_dir);
             free(repo_root);
             return 1;
         }
 
         has_head = (sg_ref_resolve_head(git_dir, ours_commit) == 0);
-
-        /* Real git can merge on a detached HEAD (it just moves HEAD and no
-           branch); sg deliberately does not, because merge's whole write
-           path below assumes a branch ref to advance. Phase 18 scope stops
-           here on purpose. What it does fix is the wording: this used to say
-           "failed to determine current branch", which described a detached
-           HEAD as an internal failure to read something -- the state was
-           unreachable then, so nobody had to name it. Same phrasing as
-           reset's and rebase's refusals. */
-        current_branch = sg_ref_current_branch(git_dir);
-        if (current_branch == NULL) {
-            if (sg_ref_head_is_detached(git_dir) == 1)
-                fprintf(stderr, "sg: 目前是 detached HEAD，無法 merge（HEAD 必須指向一個分支）\n");
-            else
-                fprintf(stderr, "sg: failed to determine current branch\n");
-            free(git_dir);
-            free(repo_root);
-            return 1;
-        }
 
         if (sg_commit_tree_of(git_dir, theirs_commit, theirs_tree) != 0) {
             fprintf(stderr, "sg: corrupt commit for branch '%s'\n", branch_arg);
