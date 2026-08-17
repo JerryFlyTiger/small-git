@@ -39,13 +39,15 @@ static void print_dropped(const char *spec, size_t index, const char *hex)
 
 static int cmd_stash_push(int argc, char **argv, const char *usage)
 {
-    const char *message = NULL;
+    sg_stash_push_opts opts;
     int i0 = 1;
     int i;
     char *git_dir;
     char *repo_root;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
     int rc;
+
+    memset(&opts, 0, sizeof(opts));
 
     if (argc >= 2 && strcmp(argv[1], "push") == 0)
         i0 = 2;
@@ -56,11 +58,27 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
                 fputs(usage, stderr);
                 return 1;
             }
-            message = argv[++i];
+            opts.message = argv[++i];
+        } else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--include-untracked") == 0) {
+            opts.include_untracked = 1;
+        } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--all") == 0) {
+            opts.include_ignored = 1;
+        } else if (strcmp(argv[i], "--keep-index") == 0) {
+            opts.keep_index = 1;
         } else {
             fputs(usage, stderr);
             return 1;
         }
+    }
+
+    /* -u/-a are recognized (the struct carries them, this parses them) but
+       not yet implemented -- see sg_stash_push_opts's header comment. Refuse
+       explicitly rather than silently ignoring the flag and stashing as if
+       it had not been given, which would look like success while quietly
+       doing the wrong thing. */
+    if (opts.include_untracked || opts.include_ignored) {
+        fprintf(stderr, "sg: -u/-a (未追蹤/已忽略檔案) 尚未支援\n");
+        return 1;
     }
 
     git_dir = sg_require_git_dir();
@@ -106,7 +124,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
                         "HEAD，之後 `sg rebase --continue` 可能因此略過目前這個 commit\n");
     }
 
-    rc = sg_stash_push(git_dir, repo_root, message, commit_id);
+    rc = sg_stash_push(git_dir, repo_root, &opts, commit_id);
     if (rc == 1) {
         printf("No local changes to save\n");
         free(git_dir);
@@ -452,7 +470,8 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
 
 int sg_cmd_stash(int argc, char **argv)
 {
-    static const char usage[] = "usage: sg stash [push] [-m <msg>]\n"
+    static const char usage[] = "usage: sg stash [push] [-m <msg>] [-u|--include-untracked] [-a|--all] "
+                                "[--keep-index]\n"
                                 "   or: sg stash list\n"
                                 "   or: sg stash apply [<stash>]\n"
                                 "   or: sg stash pop [<stash>]\n"

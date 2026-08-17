@@ -36,10 +36,31 @@ void sg_stash_list_free(sg_stash_list *list);
    the count. Prints nothing. */
 int sg_stash_parse_spec(const char *spec, size_t *index_out);
 
+/* Options for sg_stash_push. A NULL opts pointer is equivalent to every
+   field zeroed (message NULL, all three flags 0).
+
+   include_untracked (-u) and include_ignored (-a, which implies -u) are
+   PLACEHOLDERS as of Phase 20 batch 1: the struct carries them and the CLI
+   parses them, but sg_stash_push does not yet act on either -- the CLI
+   layer refuses with "尚未支援" before ever calling in when either is set.
+   A future batch will give them their real (3-parent, untracked-files)
+   behavior; do not read anything into their current no-op status. */
+typedef struct {
+    const char *message;   /* NULL selects the "WIP on <branch>: ..." form */
+    int include_untracked; /* -u  -- placeholder, see above */
+    int include_ignored;   /* -a  -- placeholder, see above */
+    int keep_index;        /* --keep-index: reset the working tree to the
+                               INDEX tree instead of HEAD's tree, leaving
+                               staged changes staged (measured against real
+                               git: this is not a separate code path, just a
+                               different tree passed to the same reset). */
+} sg_stash_push_opts;
+
 /* Creates a new stash from the current index and working tree and resets
-   both to HEAD. message NULL selects the "WIP on <branch>: <short> <subj>"
-   form; otherwise the "On <branch>: <message>" form is used. Writes the
-   index commit (parent 2) unconditionally -- real git refuses to treat a
+   the working tree back to either HEAD's tree, or (opts->keep_index) the
+   index tree. opts->message NULL selects the "WIP on <branch>: <short>
+   <subj>" form; otherwise the "On <branch>: <message>" form is used. Writes
+   the index commit (parent 2) unconditionally -- real git refuses to treat a
    commit with fewer than two parents as a stash at all (measured: a forged
    1-parent stash lists, but `show`/`apply`/`pop` die with "not a stash-like
    commit"), so it is not optional.
@@ -51,12 +72,12 @@ int sg_stash_parse_spec(const char *spec, size_t *index_out);
    this way on an unborn HEAD or an unmerged index -- the caller may report
    "nothing happened"). Returns -2 when the stash commit + refs/stash were
    already written durably (so it IS on `sg stash list`) but a later step --
-   the snapshot or the working-tree reset back to HEAD -- failed; the caller
-   must not claim nothing was created, and should tell the user the entry
-   exists and the working tree may not have been reset. Deliberately does NOT
-   touch a paused rebase's sequencer state, and does NOT remove MERGE_HEAD --
-   both are the CLI layer's job (see cmd_stash.c). */
-int sg_stash_push(const char *git_dir, const char *repo_root, const char *message,
+   the snapshot or the working-tree reset -- failed; the caller must not
+   claim nothing was created, and should tell the user the entry exists and
+   the working tree may not have been reset. Deliberately does NOT touch a
+   paused rebase's sequencer state, and does NOT remove MERGE_HEAD -- both
+   are the CLI layer's job (see cmd_stash.c). */
+int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_push_opts *opts,
                   unsigned char commit_id_out[SG_SHA1_RAW_LEN]);
 
 /* Three-way merges stash entry `index` into the current HEAD (base = the

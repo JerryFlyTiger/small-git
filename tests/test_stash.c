@@ -56,6 +56,30 @@ static void write_workdir_file(const char *repo_root, const char *rel, const cha
          "failed to write workdir file %s", rel);
 }
 
+/* sg_stash_push now takes an options struct; this wrapper keeps the many
+   existing "just a message, no flags" call sites below a one-liner. */
+static int stash_push(const char *git_dir, const char *repo_root, const char *message,
+                      unsigned char commit_id_out[SG_SHA1_RAW_LEN])
+{
+    sg_stash_push_opts opts;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.message = message;
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+}
+
+/* Same, but for a call site that also needs opts.keep_index set. */
+static int stash_push_keep_index(const char *git_dir, const char *repo_root, const char *message,
+                                 unsigned char commit_id_out[SG_SHA1_RAW_LEN])
+{
+    sg_stash_push_opts opts;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.message = message;
+    opts.keep_index = 1;
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+}
+
 static char *read_workdir_file(const char *repo_root, const char *rel)
 {
     char abspath[4096];
@@ -183,7 +207,7 @@ static void test_push_list_drop_clear(void)
     commit_initial(git_dir, repo_root);
 
     /* nothing to save yet: exit 1, disk untouched */
-    rc = sg_stash_push(git_dir, repo_root, NULL, commit1);
+    rc = stash_push(git_dir, repo_root, NULL, commit1);
     CHECK(rc == 1, "expected nothing-to-save (1), got %d", rc);
     assert_tip_invariant(git_dir);
     {
@@ -195,7 +219,7 @@ static void test_push_list_drop_clear(void)
     /* dirty the workdir, then stash it */
     write_workdir_file(repo_root, "a.txt", "changed\n");
 
-    rc = sg_stash_push(git_dir, repo_root, "first stash", commit1);
+    rc = stash_push(git_dir, repo_root, "first stash", commit1);
     CHECK(rc == 0, "expected a stash to be created, got %d", rc);
     assert_tip_invariant(git_dir);
 
@@ -209,7 +233,7 @@ static void test_push_list_drop_clear(void)
 
     /* second stash, default WIP message */
     write_workdir_file(repo_root, "a.txt", "changed again\n");
-    rc = sg_stash_push(git_dir, repo_root, NULL, commit2);
+    rc = stash_push(git_dir, repo_root, NULL, commit2);
     CHECK(rc == 0, "expected a second stash, got %d", rc);
     assert_tip_invariant(git_dir);
 
@@ -264,7 +288,7 @@ static void test_push_list_drop_clear(void)
 
     /* push once more, then clear */
     write_workdir_file(repo_root, "a.txt", "one more change\n");
-    rc = sg_stash_push(git_dir, repo_root, NULL, commit1);
+    rc = stash_push(git_dir, repo_root, NULL, commit1);
     CHECK(rc == 0, "expected a stash before clear, got %d", rc);
     assert_tip_invariant(git_dir);
 
@@ -311,9 +335,9 @@ static void test_drop_rolls_back_on_ref_write_failure(void)
     commit_initial(git_dir, repo_root);
 
     write_workdir_file(repo_root, "a.txt", "changed\n");
-    CHECK(sg_stash_push(git_dir, repo_root, "first", commit1) == 0, "first push failed");
+    CHECK(stash_push(git_dir, repo_root, "first", commit1) == 0, "first push failed");
     write_workdir_file(repo_root, "a.txt", "changed again\n");
-    CHECK(sg_stash_push(git_dir, repo_root, "second", commit2) == 0, "second push failed");
+    CHECK(stash_push(git_dir, repo_root, "second", commit2) == 0, "second push failed");
     assert_tip_invariant(git_dir);
 
     CHECK(sg_ref_read_path(git_dir, "refs/stash", old_tip) == 0, "refs/stash should exist before drop");
@@ -373,7 +397,7 @@ static void test_clear_rolls_back_on_delete_failure(void)
     commit_initial(git_dir, repo_root);
 
     write_workdir_file(repo_root, "a.txt", "changed\n");
-    CHECK(sg_stash_push(git_dir, repo_root, "only", commit1) == 0, "push failed");
+    CHECK(stash_push(git_dir, repo_root, "only", commit1) == 0, "push failed");
     assert_tip_invariant(git_dir);
 
     CHECK(sg_ref_read_path(git_dir, "refs/stash", old_tip) == 0, "refs/stash should exist before clear");
@@ -439,7 +463,7 @@ static void test_push_returns_minus_two_when_reset_fails(void)
     snprintf(abspath, sizeof(abspath), "%s/a.txt", repo_root);
     CHECK(chmod(abspath, 0444) == 0, "chmod a.txt read-only failed");
 
-    rc = sg_stash_push(git_dir, repo_root, "will half-fail", commit1);
+    rc = stash_push(git_dir, repo_root, "will half-fail", commit1);
     CHECK(rc == -2, "expected -2 (stash durable, reset failed), got %d", rc);
 
     chmod(abspath, 0644); /* restore before any further reads/writes */
@@ -535,7 +559,7 @@ static void test_apply_fails_when_clean_write_target_is_a_directory(void)
     /* stash a change to d/file.txt (push resets the workdir back to HEAD,
        so d/file.txt is "one\n" again afterward) */
     write_workdir_file(repo_root, "d/file.txt", "two\n");
-    rc = sg_stash_push(git_dir, repo_root, "change d", stash_commit);
+    rc = stash_push(git_dir, repo_root, "change d", stash_commit);
     CHECK(rc == 0, "stash push failed, rc=%d", rc);
 
     /* replace the tracked file with a directory of the same name */
@@ -559,6 +583,263 @@ static void test_apply_fails_when_clean_write_target_is_a_directory(void)
     free(git_dir);
 }
 
+/* ---- --keep-index: reset to the index tree instead of HEAD's ------------ */
+
+/* Builds the five-file fixture from the Phase 20 spec's --keep-index table
+   (root commit: tracked.txt=v1, staged.txt=s1, staged_del.txt and wt_del.txt
+   both present) directly through the index/tree/commit APIs, mirroring
+   commit_initial but for four files instead of one. */
+static void keep_index_base_repo(const char *git_dir, const char *repo_root)
+{
+    sg_index idx;
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    sg_commit commit;
+    unsigned char *serialized;
+    size_t serialized_len;
+    struct {
+        const char *path;
+        const char *content;
+    } files[4] = {
+        {"staged.txt", "s1\n"},
+        {"staged_del.txt", "del content\n"},
+        {"tracked.txt", "v1\n"},
+        {"wt_del.txt", "wtdel content\n"},
+    };
+    size_t i;
+
+    memset(&idx, 0, sizeof(idx));
+    for (i = 0; i < 4; i++) {
+        unsigned char blob[SG_SHA1_RAW_LEN];
+        sg_index_entry e;
+
+        write_workdir_file(repo_root, files[i].path, files[i].content);
+        CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, files[i].content, strlen(files[i].content), blob) == 0,
+             "write blob for %s", files[i].path);
+        memset(&e, 0, sizeof(e));
+        e.mode = 0100644;
+        memcpy(e.sha1, blob, SG_SHA1_RAW_LEN);
+        e.path = (char *)files[i].path;
+        CHECK(sg_index_upsert(&idx, &e) == 0, "upsert %s", files[i].path);
+    }
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write initial index");
+
+    CHECK(sg_tree_build_from_index(git_dir, &idx, tree_id) == 0, "build initial tree");
+    sg_index_free(&idx);
+
+    memset(&commit, 0, sizeof(commit));
+    memcpy(commit.tree, tree_id, SG_SHA1_RAW_LEN);
+    commit.parent_count = 0;
+    commit.author_name = (char *)"Test";
+    commit.author_email = (char *)"test@example.com";
+    commit.author_time = 1700000200;
+    strcpy(commit.author_tz, "+0000");
+    commit.committer_name = commit.author_name;
+    commit.committer_email = commit.author_email;
+    commit.committer_time = commit.author_time;
+    strcpy(commit.committer_tz, "+0000");
+    commit.message = (char *)"initial\n";
+    CHECK(sg_commit_serialize(&commit, &serialized, &serialized_len) == 0, "serialize initial commit");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_COMMIT, serialized, serialized_len, commit_id) == 0,
+         "write initial commit");
+    free(serialized);
+    CHECK(sg_ref_update_branch(git_dir, "master", commit_id) == 0, "update branch to initial commit");
+}
+
+/* Applies the five per-file mutations the spec's table is built on:
+   tracked.txt unstaged-modified, staged.txt staged-modified, new_staged.txt
+   staged as a brand new file, staged_del.txt staged for deletion (removed
+   from the index, left on disk -- what `git rm --cached` produces), and
+   wt_del.txt deleted from the working tree without being staged. Callable
+   more than once against the same repo as long as the tree has been reset
+   back to HEAD in between (sg_stash_push's own job). */
+static void apply_five_state_mutations(const char *git_dir, const char *repo_root)
+{
+    sg_index idx;
+    unsigned char blob_s2[SG_SHA1_RAW_LEN];
+    unsigned char blob_ns[SG_SHA1_RAW_LEN];
+    sg_index_entry e;
+    char abspath[4096];
+
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index before mutating");
+
+    write_workdir_file(repo_root, "tracked.txt", "v2\n");
+
+    write_workdir_file(repo_root, "staged.txt", "s2\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "s2\n", 3, blob_s2) == 0, "write s2 blob");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_s2, SG_SHA1_RAW_LEN);
+    e.path = (char *)"staged.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "restage staged.txt at s2");
+
+    write_workdir_file(repo_root, "new_staged.txt", "ns1\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "ns1\n", 4, blob_ns) == 0, "write ns1 blob");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_ns, SG_SHA1_RAW_LEN);
+    e.path = (char *)"new_staged.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "stage new_staged.txt");
+
+    CHECK(sg_index_remove(&idx, "staged_del.txt") == 0, "stage removal of staged_del.txt");
+
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write mutated index");
+    sg_index_free(&idx);
+
+    snprintf(abspath, sizeof(abspath), "%s/wt_del.txt", repo_root);
+    CHECK(remove(abspath) == 0, "delete wt_del.txt from the working tree");
+}
+
+static int file_exists(const char *repo_root, const char *rel)
+{
+    char abspath[4096];
+    struct stat st;
+
+    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, rel);
+    return stat(abspath, &st) == 0;
+}
+
+static void test_keep_index_table(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_default[SG_SHA1_RAW_LEN];
+    unsigned char stash_keep[SG_SHA1_RAW_LEN];
+
+    keep_index_base_repo(git_dir, repo_root);
+
+    /* ---- control: no flag, resets to HEAD's tree ---- */
+    apply_five_state_mutations(git_dir, repo_root);
+    CHECK(stash_push(git_dir, repo_root, "control", stash_default) == 0, "control push failed");
+    {
+        char *tracked = read_workdir_file(repo_root, "tracked.txt");
+        char *staged = read_workdir_file(repo_root, "staged.txt");
+        char *wtdel = read_workdir_file(repo_root, "wt_del.txt");
+        sg_index idx;
+
+        CHECK(tracked != NULL && strcmp(tracked, "v1\n") == 0,
+             "no-flag: tracked.txt should be reset to HEAD (v1), got %s",
+             tracked != NULL ? tracked : "(null)");
+        CHECK(staged != NULL && strcmp(staged, "s1\n") == 0,
+             "no-flag: staged.txt should be reset to HEAD (s1), not kept at s2, got %s",
+             staged != NULL ? staged : "(null)");
+        CHECK(!file_exists(repo_root, "new_staged.txt"),
+             "no-flag: new_staged.txt should not exist (it was never in HEAD)");
+        CHECK(file_exists(repo_root, "staged_del.txt"),
+             "no-flag: staged_del.txt should still exist (HEAD has it)");
+        {
+            char *delcontent = read_workdir_file(repo_root, "staged_del.txt");
+
+            CHECK(delcontent != NULL && strcmp(delcontent, "del content\n") == 0,
+                 "no-flag: staged_del.txt should carry HEAD's content, got %s",
+                 delcontent != NULL ? delcontent : "(null)");
+            free(delcontent);
+        }
+        CHECK(wtdel != NULL && strcmp(wtdel, "wtdel content\n") == 0,
+             "no-flag: wt_del.txt should be restored, got %s", wtdel != NULL ? wtdel : "(null)");
+
+        CHECK(sg_index_read(git_dir, &idx) == 0, "read index after no-flag push");
+        {
+            int pos = sg_index_find(&idx, "staged.txt");
+            unsigned char blob_s1[SG_SHA1_RAW_LEN];
+
+            CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "s1\n", 3, blob_s1) == 0,
+                 "recompute the s1 blob id for comparison");
+            CHECK(pos >= 0 && memcmp(idx.entries[pos].sha1, blob_s1, SG_SHA1_RAW_LEN) == 0,
+                 "no-flag: staged.txt's index entry should be back at the s1 (HEAD) blob");
+        }
+        CHECK(sg_index_find(&idx, "new_staged.txt") < 0,
+             "no-flag: new_staged.txt should not be in the index");
+        CHECK(sg_index_find(&idx, "staged_del.txt") >= 0,
+             "no-flag: staged_del.txt should be re-staged (reset to HEAD restages everything)");
+        sg_index_free(&idx);
+
+        free(tracked);
+        free(staged);
+        free(wtdel);
+    }
+
+    /* ---- --keep-index: resets to the INDEX tree, keeping staged changes
+       staged (and re-applying a staged deletion for real) ---- */
+    apply_five_state_mutations(git_dir, repo_root);
+    CHECK(stash_push_keep_index(git_dir, repo_root, "keepidx", stash_keep) == 0, "--keep-index push failed");
+    {
+        char *tracked = read_workdir_file(repo_root, "tracked.txt");
+        char *staged = read_workdir_file(repo_root, "staged.txt");
+        char *newstaged = read_workdir_file(repo_root, "new_staged.txt");
+        char *wtdel = read_workdir_file(repo_root, "wt_del.txt");
+        sg_index idx;
+
+        CHECK(tracked != NULL && strcmp(tracked, "v1\n") == 0,
+             "--keep-index: tracked.txt should still be reset to HEAD (v1), got %s",
+             tracked != NULL ? tracked : "(null)");
+        CHECK(staged != NULL && strcmp(staged, "s2\n") == 0,
+             "--keep-index: staged.txt should be kept at the staged content (s2), got %s",
+             staged != NULL ? staged : "(null)");
+        CHECK(newstaged != NULL && strcmp(newstaged, "ns1\n") == 0,
+             "--keep-index: new_staged.txt should be kept, got %s",
+             newstaged != NULL ? newstaged : "(null)");
+        CHECK(!file_exists(repo_root, "staged_del.txt"),
+             "--keep-index: staged_del.txt should be DELETED (the staged removal is re-applied), "
+             "not left behind the way the no-flag run leaves it");
+        CHECK(wtdel != NULL && strcmp(wtdel, "wtdel content\n") == 0,
+             "--keep-index: wt_del.txt should be restored, got %s", wtdel != NULL ? wtdel : "(null)");
+
+        CHECK(sg_index_read(git_dir, &idx) == 0, "read index after --keep-index push");
+        CHECK(sg_index_find(&idx, "staged.txt") >= 0, "--keep-index: staged.txt should still be tracked");
+        {
+            int pos = sg_index_find(&idx, "staged.txt");
+            unsigned char blob_s2[SG_SHA1_RAW_LEN];
+
+            CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "s2\n", 3, blob_s2) == 0,
+                 "recompute the s2 blob id for comparison");
+            CHECK(pos >= 0 && memcmp(idx.entries[pos].sha1, blob_s2, SG_SHA1_RAW_LEN) == 0,
+                 "--keep-index: staged.txt's index entry should point at the s2 blob");
+        }
+        CHECK(sg_index_find(&idx, "new_staged.txt") >= 0,
+             "--keep-index: new_staged.txt should still be staged in the index");
+        CHECK(sg_index_find(&idx, "staged_del.txt") < 0,
+             "--keep-index: staged_del.txt should stay absent from the index");
+        sg_index_free(&idx);
+
+        free(tracked);
+        free(staged);
+        free(newstaged);
+        free(wtdel);
+    }
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* index_tree == head_tree (no staged changes at all) -- --keep-index must be
+   a no-op that behaves exactly like the no-flag path: both reset the same
+   single tree. */
+static void test_keep_index_noop_when_index_matches_head(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+
+    commit_initial(git_dir, repo_root); /* a.txt = "hello\n" */
+
+    write_workdir_file(repo_root, "a.txt", "unstaged only\n");
+    CHECK(stash_push_keep_index(git_dir, repo_root, "noop case", stash_id) == 0,
+         "--keep-index push failed when index == HEAD");
+    {
+        char *content = read_workdir_file(repo_root, "a.txt");
+
+        CHECK(content != NULL && strcmp(content, "hello\n") == 0,
+             "--keep-index with a clean index should reset a.txt to HEAD just like the no-flag path, "
+             "got %s",
+             content != NULL ? content : "(null)");
+        free(content);
+    }
+
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_parse_spec_table();
@@ -567,6 +848,8 @@ int main(void)
     test_clear_rolls_back_on_delete_failure();
     test_push_returns_minus_two_when_reset_fails();
     test_apply_fails_when_clean_write_target_is_a_directory();
+    test_keep_index_table();
+    test_keep_index_noop_when_index_matches_head();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

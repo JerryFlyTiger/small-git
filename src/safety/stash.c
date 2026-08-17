@@ -223,9 +223,11 @@ int sg_stash_parse_spec(const char *spec, size_t *index_out)
 
 /* ---- push ------------------------------------------------------------------ */
 
-int sg_stash_push(const char *git_dir, const char *repo_root, const char *message,
+int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_push_opts *opts,
                   unsigned char commit_id_out[SG_SHA1_RAW_LEN])
 {
+    static const sg_stash_push_opts default_opts = {NULL, 0, 0, 0};
+    const char *message;
     unsigned char head_commit[SG_SHA1_RAW_LEN];
     unsigned char head_tree[SG_SHA1_RAW_LEN];
     sg_index idx;
@@ -248,6 +250,10 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const char *messag
     const char *name;
     const char *email;
     int rc = -1;
+
+    if (opts == NULL)
+        opts = &default_opts;
+    message = opts->message;
 
     if (sg_ref_resolve_head(git_dir, head_commit) != 0)
         return -1; /* unborn HEAD */
@@ -370,6 +376,30 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const char *messag
     if (sg_apply_tree_to_workdir(git_dir, repo_root, head_tree) != 0) {
         free(branch);
         return -2;
+    }
+
+    /* --keep-index (measured against real git 2.55.0): after the reset to
+       HEAD above, re-apply the index tree on top so staged changes land
+       back in both the working tree and the index. This is deliberately
+       TWO calls to sg_apply_tree_to_workdir rather than one call straight to
+       index_tree: sg_apply_tree_to_workdir only removes a working-tree file
+       when it is tracked by the index it reads AT CALL TIME and absent from
+       the target tree. A single call with index_tree as the target, using
+       the pre-push (staged) index as that baseline, would never delete a
+       path staged for removal (e.g. `git rm --cached f` leaves f on disk,
+       untracked) -- absent from BOTH the staged index and index_tree, so it
+       reads as "not this call's business" and is left behind. Chaining
+       through head_tree first makes the second call's baseline HEAD's
+       tree (which DOES still list that path), so it gets deleted exactly
+       where the index tree also lacks it -- matching real git's own
+       "reset to HEAD, then re-apply the staged diff" implementation, and
+       the staged-delete row of the measured --keep-index table (Phase 20
+       spec). */
+    if (opts->keep_index) {
+        if (sg_apply_tree_to_workdir(git_dir, repo_root, index_tree) != 0) {
+            free(branch);
+            return -2;
+        }
     }
 
     memcpy(commit_id_out, stash_commit_id, SG_SHA1_RAW_LEN);

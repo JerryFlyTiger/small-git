@@ -4949,6 +4949,127 @@ P15_LOSTBLOB_TIP=$(cd "$P15_LOSTBLOB" && tail -1 .git/logs/refs/stash 2>/dev/nul
 check "phase15 lost blob: the tip invariant survived the failed pop" \
     sh -c "[ -n \"$P15_LOSTBLOB_REF\" ] && [ \"$P15_LOSTBLOB_REF\" = \"$P15_LOSTBLOB_TIP\" ]"
 
+# ============================================================
+# Phase 20 batch 1: sg stash push --keep-index, and the -u/-a placeholders
+#
+# Fixture: a five-file spread covering the whole --keep-index table (spec
+# sec 2) -- tracked.txt unstaged-modified, staged.txt staged-modified,
+# new_staged.txt staged-new, staged_del.txt staged FOR DELETION (removed
+# from the index, left on disk), wt_del.txt deleted unstaged. sg has no `rm
+# --cached`, so `git rm --cached` builds that one state for BOTH the
+# oracle and the sg-built repo -- legitimate, not a shortcut unique to sg,
+# because the index format is bit-compatible (see CLAUDE.md's project
+# summary).
+# ============================================================
+
+p20_keepidx_fixture() {
+    # $1 = dir, $2 = "sg" or "git"
+    _dir="$1"; _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = sg ]; then
+        (cd "$WORKDIR" && "$SG" init "$(basename "$_dir")") > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && git init -q "$(basename "$_dir")")
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'v1\n' > "$_dir/tracked.txt"
+    printf 's1\n' > "$_dir/staged.txt"
+    printf 'del content\n' > "$_dir/staged_del.txt"
+    printf 'wtdel content\n' > "$_dir/wt_del.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add tracked.txt staged.txt staged_del.txt wt_del.txt && \
+            "$SG" commit -m base) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add tracked.txt staged.txt staged_del.txt wt_del.txt && git commit -q -m base)
+    fi
+
+    printf 'v2\n' > "$_dir/tracked.txt"
+    printf 's2\n' > "$_dir/staged.txt"
+    printf 'ns1\n' > "$_dir/new_staged.txt"
+    rm -f "$_dir/wt_del.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add staged.txt new_staged.txt) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add staged.txt new_staged.txt) > /dev/null 2>&1
+    fi
+    (cd "$_dir" && git rm -q --cached staged_del.txt) > /dev/null 2>&1
+}
+
+# --- oracle: real git's own --keep-index result on the fixture ---
+P20_KI_GIT="$WORKDIR/p20_keepidx_git"
+p20_keepidx_fixture "$P20_KI_GIT" git
+(cd "$P20_KI_GIT" && git stash push -q --keep-index -m keepidx) > /dev/null 2>&1
+check "phase20 keep-index oracle: git stash push --keep-index exits 0" test $? = 0
+P20_KI_GIT_PORCELAIN=$(cd "$P20_KI_GIT" && git status --porcelain | sort)
+
+# --- sg's --keep-index result on the identical fixture ---
+P20_KI_SG="$WORKDIR/p20_keepidx_sg"
+p20_keepidx_fixture "$P20_KI_SG" sg
+(cd "$P20_KI_SG" && "$SG" stash push --keep-index -m keepidx) > /dev/null 2>&1
+check "phase20 keep-index: sg stash push --keep-index exits 0" test $? = 0
+
+check "phase20 keep-index: tracked.txt reset to HEAD (v1)" \
+    sh -c "[ \"\$(cat '$P20_KI_SG/tracked.txt')\" = v1 ]"
+check "phase20 keep-index: staged.txt kept at the staged content (s2), not reset to HEAD's s1" \
+    sh -c "[ \"\$(cat '$P20_KI_SG/staged.txt')\" = s2 ]"
+check "phase20 keep-index: new_staged.txt kept and still present" \
+    sh -c "[ \"\$(cat '$P20_KI_SG/new_staged.txt')\" = ns1 ]"
+check "phase20 keep-index: staged_del.txt was deleted (the staged removal is re-applied)" \
+    test ! -e "$P20_KI_SG/staged_del.txt"
+check "phase20 keep-index: wt_del.txt restored" \
+    sh -c "[ \"\$(cat '$P20_KI_SG/wt_del.txt')\" = 'wtdel content' ]"
+
+P20_KI_SG_PORCELAIN=$(cd "$P20_KI_SG" && git status --porcelain | sort)
+check "phase20 keep-index: real git's interpretation of sg's result matches real git's own --keep-index output byte-for-byte" \
+    test "$P20_KI_SG_PORCELAIN" = "$P20_KI_GIT_PORCELAIN"
+
+# --- control: the SAME fixture without --keep-index, both implementations,
+# so the --keep-index checks above are pinned against a contrast rather than
+# read on their own (a no-op --keep-index implementation would also pass
+# every check that doesn't compare the two modes). ---
+P20_NOFLAG_GIT="$WORKDIR/p20_noflag_git"
+p20_keepidx_fixture "$P20_NOFLAG_GIT" git
+(cd "$P20_NOFLAG_GIT" && git stash push -q -m noflag) > /dev/null 2>&1
+check "phase20 no-flag control: git stash push (no --keep-index) exits 0" test $? = 0
+P20_NOFLAG_GIT_PORCELAIN=$(cd "$P20_NOFLAG_GIT" && git status --porcelain | sort)
+check "phase20 no-flag control: precondition -- the oracle's no-flag result differs from its --keep-index result (the flag actually changes something)" \
+    sh -c "[ \"$P20_NOFLAG_GIT_PORCELAIN\" != \"$P20_KI_GIT_PORCELAIN\" ]"
+
+P20_NOFLAG_SG="$WORKDIR/p20_noflag_sg"
+p20_keepidx_fixture "$P20_NOFLAG_SG" sg
+(cd "$P20_NOFLAG_SG" && "$SG" stash push -m noflag) > /dev/null 2>&1
+check "phase20 no-flag control: sg stash push (no --keep-index) exits 0" test $? = 0
+P20_NOFLAG_SG_PORCELAIN=$(cd "$P20_NOFLAG_SG" && git status --porcelain | sort)
+check "phase20 no-flag control: sg's no-flag result matches real git's no-flag result" \
+    test "$P20_NOFLAG_SG_PORCELAIN" = "$P20_NOFLAG_GIT_PORCELAIN"
+check "phase20 no-flag control: sg's no-flag result DIFFERS from sg's own --keep-index result" \
+    test "$P20_NOFLAG_SG_PORCELAIN" != "$P20_KI_SG_PORCELAIN"
+
+# --- -u/-a: recognized but not yet implemented in this batch. Refuse
+# explicitly on stderr and exit 1 rather than silently ignoring the flag
+# (see sg_stash_push_opts's header comment). Also pin the BARE form (no
+# `push`) -- the dispatcher falls through to push for any unrecognized
+# subcommand, but the argument-parsing loop has to recognize the flag too,
+# which is a separate thing to get right. ---
+P20_UNSUP="$WORKDIR/p20_unsupported"
+p15_base_repo "$P20_UNSUP"
+printf 'x\n' > "$P20_UNSUP/a.txt"
+P20_UNSUP_ERR="$WORKDIR/p20_unsup_err.txt"
+(cd "$P20_UNSUP" && "$SG" stash push -u -m "should refuse") > /dev/null 2> "$P20_UNSUP_ERR"
+check "phase20 -u placeholder: sg stash push -u exits 1" test $? != 0
+check "phase20 -u placeholder: refusal message mentions being unsupported" \
+    grep -q '尚未支援' "$P20_UNSUP_ERR"
+check "phase20 -u placeholder: no stash was created" \
+    sh -c "! (cd '$P20_UNSUP' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+
+P20_UNSUP_A_ERR="$WORKDIR/p20_unsup_a_err.txt"
+(cd "$P20_UNSUP" && "$SG" stash -a) > /dev/null 2> "$P20_UNSUP_A_ERR"
+check "phase20 -a placeholder (bare form, no 'push'): sg stash -a exits 1" test $? != 0
+check "phase20 -a placeholder (bare form): refusal message mentions being unsupported" \
+    grep -q '尚未支援' "$P20_UNSUP_A_ERR"
+check "phase20 -a placeholder (bare form): still no stash was created" \
+    sh -c "! (cd '$P20_UNSUP' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+
 # --- Phase 16: switch during an in-progress merge ---
 #
 # Measured against real git 2.55.0: `git switch <other>` during an
