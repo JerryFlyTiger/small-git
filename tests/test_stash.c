@@ -569,7 +569,7 @@ static void test_apply_fails_when_clean_write_target_is_a_directory(void)
     CHECK(remove(abspath) == 0, "failed to remove d/file.txt before replacing it with a directory");
     CHECK(mkdir(abspath, 0755) == 0, "failed to mkdir in place of d/file.txt");
 
-    rc = sg_stash_apply(git_dir, repo_root, 0);
+    rc = sg_stash_apply(git_dir, repo_root, 0, 0);
     CHECK(rc == -1, "expected sg_stash_apply to fail when a clean write target is a directory, got %d",
          rc);
 
@@ -1322,7 +1322,7 @@ static void test_apply_restores_untracked_unstaged(void)
     CHECK(stash_push_u(git_dir, repo_root, "u", stash_id) == 0, "-u push failed");
     CHECK(!file_exists(repo_root, "fresh/inner.txt"), "push should have removed fresh/inner.txt");
 
-    rc = sg_stash_apply(git_dir, repo_root, 0);
+    rc = sg_stash_apply(git_dir, repo_root, 0, 0);
     CHECK(rc == 0, "expected a clean apply of a 3-parent stash, got %d", rc);
 
     {
@@ -1361,7 +1361,7 @@ static void test_apply_untracked_collision_rejects_whole_apply(void)
     /* something else now occupies the path the untracked half would restore */
     write_workdir_file(repo_root, "u.txt", "COLLIDE\n");
 
-    rc = sg_stash_apply(git_dir, repo_root, 0);
+    rc = sg_stash_apply(git_dir, repo_root, 0, 0);
     CHECK(rc == -1, "expected the whole apply to be rejected on an untracked collision, got %d", rc);
 
     {
@@ -1523,7 +1523,7 @@ static void test_apply_untracked_collision_with_directory_rejects_whole_apply(vo
     /* a DIRECTORY now occupies the path the untracked half would restore */
     write_workdir_file(repo_root, "u.txt/inner.txt", "in the way\n");
 
-    rc = sg_stash_apply(git_dir, repo_root, 0);
+    rc = sg_stash_apply(git_dir, repo_root, 0, 0);
     CHECK(rc == -1, "expected the whole apply to be rejected on a directory collision, got %d", rc);
 
     {
@@ -1543,6 +1543,649 @@ static void test_apply_untracked_collision_with_directory_rejects_whole_apply(vo
         CHECK(list.count == 1, "the stash must survive a rejected apply, got %zu", list.count);
         sg_stash_list_free(&list);
     }
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- Phase 20 sec 3: --index -------------------------------------------- */
+
+/* Control (no --index) vs --index on the SAME five-mutation fixture already
+   used by the --keep-index table (spec sec 3.1's contrast) -- two separate
+   repos, not the same repo twice, because sg_stash_apply (unlike
+   sg_stash_push) leaves the working tree dirty afterward, and a second
+   apply on top of that residue would not be testing the same starting
+   state. */
+static void test_index_flag_table(void)
+{
+    /* ---- control: apply without --index ---- */
+    {
+        char *git_dir = make_tmp_repo();
+        char *repo_root = sg_repo_root(git_dir);
+        unsigned char stash_id[SG_SHA1_RAW_LEN];
+        sg_index idx;
+        int pos;
+        unsigned char blob_s1[SG_SHA1_RAW_LEN];
+
+        keep_index_base_repo(git_dir, repo_root);
+        apply_five_state_mutations(git_dir, repo_root);
+        CHECK(stash_push(git_dir, repo_root, "for control", stash_id) == 0, "push failed (control)");
+
+        CHECK(sg_stash_apply(git_dir, repo_root, 0, 0) == 0, "no-index apply failed");
+
+        CHECK(sg_index_read(git_dir, &idx) == 0, "read index after no-index apply");
+        CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "s1\n", 3, blob_s1) == 0, "recompute s1 blob");
+        pos = sg_index_find(&idx, "staged.txt");
+        CHECK(pos >= 0 && memcmp(idx.entries[pos].sha1, blob_s1, SG_SHA1_RAW_LEN) == 0,
+             "no-index apply: staged.txt should be re-staged at HEAD's content (s1), not the "
+             "stash's staged s2");
+        CHECK(sg_index_find(&idx, "new_staged.txt") >= 0,
+             "no-index apply: new_staged.txt (absent from HEAD) should stay staged");
+        sg_index_free(&idx);
+
+        free(repo_root);
+        free(git_dir);
+    }
+
+    /* ---- --index: index restored to the stash's OWN index tree ---- */
+    {
+        char *git_dir = make_tmp_repo();
+        char *repo_root = sg_repo_root(git_dir);
+        unsigned char stash_id[SG_SHA1_RAW_LEN];
+        sg_index idx;
+        int pos;
+        unsigned char blob_s2[SG_SHA1_RAW_LEN];
+        unsigned char blob_ns[SG_SHA1_RAW_LEN];
+        char *tracked;
+        char *staged;
+
+        keep_index_base_repo(git_dir, repo_root);
+        apply_five_state_mutations(git_dir, repo_root);
+        CHECK(stash_push(git_dir, repo_root, "for --index", stash_id) == 0, "push failed (--index)");
+
+        CHECK(sg_stash_apply(git_dir, repo_root, 0, 1) == 0, "--index apply failed");
+
+        CHECK(sg_index_read(git_dir, &idx) == 0, "read index after --index apply");
+        CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "s2\n", 3, blob_s2) == 0, "recompute s2 blob");
+        pos = sg_index_find(&idx, "staged.txt");
+        CHECK(pos >= 0 && memcmp(idx.entries[pos].sha1, blob_s2, SG_SHA1_RAW_LEN) == 0,
+             "--index apply: staged.txt should be restored to the stash's own staged content (s2)");
+        CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "ns1\n", 4, blob_ns) == 0, "recompute ns1 blob");
+        pos = sg_index_find(&idx, "new_staged.txt");
+        CHECK(pos >= 0 && memcmp(idx.entries[pos].sha1, blob_ns, SG_SHA1_RAW_LEN) == 0,
+             "--index apply: new_staged.txt should be restored staged");
+        CHECK(sg_index_find(&idx, "staged_del.txt") < 0,
+             "--index apply: staged_del.txt should stay absent from the index (it was staged for "
+             "removal at push time)");
+
+        /* --index only ever touches the index -- the working tree must be
+           exactly what a no-index apply would have written there too. */
+        tracked = read_workdir_file(repo_root, "tracked.txt");
+        staged = read_workdir_file(repo_root, "staged.txt");
+        CHECK(tracked != NULL && strcmp(tracked, "v2\n") == 0,
+             "--index apply: working tree tracked.txt should be the stash's own content (v2), got %s",
+             tracked != NULL ? tracked : "(null)");
+        CHECK(staged != NULL && strcmp(staged, "s2\n") == 0,
+             "--index apply: working tree staged.txt should be the stash's own content (s2), got %s",
+             staged != NULL ? staged : "(null)");
+        free(tracked);
+        free(staged);
+        sg_index_free(&idx);
+
+        free(repo_root);
+        free(git_dir);
+    }
+}
+
+/* --index must be skipped ENTIRELY on a conflicting merge (spec sec 3.2):
+   the index is left exactly as the no-"--index" rules leave it (conflict
+   stages 1/2/3), never replaced with the stash's own index tree. */
+static void test_index_flag_skipped_on_conflict(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char head1[SG_SHA1_RAW_LEN];
+    unsigned char blob_hello[SG_SHA1_RAW_LEN];
+    unsigned char blob_headside[SG_SHA1_RAW_LEN];
+    unsigned char blob_stagedside[SG_SHA1_RAW_LEN];
+    unsigned char tree2[SG_SHA1_RAW_LEN];
+    unsigned char head2[SG_SHA1_RAW_LEN];
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    sg_flat_entry tentries[1];
+    sg_index idx;
+    sg_index_entry e;
+    sg_commit commit;
+    unsigned char *serialized;
+    size_t serialized_len;
+    int rc;
+
+    commit_initial(git_dir, repo_root); /* HEAD: a.txt = "hello\n" */
+    CHECK(sg_ref_resolve_head(git_dir, head1) == 0, "resolve head1 failed");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "hello\n", 6, blob_hello) == 0, "write hello blob");
+
+    /* Working tree gets one content, the INDEX gets a DIFFERENT one -- so if
+       the bug under test let --index proceed anyway, the wrongly-restored
+       index would show "staged-side", not the conflict stages. */
+    write_workdir_file(repo_root, "a.txt", "stash-side\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "staged-side\n", 12, blob_stagedside) == 0,
+         "write staged-side blob");
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index before staging a.txt differently");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_stagedside, SG_SHA1_RAW_LEN);
+    e.path = (char *)"a.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "restage a.txt at staged-side");
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write index with staged-side a.txt");
+    sg_index_free(&idx);
+
+    rc = stash_push(git_dir, repo_root, "conflict setup", stash_id);
+    CHECK(rc == 0, "stash push failed, rc=%d", rc);
+
+    /* Advance HEAD past the stash's base, on the SAME path, with yet a
+       THIRD content -- guarantees a genuine three-way conflict on apply. */
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "head-side\n", 10, blob_headside) == 0,
+         "write head-side blob");
+    tentries[0].path = (char *)"a.txt";
+    tentries[0].mode = 0100644;
+    memcpy(tentries[0].sha1, blob_headside, SG_SHA1_RAW_LEN);
+    CHECK(sg_tree_build(git_dir, tentries, 1, tree2) == 0, "build tree2 failed");
+
+    memset(&commit, 0, sizeof(commit));
+    memcpy(commit.tree, tree2, SG_SHA1_RAW_LEN);
+    commit.parents = malloc(sizeof(*commit.parents));
+    CHECK(commit.parents != NULL, "alloc parents failed");
+    memcpy(commit.parents[0], head1, SG_SHA1_RAW_LEN);
+    commit.parent_count = 1;
+    commit.author_name = (char *)"Test";
+    commit.author_email = (char *)"test@example.com";
+    commit.author_time = 1700000400;
+    strcpy(commit.author_tz, "+0000");
+    commit.committer_name = commit.author_name;
+    commit.committer_email = commit.author_email;
+    commit.committer_time = commit.author_time;
+    strcpy(commit.committer_tz, "+0000");
+    commit.message = (char *)"advance HEAD past the stash's base\n";
+    CHECK(sg_commit_serialize(&commit, &serialized, &serialized_len) == 0, "serialize commit2 failed");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_COMMIT, serialized, serialized_len, head2) == 0,
+         "write commit2 failed");
+    free(serialized);
+    free(commit.parents);
+    CHECK(sg_ref_update_branch(git_dir, "master", head2) == 0, "update branch to head2 failed");
+
+    rc = sg_stash_apply(git_dir, repo_root, 0, 1 /* --index */);
+    CHECK(rc == 1, "expected a conflicted apply, got %d", rc);
+
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index after conflicted --index apply");
+    CHECK(sg_index_find_stage(&idx, "a.txt", 0) < 0,
+         "--index must NOT have written a stage-0 entry on conflict (that would mean the index "
+         "restore ran anyway)");
+    CHECK(sg_index_find_stage(&idx, "a.txt", 1) >= 0, "conflict stage 1 (base) missing");
+    CHECK(sg_index_find_stage(&idx, "a.txt", 2) >= 0, "conflict stage 2 (ours) missing");
+    CHECK(sg_index_find_stage(&idx, "a.txt", 3) >= 0, "conflict stage 3 (theirs) missing");
+    {
+        int p2 = sg_index_find_stage(&idx, "a.txt", 2);
+        int p3 = sg_index_find_stage(&idx, "a.txt", 3);
+
+        CHECK(p2 >= 0 && memcmp(idx.entries[p2].sha1, blob_headside, SG_SHA1_RAW_LEN) == 0,
+             "conflict stage 2 should be HEAD's own content (head-side)");
+        CHECK(p3 >= 0 && memcmp(idx.entries[p3].sha1, blob_stagedside, SG_SHA1_RAW_LEN) != 0,
+             "conflict stage 3 should be the stash's tree content (stash-side), not the "
+             "unrelated staged-side blob that --index would have wrongly restored");
+    }
+    sg_index_free(&idx);
+
+    {
+        sg_stash_list list;
+
+        CHECK(sg_stash_list_read(git_dir, &list) == 0, "list read failed after conflicted apply");
+        CHECK(list.count == 1, "a conflicted apply must not drop the stash entry, got %zu", list.count);
+        sg_stash_list_free(&list);
+    }
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- Phase 20 sec 4: sg_stash_apply_check_dirty's targeted gate -------- */
+
+/* HEAD: del_me.txt = "d1\n", mod.txt = "m1\n", untouched.txt = "u1\n". */
+static void dirty_gate_base_repo(const char *git_dir, const char *repo_root)
+{
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    sg_flat_entry entries[3];
+    unsigned char blob_del[SG_SHA1_RAW_LEN];
+    unsigned char blob_mod[SG_SHA1_RAW_LEN];
+    unsigned char blob_unt[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry e;
+    sg_commit commit;
+    unsigned char *serialized;
+    size_t serialized_len;
+
+    write_workdir_file(repo_root, "del_me.txt", "d1\n");
+    write_workdir_file(repo_root, "mod.txt", "m1\n");
+    write_workdir_file(repo_root, "untouched.txt", "u1\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "d1\n", 3, blob_del) == 0, "write d1 blob");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "m1\n", 3, blob_mod) == 0, "write m1 blob");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "u1\n", 3, blob_unt) == 0, "write u1 blob");
+
+    memset(&idx, 0, sizeof(idx));
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_del, SG_SHA1_RAW_LEN);
+    e.path = (char *)"del_me.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert del_me.txt");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_mod, SG_SHA1_RAW_LEN);
+    e.path = (char *)"mod.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert mod.txt");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_unt, SG_SHA1_RAW_LEN);
+    e.path = (char *)"untouched.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert untouched.txt");
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write index");
+
+    entries[0].path = (char *)"del_me.txt";
+    entries[0].mode = 0100644;
+    memcpy(entries[0].sha1, blob_del, SG_SHA1_RAW_LEN);
+    entries[1].path = (char *)"mod.txt";
+    entries[1].mode = 0100644;
+    memcpy(entries[1].sha1, blob_mod, SG_SHA1_RAW_LEN);
+    entries[2].path = (char *)"untouched.txt";
+    entries[2].mode = 0100644;
+    memcpy(entries[2].sha1, blob_unt, SG_SHA1_RAW_LEN);
+    CHECK(sg_tree_build(git_dir, entries, 3, tree_id) == 0, "build tree");
+    sg_index_free(&idx);
+
+    memset(&commit, 0, sizeof(commit));
+    memcpy(commit.tree, tree_id, SG_SHA1_RAW_LEN);
+    commit.parent_count = 0;
+    commit.author_name = (char *)"Test";
+    commit.author_email = (char *)"test@example.com";
+    commit.author_time = 1700000500;
+    strcpy(commit.author_tz, "+0000");
+    commit.committer_name = commit.author_name;
+    commit.committer_email = commit.author_email;
+    commit.committer_time = commit.author_time;
+    strcpy(commit.committer_tz, "+0000");
+    commit.message = (char *)"base\n";
+    CHECK(sg_commit_serialize(&commit, &serialized, &serialized_len) == 0, "serialize base commit");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_COMMIT, serialized, serialized_len, commit_id) == 0,
+         "write base commit");
+    free(serialized);
+    CHECK(sg_ref_update_branch(git_dir, "master", commit_id) == 0, "update branch to base commit");
+}
+
+/* Stashes: deletes del_me.txt, modifies mod.txt to "m2\n", adds
+   created.txt = "new\n". Leaves untouched.txt alone entirely -- the whole
+   point of the fixture. After this, the working tree is back at
+   dirty_gate_base_repo's HEAD state (push always resets). */
+static void push_dirty_gate_stash(const char *git_dir, const char *repo_root,
+                                  unsigned char stash_id_out[SG_SHA1_RAW_LEN])
+{
+    char abspath[4096];
+    sg_index idx;
+    unsigned char blob_mod2[SG_SHA1_RAW_LEN];
+    unsigned char blob_new[SG_SHA1_RAW_LEN];
+    sg_index_entry e;
+
+    snprintf(abspath, sizeof(abspath), "%s/del_me.txt", repo_root);
+    CHECK(remove(abspath) == 0, "delete del_me.txt from the working tree before stashing");
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index before removing del_me.txt");
+    CHECK(sg_index_remove(&idx, "del_me.txt") == 0, "unstage del_me.txt");
+
+    write_workdir_file(repo_root, "mod.txt", "m2\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "m2\n", 3, blob_mod2) == 0, "write m2 blob");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_mod2, SG_SHA1_RAW_LEN);
+    e.path = (char *)"mod.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "restage mod.txt at m2");
+
+    write_workdir_file(repo_root, "created.txt", "new\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "new\n", 4, blob_new) == 0, "write new blob");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_new, SG_SHA1_RAW_LEN);
+    e.path = (char *)"created.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "stage created.txt");
+
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write mutated index");
+    sg_index_free(&idx);
+
+    CHECK(stash_push(git_dir, repo_root, "dirty gate base", stash_id_out) == 0,
+         "stash push for the dirty-gate fixture failed");
+}
+
+static char **check_dirty_paths;
+static size_t check_dirty_count;
+
+static void free_check_dirty_result(void)
+{
+    size_t i;
+
+    for (i = 0; i < check_dirty_count; i++)
+        free(check_dirty_paths[i]);
+    free(check_dirty_paths);
+    check_dirty_paths = NULL;
+    check_dirty_count = 0;
+}
+
+/* Row 1/control: a dirty path the merge never touches must be let through. */
+static void test_dirty_gate_untouched_path_allowed(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    int rc;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    write_workdir_file(repo_root, "untouched.txt", "DIRTY\n");
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 0, "row 1: dirtying a path the stash never touches must not block apply, rc=%d", rc);
+    CHECK(check_dirty_count == 0, "row 1: expected no dirty paths, got %zu", check_dirty_count);
+    free_check_dirty_result();
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Row 2: dirty on a path the stash MODIFIES, content differs from both HEAD
+   and the stash. */
+static void test_dirty_gate_modified_path_rejected(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    int rc;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    write_workdir_file(repo_root, "mod.txt", "CONFLICT\n");
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 1, "row 2: dirty content on a modified path must block apply, rc=%d", rc);
+    CHECK(check_dirty_count == 1 && strcmp(check_dirty_paths[0], "mod.txt") == 0,
+         "row 2: expected mod.txt alone in the dirty list, got %zu entries (%s)", check_dirty_count,
+         check_dirty_count > 0 ? check_dirty_paths[0] : "(none)");
+    free_check_dirty_result();
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Row 3: dirty content on a modified path that HAPPENS to equal what the
+   stash would write there -- must STILL be rejected (the rule looks at
+   whether the working tree differs from HEAD, not from the stash). */
+static void test_dirty_gate_content_matches_stash_still_rejected(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    int rc;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    write_workdir_file(repo_root, "mod.txt", "m2\n"); /* == the stash's own target content */
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 1,
+         "row 3: dirty content coincidentally equal to the stash's own target must still be "
+         "rejected (the gate looks at HEAD, not the stash), rc=%d",
+         rc);
+    CHECK(check_dirty_count == 1 && strcmp(check_dirty_paths[0], "mod.txt") == 0,
+         "row 3: expected mod.txt in the dirty list");
+    free_check_dirty_result();
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Row 4: dirty on a path the stash DELETES. */
+static void test_dirty_gate_deleted_path_dirty_rejected(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    int rc;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    write_workdir_file(repo_root, "del_me.txt", "DIRTY\n");
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 1, "row 4: dirty content on a path the stash deletes must block apply, rc=%d", rc);
+    CHECK(check_dirty_count == 1 && strcmp(check_dirty_paths[0], "del_me.txt") == 0,
+         "row 4: expected del_me.txt in the dirty list");
+    free_check_dirty_result();
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Row 5: the path the stash MODIFIES was deleted from the working tree --
+   nothing there to overwrite, so this must be ALLOWED (the opposite
+   direction from row 4). */
+static void test_dirty_gate_deleted_from_worktree_allowed(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    char abspath[4096];
+    int rc;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    snprintf(abspath, sizeof(abspath), "%s/mod.txt", repo_root);
+    CHECK(remove(abspath) == 0, "failed to delete mod.txt from the working tree");
+
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 0, "row 5: a path deleted from the working tree must not block apply, rc=%d", rc);
+    CHECK(check_dirty_count == 0, "row 5: expected no dirty paths, got %zu", check_dirty_count);
+    free_check_dirty_result();
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Row 7 (spec sec 4.4): a STAGED change on a path the stash never touches
+   must not block apply, AND must survive the apply itself (this is the part
+   the old blanket re-stage-everything-from-HEAD loop would silently wipe). */
+static void test_dirty_gate_untouched_staged_change_survives(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    unsigned char blob_staged[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry e;
+    int rc;
+    int pos;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    /* Simulate `git add` on untouched.txt: the index gets new content, the
+       working tree has that SAME content (so this is purely a staged
+       change, not also an unstaged one). */
+    write_workdir_file(repo_root, "untouched.txt", "staged-diff\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "staged-diff\n", 12, blob_staged) == 0,
+         "write staged-diff blob");
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index before staging untouched.txt");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_staged, SG_SHA1_RAW_LEN);
+    e.path = (char *)"untouched.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "restage untouched.txt");
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write index with staged untouched.txt");
+    sg_index_free(&idx);
+
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 0, "row 7: a staged change on an untouched path must not block apply, rc=%d", rc);
+    CHECK(check_dirty_count == 0, "row 7: expected no dirty paths, got %zu", check_dirty_count);
+    free_check_dirty_result();
+
+    rc = sg_stash_apply(git_dir, repo_root, 0, 0);
+    CHECK(rc == 0, "row 7: the apply itself should succeed cleanly, rc=%d", rc);
+
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index after apply");
+    pos = sg_index_find(&idx, "untouched.txt");
+    CHECK(pos >= 0 && memcmp(idx.entries[pos].sha1, blob_staged, SG_SHA1_RAW_LEN) == 0,
+         "row 7: untouched.txt's pre-existing staged content must survive the apply, not be "
+         "silently reset back to HEAD's own version");
+    sg_index_free(&idx);
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Row 8 (deliberate divergence from real git): a STAGED difference from
+   HEAD on a path the stash DOES touch must block apply, even when the
+   working tree file itself still matches HEAD exactly (i.e. purely a
+   staged change, no unstaged component -- isolating this from rows 2/3/4,
+   which are about the working tree). */
+static void test_dirty_gate_touched_staged_change_rejected(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    unsigned char blob_other[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry e;
+    int rc;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    /* mod.txt on disk is untouched (still HEAD's m1\n) -- only the INDEX
+       gets a different blob, simulating some unrelated `git add` that ran
+       before this apply. */
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "staged-other\n", 13, blob_other) == 0,
+         "write staged-other blob");
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index before staging mod.txt differently");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_other, SG_SHA1_RAW_LEN);
+    e.path = (char *)"mod.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "restage mod.txt at an unrelated staged blob");
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write index with staged mod.txt");
+    sg_index_free(&idx);
+
+    {
+        char *on_disk = read_workdir_file(repo_root, "mod.txt");
+
+        CHECK(on_disk != NULL && strcmp(on_disk, "m1\n") == 0,
+             "precondition: mod.txt on disk must still be HEAD's own content, got %s",
+             on_disk != NULL ? on_disk : "(null)");
+        free(on_disk);
+    }
+
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 1,
+         "row 8: a staged difference from HEAD on a touched path must block apply even though the "
+         "working tree file itself matches HEAD, rc=%d",
+         rc);
+    CHECK(check_dirty_count == 1 && strcmp(check_dirty_paths[0], "mod.txt") == 0,
+         "row 8: expected mod.txt in the dirty list");
+    free_check_dirty_result();
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Error 1 (Phase 20 fix): an untouched path that the user DELETED from the
+   working tree before apply/pop must stay deleted -- not silently
+   resurrected. Before the fix, sg_merge_result_apply unconditionally
+   rewrote every clean, non-deleted result entry, including untouched.txt
+   with HEAD's own (identical) content, even though nothing about this
+   apply concerns that path at all. */
+static void test_untouched_path_deleted_by_user_stays_deleted(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    char abspath[4096];
+    int rc;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    snprintf(abspath, sizeof(abspath), "%s/untouched.txt", repo_root);
+    CHECK(remove(abspath) == 0, "failed to delete untouched.txt from the working tree");
+
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 0, "deleting an untouched path must not block apply, rc=%d", rc);
+    free_check_dirty_result();
+
+    rc = sg_stash_apply(git_dir, repo_root, 0, 0);
+    CHECK(rc == 0, "apply itself should succeed cleanly, rc=%d", rc);
+
+    CHECK(!file_exists(repo_root, "untouched.txt"),
+         "untouched.txt's deletion must survive the apply -- it must not be resurrected from HEAD");
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Error 2 (Phase 20 fix): a path staged AFTER the stash was pushed, that
+   HEAD never had at all and the stash never touches either, must keep its
+   staged ("A ") status through apply/pop -- both on disk and in the index.
+   Before the fix, sg_stash_apply's re-stage loop only walked head_flat
+   (HEAD's own paths), so a stage-0 orig_idx entry for a path absent from
+   HEAD had no code path putting it back into new_idx at all. */
+static void test_untouched_new_staged_file_survives(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    unsigned char blob_new_staged[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry e;
+    int rc;
+    int pos;
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    /* Simulate `printf ... > new_staged.txt; git add new_staged.txt` run
+       after the stash push, on a path the stash's own change never
+       mentions at all (unlike created.txt, which push_dirty_gate_stash
+       itself stages as part of the stash). */
+    write_workdir_file(repo_root, "new_staged.txt", "n1\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "n1\n", 3, blob_new_staged) == 0,
+         "write new_staged.txt blob");
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index before staging new_staged.txt");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob_new_staged, SG_SHA1_RAW_LEN);
+    e.path = (char *)"new_staged.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "stage new_staged.txt");
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write index with staged new_staged.txt");
+    sg_index_free(&idx);
+
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 0, "a new staged file the stash never touches must not block apply, rc=%d", rc);
+    free_check_dirty_result();
+
+    rc = sg_stash_apply(git_dir, repo_root, 0, 0);
+    CHECK(rc == 0, "apply itself should succeed cleanly, rc=%d", rc);
+
+    CHECK(file_exists(repo_root, "new_staged.txt"), "new_staged.txt must still be on disk");
+
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index after apply");
+    pos = sg_index_find(&idx, "new_staged.txt");
+    CHECK(pos >= 0, "new_staged.txt must still have a stage-0 index entry after apply");
+    if (pos >= 0)
+        CHECK(idx.entries[pos].stage == 0 &&
+             memcmp(idx.entries[pos].sha1, blob_new_staged, SG_SHA1_RAW_LEN) == 0,
+             "new_staged.txt's index entry must be stage 0 with its own (staged) blob");
+    sg_index_free(&idx);
 
     free(repo_root);
     free(git_dir);
@@ -1572,6 +2215,17 @@ int main(void)
     test_push_returns_minus_two_when_keep_index_second_apply_fails();
     test_push_returns_minus_two_when_untracked_removal_fails();
     test_apply_untracked_collision_with_directory_rejects_whole_apply();
+    test_index_flag_table();
+    test_index_flag_skipped_on_conflict();
+    test_dirty_gate_untouched_path_allowed();
+    test_dirty_gate_modified_path_rejected();
+    test_dirty_gate_content_matches_stash_still_rejected();
+    test_dirty_gate_deleted_path_dirty_rejected();
+    test_dirty_gate_deleted_from_worktree_allowed();
+    test_dirty_gate_untouched_staged_change_survives();
+    test_dirty_gate_touched_staged_change_rejected();
+    test_untouched_path_deleted_by_user_stays_deleted();
+    test_untouched_new_staged_file_survives();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

@@ -5204,6 +5204,334 @@ check "phase20 -u+--keep-index: sg's post-push status matches real git's byte-fo
 check "phase20 -u+--keep-index: fresh/ was still swept (untracked half taken despite --keep-index)" \
     test ! -e "$P20_UKI_SG/fresh"
 
+# ============================================================
+# Phase 20 batch 3: sg stash apply/pop --index, and the targeted
+# dirty-workdir gate that replaced the old blanket "must be perfectly
+# clean" refusal (spec sec 3 & 4).
+# ============================================================
+
+# Dedicated fixture for I1/I2 -- deliberately narrower than
+# p20_keepidx_fixture (no wt_del.txt/staged_del.txt): those two exercise a
+# PRE-EXISTING, unrelated divergence in sg_tree_build_from_workdir (used by
+# `stash push`, not touched by this batch) -- real git's stash records a
+# working-tree-missing tracked file as DELETED in the stash's own tree,
+# while sg's push falls back to the file's INDEX blob there instead
+# (measured: confirmed by comparing `stash push` + `stash apply --index`
+# end to end, which is the only way this particular difference becomes
+# externally visible -- `stash push` alone, already covered by the
+# --keep-index oracle checks above, only ever compares against a plain
+# reset to HEAD/index_tree, which cannot expose it). Out of scope for
+# Phase 20 batch 3 (--index and the dirty-workdir gate); reported rather
+# than silently worked around, per CLAUDE.md.
+p20_index_fixture() {
+    # $1 = dir, $2 = "sg" or "git"
+    _dir="$1"; _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = sg ]; then
+        (cd "$WORKDIR" && "$SG" init "$(basename "$_dir")") > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && git init -q "$(basename "$_dir")")
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'v1\n' > "$_dir/tracked.txt"
+    printf 's1\n' > "$_dir/staged.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add tracked.txt staged.txt && "$SG" commit -m base) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add tracked.txt staged.txt && git commit -q -m base)
+    fi
+    printf 'v2\n' > "$_dir/tracked.txt"
+    printf 's2\n' > "$_dir/staged.txt"
+    printf 'ns1\n' > "$_dir/new_staged.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add staged.txt new_staged.txt) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add staged.txt new_staged.txt) > /dev/null 2>&1
+    fi
+}
+
+# --- I1: --index vs no --index, oracle comparison (spec sec 3.1) ---
+P20_IDX_GIT="$WORKDIR/p20_idx_git"
+p20_index_fixture "$P20_IDX_GIT" git
+(cd "$P20_IDX_GIT" && git stash push -q -m forindex) > /dev/null 2>&1
+(cd "$P20_IDX_GIT" && git stash apply -q --index) > /dev/null 2>&1
+check "phase20 --index oracle: git stash apply --index exits 0" test $? = 0
+P20_IDX_GIT_PORCELAIN=$(cd "$P20_IDX_GIT" && git status --porcelain | sort)
+
+P20_IDX_SG="$WORKDIR/p20_idx_sg"
+p20_index_fixture "$P20_IDX_SG" sg
+(cd "$P20_IDX_SG" && "$SG" stash push -m forindex) > /dev/null 2>&1
+(cd "$P20_IDX_SG" && "$SG" stash apply --index) > /dev/null 2>&1
+check "phase20 --index: sg stash apply --index exits 0" test $? = 0
+P20_IDX_SG_PORCELAIN=$(cd "$P20_IDX_SG" && git status --porcelain | sort)
+check "phase20 --index: sg's result matches real git's --index result byte-for-byte" \
+    test "$P20_IDX_SG_PORCELAIN" = "$P20_IDX_GIT_PORCELAIN"
+
+# --- I2: control -- the SAME fixture without --index, pinning I1 against a
+# contrast (a no-op --index implementation would also pass I1 alone) ---
+P20_NOIDX_GIT="$WORKDIR/p20_noidx_git"
+p20_index_fixture "$P20_NOIDX_GIT" git
+(cd "$P20_NOIDX_GIT" && git stash push -q -m noidx) > /dev/null 2>&1
+(cd "$P20_NOIDX_GIT" && git stash apply -q) > /dev/null 2>&1
+check "phase20 no-index control oracle: git stash apply exits 0" test $? = 0
+P20_NOIDX_GIT_PORCELAIN=$(cd "$P20_NOIDX_GIT" && git status --porcelain | sort)
+check "phase20 no-index control oracle: precondition -- differs from the --index oracle result" \
+    test "$P20_NOIDX_GIT_PORCELAIN" != "$P20_IDX_GIT_PORCELAIN"
+
+P20_NOIDX_SG="$WORKDIR/p20_noidx_sg"
+p20_index_fixture "$P20_NOIDX_SG" sg
+(cd "$P20_NOIDX_SG" && "$SG" stash push -m noidx) > /dev/null 2>&1
+(cd "$P20_NOIDX_SG" && "$SG" stash apply) > /dev/null 2>&1
+check "phase20 no-index control: sg stash apply exits 0" test $? = 0
+P20_NOIDX_SG_PORCELAIN=$(cd "$P20_NOIDX_SG" && git status --porcelain | sort)
+check "phase20 no-index control: sg's result matches real git's no-index result" \
+    test "$P20_NOIDX_SG_PORCELAIN" = "$P20_NOIDX_GIT_PORCELAIN"
+check "phase20 no-index control: sg's own --index and no-index results differ (the flag actually changes something)" \
+    test "$P20_NOIDX_SG_PORCELAIN" != "$P20_IDX_SG_PORCELAIN"
+
+# --- I3: --index on a real conflict is skipped entirely, and sg says so on
+# stderr (spec sec 3.2) -- no real-git comparison here, this is purely
+# about sg's own message and the index being left alone. ---
+P20_IDXCONFLICT="$WORKDIR/p20_idxconflict"
+(cd "$WORKDIR" && "$SG" init p20_idxconflict) > /dev/null 2>&1
+(cd "$P20_IDXCONFLICT" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'hello\n' > "$P20_IDXCONFLICT/a.txt"
+(cd "$P20_IDXCONFLICT" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+printf 'stash-side\n' > "$P20_IDXCONFLICT/a.txt"
+(cd "$P20_IDXCONFLICT" && "$SG" add a.txt) > /dev/null 2>&1
+(cd "$P20_IDXCONFLICT" && "$SG" stash push -m conflict) > /dev/null 2>&1
+printf 'head-side\n' > "$P20_IDXCONFLICT/a.txt"
+(cd "$P20_IDXCONFLICT" && "$SG" add a.txt && "$SG" commit -m advance) > /dev/null 2>&1
+P20_IDXCONFLICT_ERR=$(cd "$P20_IDXCONFLICT" && "$SG" stash apply --index 2>&1 >/dev/null)
+P20_IDXCONFLICT_RC=$?
+check "phase20 --index conflict: sg stash apply --index exits 1 on a real conflict" \
+    test "$P20_IDXCONFLICT_RC" = 1
+check "phase20 --index conflict: stderr says the index was not unstashed" \
+    sh -c "printf '%s' \"$P20_IDXCONFLICT_ERR\" | grep -q 'Index was not unstashed'"
+check "phase20 --index conflict: the stash entry survives (not dropped)" \
+    sh -c "[ -n \"\$(cd '$P20_IDXCONFLICT' && '$SG' stash list)\" ]"
+
+# --- Dirty-workdir gate (spec sec 4.2/4.3): HEAD has del_me.txt/mod.txt/
+# untouched.txt; the pushed stash deletes del_me.txt, modifies mod.txt to
+# "m2", and adds created.txt -- untouched.txt is never touched at all. ---
+p20_dirty_gate_fixture() {
+    # $1 = dir, $2 = "sg" or "git"
+    _dir="$1"; _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = sg ]; then
+        (cd "$WORKDIR" && "$SG" init "$(basename "$_dir")") > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && git init -q "$(basename "$_dir")")
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'd1\n' > "$_dir/del_me.txt"
+    printf 'm1\n' > "$_dir/mod.txt"
+    printf 'u1\n' > "$_dir/untouched.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add . && git commit -q -m base)
+    fi
+    (cd "$_dir" && git rm -q del_me.txt) > /dev/null 2>&1
+    printf 'm2\n' > "$_dir/mod.txt"
+    printf 'new\n' > "$_dir/created.txt"
+    (cd "$_dir" && git add mod.txt created.txt) > /dev/null 2>&1
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" stash push -m "dirty gate base") > /dev/null 2>&1
+    else
+        (cd "$_dir" && git stash push -q -m "dirty gate base") > /dev/null 2>&1
+    fi
+}
+
+# --- row C (control): a dirty path the stash never touches must be let
+# through, oracle comparison ---
+P20_DG_C_GIT="$WORKDIR/p20_dg_c_git"
+p20_dirty_gate_fixture "$P20_DG_C_GIT" git
+printf 'DIRTY\n' > "$P20_DG_C_GIT/untouched.txt"
+(cd "$P20_DG_C_GIT" && git stash apply -q) > /dev/null 2>&1
+check "phase20 dirty-gate row C oracle: git stash apply exits 0 when only an untouched path is dirty" \
+    test $? = 0
+P20_DG_C_GIT_PORCELAIN=$(cd "$P20_DG_C_GIT" && git status --porcelain | sort)
+
+P20_DG_C_SG="$WORKDIR/p20_dg_c_sg"
+p20_dirty_gate_fixture "$P20_DG_C_SG" sg
+printf 'DIRTY\n' > "$P20_DG_C_SG/untouched.txt"
+(cd "$P20_DG_C_SG" && "$SG" stash apply) > /dev/null 2>&1
+check "phase20 dirty-gate row C: sg stash apply exits 0 when only an untouched path is dirty" \
+    test $? = 0
+P20_DG_C_SG_PORCELAIN=$(cd "$P20_DG_C_SG" && git status --porcelain | sort)
+check "phase20 dirty-gate row C: sg's result matches real git's byte-for-byte" \
+    test "$P20_DG_C_SG_PORCELAIN" = "$P20_DG_C_GIT_PORCELAIN"
+
+# --- row 2: dirty content on a path the stash MODIFIES -- refused by both,
+# and sg's message names the path ---
+P20_DG_R2_GIT="$WORKDIR/p20_dg_r2_git"
+p20_dirty_gate_fixture "$P20_DG_R2_GIT" git
+printf 'CONFLICT\n' > "$P20_DG_R2_GIT/mod.txt"
+(cd "$P20_DG_R2_GIT" && git stash apply -q) > /dev/null 2>&1
+check "phase20 dirty-gate row 2 oracle: git stash apply refuses (exit 1) when a modified path is dirty" \
+    test $? = 1
+
+P20_DG_R2_SG="$WORKDIR/p20_dg_r2_sg"
+p20_dirty_gate_fixture "$P20_DG_R2_SG" sg
+printf 'CONFLICT\n' > "$P20_DG_R2_SG/mod.txt"
+P20_DG_R2_SG_ERR=$(cd "$P20_DG_R2_SG" && "$SG" stash apply 2>&1 >/dev/null)
+P20_DG_R2_SG_RC=$?
+check "phase20 dirty-gate row 2: sg stash apply refuses (exit 1) when a modified path is dirty" \
+    test "$P20_DG_R2_SG_RC" = 1
+check "phase20 dirty-gate row 2: sg's rejection message names mod.txt" \
+    sh -c "printf '%s' \"$P20_DG_R2_SG_ERR\" | grep -q mod.txt"
+check "phase20 dirty-gate row 2: mod.txt is left at the dirty content, nothing applied" \
+    sh -c "[ \"\$(cat '$P20_DG_R2_SG/mod.txt')\" = CONFLICT ]"
+
+# --- row 3: dirty content that happens to equal the stash's own target --
+# must STILL be refused (the rule looks at HEAD, not the stash's content) ---
+P20_DG_R3_GIT="$WORKDIR/p20_dg_r3_git"
+p20_dirty_gate_fixture "$P20_DG_R3_GIT" git
+printf 'm2\n' > "$P20_DG_R3_GIT/mod.txt"
+(cd "$P20_DG_R3_GIT" && git stash apply -q) > /dev/null 2>&1
+check "phase20 dirty-gate row 3 oracle: git stash apply STILL refuses (exit 1) even though the dirty content equals the stash's own target" \
+    test $? = 1
+
+P20_DG_R3_SG="$WORKDIR/p20_dg_r3_sg"
+p20_dirty_gate_fixture "$P20_DG_R3_SG" sg
+printf 'm2\n' > "$P20_DG_R3_SG/mod.txt"
+(cd "$P20_DG_R3_SG" && "$SG" stash apply) > /dev/null 2>&1
+check "phase20 dirty-gate row 3: sg stash apply STILL refuses (exit 1) even though the dirty content equals the stash's own target" \
+    test $? = 1
+
+# --- row 4: dirty content on a path the stash DELETES -- refused ---
+P20_DG_R4_GIT="$WORKDIR/p20_dg_r4_git"
+p20_dirty_gate_fixture "$P20_DG_R4_GIT" git
+printf 'DIRTY\n' > "$P20_DG_R4_GIT/del_me.txt"
+(cd "$P20_DG_R4_GIT" && git stash apply -q) > /dev/null 2>&1
+check "phase20 dirty-gate row 4 oracle: git stash apply refuses (exit 1) when a deleted path is dirty" \
+    test $? = 1
+
+P20_DG_R4_SG="$WORKDIR/p20_dg_r4_sg"
+p20_dirty_gate_fixture "$P20_DG_R4_SG" sg
+printf 'DIRTY\n' > "$P20_DG_R4_SG/del_me.txt"
+(cd "$P20_DG_R4_SG" && "$SG" stash apply) > /dev/null 2>&1
+check "phase20 dirty-gate row 4: sg stash apply refuses (exit 1) when a deleted path is dirty" \
+    test $? = 1
+
+# --- row 5: the path the stash MODIFIES was deleted from the working tree
+# -- the opposite of row 4, must be ALLOWED (nothing there to overwrite) ---
+P20_DG_R5_GIT="$WORKDIR/p20_dg_r5_git"
+p20_dirty_gate_fixture "$P20_DG_R5_GIT" git
+rm -f "$P20_DG_R5_GIT/mod.txt"
+(cd "$P20_DG_R5_GIT" && git stash apply -q) > /dev/null 2>&1
+check "phase20 dirty-gate row 5 oracle: git stash apply exits 0 when the modified path was deleted from the worktree" \
+    test $? = 0
+P20_DG_R5_GIT_PORCELAIN=$(cd "$P20_DG_R5_GIT" && git status --porcelain | sort)
+
+P20_DG_R5_SG="$WORKDIR/p20_dg_r5_sg"
+p20_dirty_gate_fixture "$P20_DG_R5_SG" sg
+rm -f "$P20_DG_R5_SG/mod.txt"
+(cd "$P20_DG_R5_SG" && "$SG" stash apply) > /dev/null 2>&1
+check "phase20 dirty-gate row 5: sg stash apply exits 0 when the modified path was deleted from the worktree" \
+    test $? = 0
+P20_DG_R5_SG_PORCELAIN=$(cd "$P20_DG_R5_SG" && git status --porcelain | sort)
+check "phase20 dirty-gate row 5: sg's result matches real git's byte-for-byte" \
+    test "$P20_DG_R5_SG_PORCELAIN" = "$P20_DG_R5_GIT_PORCELAIN"
+
+# --- row 8 (sg's OWN deliberate divergence, spec sec 4.2 row 8): a staged
+# change on a path the stash touches is refused outright by sg (its "ours"
+# is HEAD, not the index) where real git would three-way-merge it instead.
+# Deliberately NOT compared against real git here -- the two are expected to
+# disagree; sg's own message is what is being pinned. (The pure-index-only
+# isolation of this row, with the working tree file untouched, is covered by
+# test_dirty_gate_touched_staged_change_rejected in tests/test_stash.c --
+# staging mod.txt here via `sg add` also happens to leave the working tree
+# file itself at the same dirty content, so this also exercises row 2's
+# rule; that overlap does not weaken the assertion below.) ---
+P20_DG_R8_SG="$WORKDIR/p20_dg_r8_sg"
+p20_dirty_gate_fixture "$P20_DG_R8_SG" sg
+printf 'staged-other\n' > "$P20_DG_R8_SG/mod.txt"
+(cd "$P20_DG_R8_SG" && "$SG" add mod.txt) > /dev/null 2>&1
+P20_DG_R8_SG_ERR=$(cd "$P20_DG_R8_SG" && "$SG" stash apply 2>&1 >/dev/null)
+P20_DG_R8_SG_RC=$?
+check "phase20 dirty-gate row 8 (sg-only divergence): sg stash apply refuses (exit 1) on a staged change to a touched path" \
+    test "$P20_DG_R8_SG_RC" = 1
+check "phase20 dirty-gate row 8: sg's rejection message names mod.txt" \
+    sh -c "printf '%s' \"$P20_DG_R8_SG_ERR\" | grep -q mod.txt"
+
+# --- rows D/E: the two error cases sg_merge_result_apply's Phase 20 fix
+# (route B, skip-if-equal-to-ours) exists for -- both on paths the stash
+# never touches at all, both previously silently wrong (exit 0, no message,
+# wrong result), so a byte-for-byte porcelain comparison against real git is
+# the only thing that would have caught either regression; a unit test only
+# pins sg's own (possibly also wrong) idea of correct.
+#
+#   row D: the user DELETED untouched.txt from the working tree before
+#   apply -- that deletion must survive, not be silently resurrected from
+#   HEAD (merge.c's sg_merge_result_apply used to rewrite every clean
+#   result entry unconditionally, including untouched ones).
+#
+#   row E: new_staged.txt was `git add`ed AFTER the stash push, on a path
+#   HEAD never had and the stash never touches either -- its staged ("A ")
+#   status must survive too (stash.c's re-stage loop used to only walk
+#   HEAD's own paths, so a stage-0 entry for a path absent from HEAD had no
+#   code path putting it back).
+#
+# Both land in the SAME fixture/apply, measured together against real git
+# 2.55.0 (this is the combined scenario the fix's regression report used) --
+# one build, one apply, two independent assertions on the result. ---
+p20_untouched_survives_fixture() {
+    # $1 = dir, $2 = "sg" or "git"
+    _dir="$1"; _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = sg ]; then
+        (cd "$WORKDIR" && "$SG" init "$(basename "$_dir")") > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && git init -q "$(basename "$_dir")")
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'm1\n' > "$_dir/mod.txt"
+    printf 'u1\n' > "$_dir/untouched.txt"
+    printf 'o1\n' > "$_dir/other.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add . && git commit -q -m base)
+    fi
+    printf 'm2\n' > "$_dir/mod.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" stash push -m "untouched survives base") > /dev/null 2>&1
+    else
+        (cd "$_dir" && git stash push -q -m "untouched survives base") > /dev/null 2>&1
+    fi
+    rm -f "$_dir/untouched.txt"
+    printf 'n1\n' > "$_dir/new_staged.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add new_staged.txt) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add new_staged.txt) > /dev/null 2>&1
+    fi
+}
+
+P20_DG_DE_GIT="$WORKDIR/p20_dg_de_git"
+p20_untouched_survives_fixture "$P20_DG_DE_GIT" git
+(cd "$P20_DG_DE_GIT" && git stash apply -q) > /dev/null 2>&1
+check "phase20 dirty-gate row D/E oracle: git stash apply exits 0" test $? = 0
+P20_DG_DE_GIT_PORCELAIN=$(cd "$P20_DG_DE_GIT" && git status --porcelain | sort)
+
+P20_DG_DE_SG="$WORKDIR/p20_dg_de_sg"
+p20_untouched_survives_fixture "$P20_DG_DE_SG" sg
+(cd "$P20_DG_DE_SG" && "$SG" stash apply) > /dev/null 2>&1
+check "phase20 dirty-gate row D/E: sg stash apply exits 0" test $? = 0
+
+check "phase20 dirty-gate row D: untouched.txt's deletion survives (not resurrected from HEAD)" \
+    test ! -e "$P20_DG_DE_SG/untouched.txt"
+check "phase20 dirty-gate row E: new_staged.txt (staged after push, absent from HEAD) is still on disk" \
+    sh -c "[ \"\$(cat '$P20_DG_DE_SG/new_staged.txt')\" = n1 ]"
+check "phase20 dirty-gate row E: new_staged.txt is still staged (A ) in the index" \
+    sh -c "(cd '$P20_DG_DE_SG' && git status --porcelain) | grep -q '^A  new_staged.txt\$'"
+
+P20_DG_DE_SG_PORCELAIN=$(cd "$P20_DG_DE_SG" && git status --porcelain | sort)
+check "phase20 dirty-gate row D/E: sg's result matches real git's byte-for-byte" \
+    test "$P20_DG_DE_SG_PORCELAIN" = "$P20_DG_DE_GIT_PORCELAIN"
+
 # --- Phase 16: switch during an in-progress merge ---
 #
 # Measured against real git 2.55.0: `git switch <other>` during an

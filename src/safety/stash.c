@@ -717,7 +717,21 @@ static int restore_untracked_flat(const char *git_dir, const char *repo_root, co
     return 0;
 }
 
-int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
+/* Everything sg_stash_apply and sg_stash_apply_check_dirty both need to know
+   about entry `index` before they can even start comparing trees: the base
+   (parents[0]), theirs (the stash's own tree), index (parents[1]) trees, and
+   -- when present -- the untracked (parents[2]) tree. Factored out so the
+   two never drift on what counts as a valid stash-shaped commit (parent
+   count 2 or 3). */
+typedef struct {
+    unsigned char base_tree[SG_SHA1_RAW_LEN];
+    unsigned char theirs_tree[SG_SHA1_RAW_LEN];
+    unsigned char index_tree[SG_SHA1_RAW_LEN];
+    int has_untracked;
+    unsigned char untracked_tree[SG_SHA1_RAW_LEN];
+} stash_trees;
+
+static int load_stash_trees(const char *git_dir, size_t index, stash_trees *out)
 {
     sg_stash_list list;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
@@ -725,22 +739,6 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
     unsigned char *content = NULL;
     size_t content_len;
     sg_commit stash_commit;
-    unsigned char base_tree[SG_SHA1_RAW_LEN];
-    unsigned char ours_tree[SG_SHA1_RAW_LEN];
-    unsigned char theirs_tree[SG_SHA1_RAW_LEN];
-    unsigned char untracked_tree[SG_SHA1_RAW_LEN];
-    int has_untracked = 0;
-    unsigned char head_commit_id[SG_SHA1_RAW_LEN];
-    sg_merge_result result;
-    sg_flat_list head_flat;
-    sg_flat_list untracked_flat;
-    sg_index new_idx;
-    char **conflict_paths = NULL;
-    size_t conflict_count = 0;
-    size_t i;
-    int untracked_collision = 0;
-
-    memset(&untracked_flat, 0, sizeof(untracked_flat));
 
     if (sg_stash_list_read(git_dir, &list) != 0)
         return -1;
@@ -766,17 +764,233 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
         return -1;
     }
 
-    if (sg_commit_tree_of(git_dir, stash_commit.parents[0], base_tree) != 0) {
+    if (sg_commit_tree_of(git_dir, stash_commit.parents[0], out->base_tree) != 0) {
         sg_commit_free(&stash_commit);
         return -1;
     }
-    memcpy(theirs_tree, stash_commit.tree, SG_SHA1_RAW_LEN);
-    has_untracked = (stash_commit.parent_count == 3);
-    if (has_untracked && sg_commit_tree_of(git_dir, stash_commit.parents[2], untracked_tree) != 0) {
+    if (sg_commit_tree_of(git_dir, stash_commit.parents[1], out->index_tree) != 0) {
+        sg_commit_free(&stash_commit);
+        return -1;
+    }
+    memcpy(out->theirs_tree, stash_commit.tree, SG_SHA1_RAW_LEN);
+    out->has_untracked = (stash_commit.parent_count == 3);
+    if (out->has_untracked && sg_commit_tree_of(git_dir, stash_commit.parents[2], out->untracked_tree) != 0) {
         sg_commit_free(&stash_commit);
         return -1;
     }
     sg_commit_free(&stash_commit);
+    return 0;
+}
+
+/* Finds path's entry in result, or NULL. */
+static const sg_merge_result_entry *result_find(const sg_merge_result *result, const char *path)
+{
+    size_t i;
+
+    for (i = 0; i < result->count; i++) {
+        if (strcmp(result->entries[i].path, path) == 0)
+            return &result->entries[i];
+    }
+    return NULL;
+}
+
+/* True if the merge's outcome at path actually TOUCHES it -- i.e. differs
+   from what ours (HEAD's tree) already has there -- as opposed to carrying
+   it through unchanged (base/ours/theirs all agree). A thin wrapper around
+   sg_merge_entry_touches_ours (merge.h): as of Phase 20,
+   sg_merge_result_apply itself skips rewriting a path whose outcome equals
+   ours, so this now answers exactly the same question that function asks
+   internally. Shared by sg_stash_apply_check_dirty's dirty-workdir gate
+   (spec sec 4.3) and sg_stash_apply's own index-restaging rule (spec sec
+   4.4): the two must agree on what "touched" means, or the gate could let a
+   path through that the restage step then clobbers, or refuse a path the
+   restage step would have left alone anyway. Returns 0 (not touched) for a
+   path absent from result -- sg_merge_trees only omits a path when none of
+   base/ours/theirs has it, which can't happen for anything in head_flat. */
+static int path_is_touched(const sg_merge_result *result, const char *path)
+{
+    const sg_merge_result_entry *re = result_find(result, path);
+
+    if (re == NULL)
+        return 0;
+    return sg_merge_entry_touches_ours(re);
+}
+
+/* Checks whether apply/pop of stash entry `index` would be forced to
+   overwrite an uncommitted change (Phase 20 spec sec 4.2/4.3): the
+   replacement for the old blanket sg_require_clean_workdir gate. Only paths
+   the merge actually TOUCHES (path_is_touched) are examined, and only two of
+   the three ways a touched path can collide are checked here:
+
+     - the working tree still has the path and its content differs from HEAD
+       (spec rows 2/3/4 -- row 3, content that happens to already equal what
+       the stash would write, is included: the rule looks at whether the
+       path differs from HEAD, not whether it differs from the stash).
+     - the index already differs from HEAD at that path (row 8) -- sg's
+       three-way merge uses HEAD as "ours", not the index the way real git
+       does, so letting a staged change through here would silently overwrite
+       it. This is a DELIBERATE DIVERGENCE from real git (which 3-way-merges
+       against the index and can produce a conflict instead); see
+       sg_stash_apply's header comment in sg/stash.h.
+
+   Row 5 (the working-tree file is simply gone) is deliberately NOT flagged:
+   nothing is there to overwrite. Row 6 (an untracked file blocking a path
+   the stash would newly CREATE, i.e. hf == NULL here) is intentionally left
+   to sg_stash_apply's own pre-flight collision check rather than duplicated
+   here -- that check already exists, has its own message, and covers both
+   the tracked and the -u/-a untracked half.
+
+   On success, *dirty_paths_out is a malloc'd, path-sorted array of malloc'd
+   path strings (the same order sg_merge_trees produced), *dirty_count_out
+   its length; both are set to NULL/0 when nothing collided. Returns 0 when
+   it is safe to proceed, 1 when at least one path collided, -1 on error
+   (same causes as sg_stash_apply: bad index, out-of-range index, corrupt
+   stash commit, unreadable tree/object, allocation failure). */
+int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_t index,
+                               char ***dirty_paths_out, size_t *dirty_count_out)
+{
+    stash_trees trees;
+    unsigned char head_commit_id[SG_SHA1_RAW_LEN];
+    unsigned char ours_tree[SG_SHA1_RAW_LEN];
+    sg_merge_result result;
+    sg_flat_list head_flat;
+    sg_index idx;
+    char **dirty = NULL;
+    size_t dirty_count = 0;
+    size_t i;
+    int rc = 0;
+
+    *dirty_paths_out = NULL;
+    *dirty_count_out = 0;
+
+    if (load_stash_trees(git_dir, index, &trees) != 0)
+        return -1;
+
+    if (sg_ref_resolve_head(git_dir, head_commit_id) != 0)
+        return -1;
+    if (sg_commit_tree_of(git_dir, head_commit_id, ours_tree) != 0)
+        return -1;
+
+    if (sg_merge_trees(git_dir, trees.base_tree, ours_tree, trees.theirs_tree, "Updated upstream",
+                       "Stashed changes", &result) != 0)
+        return -1;
+
+    if (sg_tree_flatten(git_dir, ours_tree, &head_flat) != 0) {
+        sg_merge_result_free(&result);
+        return -1;
+    }
+
+    if (sg_index_read(git_dir, &idx) != 0) {
+        sg_flat_list_free(&head_flat);
+        sg_merge_result_free(&result);
+        return -1;
+    }
+
+    for (i = 0; i < result.count && rc == 0; i++) {
+        const char *path = result.entries[i].path;
+        const sg_flat_entry *hf = NULL;
+        size_t hi;
+        int dirty_here = 0;
+
+        if (!path_is_touched(&result, path))
+            continue;
+
+        for (hi = 0; hi < head_flat.count; hi++) {
+            if (strcmp(head_flat.entries[hi].path, path) == 0) {
+                hf = &head_flat.entries[hi];
+                break;
+            }
+        }
+
+        /* Row 8. */
+        {
+            int idxpos = sg_index_find_stage(&idx, path, 0);
+
+            if (idxpos < 0) {
+                if (hf != NULL)
+                    dirty_here = 1; /* staged delete of a HEAD path the stash touches */
+            } else if (hf == NULL || memcmp(idx.entries[idxpos].sha1, hf->sha1, SG_SHA1_RAW_LEN) != 0 ||
+                      idx.entries[idxpos].mode != hf->mode) {
+                dirty_here = 1;
+            }
+        }
+
+        /* Rows 2/3/4. */
+        if (!dirty_here && hf != NULL) {
+            char abspath[4096];
+            struct stat st;
+
+            snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, path);
+            if (lstat(abspath, &st) == 0) {
+                unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+
+                if (sg_hash_file_blob(abspath, wd_sha1) != 0 ||
+                   memcmp(wd_sha1, hf->sha1, SG_SHA1_RAW_LEN) != 0)
+                    dirty_here = 1;
+            }
+        }
+
+        if (dirty_here) {
+            char **grown = realloc(dirty, (dirty_count + 1) * sizeof(*grown));
+
+            if (grown == NULL) {
+                rc = -1;
+                break;
+            }
+            dirty = grown;
+            dirty[dirty_count] = strdup(path);
+            if (dirty[dirty_count] == NULL) {
+                rc = -1;
+                break;
+            }
+            dirty_count++;
+        }
+    }
+
+    sg_index_free(&idx);
+    sg_flat_list_free(&head_flat);
+    sg_merge_result_free(&result);
+
+    if (rc != 0) {
+        for (i = 0; i < dirty_count; i++)
+            free(dirty[i]);
+        free(dirty);
+        return -1;
+    }
+
+    *dirty_paths_out = dirty;
+    *dirty_count_out = dirty_count;
+    return dirty_count > 0 ? 1 : 0;
+}
+
+int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int restore_index)
+{
+    stash_trees trees;
+    unsigned char base_tree[SG_SHA1_RAW_LEN];
+    unsigned char ours_tree[SG_SHA1_RAW_LEN];
+    unsigned char theirs_tree[SG_SHA1_RAW_LEN];
+    unsigned char untracked_tree[SG_SHA1_RAW_LEN];
+    int has_untracked = 0;
+    unsigned char head_commit_id[SG_SHA1_RAW_LEN];
+    sg_merge_result result;
+    sg_flat_list head_flat;
+    sg_flat_list untracked_flat;
+    sg_index orig_idx;
+    sg_index new_idx;
+    char **conflict_paths = NULL;
+    size_t conflict_count = 0;
+    size_t i;
+    int untracked_collision = 0;
+
+    memset(&untracked_flat, 0, sizeof(untracked_flat));
+
+    if (load_stash_trees(git_dir, index, &trees) != 0)
+        return -1;
+    memcpy(base_tree, trees.base_tree, SG_SHA1_RAW_LEN);
+    memcpy(theirs_tree, trees.theirs_tree, SG_SHA1_RAW_LEN);
+    has_untracked = trees.has_untracked;
+    if (has_untracked)
+        memcpy(untracked_tree, trees.untracked_tree, SG_SHA1_RAW_LEN);
 
     if (sg_ref_resolve_head(git_dir, head_commit_id) != 0)
         return -1;
@@ -833,36 +1047,133 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
         return -1;
     }
 
-    /* Materializes the merge result into the working tree and a fresh
-       index; a -1 here means either a chunked blob's data was unrecoverable
-       or the index could not be built completely. */
-    if (sg_merge_result_apply(git_dir, repo_root, &result, &new_idx, &conflict_paths, &conflict_count) !=
-       0) {
+    /* Materializes the merge result into the working tree and a fresh index.
+       As of Phase 20, sg_merge_result_apply itself skips rewriting any path
+       whose outcome equals ours (HEAD's tree) -- see its header comment in
+       merge.h -- so a dirty-but-untouched working-tree path is left alone
+       here without this caller needing to snapshot/restore anything around
+       the call. A -1 here means either a chunked blob's data was
+       unrecoverable or the index could not be built completely. */
+    if (sg_merge_result_apply(git_dir, repo_root, &result, &new_idx, &conflict_paths, &conflict_count) != 0) {
         sg_flat_list_free(&untracked_flat);
         sg_flat_list_free(&head_flat);
         sg_merge_result_free(&result);
         return -1;
     }
 
-    /* Default pop index rule (measured): the index ends up equal to HEAD's
-       tree, except that a path the merge result introduced but HEAD never
-       had stays staged. Re-stage every HEAD path that isn't part of a
-       conflict -- path_is_conflict consults the merge result (not the
-       index), so this is correct even for a path sg_merge_result_apply left
-       with no stage-0 entry at all (HEAD had it, the stash cleanly deleted
-       it: re-staging it here is exactly the "unstaged deletion" real git
-       leaves behind). A conflicted path must carry ONLY the stage 1/2/3
-       entries sg_merge_result_apply already wrote, never a stage-0 one
-       alongside them, so those are skipped. */
+    /* Snapshot of the on-disk index exactly as it stood before this apply/
+       pop touched anything -- needed by the re-stage loop below (Phase 20
+       spec sec 4.4) to tell "untouched by the merge" paths apart from paths
+       the merge actually changed. Reading it here (nothing above this point
+       writes to the index) is equivalent to reading it at function entry. */
+    if (sg_index_read(git_dir, &orig_idx) != 0) {
+        size_t j;
+
+        sg_flat_list_free(&untracked_flat);
+        sg_flat_list_free(&head_flat);
+        sg_index_free(&new_idx);
+        sg_merge_result_free(&result);
+        for (j = 0; j < conflict_count; j++)
+            free(conflict_paths[j]);
+        free(conflict_paths);
+        return -1;
+    }
+
+    /* Default pop index rule (measured): for every HEAD path the merge
+       actually TOUCHES (path_is_touched -- spec sec 4.3/4.4), the index ends
+       up equal to HEAD's own version there, except that a path the merge
+       result introduced but HEAD never had stays staged. path_is_conflict
+       consults the merge result (not the index), so re-staging HEAD's
+       version is correct even for a path sg_merge_result_apply left with no
+       stage-0 entry at all (HEAD had it, the stash cleanly deleted it:
+       re-staging it here is exactly the "unstaged deletion" real git leaves
+       behind). A conflicted path must carry ONLY the stage 1/2/3 entries
+       sg_merge_result_apply already wrote, never a stage-0 one alongside
+       them, so those are skipped entirely.
+
+       For a HEAD path the merge does NOT touch, sg_merge_result_apply above
+       still wrote a stage-0 entry for it (built purely from the tree merge,
+       which agrees with HEAD when nothing changed) -- but that ignores
+       whatever was ALREADY staged there before this apply/pop ran. Once the
+       dirty-workdir gate stopped requiring a perfectly clean index (spec sec
+       4.2 row 7), that staged change must survive: restore orig_idx's own
+       stage-0 entry for the path instead of HEAD's, or drop the path
+       entirely if orig_idx did not have it either (a pre-existing staged
+       delete on an untouched path stays deleted, not resurrected). Under the
+       old clean-workdir precondition orig_idx's stage-0 entry always equaled
+       HEAD's own, so this is a no-op there -- not a special case. */
     for (i = 0; i < head_flat.count; i++) {
-        if (path_is_conflict(&result, head_flat.entries[i].path))
+        const char *path = head_flat.entries[i].path;
+
+        if (path_is_conflict(&result, path))
             continue;
-        if (add_stage_entry(&new_idx, head_flat.entries[i].path, 0, head_flat.entries[i].mode,
-                            head_flat.entries[i].sha1) != 0) {
+
+        if (path_is_touched(&result, path)) {
+            if (add_stage_entry(&new_idx, path, 0, head_flat.entries[i].mode, head_flat.entries[i].sha1) !=
+               0) {
+                size_t j;
+
+                sg_flat_list_free(&untracked_flat);
+                sg_flat_list_free(&head_flat);
+                sg_index_free(&orig_idx);
+                sg_index_free(&new_idx);
+                sg_merge_result_free(&result);
+                for (j = 0; j < conflict_count; j++)
+                    free(conflict_paths[j]);
+                free(conflict_paths);
+                return -1;
+            }
+        } else {
+            int oi = sg_index_find_stage(&orig_idx, path, 0);
+
+            if (oi >= 0) {
+                if (add_stage_entry(&new_idx, path, 0, orig_idx.entries[oi].mode,
+                                    orig_idx.entries[oi].sha1) != 0) {
+                    size_t j;
+
+                    sg_flat_list_free(&untracked_flat);
+                    sg_flat_list_free(&head_flat);
+                    sg_index_free(&orig_idx);
+                    sg_index_free(&new_idx);
+                    sg_merge_result_free(&result);
+                    for (j = 0; j < conflict_count; j++)
+                        free(conflict_paths[j]);
+                    free(conflict_paths);
+                    return -1;
+                }
+            } else {
+                sg_index_remove(&new_idx, path);
+            }
+        }
+    }
+
+    /* Second half of the same "untouched things survive" rule (Phase 20
+       spec sec 4.4, error 2): a stage-0 orig_idx entry for a path HEAD never
+       had at all is invisible to the loop above -- head_flat only lists
+       HEAD's own paths -- and, when the stash's own change never touches
+       that path either, sg_merge_trees never emits an entry for it in
+       result at all (base/ours/theirs all agree there is nothing there), so
+       sg_merge_result_apply never staged it in new_idx either. Without this
+       pass a staged-new file whose path the stash never touches would
+       silently lose its "A " status. Skip any path new_idx already carries
+       at stage 0 (already handled above) and any path the merge left
+       conflicted (already carries stage 1/2/3, never stage 0 alongside
+       them). */
+    for (i = 0; i < orig_idx.count; i++) {
+        const sg_index_entry *oe = &orig_idx.entries[i];
+
+        if (oe->stage != 0)
+            continue;
+        if (sg_index_find_stage(&new_idx, oe->path, 0) >= 0)
+            continue;
+        if (path_is_conflict(&result, oe->path))
+            continue;
+        if (add_stage_entry(&new_idx, oe->path, 0, oe->mode, oe->sha1) != 0) {
             size_t j;
 
-            sg_flat_list_free(&untracked_flat);
+            sg_index_free(&orig_idx);
             sg_flat_list_free(&head_flat);
+            sg_flat_list_free(&untracked_flat);
             sg_index_free(&new_idx);
             sg_merge_result_free(&result);
             for (j = 0; j < conflict_count; j++)
@@ -871,6 +1182,7 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
             return -1;
         }
     }
+    sg_index_free(&orig_idx);
     sg_flat_list_free(&head_flat);
 
     /* Untracked half: written to disk, never staged (see sg_stash_apply's
@@ -904,6 +1216,21 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
         for (i = 0; i < conflict_count; i++)
             free(conflict_paths[i]);
         free(conflict_paths);
+
+        /* --index (spec sec 3): restores the index to the stash's own index
+           tree (parents[1]), entirely replacing whatever the rules above
+           just staged. Only on a clean merge -- real git (measured) skips
+           this step outright on conflict and leaves the index exactly as
+           the no-"--index" rules above already left it; the caller is
+           responsible for telling the user (see sg/stash.h). No no-staged-
+           changes special case is needed: when trees.index_tree equals
+           trees.base_tree, resetting to it is simply a no-op alongside
+           whatever the rules above already produced from the same base. */
+        if (restore_index && !has_conflict) {
+            if (sg_index_reset_to_tree(git_dir, trees.index_tree) != 0)
+                return -1;
+        }
+
         return has_conflict ? 1 : 0;
     }
 }

@@ -287,8 +287,10 @@ static int cmd_stash_drop(int argc, char **argv)
 static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
 {
     const char *cmd_name = is_pop ? "pop" : "apply";
-    char usage[64];
+    char usage[80];
     const char *spec = NULL;
+    int restore_index = 0;
+    int i;
     char *git_dir;
     char *repo_root;
     sg_index idx;
@@ -299,15 +301,21 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
     unsigned char *content = NULL;
     size_t content_len;
     sg_commit commit;
+    char **dirty_paths = NULL;
+    size_t dirty_count = 0;
     int rc;
 
-    snprintf(usage, sizeof(usage), "usage: sg stash %s [<stash>]\n", cmd_name);
+    snprintf(usage, sizeof(usage), "usage: sg stash %s [--index] [<stash>]\n", cmd_name);
 
-    if (argc == 3)
-        spec = argv[2];
-    else if (argc != 2) {
-        fputs(usage, stderr);
-        return 1;
+    for (i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--index") == 0) {
+            restore_index = 1;
+        } else if (spec == NULL) {
+            spec = argv[i];
+        } else {
+            fputs(usage, stderr);
+            return 1;
+        }
     }
 
     if (sg_stash_parse_spec(spec, &index) != 0) {
@@ -339,17 +347,6 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
         return 1;
     }
     sg_index_free(&idx);
-
-    {
-        char what[64];
-
-        snprintf(what, sizeof(what), "sg stash %s", cmd_name);
-        if (sg_require_clean_workdir(git_dir, repo_root, what) != 0) {
-            free(git_dir);
-            free(repo_root);
-            return 1;
-        }
-    }
 
     /* Deliberate divergence from real git (which allows this): pop/apply
        during a paused rebase is refused, consistent with switch/merge, and
@@ -406,11 +403,40 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
     }
     sg_commit_free(&commit);
 
-    rc = sg_stash_apply(git_dir, repo_root, index);
+    /* Phase 20 sec 4: targeted dirty-workdir gate, replacing the old blanket
+       sg_require_clean_workdir call -- only paths this stash's merge
+       actually touches are checked (see sg_stash_apply_check_dirty's header
+       comment for the exact rule, including the row-8 divergence from real
+       git). */
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, index, &dirty_paths, &dirty_count);
+    if (rc != 0) {
+        if (rc == 1) {
+            size_t j;
+
+            fprintf(stderr, "sg: 下列路徑的本地變更會被這次 stash %s 覆寫，請先處理（commit 或另外 "
+                            "stash）：\n",
+                   cmd_name);
+            for (j = 0; j < dirty_count; j++)
+                fprintf(stderr, "\t%s\n", dirty_paths[j]);
+            for (j = 0; j < dirty_count; j++)
+                free(dirty_paths[j]);
+            free(dirty_paths);
+        } else {
+            fprintf(stderr, "sg: 無法檢查工作目錄狀態\n");
+        }
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+
+    rc = sg_stash_apply(git_dir, repo_root, index, restore_index);
     if (rc == 1) {
         fprintf(stderr, "自動合併失敗，工作目錄與 index 留下衝突標記（Updated upstream / Stashed "
                         "changes）：\n"
                         "請編輯衝突檔案並執行 `sg add <file>...` 標記為已解決；stash 本身沒有被丟棄\n");
+        if (restore_index)
+            fprintf(stderr, "sg: 因為有衝突，index 未被還原成 stash 建立時的樣子（Index was not "
+                            "unstashed）\n");
         free(git_dir);
         free(repo_root);
         return 1;
@@ -457,8 +483,8 @@ int sg_cmd_stash(int argc, char **argv)
     static const char usage[] = "usage: sg stash [push] [-m <msg>] [-u|--include-untracked] [-a|--all] "
                                 "[--keep-index]\n"
                                 "   or: sg stash list\n"
-                                "   or: sg stash apply [<stash>]\n"
-                                "   or: sg stash pop [<stash>]\n"
+                                "   or: sg stash apply [--index] [<stash>]\n"
+                                "   or: sg stash pop [--index] [<stash>]\n"
                                 "   or: sg stash drop [<stash>]\n"
                                 "   or: sg stash clear\n";
 

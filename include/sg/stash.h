@@ -102,21 +102,91 @@ typedef struct {
 int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_push_opts *opts,
                   unsigned char commit_id_out[SG_SHA1_RAW_LEN]);
 
+/* Checks whether apply/pop of stash entry `index` would be forced to
+   overwrite an uncommitted change -- the replacement for the old blanket
+   "working directory must be perfectly clean" precondition (Phase 20 spec
+   sec 4). Only paths the merge (base = the stash's first parent's tree,
+   ours = HEAD's tree, theirs = the stash's tree) actually TOUCHES are
+   examined; a path it leaves alone is never flagged even if it is dirty.
+   Two kinds of collision are checked:
+
+     - the working tree still has the touched path and its content differs
+       from HEAD (this includes the case where that content happens to
+       already equal what the stash would write -- the rule looks at
+       whether the path differs from HEAD, not from the stash);
+     - the index already differs from HEAD at that touched path.
+
+   A touched path that is simply missing from the working tree is NOT
+   flagged (nothing there to overwrite). An untracked file blocking a path
+   the stash would newly CREATE is NOT flagged here either -- that is
+   sg_stash_apply's own pre-flight collision check's job (see its header
+   comment below), which already exists and already covers both the tracked
+   and the -u/-a untracked half; duplicating it here would just produce a
+   second, differently-worded rejection for the same condition.
+
+   The index-differs-from-HEAD check is a DELIBERATE DIVERGENCE from real
+   git (measured, Phase 20 spec sec 4.2 row 8): real git's "ours" is the
+   index, so it can three-way-merge a staged change against the stash (and
+   possibly conflict); sg's "ours" is HEAD, so letting a staged change on a
+   touched path through here would silently overwrite it. sg refuses
+   instead -- strictly safer, at the cost of not matching real git's
+   more permissive behavior on that one row.
+
+   On success (or on a genuine collision), *dirty_paths_out is a malloc'd,
+   path-sorted array of malloc'd path strings, *dirty_count_out its length;
+   both are NULL/0 when nothing collided. Caller frees each entry, then the
+   array. Returns 0 when it is safe to proceed, 1 when at least one path
+   collided, -1 on error (bad index/out-of-range index/corrupt stash commit/
+   unreadable tree or object/allocation failure -- same causes as
+   sg_stash_apply below; *dirty_paths_out and *dirty_count_out are left at
+   NULL/0). */
+int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_t index,
+                               char ***dirty_paths_out, size_t *dirty_count_out);
+
 /* Three-way merges stash entry `index` into the current HEAD (base = the
    stash's first parent's tree, ours = HEAD's tree, theirs = the stash's
    tree), writing the result into the working tree and the index. The caller
-   must already have verified that the working tree is clean; that is what
-   makes "ours" equal to HEAD's tree. Conflict markers are labelled
-   "Updated upstream" / "Stashed changes" (measured -- git uses those literal
-   strings here, not branch names).
+   is expected to have already run sg_stash_apply_check_dirty (or an
+   equivalent gate) -- unlike before Phase 20, the working directory no
+   longer needs to be perfectly clean, only clean on every path the merge
+   actually touches; sg's "ours" is HEAD's tree regardless. Conflict markers
+   are labelled "Updated upstream" / "Stashed changes" (measured -- git uses
+   those literal strings here, not branch names).
+
+   The working tree itself is left alone on any path the merge does NOT
+   touch (sg_merge_result_apply, as of Phase 20, skips rewriting a path
+   whose resolved outcome already equals HEAD's own -- see its header
+   comment in merge.h): a dirty-but-untouched file's uncommitted on-disk
+   content survives an apply/pop exactly as sg_stash_apply_check_dirty's
+   gate above promises it will.
 
    On a clean merge the index is left as real git leaves it without --index:
-   equal to HEAD's tree, except that paths present in the merge result but
-   absent from HEAD stay staged (measured: ` M tracked.txt` but
-   `A  newfile.txt`). On conflict the merge-result index is written as-is
-   (stages 1/2/3 for conflicted paths, stage 0 for cleanly merged ones --
-   measured `UU c.txt` alongside `M  clean.txt`), and MERGE_HEAD is NOT
-   written (git does not create one here).
+   for every path the merge TOUCHES, equal to HEAD's tree there, except that
+   a path present in the merge result but absent from HEAD stays staged
+   (measured: ` M tracked.txt` but `A  newfile.txt`). For a path the merge
+   does NOT touch, whatever was already staged there before this call stays
+   staged untouched (Phase 20 spec sec 4.4) -- including a path staged but
+   absent from HEAD entirely (e.g. `git add`ed after the stash was pushed):
+   sg_merge_trees never even produces a result entry for it, so it is
+   restored from a second pass over the pre-apply index rather than from
+   head_flat/result. Under the old clean-workdir precondition the index was
+   always identical to HEAD's own version anyway, so this is not a behavior
+   change there, only where a dirty-but-untouched path is now allowed
+   through at all. On conflict the merge-result index is
+   written as-is (stages 1/2/3 for conflicted paths, stage 0 for cleanly
+   merged ones -- measured `UU c.txt` alongside `M  clean.txt`), and
+   MERGE_HEAD is NOT written (git does not create one here).
+
+   restore_index (--index, Phase 20 spec sec 3): on a CLEAN merge only,
+   after the above, the index is entirely replaced with the stash's own
+   index tree (parents[1] -- the tree the index had at `stash push` time),
+   restoring the exact staged state that was stashed away, independent of
+   what the rules above computed. On conflict this step is skipped outright
+   (measured against real git) and the index is left exactly as the rules
+   above already left it -- the caller must tell the user the index was not
+   restored (sg does not print this itself; see cmd_stash.c). When the
+   stash's index tree never differed from its base tree (nothing was staged
+   at push time), this is simply a no-op -- no special case needed.
 
    A 3-parent entry (a `git stash -u`/`-a` stash, see sg_stash_push_opts) is
    also accepted: the third parent's tree (full relative paths) is restored
@@ -137,10 +207,11 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
 
    Returns 0 on a clean apply, 1 when there were conflicts (working tree and
    index are left in the conflicted state, the stash entry is untouched and
-   the caller must not drop it), -1 on failure. Returns -1 if the entry has
-   fewer than 2 or more than 3 parents -- that is not a shape sg (or real
-   git) ever produces for a stash. */
-int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index);
+   the caller must not drop it -- and, if restore_index was set, the index
+   restore was skipped), -1 on failure. Returns -1 if the entry has fewer
+   than 2 or more than 3 parents -- that is not a shape sg (or real git)
+   ever produces for a stash. */
+int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int restore_index);
 
 /* Removes entry `index` from the stack: rewrites the reflog without that
    line (re-chaining old_ids, preserving every surviving entry's ident and

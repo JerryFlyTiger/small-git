@@ -636,6 +636,16 @@ static int process_path(const char *git_dir, const triple *t, const char *ours_l
     if (out->path == NULL)
         return -1;
 
+    /* Filled unconditionally, not just on the conflict path below: Phase 20
+       (stash apply/pop's index touched-check) needs to know each CLEAN
+       entry's ours side too, to tell "the merge outcome happens to equal
+       what's already at ours" apart from "the merge actually changed this
+       path" -- see sg_merge_entry_touches_ours's header comment in
+       merge.h. Harmless for every existing reader: grep confirms
+       ours_present/base_present/theirs_present are read only inside this
+       file, and only from the two call sites gated on e->conflict. */
+    fill_conflict_sides(out, t);
+
     if (eq_ob && eq_tb) {
         out->deleted = !t->base_present;
         if (t->base_present) {
@@ -669,8 +679,8 @@ static int process_path(const char *git_dir, const triple *t, const char *ours_l
         return 0;
     }
 
-    /* genuine conflict candidate */
-    fill_conflict_sides(out, t);
+    /* genuine conflict candidate -- base/ours/theirs sides already filled
+       above (unconditionally, for every entry). */
     out->conflict = 1;
 
     if (t->ours_present && t->theirs_present) {
@@ -844,6 +854,16 @@ static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *
     return sg_index_upsert(idx, &entry);
 }
 
+int sg_merge_entry_touches_ours(const sg_merge_result_entry *e)
+{
+    if (e->conflict)
+        return 1;
+    if (e->deleted)
+        return e->ours_present;
+    return !e->ours_present || e->ours_mode != e->mode ||
+          memcmp(e->ours_sha1, e->sha1, SG_SHA1_RAW_LEN) != 0;
+}
+
 int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_merge_result *result,
                           sg_index *index_out, char ***conflict_paths_out, size_t *conflict_count_out)
 {
@@ -887,30 +907,50 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                     conflict_count++;
             }
         } else if (e->deleted) {
-            remove(abspath);
+            /* Skip the remove() when ours never had this path in the first
+               place (sg_merge_entry_touches_ours) -- otherwise this would
+               unlink an unrelated, unversioned file that happens to share
+               the name (Phase 20: base had the path, ours and theirs both
+               deleted it, and some untracked file with the same name now
+               sits at abspath). */
+            if (sg_merge_entry_touches_ours(e))
+                remove(abspath);
         } else {
-            unsigned char *content;
-            size_t content_len;
-            sg_chunk_missing_info missing;
-            int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &content, &content_len, &missing);
+            /* Skip re-reading/rewriting when the resolved outcome already
+               equals ours -- this is the untouched-path case (Phase 20 spec
+               sec 4.2/4.4): leaves whatever is on disk there alone instead
+               of clobbering a dirty-but-untouched working-tree file with
+               ours's own (identical) content. add_resolved_entry still runs
+               unconditionally below: the index must stay complete even for
+               paths this merge never touched (see this function's header
+               comment) -- cmd_merge.c and cmd_rebase.c build the merge
+               commit's tree straight from new_idx, so a missing path here
+               would silently drop a file from the resulting commit. */
+            if (sg_merge_entry_touches_ours(e)) {
+                unsigned char *content;
+                size_t content_len;
+                sg_chunk_missing_info missing;
+                int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &content, &content_len, &missing);
 
-            if (read_rc == 0) {
-                if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0) {
-                    fprintf(stderr, "sg: failed to write '%s'\n", e->path);
+                if (read_rc == 0) {
+                    if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0) {
+                        fprintf(stderr, "sg: failed to write '%s'\n", e->path);
+                        content_missing = 1;
+                    }
+                    free(content);
+                } else if (read_rc == -2) {
+                    sg_chunk_print_missing_error(e->path, &missing);
+                    content_missing = 1;
+                } else {
+                    /* -1: the object behind this sha1 could not be read at
+                       all (see sg/chunk.h). The file never reached the
+                       working tree, yet the index entry below records it as
+                       present at this sha1 -- exactly the "silently dropped
+                       a path" state this function promises never to hand
+                       back. Fatal, like -2. */
+                    fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
                     content_missing = 1;
                 }
-                free(content);
-            } else if (read_rc == -2) {
-                sg_chunk_print_missing_error(e->path, &missing);
-                content_missing = 1;
-            } else {
-                /* -1: the object behind this sha1 could not be read at all
-                   (see sg/chunk.h). The file never reached the working tree,
-                   yet the index entry below records it as present at this
-                   sha1 -- exactly the "silently dropped a path" state this
-                   function promises never to hand back. Fatal, like -2. */
-                fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
-                content_missing = 1;
             }
             if (add_resolved_entry(repo_root, index_out, e->path, e->mode, e->sha1) != 0)
                 index_ok = 0;

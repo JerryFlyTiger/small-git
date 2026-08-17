@@ -47,10 +47,12 @@ typedef struct {
     unsigned int mode;
     unsigned char sha1[SG_SHA1_RAW_LEN]; /* valid iff !conflict && !deleted */
 
-    /* Valid when conflict: which of base/ours/theirs have this path, and
-       their mode/blob -- used to write index stages 1/2/3 (only for the
-       parties that are actually present) and, for a modify/delete conflict,
-       to know which single side's content survives in the working tree. */
+    /* Which of base/ours/theirs have this path, and their mode/blob. Filled
+       unconditionally for EVERY entry, not just conflicts (Phase 20) --
+       sg_merge_entry_touches_ours below needs a clean entry's ours side too.
+       When conflict: used to write index stages 1/2/3 (only for the parties
+       actually present) and, for a modify/delete conflict, to know which
+       single side's content survives in the working tree. */
     int base_present, ours_present, theirs_present;
     unsigned int base_mode, ours_mode, theirs_mode;
     unsigned char base_sha1[SG_SHA1_RAW_LEN];
@@ -85,19 +87,40 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
 
 void sg_merge_result_free(sg_merge_result *result);
 
+/* True iff e's resolved outcome is exactly what ours already has at this
+   path -- i.e. this entry is one sg_merge_result_apply will (as of Phase 20)
+   leave alone rather than write. A conflict is never "equal to ours" (it has
+   no single resolved outcome yet); a deleted entry equals ours only when
+   ours never had the path either; otherwise it compares ours_mode/ours_sha1
+   against the resolved mode/sha1. Shared by sg_merge_result_apply's own
+   skip-if-unchanged check and by sg_safety/stash.c's path_is_touched (the
+   stash apply/pop index re-stage rule, spec sec 4.4) -- the two must agree
+   on what "touches ours" means, or the working-tree half and the index half
+   of an apply/pop can disagree about which paths were actually acted on. */
+int sg_merge_entry_touches_ours(const sg_merge_result_entry *e);
+
 /* Materializes a sg_merge_result into the working tree and into a fresh
-   in-memory index: clean entries are written as files and staged at stage 0,
-   deleted entries are removed, conflicted entries get their marker-laden
-   content written and index stages 1/2/3 (only for the sides actually
-   present). Does NOT write the index to disk, does not touch HEAD/refs, and
-   does not write MERGE_HEAD -- callers own all of that. *index_out is owned
-   by the caller (sg_index_free). *conflict_count_out is the number of
-   conflicted paths; *conflict_paths_out is a malloc'd array of malloc'd
-   paths (caller frees both) or NULL when there are none. Returns 0 on
-   success, -1 if a chunked blob's data is unrecoverable or the index could
-   not be built completely -- in which case the working tree may already be
-   partially updated (same caveat as sg_apply_tree_to_workdir) and the caller
-   must abort rather than record a state that silently dropped paths. */
+   in-memory index: every entry sg_merge_trees produced gets a stage-0 (or,
+   for a conflict, stage 1/2/3) index entry, so the index stays complete --
+   it never has a path missing relative to the merge result. But only paths
+   whose resolved outcome actually DIFFERS from ours are touched on disk
+   (see sg_merge_entry_touches_ours): a clean entry that equals ours is
+   staged with ours's own mode/sha1 without being re-read from the object
+   store or rewritten to the working tree, and a "deleted" entry that equals
+   ours (ours never had the path) is not remove()'d. This is what lets a
+   caller like sg_stash_apply pass ours == HEAD's tree on a dirty-but-
+   untouched working tree without clobbering the untouched path's
+   uncommitted on-disk content (Phase 20 spec sec 4.2/4.4) -- callers no
+   longer need to snapshot/restore anything around this call. Does NOT write
+   the index to disk, does not touch HEAD/refs, and does not write
+   MERGE_HEAD -- callers own all of that. *index_out is owned by the caller
+   (sg_index_free). *conflict_count_out is the number of conflicted paths;
+   *conflict_paths_out is a malloc'd array of malloc'd paths (caller frees
+   both) or NULL when there are none. Returns 0 on success, -1 if a chunked
+   blob's data is unrecoverable or the index could not be built completely --
+   in which case the working tree may already be partially updated (same
+   caveat as sg_apply_tree_to_workdir) and the caller must abort rather than
+   record a state that silently dropped paths. */
 int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_merge_result *result,
                           sg_index *index_out, char ***conflict_paths_out, size_t *conflict_count_out);
 
