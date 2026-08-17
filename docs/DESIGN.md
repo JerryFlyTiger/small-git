@@ -1654,3 +1654,164 @@ segfault,rebase 根本沒機會寫出多餘的 finish 行。那條專門驗「�
 
 最終 `tests/interop.sh` 1165 項檢查(Phase 18 結束時是 1098),`make test` 35 支
 二進位全過,`make sanitize` 乾淨,子指令維持 24 個。
+
+---
+
+## Phase 20:`sg stash` 的 `-u`/`-a`/`--keep-index`/`--index`,以及放寬 apply/pop 的乾淨閘門
+
+Phase 15 把 `sg stash` 縮到核心子集,README 當時列出的未實作清單裡有四樣:
+`-u`(未追蹤檔案)、`--index`、`--keep-index`、pathspec。這一階段做了前三個,
+`sg_stash_push` 也從一串位置參數改成吃 `sg_stash_push_opts`
+(`include/sg/stash.h`)。**刻意不做**:`stash show`、pathspec、任何 `sg diff`
+改動——`show` 需要 tree-vs-tree diff 與 `--stat`,那是下一批的範圍,這裡不碰。
+
+### `--keep-index`:换掉 reset 的目標 tree,不是換一條新路徑
+
+真 git 的 `--keep-index` 把工作目錄重設到**目前的 index**而不是 HEAD,index 本
+身原封不動。量法是五狀態 fixture(unstaged-modify / staged-modify / staged-new
+/ staged-delete / worktree-delete),`staged-delete` 那一格是唯一與其他四格反方
+向移動的,所以兩個方向都各釘一條斷言。
+
+實作是**串接兩次 `sg_apply_tree_to_workdir`**(先重設到 HEAD,再套用 index 的
+tree),不是直接把它指向 index tree 的單次呼叫。單次呼叫看起來等價、描述的也是
+同一個終態,但 `sg_apply_tree_to_workdir` 判斷「要不要刪掉工作目錄上的某個檔
+案」是看**呼叫當下讀到的 index**列不列它,而一個被 staged 為刪除的路徑,兩邊的
+index(呼叫當下的、以及目標 index tree)都不會列它,單次呼叫因此讓它在磁碟上原
+封不動地留著。串接讓第二次呼叫的基準是 HEAD 的 tree(它會列出這個路徑),第一
+次就把它刪乾淨。這也是真 git 自己實作這個旗標的方式。
+
+### `-u`/`-a`:第三個 parent,而且是無條件寫的
+
+未追蹤檔案的列舉從 `cmd_status.c` 的 `collect_untracked` 搬進
+`workdir/status.c`,改名 `sg_status_list_untracked`,加一個 `include_ignored`
+開關(status 與 `-u` 傳 0,`-a` 傳 1),回傳值改成排序過的——`sg_tree_build` 的
+扁平清單合約要求排序輸入,第一版直接餵 `readdir` 順序進去,錯了。建對應 tree 的
+`sg_tree_build_from_untracked` 加進 `tree_build.h`,與另兩支建 tree 的函式並列。
+
+拿真 git 2.55.0 量出來的規則:
+
+- stash commit 長出第三個 parent:一個**沒有自己 parent 的 root commit**,tree
+  只放未追蹤檔案(`-a` 連 ignored 的也放)。**stash 自己的 tree(第一個
+  parent)與不帶 `-u` 時逐位元組相同**——這件事單看 `-u` 的輸出看不出來,是並排
+  跑一次不帶旗標的對照組,兩邊的 tree id 相減出來塌縮成的結論。
+- 只要有東西要 stash,第三個 parent 就**無條件建立**,即使未追蹤清單是空的
+  (寫一個空 tree)。「清單空就退回兩個 parent」的最佳化會讓寫出來的物件與真
+  git 不一致——真 git 就是寫了那個空 tree。
+- `-m` 不影響第二、三個 parent 的 subject,只動第一個。
+- `-u`/`-a` 下,「沒東西可存」的判斷也要看未追蹤清單(用第三個 parent 會用的同
+  一套過濾規則過濾過):工作目錄除了一個未追蹤檔案以外全乾淨,在純 `push` 下算
+  nothing-to-save,在 `-u`/`-a` 下**不算**。
+- 拿掉已收進第三個 parent 的檔案之後,`-u` 刪掉留下的空目錄,但**跳過被
+  ignore 的空目錄**;`-a` 兩者都刪(因為 `-a` 本來就把 ignored 檔案一起收
+  走,留下的空目錄不會再有 ignore 規則想保護的東西)。這個修剪步驟
+  **開 ignore engine 的時間點在拿檔案之前,不是之後**:`.gitignore` 自己通
+  常是未追蹤的,`-u` 會把它一起掃走,若修剪階段晚一步才開 ignore engine,
+  看到的就是空規則、於是連本該保留的 ignored 空目錄都刪了。單元 fixture 讓
+  `.gitignore` 保持未追蹤,才蓋得到這條;interop fixture 先 commit 了它,只
+  蓋得到守衛本身存在,蓋不到這個時序死角。
+
+### apply/pop:從「工作目錄必須全乾淨」收窄成「被動到的路徑不能髒」
+
+舊的乾淨閘門是整個工作目錄與 index 都得跟 HEAD 一致。新規則
+(`sg_stash_apply_check_dirty`)只看這次 merge(base = stash 第一個 parent的
+tree、ours = HEAD tree、theirs = stash 的 tree)**實際會動到的路徑**:
+
+- 該路徑在工作目錄裡的內容與 HEAD 不同 → 擋(含「內容碰巧與 stash 要寫的完全
+  相同」這格——判斷式看的是「是否偏離 HEAD」,不是「是否偏離 stash」);
+- 該路徑在 index 裡已經偏離 HEAD → 擋;
+- 該路徑在工作目錄裡**被刪掉了** → **不擋**(沒有東西會被覆寫);
+- 沒被這次 merge 碰到的路徑,不論多髒都不看。
+
+這條規則本身依賴 `sg_merge_result_apply` 的一項改動(見下一節)才能兌現「沒碰到
+的路徑維持原樣」的承諾。
+
+### 兩處刻意與真 git 分歧
+
+1. **`-u` 的 pop 碰撞**:真 git 遇到未追蹤半邊撞车時,已追蹤半邊照樣套用,未
+   追蹤半邊逐檔失敗,把 entry 留在堆疊上——留下一個「entry 還在,但它要還原
+   的檔案已經在磁碟上跟自己打架」的無出口狀態(再 pop 一次照樣撞)。sg 把未
+   追蹤半邊的碰撞併進既有的事前檢查(已經同時涵蓋已追蹤與 `-u`/`-a` 未追蹤兩
+   邊),整個 apply 全有全無地拒絕——安全,代價是不比照真 git 的部分套用。
+2. **dirty apply 撞到 staged 改動**:真 git 的 `ours` 是 index,所以能把
+   stash 三方合併進一個已經 staged 的改動(可能合出衝突);sg 的 `ours` 是
+   HEAD,若在這裡放行,會直接把已 staged 的內容輾掉,所以 sg 拒絕——嚴格安全
+   的一側,代價是不比照真 git 這一格的寬鬆行為。
+
+### `sg_merge_result_apply` 的改動:本階段影響面最大的一處
+
+它原本對 `sg_merge_trees` 的每個 clean 條目無條件寫回工作目錄。只要「工作目錄
+必須乾淨」還是硬性前提,這個無條件寫回是不可見的——寫回去的內容與磁碟上原本的
+逐位元組相同。放行髒工作目錄的那一刻,它就從無害變成破壞性:會把使用者留在磁
+碟上、跟這次 merge 無關的髒內容原地輾掉。
+
+現在的規則是:跳過「結果與 ours(HEAD)相同」的條目,不重讀物件、不重寫磁碟。
+「是否碰到 ours」導出成獨立函式 `sg_merge_entry_touches_ours`
+(`include/sg/merge.h`),讓 stash 的 index 收尾規則(下段)與 merge/rebase 的
+工作目錄規則吃同一份定義——兩份獨立實作的漂移方向正好是「閘門放行了某條路
+徑,收尾邏輯卻把它輾掉」,只有一份定義才不會分岔。
+
+**`add_resolved_entry` 仍然無條件執行**,不受這條跳過規則影響:`cmd_merge.c`
+與 `cmd_rebase.c` 都是拿這支函式建出來的 in-memory index 去建 commit 的
+tree,少一個路徑就等於 commit 少一個檔案——這是 index 半邊,`sg_merge_entry_touches_ours`
+管的是工作目錄半邊要不要動筆,兩者不是同一件事。
+
+順帶兩個效果:`sg merge`/`sg rebase` 不再每次重寫整棵工作樹(含重組 chunk 過的
+大檔案),變成只碰真的有變動的路徑;而且「兩側都刪除同一路徑」的情況不再無聲
+`unlink` 掉一個剛好同名的未追蹤檔案(舊版是無條件對每個「刪除」結果呼叫刪
+除,不管磁碟上那個路徑到底是什麼)。
+
+Index 半邊需要**另外陳述同一條規則**:一個 stage-0 條目,如果它的路徑 HEAD 從
+來沒有、這次 merge 也沒碰到,merge 結果裡沒有對應的 entry 可以把它接住,舊版
+會讓它悄悄從 index 掉出去(變成 unstaged)。stash 的 apply/pop 走的是自己一段
+專門對「沒被碰到的路徑」做第二輪掃描(對 pre-apply 的 index)來補回這個保證,
+而不是指望 `sg_merge_result_apply` 自己處理——它輸入是 `sg_merge_trees` 的結
+果,壓根不知道呼叫端之前的 index 長什麼樣。
+
+### 這一輪的教訓
+
+- **oracle 只給終態,不給機制**。`--keep-index` 量到的五種檔案狀態完美對應
+  「把工作目錄重設到 index tree」,規格因此寫成「只要換一個參數」。實作時去
+  查 `sg_apply_tree_to_workdir` 的刪除迴圈才發現它是拿**呼叫當下讀到的
+  index**減去目標 tree——staged-delete 的路徑兩邊都不在,迴圈根本不會考慮
+  它,檔案會原地留著,正好跟量到的那一格反過來。正解是前面寫的串接兩次呼叫,
+  也是真 git 自己的實作方式。
+- **一個測試可以「被 mutation 抓到卻什麼都沒驗到」**。把
+  `remove_untracked_files` 改成無條件失敗,有兩個測試變紅——但紅的原因是
+  `-u push failed`,也就是**setup 本身壞了**,不是在驗 `-2` 這個回傳值的語
+  意。新測試因此改成斷言「回傳值恰好是 `-2`」,而不是「非 0」。
+- **一個死角需要「守衛唯一存在的理由」那種 fixture 才照得出來**。
+  `prune_empty_untracked_dirs` 的 ignore 守衛拿掉之後,`make test` 與 interop
+  全過——因為兩邊 fixture 裡都沒有一個「本身被 ignore、而且是空的」目錄。補上
+  之後,那個 fixture 還順帶照出一個真 bug:`.gitignore` 本身常常是未追蹤的,
+  `-u` 會連它一起掃走,而修剪階段的 ignore engine 若在那之後才開,就看不到任
+  何 ignore 規則了(細節見上面 `-u`/`-a` 那節)。
+- **`make test` 在第一個失敗的二進位就停**,看 mutation 結果要注意某支測試可
+  能根本沒跑到——本階段實際踩到:`test_merge_result_apply` 失敗導致
+  `test_stash` 沒有執行,乍看之下像是 stash 沒有回歸,其實是它從沒被問過。
+- **改動 merge/rebase/stash 共用的落地路徑時,`make test` 綠不算數**。實測:
+  把 `add_resolved_entry` 也跟著跳過(誤把 index 半邊的規則等同工作目錄半邊)
+  之後,`make test` 一條都沒紅,但 10 條 interop 檢查變紅(多數是 rebase 的
+  phase4c / 17 / 18f / 19a)——本專案這條「interop 才抓得到 merge/rebase 回
+  歸」的紀律,這次踩實了。
+
+### 本階段刻意不修、留給後續的兩件事
+
+1. **`sg_tree_build_from_workdir` 無法表示工作目錄裡的刪除**。對「已追蹤但工
+   作目錄裡已經不見了」的檔案,它會退回用 index 裡的 blob
+   (`include/sg/tree_build.h` 的標頭註解寫明這是刻意的,為了讓「每個條目都
+   解析得出來」這個合約成立)。後果:`sg stash push` 在只有一個已追蹤檔案被
+   刪除、其餘乾淨時會印「No local changes to save」、不建 stash;真 git 會
+   把刪除本身記進 stash 的 tree,pop 之後檔案維持刪除狀態(已實測驗證這個
+   分歧)。它有兩個呼叫端——`stash push` 與 `snapshot`——而對 snapshot 來
+   說那個 fallback 正是對的(安全網要能還原一切,包括「回到刪除之前」)。修
+   法必須讓兩個呼叫端拿到不同行為,這是設計決定,不是補丁,留給下一批。
+2. **`restore_untracked_flat` 用裸 `snprintf` 組路徑,不檢查截斷**。它的路徑
+   來自 stash 的第三個 parent 的 tree,那棵 tree 可能是真 git 寫的,不受
+   `sg_status_list_untracked` 內部 `path_join` 的截斷保護。但既有的
+   `sg_apply_tree_to_workdir` 對已追蹤那半邊用的**是完全相同的裸
+   `snprintf`**,所以這是專案既有的一致做法(雖然不安全),只補這一支會變成
+   「一類缺口只補了一半」。要修就整批一起修,不要在這裡先開一個特例。
+
+最終 `tests/interop.sh` 1247 項檢查(Phase 19 結束時是 1165),`make test` 37
+支二進位全過(新增 `tests/test_status_untracked.c`、
+`tests/test_merge_result_apply.c`),`make sanitize` 乾淨,子指令維持 24 個。

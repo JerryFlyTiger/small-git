@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1165 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1247 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 35 個單元測試二進位,任一失敗即整體失敗
+make test                         # 37 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -27,7 +27,7 @@ python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
 
 - 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
   的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
-- `make test` 那行的 `N/35 個跑到`,N 少於 35 就是**中途中止**(Makefile 在第一
+- `make test` 那行的 `N/37 個跑到`,N 少於 37 就是**中途中止**(Makefile 在第一
   個失敗的二進位就停),不是「其他都過了」。
 - 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
 - interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
@@ -120,7 +120,9 @@ staging 的驗證。本機綠燈不是充分證據。**
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
   `workdir.h`,不要去 `util/`,也不要自己再寫一份。
 - 已知重複(碰到時順手收斂,不要再增加下一份):`path_join` 逐字重複於
-  `src/cli/cmd_add.c:174` 與 `src/cli/cmd_status.c:118`;小型 strbuf 重複於
+  `src/cli/cmd_add.c:174` 與 `src/workdir/status.c:169`(Phase 20 把未追蹤檔案
+  列舉從 `cmd_status.c` 搬進 `workdir/status.c` 時帶過去的,位置變了但重複沒
+  收斂);小型 strbuf 重複於
   `src/workdir/apply.c:175` 與 `src/cli/cmd_restore.c:104`。`resolve_commit_tree`
   的六份逐字複本(`cmd_switch.c`、`cmd_merge.c`、`cmd_rebase.c`、`cmd_clone.c`、
   `cmd_reset.c`、`workdir/apply.c`)已在 Phase 15 收斂成
@@ -130,11 +132,18 @@ staging 的驗證。本機綠燈不是充分證據。**
   (`include/sg/tree_build.h`),前者只吃 index 的 stage-0 條目、後者會重新雜湊
   工作目錄;新程式碼要哪一種先看標頭註解,不要在呼叫端重寫這段邏輯。
   merge/rebase/stash 共用的「把 `sg_merge_result` 落地成工作目錄+index」迴圈
-  也已抽成 `sg_merge_result_apply`(`include/sg/merge.h`)。`env_or()`(讀
-  `GIT_AUTHOR_NAME`/`EMAIL` 帶 fallback)有**八份**逐字複本:`storage/reflog.c`、
-  `storage/chunk.c`、`safety/stash.c`、`safety/snapshot.c`、`cli/cmd_rebase.c`、
-  `cli/cmd_merge.c`、`cli/cmd_tag.c`、`cli/cmd_commit.c`。碰到時順手收斂,
-  不要再增加下一份。
+  也已抽成 `sg_merge_result_apply`(`include/sg/merge.h`)。**Phase 20 起它會
+  跳過「結果與 ours(HEAD)相同」的條目,不重寫工作目錄,但仍會把每個結果條目
+  加進 index**(`add_resolved_entry` 無條件執行,判斷式是
+  `sg_merge_entry_touches_ours`,唯一一份定義,不要再寫第二份)。`cmd_merge.c`
+  與 `cmd_rebase.c` 都拿這支函式建出來的 index 去建 commit 的 tree——跟著把
+  `add_resolved_entry` 也跳過會讓 merge/rebase 的 commit 悄悄少檔案,而
+  `make test` 抓不到這個回歸,只有 `interop.sh` 抓得到(Phase 20 實測:10 條
+  rebase 相關 interop 檢查變紅,`make test` 全綠)。改這支函式時 `make test`
+  綠不算數。`env_or()`(讀 `GIT_AUTHOR_NAME`/`EMAIL` 帶 fallback)仍是**八份**
+  逐字複本:`storage/reflog.c`、`storage/chunk.c`、`safety/stash.c`、
+  `safety/snapshot.c`、`cli/cmd_rebase.c`、`cli/cmd_merge.c`、`cli/cmd_tag.c`、
+  `cli/cmd_commit.c`。碰到時順手收斂,不要再增加下一份。
 - 遠端/使用者字串轉成檔案路徑前必須先過閘門函式:`sg_ref_name_is_safe`
   (`include/sg/transport.h:38`)、`sg_ref_branch_name_is_safe`(`include/sg/refs.h:13`)。
   **建立**新 ref 時的 check-ref-format 驗證另有一支
@@ -177,6 +186,15 @@ staging 的驗證。本機綠燈不是充分證據。**
 - **使用者給的 commit/tag 訊息一律先過 `sg_message_cleanup`**
   (`include/sg/object.h`),否則產生的物件 id 與真 git 不同。**例外是
   `cmd_rebase.c`**——它轉發既有訊息,必須逐位元組保真,刻意不套用。
+- **`sg stash` 支援 `-u`/`--include-untracked`、`-a`/`--all`、`--keep-index`、
+  `--index`(Phase 20)**。`sg_stash_push` 吃 `sg_stash_push_opts`
+  (`include/sg/stash.h`),不是一串位置參數。列舉未追蹤檔案一律走
+  `sg_status_list_untracked`(`include/sg/status.h`,`status`/`-u`/`-a` 共用,
+  `include_ignored` 開關),建對應 tree 走 `sg_tree_build_from_untracked`
+  (`include/sg/tree_build.h`)。兩處刻意分歧:`-u`/`-a` 撞到既有檔案時全有全無
+  拒絕(真 git 部分套用,留下無出口的 entry);dirty apply/pop 撞到已 staged
+  的改動一律拒絕(真 git 的 ours 是 index、能合併,sg 的 ours 是 HEAD、放行
+  會輾掉 staged 內容)。細節見 `docs/DESIGN.md` Phase 20。
 
 ## 核心型別速查
 
@@ -224,11 +242,14 @@ staging 的驗證。本機綠燈不是充分證據。**
   會覆寫工作目錄的新指令要分開決定兩件事,不要當成同一個選擇:
 
   **(1) 閘門**——髒工作目錄/進行中的 rebase/進行中的 merge 該不該擋?
-  - `switch`/`merge`/`stash pop`:直接拒絕。`switch` 對 rebase 與 merge 各有
-    一道**明確**閘門(`cmd_switch.c`,Phase 14 與 Phase 16),都在任何副作用
-    之前、`--force` 繞不過、`-c` 也不會建出分支。**不要靠
-    `sg_safe_apply_tree` 的髒確認代打**——`--force` 正好繞過它,Phase 16 的
-    bug 就是這樣來的。
+  - `switch`/`merge`:直接拒絕。`switch` 對 rebase 與 merge 各有一道**明確**
+    閘門(`cmd_switch.c`,Phase 14 與 Phase 16),都在任何副作用之前、
+    `--force` 繞不過、`-c` 也不會建出分支。**不要靠 `sg_safe_apply_tree` 的
+    髒確認代打**——`--force` 正好繞過它,Phase 16 的 bug 就是這樣來的。
+  - `stash apply`/`stash pop`:**Phase 20 起不再是全域拒絕**,改成
+    `sg_stash_apply_check_dirty`(`include/sg/stash.h`)只擋這次合併真的會動
+    到的路徑上的髒改動;工作目錄裡已刪除的路徑不擋。進行中的 rebase 仍然直接
+    拒絕(與 switch/merge 一致),這條沒變。
   - `reset --hard`:走 `sg_safe_apply_tree`(確認 + 快照)。
   - `stash push`:**不擋**——「工作目錄是髒的」是它的輸入而不是危險,所以它
     直接呼叫 `sg_apply_tree_to_workdir` 並自己先 `sg_snapshot_create`;用
@@ -255,7 +276,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 35 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 37 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。

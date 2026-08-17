@@ -1,7 +1,6 @@
 #include "sg/cli.h"
 
 #include "sg/hash.h"
-#include "sg/ignore.h"
 #include "sg/index.h"
 #include "sg/merge.h"
 #include "sg/objstore.h"
@@ -13,12 +12,9 @@
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
-#include <dirent.h>
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 static const char *kind_label(sg_status_kind kind)
 {
@@ -46,27 +42,6 @@ static void print_section(const char *title, const char **hints, size_t hint_cou
     for (i = 0; i < list->count; i++)
         printf("\t%s%s\n", kind_label(list->entries[i].kind), list->entries[i].path);
     printf("\n");
-}
-
-static int str_cmp(const void *a, const void *b)
-{
-    const char *sa = *(const char *const *)a;
-    const char *sb = *(const char *const *)b;
-
-    return strcmp(sa, sb);
-}
-
-/* A path with an unresolved conflict has no stage-0 entry (only 1/2/3), so
-   plain sg_index_find would wrongly call it untracked. */
-static int path_tracked_any_stage(const sg_index *idx, const char *path)
-{
-    unsigned int stage;
-
-    for (stage = 0; stage <= 3; stage++) {
-        if (sg_index_find_stage(idx, path, stage) >= 0)
-            return 1;
-    }
-    return 0;
 }
 
 /* Prints every distinct path carrying a stage 1/2/3 entry (idx is sorted by
@@ -104,138 +79,12 @@ static size_t print_unmerged(const sg_index *idx, int rebase_in_progress)
     return count;
 }
 
-/* Walks the worktree collecting untracked files, filtered through the
-   .gitignore engine (ig): ignored directories are pruned outright -- nothing
-   under an ignored directory can be re-included -- and ignored files are
-   skipped. Tracked paths are checked first, since tracked files are never
-   ignore-filtered. Returns 0 on success, -1 on allocation failure; callers
-   must treat that as an error, never as "no untracked files" (silently
-   swallowing an alloc failure here would let sg status claim a clean tree it
-   never actually examined). */
-/* Joins base and rel as "base/rel", returning -1 rather than a truncated
-   result if it does not fit -- see the identically-named helper in
-   cmd_add.c for why truncation must never be acted on. */
-static int path_join(char *out, size_t out_size, const char *base, const char *rel)
-{
-    int n;
-
-    if (rel == NULL || rel[0] == '\0')
-        n = snprintf(out, out_size, "%s", base);
-    else if (base == NULL || base[0] == '\0')
-        n = snprintf(out, out_size, "%s", rel);
-    else
-        n = snprintf(out, out_size, "%s/%s", base, rel);
-
-    if (n < 0 || (size_t)n >= out_size)
-        return -1;
-    return 0;
-}
-
-static int collect_untracked(const char *repo_root, const char *reldir, const sg_index *idx,
-                             sg_ignore *ig, char ***out, size_t *count, size_t *cap)
-{
-    char absdir[4096];
-    DIR *d;
-    struct dirent *ent;
-
-    if (path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
-        fprintf(stderr, "sg: warning: 路徑過長,略過目錄 '%s'(未追蹤清單可能不完整)\n", reldir);
-        return 0;
-    }
-
-    d = opendir(absdir);
-    if (d == NULL) {
-        /* Not fatal -- status still reports everything it did manage to see
-           -- but never silent: an unreadable directory means the untracked
-           list below is incomplete, and a status that under-reports without
-           saying so is how uncommitted work gets lost. */
-        fprintf(stderr, "sg: warning: 無法讀取目錄 '%s': %s（未追蹤清單可能不完整）\n",
-                reldir[0] != '\0' ? reldir : ".", strerror(errno));
-        return 0;
-    }
-
-    while ((ent = readdir(d)) != NULL) {
-        char relpath[4096];
-        char abspath[4096];
-        struct stat st;
-
-        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
-            continue;
-        /* skip any git dir at ANY depth, not just the top level: there is no
-           submodule support, and an embedded repo's metadata must never be
-           walked or reported */
-        if (strcmp(ent->d_name, ".git") == 0)
-            continue;
-
-        /* Never act on a truncated path: it usually still names a real
-           directory further up, so lstat would succeed against the wrong
-           entry and this would report a path that is not the one on disk. */
-        if (path_join(relpath, sizeof(relpath), reldir, ent->d_name) != 0 ||
-           path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
-            fprintf(stderr, "sg: warning: 路徑過長,略過 '%s/%s'(未追蹤清單可能不完整)\n",
-                    reldir[0] != '\0' ? reldir : ".", ent->d_name);
-            continue;
-        }
-
-        if (lstat(abspath, &st) != 0) {
-            /* ENOENT = the entry vanished between readdir and now, benign.
-               Anything else (ENAMETOOLONG on a tree deeper than the
-               platform's PATH_MAX, EACCES, ELOOP) means we are dropping a
-               real entry, so say so rather than under-report in silence. */
-            if (errno != ENOENT)
-                fprintf(stderr, "sg: warning: 無法讀取 '%s': %s（未追蹤清單可能不完整）\n",
-                        relpath, strerror(errno));
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            if (sg_ignore_is_ignored(ig, relpath, 1))
-                continue; /* prune: nothing below can be re-included */
-            if (sg_ignore_push_dir(ig, relpath) != 0) {
-                closedir(d);
-                return -1;
-            }
-            if (collect_untracked(repo_root, relpath, idx, ig, out, count, cap) != 0) {
-                sg_ignore_pop_dir(ig);
-                closedir(d);
-                return -1;
-            }
-            sg_ignore_pop_dir(ig);
-        } else if (S_ISREG(st.st_mode)) {
-            if (path_tracked_any_stage(idx, relpath))
-                continue;
-            if (sg_ignore_is_ignored(ig, relpath, 0))
-                continue;
-            if (*count == *cap) {
-                size_t new_cap = *cap == 0 ? 16 : *cap * 2;
-                char **grown = realloc(*out, new_cap * sizeof(*grown));
-
-                if (grown == NULL) {
-                    closedir(d);
-                    return -1;
-                }
-                *out = grown;
-                *cap = new_cap;
-            }
-            (*out)[*count] = strdup(relpath);
-            if ((*out)[*count] == NULL) {
-                closedir(d);
-                return -1;
-            }
-            (*count)++;
-        }
-    }
-    closedir(d);
-    return 0;
-}
-
 int sg_cmd_status(int argc, char **argv)
 {
     char *git_dir;
     char *repo_root;
     char *branch;
     sg_index idx;
-    sg_ignore *ig = NULL;
     unsigned char head_commit_id[SG_SHA1_RAW_LEN];
     int has_head;
     sg_flat_list head_flat;
@@ -243,7 +92,6 @@ int sg_cmd_status(int argc, char **argv)
     sg_status_list unstaged;
     char **untracked = NULL;
     size_t untracked_count = 0;
-    size_t untracked_cap = 0;
     size_t unmerged_count;
     size_t i;
     static const char *staged_hints[] = {
@@ -275,17 +123,6 @@ int sg_cmd_status(int argc, char **argv)
         free(repo_root);
         return 1;
     }
-    /* Load the ignore rules up front: a failure here must fail the whole
-       command -- silently showing everything (or nothing) on an alloc
-       failure is a bug class this codebase has already been bitten by. */
-    if (sg_ignore_open(&ig, git_dir, repo_root) != 0) {
-        fprintf(stderr, "sg: 記憶體不足，無法載入 .gitignore 規則\n");
-        sg_index_free(&idx);
-        free(git_dir);
-        free(repo_root);
-        return 1;
-    }
-
     branch = sg_ref_current_branch(git_dir);
     if (branch != NULL) {
         printf("On branch %s\n", branch);
@@ -373,23 +210,15 @@ int sg_cmd_status(int argc, char **argv)
                "sg: warning: failed to compute unstaged changes (out of memory, or a chunked "
                "file's data is missing/corrupt -- see sg restore for details)\n");
 
-    if (collect_untracked(repo_root, "", &idx, ig, &untracked, &untracked_count,
-                          &untracked_cap) != 0) {
+    if (sg_status_list_untracked(git_dir, repo_root, &idx, 0, &untracked, &untracked_count) != 0) {
         fprintf(stderr, "sg: 記憶體不足，無法掃描未追蹤的檔案\n");
-        for (i = 0; i < untracked_count; i++)
-            free(untracked[i]);
-        free(untracked);
         sg_status_list_free(&staged);
         sg_status_list_free(&unstaged);
-        sg_ignore_free(ig);
         sg_index_free(&idx);
         free(repo_root);
         free(git_dir);
         return 1;
     }
-    if (untracked_count > 0)
-        qsort(untracked, untracked_count, sizeof(*untracked), str_cmp);
-
     unmerged_count = print_unmerged(&idx, sg_rebase_state_exists(git_dir));
 
     print_section("Changes to be committed:", staged_hints, 1, &staged);
@@ -411,7 +240,6 @@ int sg_cmd_status(int argc, char **argv)
     free(untracked);
     sg_status_list_free(&staged);
     sg_status_list_free(&unstaged);
-    sg_ignore_free(ig);
     sg_index_free(&idx);
     free(repo_root);
     free(git_dir);

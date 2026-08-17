@@ -43,4 +43,26 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
 int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg_index *idx,
                             sg_status_list *out);
 
+/* Lists every untracked file under repo_root, one entry per file (never
+   folded into a "dir/" line the way some porcelain output does). A path
+   already tracked at idx (any stage 0/1/2/3 -- see path_tracked_any_stage in
+   the .c) never appears here, including a staged-delete: the file may still
+   sit on disk with nothing left in the index, in which case it counts as
+   untracked exactly like git does. include_ignored = 0 skips paths matched
+   by the repo's .gitignore rules (opening and closing the ignore engine
+   internally -- the caller does not manage one); 1 includes them too. *out
+   is a malloc'd array of malloc'd strings, sorted by path (the walk itself
+   is readdir order, which is unspecified; callers such as
+   sg_tree_build_from_untracked rely on this being sorted rather than each
+   having to sort it themselves -- sg_tree_build's flat-list contract
+   requires it). On success the caller frees each entry and then the array.
+   On the -1 (allocation) return, the function has already freed whatever it
+   collected before failing and sets *out to NULL, *count to 0 -- callers
+   must not free anything themselves in that case, and must never treat -1
+   as "no untracked files", since silently under-reporting is how
+   uncommitted work gets lost. Returns 0 on success, -1 on allocation
+   failure. */
+int sg_status_list_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
+                             int include_ignored, char ***out, size_t *count);
+
 #endif
