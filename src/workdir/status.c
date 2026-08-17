@@ -314,12 +314,27 @@ int sg_status_list_untracked(const char *git_dir, const char *repo_root, const s
 
     rc = collect_untracked(repo_root, "", idx, ig, include_ignored, out, count, &cap);
     sg_ignore_free(ig);
+    if (rc != 0) {
+        /* Whatever collect_untracked managed to accumulate before failing is
+           not useful to any caller and would otherwise have to be freed by
+           every one of them identically -- clean it up here instead so -1
+           always means "nothing allocated", matching every other failure
+           path in this file. */
+        size_t i;
+
+        for (i = 0; i < *count; i++)
+            free((*out)[i]);
+        free(*out);
+        *out = NULL;
+        *count = 0;
+        return rc;
+    }
     /* collect_untracked walks in readdir order, which is unspecified and not
        lexicographic -- callers (sg_tree_build_from_untracked in particular,
        whose sg_tree_build contract requires a path-sorted flat list) must be
        able to rely on this being sorted rather than each having to sort it
        themselves. */
-    if (rc == 0 && *count > 0)
+    if (*count > 0)
         qsort(*out, *count, sizeof(**out), untracked_str_cmp);
     return rc;
 }

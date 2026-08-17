@@ -141,7 +141,9 @@ static int remove_untracked_files(const char *repo_root, char **paths, size_t co
    reldir itself if it is now physically empty. reldir == "" (repo_root) is
    never removed. Best-effort: an unreadable directory is left alone rather
    than treated as a hard failure, same convention as
-   sg_status_list_untracked's own directory walk. */
+   sg_status_list_untracked's own directory walk. A path that would truncate
+   is skipped the same way -- never acted on -- matching path_join in
+   status.c. */
 static void prune_empty_untracked_dirs(const char *repo_root, const char *reldir, sg_ignore *ig,
                                        int include_ignored)
 {
@@ -149,8 +151,11 @@ static void prune_empty_untracked_dirs(const char *repo_root, const char *reldir
     DIR *d;
     struct dirent *ent;
     int empty;
+    int n;
 
-    snprintf(absdir, sizeof(absdir), "%s%s%s", repo_root, reldir[0] != '\0' ? "/" : "", reldir);
+    n = snprintf(absdir, sizeof(absdir), "%s%s%s", repo_root, reldir[0] != '\0' ? "/" : "", reldir);
+    if (n < 0 || (size_t)n >= sizeof(absdir))
+        return; /* truncated -- never act on a truncated path, same as path_join in status.c */
 
     d = opendir(absdir);
     if (d == NULL)
@@ -164,8 +169,12 @@ static void prune_empty_untracked_dirs(const char *repo_root, const char *reldir
             continue;
         if (strcmp(ent->d_name, ".git") == 0)
             continue;
-        snprintf(relpath, sizeof(relpath), "%s%s%s", reldir, reldir[0] != '\0' ? "/" : "", ent->d_name);
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, relpath);
+        n = snprintf(relpath, sizeof(relpath), "%s%s%s", reldir, reldir[0] != '\0' ? "/" : "", ent->d_name);
+        if (n < 0 || (size_t)n >= sizeof(relpath))
+            continue; /* truncated -- skip this entry entirely, never act on it */
+        n = snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, relpath);
+        if (n < 0 || (size_t)n >= sizeof(abspath))
+            continue; /* truncated -- skip this entry entirely, never act on it */
         if (lstat(abspath, &st) != 0 || !S_ISDIR(st.st_mode))
             continue;
         if (!include_ignored && sg_ignore_is_ignored(ig, relpath, 1))

@@ -1388,6 +1388,166 @@ static void test_apply_untracked_collision_rejects_whole_apply(void)
     free(git_dir);
 }
 
+/* ---- -2 branch: the second (keep-index) sg_apply_tree_to_workdir call
+   fails after the first one already succeeded ---------------------------- */
+
+/* "blocked/c.txt" is staged (so it is part of index_tree, the --keep-index
+   re-apply's target) but absent from HEAD (so the first, head_tree, apply
+   does not need to touch "blocked" at all -- it only ever tries to *remove*
+   the working-tree copy, and that removal's return value is discarded, see
+   sg_apply_tree_to_workdir). The working-tree copy is deleted and "blocked"
+   is left as an empty, write-less directory, so the SECOND apply -- which
+   must create c.txt fresh -- fails opening it while the first apply, which
+   never needed to create anything under "blocked", still succeeds. */
+static void test_push_returns_minus_two_when_keep_index_second_apply_fails(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char blob[SG_SHA1_RAW_LEN];
+    unsigned char commit1[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry e;
+    char blocked_dir[4096];
+    char blocked_file[4096];
+    int rc;
+
+    if (geteuid() == 0) {
+        free(repo_root);
+        free(git_dir);
+        return;
+    }
+
+    commit_initial(git_dir, repo_root); /* HEAD: a.txt = "hello\n" */
+
+    write_workdir_file(repo_root, "blocked/c.txt", "orig\n");
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "orig\n", 5, blob) == 0, "write blob for blocked/c.txt");
+    CHECK(sg_index_read(git_dir, &idx) == 0, "read index before staging blocked/c.txt");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob, SG_SHA1_RAW_LEN);
+    e.path = (char *)"blocked/c.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "stage blocked/c.txt");
+    CHECK(sg_index_write(git_dir, &idx) == 0, "write index with blocked/c.txt staged");
+    sg_index_free(&idx);
+
+    snprintf(blocked_file, sizeof(blocked_file), "%s/blocked/c.txt", repo_root);
+    CHECK(remove(blocked_file) == 0, "delete the working-tree copy of blocked/c.txt");
+    snprintf(blocked_dir, sizeof(blocked_dir), "%s/blocked", repo_root);
+    CHECK(chmod(blocked_dir, 0555) == 0, "chmod blocked/ read-only failed");
+
+    rc = stash_push_keep_index(git_dir, repo_root, "keep-index will half-fail", commit1);
+    CHECK(rc == -2, "expected -2 (stash durable, --keep-index re-apply failed), got %d", rc);
+
+    chmod(blocked_dir, 0755); /* restore before any further reads/writes */
+
+    {
+        sg_stash_list list;
+
+        CHECK(sg_stash_list_read(git_dir, &list) == 0, "list read failed after the -2 push");
+        CHECK(list.count == 1,
+             "the stash must be durably listed even though the --keep-index re-apply failed, got %zu",
+             list.count);
+        if (list.count == 1)
+            CHECK(strstr(list.entries[0].message, "keep-index will half-fail") != NULL,
+                 "the listed entry should carry the -m message sg_stash_push was given: %s",
+                 list.entries[0].message);
+        sg_stash_list_free(&list);
+    }
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- -2 branch: remove_untracked_files fails after the stash object,
+   refs/stash and the head_tree reset already succeeded ------------------- */
+static void test_push_returns_minus_two_when_untracked_removal_fails(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char commit1[SG_SHA1_RAW_LEN];
+    char udir[4096];
+    int rc;
+
+    if (geteuid() == 0) {
+        free(repo_root);
+        free(git_dir);
+        return;
+    }
+
+    commit_initial(git_dir, repo_root); /* HEAD: a.txt = "hello\n" */
+    write_workdir_file(repo_root, "udir/u.txt", "extra\n"); /* untracked */
+
+    snprintf(udir, sizeof(udir), "%s/udir", repo_root);
+    CHECK(chmod(udir, 0555) == 0, "chmod udir/ read-only failed");
+
+    rc = stash_push_u(git_dir, repo_root, "untracked removal will half-fail", commit1);
+    CHECK(rc == -2, "expected -2 (stash durable, untracked removal failed), got %d", rc);
+
+    chmod(udir, 0755); /* restore before any further reads/writes */
+
+    {
+        sg_stash_list list;
+
+        CHECK(sg_stash_list_read(git_dir, &list) == 0, "list read failed after the -2 push");
+        CHECK(list.count == 1,
+             "the stash must be durably listed even though untracked removal failed, got %zu",
+             list.count);
+        if (list.count == 1)
+            CHECK(strstr(list.entries[0].message, "untracked removal will half-fail") != NULL,
+                 "the listed entry should carry the -m message sg_stash_push was given: %s",
+                 list.entries[0].message);
+        sg_stash_list_free(&list);
+    }
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- collision on the untracked half rejects the whole apply when the
+   thing in the way is a DIRECTORY, not just a file (oracle scenario E,
+   oracle4.txt) -- lstat doesn't care which, so this is expected to already
+   work, but nothing pinned it down before ------------------------------- */
+static void test_apply_untracked_collision_with_directory_rejects_whole_apply(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    int rc;
+
+    commit_initial(git_dir, repo_root); /* HEAD: a.txt = "hello\n" */
+    write_workdir_file(repo_root, "a.txt", "changed\n");
+    write_workdir_file(repo_root, "u.txt", "original\n");
+    CHECK(stash_push_u(git_dir, repo_root, "u", stash_id) == 0, "-u push failed");
+    CHECK(!file_exists(repo_root, "u.txt"), "push should have removed u.txt");
+
+    /* a DIRECTORY now occupies the path the untracked half would restore */
+    write_workdir_file(repo_root, "u.txt/inner.txt", "in the way\n");
+
+    rc = sg_stash_apply(git_dir, repo_root, 0);
+    CHECK(rc == -1, "expected the whole apply to be rejected on a directory collision, got %d", rc);
+
+    {
+        char *a = read_workdir_file(repo_root, "a.txt");
+
+        CHECK(a != NULL && strcmp(a, "hello\n") == 0,
+             "a.txt must stay at HEAD's content (nothing written at all), got %s",
+             a != NULL ? a : "(null)");
+        CHECK(file_exists(repo_root, "u.txt/inner.txt"),
+             "the colliding directory and its content must be untouched");
+        free(a);
+    }
+    {
+        sg_stash_list list;
+
+        CHECK(sg_stash_list_read(git_dir, &list) == 0, "list read failed");
+        CHECK(list.count == 1, "the stash must survive a rejected apply, got %zu", list.count);
+        sg_stash_list_free(&list);
+    }
+
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_parse_spec_table();
@@ -1409,6 +1569,9 @@ int main(void)
     test_u_with_keep_index();
     test_apply_restores_untracked_unstaged();
     test_apply_untracked_collision_rejects_whole_apply();
+    test_push_returns_minus_two_when_keep_index_second_apply_fails();
+    test_push_returns_minus_two_when_untracked_removal_fails();
+    test_apply_untracked_collision_with_directory_rejects_whole_apply();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

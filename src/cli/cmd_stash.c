@@ -128,7 +128,8 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
            be a lie: the entry exists, only its cleanup step is in doubt. */
         sg_stash_list list;
 
-        fprintf(stderr, "sg: stash 已建立，但後續步驟失敗（快照或還原工作目錄回 HEAD）；"
+        fprintf(stderr, "sg: stash 已建立，但後續步驟失敗（快照、還原工作目錄回 HEAD，或"
+                        "（在 -u/-a 下）移除已收進 stash 的未追蹤檔案／清理空目錄）；"
                         "請自行確認工作目錄狀態\n");
         if (sg_stash_list_read(git_dir, &list) == 0 && list.count > 0) {
             fprintf(stderr, "sg: 該 stash 為 stash@{0}: %s\n", list.entries[0].message);

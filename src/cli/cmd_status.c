@@ -212,9 +212,6 @@ int sg_cmd_status(int argc, char **argv)
 
     if (sg_status_list_untracked(git_dir, repo_root, &idx, 0, &untracked, &untracked_count) != 0) {
         fprintf(stderr, "sg: 記憶體不足，無法掃描未追蹤的檔案\n");
-        for (i = 0; i < untracked_count; i++)
-            free(untracked[i]);
-        free(untracked);
         sg_status_list_free(&staged);
         sg_status_list_free(&unstaged);
         sg_index_free(&idx);

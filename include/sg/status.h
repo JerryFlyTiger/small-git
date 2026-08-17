@@ -56,11 +56,12 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
    sg_tree_build_from_untracked rely on this being sorted rather than each
    having to sort it themselves -- sg_tree_build's flat-list contract
    requires it). On success the caller frees each entry and then the array.
-   On the -1 (allocation) return, *out and *count are left as whatever was
-   collected so far, unsorted, and must still be freed the same way --
-   callers must never treat -1 as "no untracked files" here, since silently
-   under-reporting is how uncommitted work gets lost. Returns 0 on success,
-   -1 on allocation failure. */
+   On the -1 (allocation) return, the function has already freed whatever it
+   collected before failing and sets *out to NULL, *count to 0 -- callers
+   must not free anything themselves in that case, and must never treat -1
+   as "no untracked files", since silently under-reporting is how
+   uncommitted work gets lost. Returns 0 on success, -1 on allocation
+   failure. */
 int sg_status_list_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
                              int include_ignored, char ***out, size_t *count);
 
