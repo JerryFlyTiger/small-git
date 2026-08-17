@@ -122,7 +122,7 @@ sg undo 1                     # 內容回來了
 - `sg` 建立的 repo 可以直接用 `git` 操作,通過 `git fsck --strict`;`git` 建立的 repo 也可以
   直接用 `sg` 操作,包含 `git gc` 之後把 ref 收進 `packed-refs`、把物件打包成 pack 的狀態。
 - 網路端實作 smart HTTP,可與真實的 git 伺服器互通(clone/fetch/push)。
-- 測試套件 `tests/interop.sh` 有 1165 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
+- 測試套件 `tests/interop.sh` 有 1247 項檢查,大部分是拿 `sg` 的產出去餵真正的 `git` 二進位檔
   (含一個本機 `git http-backend` 伺服器)來驗證,而不是自己跟自己比對。
 
 **唯一的例外是啟用分塊之後**——那時 tree 裡放的是指標 blob,`git checkout` 會拿到指標文字。
@@ -143,11 +143,18 @@ sg undo 1                     # 內容回來了
 - **寫入端不產生超過 2GB 的 pack**(會明確報錯而非產生壞檔);讀取端支援。
 - **啟用分塊後 `refs/sg/chunks` 不可刪除**,所有 chunk 靠它在物件圖中保持可達,刪掉之後
   `git gc` 會清掉資料。`sg` 偵測到這個狀態會硬失敗,不會靜默寫出指標文字。
-- **`sg stash` 只實作核心子集**:`push`/`list`/`apply`/`pop`/`drop`/`clear`。
-  不支援 `-u`(未追蹤檔案)、`show`、`--index`、`--keep-index` 與 pathspec。
-  `pop`/`apply` 要求工作目錄乾淨(真 git 會做三方合併),rebase 進行中則直接拒絕。
-  格式本身完全相容——`sg` 建的 stash 真 `git` 讀得到、反之亦然,`stash@{n}` 走的是
-  與真 git 逐位元組相同的 reflog。
+- **`sg stash` 支援** `push`/`list`/`apply`/`pop`/`drop`/`clear`,`push` 加
+  `-u`/`--include-untracked`、`-a`/`--all`(連 ignore 的也收)、`--keep-index`
+  (重設工作目錄到 index 而非 HEAD),`apply`/`pop` 加 `--index`(乾淨合併後把
+  index 整個換回 push 時的樣子)。`-u`/`-a` 把未追蹤檔案存進 stash commit 的第
+  三個 parent(一個只含未追蹤檔案的 root commit),已追蹤那半邊的 tree 與不帶
+  旗標時逐位元組相同。`apply`/`pop` 不再要求整個工作目錄乾淨,只擋這次合併真
+  的會動到的路徑上的髒改動——工作目錄裡已刪除的路徑不算擋路。**不支援**:
+  `show` 與 pathspec。刻意與真 git 分歧的兩處:`-u` 撞到既有檔案時 sg 全有全無
+  地拒絕(真 git 會部分套用,留下一個沒有乾淨出口的 entry);dirty apply 撞到
+  **已 staged** 的改動時 sg 一律拒絕(真 git 的 ours 是 index,能合併,sg 的
+  ours 是 HEAD,放行會輾掉 staged 內容)。格式本身完全相容——`sg` 建的 stash
+  真 `git` 讀得到、反之亦然,`stash@{n}` 走的是與真 git 逐位元組相同的 reflog。
 - **未實作 commit-graph 與 multi-pack-index**。原本規劃在 Phase 7,但物件存取層修好之後
   `sg log` 已與 `git log` 同級,邊際效益不高,留待有實際需求再評估。
 

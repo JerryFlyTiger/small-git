@@ -1071,13 +1071,18 @@ diagnostic command; it does not modify anything.
 .RB [ push ]
 .RB [ -m
 .IR message ]
+.RB [ -u | \-\-include\-untracked ]
+.RB [ -a | \-\-all ]
+.RB [ \-\-keep\-index ]
 .br
 .B sg stash list
 .br
 .B sg stash apply
+.RB [ \-\-index ]
 .RI [ stash ]
 .br
 .B sg stash pop
+.RB [ \-\-index ]
 .RI [ stash ]
 .br
 .B sg stash drop
@@ -1113,15 +1118,47 @@ With no subcommand, or with an explicit
 saves the change and reports
 .RB \(dq "No local changes to save" \(dq
 (exit 0, nothing written) if the working tree and index already match
-.BR HEAD .
+.BR HEAD
+(and, under
+.BR -u / -a ,
+there is also no untracked file to save).
 .B -m
 .I message
 sets the entry's description to \(dqOn
 .IR branch : message\(dq;
 without it, the description is the \(dqWIP on
 .IR branch : short-hash
-subject\(dq form real git uses. Untracked files are never stashed and are
-left untouched. A conflicted (unmerged) index refuses the push outright.
+subject\(dq form real git uses. A conflicted (unmerged) index refuses the
+push outright.
+.PP
+By default untracked files are never stashed and are left untouched.
+.B -u
+(or
+.BR \-\-include\-untracked )
+also stashes them, into a third parent commit of the stash (a root commit
+holding only the untracked files) so the tracked half's tree stays
+byte-for-byte identical to a stash made without the flag (measured against
+real git 2.55.0).
+.B -a
+(or
+.BR \-\-all )
+does the same but also sweeps up files that are
+.BR .gitignore d.
+Once anything is being stashed, this third parent is written
+unconditionally, even when the untracked list is empty. After stashing,
+.B -u
+removes the taken files and prunes any directory left empty by their
+removal, except a directory that still holds only ignored files, which
+.B -u
+leaves alone;
+.B -a
+removes those too.
+.B \-\-keep\-index
+resets the working tree to the
+.B index
+instead of
+.BR HEAD ,
+leaving whatever was staged still staged.
 .PP
 An in-progress rebase does
 .B not
@@ -1159,32 +1196,58 @@ dropped and the working tree and index are left with stages 1/2/3 for the
 conflicted paths, same as a conflicted
 .BR merge .
 .PP
-Unlike real git, which will attempt a three-way merge against pre-existing
-dirty changes,
 .B apply
 and
 .B pop
-require a clean working directory and index first (no unmerged entries,
-nothing staged or modified relative to
-.BR HEAD ),
-consistent with
-.BR "sg merge" \(cqs
-existing requirement. An in-progress rebase also refuses
+no longer require the whole working directory and index to be clean; only a
+path the merge actually touches may not be dirty. A touched path is refused
+if the working tree has it and its content differs from
+.BR HEAD
+(even if that content happens to already equal what the stash would write),
+or if the index already differs from
+.BR HEAD
+there; a touched path simply missing from the working tree is not a
+collision, since nothing there could be overwritten. This is a deliberate
+divergence from real git on one row: real git's \(dqours\(dq side is the
+index, so it three-way-merges a staged change against the stash and may
+report a conflict; sg's \(dqours\(dq is
+.BR HEAD ,
+so letting a staged change through here would silently discard it, and sg
+refuses instead. An in-progress rebase still refuses
 .B apply
 /
 .B pop
 outright, a deliberate divergence from real git (which allows it) taken
 for consistency with
 .BR switch / merge .
-A stash created by
-.B "git stash -u"
-(which has more than two parents) is refused by
+.PP
+A stash created with
+.B -u
+or
+.B -a
+(three parents) is restored by
 .B apply
 /
 .B pop
-without being dropped;
-.B sg
-cannot currently restore its untracked half.
+too: the untracked half is written back to disk, unstaged, creating any
+directories it needs. Where real git, on a collision with the untracked
+half, applies the tracked half anyway and then fails the untracked half
+file-by-file \(em leaving the entry on the stack with its own files now in
+the way, a state with no clean exit \(em sg folds the untracked half into
+the same pre-flight collision check as the tracked half and refuses the
+whole apply if anything on either half collides, writing nothing. This is
+strictly safer (an apply either fully succeeds or touches nothing) at the
+cost of not matching real git's partial-apply behavior here.
+.PP
+.B \-\-index
+(after a
+.I clean
+merge only) additionally replaces the index outright with the stash's own
+index tree \(em the exact staged state at the time of
+.BR push \(em
+instead of the rule above's per-path result. On conflict this step is
+skipped, matching real git, and the index is left as the merge left it; the
+caller is not told separately, so check for conflict markers.
 .PP
 .B drop
 removes an entry from the stack without applying it.
