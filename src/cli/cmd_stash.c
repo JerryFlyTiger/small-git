@@ -71,16 +71,6 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         }
     }
 
-    /* -u/-a are recognized (the struct carries them, this parses them) but
-       not yet implemented -- see sg_stash_push_opts's header comment. Refuse
-       explicitly rather than silently ignoring the flag and stashing as if
-       it had not been given, which would look like success while quietly
-       doing the wrong thing. */
-    if (opts.include_untracked || opts.include_ignored) {
-        fprintf(stderr, "sg: -u/-a (未追蹤/已忽略檔案) 尚未支援\n");
-        return 1;
-    }
-
     git_dir = sg_require_git_dir();
     if (git_dir == NULL)
         return 1;
@@ -406,15 +396,8 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
         return 1;
     }
     free(content);
-    if (commit.parent_count < 2) {
+    if (commit.parent_count < 2 || commit.parent_count > 3) {
         fprintf(stderr, "sg: stash@{%zu}: not a stash-like commit\n", index);
-        sg_commit_free(&commit);
-        free(git_dir);
-        free(repo_root);
-        return 1;
-    }
-    if (commit.parent_count > 2) {
-        fprintf(stderr, "sg: 這個 stash 含有未追蹤檔案（git stash -u 建立），sg 目前無法還原\n");
         sg_commit_free(&commit);
         free(git_dir);
         free(repo_root);

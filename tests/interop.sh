@@ -4761,32 +4761,30 @@ P15_POPCONFLICT_STAGES=$(cd "$P15_POPCONFLICT" && git ls-files -u c.txt | awk '{
 check "phase15 row8 (conflicting pop): index has all three stages for c.txt" \
     sh -c "echo \"$P15_POPCONFLICT_STAGES\" | sort -u | tr -d '\n' | grep -qx '123'"
 
-# --- row 9: popping a `-u` stash -- "silently drop the untracked half and
-# pop the rest" would also exit non-zero on some unrelated path in a sloppy
-# implementation, or worse, exit 0 having lost the untracked file; assert
-# the stash SURVIVES and the untracked file was never created. ---
+# --- row 9 (Phase 20 REVERSAL of the Phase 15 refusal): a stash real git
+# built with -u must now be poppable by sg -- the untracked half is restored
+# to disk, unstaged, and the entry is dropped, same as any other successful
+# pop. This is also half of the bidirectional interop coverage (git builds,
+# sg reads); the other half (sg builds, git reads) is further down. ---
 P15_POPU="$WORKDIR/p15_popu"
 p15_base_repo "$P15_POPU"
 printf 'tracked change\n' > "$P15_POPU/a.txt"
 printf 'untracked content\n' > "$P15_POPU/u.txt"
 (cd "$P15_POPU" && git add a.txt && git stash push -q -u -m "has untracked") > /dev/null 2>&1
-check "phase15 row9 (pop -u stash): precondition -- u.txt is gone (git -u stashed it)" \
+check "phase20 row9 (pop -u stash): precondition -- u.txt is gone (git -u stashed it)" \
     test ! -e "$P15_POPU/u.txt"
-P15_POPU_ERR="$WORKDIR/p15_popu_err.txt"
-(cd "$P15_POPU" && "$SG" stash pop) > /dev/null 2> "$P15_POPU_ERR"
-check "phase15 row9 (pop -u stash): sg refuses (exit 1)" test $? != 0
-check "phase15 row9 (pop -u stash): the stash is still listed" \
-    sh -c "[ -n \"\$(cd '$P15_POPU' && git stash list)\" ]"
-check "phase15 row9 (pop -u stash): the untracked file was not created" \
-    test ! -e "$P15_POPU/u.txt"
-# The three assertions above cannot tell the -u guard from any other
-# failure: the parent-count check exists at both the CLI and the library
-# layer, and disabling either one leaves the other returning the same exit
-# 1, the same surviving stash and the same absent file. Measured -- with
-# cmd_stash.c's `parent_count > 2` branch removed, all 798 checks stayed
-# green. Only the message names which guard actually spoke.
-check "phase15 row9 (pop -u stash): the refusal names the untracked half, not a generic failure" \
-    grep -q '未追蹤檔案' "$P15_POPU_ERR"
+P15_POPU_OUT="$WORKDIR/p15_popu_out.txt"
+(cd "$P15_POPU" && "$SG" stash pop) > "$P15_POPU_OUT" 2>&1
+check "phase20 row9 (pop -u stash): sg now SUCCEEDS restoring a git-built -u stash (exit 0)" \
+    test $? = 0
+check "phase20 row9 (pop -u stash): a.txt got its tracked content back" \
+    sh -c "[ \"\$(cat '$P15_POPU/a.txt')\" = 'tracked change' ]"
+check "phase20 row9 (pop -u stash): u.txt was restored with its original content" \
+    sh -c "[ \"\$(cat '$P15_POPU/u.txt')\" = 'untracked content' ]"
+check "phase20 row9 (pop -u stash): u.txt is untracked (?? ), not staged" \
+    sh -c "[ \"\$(cd '$P15_POPU' && git status --porcelain u.txt)\" = '?? u.txt' ]"
+check "phase20 row9 (pop -u stash): the entry was dropped after a successful pop" \
+    sh -c "[ -z \"\$(cd '$P15_POPU' && git stash list)\" ]"
 
 # --- apply vs pop: the ONLY thing separating the two subcommands is whether
 # the entry survives, and "it survived" is a negative assertion -- an apply
@@ -5045,30 +5043,166 @@ check "phase20 no-flag control: sg's no-flag result matches real git's no-flag r
 check "phase20 no-flag control: sg's no-flag result DIFFERS from sg's own --keep-index result" \
     test "$P20_NOFLAG_SG_PORCELAIN" != "$P20_KI_SG_PORCELAIN"
 
-# --- -u/-a: recognized but not yet implemented in this batch. Refuse
-# explicitly on stderr and exit 1 rather than silently ignoring the flag
-# (see sg_stash_push_opts's header comment). Also pin the BARE form (no
-# `push`) -- the dispatcher falls through to push for any unrecognized
-# subcommand, but the argument-parsing loop has to recognize the flag too,
-# which is a separate thing to get right. ---
-P20_UNSUP="$WORKDIR/p20_unsupported"
-p15_base_repo "$P20_UNSUP"
-printf 'x\n' > "$P20_UNSUP/a.txt"
-P20_UNSUP_ERR="$WORKDIR/p20_unsup_err.txt"
-(cd "$P20_UNSUP" && "$SG" stash push -u -m "should refuse") > /dev/null 2> "$P20_UNSUP_ERR"
-check "phase20 -u placeholder: sg stash push -u exits 1" test $? != 0
-check "phase20 -u placeholder: refusal message mentions being unsupported" \
-    grep -q '尚未支援' "$P20_UNSUP_ERR"
-check "phase20 -u placeholder: no stash was created" \
-    sh -c "! (cd '$P20_UNSUP' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+# --- Phase 20 batch 2b: real -u/-a semantics ---
+#
+# Fixture covers every boundary spec sec 1.3/1.4 pins: a tracked change
+# (tracked.txt), a plain untracked file, an untracked file in a fresh
+# subdirectory (dir removal after the file is taken), a directory holding
+# ONLY an ignored file (must survive -u, must be removed by -a), a directory
+# with one ignored and one plain file (partial removal), and a directory
+# that is already completely empty before the push (removed by -u alone,
+# since it has nothing ignored in it to begin with).
+# ============================================================
 
-P20_UNSUP_A_ERR="$WORKDIR/p20_unsup_a_err.txt"
-(cd "$P20_UNSUP" && "$SG" stash -a) > /dev/null 2> "$P20_UNSUP_A_ERR"
-check "phase20 -a placeholder (bare form, no 'push'): sg stash -a exits 1" test $? != 0
-check "phase20 -a placeholder (bare form): refusal message mentions being unsupported" \
-    grep -q '尚未支援' "$P20_UNSUP_A_ERR"
-check "phase20 -a placeholder (bare form): still no stash was created" \
-    sh -c "! (cd '$P20_UNSUP' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
+p20_untracked_fixture() {
+    # $1 = dir, $2 = "sg" or "git"
+    _dir="$1"; _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = sg ]; then
+        (cd "$WORKDIR" && "$SG" init "$(basename "$_dir")") > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && git init -q "$(basename "$_dir")")
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'v1\n' > "$_dir/tracked.txt"
+    printf 'ignored_only/\nmixed/keep.log\nbuild/\n' > "$_dir/.gitignore"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add tracked.txt .gitignore && "$SG" commit -m base) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add tracked.txt .gitignore && git commit -q -m base)
+    fi
+    printf 'v2\n' > "$_dir/tracked.txt"
+    printf 'u1\n' > "$_dir/untracked.txt"
+    mkdir -p "$_dir/fresh"; printf 'f1\n' > "$_dir/fresh/inner.txt"
+    mkdir -p "$_dir/ignored_only"; printf 'x1\n' > "$_dir/ignored_only/x.txt"
+    mkdir -p "$_dir/mixed"; printf 'k1\n' > "$_dir/mixed/keep.log"; printf 't1\n' > "$_dir/mixed/take.txt"
+    mkdir -p "$_dir/emptydir"
+    # build/ is itself matched by .gitignore AND physically empty -- the
+    # boundary that tells apart "prune whatever's physically empty" (wrong)
+    # from "prune whatever's physically empty AND not itself ignored under
+    # -u" (right, measured against real git 2.55.0). emptydir/ above is
+    # empty but NOT ignored, so it alone cannot distinguish the two rules.
+    mkdir -p "$_dir/build"
+}
+
+p20_worktree_listing() {
+    (cd "$1" && find . -path ./.git -prune -o \( -type f -o -type d \) -print | grep -v '^\.$' | sort)
+}
+
+# --- U1: -u, sg vs real git, full worktree listing after push must match ---
+P20_U_GIT="$WORKDIR/p20_u_git"
+p20_untracked_fixture "$P20_U_GIT" git
+(cd "$P20_U_GIT" && git stash push -q -u -m untracked) > /dev/null 2>&1
+check "phase20 -u oracle: git stash push -u exits 0" test $? = 0
+P20_U_GIT_LISTING=$(p20_worktree_listing "$P20_U_GIT")
+
+P20_U_SG="$WORKDIR/p20_u_sg"
+p20_untracked_fixture "$P20_U_SG" sg
+(cd "$P20_U_SG" && "$SG" stash push -u -m untracked) > /dev/null 2>&1
+check "phase20 -u: sg stash push -u exits 0" test $? = 0
+P20_U_SG_LISTING=$(p20_worktree_listing "$P20_U_SG")
+check "phase20 -u: sg's post-push worktree listing matches real git's byte-for-byte (dir-removal boundaries included)" \
+    test "$P20_U_SG_LISTING" = "$P20_U_GIT_LISTING"
+check "phase20 -u: ignored_only/ survives (still holds the ignored x.txt)" \
+    test -d "$P20_U_SG/ignored_only"
+check "phase20 -u: mixed/ survives with keep.log, take.txt taken" \
+    sh -c "[ -f '$P20_U_SG/mixed/keep.log' ] && [ ! -e '$P20_U_SG/mixed/take.txt' ]"
+check "phase20 -u: the already-empty emptydir/ is removed" \
+    test ! -e "$P20_U_SG/emptydir"
+check "phase20 -u: fresh/ is removed once inner.txt is taken" \
+    test ! -e "$P20_U_SG/fresh"
+# build/ is empty AND ignored -- unlike emptydir/ (empty but not ignored),
+# this is the boundary that catches a prune rule which only checks physical
+# emptiness and never re-consults ignore status for the directory itself.
+check "phase20 -u oracle: real git also SPARES build/ (empty, but ignored -- precondition for the check below)" \
+    test -d "$P20_U_GIT/build"
+check "phase20 -u: build/ (empty AND ignored) survives, matching real git -- -u must not sweep an ignored empty dir" \
+    test -d "$P20_U_SG/build"
+
+# --- U2: same fixture, -a -- ignored_only/ must now be removed too ---
+P20_A_GIT="$WORKDIR/p20_a_git"
+p20_untracked_fixture "$P20_A_GIT" git
+(cd "$P20_A_GIT" && git stash push -q -a -m ignored) > /dev/null 2>&1
+check "phase20 -a oracle: git stash push -a exits 0" test $? = 0
+P20_A_GIT_LISTING=$(p20_worktree_listing "$P20_A_GIT")
+
+P20_A_SG="$WORKDIR/p20_a_sg"
+p20_untracked_fixture "$P20_A_SG" sg
+(cd "$P20_A_SG" && "$SG" stash push -a -m ignored) > /dev/null 2>&1
+check "phase20 -a: sg stash push -a exits 0" test $? = 0
+P20_A_SG_LISTING=$(p20_worktree_listing "$P20_A_SG")
+check "phase20 -a: sg's post-push worktree listing matches real git's byte-for-byte" \
+    test "$P20_A_SG_LISTING" = "$P20_A_GIT_LISTING"
+check "phase20 -a: ignored_only/ is REMOVED (its only file was ignored, but -a still took it)" \
+    test ! -e "$P20_A_SG/ignored_only"
+check "phase20 -a: mixed/ is removed too (both files taken)" \
+    test ! -e "$P20_A_SG/mixed"
+check "phase20 -a oracle: real git also REMOVES build/ under -a (precondition for the check below)" \
+    test ! -e "$P20_A_GIT/build"
+check "phase20 -a: build/ (empty AND ignored) is removed too, matching real git -- -a sweeps ignored paths" \
+    test ! -e "$P20_A_SG/build"
+
+# --- U3 (bidirectional half 1): sg builds a -u stash, real git pops it ---
+P20_SG2GIT_U="$WORKDIR/p20_sg2git_u"
+p20_untracked_fixture "$P20_SG2GIT_U" sg
+(cd "$P20_SG2GIT_U" && "$SG" stash push -u -m roundtrip) > /dev/null 2>&1
+check "phase20 sg->git roundtrip (-u): sg stash push -u exits 0" test $? = 0
+(cd "$P20_SG2GIT_U" && git stash pop -q) > /dev/null 2>&1
+check "phase20 sg->git roundtrip (-u): real git pop exits 0" test $? = 0
+check "phase20 sg->git roundtrip (-u): tracked.txt restored to v2" \
+    sh -c "[ \"\$(cat '$P20_SG2GIT_U/tracked.txt')\" = v2 ]"
+check "phase20 sg->git roundtrip (-u): untracked.txt restored" \
+    sh -c "[ \"\$(cat '$P20_SG2GIT_U/untracked.txt')\" = u1 ]"
+check "phase20 sg->git roundtrip (-u): fresh/inner.txt restored (nested dir recreated)" \
+    sh -c "[ \"\$(cat '$P20_SG2GIT_U/fresh/inner.txt')\" = f1 ]"
+check "phase20 sg->git roundtrip (-u): untracked.txt is untracked, not staged" \
+    sh -c "[ \"\$(cd '$P20_SG2GIT_U' && git status --porcelain untracked.txt)\" = '?? untracked.txt' ]"
+
+# --- U4 (bidirectional half 2): real git builds a -a stash, sg pops it ---
+P20_GIT2SG_A="$WORKDIR/p20_git2sg_a"
+p20_untracked_fixture "$P20_GIT2SG_A" git
+(cd "$P20_GIT2SG_A" && git stash push -q -a -m roundtrip) > /dev/null 2>&1
+check "phase20 git->sg roundtrip (-a): git stash push -a exits 0" test $? = 0
+(cd "$P20_GIT2SG_A" && "$SG" stash pop) > /dev/null 2>&1
+check "phase20 git->sg roundtrip (-a): sg pop exits 0" test $? = 0
+check "phase20 git->sg roundtrip (-a): tracked.txt restored to v2" \
+    sh -c "[ \"\$(cat '$P20_GIT2SG_A/tracked.txt')\" = v2 ]"
+check "phase20 git->sg roundtrip (-a): the previously-ignored mixed/keep.log came back" \
+    sh -c "[ \"\$(cat '$P20_GIT2SG_A/mixed/keep.log')\" = k1 ]"
+check "phase20 git->sg roundtrip (-a): mixed/keep.log is untracked, not staged (still ignored)" \
+    sh -c "[ \"\$(cd '$P20_GIT2SG_A' && git status --porcelain --ignored mixed/keep.log)\" = '!! mixed/keep.log' ]"
+check "phase20 git->sg roundtrip (-a): the stash entry was dropped" \
+    sh -c "[ -z \"\$(cd '$P20_GIT2SG_A' && git stash list)\" ]"
+
+# --- U5: bare-form flag recognition actually works now (no "push" keyword),
+# and combining -u with --keep-index matches real git ---
+P20_BARE="$WORKDIR/p20_bare"
+p15_base_repo "$P20_BARE"
+printf 'x\n' > "$P20_BARE/a.txt"
+printf 'y\n' > "$P20_BARE/b_untracked.txt"
+(cd "$P20_BARE" && "$SG" stash -u) > /dev/null 2>&1
+check "phase20 bare form: sg stash -u (no 'push') exits 0" test $? = 0
+check "phase20 bare form: b_untracked.txt was taken by the bare -u form" \
+    test ! -e "$P20_BARE/b_untracked.txt"
+check "phase20 bare form: the stash it created has 3 parents (untracked half present)" \
+    sh -c "[ \"\$(cd '$P20_BARE' && git rev-list --parents -n1 refs/stash | wc -w | tr -d ' ')\" = 4 ]"
+
+P20_UKI_GIT="$WORKDIR/p20_uki_git"
+p20_untracked_fixture "$P20_UKI_GIT" git
+(cd "$P20_UKI_GIT" && git add tracked.txt && git stash push -q -u --keep-index -m ukeep) > /dev/null 2>&1
+check "phase20 -u+--keep-index oracle: git exits 0" test $? = 0
+P20_UKI_GIT_PORCELAIN=$(cd "$P20_UKI_GIT" && git status --porcelain | sort)
+
+P20_UKI_SG="$WORKDIR/p20_uki_sg"
+p20_untracked_fixture "$P20_UKI_SG" sg
+(cd "$P20_UKI_SG" && "$SG" add tracked.txt) > /dev/null 2>&1
+(cd "$P20_UKI_SG" && "$SG" stash push -u --keep-index -m ukeep) > /dev/null 2>&1
+check "phase20 -u+--keep-index: sg exits 0" test $? = 0
+P20_UKI_SG_PORCELAIN=$(cd "$P20_UKI_SG" && git status --porcelain | sort)
+check "phase20 -u+--keep-index: sg's post-push status matches real git's byte-for-byte" \
+    test "$P20_UKI_SG_PORCELAIN" = "$P20_UKI_GIT_PORCELAIN"
+check "phase20 -u+--keep-index: fresh/ was still swept (untracked half taken despite --keep-index)" \
+    test ! -e "$P20_UKI_SG/fresh"
 
 # --- Phase 16: switch during an in-progress merge ---
 #

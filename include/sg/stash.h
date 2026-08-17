@@ -39,16 +39,21 @@ int sg_stash_parse_spec(const char *spec, size_t *index_out);
 /* Options for sg_stash_push. A NULL opts pointer is equivalent to every
    field zeroed (message NULL, all three flags 0).
 
-   include_untracked (-u) and include_ignored (-a, which implies -u) are
-   PLACEHOLDERS as of Phase 20 batch 1: the struct carries them and the CLI
-   parses them, but sg_stash_push does not yet act on either -- the CLI
-   layer refuses with "尚未支援" before ever calling in when either is set.
-   A future batch will give them their real (3-parent, untracked-files)
-   behavior; do not read anything into their current no-op status. */
+   include_untracked (-u) and include_ignored (-a, which implies -u --
+   passing include_ignored alone has the same effect as passing both) give
+   the stash commit a THIRD parent: a root commit (no parent of its own)
+   whose tree holds only the untracked files (include_ignored also pulls in
+   ignored ones), full relative paths. The stash's own tree (parent commit's
+   tree, i.e. the "tracked" half) is IDENTICAL whether or not either flag is
+   set -- untracked files live only in the third parent (measured against
+   real git 2.55.0, Phase 20 spec sec 1.1). Once the stash has anything to
+   save at all, the third parent is written unconditionally, even when the
+   untracked file list is empty (an empty tree) -- there is no "fall back to
+   2 parents" optimization (spec sec 1.6). */
 typedef struct {
     const char *message;   /* NULL selects the "WIP on <branch>: ..." form */
-    int include_untracked; /* -u  -- placeholder, see above */
-    int include_ignored;   /* -a  -- placeholder, see above */
+    int include_untracked; /* -u */
+    int include_ignored;   /* -a (implies -u) */
     int keep_index;        /* --keep-index: reset the working tree to the
                                INDEX tree instead of HEAD's tree, leaving
                                staged changes staged (measured against real
@@ -65,17 +70,34 @@ typedef struct {
    1-parent stash lists, but `show`/`apply`/`pop` die with "not a stash-like
    commit"), so it is not optional.
 
+   When include_untracked or include_ignored is set, "nothing to save" also
+   requires the untracked file list (filtered the same way the third parent
+   would be) to be empty -- a worktree that is clean except for an untracked
+   file is NOT nothing-to-save under -u/-a even though it is under plain
+   push (measured, spec sec 1.5).
+
+   With either flag set, after the working tree is reset (to head_tree, then
+   to index_tree too if keep_index), every file that went into the third
+   parent's tree is removed from the working tree, and any directory left
+   physically empty by that removal is pruned (recursively upward). This
+   step does NOT consult ignore status again -- a directory that still holds
+   an ignored file under -u (untracked, but not swept up) is not empty and
+   is left alone; the same directory under -a (which does sweep it) is
+   removed once its last file is gone (measured, spec sec 1.4).
+
    Returns 0 when a stash was created, 1 when there was nothing to save
-   (working tree and index both already equal HEAD -- nothing on disk was
-   touched, and the caller prints "No local changes to save" and exits 0,
-   matching git), -1 on failure before anything durable was written (refuses
-   this way on an unborn HEAD or an unmerged index -- the caller may report
-   "nothing happened"). Returns -2 when the stash commit + refs/stash were
-   already written durably (so it IS on `sg stash list`) but a later step --
-   the snapshot or the working-tree reset -- failed; the caller must not
-   claim nothing was created, and should tell the user the entry exists and
-   the working tree may not have been reset. Deliberately does NOT touch a
-   paused rebase's sequencer state, and does NOT remove MERGE_HEAD -- both
+   (working tree and index both already equal HEAD, and -- see above -- no
+   untracked files if -u/-a was given -- nothing on disk was touched, and
+   the caller prints "No local changes to save" and exits 0, matching git),
+   -1 on failure before anything durable was written (refuses this way on an
+   unborn HEAD or an unmerged index -- the caller may report "nothing
+   happened"). Returns -2 when the stash commit + refs/stash were already
+   written durably (so it IS on `sg stash list`) but a later step -- the
+   snapshot, the working-tree reset, or (under -u/-a) removing the taken
+   untracked files/pruning now-empty directories -- failed; the caller must
+   not claim nothing was created, and should tell the user the entry exists
+   and the working tree may not have been reset. Deliberately does NOT touch
+   a paused rebase's sequencer state, and does NOT remove MERGE_HEAD -- both
    are the CLI layer's job (see cmd_stash.c). */
 int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_push_opts *opts,
                   unsigned char commit_id_out[SG_SHA1_RAW_LEN]);
@@ -96,12 +118,28 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
    measured `UU c.txt` alongside `M  clean.txt`), and MERGE_HEAD is NOT
    written (git does not create one here).
 
+   A 3-parent entry (a `git stash -u`/`-a` stash, see sg_stash_push_opts) is
+   also accepted: the third parent's tree (full relative paths) is restored
+   into the working tree as untracked files -- written to disk, never staged
+   -- creating any nested directories those paths need.
+
+   DELIBERATE DIVERGENCE from real git (measured, Phase 20 spec sec 1.7):
+   when a path the untracked half would restore already exists on disk, real
+   git applies the tracked half regardless and then fails the untracked half
+   per-file, leaving the stash entry around with only some of its untracked
+   files restored -- a state with no clean way out (popping again collides
+   with the files it just restored). sg instead folds the untracked paths
+   into the SAME pre-flight collision check it already runs for the tracked
+   half (see the untracked-in-HEAD collision check below) and refuses the
+   whole apply, writing nothing, if anything collides on either half. This
+   is strictly safe (an apply either fully succeeds or touches nothing) at
+   the cost of not matching real git's partial-apply behavior here.
+
    Returns 0 on a clean apply, 1 when there were conflicts (working tree and
    index are left in the conflicted state, the stash entry is untouched and
    the caller must not drop it), -1 on failure. Returns -1 if the entry has
-   fewer than 2 or more than 2 parents -- a 3-parent entry is a `git stash
-   -u` stash whose untracked half Phase 15 cannot restore, and applying only
-   the tracked half would silently lose files. */
+   fewer than 2 or more than 3 parents -- that is not a shape sg (or real
+   git) ever produces for a stash. */
 int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index);
 
 /* Removes entry `index` from the stack: rewrites the reflog without that

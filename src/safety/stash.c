@@ -2,6 +2,7 @@
 
 #include "sg/apply.h"
 #include "sg/chunk.h"
+#include "sg/ignore.h"
 #include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/merge.h"
@@ -10,10 +11,12 @@
 #include "sg/reflog.h"
 #include "sg/refs.h"
 #include "sg/snapshot.h"
+#include "sg/status.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -110,6 +113,86 @@ static int build_and_write_commit(const char *git_dir, const unsigned char tree[
     rc = sg_loose_write(git_dir, SG_OBJ_COMMIT, serialized, serialized_len, id_out);
     free(serialized);
     return rc;
+}
+
+/* Unlinks every path in paths[0..count) under repo_root -- the files that
+   just went into the third parent's tree. ENOENT is not an error (the file
+   may already be gone for some unrelated reason); anything else is, and
+   aborts immediately rather than silently leaving some files behind while
+   reporting success. Returns 0, -1 on the first real failure. */
+static int remove_untracked_files(const char *repo_root, char **paths, size_t count)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        char abspath[4096];
+
+        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, paths[i]);
+        if (unlink(abspath) != 0 && errno != ENOENT)
+            return -1;
+    }
+    return 0;
+}
+
+/* Post-order: recurses into reldir's subdirectories first (skipping ones
+   sg_ignore prunes -- an ignored directory is never entered, matching
+   sg_status_list_untracked's own walk, unless include_ignored says to sweep
+   it too), then, once every child has had its chance to disappear, removes
+   reldir itself if it is now physically empty. reldir == "" (repo_root) is
+   never removed. Best-effort: an unreadable directory is left alone rather
+   than treated as a hard failure, same convention as
+   sg_status_list_untracked's own directory walk. */
+static void prune_empty_untracked_dirs(const char *repo_root, const char *reldir, sg_ignore *ig,
+                                       int include_ignored)
+{
+    char absdir[4096];
+    DIR *d;
+    struct dirent *ent;
+    int empty;
+
+    snprintf(absdir, sizeof(absdir), "%s%s%s", repo_root, reldir[0] != '\0' ? "/" : "", reldir);
+
+    d = opendir(absdir);
+    if (d == NULL)
+        return;
+    while ((ent = readdir(d)) != NULL) {
+        char relpath[4096];
+        char abspath[4096];
+        struct stat st;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        if (strcmp(ent->d_name, ".git") == 0)
+            continue;
+        snprintf(relpath, sizeof(relpath), "%s%s%s", reldir, reldir[0] != '\0' ? "/" : "", ent->d_name);
+        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, relpath);
+        if (lstat(abspath, &st) != 0 || !S_ISDIR(st.st_mode))
+            continue;
+        if (!include_ignored && sg_ignore_is_ignored(ig, relpath, 1))
+            continue; /* left alone entirely, same as the untracked-file walk */
+        if (sg_ignore_push_dir(ig, relpath) != 0)
+            continue;
+        prune_empty_untracked_dirs(repo_root, relpath, ig, include_ignored);
+        sg_ignore_pop_dir(ig);
+    }
+    closedir(d);
+
+    /* Re-open and recount: children removed above may have made reldir
+       itself empty now. */
+    d = opendir(absdir);
+    if (d == NULL)
+        return;
+    empty = 1;
+    while ((ent = readdir(d)) != NULL) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        empty = 0;
+        break;
+    }
+    closedir(d);
+
+    if (empty && reldir[0] != '\0')
+        rmdir(absdir);
 }
 
 /* ---- list ---------------------------------------------------------------- */
@@ -228,32 +311,40 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
 {
     static const sg_stash_push_opts default_opts = {NULL, 0, 0, 0};
     const char *message;
+    int untracked_flag;
     unsigned char head_commit[SG_SHA1_RAW_LEN];
     unsigned char head_tree[SG_SHA1_RAW_LEN];
     sg_index idx;
     unsigned char worktree_tree[SG_SHA1_RAW_LEN];
     unsigned char index_tree[SG_SHA1_RAW_LEN];
+    char **untracked_paths = NULL;
+    size_t untracked_path_count = 0;
     char *branch = NULL;
     const char *branch_display;
     char short_hex[8];
     char *head_subject = NULL;
     char subj_buf[512];
     char *cleaned_index_msg = NULL;
+    char *cleaned_untracked_msg = NULL;
     char *cleaned_subject = NULL;
     unsigned char index_commit_id[SG_SHA1_RAW_LEN];
+    unsigned char untracked_commit_id[SG_SHA1_RAW_LEN];
     unsigned char stash_commit_id[SG_SHA1_RAW_LEN];
     unsigned char index_parents[1][SG_SHA1_RAW_LEN];
-    unsigned char stash_parents[2][SG_SHA1_RAW_LEN];
+    unsigned char stash_parents[3][SG_SHA1_RAW_LEN];
+    size_t stash_parent_count;
     unsigned char old_stash_id[SG_SHA1_RAW_LEN];
     long long appended_at = 0;
     long long when;
     const char *name;
     const char *email;
+    size_t i;
     int rc = -1;
 
     if (opts == NULL)
         opts = &default_opts;
     message = opts->message;
+    untracked_flag = opts->include_untracked || opts->include_ignored;
 
     if (sg_ref_resolve_head(git_dir, head_commit) != 0)
         return -1; /* unborn HEAD */
@@ -278,8 +369,20 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         return -1;
     }
 
+    if (untracked_flag) {
+        if (sg_status_list_untracked(git_dir, repo_root, &idx, opts->include_ignored, &untracked_paths,
+                                     &untracked_path_count) != 0) {
+            sg_index_free(&idx);
+            return -1;
+        }
+    }
+
     if (memcmp(worktree_tree, head_tree, SG_SHA1_RAW_LEN) == 0 &&
-       memcmp(index_tree, head_tree, SG_SHA1_RAW_LEN) == 0) {
+       memcmp(index_tree, head_tree, SG_SHA1_RAW_LEN) == 0 &&
+       (!untracked_flag || untracked_path_count == 0)) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         sg_index_free(&idx);
         return 1; /* nothing to save */
     }
@@ -288,6 +391,9 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     branch_display = (branch != NULL) ? branch : "(no branch)";
 
     if (get_short_and_subject(git_dir, head_commit, short_hex, &head_subject) != 0) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         sg_index_free(&idx);
         return -1;
@@ -302,6 +408,9 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     snprintf(subj_buf, sizeof(subj_buf), "index on %s: %s %s", branch_display, short_hex, head_subject);
     if (sg_message_cleanup(subj_buf, &cleaned_index_msg) != 0) {
         free(head_subject);
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         sg_index_free(&idx);
         return -1;
@@ -312,11 +421,58 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
                                index_commit_id) != 0) {
         free(cleaned_index_msg);
         free(head_subject);
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         sg_index_free(&idx);
         return -1;
     }
     free(cleaned_index_msg);
+
+    /* untracked commit (parent 3): root commit (no parent of its own), tree
+       built from the untracked file list -- unconditionally, even when that
+       list is empty (spec sec 1.6), and its subject is ALWAYS the "untracked
+       files on" default form, never influenced by -m (spec sec 1.2), so it
+       is built here, before head_subject is freed below, rather than
+       alongside the stash's own (possibly -m-driven) subject. */
+    if (untracked_flag) {
+        unsigned char untracked_tree[SG_SHA1_RAW_LEN];
+
+        if (sg_tree_build_from_untracked(git_dir, repo_root, &idx, opts->include_ignored, untracked_tree,
+                                         NULL) != 0) {
+            free(head_subject);
+            for (i = 0; i < untracked_path_count; i++)
+                free(untracked_paths[i]);
+            free(untracked_paths);
+            free(branch);
+            sg_index_free(&idx);
+            return -1;
+        }
+        snprintf(subj_buf, sizeof(subj_buf), "untracked files on %s: %s %s", branch_display, short_hex,
+                head_subject);
+        if (sg_message_cleanup(subj_buf, &cleaned_untracked_msg) != 0) {
+            free(head_subject);
+            for (i = 0; i < untracked_path_count; i++)
+                free(untracked_paths[i]);
+            free(untracked_paths);
+            free(branch);
+            sg_index_free(&idx);
+            return -1;
+        }
+        if (build_and_write_commit(git_dir, untracked_tree, NULL, 0, cleaned_untracked_msg, name, email,
+                                   when, untracked_commit_id) != 0) {
+            free(cleaned_untracked_msg);
+            free(head_subject);
+            for (i = 0; i < untracked_path_count; i++)
+                free(untracked_paths[i]);
+            free(untracked_paths);
+            free(branch);
+            sg_index_free(&idx);
+            return -1;
+        }
+        free(cleaned_untracked_msg);
+    }
 
     /* stash commit's own subject -- also the reflog message. */
     if (message != NULL)
@@ -327,6 +483,9 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     head_subject = NULL;
 
     if (sg_message_cleanup(subj_buf, &cleaned_subject) != 0) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         sg_index_free(&idx);
         return -1;
@@ -334,9 +493,17 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
 
     memcpy(stash_parents[0], head_commit, SG_SHA1_RAW_LEN);
     memcpy(stash_parents[1], index_commit_id, SG_SHA1_RAW_LEN);
-    if (build_and_write_commit(git_dir, worktree_tree, stash_parents, 2, cleaned_subject, name, email, when,
-                               stash_commit_id) != 0) {
+    stash_parent_count = 2;
+    if (untracked_flag) {
+        memcpy(stash_parents[2], untracked_commit_id, SG_SHA1_RAW_LEN);
+        stash_parent_count = 3;
+    }
+    if (build_and_write_commit(git_dir, worktree_tree, stash_parents, stash_parent_count, cleaned_subject,
+                               name, email, when, stash_commit_id) != 0) {
         free(cleaned_subject);
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         sg_index_free(&idx);
         return -1;
@@ -348,6 +515,9 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
 
     if (sg_reflog_append(git_dir, "refs/stash", old_stash_id, stash_commit_id, subj_buf, &appended_at) !=
        0) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         sg_index_free(&idx);
         return -1;
@@ -355,6 +525,9 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
 
     if (sg_ref_write_path(git_dir, "refs/stash", stash_commit_id) != 0) {
         sg_reflog_truncate(git_dir, "refs/stash", appended_at);
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         sg_index_free(&idx);
         return -1;
@@ -367,6 +540,9 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
        claim "nothing was created" once the stash entry is already listed in
        `sg stash list`. */
     if (sg_snapshot_create(git_dir, repo_root, &idx, "stash push", NULL) != 0) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         sg_index_free(&idx);
         return -2;
@@ -374,6 +550,9 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     sg_index_free(&idx);
 
     if (sg_apply_tree_to_workdir(git_dir, repo_root, head_tree) != 0) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
         free(branch);
         return -2;
     }
@@ -397,10 +576,53 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
        spec). */
     if (opts->keep_index) {
         if (sg_apply_tree_to_workdir(git_dir, repo_root, index_tree) != 0) {
+            for (i = 0; i < untracked_path_count; i++)
+                free(untracked_paths[i]);
+            free(untracked_paths);
             free(branch);
             return -2;
         }
     }
+
+    /* Only after the working tree has settled into its final shape (HEAD's
+       tree, or the index tree too under --keep-index) do we take away the
+       untracked files that went into the third parent, and prune whatever
+       directories that leaves physically empty -- see sg_stash_push_opts's
+       header comment for why this does not re-consult ignore status for
+       FILES (it does still need it for deciding whether an already-empty
+       directory is itself ignored -- see prune_empty_untracked_dirs). The
+       ignore engine is opened BEFORE remove_untracked_files runs, not
+       after: .gitignore itself is frequently untracked (never committed),
+       so it is one of the paths remove_untracked_files can delete under -u.
+       Opening the engine first means it still reads the real .gitignore
+       content; opening it after would silently see an empty rule set (or a
+       stale/partial one) once .gitignore itself is gone, misjudging every
+       ignored-and-now-empty directory as not ignored -- exactly what real
+       git does NOT do (measured: real git still spares an ignored, empty
+       directory under -u even when .gitignore itself was untracked and got
+       stashed away by the same push). */
+    if (untracked_flag) {
+        sg_ignore *ig = NULL;
+        int ig_opened = (sg_ignore_open(&ig, git_dir, repo_root) == 0);
+
+        if (remove_untracked_files(repo_root, untracked_paths, untracked_path_count) != 0) {
+            if (ig_opened)
+                sg_ignore_free(ig);
+            for (i = 0; i < untracked_path_count; i++)
+                free(untracked_paths[i]);
+            free(untracked_paths);
+            free(branch);
+            return -2;
+        }
+        if (ig_opened) {
+            prune_empty_untracked_dirs(repo_root, "", ig, opts->include_ignored);
+            sg_ignore_free(ig);
+        }
+    }
+
+    for (i = 0; i < untracked_path_count; i++)
+        free(untracked_paths[i]);
+    free(untracked_paths);
 
     memcpy(commit_id_out, stash_commit_id, SG_SHA1_RAW_LEN);
     free(branch);
@@ -445,6 +667,47 @@ static int path_is_conflict(const sg_merge_result *result, const char *path)
     return 0;
 }
 
+/* Writes every entry in flat to disk under repo_root, chunk-aware, exactly
+   the way sg_apply_tree_to_workdir writes a tracked tree -- but these paths
+   are never staged (see sg_stash_apply's header comment: the untracked half
+   of a -u/-a stash is restored as untracked files, not index entries).
+   Returns 0, -1 on the first unreadable blob or write failure -- leaves
+   whatever was already written on disk, same no-rollback convention as
+   sg_apply_tree_to_workdir. The pre-flight collision check the caller runs
+   first means a failure here is a genuine I/O error, not a pre-existing
+   file at the target path. */
+static int restore_untracked_flat(const char *git_dir, const char *repo_root, const sg_flat_list *flat)
+{
+    size_t i;
+
+    for (i = 0; i < flat->count; i++) {
+        char abspath[4096];
+        unsigned char *blob_content;
+        size_t blob_len;
+        sg_chunk_missing_info missing;
+        int read_rc;
+
+        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, flat->entries[i].path);
+        read_rc = sg_chunk_read_blob(git_dir, flat->entries[i].sha1, &blob_content, &blob_len, &missing);
+        if (read_rc == -2) {
+            sg_chunk_print_missing_error(flat->entries[i].path, &missing);
+            return -1;
+        }
+        if (read_rc != 0) {
+            fprintf(stderr, "sg: missing blob for '%s'\n", flat->entries[i].path);
+            return -1;
+        }
+        if (sg_write_file_mkdirs(abspath, blob_content, blob_len, (int)(flat->entries[i].mode & 0777)) !=
+           0) {
+            fprintf(stderr, "sg: failed to write '%s'\n", flat->entries[i].path);
+            free(blob_content);
+            return -1;
+        }
+        free(blob_content);
+    }
+    return 0;
+}
+
 int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
 {
     sg_stash_list list;
@@ -456,14 +719,19 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
     unsigned char base_tree[SG_SHA1_RAW_LEN];
     unsigned char ours_tree[SG_SHA1_RAW_LEN];
     unsigned char theirs_tree[SG_SHA1_RAW_LEN];
+    unsigned char untracked_tree[SG_SHA1_RAW_LEN];
+    int has_untracked = 0;
     unsigned char head_commit_id[SG_SHA1_RAW_LEN];
     sg_merge_result result;
     sg_flat_list head_flat;
+    sg_flat_list untracked_flat;
     sg_index new_idx;
     char **conflict_paths = NULL;
     size_t conflict_count = 0;
     size_t i;
     int untracked_collision = 0;
+
+    memset(&untracked_flat, 0, sizeof(untracked_flat));
 
     if (sg_stash_list_read(git_dir, &list) != 0)
         return -1;
@@ -484,7 +752,7 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
     }
     free(content);
 
-    if (stash_commit.parent_count != 2) {
+    if (stash_commit.parent_count != 2 && stash_commit.parent_count != 3) {
         sg_commit_free(&stash_commit);
         return -1;
     }
@@ -494,6 +762,11 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
         return -1;
     }
     memcpy(theirs_tree, stash_commit.tree, SG_SHA1_RAW_LEN);
+    has_untracked = (stash_commit.parent_count == 3);
+    if (has_untracked && sg_commit_tree_of(git_dir, stash_commit.parents[2], untracked_tree) != 0) {
+        sg_commit_free(&stash_commit);
+        return -1;
+    }
     sg_commit_free(&stash_commit);
 
     if (sg_ref_resolve_head(git_dir, head_commit_id) != 0)
@@ -506,6 +779,12 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
         return -1;
 
     if (sg_tree_flatten(git_dir, ours_tree, &head_flat) != 0) {
+        sg_merge_result_free(&result);
+        return -1;
+    }
+
+    if (has_untracked && sg_tree_flatten(git_dir, untracked_tree, &untracked_flat) != 0) {
+        sg_flat_list_free(&head_flat);
         sg_merge_result_free(&result);
         return -1;
     }
@@ -527,7 +806,19 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
                 untracked_collision = 1;
         }
     }
+    /* Same pre-flight, extended to the untracked half (see sg_stash_apply's
+       header comment for why sg deliberately refuses the WHOLE apply here
+       instead of real git's partial-apply behavior). */
+    for (i = 0; i < untracked_flat.count && !untracked_collision; i++) {
+        char abspath[4096];
+        struct stat st;
+
+        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, untracked_flat.entries[i].path);
+        if (lstat(abspath, &st) == 0)
+            untracked_collision = 1;
+    }
     if (untracked_collision) {
+        sg_flat_list_free(&untracked_flat);
         sg_flat_list_free(&head_flat);
         sg_merge_result_free(&result);
         return -1;
@@ -538,6 +829,7 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
        or the index could not be built completely. */
     if (sg_merge_result_apply(git_dir, repo_root, &result, &new_idx, &conflict_paths, &conflict_count) !=
        0) {
+        sg_flat_list_free(&untracked_flat);
         sg_flat_list_free(&head_flat);
         sg_merge_result_free(&result);
         return -1;
@@ -560,6 +852,7 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
                             head_flat.entries[i].sha1) != 0) {
             size_t j;
 
+            sg_flat_list_free(&untracked_flat);
             sg_flat_list_free(&head_flat);
             sg_index_free(&new_idx);
             sg_merge_result_free(&result);
@@ -570,6 +863,20 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index)
         }
     }
     sg_flat_list_free(&head_flat);
+
+    /* Untracked half: written to disk, never staged (see sg_stash_apply's
+       header comment). The pre-flight collision check above already ruled
+       out a pre-existing file at any of these paths. */
+    if (has_untracked && restore_untracked_flat(git_dir, repo_root, &untracked_flat) != 0) {
+        sg_flat_list_free(&untracked_flat);
+        sg_index_free(&new_idx);
+        sg_merge_result_free(&result);
+        for (i = 0; i < conflict_count; i++)
+            free(conflict_paths[i]);
+        free(conflict_paths);
+        return -1;
+    }
+    sg_flat_list_free(&untracked_flat);
 
     if (sg_index_write(git_dir, &new_idx) != 0) {
         sg_index_free(&new_idx);
