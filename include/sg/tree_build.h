@@ -50,4 +50,15 @@ int sg_tree_build_from_index(const char *git_dir, const sg_index *idx,
 int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
                                unsigned char tree_id_out[SG_SHA1_RAW_LEN]);
 
+/* Builds a tree out of the working tree's untracked files (full relative
+   paths, not flattened basenames) -- see sg_status_list_untracked for what
+   counts as untracked and what include_ignored does. Every file's content is
+   hashed and written as a blob. file_count_out, if non-NULL, reports how
+   many files were included. No untracked files produces an empty tree and
+   reports 0, not an error. Returns 0 on success, -1 on failure. */
+int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
+                                 int include_ignored,
+                                 unsigned char tree_id_out[SG_SHA1_RAW_LEN],
+                                 size_t *file_count_out);
+
 #endif

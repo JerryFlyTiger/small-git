@@ -5,11 +5,13 @@
 #include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/repo.h"
+#include "sg/status.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define SG_TREE_DIR_MODE 040000
 #define SG_TREE_BUILD_PATH_MAX 4096
@@ -337,5 +339,79 @@ int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const
 
 out_free_entries:
     free(entries);
+    return rc;
+}
+
+int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
+                                 int include_ignored,
+                                 unsigned char tree_id_out[SG_SHA1_RAW_LEN],
+                                 size_t *file_count_out)
+{
+    char **paths = NULL;
+    size_t count = 0;
+    sg_flat_entry *entries = NULL;
+    size_t i;
+    int rc = -1;
+    int chunk_enabled = 0;
+    size_t chunk_threshold = SG_CHUNK_DEFAULT_THRESHOLD;
+
+    if (sg_status_list_untracked(git_dir, repo_root, idx, include_ignored, &paths, &count) != 0)
+        return -1;
+
+    if (file_count_out != NULL)
+        *file_count_out = count;
+
+    if (count > 0) {
+        entries = malloc(count * sizeof(*entries));
+        if (entries == NULL)
+            goto out_free_paths;
+    }
+
+    sg_repo_read_chunk_config(git_dir, &chunk_enabled, &chunk_threshold);
+
+    for (i = 0; i < count; i++) {
+        char abspath[SG_TREE_BUILD_PATH_MAX];
+        unsigned char *content = NULL;
+        size_t content_len = 0;
+        unsigned char blob_id[SG_SHA1_RAW_LEN];
+        struct stat st;
+        unsigned int mode = 0100644;
+
+        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, paths[i]);
+        if (stat(abspath, &st) == 0 && (st.st_mode & 0111))
+            mode = 0100755;
+
+        if (sg_read_file(abspath, &content, &content_len) != 0)
+            goto out_free_entries;
+
+        if (chunk_enabled) {
+            int chunked;
+
+            if (sg_chunk_store_blob(git_dir, content, content_len, chunk_threshold, blob_id,
+                                    &chunked) != 0) {
+                free(content);
+                goto out_free_entries;
+            }
+        } else {
+            if (sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, blob_id) != 0) {
+                free(content);
+                goto out_free_entries;
+            }
+        }
+        free(content);
+
+        entries[i].path = paths[i]; /* transient view, not owned here */
+        entries[i].mode = mode;
+        memcpy(entries[i].sha1, blob_id, SG_SHA1_RAW_LEN);
+    }
+
+    rc = sg_tree_build(git_dir, entries, count, tree_id_out);
+
+out_free_entries:
+    free(entries);
+out_free_paths:
+    for (i = 0; i < count; i++)
+        free(paths[i]);
+    free(paths);
     return rc;
 }
