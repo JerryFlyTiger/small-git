@@ -141,7 +141,7 @@ static void test_policies_differ_only_on_the_missing_path(void)
     CHECK(memcmp(keep_tree, del_tree, SG_SHA1_RAW_LEN) != 0,
          "the two policies produced the SAME tree -- the missing path was treated identically");
 
-    CHECK(sg_tree_flatten(git_dir, keep_tree, &keep_flat) == 0, "flatten KEEP_INDEX_BLOB tree");
+    CHECK(sg_tree_flatten(git_dir, keep_tree, &keep_flat, NULL) == 0, "flatten KEEP_INDEX_BLOB tree");
     CHECK(keep_flat.count == 2, "KEEP_INDEX_BLOB should cover both paths, got %zu",
           keep_flat.count);
     pos = flat_find(&keep_flat, "gone.txt");
@@ -155,7 +155,7 @@ static void test_policies_differ_only_on_the_missing_path(void)
         CHECK(memcmp(keep_flat.entries[pos].sha1, expected_kept, SG_SHA1_RAW_LEN) == 0,
              "kept.txt must hash the WORKING TREE content, not the staged blob");
 
-    CHECK(sg_tree_flatten(git_dir, del_tree, &del_flat) == 0, "flatten RECORD_DELETION tree");
+    CHECK(sg_tree_flatten(git_dir, del_tree, &del_flat, NULL) == 0, "flatten RECORD_DELETION tree");
     CHECK(del_flat.count == 1, "RECORD_DELETION should cover only the surviving path, got %zu",
           del_flat.count);
     CHECK(flat_find(&del_flat, "gone.txt") < 0,
@@ -197,7 +197,7 @@ static void test_record_deletion_can_build_the_empty_tree(void)
     CHECK(memcmp(tree_id, expected, SG_SHA1_RAW_LEN) == 0,
          "an all-deleted working tree must build git's empty tree");
 
-    CHECK(sg_tree_flatten(git_dir, tree_id, &flat) == 0, "flatten empty tree");
+    CHECK(sg_tree_flatten(git_dir, tree_id, &flat, NULL) == 0, "flatten empty tree");
     CHECK(flat.count == 0, "empty tree should flatten to 0 entries, got %zu", flat.count);
 
     sg_flat_list_free(&flat);

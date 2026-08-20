@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1276 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1299 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 39 個單元測試二進位,任一失敗即整體失敗
+make test                         # 40 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -27,7 +27,7 @@ python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
 
 - 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
   的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
-- `make test` 那行的 `N/39 個跑到`,N 少於 39 就是**中途中止**(Makefile 在第一
+- `make test` 那行的 `N/40 個跑到`,N 少於 40 就是**中途中止**(Makefile 在第一
   個失敗的二進位就停),不是「其他都過了」。
 - 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
 - interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
@@ -128,6 +128,20 @@ staging 的驗證。本機綠燈不是充分證據。**
   不可以靜默從 `sg status`/`sg diff` 掉一個檔案。刻意的例外只有兩處:
   `prune_empty_untracked_dirs` 保留自己的 inline 檢查(它的慣例是靜默跳過),
   以及 `git_dir` + 定長 hex 那類 buffer(風險輪廓不同,只用 `SG_PATH_MAX`)。
+- **不受信任的路徑一律過 `sg_path_component_is_safe` / `sg_relpath_is_safe`**
+  (`include/sg/workdir.h`,Phase 22)。它們擋 `""`/`.`/`..`/含 `/`,以及 `.git` 的
+  任何大小寫變體、尾綴 `.`/空白的形式、和折掉 HFS+ 忽略碼位後等於 `.git` 的名稱。
+  **守衛按「來源」放,不是按「危險動作」放**——三個來源各一道:tree 位元組
+  (`sg_tree_flatten`,回 `-2` 並填 `bad_path`)、index 條目(`apply.c` 的 `remove()`、
+  `cmd_restore.c` 的寫入)、argv(`cmd_add.c`)。刪掉任一道都有一組只有它擋得住的
+  輸入,所以不算冗餘防禦。
+  **不要把守衛下放到 `sg_write_file_mkdirs`/`sg_path_join`**:`storage/refs.c` 就是
+  拿前者把 ref 檔寫進 `.git/refs/`,在那裡擋 `.git` 會直接打死 ref 寫入。
+  **也不要上提到 `sg_tree_parse`**:真 git 的物件庫照收壞 tree、`cat-file -p` 讀得
+  出來,上提會讓 `sg cat-file -p` 沒辦法檢視壞物件。
+  ⚠ **走訪工作目錄時判斷「這是不是 gitdir」不可以用這支判準**,要用
+  `strcmp(name, ".git") == 0`:真 git 會把 `.git.` 列為未追蹤目錄,用判準去跳過會
+  讓 `sg status` **漏報**(Phase 22 實測)。
 - **刪掉一個已追蹤檔案之後要呼叫 `sg_prune_empty_parents`**
   (`include/sg/workdir.h`,Phase 21)。執行點只有兩個:`workdir/apply.c` 與
   `workdir/merge.c` 的 `remove()` 成功之後。⚠ 它**刻意不是 ignore-aware**,與
@@ -313,7 +327,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 39 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 40 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。

@@ -270,27 +270,126 @@ int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])
     return 0;
 }
 
-/* Whether relpath stays under the directory it is resolved against: not
-   absolute, and with no ".." component. Callers of sg_prune_empty_parents
-   pass a path that came from an index entry or a merge result, which
-   ultimately came out of a tree object -- and sg does not validate entry
-   names when it parses one. "Never above repo_root" therefore has to be
-   enforced here rather than assumed. Measured before this guard existed:
-   "../sibling/f.txt" rmdir'd a directory outside the repository, and "/f"
-   reached rmdir(repo_root) itself (which survives in a real repository only
-   because .git keeps it non-empty -- not because the code stopped). */
-static int relpath_is_confined(const char *relpath)
+static int ascii_tolower(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A' + 'a';
+    return c;
+}
+
+/* The code points real git ignores when deciding whether a name aliases
+   ".git" -- HFS+ folds them away, so ".g<U+200C>it" and ".git" can be the
+   same directory there. Measured against git 2.55.0 by feeding ".g<cp>it"
+   to git add: these sixteen are refused while U+200B, U+2060, U+00A0 and
+   U+3000 are accepted, so the set is specific and NOT "anything
+   invisible" -- do not widen it by intuition.
+
+   Matched as raw UTF-8 byte sequences rather than decoded: all sixteen are
+   three bytes, so a decoder would buy nothing here and would need its own
+   rules for malformed input, which this has no opinion about. Returns the
+   sequence's length, or 0 if p does not start with one. */
+static size_t ignorable_utf8_len(const unsigned char *p, size_t remaining)
+{
+    if (remaining < 3)
+        return 0;
+    /* U+200C..U+200F and U+202A..U+202E */
+    if (p[0] == 0xE2 && p[1] == 0x80 &&
+       ((p[2] >= 0x8C && p[2] <= 0x8F) || (p[2] >= 0xAA && p[2] <= 0xAE)))
+        return 3;
+    /* U+206A..U+206F */
+    if (p[0] == 0xE2 && p[1] == 0x81 && p[2] >= 0xAA && p[2] <= 0xAF)
+        return 3;
+    /* U+FEFF */
+    if (p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF)
+        return 3;
+    return 0;
+}
+
+/* Whether name aliases ".git" on some filesystem sg might be running on.
+   Two independent folds, both of which real git applies:
+
+     - a trailing run of '.' and ' ' is dropped, because a filesystem that
+       trims those on write (NTFS does) would let ".git." reach ".git";
+     - the ignorable code points above are dropped wherever they appear,
+       because HFS+ compares as if they were not there.
+
+   The trailing run is stripped first and includes ignorables, so
+   ".git.<U+200C>" and ".git<U+200C>." both fold to ".git" -- stripping only
+   one of the two kinds would leave the other as a way through. */
+static int aliases_dotgit(const char *name)
+{
+    const unsigned char *p = (const unsigned char *)name;
+    size_t len = strlen(name);
+    size_t i;
+    size_t matched = 0;
+    static const char want[] = ".git";
+
+    for (;;) {
+        if (len > 0 && (name[len - 1] == '.' || name[len - 1] == ' ')) {
+            len--;
+            continue;
+        }
+        if (len >= 3 && ignorable_utf8_len(p + len - 3, 3) == 3) {
+            len -= 3;
+            continue;
+        }
+        break;
+    }
+
+    i = 0;
+    while (i < len) {
+        size_t skip = ignorable_utf8_len(p + i, len - i);
+
+        if (skip > 0) {
+            i += skip;
+            continue;
+        }
+        if (matched == 4)
+            return 0; /* something beyond ".git" -- ".gitx", not an alias */
+        if (ascii_tolower(p[i]) != (unsigned char)want[matched])
+            return 0;
+        matched++;
+        i++;
+    }
+    return matched == 4;
+}
+
+int sg_path_component_is_safe(const char *name)
+{
+    if (name[0] == '\0')
+        return 0;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        return 0;
+    if (strchr(name, '/') != NULL)
+        return 0;
+    if (aliases_dotgit(name))
+        return 0;
+
+    return 1;
+}
+
+int sg_relpath_is_safe(const char *relpath)
 {
     const char *p = relpath;
+    size_t len = strlen(relpath);
 
-    if (p[0] == '/')
+    if (len == 0 || relpath[0] == '/' || relpath[len - 1] == '/')
         return 0;
     while (*p != '\0') {
-        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
-            return 0;
+        const char *start = p;
+        char comp[SG_PATH_MAX];
+        size_t comp_len;
+
         while (*p != '\0' && *p != '/')
             p++;
-        while (*p == '/')
+        comp_len = (size_t)(p - start);
+        if (comp_len == 0 || comp_len >= sizeof(comp))
+            return 0; /* empty component ("a//b"), or a single component too long to check */
+        memcpy(comp, start, comp_len);
+        comp[comp_len] = '\0';
+        if (!sg_path_component_is_safe(comp))
+            return 0;
+        if (*p == '/')
             p++;
     }
     return 1;
@@ -300,8 +399,9 @@ void sg_prune_empty_parents(const char *repo_root, const char *relpath)
 {
     char cur[SG_PATH_MAX];
 
-    if (!relpath_is_confined(relpath))
-        return; /* would resolve at or above repo_root -- never act on it */
+    if (!sg_relpath_is_safe(relpath))
+        return; /* would resolve at or above repo_root, or names a hostile
+                    component such as ".git" -- never act on it */
     if (strlen(relpath) >= sizeof(cur))
         return; /* truncated -- never act on a truncated path */
     strcpy(cur, relpath);

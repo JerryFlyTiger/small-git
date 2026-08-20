@@ -1013,7 +1013,7 @@ static void test_u_excludes_ignored_a_includes(void)
         read_commit(git_dir_u, untracked_id, &untracked);
         memcpy(tree_u, untracked.tree, SG_SHA1_RAW_LEN);
         sg_commit_free(&untracked);
-        CHECK(sg_tree_flatten(git_dir_u, tree_u, &flat_u) == 0, "flatten -u tree failed");
+        CHECK(sg_tree_flatten(git_dir_u, tree_u, &flat_u, NULL) == 0, "flatten -u tree failed");
         CHECK(flat_find(&flat_u, "take.txt") != NULL, "-u must include take.txt");
         CHECK(flat_find(&flat_u, "keep.log") == NULL, "-u must NOT include the ignored keep.log");
         sg_flat_list_free(&flat_u);
@@ -1026,7 +1026,7 @@ static void test_u_excludes_ignored_a_includes(void)
         read_commit(git_dir_a, untracked_id, &untracked);
         memcpy(tree_a, untracked.tree, SG_SHA1_RAW_LEN);
         sg_commit_free(&untracked);
-        CHECK(sg_tree_flatten(git_dir_a, tree_a, &flat_a) == 0, "flatten -a tree failed");
+        CHECK(sg_tree_flatten(git_dir_a, tree_a, &flat_a, NULL) == 0, "flatten -a tree failed");
         CHECK(flat_find(&flat_a, "take.txt") != NULL, "-a must include take.txt");
         CHECK(flat_find(&flat_a, "keep.log") != NULL, "-a MUST include the ignored keep.log too");
         sg_flat_list_free(&flat_a);

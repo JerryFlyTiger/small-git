@@ -49,6 +49,17 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
         fprintf(stderr, "sg: '%s' is not tracked in the index\n", arg);
         return -1;
     }
+    /* The index is not a trusted source of paths. An entry naming a ".git"
+       component can be sitting in .git/index right now -- an sg predating
+       the add-side guard staged such paths happily -- and finding it here
+       is not evidence that writing it is safe. Without this, `sg restore
+       .git/hooks/pre-commit` writes blob content straight into the real
+       gitdir, which is worse than the delete-side hole in apply.c: that one
+       only removes, this one writes attacker-chosen bytes. */
+    if (!sg_relpath_is_safe(rel)) {
+        fprintf(stderr, "sg: 路徑「%s」無效,拒絕還原\n", arg);
+        return -1;
+    }
     {
         sg_chunk_missing_info missing;
         int read_rc = sg_chunk_read_blob(git_dir, idx->entries[pos].sha1, &content, &content_len,
@@ -226,7 +237,7 @@ int sg_cmd_restore(int argc, char **argv)
             if (sg_object_read(git_dir, head_commit_id, &type, &content, &content_len) == 0 &&
                type == SG_OBJ_COMMIT) {
                 if (sg_commit_parse(content, content_len, &commit) == 0) {
-                    sg_tree_flatten(git_dir, commit.tree, &head_flat);
+                    sg_tree_flatten(git_dir, commit.tree, &head_flat, NULL);
                     sg_commit_free(&commit);
                 }
                 free(content);

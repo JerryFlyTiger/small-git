@@ -200,7 +200,16 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
-        /* never walk into a git dir, at any depth (no submodule support) */
+        /* Skip the gitdir itself. Only an exact ".git" is skipped, NOT
+           every name sg_path_component_is_safe would reject: real git
+           (2.55.0, measured) lists ".git." as an untracked directory and
+           refuses it only when adding, so folding this skip into the safety
+           predicate makes sg UNDER-REPORT a path git reports -- a status
+           listing quietly missing a file is the hardest kind of error to
+           notice. The gitdir sg creates is always literally ".git", so an
+           exact compare cannot miss it; anything else by that name is an
+           ordinary directory whose files must be listed, and refused later
+           at the point they would actually enter the index. */
         if (strcmp(ent->d_name, ".git") == 0)
             continue;
         if (count == cap) {
@@ -440,6 +449,21 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
     rel = sg_resolve_repo_path_allow_root(repo_root, arg);
     if (rel == NULL) {
         fprintf(stderr, "sg: '%s' is outside the repository\n", arg);
+        return -1;
+    }
+
+    /* rel == "" only when arg names the repo root itself (via
+       sg_resolve_repo_path_allow_root), which is not a path component and
+       has nothing to validate -- sg_relpath_is_safe would reject it. Every
+       other rel is a real repo-relative path and may contain a ".git"
+       component supplied by the user (e.g. "d/.git/evil"): measured against
+       real git, `git add d/.git/evil` silently no-ops rather than staging
+       it, but `sg add` is all-or-nothing (see the header comment on
+       sg_cmd_add below), so refusing outright and exiting 1 fits sg's
+       existing convention better than a silent per-argument skip. */
+    if (rel[0] != '\0' && !sg_relpath_is_safe(rel)) {
+        fprintf(stderr, "sg: 路徑「%s」無效,無法加入索引\n", rel);
+        free(rel);
         return -1;
     }
 

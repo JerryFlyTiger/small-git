@@ -126,7 +126,7 @@ static void test_create_uses_workdir_or_falls_back_to_index(void)
     CHECK(strcmp(commit.message, "test snapshot\n") == 0, "message mismatch: %s", commit.message);
     CHECK(commit.parent_count == 0, "brand new repo has no HEAD, snapshot should have no parent");
 
-    CHECK(sg_tree_flatten(git_dir, commit.tree, &flat) == 0, "flatten snapshot tree failed");
+    CHECK(sg_tree_flatten(git_dir, commit.tree, &flat, NULL) == 0, "flatten snapshot tree failed");
     CHECK(flat.count == 2, "expected 2 entries, got %zu", flat.count);
 
     a_pos = flat_find(&flat, "a.txt");

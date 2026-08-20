@@ -192,7 +192,7 @@ int sg_cmd_status(int argc, char **argv)
         if (sg_object_read(git_dir, head_commit_id, &type, &content, &content_len) == 0 &&
            type == SG_OBJ_COMMIT) {
             if (sg_commit_parse(content, content_len, &commit) == 0) {
-                sg_tree_flatten(git_dir, commit.tree, &head_flat);
+                sg_tree_flatten(git_dir, commit.tree, &head_flat, NULL);
                 sg_commit_free(&commit);
             }
             free(content);
