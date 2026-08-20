@@ -317,6 +317,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
     size_t cap = 0;
     size_t i;
     int rc = 0;
+    int oom = 0;
 
     for (i = 0; i < idx->count; i++) {
         const sg_index_entry *e = &idx->entries[i];
@@ -343,6 +344,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
             char **grown = realloc(gone, new_cap * sizeof(*grown));
 
             if (grown == NULL) {
+                oom = 1;
                 rc = -1;
                 break;
             }
@@ -351,6 +353,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
         }
         copy = strdup(e->path);
         if (copy == NULL) {
+            oom = 1;
             rc = -1;
             break;
         }
@@ -360,7 +363,10 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
     if (rc == 0) {
         for (i = 0; i < count; i++)
             sg_index_remove(idx, gone[i]);
-    } else {
+    } else if (oom) {
+        /* Only the allocation failures get this message. The path-too-long
+           bail above has already said what went wrong, and following it with
+           "out of memory" would contradict it. */
         fprintf(stderr, "sg: 記憶體不足，無法暫存刪除的檔案\n");
     }
 
