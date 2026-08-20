@@ -1143,6 +1143,21 @@ the repository root; unlike the untracked sweep below, this ignores
 entirely \(em a now-empty directory goes even if it is ignored, matching
 real git 2.55.0.
 .PP
+A path whose name would resolve inside the repository's own
+.B .git
+directory is refused wherever it could reach the filesystem \(em checking
+out a commit that carries such a tree entry, adding one, or restoring one
+from the index. The comparison covers case variants and the trailing-dot
+and trailing-space forms, and names that differ from
+.B .git
+only by code points a case-folding filesystem ignores. Ordinary names that
+merely resemble it, such as
+.BR .gitignore ,
+.B .gitmodules
+or
+.BR git~1 ,
+are unaffected.
+.PP
 By default untracked files are never stashed and are left untouched.
 .B -u
 (or
