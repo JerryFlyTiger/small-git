@@ -24,9 +24,18 @@ int sg_tree_build(const char *git_dir, const sg_flat_entry *entries, size_t coun
                   unsigned char tree_id_out[SG_SHA1_RAW_LEN]);
 
 /* Recursively expands tree_id into a flat, path-sorted list of blob entries
-   (subdirectories are walked into but not themselves present in the output). */
+   (subdirectories are walked into but not themselves present in the output).
+   Returns 0 on success, -1 if an object is missing or corrupt, -2 if some
+   entry name in the tree fails sg_path_component_is_safe -- e.g. a crafted
+   or foreign commit naming an entry ".git". The two are kept apart on
+   purpose: -1 means "this repository is broken", -2 means "this tree is
+   hostile"; reporting the former's message for the latter would describe a
+   thwarted attack as data corruption. -2 is still non-zero, so every
+   existing "!= 0" caller stays fail-closed without changes.
+   If bad_path is non-NULL and the call returns -2, the offending
+   repo-relative path is copied into it (needs SG_PATH_MAX bytes). */
 int sg_tree_flatten(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW_LEN],
-                    sg_flat_list *out);
+                    sg_flat_list *out, char *bad_path);
 
 void sg_flat_list_free(sg_flat_list *list);
 

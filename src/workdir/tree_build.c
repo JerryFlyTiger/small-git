@@ -148,24 +148,8 @@ static int flatten_append(sg_flat_list *out, size_t *cap, const char *path, unsi
     return 0;
 }
 
-/* A tree object's entry names come straight from object content, which may
-   originate from a crafted/foreign commit (not just sg's own tree builder).
-   Without this check, an entry named e.g. "../../../tmp/evil" would let
-   `sg switch`/`sg restore` write outside the repository via the full_path
-   built below. */
-static int entry_name_is_safe(const char *name)
-{
-    if (name[0] == '\0')
-        return 0;
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-        return 0;
-    if (strchr(name, '/') != NULL)
-        return 0;
-    return 1;
-}
-
 static int flatten_into(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW_LEN],
-                        const char *prefix, sg_flat_list *out, size_t *cap)
+                        const char *prefix, sg_flat_list *out, size_t *cap, char *bad_path)
 {
     sg_obj_type type;
     unsigned char *content;
@@ -189,8 +173,35 @@ static int flatten_into(const char *git_dir, const unsigned char tree_id[SG_SHA1
         size_t prefix_len = strlen(prefix);
         size_t name_len = strlen(e->name);
 
-        if (!entry_name_is_safe(e->name)) {
-            rc = -1;
+        /* A tree object's entry names come straight from object content,
+           which may originate from a crafted/foreign commit (not just sg's
+           own tree builder). Without this check, an entry named ".git"
+           would let `sg switch`/`sg reset --hard` write into the
+           repository's own .git directory via the full_path built below
+           (measured against real git 2.55.0: it refuses the same tree at
+           read-tree time). See sg_path_component_is_safe for exactly what
+           it rejects and why. */
+        if (!sg_path_component_is_safe(e->name)) {
+            if (bad_path != NULL) {
+                if (prefix_len > 0)
+                    snprintf(bad_path, SG_PATH_MAX, "%s/%s", prefix, e->name);
+                else
+                    snprintf(bad_path, SG_PATH_MAX, "%s", e->name);
+            }
+            rc = -2;
+            break;
+        }
+
+        /* flatten_into recurses one stack frame per directory level with no
+           depth limit of its own; bounding path length here also bounds
+           recursion depth to roughly SG_PATH_MAX / 2 (the shortest possible
+           non-root component is "x/"), and any path this long would fail
+           the sg_path_join callers below anyway -- better to refuse it here
+           than after exhausting the stack. */
+        if (prefix_len + name_len + 1 >= SG_PATH_MAX) {
+            if (bad_path != NULL)
+                snprintf(bad_path, SG_PATH_MAX, "%s", prefix_len > 0 ? prefix : e->name);
+            rc = -2;
             break;
         }
 
@@ -208,7 +219,7 @@ static int flatten_into(const char *git_dir, const unsigned char tree_id[SG_SHA1
         }
 
         if (e->mode == SG_TREE_DIR_MODE)
-            rc = flatten_into(git_dir, e->sha1, full_path, out, cap);
+            rc = flatten_into(git_dir, e->sha1, full_path, out, cap, bad_path);
         else
             rc = flatten_append(out, cap, full_path, e->mode, e->sha1);
 
@@ -219,15 +230,18 @@ static int flatten_into(const char *git_dir, const unsigned char tree_id[SG_SHA1
     return rc;
 }
 
-int sg_tree_flatten(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW_LEN], sg_flat_list *out)
+int sg_tree_flatten(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW_LEN], sg_flat_list *out,
+                    char *bad_path)
 {
     size_t cap = 0;
+    int rc;
 
     out->entries = NULL;
     out->count = 0;
-    if (flatten_into(git_dir, tree_id, "", out, &cap) != 0) {
+    rc = flatten_into(git_dir, tree_id, "", out, &cap, bad_path);
+    if (rc != 0) {
         sg_flat_list_free(out);
-        return -1;
+        return rc;
     }
     return 0;
 }

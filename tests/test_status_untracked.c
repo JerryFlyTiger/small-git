@@ -286,7 +286,7 @@ static void test_tree_build_from_untracked_nonempty(void)
          "tree build from untracked (nonempty) failed");
     CHECK(file_count == 2, "expected file_count 2, got %zu", file_count);
 
-    CHECK(sg_tree_flatten(git_dir, tree_id, &flat) == 0, "flatten failed");
+    CHECK(sg_tree_flatten(git_dir, tree_id, &flat, NULL) == 0, "flatten failed");
     CHECK(flat.count == 2, "expected 2 flattened entries, got %zu", flat.count);
     if (flat.count == 2) {
         CHECK(strcmp(flat.entries[0].path, "sub/inner.txt") == 0, "flat[0] path %s",

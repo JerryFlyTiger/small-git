@@ -7963,6 +7963,137 @@ check "phase21 divergence: sg says why on stderr (got '$P21_D5_OUT')" \
 check "phase21 divergence: the refusal left the stash in place" \
     sh -c "[ \"\$(cd '$P21_D5' && '$SG' stash list | wc -l | tr -d ' ')\" = 1 ]"
 
+# ============================================================
+# Phase 22: a tree entry named .git cannot write into the gitdir
+#
+# entry_name_is_safe has refused "", ".", ".." and any name containing '/'
+# since Phase 2, so path traversal was already closed. ".git" slipped
+# between those three rules: no slash, not "." and not "..". Measured before
+# the fix: a commit whose tree carried a ".git" subtree made
+# `sg reset --hard` exit 0 while writing .git/hacked.txt: HEAD, config and
+# refs/* are all writable that way, from any commit a remote can serve.
+#
+# The trees here are assembled byte by byte with git hash-object
+# --literally, because neither git write-tree nor sg can produce one: real
+# git refuses such a path on the way in as well as on the way out, which is
+# the whole reason this is a hostile-input test and not a round-trip test.
+# ============================================================
+
+p22_evil_fixture() {
+    # $1 = dir, $2 = "sg" or "git". Leaves refs/heads/evil pointing at a
+    # commit whose tree holds { ".git"/ -> { hacked.txt }, normal.txt }.
+    _dir="$1"; _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = sg ]; then
+        (cd "$WORKDIR" && "$SG" init "$(basename "$_dir")") > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && git init -q "$(basename "$_dir")")
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'ok\n' > "$_dir/normal.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add normal.txt && "$SG" commit -m base) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add normal.txt && git commit -q -m base)
+    fi
+    _blob=$(cd "$_dir" && printf 'PWNED\n' | git hash-object -w --stdin)
+    _norm=$(cd "$_dir" && printf 'ok\n' | git hash-object -w --stdin)
+    python3 -c "
+import sys,binascii
+sys.stdout.buffer.write(b'100644 hacked.txt\x00'+binascii.unhexlify('$_blob'))" > "$_dir/.inner.bin"
+    _inner=$(cd "$_dir" && git hash-object -t tree -w --stdin --literally < .inner.bin)
+    python3 -c "
+import sys,binascii
+sys.stdout.buffer.write(b'40000 .git\x00'+binascii.unhexlify('$_inner'))
+sys.stdout.buffer.write(b'100644 normal.txt\x00'+binascii.unhexlify('$_norm'))" > "$_dir/.outer.bin"
+    _outer=$(cd "$_dir" && git hash-object -t tree -w --stdin --literally < .outer.bin)
+    rm -f "$_dir/.inner.bin" "$_dir/.outer.bin"
+    _evil=$(cd "$_dir" && git commit-tree "$_outer" -m evil)
+    (cd "$_dir" && git update-ref refs/heads/evil "$_evil")
+}
+
+# --- E1: oracle -- real git refuses the same commit ---
+P22_EVIL_GIT="$WORKDIR/p22_evil_git"
+p22_evil_fixture "$P22_EVIL_GIT" git
+P22_EVIL_GIT_ERR=$( (cd "$P22_EVIL_GIT" && git reset --hard evil) 2>&1 >/dev/null )
+check "phase22 oracle: real git leaves the gitdir alone" \
+    test ! -e "$P22_EVIL_GIT/.git/hacked.txt"
+check "phase22 oracle: precondition -- real git says the path is invalid (got '$P22_EVIL_GIT_ERR')" \
+    sh -c "printf '%s' \"$P22_EVIL_GIT_ERR\" | grep -q '.git/hacked.txt'"
+
+# --- E2: sg must refuse it too, on every command that applies a tree ---
+for p22_cmd in reset switch; do
+    P22_EVIL_SG="$WORKDIR/p22_evil_sg_$p22_cmd"
+    p22_evil_fixture "$P22_EVIL_SG" sg
+    if [ "$p22_cmd" = reset ]; then
+        P22_ERR=$( (cd "$P22_EVIL_SG" && "$SG" reset --hard evil) 2>&1 >/dev/null )
+    else
+        P22_ERR=$( (cd "$P22_EVIL_SG" && "$SG" switch evil) 2>&1 >/dev/null )
+    fi
+    P22_RC=$?
+    check "phase22: sg $p22_cmd refuses the hostile tree (exit $P22_RC)" test "$P22_RC" != 0
+    check "phase22: sg $p22_cmd writes nothing into the gitdir" \
+        test ! -e "$P22_EVIL_SG/.git/hacked.txt"
+    check "phase22: sg $p22_cmd says why on stderr (got '$P22_ERR')" \
+        sh -c "[ -n \"$P22_ERR\" ]"
+    check "phase22: sg $p22_cmd names the offending path, not just 'corrupt'" \
+        sh -c "printf '%s' \"$P22_ERR\" | grep -q '\.git'"
+    check "phase22: the refusal left the working tree on the original commit" \
+        test -f "$P22_EVIL_SG/normal.txt"
+done
+
+# --- E3: the write side -- sg must not be able to CREATE such a tree.
+# Real git ignores the path silently and exits 0; sg reports and exits 1.
+# The disk outcome is identical, only the exit code differs, and that is a
+# deliberate divergence: sg add is all-or-nothing. Asserted rather than
+# worked around. ---
+P22_ADD_GIT="$WORKDIR/p22_add_git"
+(cd "$WORKDIR" && git init -q p22_add_git)
+(cd "$P22_ADD_GIT" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P22_ADD_GIT/d/.git"
+printf 'EVIL\n' > "$P22_ADD_GIT/d/.git/evil"
+printf 'ok\n' > "$P22_ADD_GIT/normal.txt"
+(cd "$P22_ADD_GIT" && git add d/.git/evil) > /dev/null 2>&1
+check "phase22 oracle: real git stages nothing for a .git path" \
+    sh -c "! (cd '$P22_ADD_GIT' && git ls-files) | grep -q '\.git/evil'"
+
+P22_ADD_SG="$WORKDIR/p22_add_sg"
+(cd "$WORKDIR" && "$SG" init p22_add_sg) > /dev/null 2>&1
+(cd "$P22_ADD_SG" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P22_ADD_SG/d/.git"
+printf 'EVIL\n' > "$P22_ADD_SG/d/.git/evil"
+printf 'ok\n' > "$P22_ADD_SG/normal.txt"
+P22_ADD_ERR=$( (cd "$P22_ADD_SG" && "$SG" add d/.git/evil) 2>&1 >/dev/null )
+P22_ADD_RC=$?
+check "phase22: sg add refuses a .git path (exit $P22_ADD_RC -- deliberate divergence, git exits 0)" \
+    test "$P22_ADD_RC" != 0
+check "phase22: sg add stages nothing for it, same disk outcome as real git" \
+    sh -c "! (cd '$P22_ADD_SG' && git ls-files) | grep -q '\.git/evil'"
+check "phase22: sg add says why on stderr (got '$P22_ADD_ERR')" \
+    sh -c "[ -n \"$P22_ADD_ERR\" ]"
+
+# --- E4: the rule must not be over-broad. These names all merely start with
+# or contain ".git" or dots and are perfectly ordinary; a prefix or substring
+# comparison would reject them and this is the only thing checking for that. ---
+P22_OK="$WORKDIR/p22_ok"
+(cd "$WORKDIR" && "$SG" init p22_ok) > /dev/null 2>&1
+(cd "$P22_OK" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'ign\n' > "$P22_OK/.gitignore"
+printf 'mod\n' > "$P22_OK/.gitmodules"
+printf 'a\n' > "$P22_OK/..a"
+printf 'b\n' > "$P22_OK/a.."
+printf 'c\n' > "$P22_OK/git~1"
+mkdir -p "$P22_OK/.github/workflows"
+printf 'w\n' > "$P22_OK/.github/workflows/ci.yml"
+(cd "$P22_OK" && "$SG" add . && "$SG" commit -m ok) > /dev/null 2>&1
+check "phase22: ordinary names that merely resemble .git are still accepted" test $? = 0
+P22_OK_FILES=$(cd "$P22_OK" && git ls-files | sort | tr '\n' ' ')
+check "phase22: all six are tracked (got '$P22_OK_FILES')" \
+    sh -c "[ \"\$(cd '$P22_OK' && git ls-files | wc -l | tr -d ' ')\" = 6 ]"
+(cd "$P22_OK" && "$SG" switch -c other && "$SG" switch master) > /dev/null 2>&1
+check "phase22: and a tree holding them still checks out" \
+    sh -c "[ -f '$P22_OK/.gitignore' ] && [ -f '$P22_OK/.github/workflows/ci.yml' ] && [ -f '$P22_OK/git~1' ]"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

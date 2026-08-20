@@ -97,7 +97,7 @@ static void test_build_matches_known_hash(void)
         free(content);
     }
 
-    CHECK(sg_tree_flatten(git_dir, tree_id, &flat) == 0, "flatten failed");
+    CHECK(sg_tree_flatten(git_dir, tree_id, &flat, NULL) == 0, "flatten failed");
     CHECK(flat.count == 3, "expected 3 flattened entries, got %zu", flat.count);
     if (flat.count == 3) {
         CHECK(strcmp(flat.entries[0].path, "a.txt") == 0, "flat[0] path %s", flat.entries[0].path);

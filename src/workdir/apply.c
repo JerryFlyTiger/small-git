@@ -43,10 +43,17 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
     sg_flat_list target_flat;
     sg_index old_idx;
     sg_index new_idx;
+    char bad_path[SG_PATH_MAX];
     size_t i;
     int rc = 0;
+    int flatten_rc;
 
-    if (sg_tree_flatten(git_dir, tree_id, &target_flat) != 0) {
+    flatten_rc = sg_tree_flatten(git_dir, tree_id, &target_flat, bad_path);
+    if (flatten_rc == -2) {
+        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        return -1;
+    }
+    if (flatten_rc != 0) {
         fprintf(stderr, "sg: failed to read target tree\n");
         return -1;
     }
@@ -67,6 +74,19 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         if (flat_find(&target_flat, old_idx.entries[i].path) < 0) {
             char abspath[SG_PATH_MAX];
 
+            /* The index entry being removed here did not necessarily come
+               through sg_tree_flatten's own guard above: it may have been
+               written by an sg build that predates this check (or by `sg
+               add`, before Phase 22's cmd_add guard existed), and that
+               guard does not retroactively clean up what is already on
+               disk. Without this, a path like "../victim.txt" or ".git/x"
+               left in the index by an old bug would still reach remove()
+               here even after the tree-side hole is closed. */
+            if (!sg_relpath_is_safe(old_idx.entries[i].path)) {
+                fprintf(stderr, "sg: index 裡的路徑「%s」無效,拒絕刪除\n", old_idx.entries[i].path);
+                rc = -1;
+                continue;
+            }
             if (sg_path_join(abspath, sizeof(abspath), repo_root, old_idx.entries[i].path) != 0) {
                 fprintf(stderr, "sg: 路徑過長,無法刪除 '%s'\n", old_idx.entries[i].path);
                 rc = -1;
@@ -161,10 +181,17 @@ int sg_index_reset_to_tree(const char *git_dir, const unsigned char tree_id[SG_S
     sg_flat_list target_flat;
     sg_index old_idx;
     sg_index new_idx;
+    char bad_path[SG_PATH_MAX];
     size_t i;
     int rc = 0;
+    int flatten_rc;
 
-    if (sg_tree_flatten(git_dir, tree_id, &target_flat) != 0) {
+    flatten_rc = sg_tree_flatten(git_dir, tree_id, &target_flat, bad_path);
+    if (flatten_rc == -2) {
+        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        return -1;
+    }
+    if (flatten_rc != 0) {
         fprintf(stderr, "sg: failed to read target tree\n");
         return -1;
     }
@@ -274,7 +301,7 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
         if (sg_object_read(git_dir, head_id, &type, &content, &content_len) == 0 &&
            type == SG_OBJ_COMMIT) {
             if (sg_commit_parse(content, content_len, &commit) == 0) {
-                sg_tree_flatten(git_dir, commit.tree, &head_flat);
+                sg_tree_flatten(git_dir, commit.tree, &head_flat, NULL);
                 sg_commit_free(&commit);
             }
             free(content);
@@ -401,7 +428,7 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
         unsigned char tree_id[SG_SHA1_RAW_LEN];
 
         if (sg_commit_tree_of(git_dir, head_id, tree_id) == 0)
-            sg_tree_flatten(git_dir, tree_id, &head_flat);
+            sg_tree_flatten(git_dir, tree_id, &head_flat, NULL);
     }
 
     staged_ok = sg_status_diff_staged(&head_flat, &idx, &staged) == 0;

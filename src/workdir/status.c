@@ -207,8 +207,11 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
             continue;
         /* skip any git dir at ANY depth, not just the top level: there is no
            submodule support, and an embedded repo's metadata must never be
-           walked or reported */
-        if (strcmp(ent->d_name, ".git") == 0)
+           walked or reported. sg_path_component_is_safe's ".git" fold is
+           case-insensitive on purpose: on the default case-insensitive
+           macOS filesystem, a directory actually named ".GIT" names the
+           very same gitdir a plain strcmp would have missed. */
+        if (!sg_path_component_is_safe(ent->d_name))
             continue;
 
         /* Never act on a truncated path: it usually still names a real

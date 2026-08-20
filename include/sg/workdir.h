@@ -71,4 +71,37 @@ int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])
    design -- do not "unify" them. */
 void sg_prune_empty_parents(const char *repo_root, const char *relpath);
 
+/* Whether a single path component -- a tree entry name, or one
+   slash-separated piece of a repo-relative path -- may be turned into a
+   working-tree path. Returns 1 if safe, 0 if not.
+
+   Rejects: "", ".", "..", anything containing '/', and any case variant of
+   ".git" including the trailing-'.'-or-space forms (".GIT", ".git.",
+   ".git ") -- on a case-insensitive filesystem (the macOS default) ".GIT"
+   names the very same directory, and real git refuses ".git." / ".git " on
+   every platform, so accepting them would only ever produce a repository
+   real git cannot check out.
+
+   The case fold is ASCII-only and deliberately not strcasecmp: strcasecmp
+   is locale-dependent and does not fold 'I' to 'i' under a Turkish locale,
+   which would let ".GIT" through on exactly the filesystem this rule exists
+   for.
+
+   Accepts ".gitignore", ".gitmodules", "..a", "a.." -- the comparison is on
+   the whole component, never a prefix or substring match. Control characters
+   are accepted: real git accepts them in tree entries and defends at the
+   display layer instead (measured; core.quotePath does NOT turn that off).
+
+   NOT applied when sg parses a tree object: like git, sg can read and print
+   a hostile tree (`sg cat-file -p`), it just refuses to turn one into
+   files. */
+int sg_path_component_is_safe(const char *name);
+
+/* Whether an already-assembled repo-relative path may be turned into a
+   working-tree path: non-empty, not absolute, no empty component ("a//b",
+   "a/"), and every component passes sg_path_component_is_safe.
+   For the two sources that arrive assembled rather than one component at a
+   time -- .git/index entries and command-line arguments. */
+int sg_relpath_is_safe(const char *relpath);
+
 #endif

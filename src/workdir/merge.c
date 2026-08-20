@@ -717,19 +717,39 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
     size_t bi = 0, oi = 0, ti = 0;
     size_t cap = 0;
     int rc = 0;
+    char bad_path[SG_PATH_MAX];
+    int flatten_rc;
 
     memset(out, 0, sizeof(*out));
     memset(&base_flat, 0, sizeof(base_flat));
     memset(&ours_flat, 0, sizeof(ours_flat));
     memset(&theirs_flat, 0, sizeof(theirs_flat));
 
-    if (sg_tree_flatten(git_dir, base_tree, &base_flat) != 0)
+    flatten_rc = sg_tree_flatten(git_dir, base_tree, &base_flat, bad_path);
+    if (flatten_rc == -2) {
+        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
         return -1;
-    if (sg_tree_flatten(git_dir, ours_tree, &ours_flat) != 0) {
+    }
+    if (flatten_rc != 0)
+        return -1;
+    flatten_rc = sg_tree_flatten(git_dir, ours_tree, &ours_flat, bad_path);
+    if (flatten_rc == -2) {
+        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
         sg_flat_list_free(&base_flat);
         return -1;
     }
-    if (sg_tree_flatten(git_dir, theirs_tree, &theirs_flat) != 0) {
+    if (flatten_rc != 0) {
+        sg_flat_list_free(&base_flat);
+        return -1;
+    }
+    flatten_rc = sg_tree_flatten(git_dir, theirs_tree, &theirs_flat, bad_path);
+    if (flatten_rc == -2) {
+        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        sg_flat_list_free(&base_flat);
+        sg_flat_list_free(&ours_flat);
+        return -1;
+    }
+    if (flatten_rc != 0) {
         sg_flat_list_free(&base_flat);
         sg_flat_list_free(&ours_flat);
         return -1;

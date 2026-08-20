@@ -883,9 +883,16 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
                        "Stashed changes", &result) != 0)
         return -1;
 
-    if (sg_tree_flatten(git_dir, ours_tree, &head_flat) != 0) {
-        sg_merge_result_free(&result);
-        return -1;
+    {
+        char bad_path[SG_PATH_MAX];
+        int flatten_rc = sg_tree_flatten(git_dir, ours_tree, &head_flat, bad_path);
+
+        if (flatten_rc == -2)
+            fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        if (flatten_rc != 0) {
+            sg_merge_result_free(&result);
+            return -1;
+        }
     }
 
     if (sg_index_read(git_dir, &idx) != 0) {
@@ -1012,15 +1019,29 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
                        &result) != 0)
         return -1;
 
-    if (sg_tree_flatten(git_dir, ours_tree, &head_flat) != 0) {
-        sg_merge_result_free(&result);
-        return -1;
+    {
+        char bad_path[SG_PATH_MAX];
+        int flatten_rc = sg_tree_flatten(git_dir, ours_tree, &head_flat, bad_path);
+
+        if (flatten_rc == -2)
+            fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        if (flatten_rc != 0) {
+            sg_merge_result_free(&result);
+            return -1;
+        }
     }
 
-    if (has_untracked && sg_tree_flatten(git_dir, untracked_tree, &untracked_flat) != 0) {
-        sg_flat_list_free(&head_flat);
-        sg_merge_result_free(&result);
-        return -1;
+    if (has_untracked) {
+        char bad_path[SG_PATH_MAX];
+        int flatten_rc = sg_tree_flatten(git_dir, untracked_tree, &untracked_flat, bad_path);
+
+        if (flatten_rc == -2)
+            fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        if (flatten_rc != 0) {
+            sg_flat_list_free(&head_flat);
+            sg_merge_result_free(&result);
+            return -1;
+        }
     }
 
     /* Pre-flight: a merge-result path missing from HEAD must not already

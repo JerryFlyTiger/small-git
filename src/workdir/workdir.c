@@ -270,27 +270,62 @@ int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])
     return 0;
 }
 
-/* Whether relpath stays under the directory it is resolved against: not
-   absolute, and with no ".." component. Callers of sg_prune_empty_parents
-   pass a path that came from an index entry or a merge result, which
-   ultimately came out of a tree object -- and sg does not validate entry
-   names when it parses one. "Never above repo_root" therefore has to be
-   enforced here rather than assumed. Measured before this guard existed:
-   "../sibling/f.txt" rmdir'd a directory outside the repository, and "/f"
-   reached rmdir(repo_root) itself (which survives in a real repository only
-   because .git keeps it non-empty -- not because the code stopped). */
-static int relpath_is_confined(const char *relpath)
+static int ascii_tolower(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A' + 'a';
+    return c;
+}
+
+int sg_path_component_is_safe(const char *name)
+{
+    size_t len;
+    size_t end;
+
+    if (name[0] == '\0')
+        return 0;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        return 0;
+    if (strchr(name, '/') != NULL)
+        return 0;
+
+    /* Strip any trailing run of '.' and ' ' before comparing to ".git":
+       real git refuses ".git." and ".git " too (measured, every platform),
+       since a filesystem that trims those characters on write -- NTFS does
+       -- would otherwise let them alias the real ".git" directory. */
+    len = strlen(name);
+    end = len;
+    while (end > 0 && (name[end - 1] == '.' || name[end - 1] == ' '))
+        end--;
+    if (end == 4 && name[0] == '.' && ascii_tolower((unsigned char)name[1]) == 'g' &&
+       ascii_tolower((unsigned char)name[2]) == 'i' && ascii_tolower((unsigned char)name[3]) == 't')
+        return 0;
+
+    return 1;
+}
+
+int sg_relpath_is_safe(const char *relpath)
 {
     const char *p = relpath;
+    size_t len = strlen(relpath);
 
-    if (p[0] == '/')
+    if (len == 0 || relpath[0] == '/' || relpath[len - 1] == '/')
         return 0;
     while (*p != '\0') {
-        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
-            return 0;
+        const char *start = p;
+        char comp[SG_PATH_MAX];
+        size_t comp_len;
+
         while (*p != '\0' && *p != '/')
             p++;
-        while (*p == '/')
+        comp_len = (size_t)(p - start);
+        if (comp_len == 0 || comp_len >= sizeof(comp))
+            return 0; /* empty component ("a//b"), or a single component too long to check */
+        memcpy(comp, start, comp_len);
+        comp[comp_len] = '\0';
+        if (!sg_path_component_is_safe(comp))
+            return 0;
+        if (*p == '/')
             p++;
     }
     return 1;
@@ -300,8 +335,9 @@ void sg_prune_empty_parents(const char *repo_root, const char *relpath)
 {
     char cur[SG_PATH_MAX];
 
-    if (!relpath_is_confined(relpath))
-        return; /* would resolve at or above repo_root -- never act on it */
+    if (!sg_relpath_is_safe(relpath))
+        return; /* would resolve at or above repo_root, or names a hostile
+                    component such as ".git" -- never act on it */
     if (strlen(relpath) >= sizeof(cur))
         return; /* truncated -- never act on a truncated path */
     strcpy(cur, relpath);
