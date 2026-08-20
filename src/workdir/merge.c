@@ -830,11 +830,17 @@ static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *
     sg_index_entry entry;
 
     memset(&entry, 0, sizeof(entry));
-    /* A truncated path here must fail this entry outright, not just skip
-       the stat below with zeroed fields: the caller (sg_merge_result_apply)
-       treats a non-zero return the same as an sg_index_upsert failure and
-       aborts the whole apply rather than handing back an index silently
-       missing this path or carrying bogus stat data for it. */
+    /* sg_merge_result_apply already ran this exact join, with the same
+       repo_root and path, at the top of the loop that calls us, so from that
+       (currently only) call site this check is unreachable: the observable
+       defence is the caller's, and a mutation aimed at truncation handling
+       has to be planted there, not here -- a redundant guard hides the
+       verification point. It stays because the alternative is an unchecked
+       join, and because if this static ever grows a second caller the right
+       behaviour is the one below: fail the entry outright rather than stat a
+       wrong path and hand back an index carrying bogus data for it. The
+       caller treats a non-zero return like an sg_index_upsert failure and
+       aborts the whole apply. */
     if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0) {
         fprintf(stderr, "sg: 路徑過長,無法解析 '%s'\n", path);
         return -1;
@@ -929,8 +935,8 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                the name (Phase 20: base had the path, ours and theirs both
                deleted it, and some untracked file with the same name now
                sits at abspath). */
-            if (sg_merge_entry_touches_ours(e))
-                remove(abspath);
+            if (sg_merge_entry_touches_ours(e) && remove(abspath) == 0)
+                sg_prune_empty_parents(repo_root, e->path);
         } else {
             /* Skip re-reading/rewriting when the resolved outcome already
                equals ours -- this is the untouched-path case (Phase 20 spec

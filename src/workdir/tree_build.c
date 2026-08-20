@@ -8,6 +8,7 @@
 #include "sg/status.h"
 #include "sg/workdir.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -271,6 +272,7 @@ int sg_tree_build_from_index(const char *git_dir, const sg_index *idx,
 }
 
 int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
+                               sg_workdir_missing missing,
                                unsigned char tree_id_out[SG_SHA1_RAW_LEN])
 {
     sg_flat_entry *entries = NULL;
@@ -332,8 +334,42 @@ int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const
             if (!write_ok)
                 goto out_free_entries;
         } else {
-            /* working-tree file gone or unreadable: fall back to the blob the
-               index already recorded, so this entry still resolves */
+            /* sg_read_file failed. Classify with lstat, AFTER the read
+               attempt and never before it: sg_read_file's own errno is not
+               usable here (workdir.c: the failure path runs free()/fclose()
+               first, and malloc failure shares the same return -1 as an
+               I/O error on the file itself), so lstat is the only signal
+               available, and it must be a second, separate syscall rather
+               than a probe run ahead of the read.
+
+               Classifying after the read (not before) matters because the
+               common race is "existed when probed, gone by the time we
+               tried to read it" -- probing first would turn that ordinary
+               race into a hard failure of the whole snapshot/stash. Doing
+               the lstat second means the only race that can still fool us
+               is the rare opposite direction (absent when probed, present
+               and unreadable by the time we lstat), which is exactly the
+               direction that is safe to hard-fail on.
+
+               lstat (not stat) matches the existence test stash.c's dirty
+               gate already uses for the same path, so both agree.
+
+               If lstat finds something there, or fails for a reason other
+               than "no such path", something IS there and unreadable:
+               that is always a hard failure regardless of policy, under
+               both KEEP_INDEX_BLOB and RECORD_DELETION. Recording the
+               index's stale blob for a file that exists-but-can't-be-read
+               would produce a "snapshot" that silently omits or
+               misrepresents that file's real content -- worse than no
+               snapshot at all. */
+            struct stat st;
+
+            if (lstat(abspath, &st) == 0 || (errno != ENOENT && errno != ENOTDIR))
+                goto out_free_entries;
+            if (missing == SG_WORKDIR_MISSING_RECORD_DELETION)
+                continue; /* omitted: the resulting tree records the deletion */
+            /* KEEP_INDEX_BLOB: fall back to the blob the index already
+               recorded, so this entry still resolves. */
             memcpy(blob_id, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
         }
 
@@ -385,7 +421,16 @@ int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, con
         struct stat st;
         unsigned int mode = 0100644;
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, paths[i]);
+        /* sg_status_list_untracked only emits a path after collect_untracked
+           has already joined repo_root with it into a buffer this same size
+           and checked the result, so truncation here is not reachable today.
+           Check anyway rather than depending on an invariant established in
+           another module and recorded nowhere near this line: if that
+           enumerator ever gains a second source of paths, the failure here
+           would be silent and would hash some unrelated file's content into
+           this path's blob. */
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, paths[i]) != 0)
+            goto out_free_entries;
         if (stat(abspath, &st) == 0 && (st.st_mode & 0111))
             mode = 0100755;
 

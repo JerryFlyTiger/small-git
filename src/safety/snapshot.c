@@ -90,7 +90,7 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
 
     memset(&commit, 0, sizeof(commit));
 
-    if (sg_tree_build_from_workdir(git_dir, repo_root, idx, tree_id) != 0)
+    if (sg_tree_build_from_workdir(git_dir, repo_root, idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB, tree_id) != 0)
         return -1;
 
     has_parent = (sg_ref_resolve_head(git_dir, parent_id) == 0);

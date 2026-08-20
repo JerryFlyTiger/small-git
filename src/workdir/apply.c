@@ -72,7 +72,8 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
                 rc = -1;
                 continue;
             }
-            remove(abspath);
+            if (remove(abspath) == 0)
+                sg_prune_empty_parents(repo_root, old_idx.entries[i].path);
         }
     }
     sg_index_free(&old_idx);

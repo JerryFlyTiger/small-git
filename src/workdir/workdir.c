@@ -269,3 +269,25 @@ int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])
     free(buf);
     return 0;
 }
+
+void sg_prune_empty_parents(const char *repo_root, const char *relpath)
+{
+    char cur[SG_PATH_MAX];
+
+    if (strlen(relpath) >= sizeof(cur))
+        return; /* truncated -- never act on a truncated path */
+    strcpy(cur, relpath);
+
+    for (;;) {
+        char *slash = strrchr(cur, '/');
+        char absdir[SG_PATH_MAX];
+
+        if (slash == NULL)
+            return; /* cur is now a top-level name; its parent is repo_root, never removed */
+        *slash = '\0';
+        if (sg_path_join(absdir, sizeof(absdir), repo_root, cur) != 0)
+            return; /* truncated -- never act on a truncated path */
+        if (rmdir(absdir) != 0)
+            return; /* not empty (or some other reason) -- ancestors won't be empty either */
+    }
+}

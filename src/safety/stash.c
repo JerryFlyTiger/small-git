@@ -375,7 +375,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         return -1;
     }
 
-    if (sg_tree_build_from_workdir(git_dir, repo_root, &idx, worktree_tree) != 0) {
+    if (sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_RECORD_DELETION,
+                                   worktree_tree) != 0) {
         sg_index_free(&idx);
         return -1;
     }
