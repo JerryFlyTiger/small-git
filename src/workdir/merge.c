@@ -830,7 +830,15 @@ static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *
     sg_index_entry entry;
 
     memset(&entry, 0, sizeof(entry));
-    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, path);
+    /* A truncated path here must fail this entry outright, not just skip
+       the stat below with zeroed fields: the caller (sg_merge_result_apply)
+       treats a non-zero return the same as an sg_index_upsert failure and
+       aborts the whole apply rather than handing back an index silently
+       missing this path or carrying bogus stat data for it. */
+    if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0) {
+        fprintf(stderr, "sg: 路徑過長,無法解析 '%s'\n", path);
+        return -1;
+    }
     if (stat(abspath, &st) == 0) {
         entry.ctime_sec = (unsigned int)st.st_ctime;
         entry.mtime_sec = (unsigned int)st.st_mtime;
@@ -879,7 +887,15 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
         sg_merge_result_entry *e = &result->entries[i];
         char abspath[4096];
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, e->path);
+        /* A truncated path here can't safely be used for any of the three
+           branches below (conflict write, deletion, or content write), so
+           this entry must count as a failure the same way a missing chunk
+           or unreadable object does -- never silently skipped. */
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
+            fprintf(stderr, "sg: 路徑過長,無法處理 '%s'\n", e->path);
+            content_missing = 1;
+            continue;
+        }
 
         if (e->conflict) {
             int mode = e->ours_present ? (int)(e->ours_mode & 0777)

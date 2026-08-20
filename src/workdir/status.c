@@ -122,7 +122,11 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
         if (idx->entries[i].stage != 0)
             continue;
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx->entries[i].path);
+        /* A truncated path must not be silently skipped: that would drop a
+           path from the unstaged-diff list, which `sg status` reports as
+           "nothing changed" for a file that may well be dirty. */
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, idx->entries[i].path) != 0)
+            return -1;
         if (stat(abspath, &st) != 0) {
             if (status_list_add(out, idx->entries[i].path, SG_STATUS_DELETED) != 0)
                 return -1;
@@ -161,27 +165,6 @@ static int path_tracked_any_stage(const sg_index *idx, const char *path)
     return 0;
 }
 
-/* Joins base and rel as "base/rel", returning -1 rather than a truncated
-   result if it does not fit -- truncation would silently name the wrong path
-   on disk further up the tree, so it must never be acted on (identical
-   contract to the same-named helper in cmd_add.c, CLAUDE.md's known
-   duplicate). */
-static int path_join(char *out, size_t out_size, const char *base, const char *rel)
-{
-    int n;
-
-    if (rel == NULL || rel[0] == '\0')
-        n = snprintf(out, out_size, "%s", base);
-    else if (base == NULL || base[0] == '\0')
-        n = snprintf(out, out_size, "%s", rel);
-    else
-        n = snprintf(out, out_size, "%s/%s", base, rel);
-
-    if (n < 0 || (size_t)n >= out_size)
-        return -1;
-    return 0;
-}
-
 /* Walks the worktree collecting untracked files, filtered through the
    .gitignore engine (ig) unless include_ignored makes every path pass:
    ignored directories are pruned outright -- nothing under an ignored
@@ -199,7 +182,7 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
     DIR *d;
     struct dirent *ent;
 
-    if (path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
+    if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
         fprintf(stderr, "sg: warning: 路徑過長,略過目錄 '%s'(未追蹤清單可能不完整)\n", reldir);
         return 0;
     }
@@ -231,8 +214,8 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
         /* Never act on a truncated path: it usually still names a real
            directory further up, so lstat would succeed against the wrong
            entry and this would report a path that is not the one on disk. */
-        if (path_join(relpath, sizeof(relpath), reldir, ent->d_name) != 0 ||
-           path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
+        if (sg_path_join(relpath, sizeof(relpath), reldir, ent->d_name) != 0 ||
+           sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
             fprintf(stderr, "sg: warning: 路徑過長,略過 '%s/%s'(未追蹤清單可能不完整)\n",
                     reldir[0] != '\0' ? reldir : ".", ent->d_name);
             continue;

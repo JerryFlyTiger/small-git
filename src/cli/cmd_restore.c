@@ -64,7 +64,11 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
         }
     }
 
-    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, rel);
+    if (sg_path_join(abspath, sizeof(abspath), repo_root, rel) != 0) {
+        fprintf(stderr, "sg: 路徑過長,無法還原 '%s'\n", arg);
+        free(content);
+        return -1;
+    }
     rc = sg_write_file_mkdirs(abspath, content, content_len, (int)(idx->entries[pos].mode & 0777));
     free(content);
     if (rc != 0)
@@ -134,7 +138,11 @@ static void strbuf_append_path(strbuf *b, const char *path)
 
 /* Determines whether restoring rel from the index would actually discard
    working-directory content: a missing file or one whose content already
-   matches the index entry loses nothing. */
+   matches the index entry loses nothing. Returns 1 if it would, 0 if it
+   would not, -1 on error (path too long to check) -- callers must report
+   the -1 case rather than silently treating it as either answer, since
+   under-reporting here means restore proceeds without ever having warned
+   about content it is about to discard. */
 static int would_lose_content(const char *git_dir, const char *repo_root, const sg_index *idx,
                               const char *rel)
 {
@@ -147,7 +155,8 @@ static int would_lose_content(const char *git_dir, const char *repo_root, const 
     if (pos < 0)
         return 0; /* not tracked: restore will error out, nothing to lose */
 
-    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, rel);
+    if (sg_path_join(abspath, sizeof(abspath), repo_root, rel) != 0)
+        return -1;
     if (stat(abspath, &st) != 0)
         return 0;
     if (sg_hash_file_blob(abspath, wd_sha1) != 0)
@@ -230,6 +239,7 @@ int sg_cmd_restore(int argc, char **argv)
 
         for (i = 1; i < argc; i++) {
             char *rel;
+            int lossy;
 
             if (strcmp(argv[i], "--staged") == 0 || strcmp(argv[i], "--force") == 0 ||
                strcmp(argv[i], "-f") == 0)
@@ -239,7 +249,19 @@ int sg_cmd_restore(int argc, char **argv)
             if (rel == NULL)
                 continue; /* reported as an error in the main loop below */
 
-            if (would_lose_content(git_dir, repo_root, &idx, rel)) {
+            lossy = would_lose_content(git_dir, repo_root, &idx, rel);
+            if (lossy < 0) {
+                fprintf(stderr, "sg: 路徑過長,無法檢查 '%s' 是否會遺失變更\n", argv[i]);
+                free(rel);
+                free(msg.buf);
+                free(affected.buf);
+                sg_flat_list_free(&head_flat);
+                sg_index_free(&idx);
+                free(repo_root);
+                free(git_dir);
+                return 1;
+            }
+            if (lossy) {
                 if (!any_lossy)
                     strbuf_append(&msg,
                                   "sg restore: 以下路徑目前的工作目錄內容跟 index 不同，"

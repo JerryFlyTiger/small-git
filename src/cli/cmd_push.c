@@ -16,7 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SG_PATH_MAX 4096
 /* mode of a tree entry pointing at a submodule's own commit in another repo
    -- there is nothing to read here, the id isn't an object in this repo */
 #define SG_GITLINK_MODE 0160000

@@ -2,6 +2,7 @@
 
 #include "sg/loose.h"
 #include "sg/objstore.h"
+#include "sg/workdir.h"
 #include "sg/zutil.h"
 
 #include <dirent.h>
@@ -16,8 +17,6 @@
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
-
-#define SG_PATH_MAX 4096
 
 /* git's own pack object type numbering -- 5 is intentionally unused */
 #define SG_PACK_TYPE_COMMIT 1

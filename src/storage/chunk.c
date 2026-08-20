@@ -5,6 +5,7 @@
 #include "sg/objstore.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/workdir.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -14,8 +15,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-
-#define SG_PATH_MAX 4096
 
 static const char *env_or(const char *name, const char *fallback)
 {

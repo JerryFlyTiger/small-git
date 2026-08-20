@@ -14,7 +14,6 @@
 #include <sys/stat.h>
 
 #define SG_TREE_DIR_MODE 040000
-#define SG_TREE_BUILD_PATH_MAX 4096
 
 static int build_level(const char *git_dir, const sg_flat_entry *entries, size_t count,
                        unsigned char tree_id_out[SG_SHA1_RAW_LEN])
@@ -290,7 +289,7 @@ int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const
     sg_repo_read_chunk_config(git_dir, &chunk_enabled, &chunk_threshold);
 
     for (i = 0; i < idx->count; i++) {
-        char abspath[SG_TREE_BUILD_PATH_MAX];
+        char abspath[SG_PATH_MAX];
         unsigned char *content = NULL;
         size_t content_len = 0;
         unsigned char blob_id[SG_SHA1_RAW_LEN];
@@ -307,7 +306,16 @@ int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const
         if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
             continue;
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx->entries[i].path);
+        /* A truncated path must hard-fail here, before sg_read_file ever
+           runs: a truncated buffer usually still names some real,
+           unrelated path higher up the tree, and if sg_read_file happened
+           to fail against THAT path (e.g. it doesn't exist), this loop's
+           existing "gone or unreadable" fallback below would silently
+           record the entry as deleted from the working tree using the
+           index's own blob -- the exact silent-data-loss shape this
+           function must never produce. */
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, idx->entries[i].path) != 0)
+            goto out_free_entries;
         if (sg_read_file(abspath, &content, &content_len) == 0) {
             int write_ok;
 
@@ -370,7 +378,7 @@ int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, con
     sg_repo_read_chunk_config(git_dir, &chunk_enabled, &chunk_threshold);
 
     for (i = 0; i < count; i++) {
-        char abspath[SG_TREE_BUILD_PATH_MAX];
+        char abspath[SG_PATH_MAX];
         unsigned char *content = NULL;
         size_t content_len = 0;
         unsigned char blob_id[SG_SHA1_RAW_LEN];

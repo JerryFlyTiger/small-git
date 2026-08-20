@@ -3,14 +3,13 @@
 #include "sg/hash.h"
 #include "sg/pack.h"
 #include "sg/repo.h"
+#include "sg/workdir.h"
 
 #include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-#define SG_PATH_MAX 4096
 
 /* Walks git_dir/objects/<xx>/<38 remaining hex chars>, skipping the "pack"
    and "info" entries that live alongside the two-hex-char loose object

@@ -17,7 +17,6 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#define SG_PATH_MAX 4096
 #define SG_FETCH_MAX_HAVES 256
 
 /* Deduplicated want list: the tip of every refs/heads/, refs/tags/, and (if

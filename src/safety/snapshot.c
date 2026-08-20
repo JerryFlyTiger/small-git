@@ -14,7 +14,6 @@
 #include <sys/stat.h>
 #include <time.h>
 
-#define SG_PATH_MAX 4096
 #define SG_SNAPSHOT_SLUG_MAX 40
 
 static const char *env_or(const char *name, const char *fallback)

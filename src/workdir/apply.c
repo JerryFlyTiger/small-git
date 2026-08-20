@@ -67,7 +67,11 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         if (flat_find(&target_flat, old_idx.entries[i].path) < 0) {
             char abspath[4096];
 
-            snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, old_idx.entries[i].path);
+            if (sg_path_join(abspath, sizeof(abspath), repo_root, old_idx.entries[i].path) != 0) {
+                fprintf(stderr, "sg: 路徑過長,無法刪除 '%s'\n", old_idx.entries[i].path);
+                rc = -1;
+                continue;
+            }
             remove(abspath);
         }
     }
@@ -81,7 +85,11 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         struct stat st;
         sg_index_entry entry;
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, target_flat.entries[i].path);
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, target_flat.entries[i].path) != 0) {
+            fprintf(stderr, "sg: 路徑過長,無法寫入 '%s'\n", target_flat.entries[i].path);
+            rc = -1;
+            continue;
+        }
         {
             sg_chunk_missing_info missing;
             int read_rc = sg_chunk_read_blob(git_dir, target_flat.entries[i].sha1, &blob_content,

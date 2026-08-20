@@ -9,7 +9,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define SG_PATH_MAX 4096
 #define SG_MAX_PATH_COMPONENTS 512
 
 char *sg_repo_root(const char *git_dir)
@@ -241,6 +240,22 @@ int sg_is_symlink(const char *path)
     struct stat st;
 
     return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+}
+
+int sg_path_join(char *out, size_t out_size, const char *base, const char *rel)
+{
+    int n;
+
+    if (rel == NULL || rel[0] == '\0')
+        n = snprintf(out, out_size, "%s", base);
+    else if (base == NULL || base[0] == '\0')
+        n = snprintf(out, out_size, "%s", rel);
+    else
+        n = snprintf(out, out_size, "%s/%s", base, rel);
+
+    if (n < 0 || (size_t)n >= out_size)
+        return -1;
+    return 0;
 }
 
 int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])

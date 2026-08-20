@@ -2,6 +2,7 @@
 
 #include "sg/chunk.h"
 #include "sg/refs.h"
+#include "sg/workdir.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -9,8 +10,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#define SG_PATH_MAX 4096
 
 static int write_file(const char *path, const char *content)
 {

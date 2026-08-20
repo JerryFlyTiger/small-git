@@ -4,12 +4,11 @@
 #include "sg/reflog.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
+#include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define SG_PATH_MAX 4096
 
 /* Supports only the read-only subset real git's `git reflog` offers most
    often (Phase 17 scope): `sg reflog`/`sg reflog show` with an optional

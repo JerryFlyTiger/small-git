@@ -127,7 +127,8 @@ static int remove_untracked_files(const char *repo_root, char **paths, size_t co
     for (i = 0; i < count; i++) {
         char abspath[4096];
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, paths[i]);
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, paths[i]) != 0)
+            return -1;
         if (unlink(abspath) != 0 && errno != ENOENT)
             return -1;
     }
@@ -142,8 +143,13 @@ static int remove_untracked_files(const char *repo_root, char **paths, size_t co
    never removed. Best-effort: an unreadable directory is left alone rather
    than treated as a hard failure, same convention as
    sg_status_list_untracked's own directory walk. A path that would truncate
-   is skipped the same way -- never acted on -- matching path_join in
-   status.c. */
+   is skipped the same way -- never acted on. This is NOT the same
+   convention as status.c's collect_untracked (:202-204,233-239), which
+   prints a warning when it has to skip an entry -- collect_untracked's
+   silence would under-report real, user-visible untracked files, but here
+   the only thing left behind by a skip is an empty directory, which is
+   invisible to `sg status` and to real git alike, so there is nothing
+   worth warning about. */
 static void prune_empty_untracked_dirs(const char *repo_root, const char *reldir, sg_ignore *ig,
                                        int include_ignored)
 {
@@ -696,7 +702,8 @@ static int restore_untracked_flat(const char *git_dir, const char *repo_root, co
         sg_chunk_missing_info missing;
         int read_rc;
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, flat->entries[i].path);
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, flat->entries[i].path) != 0)
+            return -1;
         read_rc = sg_chunk_read_blob(git_dir, flat->entries[i].sha1, &blob_content, &blob_len, &missing);
         if (read_rc == -2) {
             sg_chunk_print_missing_error(flat->entries[i].path, &missing);
@@ -920,8 +927,11 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
             char abspath[4096];
             struct stat st;
 
-            snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, path);
-            if (lstat(abspath, &st) == 0) {
+            /* A truncated path can't be verified clean, and this is a gate:
+               the conservative answer is dirty, never clean. */
+            if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0) {
+                dirty_here = 1;
+            } else if (lstat(abspath, &st) == 0) {
                 unsigned char wd_sha1[SG_SHA1_RAW_LEN];
 
                 if (sg_hash_file_blob(abspath, wd_sha1) != 0 ||
@@ -1024,8 +1034,12 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
             char abspath[4096];
             struct stat st;
 
-            snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, e->path);
-            if (lstat(abspath, &st) == 0)
+            /* A truncated path can't be verified collision-free -- this is
+               a pre-flight gate, so the conservative answer is "collides",
+               never "clear". */
+            if (sg_path_join(abspath, sizeof(abspath), repo_root, e->path) != 0)
+                untracked_collision = 1;
+            else if (lstat(abspath, &st) == 0)
                 untracked_collision = 1;
         }
     }
@@ -1036,7 +1050,10 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
         char abspath[4096];
         struct stat st;
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, untracked_flat.entries[i].path);
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, untracked_flat.entries[i].path) != 0) {
+            untracked_collision = 1;
+            continue;
+        }
         if (lstat(abspath, &st) == 0)
             untracked_collision = 1;
     }
