@@ -16,8 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SG_PATH_MAX 4096
-
 /* Takes the last non-empty path segment of the URL, stripping a trailing
    ".git" -- e.g. "http://host/a/b/repo.git" -> "repo", matching `git clone`
    with no explicit destination directory. */

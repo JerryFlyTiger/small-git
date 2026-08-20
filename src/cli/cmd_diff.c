@@ -95,7 +95,7 @@ int sg_cmd_diff(int argc, char **argv)
     }
 
     for (i = 0; i < idx.count; i++) {
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         unsigned char *a_content = NULL;
         size_t a_len = 0;
         unsigned char *b_content = NULL;
@@ -126,7 +126,15 @@ int sg_cmd_diff(int argc, char **argv)
             }
         }
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, idx.entries[i].path);
+        /* A truncated path must not be silently skipped: that would leave
+           this entry undiffed and `sg diff` would report a changed file as
+           unchanged instead. */
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, idx.entries[i].path) != 0) {
+            fprintf(stderr, "sg: warning: 路徑過長,無法比較 '%s'\n", idx.entries[i].path);
+            free(a_content);
+            had_chunk_error = 1;
+            continue;
+        }
         (void)sg_read_file(abspath, &b_content, &b_len); /* missing file => empty b (all removed) */
 
         if (a_len == b_len && (a_len == 0 || memcmp(a_content, b_content, a_len) == 0)) {

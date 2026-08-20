@@ -303,7 +303,7 @@ int sg_cmd_switch(int argc, char **argv)
            logs "Created from <current branch name>" instead (see
            cmd_branch.c's create_branch). Written before HEAD moves, same
            order real git uses. */
-        char ref_path[4096];
+        char ref_path[SG_PATH_MAX];
 
         if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch_arg) >= (int)sizeof(ref_path) ||
            sg_ref_update(git_dir, ref_path, target_commit_id, "branch: Created from HEAD") != 0) {

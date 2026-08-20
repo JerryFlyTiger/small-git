@@ -5,6 +5,8 @@
 
 #include "sg/hash.h"
 
+#define SG_PATH_MAX 4096
+
 /* The repo root is git_dir's parent directory (git_dir is ".../.git"). Result
    is malloc'd, caller frees. */
 char *sg_repo_root(const char *git_dir);
@@ -38,7 +40,35 @@ int sg_write_file_mkdirs(const char *path, const unsigned char *data, size_t len
    followed). */
 int sg_is_symlink(const char *path);
 
+/* Joins base and rel as "base/rel" into out, or copies whichever side is
+   non-empty when the other is NULL/"". Returns 0, or -1 if the result does
+   not fit: a truncated path usually still names a real entry higher up the
+   tree, so every caller must treat -1 as "this path does not exist to me"
+   and never act on the buffer. Replaces the per-file path_join copies in
+   status.c/cmd_add.c. prune_empty_untracked_dirs in safety/stash.c keeps its
+   own inline bounds check on purpose: it skips silently where this helper's
+   callers report, an empty directory left behind being invisible to sg and
+   to real git alike. */
+int sg_path_join(char *out, size_t out_size, const char *base, const char *rel);
+
 /* SHA-1 object id of path's content as a blob, without writing any object. */
 int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN]);
+
+/* After a tracked file has been removed, removes each ancestor directory
+   that is now empty, up to but never including repo_root -- rmdir only, so
+   a directory still holding anything at all (tracked or not) is left alone.
+   relpath must stay under repo_root: an absolute path, or one with a ".."
+   component, is refused outright rather than resolved, since these paths
+   come from tree objects whose entry names sg does not validate.
+   Best effort: every failure is ignored, because a leftover empty directory
+   is invisible to sg status and to real git alike.
+
+   Deliberately NOT ignore-aware, unlike safety/stash.c's
+   prune_empty_untracked_dirs: real git (2.55.0, verified) removes a
+   now-empty directory here even if that directory is itself covered by
+   .gitignore, whereas the untracked-file sweep leaves an empty-but-ignored
+   directory (e.g. "build/") alone. The two functions' rules are opposite by
+   design -- do not "unify" them. */
+void sg_prune_empty_parents(const char *repo_root, const char *relpath);
 
 #endif

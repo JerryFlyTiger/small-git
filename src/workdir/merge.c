@@ -825,12 +825,26 @@ static int add_stage_entry(sg_index *idx, const char *path, unsigned int stage, 
 static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *path,
                               unsigned int mode, const unsigned char sha1[SG_SHA1_RAW_LEN])
 {
-    char abspath[4096];
+    char abspath[SG_PATH_MAX];
     struct stat st;
     sg_index_entry entry;
 
     memset(&entry, 0, sizeof(entry));
-    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, path);
+    /* sg_merge_result_apply already ran this exact join, with the same
+       repo_root and path, at the top of the loop that calls us, so from that
+       (currently only) call site this check is unreachable: the observable
+       defence is the caller's, and a mutation aimed at truncation handling
+       has to be planted there, not here -- a redundant guard hides the
+       verification point. It stays because the alternative is an unchecked
+       join, and because if this static ever grows a second caller the right
+       behaviour is the one below: fail the entry outright rather than stat a
+       wrong path and hand back an index carrying bogus data for it. The
+       caller treats a non-zero return like an sg_index_upsert failure and
+       aborts the whole apply. */
+    if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0) {
+        fprintf(stderr, "sg: 路徑過長,無法解析 '%s'\n", path);
+        return -1;
+    }
     if (stat(abspath, &st) == 0) {
         entry.ctime_sec = (unsigned int)st.st_ctime;
         entry.mtime_sec = (unsigned int)st.st_mtime;
@@ -877,9 +891,17 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
 
     for (i = 0; i < result->count; i++) {
         sg_merge_result_entry *e = &result->entries[i];
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, e->path);
+        /* A truncated path here can't safely be used for any of the three
+           branches below (conflict write, deletion, or content write), so
+           this entry must count as a failure the same way a missing chunk
+           or unreadable object does -- never silently skipped. */
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
+            fprintf(stderr, "sg: 路徑過長,無法處理 '%s'\n", e->path);
+            content_missing = 1;
+            continue;
+        }
 
         if (e->conflict) {
             int mode = e->ours_present ? (int)(e->ours_mode & 0777)
@@ -913,8 +935,8 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                the name (Phase 20: base had the path, ours and theirs both
                deleted it, and some untracked file with the same name now
                sits at abspath). */
-            if (sg_merge_entry_touches_ours(e))
-                remove(abspath);
+            if (sg_merge_entry_touches_ours(e) && remove(abspath) == 0)
+                sg_prune_empty_parents(repo_root, e->path);
         } else {
             /* Skip re-reading/rewriting when the resolved outcome already
                equals ours -- this is the untouched-path case (Phase 20 spec
@@ -992,7 +1014,7 @@ static int merge_head_path(const char *git_dir, char *out, size_t out_size)
 
 int sg_merge_head_exists(const char *git_dir)
 {
-    char path[4096];
+    char path[SG_PATH_MAX];
     struct stat st;
 
     if (merge_head_path(git_dir, path, sizeof(path)) != 0)
@@ -1006,7 +1028,7 @@ int sg_merge_head_exists(const char *git_dir)
 
 int sg_merge_head_read(const char *git_dir, unsigned char out[SG_SHA1_RAW_LEN])
 {
-    char path[4096];
+    char path[SG_PATH_MAX];
     FILE *f;
     char hexbuf[SG_SHA1_HEX_LEN + 2];
     char *nl;
@@ -1029,7 +1051,7 @@ int sg_merge_head_read(const char *git_dir, unsigned char out[SG_SHA1_RAW_LEN])
 
 int sg_merge_head_write(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN])
 {
-    char path[4096];
+    char path[SG_PATH_MAX];
     char hex[SG_SHA1_HEX_LEN + 1];
     FILE *f;
 
@@ -1048,7 +1070,7 @@ int sg_merge_head_write(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
 
 int sg_merge_head_remove(const char *git_dir)
 {
-    char path[4096];
+    char path[SG_PATH_MAX];
 
     if (merge_head_path(git_dir, path, sizeof(path)) != 0)
         return -1;

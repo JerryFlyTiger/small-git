@@ -1131,6 +1131,18 @@ without it, the description is the \(dqWIP on
 subject\(dq form real git uses. A conflicted (unmerged) index refuses the
 push outright.
 .PP
+A tracked file deleted from the working directory is a change like any
+other: the stash's own tree omits the path, so
+.B pop
+re-deletes it rather than bringing it back, and a deletion on its own is
+enough to make a stash (it is not \(dqno local changes\(dq). The stash's
+index parent still lists the file unless the deletion was staged. Popping a
+deletion also removes any directory it leaves empty, up to but not including
+the repository root; unlike the untracked sweep below, this ignores
+.B .gitignore
+entirely \(em a now-empty directory goes even if it is ignored, matching
+real git 2.55.0.
+.PP
 By default untracked files are never stashed and are left untouched.
 .B -u
 (or

@@ -40,14 +40,40 @@ void sg_flat_list_free(sg_flat_list *list);
 int sg_tree_build_from_index(const char *git_dir, const sg_index *idx,
                              unsigned char tree_id_out[SG_SHA1_RAW_LEN]);
 
+/* What sg_tree_build_from_workdir records for an index path whose file is
+   not in the working tree at all. The two callers need OPPOSITE answers, so
+   this is a required argument with no default and no zero-means-something
+   convention: silently picking one of the two is exactly the bug this enum
+   exists to make unrepresentable (docs/DESIGN.md, Phase 20 item 1). */
+typedef enum {
+    /* Record the blob the index already holds, so every index entry appears
+       in the resulting tree no matter what the working tree looks like.
+       What sg_snapshot_create needs: a safety net that omits the file the
+       user just deleted cannot restore it. */
+    SG_WORKDIR_MISSING_KEEP_INDEX_BLOB = 0,
+    /* Omit the path, so the resulting tree records the deletion. What
+       sg_stash_push needs: under the policy above, "the only change is a
+       deleted tracked file" builds a tree identical to HEAD's, and the push
+       reports "No local changes to save" instead of stashing anything. */
+    SG_WORKDIR_MISSING_RECORD_DELETION = 1
+} sg_workdir_missing;
+
 /* For every path idx covers, hashes the WORKING TREE's current content into
    the object store (chunk-aware, honouring the repo's chunk config exactly
-   as sg add does) and builds a tree from the results, falling back to the
-   blob the index already records when the working-tree file is missing or
-   unreadable, so every entry always resolves. When idx holds several stage
+   as sg add does) and builds a tree from the results. When a path's file is
+   missing from the working tree, missing selects what happens to that
+   entry (see sg_workdir_missing above). When idx holds several stage
    1/2/3 entries for one path, exactly one representative is emitted, so the
-   result never has two entries sharing a name. Returns 0, -1 on failure. */
+   result never has two entries sharing a name. Every entry resolves, or the
+   call fails: a path that exists but can't be read (e.g. EISDIR, I/O
+   error) is always a hard failure under either policy, never silently
+   treated as "missing" -- a snapshot or stash that recorded a stale blob
+   instead would be worse than no snapshot at all. Under
+   RECORD_DELETION the result can cover fewer paths than idx, down to an
+   empty tree if every path was deleted -- that is success, not an error.
+   Returns 0, -1 on failure. */
 int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
+                               sg_workdir_missing missing,
                                unsigned char tree_id_out[SG_SHA1_RAW_LEN]);
 
 /* Builds a tree out of the working tree's untracked files (full relative

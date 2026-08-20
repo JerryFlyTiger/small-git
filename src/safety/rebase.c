@@ -3,6 +3,7 @@
 #include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/refs.h"
+#include "sg/workdir.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -11,8 +12,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#define SG_PATH_MAX 4096
 
 /* What orig-branch holds when the rebase started on a detached HEAD, read
    back as orig_branch == NULL. One definition, because two copies of a

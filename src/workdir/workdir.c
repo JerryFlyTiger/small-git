@@ -9,7 +9,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define SG_PATH_MAX 4096
 #define SG_MAX_PATH_COMPONENTS 512
 
 char *sg_repo_root(const char *git_dir)
@@ -243,6 +242,22 @@ int sg_is_symlink(const char *path)
     return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
 }
 
+int sg_path_join(char *out, size_t out_size, const char *base, const char *rel)
+{
+    int n;
+
+    if (rel == NULL || rel[0] == '\0')
+        n = snprintf(out, out_size, "%s", base);
+    else if (base == NULL || base[0] == '\0')
+        n = snprintf(out, out_size, "%s", rel);
+    else
+        n = snprintf(out, out_size, "%s/%s", base, rel);
+
+    if (n < 0 || (size_t)n >= out_size)
+        return -1;
+    return 0;
+}
+
 int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])
 {
     unsigned char *buf;
@@ -253,4 +268,54 @@ int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])
     sg_object_hash(SG_OBJ_BLOB, buf, len, sha1_out);
     free(buf);
     return 0;
+}
+
+/* Whether relpath stays under the directory it is resolved against: not
+   absolute, and with no ".." component. Callers of sg_prune_empty_parents
+   pass a path that came from an index entry or a merge result, which
+   ultimately came out of a tree object -- and sg does not validate entry
+   names when it parses one. "Never above repo_root" therefore has to be
+   enforced here rather than assumed. Measured before this guard existed:
+   "../sibling/f.txt" rmdir'd a directory outside the repository, and "/f"
+   reached rmdir(repo_root) itself (which survives in a real repository only
+   because .git keeps it non-empty -- not because the code stopped). */
+static int relpath_is_confined(const char *relpath)
+{
+    const char *p = relpath;
+
+    if (p[0] == '/')
+        return 0;
+    while (*p != '\0') {
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
+            return 0;
+        while (*p != '\0' && *p != '/')
+            p++;
+        while (*p == '/')
+            p++;
+    }
+    return 1;
+}
+
+void sg_prune_empty_parents(const char *repo_root, const char *relpath)
+{
+    char cur[SG_PATH_MAX];
+
+    if (!relpath_is_confined(relpath))
+        return; /* would resolve at or above repo_root -- never act on it */
+    if (strlen(relpath) >= sizeof(cur))
+        return; /* truncated -- never act on a truncated path */
+    strcpy(cur, relpath);
+
+    for (;;) {
+        char *slash = strrchr(cur, '/');
+        char absdir[SG_PATH_MAX];
+
+        if (slash == NULL)
+            return; /* cur is now a top-level name; its parent is repo_root, never removed */
+        *slash = '\0';
+        if (sg_path_join(absdir, sizeof(absdir), repo_root, cur) != 0)
+            return; /* truncated -- never act on a truncated path */
+        if (rmdir(absdir) != 0)
+            return; /* not empty (or some other reason) -- ancestors won't be empty either */
+    }
 }

@@ -12,8 +12,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SG_PATH_MAX 4096
-
 /* "<40-hex old> <40-hex new> " is 82 bytes (0..81 inclusive) before the ident
    even starts; anything shorter than that -- including the "shorter than 81
    bytes" floor named in the header comment -- cannot possibly hold both

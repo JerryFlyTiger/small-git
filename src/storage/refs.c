@@ -12,7 +12,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define SG_PATH_MAX 4096
 #define HEAD_PREFIX "ref: "
 #define BRANCH_PREFIX "refs/heads/"
 

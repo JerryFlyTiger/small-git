@@ -5,6 +5,7 @@
 #include "sg/merge.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +55,7 @@ static int list_branches(const char *git_dir)
 static int create_branch(const char *git_dir, const char *name)
 {
     unsigned char head_id[SG_SHA1_RAW_LEN];
-    char ref_path[4096];
+    char ref_path[SG_PATH_MAX];
     char *current;
     const char *current_name;
     char reflog_msg[512];

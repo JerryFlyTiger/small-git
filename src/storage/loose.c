@@ -1,5 +1,6 @@
 #include "sg/loose.h"
 
+#include "sg/workdir.h"
 #include "sg/zutil.h"
 
 #include <errno.h>
@@ -10,8 +11,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#define SG_PATH_MAX 4096
 
 /* Loose object headers are "{type} {size}\0": type is one of the four known
    names (longest is "commit", 6 bytes) and size is a decimal size_t (at most

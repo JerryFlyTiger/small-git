@@ -345,10 +345,10 @@ done:
 static int finish_rebase(const char *git_dir, const char *branch, const sg_rebase_state *state)
 {
     unsigned char tip[SG_SHA1_RAW_LEN];
-    char ref_path[4096];
+    char ref_path[SG_PATH_MAX];
     char onto_hex[SG_SHA1_HEX_LEN + 1];
-    char branch_msg[4096 + 128];
-    char head_msg[4096 + 64];
+    char branch_msg[SG_PATH_MAX + 128];
+    char head_msg[SG_PATH_MAX + 64];
 
     if (branch == NULL)
         return 0;
@@ -1069,7 +1069,7 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
            detached HEAD -- this whole branch-restore step is skipped: see
            the other arm of this if. finish_rebase never touched a branch in
            that case either, so there is nothing to restore here.) */
-        char abort_msg[4096 + 64];
+        char abort_msg[SG_PATH_MAX + 64];
 
         if (sg_ref_update_branch(git_dir, state.orig_branch, state.orig_head) != 0) {
             fprintf(stderr, "sg: 無法把分支 '%s' 還原到 rebase 前的位置\n", state.orig_branch);

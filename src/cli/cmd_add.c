@@ -70,14 +70,17 @@ static int tracked_under_dir(const sg_index *idx, const char *dir)
 static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
                       const char *rel_path, const char *display)
 {
-    char abs_path[4096];
+    char abs_path[SG_PATH_MAX];
     struct stat st;
     unsigned char *content;
     size_t content_len;
     sg_index_entry entry;
     unsigned int mode;
 
-    snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_root, rel_path);
+    if (sg_path_join(abs_path, sizeof(abs_path), repo_root, rel_path) != 0) {
+        fprintf(stderr, "sg: 路徑過長,無法處理 '%s'\n", display);
+        return -1;
+    }
 
     if (sg_is_symlink(abs_path)) {
         fprintf(stderr, "sg: warning: '%s' is a symlink, skipping (unsupported in phase 2)\n",
@@ -162,31 +165,6 @@ static int str_ptr_cmp(const void *a, const void *b)
     return strcmp(sa, sb);
 }
 
-/* Joins base and rel into out as "base/rel" (or just base when rel is empty),
-   returning -1 rather than a truncated result if it does not fit.
-   Callers MUST treat that as fatal: a truncated path frequently still names
-   a real directory higher up the tree, so a following lstat/opendir would
-   succeed against the WRONG entry instead of failing. On Linux PATH_MAX
-   (4096) equals these buffers, so truncation is reached before the kernel
-   would reject the path -- which is exactly how a silently-incomplete
-   `sg add .` passed on macOS (PATH_MAX 1024, kernel rejects first) and
-   failed on Linux. */
-static int path_join(char *out, size_t out_size, const char *base, const char *rel)
-{
-    int n;
-
-    if (rel == NULL || rel[0] == '\0')
-        n = snprintf(out, out_size, "%s", base);
-    else if (base == NULL || base[0] == '\0')
-        n = snprintf(out, out_size, "%s", rel);
-    else
-        n = snprintf(out, out_size, "%s/%s", base, rel);
-
-    if (n < 0 || (size_t)n >= out_size)
-        return -1;
-    return 0;
-}
-
 /* Recursive directory walk for `sg add <dir>`. reldir is repo-root-relative
    ("" = the repo root itself); the caller has already pushed ignore frames
    for reldir and every ancestor. Entries are sorted before processing so
@@ -197,7 +175,7 @@ static int path_join(char *out, size_t out_size, const char *base, const char *r
 static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, sg_ignore *ig,
                     const char *reldir, int force)
 {
-    char absdir[4096];
+    char absdir[SG_PATH_MAX];
     DIR *d;
     struct dirent *ent;
     char **names = NULL;
@@ -206,7 +184,7 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
     size_t i;
     int rc = 0;
 
-    if (path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
+    if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
         fprintf(stderr, "sg: 路徑過長,無法處理目錄 '%s'\n", reldir);
         return -1;
     }
@@ -251,8 +229,8 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
         qsort(names, count, sizeof(*names), str_ptr_cmp);
 
     for (i = 0; rc == 0 && i < count; i++) {
-        char relpath[4096];
-        char abspath[4096];
+        char relpath[SG_PATH_MAX];
+        char abspath[SG_PATH_MAX];
         struct stat st;
 
         /* Truncation here is NOT a cosmetic problem: a path cut off at the
@@ -263,8 +241,8 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
            these buffers, so truncation happens before the kernel ever gets a
            chance to reject the path, whereas macOS's 1024 limit means the
            kernel rejects it first. Refuse instead of guessing. */
-        if (path_join(relpath, sizeof(relpath), reldir, names[i]) != 0 ||
-           path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
+        if (sg_path_join(relpath, sizeof(relpath), reldir, names[i]) != 0 ||
+           sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
             fprintf(stderr, "sg: 路徑過長,無法處理 '%s/%s'\n",
                     reldir[0] != '\0' ? reldir : ".", names[i]);
             rc = -1;
@@ -339,10 +317,11 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
     size_t cap = 0;
     size_t i;
     int rc = 0;
+    int oom = 0;
 
     for (i = 0; i < idx->count; i++) {
         const sg_index_entry *e = &idx->entries[i];
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         struct stat st;
         char *copy;
 
@@ -353,7 +332,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
         /* A truncated path could lstat successfully against some shorter
            real path and make this conclude the file still exists -- which
            here would mean silently NOT staging a deletion. Refuse instead. */
-        if (path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
             fprintf(stderr, "sg: 路徑過長,無法檢查 '%s' 是否已刪除\n", e->path);
             rc = -1;
             break;
@@ -365,6 +344,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
             char **grown = realloc(gone, new_cap * sizeof(*grown));
 
             if (grown == NULL) {
+                oom = 1;
                 rc = -1;
                 break;
             }
@@ -373,6 +353,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
         }
         copy = strdup(e->path);
         if (copy == NULL) {
+            oom = 1;
             rc = -1;
             break;
         }
@@ -382,7 +363,10 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
     if (rc == 0) {
         for (i = 0; i < count; i++)
             sg_index_remove(idx, gone[i]);
-    } else {
+    } else if (oom) {
+        /* Only the allocation failures get this message. The path-too-long
+           bail above has already said what went wrong, and following it with
+           "out of memory" would contradict it. */
         fprintf(stderr, "sg: 記憶體不足，無法暫存刪除的檔案\n");
     }
 
@@ -449,7 +433,7 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
                        const char *arg, int force)
 {
     char *rel;
-    char abs_path[4096];
+    char abs_path[SG_PATH_MAX];
     struct stat st;
     int rc = 0;
 
@@ -459,10 +443,11 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
         return -1;
     }
 
-    if (rel[0] != '\0')
-        snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_root, rel);
-    else
-        snprintf(abs_path, sizeof(abs_path), "%s", repo_root);
+    if (sg_path_join(abs_path, sizeof(abs_path), repo_root, rel) != 0) {
+        fprintf(stderr, "sg: 路徑過長,無法處理 '%s'\n", arg);
+        free(rel);
+        return -1;
+    }
 
     if (lstat(abs_path, &st) != 0) {
         /* A tracked path that no longer exists on disk: stage the deletion,

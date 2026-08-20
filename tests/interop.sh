@@ -5210,67 +5210,57 @@ check "phase20 -u+--keep-index: fresh/ was still swept (untracked half taken des
 # clean" refusal (spec sec 3 & 4).
 # ============================================================
 
-# Dedicated fixture for I1/I2 -- deliberately narrower than
-# p20_keepidx_fixture (no wt_del.txt/staged_del.txt): those two exercise a
-# PRE-EXISTING, unrelated divergence in sg_tree_build_from_workdir (used by
-# `stash push`, not touched by this batch) -- real git's stash records a
-# working-tree-missing tracked file as DELETED in the stash's own tree,
-# while sg's push falls back to the file's INDEX blob there instead
-# (measured: confirmed by comparing `stash push` + `stash apply --index`
-# end to end, which is the only way this particular difference becomes
-# externally visible -- `stash push` alone, already covered by the
-# --keep-index oracle checks above, only ever compares against a plain
-# reset to HEAD/index_tree, which cannot expose it). Out of scope for
-# Phase 20 batch 3 (--index and the dirty-workdir gate); reported rather
-# than silently worked around, per CLAUDE.md.
-p20_index_fixture() {
-    # $1 = dir, $2 = "sg" or "git"
-    _dir="$1"; _impl="$2"
-    mkdir -p "$_dir"
-    if [ "$_impl" = sg ]; then
-        (cd "$WORKDIR" && "$SG" init "$(basename "$_dir")") > /dev/null 2>&1
-    else
-        (cd "$WORKDIR" && git init -q "$(basename "$_dir")")
-    fi
-    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user")
-    printf 'v1\n' > "$_dir/tracked.txt"
-    printf 's1\n' > "$_dir/staged.txt"
-    if [ "$_impl" = sg ]; then
-        (cd "$_dir" && "$SG" add tracked.txt staged.txt && "$SG" commit -m base) > /dev/null 2>&1
-    else
-        (cd "$_dir" && git add tracked.txt staged.txt && git commit -q -m base)
-    fi
-    printf 'v2\n' > "$_dir/tracked.txt"
-    printf 's2\n' > "$_dir/staged.txt"
-    printf 'ns1\n' > "$_dir/new_staged.txt"
-    if [ "$_impl" = sg ]; then
-        (cd "$_dir" && "$SG" add staged.txt new_staged.txt) > /dev/null 2>&1
-    else
-        (cd "$_dir" && git add staged.txt new_staged.txt) > /dev/null 2>&1
-    fi
-}
+# I1/I2 deliberately run on p20_keepidx_fixture, the WIDER fixture -- it
+# includes wt_del.txt (deleted from the working tree only) and staged_del.txt
+# (deletion staged). Phase 20 had to keep a separate, narrower p20_index_fixture
+# without those two, because sg_tree_build_from_workdir could not represent a
+# working-tree deletion at all: real git's stash records such a file as DELETED
+# in the stash's own tree, while sg fell back to the file's INDEX blob, and
+# `stash push` + `stash apply --index` end to end is the only place that
+# difference becomes externally visible. Phase 21 fixed that, so the two
+# fixtures collapsed back into one and these checks now run WITH the case they
+# used to have to avoid. Do not split them again without saying why here.
 
 # --- I1: --index vs no --index, oracle comparison (spec sec 3.1) ---
 P20_IDX_GIT="$WORKDIR/p20_idx_git"
-p20_index_fixture "$P20_IDX_GIT" git
+p20_keepidx_fixture "$P20_IDX_GIT" git
 (cd "$P20_IDX_GIT" && git stash push -q -m forindex) > /dev/null 2>&1
 (cd "$P20_IDX_GIT" && git stash apply -q --index) > /dev/null 2>&1
 check "phase20 --index oracle: git stash apply --index exits 0" test $? = 0
 P20_IDX_GIT_PORCELAIN=$(cd "$P20_IDX_GIT" && git status --porcelain | sort)
 
 P20_IDX_SG="$WORKDIR/p20_idx_sg"
-p20_index_fixture "$P20_IDX_SG" sg
+p20_keepidx_fixture "$P20_IDX_SG" sg
 (cd "$P20_IDX_SG" && "$SG" stash push -m forindex) > /dev/null 2>&1
 (cd "$P20_IDX_SG" && "$SG" stash apply --index) > /dev/null 2>&1
 check "phase20 --index: sg stash apply --index exits 0" test $? = 0
 P20_IDX_SG_PORCELAIN=$(cd "$P20_IDX_SG" && git status --porcelain | sort)
-check "phase20 --index: sg's result matches real git's --index result byte-for-byte" \
-    test "$P20_IDX_SG_PORCELAIN" = "$P20_IDX_GIT_PORCELAIN"
+
+# staged_del.txt is excluded from the byte-for-byte comparison below and
+# asserted separately, because it hits a divergence Phase 20 already recorded
+# and deliberately kept: `git rm --cached` leaves the file on disk while
+# removing it from the index, and sg's stash apply takes HEAD (not the index)
+# as "ours", so it sees a path ours holds and theirs does not and removes it.
+# Real git leaves it alone. Measured against sg built at 1afef8b (the commit
+# before this phase): identical behaviour there, so this is pre-existing and
+# not something the deletion work introduced -- it was simply unreachable
+# while the narrow fixture excluded the file. Pinned below rather than
+# filtered away silently, so a change of behaviour still fails a check.
+P20_IDX_GIT_CMP=$(printf '%s\n' "$P20_IDX_GIT_PORCELAIN" | grep -v 'staged_del\.txt')
+P20_IDX_SG_CMP=$(printf '%s\n' "$P20_IDX_SG_PORCELAIN" | grep -v 'staged_del\.txt')
+check "phase20 --index: sg's result matches real git's --index result byte-for-byte (outside the recorded staged_del.txt divergence)" \
+    test "$P20_IDX_SG_CMP" = "$P20_IDX_GIT_CMP"
+check "phase21 divergence oracle: real git keeps staged_del.txt on disk as untracked" \
+    test -f "$P20_IDX_GIT/staged_del.txt"
+check "phase21 divergence: sg removes it instead, because its apply reads ours from HEAD" \
+    test ! -e "$P20_IDX_SG/staged_del.txt"
+check "phase21 divergence: wt_del.txt -- the case this phase fixed -- IS handled identically" \
+    test "$(printf '%s\n' "$P20_IDX_SG_PORCELAIN" | grep 'wt_del\.txt')" = "$(printf '%s\n' "$P20_IDX_GIT_PORCELAIN" | grep 'wt_del\.txt')"
 
 # --- I2: control -- the SAME fixture without --index, pinning I1 against a
 # contrast (a no-op --index implementation would also pass I1 alone) ---
 P20_NOIDX_GIT="$WORKDIR/p20_noidx_git"
-p20_index_fixture "$P20_NOIDX_GIT" git
+p20_keepidx_fixture "$P20_NOIDX_GIT" git
 (cd "$P20_NOIDX_GIT" && git stash push -q -m noidx) > /dev/null 2>&1
 (cd "$P20_NOIDX_GIT" && git stash apply -q) > /dev/null 2>&1
 check "phase20 no-index control oracle: git stash apply exits 0" test $? = 0
@@ -5279,13 +5269,18 @@ check "phase20 no-index control oracle: precondition -- differs from the --index
     test "$P20_NOIDX_GIT_PORCELAIN" != "$P20_IDX_GIT_PORCELAIN"
 
 P20_NOIDX_SG="$WORKDIR/p20_noidx_sg"
-p20_index_fixture "$P20_NOIDX_SG" sg
+p20_keepidx_fixture "$P20_NOIDX_SG" sg
 (cd "$P20_NOIDX_SG" && "$SG" stash push -m noidx) > /dev/null 2>&1
 (cd "$P20_NOIDX_SG" && "$SG" stash apply) > /dev/null 2>&1
 check "phase20 no-index control: sg stash apply exits 0" test $? = 0
 P20_NOIDX_SG_PORCELAIN=$(cd "$P20_NOIDX_SG" && git status --porcelain | sort)
-check "phase20 no-index control: sg's result matches real git's no-index result" \
-    test "$P20_NOIDX_SG_PORCELAIN" = "$P20_NOIDX_GIT_PORCELAIN"
+# Same recorded staged_del.txt divergence as I1 above; see the comment there.
+P20_NOIDX_GIT_CMP=$(printf '%s\n' "$P20_NOIDX_GIT_PORCELAIN" | grep -v 'staged_del\.txt')
+P20_NOIDX_SG_CMP=$(printf '%s\n' "$P20_NOIDX_SG_PORCELAIN" | grep -v 'staged_del\.txt')
+check "phase20 no-index control: sg's result matches real git's no-index result (outside the recorded staged_del.txt divergence)" \
+    test "$P20_NOIDX_SG_CMP" = "$P20_NOIDX_GIT_CMP"
+check "phase21 divergence: the no-index path diverges on staged_del.txt the same way" \
+    test ! -e "$P20_NOIDX_SG/staged_del.txt"
 check "phase20 no-index control: sg's own --index and no-index results differ (the flag actually changes something)" \
     test "$P20_NOIDX_SG_PORCELAIN" != "$P20_IDX_SG_PORCELAIN"
 
@@ -7807,6 +7802,166 @@ for p19h_cmd in merge rebase; do
     check "phase19h: sg $p19h_cmd leaves the corrupt HEAD as evidence" \
         test "$(cat "$P19H/.git/HEAD")" = "neither a ref nor a sha"
 done
+
+# ============================================================
+# Phase 21: a deleted tracked file is representable in a stash
+#
+# sg_tree_build_from_workdir used to fall back to the index blob for a path
+# whose working-tree file was gone, which made a deletion invisible to
+# `stash push`: with a deletion as the ONLY change the built tree equalled
+# HEAD's and push reported "No local changes to save"; with some other change
+# alongside it, the stash was created but silently carried the file's old
+# content, so popping it RESTORED the file the user had deleted.
+#
+# The symptom of the first case is a line of stdout and nothing else -- no
+# file, no ref, no reflog differs -- so these checks assert on stdout
+# explicitly. Phase 19 already cost this project a bug that hid exactly
+# there.
+# ============================================================
+
+p21_del_fixture() {
+    # $1 = dir, $2 = "sg" or "git"
+    _dir="$1"; _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = sg ]; then
+        (cd "$WORKDIR" && "$SG" init "$(basename "$_dir")") > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && git init -q "$(basename "$_dir")")
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user")
+    printf 'keep\n' > "$_dir/keep.txt"
+    printf 'gone\n' > "$_dir/gone.txt"
+    mkdir -p "$_dir/sub"
+    printf 'deep\n' > "$_dir/sub/deep.txt"
+    if [ "$_impl" = sg ]; then
+        (cd "$_dir" && "$SG" add keep.txt gone.txt sub/deep.txt && \
+            "$SG" commit -m base) > /dev/null 2>&1
+    else
+        (cd "$_dir" && git add keep.txt gone.txt sub/deep.txt && git commit -q -m base)
+    fi
+    # The ONLY changes are deletions, one of them the sole occupant of sub/.
+    rm -f "$_dir/gone.txt" "$_dir/sub/deep.txt"
+}
+
+# --- D1: push records the deletion; the stash's own tree omits the path
+# while the index tree (stash^2) keeps it, since the deletion was never
+# staged. Both trees are read with real git, so this is an oracle
+# comparison and not sg reading back its own writes. ---
+P21_D1_GIT="$WORKDIR/p21_d1_git"
+p21_del_fixture "$P21_D1_GIT" git
+(cd "$P21_D1_GIT" && git stash push -q -m p21) > /dev/null 2>&1
+check "phase21 oracle: git stash push with only a deletion exits 0" test $? = 0
+P21_D1_GIT_TREE=$(cd "$P21_D1_GIT" && git ls-tree -r --name-only refs/stash | sort)
+P21_D1_GIT_IDXTREE=$(cd "$P21_D1_GIT" && git ls-tree -r --name-only refs/stash^2 | sort)
+P21_D1_GIT_PORCELAIN=$(cd "$P21_D1_GIT" && git status --porcelain | sort)
+check "phase21 oracle: precondition -- real git's stash tree really does omit the deleted path" \
+    sh -c "! printf '%s\n' \"$P21_D1_GIT_TREE\" | grep -qx gone.txt"
+check "phase21 oracle: precondition -- real git's index tree still holds it (deletion unstaged)" \
+    sh -c "printf '%s\n' \"$P21_D1_GIT_IDXTREE\" | grep -qx gone.txt"
+
+P21_D1_SG="$WORKDIR/p21_d1_sg"
+p21_del_fixture "$P21_D1_SG" sg
+P21_D1_SG_OUT=$(cd "$P21_D1_SG" && "$SG" stash push -m p21 2>&1)
+check "phase21: sg stash push with only a deletion exits 0" test $? = 0
+check "phase21: sg does NOT report 'No local changes to save' (got '$P21_D1_SG_OUT')" \
+    sh -c "! printf '%s\n' \"$P21_D1_SG_OUT\" | grep -q 'No local changes to save'"
+check "phase21: sg actually created a stash entry" \
+    sh -c "[ \"\$(cd '$P21_D1_SG' && '$SG' stash list | wc -l | tr -d ' ')\" = 1 ]"
+P21_D1_SG_TREE=$(cd "$P21_D1_SG" && git ls-tree -r --name-only refs/stash | sort)
+P21_D1_SG_IDXTREE=$(cd "$P21_D1_SG" && git ls-tree -r --name-only refs/stash^2 | sort)
+P21_D1_SG_PORCELAIN=$(cd "$P21_D1_SG" && git status --porcelain | sort)
+check "phase21: sg's stash tree matches real git's byte-for-byte (the deletion is recorded)" \
+    test "$P21_D1_SG_TREE" = "$P21_D1_GIT_TREE"
+check "phase21: sg's index tree (stash^2) matches real git's -- an unstaged deletion stays there" \
+    test "$P21_D1_SG_IDXTREE" = "$P21_D1_GIT_IDXTREE"
+check "phase21: sg's post-push status matches real git's byte-for-byte" \
+    test "$P21_D1_SG_PORCELAIN" = "$P21_D1_GIT_PORCELAIN"
+
+# --- D2: pop replays the deletion into the working tree, and the directory
+# the deletion emptied is removed -- which is the first time any sg command
+# deletes a tracked file through this path at all. ---
+(cd "$P21_D1_GIT" && git stash pop -q) > /dev/null 2>&1
+P21_D2_GIT_PORCELAIN=$(cd "$P21_D1_GIT" && git status --porcelain | sort)
+check "phase21 oracle: precondition -- real git removes the emptied sub/ on pop" \
+    test ! -e "$P21_D1_GIT/sub"
+
+(cd "$P21_D1_SG" && "$SG" stash pop) > /dev/null 2>&1
+check "phase21: sg stash pop exits 0" test $? = 0
+check "phase21: pop re-deletes the file rather than restoring it" \
+    test ! -e "$P21_D1_SG/gone.txt"
+check "phase21: pop leaves keep.txt alone" test -f "$P21_D1_SG/keep.txt"
+check "phase21: pop removes the directory the deletion emptied, matching real git" \
+    test ! -e "$P21_D1_SG/sub"
+P21_D2_SG_PORCELAIN=$(cd "$P21_D1_SG" && git status --porcelain | sort)
+check "phase21: sg's post-pop status matches real git's byte-for-byte" \
+    test "$P21_D2_SG_PORCELAIN" = "$P21_D2_GIT_PORCELAIN"
+
+# --- D3: contrast -- a STAGED deletion is absent from the index tree too.
+# Without this, D1's stash^2 check would also pass on an implementation that
+# simply never removed anything from the index tree. ---
+P21_D3_GIT="$WORKDIR/p21_d3_git"
+p21_del_fixture "$P21_D3_GIT" git
+(cd "$P21_D3_GIT" && git rm -q --cached gone.txt) > /dev/null 2>&1
+(cd "$P21_D3_GIT" && git stash push -q -m p21staged) > /dev/null 2>&1
+P21_D3_GIT_IDXTREE=$(cd "$P21_D3_GIT" && git ls-tree -r --name-only refs/stash^2 | sort)
+check "phase21 oracle: precondition -- a staged deletion IS absent from real git's index tree" \
+    sh -c "! printf '%s\n' \"$P21_D3_GIT_IDXTREE\" | grep -qx gone.txt"
+check "phase21 oracle: precondition -- D1 and D3 index trees really do differ" \
+    test "$P21_D3_GIT_IDXTREE" != "$P21_D1_GIT_IDXTREE"
+
+P21_D3_SG="$WORKDIR/p21_d3_sg"
+p21_del_fixture "$P21_D3_SG" sg
+(cd "$P21_D3_SG" && git rm -q --cached gone.txt) > /dev/null 2>&1
+(cd "$P21_D3_SG" && "$SG" stash push -m p21staged) > /dev/null 2>&1
+check "phase21: sg stash push with a staged deletion exits 0" test $? = 0
+P21_D3_SG_IDXTREE=$(cd "$P21_D3_SG" && git ls-tree -r --name-only refs/stash^2 | sort)
+check "phase21: sg's index tree drops a STAGED deletion, matching real git" \
+    test "$P21_D3_SG_IDXTREE" = "$P21_D3_GIT_IDXTREE"
+
+# --- D4: -u -- the deletion belongs in the stash's own tree, the untracked
+# file in the third parent, and the two must not bleed into each other. ---
+P21_D4_GIT="$WORKDIR/p21_d4_git"
+p21_del_fixture "$P21_D4_GIT" git
+printf 'fresh\n' > "$P21_D4_GIT/fresh.txt"
+(cd "$P21_D4_GIT" && git stash push -q -u -m p21u) > /dev/null 2>&1
+P21_D4_GIT_TREE=$(cd "$P21_D4_GIT" && git ls-tree -r --name-only refs/stash | sort)
+P21_D4_GIT_UNTRACKED=$(cd "$P21_D4_GIT" && git ls-tree -r --name-only refs/stash^3 | sort)
+
+P21_D4_SG="$WORKDIR/p21_d4_sg"
+p21_del_fixture "$P21_D4_SG" sg
+printf 'fresh\n' > "$P21_D4_SG/fresh.txt"
+(cd "$P21_D4_SG" && "$SG" stash push -u -m p21u) > /dev/null 2>&1
+check "phase21 -u: sg stash push -u exits 0" test $? = 0
+P21_D4_SG_TREE=$(cd "$P21_D4_SG" && git ls-tree -r --name-only refs/stash | sort)
+P21_D4_SG_UNTRACKED=$(cd "$P21_D4_SG" && git ls-tree -r --name-only refs/stash^3 | sort)
+check "phase21 -u: sg's stash tree matches real git's (deletion recorded there, not in ^3)" \
+    test "$P21_D4_SG_TREE" = "$P21_D4_GIT_TREE"
+check "phase21 -u: sg's untracked tree (stash^3) matches real git's" \
+    test "$P21_D4_SG_UNTRACKED" = "$P21_D4_GIT_UNTRACKED"
+
+# --- D5: a divergence this phase newly made reachable, recorded on purpose
+# rather than left to surface as a red check later.
+#
+# Stash an UNSTAGED deletion, then stage that same deletion, then pop. sg
+# refuses, because its dirty gate compares against HEAD (not the index) and
+# sees a path the stash would touch whose index entry is gone. Real git
+# allows it. This is the same "ours is HEAD, not the index" divergence
+# Phase 20 documented for apply/pop; it simply had no way to be reached
+# before a stash could record a deletion at all. Deliberately NOT compared
+# against real git here -- only sg's own refusal is pinned, so that a future
+# change of mind shows up as a failing check rather than silent drift. ---
+P21_D5="$WORKDIR/p21_d5_sg"
+p21_del_fixture "$P21_D5" sg
+(cd "$P21_D5" && "$SG" stash push -m p21d5) > /dev/null 2>&1
+(cd "$P21_D5" && git rm -q --cached gone.txt) > /dev/null 2>&1
+P21_D5_OUT=$(cd "$P21_D5" && "$SG" stash pop 2>&1 >/dev/null)
+P21_D5_RC=$?
+check "phase21 divergence: sg refuses to pop onto a now-staged deletion of the same path" \
+    test "$P21_D5_RC" != 0
+check "phase21 divergence: sg says why on stderr (got '$P21_D5_OUT')" \
+    sh -c "[ -n \"$P21_D5_OUT\" ]"
+check "phase21 divergence: the refusal left the stash in place" \
+    sh -c "[ \"\$(cd '$P21_D5' && '$SG' stash list | wc -l | tr -d ' ')\" = 1 ]"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

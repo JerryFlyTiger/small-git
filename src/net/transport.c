@@ -3,12 +3,12 @@
 
 #include "sg/http.h"
 #include "sg/pktline.h"
+#include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define SG_PATH_MAX 4096
 /* Well under SG_PATH_MAX so "<git_dir>/refs/remotes/<remote>/<name>" always
    fits without snprintf truncation. */
 #define SG_REF_NAME_MAX 1024

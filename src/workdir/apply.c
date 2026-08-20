@@ -65,23 +65,32 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         if (i > 0 && strcmp(old_idx.entries[i].path, old_idx.entries[i - 1].path) == 0)
             continue;
         if (flat_find(&target_flat, old_idx.entries[i].path) < 0) {
-            char abspath[4096];
+            char abspath[SG_PATH_MAX];
 
-            snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, old_idx.entries[i].path);
-            remove(abspath);
+            if (sg_path_join(abspath, sizeof(abspath), repo_root, old_idx.entries[i].path) != 0) {
+                fprintf(stderr, "sg: 路徑過長,無法刪除 '%s'\n", old_idx.entries[i].path);
+                rc = -1;
+                continue;
+            }
+            if (remove(abspath) == 0)
+                sg_prune_empty_parents(repo_root, old_idx.entries[i].path);
         }
     }
     sg_index_free(&old_idx);
 
     memset(&new_idx, 0, sizeof(new_idx));
     for (i = 0; i < target_flat.count; i++) {
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         unsigned char *blob_content;
         size_t blob_len;
         struct stat st;
         sg_index_entry entry;
 
-        snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, target_flat.entries[i].path);
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, target_flat.entries[i].path) != 0) {
+            fprintf(stderr, "sg: 路徑過長,無法寫入 '%s'\n", target_flat.entries[i].path);
+            rc = -1;
+            continue;
+        }
         {
             sg_chunk_missing_info missing;
             int read_rc = sg_chunk_read_blob(git_dir, target_flat.entries[i].sha1, &blob_content,
