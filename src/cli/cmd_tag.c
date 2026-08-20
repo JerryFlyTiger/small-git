@@ -6,6 +6,7 @@
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
+#include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,7 +48,7 @@ static int list_tags(const char *git_dir)
 static int tag_exists(const char *git_dir, const char *name)
 {
     unsigned char id[SG_SHA1_RAW_LEN];
-    char ref_path[4096];
+    char ref_path[SG_PATH_MAX];
 
     if (snprintf(ref_path, sizeof(ref_path), "refs/tags/%s", name) >= (int)sizeof(ref_path))
         return 0;
@@ -58,7 +59,7 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
                       const char *message, int force)
 {
     unsigned char target_id[SG_SHA1_RAW_LEN];
-    char ref_path[4096];
+    char ref_path[SG_PATH_MAX];
 
     if (!sg_ref_name_valid_for_create(name)) {
         fprintf(stderr, "sg: '%s' 不是有效的標籤名稱\n", name);

@@ -95,7 +95,7 @@ int sg_cmd_diff(int argc, char **argv)
     }
 
     for (i = 0; i < idx.count; i++) {
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         unsigned char *a_content = NULL;
         size_t a_len = 0;
         unsigned char *b_content = NULL;

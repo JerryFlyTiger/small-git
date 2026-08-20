@@ -825,7 +825,7 @@ static int add_stage_entry(sg_index *idx, const char *path, unsigned int stage, 
 static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *path,
                               unsigned int mode, const unsigned char sha1[SG_SHA1_RAW_LEN])
 {
-    char abspath[4096];
+    char abspath[SG_PATH_MAX];
     struct stat st;
     sg_index_entry entry;
 
@@ -885,7 +885,7 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
 
     for (i = 0; i < result->count; i++) {
         sg_merge_result_entry *e = &result->entries[i];
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
 
         /* A truncated path here can't safely be used for any of the three
            branches below (conflict write, deletion, or content write), so
@@ -1008,7 +1008,7 @@ static int merge_head_path(const char *git_dir, char *out, size_t out_size)
 
 int sg_merge_head_exists(const char *git_dir)
 {
-    char path[4096];
+    char path[SG_PATH_MAX];
     struct stat st;
 
     if (merge_head_path(git_dir, path, sizeof(path)) != 0)
@@ -1022,7 +1022,7 @@ int sg_merge_head_exists(const char *git_dir)
 
 int sg_merge_head_read(const char *git_dir, unsigned char out[SG_SHA1_RAW_LEN])
 {
-    char path[4096];
+    char path[SG_PATH_MAX];
     FILE *f;
     char hexbuf[SG_SHA1_HEX_LEN + 2];
     char *nl;
@@ -1045,7 +1045,7 @@ int sg_merge_head_read(const char *git_dir, unsigned char out[SG_SHA1_RAW_LEN])
 
 int sg_merge_head_write(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN])
 {
-    char path[4096];
+    char path[SG_PATH_MAX];
     char hex[SG_SHA1_HEX_LEN + 1];
     FILE *f;
 
@@ -1064,7 +1064,7 @@ int sg_merge_head_write(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
 
 int sg_merge_head_remove(const char *git_dir)
 {
-    char path[4096];
+    char path[SG_PATH_MAX];
 
     if (merge_head_path(git_dir, path, sizeof(path)) != 0)
         return -1;

@@ -125,7 +125,7 @@ static int remove_untracked_files(const char *repo_root, char **paths, size_t co
     size_t i;
 
     for (i = 0; i < count; i++) {
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
 
         if (sg_path_join(abspath, sizeof(abspath), repo_root, paths[i]) != 0)
             return -1;
@@ -153,7 +153,7 @@ static int remove_untracked_files(const char *repo_root, char **paths, size_t co
 static void prune_empty_untracked_dirs(const char *repo_root, const char *reldir, sg_ignore *ig,
                                        int include_ignored)
 {
-    char absdir[4096];
+    char absdir[SG_PATH_MAX];
     DIR *d;
     struct dirent *ent;
     int empty;
@@ -167,8 +167,8 @@ static void prune_empty_untracked_dirs(const char *repo_root, const char *reldir
     if (d == NULL)
         return;
     while ((ent = readdir(d)) != NULL) {
-        char relpath[4096];
-        char abspath[4096];
+        char relpath[SG_PATH_MAX];
+        char abspath[SG_PATH_MAX];
         struct stat st;
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
@@ -696,7 +696,7 @@ static int restore_untracked_flat(const char *git_dir, const char *repo_root, co
     size_t i;
 
     for (i = 0; i < flat->count; i++) {
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         unsigned char *blob_content;
         size_t blob_len;
         sg_chunk_missing_info missing;
@@ -924,7 +924,7 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
 
         /* Rows 2/3/4. */
         if (!dirty_here && hf != NULL) {
-            char abspath[4096];
+            char abspath[SG_PATH_MAX];
             struct stat st;
 
             /* A truncated path can't be verified clean, and this is a gate:
@@ -1031,7 +1031,7 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
         if (e->conflict || e->deleted)
             continue;
         if (flat_find(&head_flat, e->path) == NULL) {
-            char abspath[4096];
+            char abspath[SG_PATH_MAX];
             struct stat st;
 
             /* A truncated path can't be verified collision-free -- this is
@@ -1047,7 +1047,7 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
        header comment for why sg deliberately refuses the WHOLE apply here
        instead of real git's partial-apply behavior). */
     for (i = 0; i < untracked_flat.count && !untracked_collision; i++) {
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         struct stat st;
 
         if (sg_path_join(abspath, sizeof(abspath), repo_root, untracked_flat.entries[i].path) != 0) {

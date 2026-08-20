@@ -65,7 +65,7 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         if (i > 0 && strcmp(old_idx.entries[i].path, old_idx.entries[i - 1].path) == 0)
             continue;
         if (flat_find(&target_flat, old_idx.entries[i].path) < 0) {
-            char abspath[4096];
+            char abspath[SG_PATH_MAX];
 
             if (sg_path_join(abspath, sizeof(abspath), repo_root, old_idx.entries[i].path) != 0) {
                 fprintf(stderr, "sg: 路徑過長,無法刪除 '%s'\n", old_idx.entries[i].path);
@@ -79,7 +79,7 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
 
     memset(&new_idx, 0, sizeof(new_idx));
     for (i = 0; i < target_flat.count; i++) {
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         unsigned char *blob_content;
         size_t blob_len;
         struct stat st;

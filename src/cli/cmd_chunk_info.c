@@ -49,7 +49,7 @@ static int id_cmp(const void *a, const void *b)
    blob; a stray non-pointer or unrelated object never contributes anything. */
 static void collect_chunk_refs(const char *git_dir, id_list *out)
 {
-    char objects_path[4096];
+    char objects_path[SG_PATH_MAX];
     DIR *d;
     struct dirent *entry;
 
@@ -59,7 +59,7 @@ static void collect_chunk_refs(const char *git_dir, id_list *out)
         return;
 
     while ((entry = readdir(d)) != NULL) {
-        char subdir_path[4096];
+        char subdir_path[SG_PATH_MAX];
         DIR *sd;
         struct dirent *file_entry;
 

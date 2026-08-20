@@ -114,7 +114,7 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
     memset(out, 0, sizeof(*out));
 
     for (i = 0; i < idx->count; i++) {
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         unsigned char wd_sha1[SG_SHA1_RAW_LEN];
         unsigned char effective_sha1[SG_SHA1_RAW_LEN];
         struct stat st;
@@ -178,7 +178,7 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
                              sg_ignore *ig, int include_ignored, char ***out, size_t *count,
                              size_t *cap)
 {
-    char absdir[4096];
+    char absdir[SG_PATH_MAX];
     DIR *d;
     struct dirent *ent;
 
@@ -199,8 +199,8 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
     }
 
     while ((ent = readdir(d)) != NULL) {
-        char relpath[4096];
-        char abspath[4096];
+        char relpath[SG_PATH_MAX];
+        char abspath[SG_PATH_MAX];
         struct stat st;
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)

@@ -42,7 +42,7 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
     int pos = sg_index_find(idx, rel);
     unsigned char *content;
     size_t content_len;
-    char abspath[4096];
+    char abspath[SG_PATH_MAX];
     int rc;
 
     if (pos < 0) {
@@ -147,7 +147,7 @@ static int would_lose_content(const char *git_dir, const char *repo_root, const 
                               const char *rel)
 {
     int pos = sg_index_find(idx, rel);
-    char abspath[4096];
+    char abspath[SG_PATH_MAX];
     struct stat st;
     unsigned char wd_sha1[SG_SHA1_RAW_LEN];
     unsigned char effective_sha1[SG_SHA1_RAW_LEN];

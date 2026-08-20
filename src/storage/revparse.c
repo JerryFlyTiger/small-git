@@ -4,12 +4,12 @@
 #include "sg/objstore.h"
 #include "sg/refs.h"
 #include "sg/reflog.h"
+#include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define SG_REVPARSE_PATH_MAX 4096
 
 /* An annotated tag can (maliciously or accidentally) point at another tag,
    including itself; this bounds how many "object" hops sg_rev_parse_commit
@@ -150,7 +150,7 @@ static int parse_suffix_number(const char *s, size_t len, unsigned long *out)
    Does not peel tags or apply ~/^ suffixes. Returns 0 on success. */
 static int resolve_base(const char *git_dir, const char *base, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
-    char ref_path[SG_REVPARSE_PATH_MAX];
+    char ref_path[SG_PATH_MAX];
 
     if (strlen(base) == SG_SHA1_HEX_LEN)
         return sg_hex_to_sha1(base, id_out);
@@ -173,7 +173,7 @@ static int resolve_base(const char *git_dir, const char *base, unsigned char id_
 int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size_t out_size)
 {
     unsigned char tmp[SG_SHA1_RAW_LEN];
-    char candidate[SG_REVPARSE_PATH_MAX];
+    char candidate[SG_PATH_MAX];
 
     if (strcmp(name, "HEAD") == 0) {
         if (out_size < 5)
@@ -217,7 +217,7 @@ int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size
 int sg_rev_parse_commit(const char *git_dir, const char *rev,
                         unsigned char commit_id_out[SG_SHA1_RAW_LEN])
 {
-    char base[SG_REVPARSE_PATH_MAX];
+    char base[SG_PATH_MAX];
     unsigned char id[SG_SHA1_RAW_LEN];
     sg_obj_type type;
     size_t base_len;
@@ -247,7 +247,7 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
            where it fails to parse as a number and is rejected. That is the
            whole enforcement of "@{N} must be adjacent to the ref name"; no
            separate check is needed here. */
-        char ref_path[SG_REVPARSE_PATH_MAX];
+        char ref_path[SG_PATH_MAX];
         sg_reflog log;
         const sg_reflog_entry *entry;
         size_t start;

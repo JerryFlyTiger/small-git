@@ -70,7 +70,7 @@ static int tracked_under_dir(const sg_index *idx, const char *dir)
 static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
                       const char *rel_path, const char *display)
 {
-    char abs_path[4096];
+    char abs_path[SG_PATH_MAX];
     struct stat st;
     unsigned char *content;
     size_t content_len;
@@ -175,7 +175,7 @@ static int str_ptr_cmp(const void *a, const void *b)
 static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, sg_ignore *ig,
                     const char *reldir, int force)
 {
-    char absdir[4096];
+    char absdir[SG_PATH_MAX];
     DIR *d;
     struct dirent *ent;
     char **names = NULL;
@@ -229,8 +229,8 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
         qsort(names, count, sizeof(*names), str_ptr_cmp);
 
     for (i = 0; rc == 0 && i < count; i++) {
-        char relpath[4096];
-        char abspath[4096];
+        char relpath[SG_PATH_MAX];
+        char abspath[SG_PATH_MAX];
         struct stat st;
 
         /* Truncation here is NOT a cosmetic problem: a path cut off at the
@@ -320,7 +320,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
 
     for (i = 0; i < idx->count; i++) {
         const sg_index_entry *e = &idx->entries[i];
-        char abspath[4096];
+        char abspath[SG_PATH_MAX];
         struct stat st;
         char *copy;
 
@@ -427,7 +427,7 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
                        const char *arg, int force)
 {
     char *rel;
-    char abs_path[4096];
+    char abs_path[SG_PATH_MAX];
     struct stat st;
     int rc = 0;
 
