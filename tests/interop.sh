@@ -8091,6 +8091,40 @@ P22_OK_FILES=$(cd "$P22_OK" && git ls-files | sort | tr '\n' ' ')
 check "phase22: all six are tracked (got '$P22_OK_FILES')" \
     sh -c "[ \"\$(cd '$P22_OK' && git ls-files | wc -l | tr -d ' ')\" = 6 ]"
 (cd "$P22_OK" && "$SG" switch -c other && "$SG" switch master) > /dev/null 2>&1
+# --- E5: the working-tree walk must skip ONLY the real gitdir. A directory
+# named ".git." is an ordinary directory to a walker -- real git lists it as
+# untracked (measured) and refuses it only when adding. Folding the walk's
+# skip into the safety predicate made sg omit it from status entirely, which
+# is the failure mode nobody notices: a listing quietly missing a file. ---
+P22_WALK_GIT="$WORKDIR/p22_walk_git"
+(cd "$WORKDIR" && git init -q p22_walk_git)
+(cd "$P22_WALK_GIT" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P22_WALK_GIT/.git./inner" "$P22_WALK_GIT/plain"
+printf 'x\n' > "$P22_WALK_GIT/.git./inner/f.txt"
+printf 'y\n' > "$P22_WALK_GIT/plain/g.txt"
+P22_WALK_GIT_ST=$(cd "$P22_WALK_GIT" && git status --porcelain | sort)
+check "phase22 oracle: precondition -- real git lists the .git. directory as untracked" \
+    sh -c "printf '%s\n' \"$P22_WALK_GIT_ST\" | grep -q '\.git\.'"
+
+P22_WALK_SG="$WORKDIR/p22_walk_sg"
+(cd "$WORKDIR" && "$SG" init p22_walk_sg) > /dev/null 2>&1
+(cd "$P22_WALK_SG" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P22_WALK_SG/.git./inner" "$P22_WALK_SG/plain"
+printf 'x\n' > "$P22_WALK_SG/.git./inner/f.txt"
+printf 'y\n' > "$P22_WALK_SG/plain/g.txt"
+# Captured to a file rather than a shell variable: sg status output is
+# multi-line and tab-indented, and re-quoting that through sh -c produced a
+# FALSE FAILURE the first time this check was written -- the guard was
+# working and the check was lying about it.
+P22_WALK_SG_ST="$WORKDIR/p22_walk_sg_status.txt"
+(cd "$P22_WALK_SG" && "$SG" status) > "$P22_WALK_SG_ST" 2>/dev/null
+check "phase22: sg status lists the .git. directory too, rather than under-reporting it" \
+    grep -q '\.git\./' "$P22_WALK_SG_ST"
+check "phase22: sg status still lists the ordinary directory alongside it" \
+    grep -q 'plain/' "$P22_WALK_SG_ST"
+check "phase22: and sg still never descends into the real gitdir" \
+    sh -c "! grep -qE '(^|[^.])\.git/' '$P22_WALK_SG_ST'"
+
 check "phase22: and a tree holding them still checks out" \
     sh -c "[ -f '$P22_OK/.gitignore' ] && [ -f '$P22_OK/.github/workflows/ci.yml' ] && [ -f '$P22_OK/git~1' ]"
 

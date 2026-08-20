@@ -205,13 +205,17 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
-        /* skip any git dir at ANY depth, not just the top level: there is no
-           submodule support, and an embedded repo's metadata must never be
-           walked or reported. sg_path_component_is_safe's ".git" fold is
-           case-insensitive on purpose: on the default case-insensitive
-           macOS filesystem, a directory actually named ".GIT" names the
-           very same gitdir a plain strcmp would have missed. */
-        if (!sg_path_component_is_safe(ent->d_name))
+        /* Skip the gitdir itself. Only an exact ".git" is skipped, NOT
+           every name sg_path_component_is_safe would reject: real git
+           (2.55.0, measured) lists ".git." as an untracked directory and
+           refuses it only when adding, so folding this skip into the safety
+           predicate makes sg UNDER-REPORT a path git reports -- a status
+           listing quietly missing a file is the hardest kind of error to
+           notice. The gitdir sg creates is always literally ".git", so an
+           exact compare cannot miss it; anything else by that name is an
+           ordinary directory whose files must be listed, and refused later
+           at the point they would actually enter the index. */
+        if (strcmp(ent->d_name, ".git") == 0)
             continue;
 
         /* Never act on a truncated path: it usually still names a real

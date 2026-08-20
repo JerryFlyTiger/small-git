@@ -52,9 +52,20 @@ static char *make_tmp_repo(const char *tag)
 
 static void test_component_rejects(void)
 {
+    /* The last group folds away code points HFS+ ignores when comparing
+       names, so ".g<U+200C>it" can BE ".git" on such a volume. The exact
+       set was measured against git 2.55.0 by feeding ".g<cp>it" to git add
+       -- see the accept list for the control group that pins it as a
+       specific set rather than "anything invisible". The two mixed forms
+       at the end matter because the trailing-'.'-and-space fold and the
+       ignorable fold have to compose: stripping only one of them leaves
+       the other as a way through. */
     const char *bad[] = {
         "",       ".",      "..",     "a/b",  ".git",  ".GIT",
         ".Git",   ".git.",  ".git ",  ".git..", ".git  ",
+        ".g\u200cit", ".g\u200dit", ".g\u200eit", ".g\u200fit",
+        ".g\u202ait", ".g\u202eit", ".g\u206ait", ".g\u206fit",
+        ".git\u200c", "\ufeff.git", ".git.\u200c", ".git\u200c.",
     };
     size_t i;
 
@@ -77,6 +88,11 @@ static void test_component_accepts(void)
        perfectly legal. */
     const char *good[] = {
         "ok.txt", ".gitignore", ".gitmodules", "..a", "a..", "git~1", "has\ttab", "has\x01ctrl",
+        /* Control group for the ignorable-code-point fold: these are just
+           as invisible as U+200C but real git ACCEPTS them (measured), so
+           they pin the fold to a specific list. Widening it to "anything
+           zero-width" would reject these and this is what would notice. */
+        ".g\u200bit", ".g\u2060it", ".g\u00a0it", ".g\u3000it", ".gitx", "....",
     };
     size_t i;
 
@@ -367,6 +383,87 @@ static void test_cmd_add_rejects_dotgit_arg(void)
     free(path);
 }
 
+/* The per-component length bound in sg_relpath_is_safe, which guards the
+   memcpy into its fixed stack buffer. A component of exactly SG_PATH_MAX
+   bytes is the first length that must be refused: one byte shorter still
+   leaves room for the NUL. Nothing else in the suite feeds this function a
+   component anywhere near that size -- the other overlong test exercises
+   flatten_into's cumulative-path bound, which is a different check. */
+static void test_relpath_rejects_an_oversized_component(void)
+{
+    char *huge = malloc(SG_PATH_MAX + 8);
+    size_t i;
+
+    if (huge == NULL) {
+        fprintf(stderr, "malloc failed\n");
+        exit(1);
+    }
+    for (i = 0; i < SG_PATH_MAX; i++)
+        huge[i] = 'a';
+    huge[SG_PATH_MAX] = '\0';
+    CHECK(sg_relpath_is_safe(huge) == 0,
+         "a component of exactly SG_PATH_MAX bytes must be refused");
+
+    huge[SG_PATH_MAX - 1] = '\0';
+    CHECK(sg_relpath_is_safe(huge) == 1,
+         "one byte shorter still fits and must be accepted -- this is what pins the bound "
+         "to the boundary rather than to \"something long\"");
+
+    free(huge);
+}
+
+/* sg restore writes blob content to the working tree using a path taken
+   straight from the index, and the index is not a trusted source: an sg
+   predating the add-side guard staged ".git/..." paths happily, and those
+   entries are still there afterwards. Measured before the guard existed:
+   `sg restore .git/hooks/evil` wrote PWNED into the real gitdir, exit 0.
+   That is strictly worse than the delete-side hole in apply.c -- this one
+   writes chosen bytes rather than only removing. */
+static void test_restore_refuses_a_dotgit_index_entry(void)
+{
+    char template[] = "/tmp/sg_restore_dotgit_test_XXXXXX";
+    char *path = strdup(template);
+    char git_dir[SG_PATH_MAX];
+    sg_index idx;
+    sg_index_entry e;
+    unsigned char blob[SG_SHA1_RAW_LEN];
+    struct stat st;
+    char *argv[2];
+    int rc;
+
+    if (mkdtemp(path) == NULL) {
+        fprintf(stderr, "mkdtemp failed\n");
+        exit(1);
+    }
+    CHECK(sg_repo_init(path) == 0, "sg_repo_init failed");
+    CHECK(chdir(path) == 0, "chdir failed");
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", path);
+
+    /* The index is written directly rather than through `sg add`, because
+       the add-side guard now refuses this path -- staging it first would
+       make the fixture a no-op and the test would pass for the wrong
+       reason. An index like this is what an sg predating that guard left
+       behind, and it survives the upgrade. */
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, (const unsigned char *)"PWNED\n", 6, blob) == 0,
+         "sg_loose_write failed");
+    memset(&idx, 0, sizeof(idx));
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, blob, SG_SHA1_RAW_LEN);
+    e.path = (char *)".git/hooks/evil";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "sg_index_upsert failed");
+    CHECK(sg_index_write(git_dir, &idx) == 0, "sg_index_write failed");
+    sg_index_free(&idx);
+
+    argv[0] = (char *)"restore";
+    argv[1] = (char *)".git/hooks/evil";
+    rc = sg_cmd_restore(2, argv);
+    CHECK(rc != 0, "sg restore must refuse a .git path from the index, got exit %d", rc);
+    CHECK(stat(".git/hooks/evil", &st) != 0, "sg restore wrote into the gitdir");
+
+    free(path);
+}
+
 int main(void)
 {
     test_component_rejects();
@@ -378,6 +475,8 @@ int main(void)
     test_flatten_accepts_control_char_entry();
     test_apply_remove_guard_skips_escaping_index_entry();
     test_cmd_add_rejects_dotgit_arg();
+    test_relpath_rejects_an_oversized_component();
+    test_restore_refuses_a_dotgit_index_entry();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

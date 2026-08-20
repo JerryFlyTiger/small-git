@@ -87,10 +87,22 @@ void sg_prune_empty_parents(const char *repo_root, const char *relpath);
    which would let ".GIT" through on exactly the filesystem this rule exists
    for.
 
+   Also rejects a name that folds to ".git" once the code points HFS+
+   ignores when comparing are dropped -- ".g<U+200C>it", "<U+FEFF>.git" and
+   so on. The set is the sixteen git itself uses (U+200C..U+200F,
+   U+202A..U+202E, U+206A..U+206F, U+FEFF), measured rather than guessed:
+   U+200B, U+2060, U+00A0 and U+3000 are just as invisible and git ACCEPTS
+   them, so this is a specific list and not "anything zero-width".
+
    Accepts ".gitignore", ".gitmodules", "..a", "a.." -- the comparison is on
    the whole component, never a prefix or substring match. Control characters
    are accepted: real git accepts them in tree entries and defends at the
    display layer instead (measured; core.quotePath does NOT turn that off).
+
+   This is the wrong predicate for deciding whether a directory encountered
+   while WALKING the working tree is the gitdir: git lists ".git." as an
+   untracked directory, so skipping everything this rejects would
+   under-report. Compare against ".git" exactly for that.
 
    NOT applied when sg parses a tree object: like git, sg can read and print
    a hostile tree (`sg cat-file -p`), it just refuses to turn one into

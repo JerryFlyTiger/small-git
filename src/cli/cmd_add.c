@@ -200,12 +200,17 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
-        /* never walk into a git dir, at any depth (no submodule support).
-           sg_path_component_is_safe's ".git" fold is case-insensitive on
-           purpose: on the default case-insensitive macOS filesystem, a
-           directory actually named ".GIT" names the very same gitdir a
-           plain strcmp would have missed. */
-        if (!sg_path_component_is_safe(ent->d_name))
+        /* Skip the gitdir itself. Only an exact ".git" is skipped, NOT
+           every name sg_path_component_is_safe would reject: real git
+           (2.55.0, measured) lists ".git." as an untracked directory and
+           refuses it only when adding, so folding this skip into the safety
+           predicate makes sg UNDER-REPORT a path git reports -- a status
+           listing quietly missing a file is the hardest kind of error to
+           notice. The gitdir sg creates is always literally ".git", so an
+           exact compare cannot miss it; anything else by that name is an
+           ordinary directory whose files must be listed, and refused later
+           at the point they would actually enter the index. */
+        if (strcmp(ent->d_name, ".git") == 0)
             continue;
         if (count == cap) {
             size_t new_cap = cap == 0 ? 16 : cap * 2;
