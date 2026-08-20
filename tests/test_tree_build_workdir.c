@@ -373,6 +373,88 @@ static void test_prune_of_a_top_level_path_is_a_no_op(void)
     free(git_dir);
 }
 
+/* relpath comes from an index entry or a merge result, which came out of a
+   tree object, and sg does not validate entry names when parsing one. Before
+   the confinement guard existed this was measured, not theorised: an
+   ".." component rmdir'd a directory OUTSIDE the repository, and a leading
+   "/" reached rmdir(repo_root) itself. */
+static void test_prune_refuses_to_escape_repo_root(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    char sibling[SG_PATH_MAX];
+    struct stat st;
+
+    /* An empty directory alongside the repository, which an unconfined
+       "../<name>/f.txt" would resolve to and remove. */
+    snprintf(sibling, sizeof(sibling), "%s.sibling", repo_root);
+    if (mkdir(sibling, 0755) != 0) {
+        fprintf(stderr, "mkdir failed for %s\n", sibling);
+        exit(1);
+    }
+
+    {
+        char escaping[SG_PATH_MAX];
+        const char *base = strrchr(sibling, '/');
+
+        snprintf(escaping, sizeof(escaping), "../%s/f.txt", base != NULL ? base + 1 : sibling);
+        sg_prune_empty_parents(repo_root, escaping);
+    }
+    CHECK(stat(sibling, &st) == 0 && S_ISDIR(st.st_mode),
+         "a '..' component must never reach a directory outside the repository");
+
+    sg_prune_empty_parents(repo_root, "/f.txt");
+    CHECK(stat(repo_root, &st) == 0 && S_ISDIR(st.st_mode),
+         "an absolute relpath must never reach rmdir(repo_root)");
+
+    /* A name that merely starts with dots is an ordinary name, not an escape:
+       the guard must not refuse it and silently stop pruning real work. */
+    write_workdir_file(repo_root, "...dots/t.txt", "t\n");
+    {
+        char abspath[SG_PATH_MAX];
+
+        snprintf(abspath, sizeof(abspath), "%s/...dots/t.txt", repo_root);
+        CHECK(remove(abspath) == 0, "could not remove the file under test");
+    }
+    sg_prune_empty_parents(repo_root, "...dots/t.txt");
+    CHECK(!dir_exists(repo_root, "...dots"),
+         "'...dots' is an ordinary directory name and must still be pruned");
+
+    rmdir(sibling);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* The length check guarding the strcpy below it. relpath is EXACTLY
+   SG_PATH_MAX bytes, the first length the check must refuse: one byte
+   shorter fits with room for the NUL, so this is the boundary and not just
+   "something long". Relaxing >= to > here writes one byte past cur, which
+   only a sanitizer build reliably reports -- make test alone is not
+   sufficient evidence for this assertion. */
+static void test_prune_refuses_a_relpath_at_the_buffer_boundary(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    char *huge = malloc(SG_PATH_MAX + 1);
+    struct stat st;
+
+    if (huge == NULL) {
+        fprintf(stderr, "malloc failed\n");
+        exit(1);
+    }
+    memset(huge, 'a', SG_PATH_MAX);
+    huge[SG_PATH_MAX] = '\0';
+    huge[8] = '/';
+
+    sg_prune_empty_parents(repo_root, huge);
+    CHECK(stat(repo_root, &st) == 0 && S_ISDIR(st.st_mode),
+         "a relpath at the buffer boundary must be refused, leaving the repository intact");
+
+    free(huge);
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_policies_differ_only_on_the_missing_path();
@@ -382,6 +464,8 @@ int main(void)
     test_prune_empty_parents_walks_up_to_repo_root();
     test_prune_stops_at_a_directory_that_is_not_empty();
     test_prune_of_a_top_level_path_is_a_no_op();
+    test_prune_refuses_to_escape_repo_root();
+    test_prune_refuses_a_relpath_at_the_buffer_boundary();
 
     if (failures > 0)
         return 1;

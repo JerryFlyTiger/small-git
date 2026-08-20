@@ -57,6 +57,9 @@ int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])
 /* After a tracked file has been removed, removes each ancestor directory
    that is now empty, up to but never including repo_root -- rmdir only, so
    a directory still holding anything at all (tracked or not) is left alone.
+   relpath must stay under repo_root: an absolute path, or one with a ".."
+   component, is refused outright rather than resolved, since these paths
+   come from tree objects whose entry names sg does not validate.
    Best effort: every failure is ignored, because a leftover empty directory
    is invisible to sg status and to real git alike.
 

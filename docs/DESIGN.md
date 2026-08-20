@@ -1995,3 +1995,41 @@ stash 根本記不了刪除而不可達。interop 有一條檢查釘住 sg 自�
 最終 `tests/interop.sh` 1276 項檢查(Phase 20 結束時是 1247),`make test` 39 支
 二進位全過(新增 `tests/test_path_join.c`、`tests/test_tree_build_workdir.c`),
 `make sanitize` 乾淨,子指令維持 24 個。
+
+### 收尾冷讀抓到的:prune 會走到 repo_root 之外
+
+尾段那批(語意分岔、prune、測試、interop)在第一輪 reviewer 交差之後才產生,
+沒有任何人冷讀過,所以又交了一次**只給尾段**的審查。它抓到一個實質問題:
+`sg_prune_empty_parents` 對 `relpath` 沒有任何約束,而它的標頭註解卻承諾
+「up to but never including repo_root」。
+
+**實測(不是推論)**:
+
+- `relpath = "../sibling/f.txt"` → 第一輪就把 `cur` 剝成 `"../sibling"`,
+  `sg_path_join` 產生 `repo_root/../sibling`,OS 解析成 repo 的**手足目錄**,
+  `rmdir` 真的把它刪掉了。
+- `relpath = "/f.txt"` → 剝完 `cur` 變成空字串,`sg_path_join` 對空 `rel` 的語意
+  是「直接回傳 base」,於是 `absdir` 就是 `repo_root`,**`rmdir(repo_root)` 被呼叫**。
+  真實 repo 裡 `.git` 讓它非空所以會失敗,但探針用空目錄實測時 repo_root 真的
+  被刪掉了——擋住它的是 `.git` 碰巧存在,不是程式碼。
+
+修法是加一支 `relpath_is_confined`:拒絕絕對路徑與含 `..` 元件的路徑。
+**為什麼不能假設呼叫端給的是乾淨路徑**:這些 `relpath` 來自 index 條目或 merge
+結果,最終來自 tree 物件,而 `src/object/tree.c` 解析 entry 名稱時**不做任何驗證**。
+所以「不會跑到 repo_root 之上」必須在這裡強制,不能靠上游。
+
+守衛刻意只擋這兩類:`...dots` 這種以點開頭的**普通目錄名**必須照樣被剪掉,
+測試裡有一條專門釘住這件事——mutation 把守衛改成無差別拒絕時,那條會連同其他
+四條正常 prune 檢查一起變紅,這是「守衛沒有過度嚴格」的證據。
+
+**一個更大、本階段不修的缺口**:同樣未經驗證的路徑也被緊鄰的 `remove(abspath)`
+使用(`apply.c`、`merge.c`),那在 Phase 21 之前就存在。也就是說「tree 物件裡的
+entry 名稱可以是任意字串」這件事,影響的不只 prune。整批的路徑封閉性(拒絕
+`..`、絕對路徑、`.git` 前綴)應該在**解析 tree / 寫 index 的那一層**做,而不是
+在每個消費端各補一次。記在這裡,不在本階段處理。
+
+長度邊界另有一條測試,用**剛好 `SG_PATH_MAX`** 長的 relpath(短一個位元組就塞得下,
+所以那才是邊界)。把 `>=` 改成 `>` 的 mutation 會被抓到,但要注意**抓到它的不是
+具名斷言,是二進位直接 trap(退出碼 133)**——`strcpy` 溢出一個位元組被平台的
+stack 保護攔下。`mutate.sh` 的「退出碼非 0 就算被抓到」正好涵蓋這種情況,
+但它證明的是「溢出真的發生」,不是「那句斷言在守」。

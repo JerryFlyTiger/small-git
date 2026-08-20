@@ -270,10 +270,38 @@ int sg_hash_file_blob(const char *path, unsigned char sha1_out[SG_SHA1_RAW_LEN])
     return 0;
 }
 
+/* Whether relpath stays under the directory it is resolved against: not
+   absolute, and with no ".." component. Callers of sg_prune_empty_parents
+   pass a path that came from an index entry or a merge result, which
+   ultimately came out of a tree object -- and sg does not validate entry
+   names when it parses one. "Never above repo_root" therefore has to be
+   enforced here rather than assumed. Measured before this guard existed:
+   "../sibling/f.txt" rmdir'd a directory outside the repository, and "/f"
+   reached rmdir(repo_root) itself (which survives in a real repository only
+   because .git keeps it non-empty -- not because the code stopped). */
+static int relpath_is_confined(const char *relpath)
+{
+    const char *p = relpath;
+
+    if (p[0] == '/')
+        return 0;
+    while (*p != '\0') {
+        if (p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\0'))
+            return 0;
+        while (*p != '\0' && *p != '/')
+            p++;
+        while (*p == '/')
+            p++;
+    }
+    return 1;
+}
+
 void sg_prune_empty_parents(const char *repo_root, const char *relpath)
 {
     char cur[SG_PATH_MAX];
 
+    if (!relpath_is_confined(relpath))
+        return; /* would resolve at or above repo_root -- never act on it */
     if (strlen(relpath) >= sizeof(cur))
         return; /* truncated -- never act on a truncated path */
     strcpy(cur, relpath);

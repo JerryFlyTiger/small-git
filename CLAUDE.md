@@ -133,7 +133,11 @@ staging 的驗證。本機綠燈不是充分證據。**
   `workdir/merge.c` 的 `remove()` 成功之後。⚠ 它**刻意不是 ignore-aware**,與
   `safety/stash.c` 的 `prune_empty_untracked_dirs` **規則相反**:前者會清掉
   「空但被 ignore」的目錄(真 git 2.55.0 實測),後者刻意放過(interop 那條
-  `build/` 必須存活的檢查在守它)。**不要「統一」這兩支。**
+  `build/` 必須存活的檢查在守它)。**不要「統一」這兩支。**它也會拒絕絕對路徑與
+  含 `..` 的 relpath——**因為那些路徑來自 tree 物件,而 `src/object/tree.c` 解析
+  entry 名稱時不做任何驗證**。⚠ 同樣未驗證的路徑也被緊鄰的 `remove(abspath)`
+  使用(`apply.c`、`merge.c`),那是 Phase 21 之前就有、**尚未修**的缺口:路徑封閉性
+  該在解析 tree/寫 index 那一層做,不是每個消費端各補一次。
 - 已知重複(碰到時順手收斂,不要再增加下一份):`path_join` 的兩份逐字複本
   (`cmd_add.c`、`status.c`)已在 Phase 21 收斂成 `sg_path_join`,連同 14 個
   `.c` 各自的 `#define SG_PATH_MAX`、`SG_TREE_BUILD_PATH_MAX`、
