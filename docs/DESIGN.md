@@ -1815,3 +1815,183 @@ Index 半邊需要**另外陳述同一條規則**:一個 stage-0 條目,如果�
 最終 `tests/interop.sh` 1247 項檢查(Phase 19 結束時是 1165),`make test` 37
 支二進位全過(新增 `tests/test_status_untracked.c`、
 `tests/test_merge_result_apply.c`),`make sanitize` 乾淨,子指令維持 24 個。
+
+## Phase 21:工作目錄的刪除可以被表示,以及路徑截斷的整批修補
+
+接續 Phase 20 結尾「刻意不修、留給後續的兩件事」。那一段是當時決策的紀錄,
+不改動;這裡記兩件事各自被怎麼處理了,以及修的過程中才發現的第三件。
+
+### 症狀比當初記的嚴重一級
+
+Phase 20 記的是「只刪一個已追蹤檔案時印 `No local changes to save`、不建
+stash」。實測後發現那只是兩個症狀裡較輕的一個:
+
+| 情境 | 真 git | Phase 21 之前的 sg |
+|---|---|---|
+| 只刪一個已追蹤檔案 | 建 stash,tree 裡沒有該檔 | 印 `No local changes to save`,不建 stash |
+| 刪除 + 另一檔案被修改 | 建 stash,tree 裡沒有該檔 | 建了 stash,但 tree 裡**還有該檔**;`pop` 之後檔案**回來了** |
+
+第二列才是真正的資料遺漏:它不是「少存了東西」,而是 stash 一輪之後**使用者的
+刪除被靜默還原**,退出碼 0、沒有任何警告。當初只記了第一列,是因為那是從
+`stash push` 單獨觀察得到的;第二列要 push+pop 走完整輪才看得見。
+
+### 兩個呼叫端的分岔:必填 enum,沒有預設值
+
+`sg_tree_build_from_workdir` 現在吃一個 `sg_workdir_missing`:
+`SG_WORKDIR_MISSING_KEEP_INDEX_BLOB`(給 `sg_snapshot_create`)與
+`SG_WORKDIR_MISSING_RECORD_DELETION`(給 `sg_stash_push` 建 `worktree_tree`)。
+**注意同一次 `sg stash push` 裡兩種語意都會用到**——它自己也是
+`sg_snapshot_create` 的呼叫端,那個安全網要的是前者。
+
+形狀上考慮過 options struct(Phase 20 的 `sg_stash_push_opts` 是前例),但那必然
+帶一套「NULL 表示預設」的慣例——**用一個把預設值制度化的形狀,去修一個預設值
+造成的 bug,方向是反的**。這裡只有一個軸、兩個呼叫端,必填 enum 讓呼叫端自己
+說明自己要哪一種。`= 0` 給保守那個值,讓任何意外的零初始化落在「不刪東西」那側。
+
+### 「存在但讀不到」改成硬失敗:`sg_snapshot_create` 的合約跟著變
+
+原本 `sg_read_file` 失敗就退回 index blob,不分「檔案被刪掉」與「權限被拒 /
+變成目錄 / I/O 錯誤」。新語意下這兩者必須分開:對真的刪除,省略該路徑是對的;
+對 I/O 錯誤,省略等於把檔案從 stash 裡弄丟。
+
+兩個 policy 現在都硬失敗。對 `KEEP_INDEX_BLOB` 也一樣,因為舊行為是**靜默寫入
+過期 blob 再讓破壞性操作繼續**——一個聲稱能救回、內容卻是舊的快照,比沒有快照
+更糟。所以 `sg_snapshot_create` 的合約從「每個條目都解析得出來」改成
+「解析得出來,否則拒絕快照」,9 個上游呼叫端會把它轉成「操作被拒絕」。
+
+分類器的順序是關鍵,**`lstat` 一定在 `sg_read_file` 失敗之後,不可以前置探測**:
+
+- 常見的競態是「探測後、讀之前被刪掉」。前置探測會把它判成「存在但讀不到」→
+  良性競態下整個 stash/snapshot 爆掉。後置分類把它判成「不在」,那在分類當下
+  是真的;只有罕見的反方向(讀失敗後檔案才出現)才硬失敗。兩者都消不掉競態,
+  但要讓罕見的那個方向去承擔硬失敗。
+- 零額外 syscall,成功路徑完全不動。
+- **`sg_read_file` 自己的 errno 不可用**(`workdir.c`:失敗前會經過 `free()`/
+  `fclose()`,而且 malloc 失敗與 EIO 走同一條 `return -1`)。後置 `lstat` 用的是
+  它自己的 errno,所以不必動 `sg_read_file` 的簽名。
+- 用 `lstat` 不用 `stat`,與 `stash.c` 髒閘門的存在性判定用同一個測法——push 端
+  與 gate 端對「這個檔案不在了」若定義不同,會出現 push 記了刪除、gate 卻認為
+  它還在。
+
+`tests/test_snapshot.c` 那支驗 fallback 的測試**一個字都沒改就維持全綠**,因為
+它的 `b.txt` 是從未建立(ENOENT)→ 分類為「不在」→ 退回 index blob。這條性質
+本身就是驗證:需要改動那支測試才能過,就代表分類寫錯了。
+
+### 修的過程才發現的第三件:空父目錄從來沒被清過
+
+`apply.c` 與 `merge.c` 是「sg 刪掉一個已追蹤檔案」的**唯二**執行點,兩處都只
+`remove()` 檔案,`src/` 裡完全沒有 `rmdir` 服務這條路徑。
+
+**這個缺口是本階段才第一次可達的**:修法前 `worktree_tree` 必定包含 index 的
+每個路徑,所以 stash apply 的 `deleted` 條目只可能來自「base 有、ours 和 theirs
+都沒有」→ `sg_merge_entry_touches_ours` 回 `ours_present == 0` → `merge.c` 直接
+跳過 `remove()`。也就是說**Phase 21 之前的 `sg stash pop` 從來不會刪掉任何檔案**,
+新語意一上線它第一次會刪,於是第一次撞到這個缺口。這是「放寬前提會讓舊規則
+靜默失效」的又一個實例——舊規則不報錯,只是不再涵蓋新出現的情況。
+
+新增 `sg_prune_empty_parents`(`include/sg/workdir.h`),純 `rmdir` best-effort,
+往上走祖先迴圈清到 repo_root 為止(root 不清)。實測(真 git 2.55.0)三個邊界:
+
+- 目錄**被 ignore 規則涵蓋**、因刪除而變空 → **清掉**。
+- 目錄裡還留著任何東西(含 ignored 檔案)→ 留著。
+- 巢狀 `a/b/c/t.txt` 被刪 → `a`、`b`、`c` 一路清掉。
+
+⚠ **第一條與 `prune_empty_untracked_dirs` 的規則相反**:那一支是 ignore-aware 的,
+會**放過**「空但被 ignore」的目錄(interop 的 `build/` 檢查在守它)。兩支 prune
+對 ignore 的行為刻意相反,標頭註解有寫明,**不要「統一」它們**。
+
+### 第二件事:整批修,不是只補一支
+
+Phase 20 記的是 `restore_untracked_flat` 與 `sg_apply_tree_to_workdir` 兩處,並
+下了「要修就整批一起修」的指令。實際踏勘後是 **16 個站點**,分佈到 `merge.c`
+(merge/rebase/stash 共用的落地函式)、`stash.c`、`tree_build.c`、`cmd_add.c`、
+`cmd_restore.c`、`status.c`、`cmd_diff.c`。
+
+修法是抽一支 `sg_path_join` 放進 `include/sg/workdir.h`,而不是手寫 16 次檢查
+——後者等於在修重複的過程中製造第 17、18 份重複。它同時吃掉 `status.c` 與
+`cmd_add.c` 兩份逐字複本的 `path_join`;`SG_PATH_MAX` 從 14 個 `.c` 各自
+`#define` 收進標頭,連同 `SG_TREE_BUILD_PATH_MAX` 與 `SG_REVPARSE_PATH_MAX`
+這兩個同值的獨立常數名,以及 36 處裸字面量 `4096`。
+
+**截斷的意義是逐類決定的,不是統一的**:
+
+| 類別 | 處理 |
+|---|---|
+| 寫入/刪除 | 絕不跳過(`rc = -1` 續跑 / 報錯讓該條目失敗 / `return -1`) |
+| 閘門 | 往保守倒:髒檢查標 dirty、碰撞預檢標 collision。**閘門的失敗方向不可以是「放行」** |
+| 回報 | 回 -1 讓 CLI 印,不可以靜默從 `sg status`/`sg diff` 掉一個檔案 |
+| 清理(best-effort) | 維持靜默跳過 |
+
+`tree_build.c` 是唯一必須**在 `sg_read_file` 之前**失敗的站點:它的迴圈把讀不到
+當成「檔案不在」,截斷後的路徑若剛好不存在,一個存在的檔案就會被記成刪除。
+這一站把兩件事綁在一起,所以截斷必須排在語意分岔之前落地。
+
+`would_lose_content`(`cmd_restore.c`)因此長出第三態:原本只回 yes/no,而截斷
+之下**兩個答案都是謊**——回 0 會讓 `sg restore` 在沒有警告的情況下覆寫內容。
+
+刻意不改的:那些用 `git_dir` + 定長 hex 組路徑的 buffer(`loose.c`、`rebase.c`、
+`cmd_clone.c` 等)只換掉 `#define`,沒有改成走 helper——風險輪廓不同,溢出需要
+`git_dir` 本身極長。`prune_empty_untracked_dirs` 保留自己的 inline 檢查,因為它
+的慣例是靜默跳過而 helper 的呼叫端會回報;它原本的註解宣稱與 `status.c` 的
+`path_join` 一致,那是**錯的**(`collect_untracked` 跳過時會印 warning),已改成
+講真正的理由:沒清掉的空目錄對 git 與 sg 都不可見。
+
+### 驗證:六條定向 mutation,都紅得有道理
+
+`sg_tree_build_from_workdir` 原本零測試覆蓋,`sg_path_join` 也沒有直接測試。
+新增 `tests/test_path_join.c` 與 `tests/test_tree_build_workdir.c`,每一條斷言
+都先證明會紅:
+
+| mutation | 變紅的具名檢查 |
+|---|---|
+| RECORD_DELETION 塌陷成 KEEP | 「兩個 policy 產生相同 tree」「刪除沒有被表示」「空 tree」「空子樹殘留」 |
+| 反向塌陷 | **`test_snapshot` 既有護欄**:`b.txt` 從快照樹消失 |
+| 拿掉「讀不到」硬失敗 | 兩個 policy 各自的硬失敗斷言 |
+| prune 只清一層 | 「`a/b` 該被剪掉」「`a` 該被剪掉」,而 `a/b/c` 沒紅 |
+| 拿掉截斷檢查 | 四條截斷斷言 + `out_size 0` |
+| 截斷檢查 off-by-one | **只有邊界那一條** |
+
+最後一條最有價值:它只打紅一條斷言,證明邊界測試不是粗測試的冗餘複本。反向
+塌陷那條則證明 `test_snapshot` 的護欄真的在守舊語意。
+
+`sg_path_join` 的測試用**小 `out_size`** 而不是真實深目錄,這不是偷懶:macOS 的
+kernel PATH_MAX 是 1024,遠低於 `SG_PATH_MAX`,真實路徑長到能截斷 4096 緩衝區
+之前就會被 kernel 擋下,那個分支根本不會執行。用真實目錄寫的測試在本機會綠,
+但綠的理由與待測程式碼無關。
+
+mutation 樣式要帶右括號:`(size_t)n >= out_size` 也會前綴命中同檔案裡的
+`out_size - pos`,而只改一半的 mutation 讀起來就像「已驗過」。
+
+### interop:把當初被迫繞開的檢查放回去
+
+Phase 20 為了避開這個 bug,額外維護了一份窄的 `p20_index_fixture`(不含
+`wt_del.txt`/`staged_del.txt`)。修好之後兩份 fixture 合併,`--index` 那組檢查
+現在跑在**當初必須躲開的案例**上——這是最強的回歸證據形式。
+
+合併之後兩條 `--index` 檢查變紅,而且**紅得是真的**:sg 會把 `staged_del.txt`
+從磁碟上刪掉,真 git 留著它當未追蹤檔案。用 **`1afef8b`(本階段之前的 commit)
+建出的 binary 當對照組**實測,行為完全一樣——所以這是**既有分歧,不是本階段
+造成的**,只是先前被窄 fixture 遮住。成因是 Phase 20 已記錄且刻意保留的
+「sg 的 ours 是 HEAD 而不是 index」:`git rm --cached` 後檔案仍在磁碟上,而 sg 的
+apply 只看 HEAD,於是認定 ours 有、theirs 沒有 → 刪掉。
+
+處理方式是把該路徑排除在逐位元組比對之外,並**用兩條檢查把分歧本身釘住**
+(真 git 留著 / sg 刪掉),不是靜默過濾——行為哪天變了仍然會有檢查變紅。
+**沒有調整預期值到變綠**,那是這個專案最糟的失敗模式。
+
+新增的 phase21 檢查有一條特別要記:**斷言 stdout 不是 `No local changes to save`**。
+這個 bug 在「只有刪除」那個情境下的全部症狀就是一行 stdout——檔案、ref、reflog
+都沒有差異。Phase 19 已經為「只驗檔案與 reflog 會漏掉整個輸出維度」付過一次
+代價。
+
+### 新可達的分歧,主動記下來
+
+stash 了一個未 staged 的刪除 → 之後把同一路徑的刪除 staged → 再 pop:
+`sg_stash_apply_check_dirty` 的 index 那一列會拒絕(`idxpos < 0 && hf != NULL`),
+真 git 不會。這是同一條「ours 是 HEAD 不是 index」分歧的新組合,先前因為
+stash 根本記不了刪除而不可達。interop 有一條檢查釘住 sg 自己的拒絕行為,
+刻意不與真 git 比對——寫下來,而不是留給它以「interop 突然變紅」的形式被發現。
+
+最終 `tests/interop.sh` 1276 項檢查(Phase 20 結束時是 1247),`make test` 39 支
+二進位全過(新增 `tests/test_path_join.c`、`tests/test_tree_build_workdir.c`),
+`make sanitize` 乾淨,子指令維持 24 個。

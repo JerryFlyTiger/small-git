@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1247 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1276 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 37 個單元測試二進位,任一失敗即整體失敗
+make test                         # 39 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -27,7 +27,7 @@ python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
 
 - 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
   的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
-- `make test` 那行的 `N/37 個跑到`,N 少於 37 就是**中途中止**(Makefile 在第一
+- `make test` 那行的 `N/39 個跑到`,N 少於 39 就是**中途中止**(Makefile 在第一
   個失敗的二進位就停),不是「其他都過了」。
 - 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
 - interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
@@ -119,10 +119,26 @@ staging 的驗證。本機綠燈不是充分證據。**
   在 `include/sg/workdir.h`(`sg_resolve_repo_path`、`sg_mkdir_parents`、
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
   `workdir.h`,不要去 `util/`,也不要自己再寫一份。
-- 已知重複(碰到時順手收斂,不要再增加下一份):`path_join` 逐字重複於
-  `src/cli/cmd_add.c:174` 與 `src/workdir/status.c:169`(Phase 20 把未追蹤檔案
-  列舉從 `cmd_status.c` 搬進 `workdir/status.c` 時帶過去的,位置變了但重複沒
-  收斂);小型 strbuf 重複於
+- **組 `base/rel` 一律走 `sg_path_join`**(`include/sg/workdir.h`,Phase 21),
+  緩衝區大小用同一支標頭的 `SG_PATH_MAX`。**不要再寫裸
+  `snprintf(buf, sizeof buf, "%s/%s", ...)`**:截斷後的路徑通常仍指向樹上某個
+  *真實但錯誤*的位置,於是後續的 `lstat`/`unlink`/寫檔會對錯的檔案**成功**,
+  而不是乾脆失敗。截斷的意義**逐類決定**——寫入/刪除絕不跳過;閘門往保守倒
+  (標 dirty、標 collision,**失敗方向不可以是「放行」**);回報類回 -1 讓 CLI 印,
+  不可以靜默從 `sg status`/`sg diff` 掉一個檔案。刻意的例外只有兩處:
+  `prune_empty_untracked_dirs` 保留自己的 inline 檢查(它的慣例是靜默跳過),
+  以及 `git_dir` + 定長 hex 那類 buffer(風險輪廓不同,只用 `SG_PATH_MAX`)。
+- **刪掉一個已追蹤檔案之後要呼叫 `sg_prune_empty_parents`**
+  (`include/sg/workdir.h`,Phase 21)。執行點只有兩個:`workdir/apply.c` 與
+  `workdir/merge.c` 的 `remove()` 成功之後。⚠ 它**刻意不是 ignore-aware**,與
+  `safety/stash.c` 的 `prune_empty_untracked_dirs` **規則相反**:前者會清掉
+  「空但被 ignore」的目錄(真 git 2.55.0 實測),後者刻意放過(interop 那條
+  `build/` 必須存活的檢查在守它)。**不要「統一」這兩支。**
+- 已知重複(碰到時順手收斂,不要再增加下一份):`path_join` 的兩份逐字複本
+  (`cmd_add.c`、`status.c`)已在 Phase 21 收斂成 `sg_path_join`,連同 14 個
+  `.c` 各自的 `#define SG_PATH_MAX`、`SG_TREE_BUILD_PATH_MAX`、
+  `SG_REVPARSE_PATH_MAX` 與 36 處裸字面量 `4096`——**這批不要再長回來**;
+  小型 strbuf 重複於
   `src/workdir/apply.c:175` 與 `src/cli/cmd_restore.c:104`。`resolve_commit_tree`
   的六份逐字複本(`cmd_switch.c`、`cmd_merge.c`、`cmd_rebase.c`、`cmd_clone.c`、
   `cmd_reset.c`、`workdir/apply.c`)已在 Phase 15 收斂成
@@ -131,6 +147,15 @@ staging 的驗證。本機綠燈不是充分證據。**
   `sg_tree_build_from_index`/`sg_tree_build_from_workdir`
   (`include/sg/tree_build.h`),前者只吃 index 的 stage-0 條目、後者會重新雜湊
   工作目錄;新程式碼要哪一種先看標頭註解,不要在呼叫端重寫這段邏輯。
+  **後者從 Phase 21 起多吃一個必填的 `sg_workdir_missing`**,決定「index 有、
+  工作目錄裡不見了」的路徑怎麼算:`KEEP_INDEX_BLOB`(`sg_snapshot_create`,
+  安全網要能還原到刪除之前)與 `RECORD_DELETION`(`sg_stash_push` 建
+  `worktree_tree`,要能表示刪除)。**沒有預設值是刻意的**——靜默挑一邊正是它
+  要消滅的 bug。注意**同一次 `sg stash push` 裡兩種都會用到**(它自己也呼叫
+  `sg_snapshot_create`)。另外「檔案存在但讀不到」在兩個 policy 下**都是硬失敗**,
+  所以 `sg_snapshot_create` 的合約是「解析得出來,否則拒絕快照」,不是
+  「一定解析得出來」;分類用的 `lstat` **必須排在 `sg_read_file` 失敗之後**,
+  前置探測會把良性競態變成硬失敗(理由見 `docs/DESIGN.md` Phase 21)。
   merge/rebase/stash 共用的「把 `sg_merge_result` 落地成工作目錄+index」迴圈
   也已抽成 `sg_merge_result_apply`(`include/sg/merge.h`)。**Phase 20 起它會
   跳過「結果與 ours(HEAD)相同」的條目,不重寫工作目錄,但仍會把每個結果條目
@@ -195,6 +220,14 @@ staging 的驗證。本機綠燈不是充分證據。**
   拒絕(真 git 部分套用,留下無出口的 entry);dirty apply/pop 撞到已 staged
   的改動一律拒絕(真 git 的 ours 是 index、能合併,sg 的 ours 是 HEAD、放行
   會輾掉 staged 內容)。細節見 `docs/DESIGN.md` Phase 20。
+- **工作目錄裡的刪除從 Phase 21 起是可以被 stash 的**:stash 自己的 tree 省略該
+  路徑,`pop` 因此把它重新刪掉而不是還原;只有一個刪除也足以建出 stash(不再是
+  「No local changes to save」)。index parent(`stash^2`)仍列著該檔,除非刪除
+  已 staged。**這是 `sg stash pop` 第一次會真的刪掉工作目錄裡的檔案**——先前
+  `worktree_tree` 必含 index 每個路徑,`deleted` 條目的 `ours_present` 恆為 0,
+  `merge.c` 一律跳過 `remove()`。新可達的分歧:stash 了未 staged 的刪除、之後
+  把同一路徑的刪除 staged、再 pop,sg 拒絕而真 git 不拒絕(同一條「ours 是 HEAD
+  不是 index」)。細節見 `docs/DESIGN.md` Phase 21。
 
 ## 核心型別速查
 
@@ -276,7 +309,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 37 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 39 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。
