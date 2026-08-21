@@ -8670,6 +8670,65 @@ check "phase25 oracle: precondition -- that header really is the detached one" \
     grep -q '^## HEAD (no branch)$' "$WORKDIR/p25_det_git.txt"
 (cd "$P25" && git checkout -q -) > /dev/null 2>&1
 
+# --- stash show: real git reading a stash sg built ------------------------
+# The stash is created by sg and read back by both, so this checks two
+# things at once: that sg's stash commit still has the shape git expects,
+# and that sg's rendering of it agrees with git's byte for byte.
+# The patch body is deliberately not compared -- sg emits one hunk per file
+# by design this round -- but -p is still asserted to produce a patch, so
+# that "the flag is accepted" cannot pass by printing a diffstat.
+P25_SS="$WORKDIR/p25_stashshow"
+(cd "$WORKDIR" && "$SG" init p25_stashshow) > /dev/null 2>&1
+(cd "$P25_SS" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'a\nb\nc\n' > "$P25_SS/a.txt"
+printf 'k\n' > "$P25_SS/c.txt"
+(cd "$P25_SS" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+printf 'a\nB\nc\nd\n' > "$P25_SS/a.txt"
+printf 'k\nk2\n' > "$P25_SS/c.txt"
+printf 's\n' > "$P25_SS/staged.txt"
+(cd "$P25_SS" && "$SG" add staged.txt) > /dev/null 2>&1
+# Sorts between a.txt and c.txt on purpose: a -u listing built by running two
+# diffs and concatenating them comes out in the wrong order here, and a
+# fixture whose untracked name sorted last would not notice.
+printf 'u\n' > "$P25_SS/b.txt"
+(cd "$P25_SS" && "$SG" stash push -u -m "wip") > /dev/null 2>&1
+
+check "phase25 oracle: precondition -- git can read the stash sg built" \
+    sh -c "(cd '$P25_SS' && LC_ALL=C git stash list) 2>/dev/null | grep -q 'stash@{0}'"
+check "phase25 oracle: precondition -- and it has the 3-parent shape -u produces" \
+    sh -c "(cd '$P25_SS' && git cat-file -p 'stash@{0}') 2>/dev/null | grep -c '^parent ' | grep -q '^3\$'"
+check "phase25 oracle: precondition -- the default stash show really is a diffstat" \
+    sh -c "(cd '$P25_SS' && LC_ALL=C git stash show) 2>/dev/null | grep -q 'files changed'"
+
+for _sfmt in "" "--stat" "--numstat" "--shortstat" "--name-only" "--name-status"; do
+    (cd "$P25_SS" && "$SG" stash show $_sfmt) 2>/dev/null > "$WORKDIR/p25_ss_sg.txt"
+    (cd "$P25_SS" && LC_ALL=C git -c core.quotepath=false stash show $_sfmt) 2>/dev/null \
+        > "$WORKDIR/p25_ss_git.txt"
+    check "phase25: sg stash show ${_sfmt:-'(default)'} matches git byte-for-byte" \
+        cmp -s "$WORKDIR/p25_ss_sg.txt" "$WORKDIR/p25_ss_git.txt"
+done
+
+for _sflag in "--include-untracked" "--only-untracked"; do
+    (cd "$P25_SS" && "$SG" stash show "$_sflag" --name-only) 2>/dev/null \
+        > "$WORKDIR/p25_ssu_sg.txt"
+    (cd "$P25_SS" && LC_ALL=C git -c core.quotepath=false stash show "$_sflag" --name-only) \
+        2>/dev/null > "$WORKDIR/p25_ssu_git.txt"
+    check "phase25: sg stash show $_sflag --name-only matches git" \
+        cmp -s "$WORKDIR/p25_ssu_sg.txt" "$WORKDIR/p25_ssu_git.txt"
+done
+
+# The union must be sorted, not concatenated: b.txt is untracked and sorts
+# between the two tracked names.
+check "phase25 oracle: precondition -- the untracked name really does sort in the middle" \
+    sh -c "(cd '$P25_SS' && LC_ALL=C git stash show --include-untracked --name-only) 2>/dev/null | tr '\\n' ' ' | grep -q 'a.txt b.txt c.txt'"
+check "phase25: and sg lists a path exactly once under -u, never twice" \
+    sh -c "(cd '$P25_SS' && '$SG' stash show -u --name-only) 2>/dev/null | LC_ALL=C sort | uniq -d | wc -l | tr -d ' ' | grep -q '^0\$'"
+
+check "phase25: sg stash show -p produces a patch, not a diffstat" \
+    sh -c "(cd '$P25_SS' && '$SG' stash show -p) 2>/dev/null | grep -q '^diff --git'"
+check "phase25: sg stash show rejects an unknown flag" \
+    sh -c "! (cd '$P25_SS' && '$SG' stash show --bogus) > /dev/null 2>&1"
+
 # --- an unknown flag is refused, not ignored ------------------------------
 check "phase25: sg diff rejects an unknown flag" \
     sh -c "! (cd '$P25' && '$SG' diff --bogus) > /dev/null 2>&1"
