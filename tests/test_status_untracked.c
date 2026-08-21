@@ -470,6 +470,58 @@ static void test_fold_is_per_directory_not_global(void)
     free(git_dir);
 }
 
+/* dir_has_tracked_descendant's prefix check must require the byte right
+   after the shared text prefix to be '/', not just any byte at all -- a
+   tracked path that is merely a lexical near-miss for the untracked
+   directory "un/" must NOT be mistaken for a tracked descendant of it. The
+   fixture specifically needs the near-miss's next byte to sort AFTER '/'
+   (0x2F) in the index's own (path, stage) order: "unrelated.txt" ('r' =
+   0x72 > '/') sorts to the right of the search key "un/" and so is a real
+   candidate the binary search's lower_bound can land on, whereas something
+   like "un-related.txt" ('-' = 0x2D < '/') sorts to the LEFT of "un/" and
+   is never examined at all -- a fixture built from the latter would pass
+   even with the boundary check completely missing (measured: it did, while
+   this fixture catches it). If the trailing '/' is ever dropped from the
+   comparison, "unrelated.txt" wrongly blocks "un/" from folding. */
+static void test_fold_prefix_boundary_is_not_a_lexical_near_miss(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    sg_index_entry entry;
+    unsigned char blob_id[SG_SHA1_RAW_LEN];
+    char **untracked = NULL;
+    size_t count = 0;
+
+    mkdir_p(repo_root, "un");
+    write_workdir_file(repo_root, "unrelated.txt", "t\n");
+    write_workdir_file(repo_root, "un/a.txt", "a\n");
+
+    memset(&idx, 0, sizeof(idx));
+    memset(&entry, 0, sizeof(entry));
+    entry.path = strdup("unrelated.txt");
+    entry.mode = 0100644;
+    entry.stage = 0;
+    memset(blob_id, 0, sizeof(blob_id));
+    memcpy(entry.sha1, blob_id, SG_SHA1_RAW_LEN);
+    CHECK(sg_index_upsert(&idx, &entry) == 0, "upsert failed");
+    free(entry.path);
+
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+                                   &untracked, &count) == 0,
+         "list_untracked (fold) failed");
+    CHECK(list_contains(untracked, count, "un/"),
+         "un/ must still fold -- 'unrelated.txt' is a lexical near-miss, not a tracked "
+         "descendant of un/");
+    CHECK(!list_contains(untracked, count, "un/a.txt"),
+         "un/a.txt must not be listed individually once un/ folds");
+    free_list(untracked, count);
+
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
 /* A folded directory that mixes non-ignored and ignored files: default
    (include_ignored=0) shows only the folded "mixed/" line; include_ignored=1
    ADDITIONALLY lists the ignored file individually alongside the fold. */
@@ -591,6 +643,7 @@ int main(void)
     test_tree_build_from_untracked_matches_sorted_reference();
     test_fold_wholly_untracked_dir();
     test_fold_is_per_directory_not_global();
+    test_fold_prefix_boundary_is_not_a_lexical_near_miss();
     test_fold_mixed_dir_lists_ignored_individually();
     test_fold_all_ignored_dir();
     test_fold_empty_dir_produces_no_entries();

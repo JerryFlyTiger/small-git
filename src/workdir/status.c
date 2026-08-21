@@ -325,20 +325,25 @@ static int untracked_append(char ***out, size_t *count, size_t *cap, const char 
 }
 
 /* Like untracked_append, but appends reldir with a trailing '/' -- the
-   folded-directory line. Silently drops (does not append, does not fail)
-   a reldir long enough that reldir + "/" would not fit SG_PATH_MAX; this
-   mirrors collect_untracked's own truncation convention elsewhere in this
-   file except that folded-dir names are vanishingly unlikely to approach
-   that limit, so a warning was judged not worth the noise here. Returns 0
-   on success (including the silently-skipped case), -1 on allocation
+   folded-directory line. A reldir long enough that reldir + "/" would not
+   fit SG_PATH_MAX is skipped rather than appended, same as every other
+   truncation case in this file -- and, like every other one, it warns
+   rather than dropping the path in silence: CLAUDE.md's policy on
+   directory-walk truncation is explicit that the failure direction can
+   never be "quietly omit from `sg status`", and a rare trigger condition is
+   exactly what makes a silent one hard to notice later. Returns 0 on
+   success (including the warned-and-skipped case), -1 on allocation
    failure. */
 static int untracked_append_folded(char ***out, size_t *count, size_t *cap, const char *reldir)
 {
     char folded[SG_PATH_MAX];
     size_t len = strlen(reldir);
 
-    if (len + 2 > sizeof(folded))
+    if (len + 2 > sizeof(folded)) {
+        fprintf(stderr, "sg: warning: 路徑過長,無法摺疊目錄 %s(未追蹤清單可能不完整)\n",
+               sg_quote_path_delimited(reldir));
         return 0;
+    }
     memcpy(folded, reldir, len);
     folded[len] = '/';
     folded[len + 1] = '\0';
@@ -351,19 +356,52 @@ static int untracked_append_folded(char ***out, size_t *count, size_t *cap, cons
    directory may be collapsed into a single "dir/" line: a directory that
    still holds a tracked path anywhere below it must be walked entry by
    entry, never folded, or a tracked (or conflicted) file would silently
-   disappear from the listing. */
+   disappear from the listing.
+
+   idx is sorted by (path, stage) (include/sg/index.h's documented
+   invariant), so this is a lower_bound binary search for the key
+   "reldir/" rather than the linear scan an earlier version of this
+   function used -- collect_untracked_folded calls this once per
+   undecided directory, and a linear O(index size) scan there made the
+   whole walk O(directories * index size), on the path every flagless
+   `sg status` takes. The '/' is baked directly into the search key
+   (not checked separately against p[prefix_len] after the search, the
+   way the linear version did) precisely so that boundary can never be
+   dropped by a future edit: any real descendant path "reldir/x..."
+   sorts strictly after the key "reldir/" itself (matching prefix, then
+   more characters), while a lexical near-miss like "reldirX/y" sorts
+   after "reldir/" too but does NOT share reldir's literal "reldir/"
+   prefix -- the final strncmp against the full key (slash included)
+   is what tells the two apart. */
 static int dir_has_tracked_descendant(const sg_index *idx, const char *reldir)
 {
-    size_t prefix_len = strlen(reldir);
-    size_t i;
+    char key[SG_PATH_MAX + 2];
+    size_t reldir_len = strlen(reldir);
+    size_t keylen;
+    size_t lo = 0;
+    size_t hi = idx->count;
 
-    for (i = 0; i < idx->count; i++) {
-        const char *p = idx->entries[i].path;
+    if (reldir_len + 2 > sizeof(key))
+        return 1; /* reldir always comes from sg_path_join elsewhere and so
+                     already fits SG_PATH_MAX -- this is not reachable in
+                     practice, but if it ever were, treating it as "may have
+                     a tracked descendant" is the fail-safe direction: it
+                     forces the walk instead of risking a wrongly-folded
+                     directory that hides a tracked or conflicted path. */
+    memcpy(key, reldir, reldir_len);
+    key[reldir_len] = '/';
+    key[reldir_len + 1] = '\0';
+    keylen = reldir_len + 1;
 
-        if (strncmp(p, reldir, prefix_len) == 0 && p[prefix_len] == '/')
-            return 1;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if (strcmp(idx->entries[mid].path, key) < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
     }
-    return 0;
+    return lo < idx->count && strncmp(idx->entries[lo].path, key, keylen) == 0;
 }
 
 /* Recursively determines, for a directory already known to hold no tracked
@@ -429,6 +467,10 @@ static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *
             continue;
         }
 
+        /* Symlinks are not S_ISDIR or S_ISREG here, so an untracked symlink
+           is neither counted nor listed -- this is collect_untracked's own
+           pre-existing behavior (symlink support is deliberately deferred,
+           see docs/DESIGN.md), not a regression introduced by this walk. */
         if (S_ISDIR(st.st_mode)) {
             int rc;
 
@@ -457,11 +499,17 @@ static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *
 }
 
 /* Recursively appends every ignored path under reldir individually, except
-   a subdirectory that is itself entirely ignored (sg_ignore_is_ignored with
-   is_dir = 1) collapses into one "subdir/" line instead of being descended
-   into -- the same fold-a-wholly-ignored-directory rule applied at the top
-   level (sg_status_list_untracked's own FOLD_DIRS branch below), just one
-   level down. Only meaningful under a reldir already known to have no
+   a subdirectory that -- recursively, not just by name -- holds no
+   non-ignored file at all collapses into one "subdir/" line instead of
+   being descended into file by file: the same fold-a-wholly-ignored-
+   directory rule applied at the top level (sg_status_list_untracked's own
+   FOLD_DIRS branch below), just one level down, and reusing the exact same
+   dir_scan_flags() classification the top level uses rather than a
+   name-only sg_ignore_is_ignored(..., is_dir=1) check (an earlier version
+   of this function used the latter, which under-folds: a directory whose
+   own name matches no directory-only pattern, but whose every FILE happens
+   to match a pattern like "*.tmp", was wrongly listed file by file instead
+   of folding). Only meaningful under a reldir already known to have no
    tracked descendant (the caller verified that before deciding to fold
    reldir itself), and only ever called when include_ignored is set. Warns
    (never silent) on the same truncation/unreadable-directory cases
@@ -512,25 +560,32 @@ static int collect_ignored_within(const char *repo_root, const char *reldir, sg_
         }
 
         if (S_ISDIR(st.st_mode)) {
-            if (sg_ignore_is_ignored(ig, relpath, 1)) {
-                if (untracked_append_folded(out, count, cap, relpath) != 0) {
-                    closedir(d);
-                    return -1;
-                }
-                continue;
-            }
+            /* Symlinks are not S_ISDIR or S_ISREG here, so an untracked
+               symlink is neither counted nor listed -- this is
+               collect_untracked's own pre-existing behavior (symlink
+               support is deliberately deferred, see docs/DESIGN.md), not a
+               regression introduced by this walk. */
+            int has_nonignored = 0;
+            int has_any = 0;
+            int rc;
+
             if (sg_ignore_push_dir(ig, relpath) != 0) {
                 closedir(d);
                 return -1;
             }
-            {
-                int rc = collect_ignored_within(repo_root, relpath, ig, out, count, cap);
-
-                sg_ignore_pop_dir(ig);
-                if (rc != 0) {
-                    closedir(d);
-                    return -1;
-                }
+            rc = dir_scan_flags(repo_root, relpath, ig, &has_nonignored, &has_any);
+            if (rc == 0) {
+                if (has_nonignored)
+                    rc = collect_ignored_within(repo_root, relpath, ig, out, count, cap);
+                else if (has_any)
+                    rc = untracked_append_folded(out, count, cap, relpath);
+                /* neither: relpath is empty (recursively) -- nothing to
+                   report, same as the top-level FOLD_DIRS decision. */
+            }
+            sg_ignore_pop_dir(ig);
+            if (rc != 0) {
+                closedir(d);
+                return -1;
             }
         } else if (S_ISREG(st.st_mode)) {
             if (sg_ignore_is_ignored(ig, relpath, 0)) {
@@ -624,6 +679,11 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
                 continue;
             }
 
+            /* Symlinks are not S_ISDIR or S_ISREG here, so an untracked
+               symlink is neither counted nor listed -- this is
+               collect_untracked's own pre-existing behavior (symlink
+               support is deliberately deferred, see docs/DESIGN.md), not a
+               regression introduced by this walk. */
             if (S_ISDIR(st.st_mode)) {
                 if (!include_ignored && sg_ignore_is_ignored(ig, relpath, 1))
                     continue; /* prune: nothing below can be re-included */
