@@ -245,6 +245,10 @@ path filtering, or any other
 option.
 .SS status
 .B sg status
+.RB [ -s | --short | --porcelain ]
+.RB [ -b | --branch ]
+.RB [ --ignored ]
+.RB [ -u <mode> | --untracked-files= <mode> ]
 .PP
 Prints the current branch, whether a merge or rebase is in progress (with
 next-step hints), and three sections of changes: staged (index vs.
@@ -254,19 +258,94 @@ section includes a short hint about the relevant follow-up command, such as
 .B add
 or
 .BR restore .
-Unresolved merge conflicts are listed under \(dqUnmerged paths\(dq. Takes no
-arguments or flags.
+.PP
+Unresolved merge conflicts are listed under \(dqUnmerged paths\(dq, labelled
+by which of index stages 1/2/3 the path carries:
+.BR "both deleted" ,
+.BR "deleted by them" ,
+.BR "both modified" ,
+.BR "deleted by us" ,
+.BR "added by us" ,
+.BR "both added" ,
+or
+.BR "added by them" .
+.PP
+.BR -s ", " --short " and " --porcelain
+select git's short format: one
+.RI XY " " path
+line per entry, where
+.I X
+is the index against
+.BR HEAD ,
+.I Y
+is the working directory against the index,
+.B ??
+marks an untracked path and
+.B !!
+an ignored one. Tracked entries come first, then untracked, then ignored,
+each group sorted by path; a path can appear twice (for instance
+.B "D  f"
+and
+.BR "?? f" ,
+after the file has been removed from the index but left on disk).
+.PP
+The short format quotes a path that merely contains a space, because its
+.B "?? "
+prefix makes a space a field separator; the long format leaves the same name
+bare. Both quote control characters. This is a real difference between the
+two formats in git, not an inconsistency in
+.BR sg .
+.PP
+.BR -b " and " --branch
+add a leading
+.RI "## " branch
+line, which reads
+.B "## No commits yet on <branch>"
+on an unborn
+.B HEAD
+and
+.B "## HEAD (no branch)"
+when detached.
+.B --ignored
+adds ignored paths.
+.PP
+.BR -u <mode> " and " --untracked-files= <mode>
+control how untracked paths are listed.
+.B normal
+(the default) folds a directory that contains no tracked path into a single
+.RI dir /
+entry;
+.B all
+lists every file individually; and
+.B no
+omits untracked paths entirely. A bare
+.B -u
+means
+.BR all .
+The mode must be attached to
+.B -u
+without a space \(em
+.B "-u no"
+treats
+.B no
+as a pathspec, as it does in git.
+.PP
+Folding is decided per directory and recursively: a directory holding a
+tracked path anywhere beneath it is descended into rather than folded, a
+directory whose contents are all ignored is omitted unless
+.B --ignored
+is given (in which case it too is folded), and an empty directory produces
+nothing. Ignored files sitting directly inside a folded untracked directory
+are still listed one by one under
+.BR --ignored .
 .PP
 The untracked list honours the ignore rules described under
 .B .gitignore
 in
 .B FILES
 below: ignored files are omitted and ignored directories are not descended
-into. Tracked files are never affected by ignore rules. Every untracked
-path is listed individually; unlike
-.BR "git status" ,
-directories are not collapsed. If a directory cannot be read (for instance
-a tree nested deeper than the platform's
+into. Tracked files are never affected by ignore rules. If a directory
+cannot be read (for instance a tree nested deeper than the platform's
 .BR PATH_MAX ,
 which
 .B sg
@@ -275,22 +354,82 @@ to standard error saying the list may be incomplete, rather than the entry
 being dropped silently.
 .SS diff
 .B sg diff
+.RB [ --cached | --staged ]
+.RB [ --stat [= <width> [, <name-width> ]]| --numstat | --shortstat | --name-only | --name-status ]
+.RI [ rev " [" rev ]]
 .PP
-Shows the difference between the index and the working directory (i.e. the
-unstaged changes that
+Shows a difference between two of: a commit's tree, the index, and the
+working directory. With no arguments it compares the index to the working
+directory, as
 .B "git diff"
-would show with no arguments) for every stage-0 index entry, in unified-diff
-form. Files whose content contains a NUL byte are reported as \(dqBinary
-files ... differ\(dq rather than diffed line-by-line. Entries with an
-unresolved merge conflict (stage 1/2/3) are skipped (see
-.B status
-for those). Takes no arguments or flags; there is no path filtering, no
-.BR --staged / --cached ,
-and no diffing against an arbitrary commit or ref.
+does. With
+.BR --cached " (or " --staged )
+it compares
+.B HEAD
+\(em or
+.IR rev ,
+if one is given \(em to the index. With one
+.I rev
+it compares that commit's tree to the working directory, and with two it
+compares the two trees. Flags may appear anywhere on the command line.
+.PP
+When a
+.I rev
+is given, the
+.I index
+decides which paths take part, not the working directory: a path recorded in
+the tree but absent from the index is reported as deleted even though the
+file is still on disk, and an untracked file is not reported at all. This
+matches git.
+.PP
+A path with an unresolved conflict is reported as git reports it, which
+differs by comparison:
+.B U
+under
+.BR --cached ,
+an ordinary
+.B M
+against a
+.I rev
+(the index only decides membership there; the content still comes from the
+working directory), and both a
+.B U
+row and a second row comparing stage 2 against the file on disk for the
+plain index-vs-working-directory case.
+.PP
+The default output is a patch.
+.BR --numstat ", " --shortstat ", " --name-only " and " --name-status
+produce git's machine-readable formats byte for byte;
+.B --stat
+produces git's diffstat, including its column layout, bar scaling, name
+truncation and display-width handling for wide characters, and honours
+.B COLUMNS
+the way git does even when standard output is not a terminal.
+.BI --stat= <width>
+and
+.BI --stat= <width> , <name-width>
+override the widths.
+.PP
+Files whose content contains a NUL byte are reported as \(dqBinary
+files ... differ\(dq in a patch, and as
+.RI "Bin " old " -> " new " bytes"
+in
+.BR --stat .
+A change to nothing but the mode prints
+.B "old mode"
+and
+.B "new mode"
+lines with no hunk.
 .PP
 The line-level diff algorithm is a plain LCS-based implementation: it is
 correct but does not replicate git's exact hunk-splitting or context-window
-conventions, and always emits a single hunk covering the whole file.
+conventions, and always emits a single hunk covering the whole file. The
+patch body therefore differs from git's, deliberately; the machine-readable
+formats above are the ones checked against git byte for byte. For the same
+reason an unresolved conflict is skipped in patch output rather than being
+rendered as git's combined
+.B "diff --cc"
+format. There is no path filtering, and no rename detection.
 .SS branch
 .B sg branch
 .RB [ -d | --delete ]
