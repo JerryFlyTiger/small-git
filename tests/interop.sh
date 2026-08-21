@@ -8572,6 +8572,58 @@ check "phase25 oracle: precondition -- and a control-character name it must quot
 check "phase25 oracle: precondition -- --stat leaves a spaced name unquoted" \
     sh -c "! grep -q '\"has space.txt\"' '$WORKDIR/p25_stat_git.txt'"
 
+# --- --stat under a width that forces the squeeze ------------------------
+# The layout has a clamp at W*3/8 that only fires when name+number+6+graph
+# overruns the available width, and nothing in the ordinary fixtures gets
+# near it: at the default 80 columns with short paths the bars print at full
+# length and the constant is never consulted. A mutation changing 3/8 to 1/2
+# passed every unit test. Real git is the only oracle for a constant like
+# this, so the squeeze is exercised here rather than pinned to our own
+# output. COLUMNS is set explicitly on both sides -- git honours it even when
+# stdout is not a tty, so leaving it to the environment would make this check
+# depend on whatever terminal the developer happens to be using.
+P25_SQ="$WORKDIR/p25_squeeze"
+(cd "$WORKDIR" && "$SG" init p25_squeeze) > /dev/null 2>&1
+(cd "$P25_SQ" && git config user.email "a@b.c" && git config user.name "git user")
+python3 - "$P25_SQ" <<'PYSQ1'
+import os, sys
+d = sys.argv[1]
+deep = os.path.join(d, 'aaaaaaaaaa/bbbbbbbbbb/cccccccccc/dddddddddd')
+os.makedirs(deep, exist_ok=True)
+open(os.path.join(deep, 'eeeeeeeeee.txt'), 'w').write('x\n')
+open(os.path.join(d, 'wide.txt'), 'w').write('l\n' * 10)
+open(os.path.join(d, 'tiny.txt'), 'w').write('t\n')
+PYSQ1
+(cd "$P25_SQ" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+python3 - "$P25_SQ" <<'PYSQ2'
+import os, sys
+d = sys.argv[1]
+deep = os.path.join(d, 'aaaaaaaaaa/bbbbbbbbbb/cccccccccc/dddddddddd/eeeeeeeeee.txt')
+open(deep, 'w').write('x\n' + 'z\n' * 40)
+open(os.path.join(d, 'wide.txt'), 'w').write('l\n' * 900)
+open(os.path.join(d, 'tiny.txt'), 'w').write('t\nu\n')
+PYSQ2
+(cd "$P25_SQ" && "$SG" add .) > /dev/null 2>&1
+for _cols in 40 60 80 120; do
+    (cd "$P25_SQ" && COLUMNS=$_cols "$SG" diff --cached --stat) 2>/dev/null \
+        > "$WORKDIR/p25_sq_sg.txt"
+    (cd "$P25_SQ" && LC_ALL=C COLUMNS=$_cols git -c core.quotepath=false diff --cached --stat) \
+        2>/dev/null > "$WORKDIR/p25_sq_git.txt"
+    check "phase25: --stat at COLUMNS=$_cols matches git, squeeze and all" \
+        cmp -s "$WORKDIR/p25_sq_sg.txt" "$WORKDIR/p25_sq_git.txt"
+done
+# Vacuous-pass guards: the squeeze must actually be doing something here.
+(cd "$P25_SQ" && LC_ALL=C COLUMNS=40 git -c core.quotepath=false diff --cached --stat) \
+    2>/dev/null > "$WORKDIR/p25_sq_g40.txt"
+(cd "$P25_SQ" && LC_ALL=C COLUMNS=120 git -c core.quotepath=false diff --cached --stat) \
+    2>/dev/null > "$WORKDIR/p25_sq_g120.txt"
+check "phase25 oracle: precondition -- COLUMNS really does change git's layout" \
+    sh -c "! cmp -s '$WORKDIR/p25_sq_g40.txt' '$WORKDIR/p25_sq_g120.txt'"
+check "phase25 oracle: precondition -- the long path really is truncated at 40" \
+    grep -q '\.\.\./' "$WORKDIR/p25_sq_g40.txt"
+check "phase25 oracle: precondition -- and the bars really are scaled, not printed raw" \
+    sh -c "! grep -q ' 900 ' '$WORKDIR/p25_sq_g40.txt'"
+
 # --- diff: the index decides the path set, not the working tree -----------
 # `git rm --cached f` leaves the bytes on disk, and git still calls it a
 # deletion. Getting this from the working tree instead would report nothing.

@@ -248,10 +248,13 @@ static char *truncate_name(const char *name, int name_width)
         free(cps);
         return strdup(name);
     }
-    if (name_width <= 3) {
-        free(cps);
-        return strdup("...");
-    }
+    /* No early return for name_width <= 3. It looks like it needs one, and an
+       earlier version had it, but the general path below already produces
+       exactly "...": target goes <= 0, the loop drops every character, and an
+       empty suffix has no '/' to push past. Keeping the shortcut cost more
+       than it saved -- a mutation aimed at the <= 3 boundary came back green
+       and read as missing coverage, when the truth was that the branch could
+       not change the answer. The defence worth mutating is the loop. */
 
     {
         long target = name_width - 3;
