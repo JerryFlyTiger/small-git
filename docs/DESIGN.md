@@ -2315,3 +2315,83 @@ Phase 22 把控制字元刻意留在名稱驗證之外,理由記在該段:真 gi
 
 最終 `tests/interop.sh` 1320 項檢查(Phase 22 結束時是 1299),`make test` 41 支
 二進位全過(新增 `tests/test_quote_path.c`),`make sanitize` 乾淨,子指令維持 24 個。
+
+## Phase 24:`phase6a` 間歇性失敗的根因
+
+Phase 22 末段記著一條「待查」:`phase6a` 的
+`that push advances the remote's refs/sg/chunks to the local keep-alive commit`
+偶爾變紅,無法按需重現,形狀是「push 回報成功、遠端 ref 沒動」。查到了,是真的 bug。
+
+### 根因
+
+`keep_alive_add`(`src/storage/chunk.c`)的提前返回**只檢查 `new_count == 0`**。
+當傳進來的 chunk id **全部都已存在**時,它照樣重建一個**內容完全相同的 tree**,
+再用 `time(NULL)` 建一個新 commit。
+
+`sg push` 在遠端與本機的 keep-alive ref 不同時**一定**會走合併路徑
+(`sg_chunk_keepalive_merge_commit`),而遠端的集合通常是本機的子集
+——於是「什麼都沒加,卻建了新 commit」。
+
+**間歇的來源**:新舊 commit **只差時間戳**。同一秒內 id 相同(完全看不出來),
+跨秒才不同。跨秒時本機 ref 前進、推出去的是新 id,而 interop 是在 push **之前**
+記下本機值的,於是比對失敗。
+
+逐位元組證據(同一次失敗的兩個 commit):
+```
+tree bcccb1b01bf96b7b764344472a5b9347877e5f2d
+author small_git <sg@localhost> 1787294421 +0000
+===
+tree bcccb1b01bf96b7b764344472a5b9347877e5f2d
+author small_git <sg@localhost> 1787294422 +0000
+```
+
+前後對照(同一個腳本、同一個條件):
+
+| 條件 | 失敗率 |
+|---|---|
+| 正常速度 | 6/60(10%) |
+| `sg add` 與 `push` 之間插 1.2 秒 | **8/8** |
+| **修法後 + 同樣的 1.2 秒** | **0/8** |
+
+### 修法
+
+`entries` 先複製全部既有條目、再只加不重複的新條目,所以
+`entry_count == existing_count` 精確等價於「沒有任何新東西」。那種情況直接返回。
+
+**這不只是測試不穩**:每次 push 都會在物件庫留下一個內容重複的 commit,
+並讓一個實際上沒有變化的 ref 無謂地移動。
+
+### 新測試為什麼刻意 `sleep(1)`
+
+`test_keep_alive_merge_of_subset_does_not_move_the_ref` 裡那一秒不是浪費:
+沒有它的話,重建的 commit 會落在同一秒、拿到相同 id,**測試在修法前後都會通過**
+——一條看起來有覆蓋、實際上零鑑別力的斷言。理由已寫進測試註解。
+
+### 這次調查最該記的:重現器連續兩次沒在重現,而且都偽裝成好消息
+
+| | 症狀 | 抓到的方式 |
+|---|---|---|
+| 第一次 | chunking 沒啟用 → push 短路成 "Everything up-to-date",3 次「ok」全是空跑 | 重現器自帶的**情境自檢** |
+| 第二次 | **`git clone` 預設不抓 `refs/sg/*`** → 遠端從來沒有那個 ref → 40 輪全走「建立」分支而不是要測的「合併」分支 | 把自檢加嚴:斷言遠端**已有**該 ref |
+
+第二次特別危險:**40 輪全綠看起來就是「查不到問題」**。若在那裡下結論說
+「判定為環境雜訊」,那會是一個完全錯誤、而且很有說服力的結論。
+
+**還有一個自我證偽的陷阱**:我先前用 `sleep 1.2` 測時間戳假設,得到 0 次失敗,
+於是判定假設不成立。但那次跑在**還沒修好的**重現器上,根本沒進合併分支
+——**實驗本身無效**。修好後同一個實驗是 8/8 失敗。
+教訓:**一個實驗給出否定結果時,要先確認它有沒有真的執行到待測的那條路徑。**
+
+### 重現方法(重現器本身刻意不進 repo)
+
+需要起 HTTP 伺服器、不在任何閘門裡,加進 `tests/` 只會靜默腐爛;
+持久的守衛是上面那支單元測試。要重建的話:
+
+1. 來源 repo 開 `sg.chunking true` + `sg.chunkthreshold 1048576`,加一個 5 MiB 隨機檔。
+2. `git clone --bare` 成伺服器 repo,起 `interop.sh` 內嵌的 `http_server.py`。
+3. `sg clone` 出 dest,**dest 也要開 chunking**。
+4. **先從 dest push 一次**(建立遠端的 `refs/sg/chunks`)——這一步是第二個陷阱,
+   `git clone` 不會帶 `refs/sg/*`。
+5. 再 `sg add` 第二個 5 MiB 隨機檔,`sleep 1.2`,然後 push。
+6. 比對遠端 ref 與本機 ref;**並斷言 `remote_before` 是合法 sha**,
+   否則走的是建立分支而非合併分支。
