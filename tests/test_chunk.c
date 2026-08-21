@@ -1785,6 +1785,69 @@ static void test_repo_read_chunk_config_bad_threshold(void)
     free(git_dir);
 }
 
+/* Merging a set that is already fully present must leave the keep-alive ref
+   exactly where it was -- not rewrite it under a fresh commit holding an
+   identical tree.
+
+   The distinction is invisible most of the time, which is what made the
+   original bug intermittent: the rebuilt commit takes its timestamp from
+   time(NULL), so it only gets a different object id when the rebuild lands
+   in a later second than the original. This test sleeps across that boundary
+   on purpose. Without the sleep it passes whether or not the fix is present,
+   which would be a test that looks like coverage and is not. */
+static void test_keep_alive_merge_of_subset_does_not_move_the_ref(void)
+{
+    char *git_dir = make_tmp_repo();
+    size_t len = 3 * 1024 * 1024;
+    unsigned char *data = malloc(len);
+    unsigned char blob_id[SG_SHA1_RAW_LEN];
+    unsigned char before[SG_SHA1_RAW_LEN], after[SG_SHA1_RAW_LEN];
+    int chunked = -1;
+    int ok;
+
+    if (data == NULL) {
+        fprintf(stderr, "FAIL keep-alive subset merge: out of memory\n");
+        failures++;
+        free(git_dir);
+        return;
+    }
+    fill_random(data, len, 91);
+
+    ok = sg_chunk_store_blob(git_dir, data, len, 1024 * 1024, blob_id, &chunked) == 0 &&
+        chunked == 1 && sg_ref_read_path(git_dir, SG_CHUNK_KEEPALIVE_REF, before) == 0;
+    if (!ok) {
+        fprintf(stderr, "FAIL keep-alive subset merge: could not set up a chunked blob\n");
+        failures++;
+        free(data);
+        free(git_dir);
+        return;
+    }
+
+    /* Cross a second boundary on purpose: the rebuilt commit would take its
+       timestamp from time(NULL), so within one second it lands on the same
+       object id and the bug is invisible. Without this sleep the assertion
+       below passes with or without the fix -- a test that looks like
+       coverage and is not. */
+    sleep(1);
+
+    /* Merge the keep-alive commit into itself. Every id it names is already
+       present, so nothing is added and the ref must not move. */
+    ok = sg_chunk_keepalive_merge_commit(git_dir, before) == 0 &&
+        sg_ref_read_path(git_dir, SG_CHUNK_KEEPALIVE_REF, after) == 0 &&
+        memcmp(before, after, SG_SHA1_RAW_LEN) == 0;
+    if (!ok) {
+        fprintf(stderr,
+               "FAIL keep-alive subset merge: merging an already-present set moved the ref "
+               "(rebuilt an identical tree under a fresh timestamp)\n");
+        failures++;
+    } else {
+        printf("PASS keep-alive subset merge: ref unchanged across a second boundary\n");
+    }
+
+    free(data);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_determinism();
@@ -1810,6 +1873,7 @@ int main(void)
     test_read_blob_store_then_delete_one_chunk();
     test_read_blob_store_then_delete_first_chunk();
     test_keep_alive_tree_incremental();
+    test_keep_alive_merge_of_subset_does_not_move_the_ref();
     test_read_blob_keepalive_ref_deleted_with_marker_hard_error();
     test_read_blob_no_ref_no_marker_still_ordinary();
     test_chunking_used_marker_roundtrip();
