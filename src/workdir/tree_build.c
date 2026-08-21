@@ -413,7 +413,8 @@ int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, con
     int chunk_enabled = 0;
     size_t chunk_threshold = SG_CHUNK_DEFAULT_THRESHOLD;
 
-    if (sg_status_list_untracked(git_dir, repo_root, idx, include_ignored, &paths, &count) != 0)
+    if (sg_status_list_untracked(git_dir, repo_root, idx, include_ignored,
+                                 SG_STATUS_UNTRACKED_LIST_FILES, &paths, &count) != 0)
         return -1;
 
     if (file_count_out != NULL)

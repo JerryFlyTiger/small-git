@@ -190,6 +190,49 @@ const char *sg_quote_path(const char *path)
     return sg_quote_path_prefixed("", path);
 }
 
+static int path_needs_quote_porcelain(const char *path)
+{
+    const unsigned char *p = (const unsigned char *)path;
+
+    for (; *p != '\0'; p++) {
+        if (byte_needs_escape(*p) || *p == ' ')
+            return 1;
+    }
+    return 0;
+}
+
+const char *sg_quote_path_porcelain(const char *path)
+{
+    size_t qlen;
+    char *buf;
+
+    if (path == NULL)
+        path = "";
+    qlen = strlen(path);
+
+    if (!path_needs_quote_porcelain(path)) {
+        buf = quote_slot_reserve(qlen + 1);
+        if (buf == NULL)
+            return OOM_FALLBACK;
+        memcpy(buf, path, qlen + 1);
+        return buf;
+    }
+
+    {
+        size_t worst = 1 + qlen * 4 + 1 + 1;
+        size_t pos = 0;
+
+        buf = quote_slot_reserve(worst);
+        if (buf == NULL)
+            return OOM_FALLBACK;
+        buf[pos++] = '"';
+        pos += escape_append((const unsigned char *)path, buf + pos);
+        buf[pos++] = '"';
+        buf[pos] = '\0';
+    }
+    return buf;
+}
+
 const char *sg_quote_path_delimited(const char *path)
 {
     size_t qlen, worst, pos;
