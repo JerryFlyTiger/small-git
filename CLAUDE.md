@@ -231,6 +231,11 @@ staging 的驗證。本機綠燈不是充分證據。**
   逐字複本:`storage/reflog.c`、`storage/chunk.c`、`safety/stash.c`、
   `safety/snapshot.c`、`cli/cmd_rebase.c`、`cli/cmd_merge.c`、`cli/cmd_tag.c`、
   `cli/cmd_commit.c`。碰到時順手收斂,不要再增加下一份。
+  Phase 25 又長出**一對**:`report_bad_tree_path`(`cli/cmd_diff.c:62`)與
+  `report_bad_stash_tree_path`(`cli/cmd_stash.c:337`)幾乎逐字相同(都是把
+  `sg_tree_flatten` 的 `-2` 轉成一行指名 `bad_path` 的錯誤)。**兩者目前都沒有
+  測試觸達**——`tests/interop.sh` 沒有任何一條用惡意 tree 名稱去走 `sg diff`
+  或 `sg stash show`,所以收斂它們之前要先有一條能觀測的檢查,否則改壞了不會有人發現。
 - 遠端/使用者字串轉成檔案路徑前必須先過閘門函式:`sg_ref_name_is_safe`
   (`include/sg/transport.h:38`)、`sg_ref_branch_name_is_safe`(`include/sg/refs.h:13`)。
   **建立**新 ref 時的 check-ref-format 驗證另有一支
