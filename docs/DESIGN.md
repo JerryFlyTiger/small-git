@@ -2397,6 +2397,19 @@ author small_git <sg@localhost> 1787294422 +0000
 ——**實驗本身無效**。修好後同一個實驗是 8/8 失敗。
 教訓:**一個實驗給出否定結果時,要先確認它有沒有真的執行到待測的那條路徑。**
 
+### Mutation 驗證:四條,兩條是冷讀補的
+
+| mutation | 變紅的 |
+|---|---|
+| 還原早退區塊 | `keep-alive subset merge` |
+| 條件寫成恆假 | 同上 |
+| **條件方向反轉**(`==` 改 `!=`) | **8 條**——「真的有新增」被誤判成早退,chunk 從此不被保護,`read_blob`/`missing chunk`/`keepalive-ref-deleted` 一整批跟著倒 |
+| **早退分支回 `-1` 而非 `0`** | **兩條,分屬兩個呼叫端**:`keep-alive incremental`(走 `sg_chunk_store_blob`)與 `keep-alive subset merge`(走 `sg_chunk_keepalive_merge_commit`) |
+
+後兩條是冷讀建議的方向,不是我原本設計的。**第四條的價值在於它證明這個早退同時被
+兩個獨立呼叫端的測試守著**——我自己跑的前兩條只驗到其中一個。
+記在這裡,免得下一個人為了知道「這行有沒有人守」而重跑一遍。
+
 ### 重現方法(重現器本身刻意不進 repo)
 
 需要起 HTTP 伺服器、不在任何閘門裡,加進 `tests/` 只會靜默腐爛;
