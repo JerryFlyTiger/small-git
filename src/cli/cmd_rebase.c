@@ -8,6 +8,7 @@
 #include "sg/merge.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -89,7 +90,7 @@ static void print_conflict_message(const unsigned char commit_id[SG_SHA1_RAW_LEN
     free(summary);
     fprintf(stderr, "以下檔案有衝突:\n");
     for (i = 0; i < conflict_count; i++)
-        fprintf(stderr, "    %s\n", conflict_paths[i]);
+        fprintf(stderr, "    %s\n", sg_quote_path(conflict_paths[i]));
     fprintf(stderr,
            "請解決衝突後:\n"
            "  sg add <file>...      標記為已解決\n"
@@ -741,7 +742,7 @@ static void print_unmerged_paths(const sg_index *idx)
             continue;
         if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
             continue;
-        fprintf(stderr, "\t%s\n", idx->entries[i].path);
+        fprintf(stderr, "\t%s\n", sg_quote_path(idx->entries[i].path));
     }
     fprintf(stderr, "請先解決衝突並執行 `sg add <file>...` 標記為已解決，再重新 sg rebase --continue。\n");
 }

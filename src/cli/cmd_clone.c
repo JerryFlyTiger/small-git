@@ -6,6 +6,7 @@
 #include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/pack.h"
+#include "sg/quote.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/transport.h"
@@ -292,15 +293,15 @@ int sg_cmd_clone(int argc, char **argv)
     }
 
     if (!target_dir_is_usable(target_dir)) {
-        fprintf(stderr, "sg: destination path '%s' already exists and is not empty\n",
-               target_dir);
+        fprintf(stderr, "sg: destination path %s already exists and is not empty\n",
+               sg_quote_path_delimited(target_dir));
         goto done;
     }
 
     printf("Cloning into '%s'...\n", target_dir);
 
     if (sg_repo_init(target_dir) != 0) {
-        fprintf(stderr, "sg: failed to initialize '%s'\n", target_dir);
+        fprintf(stderr, "sg: failed to initialize %s\n", sg_quote_path_delimited(target_dir));
         goto done;
     }
     initialized = 1;

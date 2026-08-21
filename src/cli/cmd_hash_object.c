@@ -3,6 +3,7 @@
 #include "sg/hash.h"
 #include "sg/loose.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/repo.h"
 
 #include <errno.h>
@@ -100,11 +101,11 @@ int sg_cmd_hash_object(int argc, char **argv)
         FILE *f = fopen(file, "rb");
 
         if (f == NULL) {
-            fprintf(stderr, "sg: cannot open '%s': %s\n", file, strerror(errno));
+            fprintf(stderr, "sg: cannot open %s: %s\n", sg_quote_path_delimited(file), strerror(errno));
             return 1;
         }
         if (read_all(f, &content, &content_len) != 0) {
-            fprintf(stderr, "sg: failed to read '%s'\n", file);
+            fprintf(stderr, "sg: failed to read %s\n", sg_quote_path_delimited(file));
             fclose(f);
             return 1;
         }

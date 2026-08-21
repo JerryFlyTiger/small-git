@@ -6,6 +6,7 @@
 #include "sg/index.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/repo.h"
 #include "sg/workdir.h"
 
@@ -21,6 +22,18 @@ static int has_nul(const unsigned char *data, size_t len)
 /* O(n*m) LCS-based unified diff; correctness of the +/-/context classification
    matters here, not minimality of the edit script or matching git's hunk
    splitting/context-window conventions exactly. */
+/* The unified-diff format separates the filename on a ---/+++ line from an
+   optional timestamp with whitespace, so a name containing a space is
+   ambiguous. Real git disambiguates by appending a TAB, and only on those
+   two lines -- measured against 2.55.0: "diff --git" and "Binary files"
+   never get one, and neither does a name whose only oddity is a control
+   character, because quoting escapes that away while a space is left as-is.
+   Returns "\t" or "". */
+static const char *diff_name_terminator(const char *path)
+{
+    return strchr(path, ' ') != NULL ? "\t" : "";
+}
+
 static int print_text_diff(const char *path, const unsigned char *a_data, size_t a_len,
                            const unsigned char *b_data, size_t b_len)
 {
@@ -37,9 +50,10 @@ static int print_text_diff(const char *path, const unsigned char *a_data, size_t
         return -1;
     }
 
-    printf("diff --git a/%s b/%s\n", path, path);
-    printf("--- a/%s\n", path);
-    printf("+++ b/%s\n", path);
+    printf("diff --git %s %s\n", sg_quote_path_prefixed("a/", path),
+          sg_quote_path_prefixed("b/", path));
+    printf("--- %s%s\n", sg_quote_path_prefixed("a/", path), diff_name_terminator(path));
+    printf("+++ %s%s\n", sg_quote_path_prefixed("b/", path), diff_name_terminator(path));
     printf("@@ -1,%zu +1,%zu @@\n", na, nb);
 
     i = 0;
@@ -144,7 +158,18 @@ int sg_cmd_diff(int argc, char **argv)
         }
 
         if (has_nul(a_content, a_len) || (b_content != NULL && has_nul(b_content, b_len))) {
-            printf("Binary files a/%s and b/%s differ\n", idx.entries[i].path, idx.entries[i].path);
+            /* The "diff --git" line goes out for a binary file too. sg used
+               to print only the "Binary files ... differ" line, which is not
+               a patch any tool can read back: git apply keys off the
+               "diff --git" header to know which file a hunk belongs to.
+               Measured against git 2.55.0, which prints both. Found while
+               adding a binary fixture for the quoting work, not by it. */
+            printf("diff --git %s %s\n",
+                  sg_quote_path_prefixed("a/", idx.entries[i].path),
+                  sg_quote_path_prefixed("b/", idx.entries[i].path));
+            printf("Binary files %s and %s differ\n",
+                  sg_quote_path_prefixed("a/", idx.entries[i].path),
+                  sg_quote_path_prefixed("b/", idx.entries[i].path));
         } else if (print_text_diff(idx.entries[i].path, a_content, a_len, b_content, b_len) != 0) {
             fprintf(stderr, "sg: warning: out of memory diffing '%s'\n", idx.entries[i].path);
         }

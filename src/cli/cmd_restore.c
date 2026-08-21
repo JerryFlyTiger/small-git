@@ -6,6 +6,7 @@
 #include "sg/index.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/snapshot.h"
@@ -46,7 +47,7 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
     int rc;
 
     if (pos < 0) {
-        fprintf(stderr, "sg: '%s' is not tracked in the index\n", arg);
+        fprintf(stderr, "sg: %s is not tracked in the index\n", sg_quote_path_delimited(arg));
         return -1;
     }
     /* The index is not a trusted source of paths. An entry naming a ".git"
@@ -57,7 +58,7 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
        gitdir, which is worse than the delete-side hole in apply.c: that one
        only removes, this one writes attacker-chosen bytes. */
     if (!sg_relpath_is_safe(rel)) {
-        fprintf(stderr, "sg: 路徑「%s」無效,拒絕還原\n", arg);
+        fprintf(stderr, "sg: 路徑 %s 無效,拒絕還原\n", sg_quote_path_delimited(arg));
         return -1;
     }
     {
@@ -70,20 +71,20 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
             return -1;
         }
         if (read_rc != 0) {
-            fprintf(stderr, "sg: failed to read staged content for '%s'\n", arg);
+            fprintf(stderr, "sg: failed to read staged content for %s\n", sg_quote_path_delimited(arg));
             return -1;
         }
     }
 
     if (sg_path_join(abspath, sizeof(abspath), repo_root, rel) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法還原 '%s'\n", arg);
+        fprintf(stderr, "sg: 路徑過長,無法還原 %s\n", sg_quote_path_delimited(arg));
         free(content);
         return -1;
     }
     rc = sg_write_file_mkdirs(abspath, content, content_len, (int)(idx->entries[pos].mode & 0777));
     free(content);
     if (rc != 0)
-        fprintf(stderr, "sg: failed to restore '%s'\n", arg);
+        fprintf(stderr, "sg: failed to restore %s\n", sg_quote_path_delimited(arg));
     return rc;
 }
 
@@ -139,12 +140,16 @@ static void strbuf_append(strbuf *b, const char *s)
     b->len += slen;
 }
 
+/* Appends directly rather than formatting into a fixed buffer first: a
+   quoted path can reach four times its original length (every byte an octal
+   escape), so the old char[4200] silently truncated the very paths most
+   worth showing -- the ones full of control characters. strbuf_append
+   already grows on demand. */
 static void strbuf_append_path(strbuf *b, const char *path)
 {
-    char line[4200];
-
-    snprintf(line, sizeof(line), "\t%s\n", path);
-    strbuf_append(b, line);
+    strbuf_append(b, "\t");
+    strbuf_append(b, sg_quote_path(path));
+    strbuf_append(b, "\n");
 }
 
 /* Determines whether restoring rel from the index would actually discard
@@ -262,7 +267,8 @@ int sg_cmd_restore(int argc, char **argv)
 
             lossy = would_lose_content(git_dir, repo_root, &idx, rel);
             if (lossy < 0) {
-                fprintf(stderr, "sg: 路徑過長,無法檢查 '%s' 是否會遺失變更\n", argv[i]);
+                fprintf(stderr, "sg: 路徑過長,無法檢查 %s 是否會遺失變更\n",
+                       sg_quote_path_delimited(argv[i]));
                 free(rel);
                 free(msg.buf);
                 free(affected.buf);
@@ -329,7 +335,7 @@ int sg_cmd_restore(int argc, char **argv)
 
         rel = sg_resolve_repo_path(repo_root, argv[i]);
         if (rel == NULL) {
-            fprintf(stderr, "sg: '%s' is outside the repository\n", argv[i]);
+            fprintf(stderr, "sg: %s is outside the repository\n", sg_quote_path_delimited(argv[i]));
             rc = 1;
             continue;
         }

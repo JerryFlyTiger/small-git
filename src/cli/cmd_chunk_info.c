@@ -5,6 +5,7 @@
 #include "sg/index.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/quote.h"
 #include "sg/repo.h"
 #include "sg/workdir.h"
 
@@ -164,7 +165,7 @@ static int resolve_blob_id(const char *git_dir, const char *arg, unsigned char i
     }
     rel = sg_resolve_repo_path(repo_root, arg);
     if (rel == NULL) {
-        fprintf(stderr, "sg: '%s' is outside the repository\n", arg);
+        fprintf(stderr, "sg: %s is outside the repository\n", sg_quote_path_delimited(arg));
         free(repo_root);
         return -1;
     }
@@ -177,7 +178,7 @@ static int resolve_blob_id(const char *git_dir, const char *arg, unsigned char i
 
     pos = sg_index_find(&idx, rel);
     if (pos < 0) {
-        fprintf(stderr, "sg: '%s' is not tracked in the index\n", arg);
+        fprintf(stderr, "sg: %s is not tracked in the index\n", sg_quote_path_delimited(arg));
     } else {
         memcpy(id_out, idx.entries[pos].sha1, SG_SHA1_RAW_LEN);
         rc = 0;

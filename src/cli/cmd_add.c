@@ -6,6 +6,7 @@
 #include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/repo.h"
 #include "sg/workdir.h"
 
@@ -78,27 +79,27 @@ static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
     unsigned int mode;
 
     if (sg_path_join(abs_path, sizeof(abs_path), repo_root, rel_path) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法處理 '%s'\n", display);
+        fprintf(stderr, "sg: 路徑過長,無法處理 %s\n", sg_quote_path_delimited(display));
         return -1;
     }
 
     if (sg_is_symlink(abs_path)) {
-        fprintf(stderr, "sg: warning: '%s' is a symlink, skipping (unsupported in phase 2)\n",
-               display);
+        fprintf(stderr, "sg: warning: %s is a symlink, skipping (unsupported in phase 2)\n",
+               sg_quote_path_delimited(display));
         return 0;
     }
 
     if (stat(abs_path, &st) != 0) {
-        fprintf(stderr, "sg: cannot stat '%s': no such file\n", display);
+        fprintf(stderr, "sg: cannot stat %s: no such file\n", sg_quote_path_delimited(display));
         return -1;
     }
     if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "sg: '%s' 是不支援的檔案類型（不是一般檔案）\n", display);
+        fprintf(stderr, "sg: %s 是不支援的檔案類型（不是一般檔案）\n", sg_quote_path_delimited(display));
         return -1;
     }
 
     if (sg_read_file(abs_path, &content, &content_len) != 0) {
-        fprintf(stderr, "sg: failed to read '%s'\n", display);
+        fprintf(stderr, "sg: failed to read %s\n", sg_quote_path_delimited(display));
         return -1;
     }
 
@@ -137,7 +138,7 @@ static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
             write_ok = sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, entry.sha1) == 0;
 
         if (!write_ok) {
-            fprintf(stderr, "sg: failed to write blob for '%s'\n", display);
+            fprintf(stderr, "sg: failed to write blob for %s\n", sg_quote_path_delimited(display));
             free(content);
             return -1;
         }
@@ -150,7 +151,7 @@ static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
     sg_index_remove_all_stages(idx, rel_path);
 
     if (sg_index_upsert(idx, &entry) != 0) {
-        fprintf(stderr, "sg: failed to stage '%s'\n", display);
+        fprintf(stderr, "sg: failed to stage %s\n", sg_quote_path_delimited(display));
         return -1;
     }
 
@@ -185,13 +186,14 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
     int rc = 0;
 
     if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法處理目錄 '%s'\n", reldir);
+        fprintf(stderr, "sg: 路徑過長,無法處理目錄 %s\n", sg_quote_path_delimited(reldir));
         return -1;
     }
 
     d = opendir(absdir);
     if (d == NULL) {
-        fprintf(stderr, "sg: 無法讀取目錄 '%s'\n", reldir[0] != '\0' ? reldir : ".");
+        fprintf(stderr, "sg: 無法讀取目錄 %s\n",
+               sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."));
         return -1;
     }
 
@@ -232,7 +234,8 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
     }
     closedir(d);
     if (rc != 0)
-        fprintf(stderr, "sg: 記憶體不足，無法列出目錄 '%s'\n", reldir[0] != '\0' ? reldir : ".");
+        fprintf(stderr, "sg: 記憶體不足，無法列出目錄 %s\n",
+               sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."));
 
     if (rc == 0 && count > 1)
         qsort(names, count, sizeof(*names), str_ptr_cmp);
@@ -252,8 +255,15 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
            kernel rejects it first. Refuse instead of guessing. */
         if (sg_path_join(relpath, sizeof(relpath), reldir, names[i]) != 0 ||
            sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
-            fprintf(stderr, "sg: 路徑過長,無法處理 '%s/%s'\n",
-                    reldir[0] != '\0' ? reldir : ".", names[i]);
+            /* Can't join reldir and names[i] into one path to quote as a
+               unit -- that's exactly the join that just failed above
+               because the combined path is too long. Quoting the two
+               pieces separately and naming the relationship in words
+               avoids gluing two independently-quoted strings together with
+               a literal "/" (see the identical fix in workdir/status.c). */
+            fprintf(stderr, "sg: 路徑過長,無法處理目錄 %s 底下的項目 %s\n",
+                    sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."),
+                    sg_quote_path_delimited(names[i]));
             rc = -1;
             break;
         }
@@ -269,7 +279,7 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
                to run. */
             if (errno == ENOENT)
                 continue;
-            fprintf(stderr, "sg: 無法讀取 '%s': %s\n", relpath, strerror(errno));
+            fprintf(stderr, "sg: 無法讀取 %s: %s\n", sg_quote_path_delimited(relpath), strerror(errno));
             rc = -1;
             break;
         }
@@ -342,7 +352,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
            real path and make this conclude the file still exists -- which
            here would mean silently NOT staging a deletion. Refuse instead. */
         if (sg_path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
-            fprintf(stderr, "sg: 路徑過長,無法檢查 '%s' 是否已刪除\n", e->path);
+            fprintf(stderr, "sg: 路徑過長,無法檢查 %s 是否已刪除\n", sg_quote_path_delimited(e->path));
             rc = -1;
             break;
         }
@@ -448,7 +458,7 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
 
     rel = sg_resolve_repo_path_allow_root(repo_root, arg);
     if (rel == NULL) {
-        fprintf(stderr, "sg: '%s' is outside the repository\n", arg);
+        fprintf(stderr, "sg: %s is outside the repository\n", sg_quote_path_delimited(arg));
         return -1;
     }
 
@@ -462,13 +472,13 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
        sg_cmd_add below), so refusing outright and exiting 1 fits sg's
        existing convention better than a silent per-argument skip. */
     if (rel[0] != '\0' && !sg_relpath_is_safe(rel)) {
-        fprintf(stderr, "sg: 路徑「%s」無效,無法加入索引\n", rel);
+        fprintf(stderr, "sg: 路徑 %s 無效,無法加入索引\n", sg_quote_path_delimited(rel));
         free(rel);
         return -1;
     }
 
     if (sg_path_join(abs_path, sizeof(abs_path), repo_root, rel) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法處理 '%s'\n", arg);
+        fprintf(stderr, "sg: 路徑過長,無法處理 %s\n", sg_quote_path_delimited(arg));
         free(rel);
         return -1;
     }
@@ -481,7 +491,7 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
             free(rel);
             return 0;
         }
-        fprintf(stderr, "sg: cannot stat '%s': no such file\n", arg);
+        fprintf(stderr, "sg: cannot stat %s: no such file\n", sg_quote_path_delimited(arg));
         free(rel);
         return -1;
     }
@@ -495,7 +505,8 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
             return -1;
         }
         if (!force && rel[0] != '\0' && sg_ignore_is_ignored(ig, rel, 1)) {
-            fprintf(stderr, "sg: '%s' 被 .gitignore 規則忽略（使用 -f 強制加入）\n", arg);
+            fprintf(stderr, "sg: %s 被 .gitignore 規則忽略（使用 -f 強制加入）\n",
+                   sg_quote_path_delimited(arg));
             rc = -1;
         } else {
             rc = add_walk(git_dir, repo_root, idx, ig, rel, force);
@@ -516,14 +527,15 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
         /* An explicitly named ignored file errors (git: exit 1 + advice)
            unless forced or already tracked -- tracked wins over ignore. */
         if (!force && !tracked_any_stage(idx, rel) && sg_ignore_is_ignored(ig, rel, 0)) {
-            fprintf(stderr, "sg: '%s' 被 .gitignore 規則忽略（使用 -f 強制加入）\n", arg);
+            fprintf(stderr, "sg: %s 被 .gitignore 規則忽略（使用 -f 強制加入）\n",
+                   sg_quote_path_delimited(arg));
             rc = -1;
         } else {
             rc = stage_file(git_dir, repo_root, idx, rel, arg);
         }
         pop_n(ig, pushed);
     } else {
-        fprintf(stderr, "sg: '%s' 是不支援的檔案類型（不是一般檔案）\n", arg);
+        fprintf(stderr, "sg: %s 是不支援的檔案類型（不是一般檔案）\n", sg_quote_path_delimited(arg));
         rc = -1;
     }
 

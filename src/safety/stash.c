@@ -8,6 +8,7 @@
 #include "sg/merge.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/quote.h"
 #include "sg/reflog.h"
 #include "sg/refs.h"
 #include "sg/snapshot.h"
@@ -711,12 +712,12 @@ static int restore_untracked_flat(const char *git_dir, const char *repo_root, co
             return -1;
         }
         if (read_rc != 0) {
-            fprintf(stderr, "sg: missing blob for '%s'\n", flat->entries[i].path);
+            fprintf(stderr, "sg: missing blob for %s\n", sg_quote_path_delimited(flat->entries[i].path));
             return -1;
         }
         if (sg_write_file_mkdirs(abspath, blob_content, blob_len, (int)(flat->entries[i].mode & 0777)) !=
            0) {
-            fprintf(stderr, "sg: failed to write '%s'\n", flat->entries[i].path);
+            fprintf(stderr, "sg: failed to write %s\n", sg_quote_path_delimited(flat->entries[i].path));
             free(blob_content);
             return -1;
         }
@@ -888,7 +889,8 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
         int flatten_rc = sg_tree_flatten(git_dir, ours_tree, &head_flat, bad_path);
 
         if (flatten_rc == -2)
-            fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+            fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+                   sg_quote_path_delimited(bad_path));
         if (flatten_rc != 0) {
             sg_merge_result_free(&result);
             return -1;
@@ -1024,7 +1026,8 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
         int flatten_rc = sg_tree_flatten(git_dir, ours_tree, &head_flat, bad_path);
 
         if (flatten_rc == -2)
-            fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+            fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+                   sg_quote_path_delimited(bad_path));
         if (flatten_rc != 0) {
             sg_merge_result_free(&result);
             return -1;
@@ -1036,7 +1039,8 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
         int flatten_rc = sg_tree_flatten(git_dir, untracked_tree, &untracked_flat, bad_path);
 
         if (flatten_rc == -2)
-            fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+            fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+                   sg_quote_path_delimited(bad_path));
         if (flatten_rc != 0) {
             sg_flat_list_free(&head_flat);
             sg_merge_result_free(&result);

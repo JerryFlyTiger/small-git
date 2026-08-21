@@ -8,6 +8,7 @@
 #include "sg/merge.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -65,7 +66,7 @@ static void print_conflict_message(char **conflict_paths, size_t conflict_count)
 
     fprintf(stderr, "自動合併失敗，以下檔案有衝突：\n");
     for (i = 0; i < conflict_count; i++)
-        fprintf(stderr, "    %s\n", conflict_paths[i]);
+        fprintf(stderr, "    %s\n", sg_quote_path(conflict_paths[i]));
     fprintf(stderr, "請編輯這些檔案解決衝突，然後：\n");
     fprintf(stderr, "  sg add <file>...     標記為已解決\n");
     fprintf(stderr, "  sg commit -m \"...\"   完成這次合併\n");
