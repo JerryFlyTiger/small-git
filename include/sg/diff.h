@@ -83,6 +83,14 @@ int sg_diff_tree_index(const char *git_dir, const unsigned char *old_tree,
 /* index vs working tree -- plain `sg diff`. Never fails on a missing working
    tree file: that is a deletion, not an error.
 
+   A blob that cannot be read at all -- a deleted object, or a chunk pointer
+   whose data is gone -- must NOT fail the whole call either. The builder
+   cannot answer "did this path change", so it records the path as changed and
+   leaves the complaining to the renderer, which is holding the path and can
+   name it. Aborting the list instead loses two things at once: every other
+   path's diff, and the actionable message itself, since nothing downstream
+   ever gets far enough to know which file was broken.
+
    An unmerged path produces up to TWO rows, in this order -- measured against
    git 2.55.0, which prints "U conflict.txt" and "M conflict.txt" for the same
    path:

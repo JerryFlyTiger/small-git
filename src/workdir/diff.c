@@ -113,7 +113,25 @@ static int flatten_or_empty(const char *git_dir, const unsigned char *tree_id, s
 /* idx is sorted by (path, stage) -- sg/index.h's invariant -- so every entry
    sharing one path is contiguous, and stage 0 (if present at all) is always
    the first of the group. Returns the index one past the last entry sharing
-   idx->entries[i].path. */
+   idx->entries[i].path.
+
+   Every caller of this function (and of the "does this group start with
+   stage 0" check right before each call) assumes a path's group is either
+   ALL stage 0 or ALL stage 1/2/3, never a mix. That holds for any index sg
+   itself writes: cmd_add.c always calls sg_index_remove_all_stages before
+   upserting a fresh stage-0 entry (src/cli/cmd_add.c:151), so resolving a
+   conflict at a path removes every stage 1/2/3 entry there before stage 0
+   is (re)written. It is NOT enforced by sg_index_read or by this file --
+   a hand-edited or corrupted .git/index that keeps both a stage-0 entry and
+   leftover stage 1/2/3 entries for the same path will have the leftover
+   entries silently skipped (index_group_end folds stage 0 in with whatever
+   nonzero-stage entries happen to sort after it, and every caller treats
+   the group as "stage 0, ordinary" once it sees a stage-0 entry first).
+   That failure direction is safe but incomplete -- no crash, no path
+   misreported as deleted or invented as unmerged, just those extra stale
+   entries never surfacing in the diff -- so this is a deliberate choice not
+   to add handling for a case sg's own write path cannot produce, not a
+   missed check. */
 static size_t index_group_end(const sg_index *idx, size_t i)
 {
     const char *path = idx->entries[i].path;
@@ -325,9 +343,21 @@ static int append_index_entry_vs_workdir(const char *git_dir, const char *repo_r
 
     /* idx's id may be a chunked-storage pointer's id rather than the
        content's own id -- normalize before comparing, same as
-       sg_status_diff_unstaged. */
-    if (sg_chunk_effective_id(git_dir, entry->sha1, effective_sha1) != 0)
-        return -1;
+       sg_status_diff_unstaged. A failure here (the object itself is
+       unreadable, or it's a genuine chunk pointer whose data is missing or
+       corrupt -- sg_chunk_effective_id's -1/-2, sg/chunk.h) must NOT fail
+       this whole call: this builder cannot answer "did this path change",
+       so it reports the path as changed instead and leaves the complaining
+       to the renderer, which re-reads the same blob through
+       sg_diff_side_read and, holding the path, can name it in an
+       actionable message (see sg/diff.h's sg_diff_index_workdir contract).
+       Failing here instead would silence every OTHER path in the same
+       diff too, which is worse than dropping just this one. */
+    if (sg_chunk_effective_id(git_dir, entry->sha1, effective_sha1) != 0) {
+        sg_diff_side ns = side_workdir();
+
+        return list_append(out, entry->path, &os, &ns);
+    }
 
     if (memcmp(wd_sha1, effective_sha1, SG_SHA1_RAW_LEN) != 0) {
         sg_diff_side ns = side_workdir();
@@ -452,19 +482,27 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                         rc = -1;
                         goto done;
                     }
-                } else {
-                    if (sg_chunk_effective_id(git_dir, old_flat.entries[oi].sha1,
-                                              effective_sha1) != 0) {
+                } else if (sg_chunk_effective_id(git_dir, old_flat.entries[oi].sha1,
+                                                    effective_sha1) != 0) {
+                    /* Same rule as append_index_entry_vs_workdir above and
+                       sg/diff.h's sg_diff_index_workdir contract: an
+                       unreadable object or a broken chunk pointer here must
+                       not fail the whole call, or every other path in this
+                       diff goes silent along with it. Report the path as
+                       changed and let the renderer's own sg_diff_side_read
+                       hit the same failure with the path in hand. */
+                    sg_diff_side ns = side_workdir();
+
+                    if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
                         rc = -1;
                         goto done;
                     }
-                    if (memcmp(wd_sha1, effective_sha1, SG_SHA1_RAW_LEN) != 0) {
-                        sg_diff_side ns = side_workdir();
+                } else if (memcmp(wd_sha1, effective_sha1, SG_SHA1_RAW_LEN) != 0) {
+                    sg_diff_side ns = side_workdir();
 
-                        if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
-                            rc = -1;
-                            goto done;
-                        }
+                    if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
+                        rc = -1;
+                        goto done;
                     }
                 }
             }

@@ -967,6 +967,220 @@ static void test_chunk_pointer_normalization(void)
     free(git_dir);
 }
 
+/* 17. Chunk pointer normalization at sg_diff_tree_workdir's OWN call site
+       (distinct from sg_diff_index_workdir's -- diff.c has two independent
+       sg_chunk_effective_id call sites, and a fixture that only exercises
+       one leaves the other completely unmeasured). Puts the chunk pointer
+       in a TREE entry, the same shape `sg commit` produces for a large
+       file, and diffs it against the working tree. */
+static void test_chunk_pointer_normalization_tree_workdir(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    size_t len = SG_CHUNK_MIN_SIZE * 3;
+    unsigned char *data = malloc(len);
+    unsigned char pointer_id[SG_SHA1_RAW_LEN];
+    int chunked = -1;
+    sg_flat_entry entries[1];
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    sg_index empty_idx;
+    sg_diff_list list;
+
+    CHECK(data != NULL, "malloc failed for chunk fixture data");
+    if (data == NULL) {
+        free(git_dir);
+        free(repo_root);
+        return;
+    }
+    fill_pseudo_random(data, len, 99);
+
+    CHECK(sg_chunk_store_blob(git_dir, data, len, 1024, pointer_id, &chunked) == 0 && chunked == 1,
+         "sg_chunk_store_blob should have produced a chunk pointer for this fixture");
+
+    entries[0].path = strdup("big.bin");
+    entries[0].mode = 0100644;
+    memcpy(entries[0].sha1, pointer_id, SG_SHA1_RAW_LEN);
+    CHECK(sg_tree_build(git_dir, entries, 1, tree_id) == 0, "sg_tree_build failed");
+    free(entries[0].path);
+
+    write_workdir_file_bytes(repo_root, "big.bin", data, len);
+
+    /* sg_diff_tree_workdir's cmp==0 branch (tree-vs-workdir content compare)
+       is only taken for a path present in BOTH the tree and the index --
+       an index-less path falls into the cmp<0 "deletion" branch instead, per
+       sg/diff.h. The index entry's own sha1/mode are irrelevant here: this
+       function never reads content from the index, only from the tree and
+       the working tree, so any stage-0 entry at this path is enough to put
+       it in the participating set. */
+    memset(&empty_idx, 0, sizeof(empty_idx));
+    index_upsert_blob(&empty_idx, "big.bin", 0100644, pointer_id);
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL) == 0,
+         "sg_diff_tree_workdir failed");
+    CHECK(list.count == 0,
+         "unmodified chunked content in a TREE entry must normalize to the working tree's hash "
+         "(got %zu spurious changes) -- sg_diff_tree_workdir's own sg_chunk_effective_id call is "
+         "not being applied",
+         list.count);
+    sg_diff_list_free(&list);
+
+    /* Now actually modify the file: the pointer's normalized id must differ
+       from the new content, ruling out a normalization bug that always
+       reports "unchanged" regardless of what it's fed. */
+    data[0] ^= 0xFF;
+    write_workdir_file_bytes(repo_root, "big.bin", data, len);
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL) == 0,
+         "sg_diff_tree_workdir failed on the modified fixture");
+    CHECK(list.count == 1, "modified chunked content should be reported as changed, got %zu",
+         list.count);
+    if (list.count == 1) {
+        CHECK(strcmp(list.entries[0].path, "big.bin") == 0, "unexpected path %s",
+             list.entries[0].path);
+        CHECK(list.entries[0].new_side.kind == SG_DIFF_SIDE_WORKDIR,
+             "modified path's new side should be WORKDIR");
+    }
+    sg_diff_list_free(&list);
+
+    sg_index_free(&empty_idx);
+    free(data);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Deletes a loose object file straight off disk, simulating "the object
+   this id names is gone" -- the same end state a lost pack/prune leaves
+   behind, and what makes sg_chunk_effective_id return -1 (not a chunk
+   pointer at all, just an ordinary blob whose bytes are unreadable). */
+static void delete_loose_object(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN])
+{
+    char hex[SG_SHA1_HEX_LEN + 1];
+    char path[4096];
+
+    sg_sha1_to_hex(id, hex);
+    snprintf(path, sizeof(path), "%s/objects/%.2s/%s", git_dir, hex, hex + 2);
+    CHECK(remove(path) == 0, "failed to delete loose object %s", hex);
+}
+
+/* 18. sg_diff_index_workdir: a blob that can't be read at all must not fail
+       the whole call -- the builder can't answer "did this path change", so
+       it reports the path as changed (old_side BLOB, new_side WORKDIR) and
+       leaves the complaining to the renderer's own sg_diff_side_read, which
+       holds the path. Directly exercises the sg_chunk_effective_id failure
+       branch inside append_index_entry_vs_workdir (see sg/diff.h's
+       sg_diff_index_workdir contract). The second assertion group is the
+       one that matters: a broken blob must not silence any OTHER path in
+       the same diff. */
+static void test_index_workdir_unreadable_blob_does_not_silence_others(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char id_broken[SG_SHA1_RAW_LEN];
+    unsigned char id_modified[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    blob(git_dir, "will vanish\n", id_broken);
+    blob(git_dir, "old content\n", id_modified);
+
+    write_workdir_file(repo_root, "broken.txt", "on disk, blob gone\n");
+    write_workdir_file(repo_root, "modified.txt", "new content\n");
+
+    delete_loose_object(git_dir, id_broken);
+
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "broken.txt", 0100644, id_broken);
+    index_upsert_blob(&idx, "modified.txt", 0100644, id_modified);
+
+    CHECK(sg_diff_index_workdir(git_dir, repo_root, &idx, &list) == 0,
+         "sg_diff_index_workdir must return 0, not -1, when one path's blob is unreadable");
+    CHECK(list.count == 2, "expected both paths to be reported, got %zu", list.count);
+
+    e = find_entry(&list, "broken.txt");
+    CHECK(e != NULL, "broken.txt (unreadable blob) missing from diff list -- an unreadable blob "
+         "must be reported as changed, not silently dropped");
+    if (e != NULL) {
+        CHECK(e->old_side.kind == SG_DIFF_SIDE_BLOB, "broken.txt's old side should still be BLOB");
+        CHECK(e->new_side.kind == SG_DIFF_SIDE_WORKDIR, "broken.txt's new side should be WORKDIR");
+    }
+
+    e = find_entry(&list, "modified.txt");
+    CHECK(e != NULL,
+         "modified.txt must still be reported: one broken blob must not silence the REST of the "
+         "diff");
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* 19. sg_diff_tree_workdir: the same rule at its OWN sg_chunk_effective_id
+       call site (the cmp==0 branch -- this is the m7b site the reviewer's
+       mutation found completely uncovered in an earlier round). Both
+       broken.txt and other.txt get a stage-0 index entry so the cmp==0
+       content-compare branch actually runs for both, not just membership. */
+static void test_tree_workdir_unreadable_blob_does_not_silence_others(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char id_broken[SG_SHA1_RAW_LEN];
+    unsigned char id_other[SG_SHA1_RAW_LEN];
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    sg_flat_entry entries[2];
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    blob(git_dir, "will vanish\n", id_broken);
+    blob(git_dir, "before\n", id_other);
+
+    entries[0].path = strdup("broken.txt");
+    entries[0].mode = 0100644;
+    memcpy(entries[0].sha1, id_broken, SG_SHA1_RAW_LEN);
+    entries[1].path = strdup("other.txt");
+    entries[1].mode = 0100644;
+    memcpy(entries[1].sha1, id_other, SG_SHA1_RAW_LEN);
+    CHECK(sg_tree_build(git_dir, entries, 2, old_tree) == 0, "sg_tree_build failed");
+    free(entries[0].path);
+    free(entries[1].path);
+
+    write_workdir_file(repo_root, "broken.txt", "on disk, blob gone\n");
+    write_workdir_file(repo_root, "other.txt", "after\n");
+
+    delete_loose_object(git_dir, id_broken);
+
+    /* The cmp==0 branch only runs for a path present in BOTH the tree and
+       the index -- see sg_diff_tree_workdir's membership rule in
+       sg/diff.h. The index entries' own ids are irrelevant: this function
+       never reads content from the index. */
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "broken.txt", 0100644, id_broken);
+    index_upsert_blob(&idx, "other.txt", 0100644, id_other);
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+         "sg_diff_tree_workdir must return 0, not -1, when one path's tree blob is unreadable");
+    CHECK(list.count == 2, "expected both paths to be reported, got %zu", list.count);
+
+    e = find_entry(&list, "broken.txt");
+    CHECK(e != NULL, "broken.txt (unreadable tree blob) missing from diff list");
+    if (e != NULL) {
+        CHECK(e->old_side.kind == SG_DIFF_SIDE_BLOB, "broken.txt's old side should still be BLOB");
+        CHECK(e->new_side.kind == SG_DIFF_SIDE_WORKDIR, "broken.txt's new side should be WORKDIR");
+    }
+
+    e = find_entry(&list, "other.txt");
+    CHECK(e != NULL,
+         "other.txt must still be reported: one broken tree blob must not silence the REST of the "
+         "diff");
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_trees_add_delete_modify();
@@ -985,6 +1199,9 @@ int main(void)
     test_side_read_blob_and_workdir();
     test_flatten_bad_path_propagates();
     test_chunk_pointer_normalization();
+    test_chunk_pointer_normalization_tree_workdir();
+    test_index_workdir_unreadable_blob_does_not_silence_others();
+    test_tree_workdir_unreadable_blob_does_not_silence_others();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
