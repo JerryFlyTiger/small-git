@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1299 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1320 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 40 個單元測試二進位,任一失敗即整體失敗
+make test                         # 41 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -27,7 +27,7 @@ python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
 
 - 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
   的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
-- `make test` 那行的 `N/40 個跑到`,N 少於 40 就是**中途中止**(Makefile 在第一
+- `make test` 那行的 `N/41 個跑到`,N 少於 41 就是**中途中止**(Makefile 在第一
   個失敗的二進位就停),不是「其他都過了」。
 - 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
 - interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
@@ -115,7 +115,8 @@ staging 的驗證。本機綠燈不是充分證據。**
   `commit`/`reset`/`merge` 三處共用。呼叫端傳 `branch == NULL` 表示 detached,
   **損壞的 HEAD 要由呼叫端先擋掉**——NULL 自己分不出這兩者,函式若擅自猜測就
   等於把 Phase 18 費力建立的區分洗掉。
-- **`util/` 裡沒有字串緩衝區、也沒有路徑處理**。路徑解析、`mkdir -p`、讀寫檔
+- **`util/` 裡沒有路徑*解析***(那些在 `workdir.h`),但從 Phase 23 起有一支純位元組
+  轉換 `util/quote.c`。路徑解析、`mkdir -p`、讀寫檔
   在 `include/sg/workdir.h`(`sg_resolve_repo_path`、`sg_mkdir_parents`、
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
   `workdir.h`,不要去 `util/`,也不要自己再寫一份。
@@ -128,6 +129,18 @@ staging 的驗證。本機綠燈不是充分證據。**
   不可以靜默從 `sg status`/`sg diff` 掉一個檔案。刻意的例外只有兩處:
   `prune_empty_untracked_dirs` 保留自己的 inline 檢查(它的慣例是靜默跳過),
   以及 `git_dir` + 定長 hex 那類 buffer(風險輪廓不同,只用 `SG_PATH_MAX`)。
+- **印路徑給使用者看一律過 `sg_quote_path` / `_prefixed` / `_delimited`**
+  (`include/sg/quote.h`,Phase 23)。含控制字元的檔名不引用的話,**真正的 ESC 位元組
+  會進終端機**,可以清螢幕或改寫後續輸出的顏色。三支的分工看**版面**不看來源:
+  獨佔一行的縮排清單用 `sg_quote_path`(不需要時不加引號);`diff` 的 `a/`/`b/` 用
+  `_prefixed`(**引號必須包住前綴**,所以前綴折進函式裡);句子內嵌用 `_delimited`
+  (無條件加引號,`format` 要改成裸 `%s`,否則會印出 `'"a\tb"'`)。
+  ⚠ 回傳的是**借用指標**,指向 4 個輪替的靜態緩衝區,**不要存起來跨敘述用、不要 free**。
+  ⚠ **≥0x80 原樣輸出**(等同 `core.quotepath=false`),所以 **interop 比對要在 git 側
+  加 `-c core.quotepath=false`**;控制字元組不必加(兩邊都會引用)。
+  ⚠ **明文禁止引用**:commit/tag 訊息與 author 字串(會破壞 `cat-file -p` 的位元組保真)、
+  ref/branch/tag 名稱(真 git 也不引用,**沒有 oracle**)、`Cloning into` 這類 stdout
+  資訊訊息(真 git 也不引用,已實測)。
 - **不受信任的路徑一律過 `sg_path_component_is_safe` / `sg_relpath_is_safe`**
   (`include/sg/workdir.h`,Phase 22)。它們擋 `""`/`.`/`..`/含 `/`,以及 `.git` 的
   任何大小寫變體、尾綴 `.`/空白的形式、和折掉 HFS+ 忽略碼位後等於 `.git` 的名稱。
@@ -156,8 +169,10 @@ staging 的驗證。本機綠燈不是充分證據。**
   (`cmd_add.c`、`status.c`)已在 Phase 21 收斂成 `sg_path_join`,連同 14 個
   `.c` 各自的 `#define SG_PATH_MAX`、`SG_TREE_BUILD_PATH_MAX`、
   `SG_REVPARSE_PATH_MAX` 與 36 處裸字面量 `4096`——**這批不要再長回來**;
-  小型 strbuf 重複於
-  `src/workdir/apply.c:175` 與 `src/cli/cmd_restore.c:104`。`resolve_commit_tree`
+  小型 strbuf 仍重複於
+  `src/workdir/apply.c` 與 `src/cli/cmd_restore.c`(**兩份並不逐字相同**:前者吃
+  prefix + path,後者只吃 path,所以收斂需要先決定介面,不是「順手」);
+  Phase 23 已消除它們各自的定長緩衝區。`resolve_commit_tree`
   的六份逐字複本(`cmd_switch.c`、`cmd_merge.c`、`cmd_rebase.c`、`cmd_clone.c`、
   `cmd_reset.c`、`workdir/apply.c`)已在 Phase 15 收斂成
   `sg_commit_tree_of`(`include/sg/objstore.h`);讀 commit 拿它的 tree id 一律
@@ -327,7 +342,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 40 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 41 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。

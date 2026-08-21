@@ -6,6 +6,7 @@
 #include "sg/merge.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/repo.h"
 #include "sg/stash.h"
@@ -417,7 +418,7 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
                             "stash）：\n",
                    cmd_name);
             for (j = 0; j < dirty_count; j++)
-                fprintf(stderr, "\t%s\n", dirty_paths[j]);
+                fprintf(stderr, "\t%s\n", sg_quote_path(dirty_paths[j]));
             for (j = 0; j < dirty_count; j++)
                 free(dirty_paths[j]);
             free(dirty_paths);

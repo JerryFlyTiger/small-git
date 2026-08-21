@@ -5,6 +5,7 @@
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/quote.h"
 #include "sg/repo.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
@@ -727,14 +728,16 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
 
     flatten_rc = sg_tree_flatten(git_dir, base_tree, &base_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+               sg_quote_path_delimited(bad_path));
         return -1;
     }
     if (flatten_rc != 0)
         return -1;
     flatten_rc = sg_tree_flatten(git_dir, ours_tree, &ours_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+               sg_quote_path_delimited(bad_path));
         sg_flat_list_free(&base_flat);
         return -1;
     }
@@ -744,7 +747,8 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
     }
     flatten_rc = sg_tree_flatten(git_dir, theirs_tree, &theirs_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+               sg_quote_path_delimited(bad_path));
         sg_flat_list_free(&base_flat);
         sg_flat_list_free(&ours_flat);
         return -1;
@@ -862,7 +866,7 @@ static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *
        caller treats a non-zero return like an sg_index_upsert failure and
        aborts the whole apply. */
     if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法解析 '%s'\n", path);
+        fprintf(stderr, "sg: 路徑過長,無法解析 %s\n", sg_quote_path_delimited(path));
         return -1;
     }
     if (stat(abspath, &st) == 0) {
@@ -918,7 +922,7 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
            this entry must count as a failure the same way a missing chunk
            or unreadable object does -- never silently skipped. */
         if (sg_path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
-            fprintf(stderr, "sg: 路徑過長,無法處理 '%s'\n", e->path);
+            fprintf(stderr, "sg: 路徑過長,無法處理 %s\n", sg_quote_path_delimited(e->path));
             content_missing = 1;
             continue;
         }
@@ -929,7 +933,7 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
             char **grown;
 
             if (sg_write_file_mkdirs(abspath, e->conflict_content, e->conflict_content_len, mode) != 0)
-                fprintf(stderr, "sg: failed to write conflicted '%s'\n", e->path);
+                fprintf(stderr, "sg: failed to write conflicted %s\n", sg_quote_path_delimited(e->path));
 
             if (e->base_present && add_stage_entry(index_out, e->path, 1, e->base_mode,
                                                    e->base_sha1) != 0)
@@ -976,7 +980,7 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
 
                 if (read_rc == 0) {
                     if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0) {
-                        fprintf(stderr, "sg: failed to write '%s'\n", e->path);
+                        fprintf(stderr, "sg: failed to write %s\n", sg_quote_path_delimited(e->path));
                         content_missing = 1;
                     }
                     free(content);
@@ -990,7 +994,7 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                        present at this sha1 -- exactly the "silently dropped
                        a path" state this function promises never to hand
                        back. Fatal, like -2. */
-                    fprintf(stderr, "sg: missing blob for '%s'\n", e->path);
+                    fprintf(stderr, "sg: missing blob for %s\n", sg_quote_path_delimited(e->path));
                     content_missing = 1;
                 }
             }

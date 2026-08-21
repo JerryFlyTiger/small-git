@@ -6,6 +6,7 @@
 #include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/snapshot.h"
@@ -50,7 +51,8 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
 
     flatten_rc = sg_tree_flatten(git_dir, tree_id, &target_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+               sg_quote_path_delimited(bad_path));
         return -1;
     }
     if (flatten_rc != 0) {
@@ -83,12 +85,14 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
                left in the index by an old bug would still reach remove()
                here even after the tree-side hole is closed. */
             if (!sg_relpath_is_safe(old_idx.entries[i].path)) {
-                fprintf(stderr, "sg: index 裡的路徑「%s」無效,拒絕刪除\n", old_idx.entries[i].path);
+                fprintf(stderr, "sg: index 裡的路徑 %s 無效,拒絕刪除\n",
+                       sg_quote_path_delimited(old_idx.entries[i].path));
                 rc = -1;
                 continue;
             }
             if (sg_path_join(abspath, sizeof(abspath), repo_root, old_idx.entries[i].path) != 0) {
-                fprintf(stderr, "sg: 路徑過長,無法刪除 '%s'\n", old_idx.entries[i].path);
+                fprintf(stderr, "sg: 路徑過長,無法刪除 %s\n",
+                       sg_quote_path_delimited(old_idx.entries[i].path));
                 rc = -1;
                 continue;
             }
@@ -107,7 +111,8 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         sg_index_entry entry;
 
         if (sg_path_join(abspath, sizeof(abspath), repo_root, target_flat.entries[i].path) != 0) {
-            fprintf(stderr, "sg: 路徑過長,無法寫入 '%s'\n", target_flat.entries[i].path);
+            fprintf(stderr, "sg: 路徑過長,無法寫入 %s\n",
+                   sg_quote_path_delimited(target_flat.entries[i].path));
             rc = -1;
             continue;
         }
@@ -122,14 +127,16 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
                 continue;
             }
             if (read_rc != 0) {
-                fprintf(stderr, "sg: missing blob for '%s'\n", target_flat.entries[i].path);
+                fprintf(stderr, "sg: missing blob for %s\n",
+                       sg_quote_path_delimited(target_flat.entries[i].path));
                 rc = -1;
                 continue;
             }
         }
         if (sg_write_file_mkdirs(abspath, blob_content, blob_len,
                                  (int)(target_flat.entries[i].mode & 0777)) != 0) {
-            fprintf(stderr, "sg: failed to write '%s'\n", target_flat.entries[i].path);
+            fprintf(stderr, "sg: failed to write %s\n",
+                   sg_quote_path_delimited(target_flat.entries[i].path));
             free(blob_content);
             rc = -1;
             continue;
@@ -161,7 +168,7 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         entry.path = target_flat.entries[i].path;
 
         if (sg_index_upsert(&new_idx, &entry) != 0) {
-            fprintf(stderr, "sg: failed to stage '%s'\n", target_flat.entries[i].path);
+            fprintf(stderr, "sg: failed to stage %s\n", sg_quote_path_delimited(target_flat.entries[i].path));
             rc = -1;
         }
     }
@@ -188,7 +195,8 @@ int sg_index_reset_to_tree(const char *git_dir, const unsigned char tree_id[SG_S
 
     flatten_rc = sg_tree_flatten(git_dir, tree_id, &target_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑「%s」無效,拒絕將這棵 tree 展開成檔案路徑\n", bad_path);
+        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+               sg_quote_path_delimited(bad_path));
         return -1;
     }
     if (flatten_rc != 0) {
@@ -225,7 +233,7 @@ int sg_index_reset_to_tree(const char *git_dir, const unsigned char tree_id[SG_S
         entry.path = target_flat.entries[i].path;
 
         if (sg_index_upsert(&new_idx, &entry) != 0) {
-            fprintf(stderr, "sg: failed to stage '%s'\n", target_flat.entries[i].path);
+            fprintf(stderr, "sg: failed to stage %s\n", sg_quote_path_delimited(target_flat.entries[i].path));
             rc = -1;
         }
     }
@@ -268,12 +276,17 @@ static void strbuf_append(strbuf *b, const char *s)
     b->len += slen;
 }
 
+/* Appends directly rather than formatting into a fixed buffer first: a
+   quoted path can reach four times its original length (every byte an octal
+   escape), so the old char[4200] silently truncated the very paths most
+   worth showing -- the ones full of control characters. strbuf_append
+   already grows on demand. */
 static void strbuf_append_path(strbuf *b, const char *prefix, const char *path)
 {
-    char line[4200];
-
-    snprintf(line, sizeof(line), "\t%s%s\n", prefix, path);
-    strbuf_append(b, line);
+    strbuf_append(b, "\t");
+    strbuf_append(b, prefix);
+    strbuf_append(b, sg_quote_path(path));
+    strbuf_append(b, "\n");
 }
 
 int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
@@ -442,9 +455,9 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
     if (dirty) {
         fprintf(stderr, "sg: %s 需要乾淨的工作目錄，但下列變更尚未提交：\n", what);
         for (i = 0; i < staged.count; i++)
-            fprintf(stderr, "\tstaged:              %s\n", staged.entries[i].path);
+            fprintf(stderr, "\tstaged:              %s\n", sg_quote_path(staged.entries[i].path));
         for (i = 0; i < unstaged.count; i++)
-            fprintf(stderr, "\tmodified (unstaged): %s\n", unstaged.entries[i].path);
+            fprintf(stderr, "\tmodified (unstaged): %s\n", sg_quote_path(unstaged.entries[i].path));
         if (!staged_ok || !unstaged_ok)
             fprintf(stderr, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足）\n");
         fprintf(stderr,

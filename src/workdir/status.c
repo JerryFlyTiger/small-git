@@ -3,6 +3,7 @@
 #include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/ignore.h"
+#include "sg/quote.h"
 #include "sg/workdir.h"
 
 #include <dirent.h>
@@ -183,7 +184,8 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
     struct dirent *ent;
 
     if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
-        fprintf(stderr, "sg: warning: 路徑過長,略過目錄 '%s'(未追蹤清單可能不完整)\n", reldir);
+        fprintf(stderr, "sg: warning: 路徑過長,略過目錄 %s(未追蹤清單可能不完整)\n",
+               sg_quote_path_delimited(reldir));
         return 0;
     }
 
@@ -193,8 +195,8 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
            see -- but never silent: an unreadable directory means the
            untracked list below is incomplete, and under-reporting without
            saying so is how uncommitted work gets lost. */
-        fprintf(stderr, "sg: warning: 無法讀取目錄 '%s': %s（未追蹤清單可能不完整）\n",
-                reldir[0] != '\0' ? reldir : ".", strerror(errno));
+        fprintf(stderr, "sg: warning: 無法讀取目錄 %s: %s（未追蹤清單可能不完整）\n",
+                sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."), strerror(errno));
         return 0;
     }
 
@@ -223,8 +225,18 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
            entry and this would report a path that is not the one on disk. */
         if (sg_path_join(relpath, sizeof(relpath), reldir, ent->d_name) != 0 ||
            sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
-            fprintf(stderr, "sg: warning: 路徑過長,略過 '%s/%s'(未追蹤清單可能不完整)\n",
-                    reldir[0] != '\0' ? reldir : ".", ent->d_name);
+            /* Can't join reldir and ent->d_name into one path to quote as a
+               unit -- that's exactly the join sg_path_join above just
+               failed at, because the combined path is too long to fit a
+               buffer. Quoting the two pieces separately and naming the
+               relationship in words avoids reproducing that same overflow
+               here, and avoids gluing two independently-quoted strings
+               together with a literal "/" (which is exactly how a
+               control-character name turns "dir"/"x\ty" into something that
+               reads as two paths instead of one). */
+            fprintf(stderr, "sg: warning: 路徑過長,略過目錄 %s 底下的項目 %s(未追蹤清單可能不完整)\n",
+                    sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."),
+                    sg_quote_path_delimited(ent->d_name));
             continue;
         }
 
@@ -234,8 +246,8 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
                platform's PATH_MAX, EACCES, ELOOP) means we are dropping a
                real entry, so say so rather than under-report in silence. */
             if (errno != ENOENT)
-                fprintf(stderr, "sg: warning: 無法讀取 '%s': %s（未追蹤清單可能不完整）\n",
-                        relpath, strerror(errno));
+                fprintf(stderr, "sg: warning: 無法讀取 %s: %s（未追蹤清單可能不完整）\n",
+                        sg_quote_path_delimited(relpath), strerror(errno));
             continue;
         }
 

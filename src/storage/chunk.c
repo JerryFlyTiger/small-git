@@ -3,6 +3,7 @@
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/quote.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/workdir.h"
@@ -923,7 +924,8 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
 void sg_chunk_print_missing_error(const char *path, const sg_chunk_missing_info *info)
 {
     if (info->keepalive_lost) {
-        fprintf(stderr, "sg: '%s' 是分塊儲存的檔案，但 %s 已經遺失\n", path, SG_CHUNK_KEEPALIVE_REF);
+        fprintf(stderr, "sg: %s 是分塊儲存的檔案，但 %s 已經遺失\n", sg_quote_path_delimited(path),
+               SG_CHUNK_KEEPALIVE_REF);
         fprintf(stderr,
                "sg: 這個 repository 的 .git/config 記錄了曾經使用過分塊儲存，"
                "但用來保護分塊資料不被 git gc 回收的 %s 已經不存在（可能被手動刪除，"
@@ -936,12 +938,12 @@ void sg_chunk_print_missing_error(const char *path, const sg_chunk_missing_info 
         return;
     }
     if (info->missing_count > 0) {
-        fprintf(stderr, "sg: '%s' 是分塊儲存的檔案，但有 %zu/%zu 個資料塊在物件庫中找不到\n", path,
-               info->missing_count, info->chunk_count);
+        fprintf(stderr, "sg: %s 是分塊儲存的檔案，但有 %zu/%zu 個資料塊在物件庫中找不到\n",
+               sg_quote_path_delimited(path), info->missing_count, info->chunk_count);
     } else {
         fprintf(stderr,
-               "sg: '%s' 是分塊儲存的檔案，但重組後的內容與記錄的雜湊碼不符（物件庫可能已損毀）\n",
-               path);
+               "sg: %s 是分塊儲存的檔案，但重組後的內容與記錄的雜湊碼不符（物件庫可能已損毀）\n",
+               sg_quote_path_delimited(path));
     }
     fprintf(stderr, "sg: 這通常表示物件庫被 git gc 清理過，或 clone 時未取得 %s\n",
            SG_CHUNK_KEEPALIVE_REF);

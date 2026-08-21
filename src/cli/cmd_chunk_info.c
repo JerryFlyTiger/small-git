@@ -5,6 +5,7 @@
 #include "sg/index.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
+#include "sg/quote.h"
 #include "sg/repo.h"
 #include "sg/workdir.h"
 
@@ -164,7 +165,7 @@ static int resolve_blob_id(const char *git_dir, const char *arg, unsigned char i
     }
     rel = sg_resolve_repo_path(repo_root, arg);
     if (rel == NULL) {
-        fprintf(stderr, "sg: '%s' is outside the repository\n", arg);
+        fprintf(stderr, "sg: %s is outside the repository\n", sg_quote_path_delimited(arg));
         free(repo_root);
         return -1;
     }
@@ -177,7 +178,7 @@ static int resolve_blob_id(const char *git_dir, const char *arg, unsigned char i
 
     pos = sg_index_find(&idx, rel);
     if (pos < 0) {
-        fprintf(stderr, "sg: '%s' is not tracked in the index\n", arg);
+        fprintf(stderr, "sg: %s is not tracked in the index\n", sg_quote_path_delimited(arg));
     } else {
         memcpy(id_out, idx.entries[pos].sha1, SG_SHA1_RAW_LEN);
         rc = 0;
@@ -219,13 +220,19 @@ int sg_cmd_chunk_info(int argc, char **argv)
     }
 
     if (sg_object_read(git_dir, id, &type, &content, &content_len) != 0) {
-        fprintf(stderr, "sg: object '%s' not found or corrupt\n", arg);
+        fprintf(stderr, "sg: object %s not found or corrupt\n", sg_quote_path_delimited(arg));
         free(git_dir);
         return 1;
     }
 
     if (type != SG_OBJ_BLOB) {
-        fprintf(stderr, "sg: '%s' is not a blob (type: %s)\n", arg, sg_obj_type_name(type));
+        /* Quoted like the other two even though reaching here usually means
+           arg was a bare hex id: the path branch gets here too if an index
+           entry points at a non-blob, and "it came out of the index" is not
+           evidence about its bytes -- the same assumption Phase 22 had to
+           stop relying on. */
+        fprintf(stderr, "sg: %s is not a blob (type: %s)\n", sg_quote_path_delimited(arg),
+                sg_obj_type_name(type));
         free(content);
         free(git_dir);
         return 1;
@@ -236,7 +243,7 @@ int sg_cmd_chunk_info(int argc, char **argv)
        alone (sg_chunk_pointer_parse succeeding) is not enough, which is
        exactly the distinction this command needs to make. */
     if (sg_chunk_effective_id(git_dir, id, effective_id) != 0) {
-        fprintf(stderr, "sg: failed to read object '%s'\n", arg);
+        fprintf(stderr, "sg: failed to read object %s\n", sg_quote_path_delimited(arg));
         free(content);
         free(git_dir);
         return 1;

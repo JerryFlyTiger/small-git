@@ -4,6 +4,7 @@
 #include "sg/hash.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/repo.h"
 
 #include <stdio.h>
@@ -41,7 +42,7 @@ static int print_tree(const unsigned char *content, size_t content_len)
         sg_sha1_to_hex(e->sha1, hex);
         /* mode is zero-padded to 6 digits for display only; on-disk it never
            has a leading zero */
-        printf("%06o %s %s\t%s\n", e->mode, type_name, hex, e->name);
+        printf("%06o %s %s\t%s\n", e->mode, type_name, hex, sg_quote_path(e->name));
     }
 
     sg_tree_free(&tree);

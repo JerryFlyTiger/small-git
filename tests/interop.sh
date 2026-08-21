@@ -8128,6 +8128,280 @@ check "phase22: and sg still never descends into the real gitdir" \
 check "phase22: and a tree holding them still checks out" \
     sh -c "[ -f '$P22_OK/.gitignore' ] && [ -f '$P22_OK/.github/workflows/ci.yml' ] && [ -f '$P22_OK/git~1' ]"
 
+# ============================================================
+# Phase 23: paths are quoted the way git quotes them
+#
+# Before this, a filename carrying an ESC byte reached the terminal intact
+# from `sg status` and `sg cat-file -p` -- measured with od -c, not inferred:
+# sg emitted byte 0x1b while git emitted the four characters \033. One
+# filename was enough to clear the screen or recolour everything printed
+# after it, which is a convincing way to fake "nothing to commit".
+#
+# sg quotes >= 0x80 bytes as-is, git's core.quotepath=false behaviour rather
+# than its default, so every comparison here passes that flag EXCEPT the
+# control-character group (where both sides quote regardless) and the
+# divergence check at the end, which exists to pin the difference itself.
+#
+# Fixtures stay at the repository root on purpose: git folds an untracked
+# directory into a single "dir/" entry while sg lists the files inside it,
+# and that difference has nothing to do with quoting -- it would just make
+# these checks fail for the wrong reason.
+# ============================================================
+
+# Writes the hostile fixture files into $1. $2 selects the set:
+#   ctrl   -- ASCII control bytes only (identical on both sides, no flag)
+#   high   -- non-ASCII only (this is where sg and git diverge)
+#   mixed  -- both, plus the names that must NOT be quoted
+p23_make_files() {
+    python3 - "$1" "$2" <<'PY'
+import os, sys
+d, which = sys.argv[1], sys.argv[2]
+ctrl  = ['esc\x1bhere.txt', 'tab\there.txt', 'bel\ahere.txt', 'del\x7fhere.txt',
+         'ctrl\x01here.txt', 'back\\slash.txt', 'quote"here.txt',
+         'bin\x1besc.dat']
+high  = ['\u4e2d\u6587.txt', '\u00fc.txt']
+plain = ['plain.txt', 'has space.txt', 'meta~!$*?#;|&()<>[].txt', "single'quote.txt"]
+sets  = {'ctrl': ctrl + plain, 'high': high, 'mixed': ctrl + high + plain}
+for n in sets[which]:
+    path = os.path.join(d, n)
+    if 'bin' in n:
+        with open(path, 'wb') as f:
+            f.write(b'\x00\x01body\n')
+    else:
+        with open(path, 'w') as f:
+            f.write('body\n')
+PY
+}
+
+# --- Q1: cat-file -p on a tree. The strongest oracle available: both sides'
+# output format is fully determined, so this is a whole-output byte compare
+# with nothing extracted or normalised away. ---
+P23_CF="$WORKDIR/p23_catfile"
+(cd "$WORKDIR" && "$SG" init p23_catfile) > /dev/null 2>&1
+(cd "$P23_CF" && git config user.email "a@b.c" && git config user.name "git user")
+p23_make_files "$P23_CF" mixed
+(cd "$P23_CF" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+check "phase23: sg add/commit of hostile filenames exits 0" test $? = 0
+P23_TREE=$(cd "$P23_CF" && git rev-parse HEAD^{tree} 2>/dev/null)
+(cd "$P23_CF" && "$SG" cat-file -p "$P23_TREE") 2>/dev/null | sort > "$WORKDIR/p23_cf_sg.txt"
+(cd "$P23_CF" && git -c core.quotepath=false cat-file -p "$P23_TREE") 2>/dev/null | sort > "$WORKDIR/p23_cf_git.txt"
+check "phase23: sg cat-file -p on a tree matches real git byte-for-byte" \
+    cmp -s "$WORKDIR/p23_cf_sg.txt" "$WORKDIR/p23_cf_git.txt"
+check "phase23: and no raw ESC byte survives into that output" \
+    sh -c "! LC_ALL=C grep -q \"\$(printf '\\033')\" '$WORKDIR/p23_cf_sg.txt'"
+check "phase23 oracle: precondition -- the fixture really does carry an ESC byte" \
+    sh -c "ls -b '$P23_CF' | grep -q 'esc'"
+
+# --- Q2: diff headers. sg's hunk and body format differ from git's, so only
+# the header lines are compared; a whole-file cmp would be red forever and
+# would say nothing about quoting. ---
+P23_DIFF="$WORKDIR/p23_diff"
+(cd "$WORKDIR" && "$SG" init p23_diff) > /dev/null 2>&1
+(cd "$P23_DIFF" && git config user.email "a@b.c" && git config user.name "git user")
+p23_make_files "$P23_DIFF" mixed
+(cd "$P23_DIFF" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+python3 - "$P23_DIFF" <<'PY'
+import os, sys
+# Rewrite every tracked file, and make the binary one binary on both sides so
+# the "Binary files ... differ" line is exercised: without a NUL byte in the
+# fixture that whole line has no coverage, which a per-site mutation found.
+for n in os.listdir(sys.argv[1]):
+    p = os.path.join(sys.argv[1], n)
+    if not os.path.isfile(p):
+        continue
+    if 'bin' in n:
+        open(p, 'wb').write(b'\x00\x01CHANGED\n')
+    else:
+        open(p, 'w').write('CHANGED\n')
+PY
+(cd "$P23_DIFF" && "$SG" diff) 2>/dev/null | grep -aE '^(diff --git|---|\+\+\+|Binary files)' | sort > "$WORKDIR/p23_d_sg.txt"
+(cd "$P23_DIFF" && git -c core.quotepath=false diff) 2>/dev/null | grep -aE '^(diff --git|---|\+\+\+|Binary files)' | sort > "$WORKDIR/p23_d_git.txt"
+check "phase23: sg diff headers match real git byte-for-byte" \
+    cmp -s "$WORKDIR/p23_d_sg.txt" "$WORKDIR/p23_d_git.txt"
+# The trailing TAB after ---/+++ is git's disambiguator for a name containing
+# a space, and only for those two lines. Asserted on its own because a whole
+# -header cmp that happened to have no spaced name would pass without it.
+check "phase23: a spaced name gets git's trailing TAB on --- and +++" \
+    sh -c "grep -c \"^--- a/has space.txt\$(printf '\\t')\$\" '$WORKDIR/p23_d_sg.txt' | grep -q '^1\$'"
+check "phase23: and diff --git does NOT get one, matching git" \
+    sh -c "! grep -q \"^diff --git.*\$(printf '\\t')\$\" '$WORKDIR/p23_d_sg.txt'"
+
+# --- Q3: the untracked list in sg status, against git's LONG format -- not
+# --porcelain. The two are different oracles: porcelain quotes a name merely
+# for containing a space (its "?? " prefix makes space a field separator),
+# while the long format and ls-files leave it bare. Measured. Comparing sg's
+# long output against porcelain reports a failure for a name sg handles
+# exactly right, which is the kind of false red that gets correct code
+# "fixed". Only the path column is compared: the wording around it is sg's
+# own. ---
+P23_ST="$WORKDIR/p23_status"
+(cd "$WORKDIR" && "$SG" init p23_status) > /dev/null 2>&1
+(cd "$P23_ST" && git config user.email "a@b.c" && git config user.name "git user")
+p23_make_files "$P23_ST" mixed
+(cd "$P23_ST" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+# All four label kinds get a name that needs quoting. A per-site mutation
+# proved this matters: with only untracked names present, deleting the
+# quoting from the staged/unstaged printer reddened nothing at all.
+# The staged name uses a double quote rather than a control byte so it can
+# be passed through argv here without another layer of escaping.
+p23_st_mutate() {
+    python3 - "$1" <<'PYX'
+import os, sys
+d = sys.argv[1]
+open(os.path.join(d, 'esc\x1bhere.txt'), 'w').write('CHANGED\n')
+os.remove(os.path.join(d, 'tab\there.txt'))
+open(os.path.join(d, 'added"quote.txt'), 'w').write('fresh\n')
+open(os.path.join(d, 'untracked\x1bnew.txt'), 'w').write('fresh\n')
+# A bare, untracked name whose only oddity is a space. The checks below
+# use it to prove the rule is not over-broad, so it must stay untracked.
+open(os.path.join(d, 'bare space.txt'), 'w').write('fresh\n')
+PYX
+}
+p23_st_mutate "$P23_ST"
+(cd "$P23_ST" && "$SG" add 'added"quote.txt') > /dev/null 2>&1
+# git's labels are compared alongside the paths, so its language is pinned:
+# this machine's git speaks Chinese while sg's labels are English.
+(cd "$P23_ST" && "$SG" status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_s_sg.txt"
+(cd "$P23_ST" && LC_ALL=C git -c core.quotepath=false status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_s_git.txt"
+check "phase23: sg status's untracked paths match real git's byte-for-byte" \
+    cmp -s "$WORKDIR/p23_s_sg.txt" "$WORKDIR/p23_s_git.txt"
+check "phase23: sg status emits no raw ESC byte" \
+    sh -c "! LC_ALL=C grep -q \"\$(printf '\\033')\" '$WORKDIR/p23_s_sg.txt'"
+# The two git formats disagree here, and that disagreement is the reason the
+# comparison above uses the long one. Pinned so a future edit cannot quietly
+# switch oracles and start "fixing" sg to match the wrong one.
+P23_ST_PORC="$WORKDIR/p23_s_git_porcelain.txt"
+(cd "$P23_ST" && git -c core.quotepath=false status --porcelain) 2>/dev/null | sed -n 's/^?? //p' | sort > "$P23_ST_PORC"
+check "phase23 oracle: precondition -- git's porcelain quotes a spaced name where its long format does not" \
+    sh -c "grep -qx '\"bare space.txt\"' '$P23_ST_PORC' && grep -qx 'bare space.txt' '$WORKDIR/p23_s_git.txt'"
+
+check "phase23: names needing no quoting are still printed bare" \
+    sh -c "grep -qx 'bare space.txt' '$WORKDIR/p23_s_sg.txt'"
+
+# --- Q6: the unmerged ("both modified") line. It has its own printer, and a
+# per-site mutation showed the other status fixtures do not reach it: with
+# no conflict present, deleting the quoting there reddened nothing. ---
+P23_CONF="$WORKDIR/p23_conflict"
+(cd "$WORKDIR" && "$SG" init p23_conflict) > /dev/null 2>&1
+(cd "$P23_CONF" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "
+import sys
+open(sys.argv[1] + '/conf\x1bict.txt', 'w').write('base\n')" "$P23_CONF"
+(cd "$P23_CONF" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P23_CONF" && "$SG" switch -c other) > /dev/null 2>&1
+python3 -c "
+import sys
+open(sys.argv[1] + '/conf\x1bict.txt', 'w').write('theirs\n')" "$P23_CONF"
+(cd "$P23_CONF" && "$SG" add . && "$SG" commit -m theirs) > /dev/null 2>&1
+(cd "$P23_CONF" && "$SG" switch master) > /dev/null 2>&1
+python3 -c "
+import sys
+open(sys.argv[1] + '/conf\x1bict.txt', 'w').write('ours\n')" "$P23_CONF"
+(cd "$P23_CONF" && "$SG" add . && "$SG" commit -m ours) > /dev/null 2>&1
+(cd "$P23_CONF" && "$SG" merge other) > /dev/null 2>&1
+check "phase23 oracle: precondition -- the merge really did conflict" \
+    test -f "$P23_CONF/.git/MERGE_HEAD"
+(cd "$P23_CONF" && "$SG" status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_u_sg.txt"
+(cd "$P23_CONF" && LC_ALL=C git -c core.quotepath=false status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_u_git.txt"
+check "phase23: the unmerged path is quoted the same way git quotes it" \
+    cmp -s "$WORKDIR/p23_u_sg.txt" "$WORKDIR/p23_u_git.txt"
+check "phase23: and that line carries no raw ESC byte" \
+    sh -c "! LC_ALL=C grep -q \"\$(printf '\\033')\" '$WORKDIR/p23_u_sg.txt'"
+
+# --- Q7: error messages. Nothing else in this suite looks at stderr wording,
+# so without this the whole error-message half of the quoting work has no
+# coverage at all -- a per-site mutation is the only way to notice, and it
+# would report a dead angle rather than a passing test.
+#
+# Two checks, and the second one is the discriminating one: a name carrying
+# an ESC gets quoted by BOTH sg_quote_path and sg_quote_path_delimited, so it
+# cannot tell them apart. Only a name that needs no escaping at all can --
+# _delimited quotes it anyway, precisely so a reader can see where a path
+# with leading or trailing spaces begins and ends. sg has no oracle here:
+# git's own wording differs, so these pin sg's behaviour rather than compare.
+P23_ERR="$WORKDIR/p23_err"
+(cd "$WORKDIR" && "$SG" init p23_err) > /dev/null 2>&1
+(cd "$P23_ERR" && git config user.email "a@b.c" && git config user.name "git user")
+P23_ERR_OUT="$WORKDIR/p23_err_hostile.txt"
+python3 - "$SG" "$P23_ERR" "$P23_ERR_OUT" <<'PYE'
+import subprocess, sys
+sg, d, out = sys.argv[1], sys.argv[2], sys.argv[3]
+r = subprocess.run([sg, 'add', 'ev\x1bil.txt'], cwd=d, capture_output=True)
+open(out, 'wb').write(r.stderr)
+PYE
+check "phase23: an error message escapes a control byte instead of emitting it" \
+    sh -c "! LC_ALL=C grep -q \"\$(printf '\\033')\" '$P23_ERR_OUT'"
+check "phase23: and renders it as the literal four characters git uses" \
+    grep -q '\\033' "$P23_ERR_OUT"
+
+P23_ERR_PLAIN="$WORKDIR/p23_err_plain.txt"
+(cd "$P23_ERR" && "$SG" restore missing.txt) 2> "$P23_ERR_PLAIN" > /dev/null
+check "phase23: a path inside a sentence is delimited even when nothing needs escaping" \
+    grep -q '"missing.txt"' "$P23_ERR_PLAIN"
+
+# --- Q8: the error paths that only a damaged repository reaches. A cold read
+# found three sites in cmd_diff.c and three in cmd_chunk_info.c still printing
+# raw bytes while the rest of the same files had been converted -- and nothing
+# was watching them, so the miss was invisible. Reaching them needs an index
+# entry whose blob is gone, which is exactly what this fixture builds. ---
+P23_DMG="$WORKDIR/p23_damaged"
+(cd "$WORKDIR" && "$SG" init p23_damaged) > /dev/null 2>&1
+(cd "$P23_DMG" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "
+import sys
+open(sys.argv[1] + '/ev\x1bil.txt', 'w').write('body\n')" "$P23_DMG"
+(cd "$P23_DMG" && "$SG" add .) > /dev/null 2>&1
+P23_DMG_BLOB=$(cd "$P23_DMG" && git ls-files -s | awk '{print $2}' | head -1)
+rm -f "$P23_DMG/.git/objects/$(printf '%s' "$P23_DMG_BLOB" | cut -c1-2)/$(printf '%s' "$P23_DMG_BLOB" | cut -c3-)"
+check "phase23 oracle: precondition -- the staged blob really is gone" \
+    sh -c "! git -C '$P23_DMG' cat-file -e '$P23_DMG_BLOB' 2>/dev/null"
+
+P23_DMG_DIFF="$WORKDIR/p23_damaged_diff.txt"
+(cd "$P23_DMG" && "$SG" diff) 2> "$P23_DMG_DIFF" > /dev/null
+check "phase23: sg diff's missing-blob warning escapes the path" \
+    sh -c "! LC_ALL=C grep -q \"\$(printf '\\033')\" '$P23_DMG_DIFF'"
+check "phase23: and renders it as the literal escape" grep -q '\\033' "$P23_DMG_DIFF"
+
+P23_DMG_CI="$WORKDIR/p23_damaged_chunkinfo.txt"
+python3 - "$SG" "$P23_DMG" "$P23_DMG_CI" <<'PYD'
+import subprocess, sys
+sg, d, out = sys.argv[1], sys.argv[2], sys.argv[3]
+r = subprocess.run([sg, 'chunk-info', 'ev\x1bil.txt'], cwd=d, capture_output=True)
+open(out, 'wb').write(r.stderr)
+PYD
+check "phase23: sg chunk-info's missing-object error escapes the path too" \
+    sh -c "! LC_ALL=C grep -q \"\$(printf '\\033')\" '$P23_DMG_CI'"
+check "phase23: and renders it as the literal escape" grep -q '\\033' "$P23_DMG_CI"
+
+# --- Q4: control characters alone, compared against git with NO flag. Both
+# implementations quote these regardless of core.quotepath, so this group
+# pins that the divergence is confined to bytes >= 0x80. ---
+P23_CTRL="$WORKDIR/p23_ctrl"
+(cd "$WORKDIR" && "$SG" init p23_ctrl) > /dev/null 2>&1
+(cd "$P23_CTRL" && git config user.email "a@b.c" && git config user.name "git user")
+p23_make_files "$P23_CTRL" ctrl
+(cd "$P23_CTRL" && "$SG" status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_c_sg.txt"
+(cd "$P23_CTRL" && git status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_c_git.txt"
+check "phase23: control-character names match git even WITHOUT core.quotepath=false" \
+    cmp -s "$WORKDIR/p23_c_sg.txt" "$WORKDIR/p23_c_git.txt"
+
+# --- Q5: the divergence itself, asserted rather than merely tolerated. A
+# non-ASCII name must differ from default git and match git with the flag.
+# Without this, silently switching sg to git's default would break nothing. ---
+P23_HIGH="$WORKDIR/p23_high"
+(cd "$WORKDIR" && "$SG" init p23_high) > /dev/null 2>&1
+(cd "$P23_HIGH" && git config user.email "a@b.c" && git config user.name "git user")
+p23_make_files "$P23_HIGH" high
+(cd "$P23_HIGH" && "$SG" status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_h_sg.txt"
+(cd "$P23_HIGH" && git status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_h_gitdef.txt"
+(cd "$P23_HIGH" && git -c core.quotepath=false status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p23_h_gitraw.txt"
+check "phase23 oracle: precondition -- git's two quotepath settings really do differ here" \
+    sh -c "! cmp -s '$WORKDIR/p23_h_gitdef.txt' '$WORKDIR/p23_h_gitraw.txt'"
+check "phase23 divergence: sg matches git -c core.quotepath=false for non-ASCII" \
+    cmp -s "$WORKDIR/p23_h_sg.txt" "$WORKDIR/p23_h_gitraw.txt"
+check "phase23 divergence: and deliberately does NOT match git's default" \
+    sh -c "! cmp -s '$WORKDIR/p23_h_sg.txt' '$WORKDIR/p23_h_gitdef.txt'"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

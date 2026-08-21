@@ -5,6 +5,7 @@
 #include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -40,7 +41,8 @@ static void print_section(const char *title, const char **hints, size_t hint_cou
     for (i = 0; i < hint_count; i++)
         printf("  (%s)\n", hints[i]);
     for (i = 0; i < list->count; i++)
-        printf("\t%s%s\n", kind_label(list->entries[i].kind), list->entries[i].path);
+        printf("\t%s%s\n", kind_label(list->entries[i].kind),
+              sg_quote_path(list->entries[i].path));
     printf("\n");
 }
 
@@ -73,7 +75,7 @@ static size_t print_unmerged(const sg_index *idx, int rebase_in_progress)
             continue;
         if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
             continue;
-        printf("\tboth modified:   %s\n", idx->entries[i].path);
+        printf("\tboth modified:   %s\n", sg_quote_path(idx->entries[i].path));
     }
     printf("\n");
     return count;
@@ -228,7 +230,7 @@ int sg_cmd_status(int argc, char **argv)
         printf("Untracked files:\n");
         printf("  (use \"sg add <file>...\" to include in what will be committed)\n");
         for (i = 0; i < untracked_count; i++)
-            printf("\t%s\n", untracked[i]);
+            printf("\t%s\n", sg_quote_path(untracked[i]));
         printf("\n");
     }
 
