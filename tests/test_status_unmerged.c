@@ -189,7 +189,11 @@ static void test_added_by_them(void)
 
 int main(void)
 {
-    make_tmp_repo_and_cd();
+    /* Held and freed rather than discarded: the CI sanitizer build runs
+       LeakSanitizer with detect_leaks=1, and a dropped strdup here is a real
+       leak report even though the process is about to exit. macOS ASan does
+       not do leak detection, so this only ever shows up on CI. */
+    char *repo_root = make_tmp_repo_and_cd();
 
     test_both_deleted();
     test_deleted_by_them();
@@ -198,6 +202,8 @@ int main(void)
     test_added_by_us();
     test_both_added();
     test_added_by_them();
+
+    free(repo_root);
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
