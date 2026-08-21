@@ -232,4 +232,31 @@ int sg_stash_drop(const char *git_dir, size_t index);
    empty stack prints nothing and exits 0). Returns 0, -1 on I/O failure. */
 int sg_stash_clear(const char *git_dir);
 
+/* The four trees a stash entry decomposes into (Phase 25 WP4 -- shared by
+   sg_stash_apply_check_dirty, sg_stash_apply, and `sg stash show`, so the
+   three never drift on what counts as a valid stash-shaped commit):
+
+     - base_tree: parents[0]'s tree -- HEAD's tree at `stash push` time, and
+       the diff base `git stash show` compares against.
+     - theirs_tree: the stash commit's OWN tree -- the "tracked" half (index
+       + working tree merged at push time).
+     - index_tree: parents[1]'s tree -- the index exactly as it stood at
+       push time.
+     - untracked_tree / has_untracked: parents[2]'s tree, present only for a
+       `stash -u`/`-a` entry (3 parents). has_untracked is 0 and
+       untracked_tree is left unset otherwise. */
+typedef struct {
+    unsigned char base_tree[SG_SHA1_RAW_LEN];
+    unsigned char theirs_tree[SG_SHA1_RAW_LEN];
+    unsigned char index_tree[SG_SHA1_RAW_LEN];
+    int has_untracked;
+    unsigned char untracked_tree[SG_SHA1_RAW_LEN];
+} sg_stash_trees;
+
+/* Resolves stash entry `index` (0 == stash@{0}, newest) into the four trees
+   above. Returns -1 on a bad/out-of-range index, a corrupt stash commit, an
+   unreadable tree/object, or a parent count that is not 2 or 3 (never a
+   shape sg -- or real git -- produces for a stash). Returns 0 on success. */
+int sg_stash_load_trees(const char *git_dir, size_t index, sg_stash_trees *out);
+
 #endif

@@ -1,6 +1,8 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/diff.h"
+#include "sg/diff_out.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/merge.h"
@@ -229,6 +231,257 @@ static int cmd_stash_clear(int argc, char **argv)
 
     free(git_dir);
     return 0;
+}
+
+/* Which half(s) of a stash's changes `sg stash show` compares against
+   base_tree. Measured against real git 2.55.0 in a scratch repo (three
+   separate findings, kept together since the first two are easy to
+   misread as two independent boolean flags):
+
+     1. `-u` and `--only-untracked` are NOT independent toggles that
+        combine -- they are one mode selector, and whichever one is named
+        LAST on the command line decides. Measured by running the same
+        3-parent stash (tracked change to f.txt + untracked u.txt) through
+        both orderings:
+          `git stash show -u --only-untracked`  -> only "u.txt" (only-untracked wins)
+          `git stash show --only-untracked -u`  -> both "f.txt" and "u.txt" (-u wins)
+        If they were independent flags both orderings would print the same
+        thing; they don't, so this file tracks a single last-write-wins
+        enum instead of two separate booleans.
+     2. `--only-untracked` on a stash with NO untracked parent (a plain
+        2-parent `stash push`, no `-u`/`-a`): prints nothing and exits 0 --
+        not an error, not a fallback to the tracked diff.
+     3. `-u` on a stash with no untracked parent: falls back to exactly the
+        tracked-only diff (identical to no flag at all), also exits 0. */
+typedef enum {
+    SHOW_UNTRACKED_NONE = 0,   /* default: base_tree vs theirs_tree only */
+    SHOW_UNTRACKED_INCLUDE,    /* -u/--include-untracked: tracked + untracked */
+    SHOW_UNTRACKED_ONLY        /* --only-untracked: untracked half only */
+} show_untracked_mode;
+
+/* Merges a (tracked half: base_tree vs theirs_tree) and b (untracked half:
+   the EMPTY tree vs untracked_tree, not base_tree vs untracked_tree -- see
+   the call site's comment for why: every path in b is therefore an
+   addition) into one path-sorted list,
+   transferring ownership of every entry from a/b into *out. sg_diff_print
+   assumes its input is already sorted by path (diff_out.h); real git's own
+   `stash show -u` output interleaves the two halves by name rather than
+   printing the tracked block followed by the untracked block, so a plain
+   concatenation would not match it (measured).
+
+   Two sg_diff_trees calls plus this merge, rather than building one merged
+   tree object first (via sg_tree_build) and diffing that against base_tree
+   once, was chosen so that `sg stash show` never writes anything to the
+   object store just to render a diff.
+
+   On success, a and b are left zeroed (their arrays freed here, without
+   touching the path strings, which now belong to *out); a caller must still
+   NOT call sg_diff_list_free on them afterward. On the (out-of-memory)
+   failure path, a and b are left untouched and *out is zeroed -- the caller
+   is responsible for freeing a and b itself. */
+static int merge_diff_lists(sg_diff_list *a, sg_diff_list *b, sg_diff_list *out)
+{
+    size_t ia = 0, ib = 0, n = 0;
+    sg_diff_entry *merged;
+
+    memset(out, 0, sizeof(*out));
+    if (a->count + b->count == 0)
+        return 0;
+
+    merged = malloc((a->count + b->count) * sizeof(*merged));
+    if (merged == NULL)
+        return -1;
+
+    while (ia < a->count && ib < b->count) {
+        if (strcmp(a->entries[ia].path, b->entries[ib].path) <= 0)
+            merged[n++] = a->entries[ia++];
+        else
+            merged[n++] = b->entries[ib++];
+    }
+    while (ia < a->count)
+        merged[n++] = a->entries[ia++];
+    while (ib < b->count)
+        merged[n++] = b->entries[ib++];
+
+    out->entries = merged;
+    out->count = n;
+    out->cap = n;
+
+    free(a->entries);
+    a->entries = NULL;
+    a->count = 0;
+    a->cap = 0;
+    free(b->entries);
+    b->entries = NULL;
+    b->count = 0;
+    b->cap = 0;
+
+    return 0;
+}
+
+static void report_bad_stash_tree_path(const char *bad_path)
+{
+    fprintf(stderr, "sg: 路徑 %s 無效，拒絕將這棵 tree 展開成檔案路徑\n",
+           sg_quote_path_delimited(bad_path));
+}
+
+static int cmd_stash_show(int argc, char **argv)
+{
+    static const char usage[] =
+        "usage: sg stash show [-p|--patch] [--stat] [--numstat] [--shortstat] [--name-only] "
+        "[--name-status]\n"
+        "                      [-u|--include-untracked] [--only-untracked] [<stash>]\n";
+    sg_diff_out_opts opts;
+    const char *spec = NULL;
+    show_untracked_mode umode = SHOW_UNTRACKED_NONE;
+    int i;
+    char *git_dir;
+    char *repo_root;
+    size_t index;
+    sg_stash_list list;
+    sg_stash_trees trees;
+    sg_diff_list diff_list;
+    char bad_path[SG_PATH_MAX];
+    int rc;
+    int exit_rc;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_STAT; /* the default -- measured, `git stash show` prints a diffstat */
+
+    for (i = 2; i < argc; i++) {
+        const char *a = argv[i];
+
+        if (strcmp(a, "-p") == 0 || strcmp(a, "--patch") == 0) {
+            opts.format = SG_DIFF_FORMAT_PATCH;
+        } else if (strcmp(a, "--stat") == 0) {
+            opts.format = SG_DIFF_FORMAT_STAT;
+        } else if (strcmp(a, "--numstat") == 0) {
+            opts.format = SG_DIFF_FORMAT_NUMSTAT;
+        } else if (strcmp(a, "--shortstat") == 0) {
+            opts.format = SG_DIFF_FORMAT_SHORTSTAT;
+        } else if (strcmp(a, "--name-only") == 0) {
+            opts.format = SG_DIFF_FORMAT_NAME_ONLY;
+        } else if (strcmp(a, "--name-status") == 0) {
+            opts.format = SG_DIFF_FORMAT_NAME_STATUS;
+        } else if (strcmp(a, "-u") == 0 || strcmp(a, "--include-untracked") == 0) {
+            umode = SHOW_UNTRACKED_INCLUDE;
+        } else if (strcmp(a, "--only-untracked") == 0) {
+            umode = SHOW_UNTRACKED_ONLY;
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fputs(usage, stderr);
+            return 1;
+        } else if (spec == NULL) {
+            spec = a;
+        } else {
+            fputs(usage, stderr);
+            return 1;
+        }
+    }
+
+    if (sg_stash_parse_spec(spec, &index) != 0) {
+        fprintf(stderr, "sg: invalid stash spec: %s\n", spec != NULL ? spec : "");
+        return 1;
+    }
+
+    git_dir = sg_require_git_dir();
+    if (git_dir == NULL)
+        return 1;
+    repo_root = sg_repo_root(git_dir);
+    if (repo_root == NULL) {
+        fprintf(stderr, "sg: failed to determine repository root\n");
+        free(git_dir);
+        return 1;
+    }
+
+    if (sg_stash_list_read(git_dir, &list) != 0) {
+        fprintf(stderr, "sg: failed to read stash list\n");
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    if (index >= list.count) {
+        fprintf(stderr, "sg: %s: log for 'stash' only has %zu entries\n",
+               spec != NULL ? spec : "stash@{0}", list.count);
+        sg_stash_list_free(&list);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+    sg_stash_list_free(&list);
+
+    if (sg_stash_load_trees(git_dir, index, &trees) != 0) {
+        fprintf(stderr, "sg: stash@{%zu} 已損壞（不是有效的 stash commit）\n", index);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
+
+    memset(&diff_list, 0, sizeof(diff_list));
+    bad_path[0] = '\0';
+    rc = 0;
+
+    if (umode == SHOW_UNTRACKED_ONLY) {
+        /* No untracked parent: real git prints nothing and exits 0 rather
+           than erroring (measured) -- passing NULL for both sides yields
+           exactly that, an empty diff list. */
+        const unsigned char *new_tree = trees.has_untracked ? trees.untracked_tree : NULL;
+
+        rc = sg_diff_trees(git_dir, NULL, new_tree, &diff_list, bad_path);
+    } else if (umode == SHOW_UNTRACKED_INCLUDE && trees.has_untracked) {
+        sg_diff_list tracked_list;
+        sg_diff_list untracked_list;
+
+        memset(&tracked_list, 0, sizeof(tracked_list));
+        memset(&untracked_list, 0, sizeof(untracked_list));
+
+        rc = sg_diff_trees(git_dir, trees.base_tree, trees.theirs_tree, &tracked_list, bad_path);
+        if (rc == 0)
+            /* NULL (empty tree), not trees.base_tree, on the old side here:
+               diffing base_tree vs untracked_tree would also report every
+               path base_tree has that untracked_tree lacks (i.e. every
+               tracked path the untracked half never touches) as a spurious
+               DELETION -- untracked_tree only ever holds untracked paths,
+               so base_tree's own tracked paths are never in it by
+               construction. Comparing against the empty tree instead is
+               exactly what --only-untracked (below) already does, and
+               yields only additions, one per untracked path -- caught by a
+               real-repo repro (`sg stash show -u --name-only` printed
+               "a.txt\na.txt\nb.txt\nc.txt\nc.txt" -- a.txt/c.txt doubled,
+               once as the tracked_list's genuine modification and once as
+               a phantom "deletion" from this call -- before this fix). */
+            rc = sg_diff_trees(git_dir, NULL, trees.untracked_tree, &untracked_list, bad_path);
+        if (rc == 0 && merge_diff_lists(&tracked_list, &untracked_list, &diff_list) != 0)
+            rc = -1;
+        if (rc != 0) {
+            sg_diff_list_free(&tracked_list);
+            sg_diff_list_free(&untracked_list);
+        }
+    } else {
+        /* Default, and -u with no untracked parent (measured: falls back to
+           the tracked-only diff rather than erroring, same as
+           --only-untracked's fallback above). */
+        rc = sg_diff_trees(git_dir, trees.base_tree, trees.theirs_tree, &diff_list, bad_path);
+    }
+
+    if (rc == -2) {
+        report_bad_stash_tree_path(bad_path);
+        free(repo_root);
+        free(git_dir);
+        return 1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "sg: failed to compute diff\n");
+        free(repo_root);
+        free(git_dir);
+        return 1;
+    }
+
+    exit_rc = sg_diff_print(git_dir, repo_root, &diff_list, &opts) != 0 ? 1 : 0;
+
+    sg_diff_list_free(&diff_list);
+    free(repo_root);
+    free(git_dir);
+    return exit_rc;
 }
 
 static int cmd_stash_drop(int argc, char **argv)
@@ -484,6 +737,10 @@ int sg_cmd_stash(int argc, char **argv)
     static const char usage[] = "usage: sg stash [push] [-m <msg>] [-u|--include-untracked] [-a|--all] "
                                 "[--keep-index]\n"
                                 "   or: sg stash list\n"
+                                "   or: sg stash show [-p|--patch] [--stat] [--numstat] [--shortstat] "
+                                "[--name-only] [--name-status]\n"
+                                "                     [-u|--include-untracked] [--only-untracked] "
+                                "[<stash>]\n"
                                 "   or: sg stash apply [--index] [<stash>]\n"
                                 "   or: sg stash pop [--index] [<stash>]\n"
                                 "   or: sg stash drop [<stash>]\n"
@@ -491,6 +748,8 @@ int sg_cmd_stash(int argc, char **argv)
 
     if (argc >= 2 && strcmp(argv[1], "list") == 0)
         return cmd_stash_list(argc, argv);
+    if (argc >= 2 && strcmp(argv[1], "show") == 0)
+        return cmd_stash_show(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "clear") == 0)
         return cmd_stash_clear(argc, argv);
     if (argc >= 2 && strcmp(argv[1], "apply") == 0)
