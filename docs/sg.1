@@ -1248,7 +1248,7 @@ side when comparing the two directly.
 .br
 .B sg stash show
 .RB [ -p | \-\-patch ]
-.RB [ \-\-stat ]
+[\fB\-\-stat\fR[=\fIw\fR[,\fIn\fR]]]
 .RB [ \-\-numstat ]
 .RB [ \-\-shortstat ]
 .RB [ \-\-name\-only ]
@@ -1402,6 +1402,11 @@ is accepted
 .BR \-\-name\-only ,
 .BR \-\-name\-status ),
 and the diff is rendered by the same code as
+.BR "sg diff" .
+.B \-\-stat
+also takes real git's
+.B \-\-stat=w[,n]
+width\-limit suffix, same as
 .BR "sg diff" .
 By default the comparison is the stash's tracked half (the commit made at
 push time) against its first parent (the tree at push time, before

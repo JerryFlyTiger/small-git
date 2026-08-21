@@ -740,6 +740,16 @@ int sg_stash_load_trees(const char *git_dir, size_t index, sg_stash_trees *out)
     size_t content_len;
     sg_commit stash_commit;
 
+    /* has_untracked == 0 leaves untracked_tree untouched below (it is only
+       ever written for a 3-parent stash) -- zero it up front so a caller
+       that someday forgets to check has_untracked first reads 20 zero
+       bytes, not uninitialized stack garbage. There is no sanitizer for
+       this project that would ever catch the alternative: ASan does not
+       flag a pure read of an uninitialized value the way it flags a
+       use-after-free or an out-of-bounds access, and this project has no
+       MemorySanitizer build. */
+    memset(out, 0, sizeof(*out));
+
     if (sg_stash_list_read(git_dir, &list) != 0)
         return -1;
     if (index >= list.count) {
