@@ -2538,7 +2538,7 @@ interop 1325/1325 全綠;渲染器那邊沒有修正可測。兩邊各自都誠�
 
 ### 驗證
 
-`tests/interop.sh` 新增 **63 條**,其中 **18 條是 `oracle: precondition`**——它們不驗 sg,
+`tests/interop.sh` 新增 **78 條**,其中 **22 條是 `oracle: precondition`**——它們不驗 sg,
 只驗 fixture 真的包含那個情境。這批立刻付了代價:第一次跑就紅了三條,全部是**我的**
 fixture 寫錯——`bin.dat` 與控制字元檔名在第一個 commit 就進去、之後沒再修改,
 所以既不出現在 `--cached` 的 diff 裡也不出現在 porcelain 裡。也就是說那組宣稱
@@ -2552,6 +2552,26 @@ fixture 寫錯——`bin.dat` 與控制字元檔名在第一個 commit 就進去
 歸併游標不再前進,測試**跑了三十分鐘還在跑**,而「永遠不退出」既不是 0 也不是非 0。
 現在有 `SG_MUTATE_TIMEOUT`(預設 300s),並且把「逾時」與「崩潰」**分開標示**
 ——兩者都只證明「改壞了會出事」,不證明那條具名斷言有鑑別力。
+
+### `sg stash show`
+
+一個 stash entry 需要的四棵樹早就算好了:`load_stash_trees` 從 Phase 15 起就在把
+`stash@{N}` 解成 base / index / worktree / 可選的 untracked,只是它是 `static`,
+`cmd_stash.c` 看不到。這一輪把它提升為公開 API,而不是讓 `cmd_stash_show` 再解一次
+parent——本專案已經有八份 `env_or()` 逐字複本的教訓。
+
+實測而非假設的三條:預設格式是 **diffstat 不是 patch**;`-u` 與 `--only-untracked`
+**不是兩個獨立布林,而是同一個模式選擇器、後寫的贏**(兩種順序各跑一次才分得出來);
+沒有 untracked parent 時 `--only-untracked` 印空、`-u` 退回一般 diff,兩者都退出 0。
+
+**`-u` 的聯集有一個 bug,是那條「排序」測試抓到的**:未追蹤那半原本拿
+`base_tree` vs `untracked_tree` 比,而每個只存在於已追蹤側的路徑在 `untracked_tree`
+裡都不存在,於是各被多報一筆**幽靈刪除**——同一路徑印兩次。正確做法是拿**空 tree**
+vs `untracked_tree`(`--only-untracked` 本來就是這樣做的)。
+
+讓它現形的是 fixture 的一個刻意選擇:未追蹤檔名取 `b.txt`,**排在兩個已追蹤檔名
+`a.txt` 與 `c.txt` 中間**。若它排最後,「兩份清單串接」與「合併排序」的輸出完全相同,
+那條測試就會零鑑別力。
 
 ### 這一輪刻意沒做的
 
