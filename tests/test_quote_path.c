@@ -227,6 +227,51 @@ static void test_ring_recycles_after_slots_exhausted(void)
           "slot must have been recycled after SG_QUOTE_SLOTS + 1 calls, still reads %s", first);
 }
 
+/* sg_quote_path and sg_quote_path_porcelain must DIVERGE on a plain space:
+   the porcelain "XY path" layout needs the space delimited even though it
+   needs no C-style escaping, while the long-format listing (one path per
+   indented line) must not quote it -- matching git measured 2.55.0. Only
+   asserting porcelain's own behavior would miss an implementation that
+   quotes spaces unconditionally in both functions; asserting the two
+   disagree on the identical input is what actually pins the divergence. */
+static void test_porcelain_quotes_space_long_format_does_not(void)
+{
+    const char *plain = sg_quote_path("has space.txt");
+    const char *porc;
+
+    CHECK(strcmp(plain, "has space.txt") == 0,
+         "sg_quote_path must not quote a plain space, got %s", plain);
+
+    porc = sg_quote_path_porcelain("has space.txt");
+    CHECK(strcmp(porc, "\"has space.txt\"") == 0,
+         "sg_quote_path_porcelain must quote a path containing a space, got %s", porc);
+}
+
+/* On a control character, both functions must agree: quoted and escaped
+   identically. This is the "consistency" half of the porcelain-vs-long
+   divergence -- porcelain does not get a DIFFERENT escaping rule, only an
+   extra trigger (space) for when to apply the same one. */
+static void test_porcelain_and_long_format_agree_on_control_chars(void)
+{
+    const char *plain = sg_quote_path("ctl\tname.txt");
+    const char *porc = sg_quote_path_porcelain("ctl\tname.txt");
+
+    CHECK(strcmp(plain, "\"ctl\\tname.txt\"") == 0, "sg_quote_path control-char case: got %s",
+         plain);
+    CHECK(strcmp(porc, "\"ctl\\tname.txt\"") == 0,
+         "sg_quote_path_porcelain control-char case: got %s", porc);
+}
+
+/* A path needing neither escaping nor porcelain's extra space trigger must
+   come back completely unquoted from sg_quote_path_porcelain too -- the
+   common case must not regress to always-quote. */
+static void test_porcelain_no_quoting_needed(void)
+{
+    const char *got = sg_quote_path_porcelain("plain.txt");
+
+    CHECK(strcmp(got, "plain.txt") == 0, "expected unquoted 'plain.txt', got %s", got);
+}
+
 int main(void)
 {
     test_named_escapes();
@@ -243,6 +288,9 @@ int main(void)
     test_delimited_always_quotes();
     test_ring_two_consecutive_calls_differ();
     test_ring_recycles_after_slots_exhausted();
+    test_porcelain_quotes_space_long_format_does_not();
+    test_porcelain_and_long_format_agree_on_control_chars();
+    test_porcelain_no_quoting_needed();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

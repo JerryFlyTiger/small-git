@@ -108,7 +108,7 @@ def git_untracked(repo):
 
 
 def sg_untracked(repo):
-    out = subprocess.run([SG, "status"], cwd=repo, capture_output=True)
+    out = subprocess.run([SG, "status", "-uall"], cwd=repo, capture_output=True)
     if out.returncode != 0:
         raise RuntimeError("sg status failed (rc=%d): %s"
                            % (out.returncode, out.stderr.decode()))

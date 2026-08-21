@@ -25,6 +25,18 @@ typedef struct {
 
 void sg_status_list_free(sg_status_list *list);
 
+/* How sg_status_list_untracked should report a directory that is entirely
+   untracked (no tracked path anywhere below it). Deliberately no default --
+   same reasoning as sg_workdir_missing in tree_build.h: a caller that needs
+   file-per-line output (sg_stash_push and sg_tree_build_from_untracked need
+   every actual file, not a directory name they cannot hash) and a caller
+   that wants git's porcelain/long "dir/" folding must each say so
+   explicitly, or one of them silently gets the other's behavior. */
+typedef enum {
+    SG_STATUS_UNTRACKED_LIST_FILES, /* never folds: one entry per file */
+    SG_STATUS_UNTRACKED_FOLD_DIRS,  /* folds a wholly-untracked dir into one "dir/" entry */
+} sg_status_untracked_fold;
+
 /* Changes staged relative to HEAD: compares head_flat (the flattened HEAD
    tree; pass a zeroed/empty sg_flat_list when there is no commit yet, in
    which case every index entry shows up as SG_STATUS_NEW) against idx. Both
@@ -43,16 +55,32 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
 int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg_index *idx,
                             sg_status_list *out);
 
-/* Lists every untracked file under repo_root, one entry per file (never
-   folded into a "dir/" line the way some porcelain output does). A path
-   already tracked at idx (any stage 0/1/2/3 -- see path_tracked_any_stage in
-   the .c) never appears here, including a staged-delete: the file may still
-   sit on disk with nothing left in the index, in which case it counts as
-   untracked exactly like git does. include_ignored = 0 skips paths matched
-   by the repo's .gitignore rules (opening and closing the ignore engine
-   internally -- the caller does not manage one); 1 includes them too. *out
-   is a malloc'd array of malloc'd strings, sorted by path (the walk itself
-   is readdir order, which is unspecified; callers such as
+/* Lists every untracked path under repo_root. A path already tracked at idx
+   (any stage 0/1/2/3 -- see path_tracked_any_stage in the .c) never appears
+   here, including a staged-delete: the file may still sit on disk with
+   nothing left in the index, in which case it counts as untracked exactly
+   like git does. include_ignored = 0 skips paths matched by the repo's
+   .gitignore rules (opening and closing the ignore engine internally -- the
+   caller does not manage one); 1 includes them too.
+
+   fold == SG_STATUS_UNTRACKED_LIST_FILES lists one entry per file, never
+   folded into a "dir/" line, matching the historical behavior every
+   non-status caller relies on. fold == SG_STATUS_UNTRACKED_FOLD_DIRS
+   collapses a directory that holds no tracked path anywhere below it into a
+   single "dir/" entry (trailing slash) once it finds any non-ignored file
+   under it, matching git's porcelain/long status output; the fold decision
+   is made independently per directory (a folded directory's own
+   sub-directories are never walked into, but a directory that is NOT
+   folded -- because something below it is tracked -- still lets its own
+   untracked children fold independently). Under FOLD_DIRS, a directory
+   whose files are all ignored is omitted entirely unless include_ignored is
+   set, in which case it is folded to "dir/" too; a directory folded because
+   it has a non-ignored file still lists each ignored file under it
+   individually when include_ignored is set (the fold only ever collapses
+   the non-ignored side of that directory).
+
+   *out is a malloc'd array of malloc'd strings, sorted by path (the walk
+   itself is readdir order, which is unspecified; callers such as
    sg_tree_build_from_untracked rely on this being sorted rather than each
    having to sort it themselves -- sg_tree_build's flat-list contract
    requires it). On success the caller frees each entry and then the array.
@@ -63,6 +91,7 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
    uncommitted work gets lost. Returns 0 on success, -1 on allocation
    failure. */
 int sg_status_list_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
-                             int include_ignored, char ***out, size_t *count);
+                             int include_ignored, sg_status_untracked_fold fold, char ***out,
+                             size_t *count);
 
 #endif

@@ -3172,7 +3172,7 @@ P9I_SG_SET="$WORKDIR/p9i_sg_set.txt"
 P9I_SG_OUT="$WORKDIR/p9i_sg_out.txt"
 (cd "$P9I_REPO" && git status --porcelain -uall -z) | tr '\0' '\n' \
     | sed -n 's/^?? //p' | LC_ALL=C sort > "$P9I_GIT_SET"
-(cd "$P9I_REPO" && "$SG" status) > "$P9I_SG_OUT" 2>&1
+(cd "$P9I_REPO" && "$SG" status -uall) > "$P9I_SG_OUT" 2>&1
 P9I_SG_RC=$?
 awk '/^Untracked files:/{f=1;next} /^$/{f=0} f && /^\t/{sub(/^\t/,"");print}' \
     "$P9I_SG_OUT" | LC_ALL=C sort > "$P9I_SG_SET"
@@ -3364,7 +3364,7 @@ check "phase9 status: working tree clean when only ignored files exist" \
 mkdir -p "$P9ST_REPO/subrepo/.git"
 printf 'junk not a real ref\n' > "$P9ST_REPO/subrepo/.git/HEAD"
 printf 'real\n' > "$P9ST_REPO/subrepo/file.txt"
-(cd "$P9ST_REPO" && "$SG" status) > "$P9ST_OUT" 2>&1
+(cd "$P9ST_REPO" && "$SG" status -uall) > "$P9ST_OUT" 2>&1
 check "phase9 status: a file next to a nested .git dir is still reported" \
     grep -q "subrepo/file.txt" "$P9ST_OUT"
 check "phase9 status: a nested .git dir is never descended into" \
@@ -8401,6 +8401,292 @@ check "phase23 divergence: sg matches git -c core.quotepath=false for non-ASCII"
     cmp -s "$WORKDIR/p23_h_sg.txt" "$WORKDIR/p23_h_gitraw.txt"
 check "phase23 divergence: and deliberately does NOT match git's default" \
     sh -c "! cmp -s '$WORKDIR/p23_h_sg.txt' '$WORKDIR/p23_h_gitdef.txt'"
+
+# ==========================================================================
+# Phase 25: flags on `sg diff` / `sg status`, and `sg stash show`.
+#
+# Two oracles are in play here and mixing them up is the known failure mode
+# (Phase 23 produced a false red exactly this way):
+#   * the machine-readable diff formats (--stat/--numstat/--name-only/
+#     --name-status) and the LONG status format leave a space bare and quote
+#     only control bytes -- sg_quote_path's rule;
+#   * `status --porcelain` quotes a name merely for containing a space,
+#     because its "?? " prefix makes the space a field separator.
+# Both are asserted below, and the divergence between them is asserted too,
+# so that collapsing one into the other cannot pass silently.
+#
+# git side always runs with `-c core.quotepath=false` (sg emits >=0x80 raw)
+# and, wherever a translated label could appear, with LC_ALL=C: the long
+# status format is localised and this repo's developer shell is not C.
+# ==========================================================================
+P25="$WORKDIR/p25"
+(cd "$WORKDIR" && "$SG" init p25) > /dev/null 2>&1
+(cd "$P25" && git config user.email "a@b.c" && git config user.name "git user")
+
+python3 - "$P25" <<'PY'
+import os, sys
+d = sys.argv[1]
+os.makedirs(os.path.join(d, 'sub'), exist_ok=True)
+open(os.path.join(d, 'tracked.txt'), 'w').write('a\nb\nc\n')
+open(os.path.join(d, 'has space.txt'), 'w').write('x\n')
+open(os.path.join(d, 'ctl\there.txt'), 'w').write('t\n')
+open(os.path.join(d, 'sub/deep.txt'), 'w').write('1\n2\n')
+open(os.path.join(d, 'bin.dat'), 'wb').write(bytes(range(256)) * 4)
+PY
+(cd "$P25" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+# sg has no rev-parse subcommand; the base id is fixture setup, not the
+# thing under test, so real git names it.
+P25_BASE=$(git -C "$P25" rev-parse HEAD)
+
+# A second commit, so that there are two trees to diff against each other.
+python3 - "$P25" <<'PY'
+import sys
+d = sys.argv[1]
+open(d + '/tracked.txt', 'w').write('a\nB\nc\nd\n')
+open(d + '/added_in_c2.txt', 'w').write('n\n' * 3)
+PY
+(cd "$P25" && "$SG" add . && "$SG" commit -m second) > /dev/null 2>&1
+
+# Now spread the working tree across every state the two formats can show:
+# staged modify, staged add, unstaged modify, unstaged delete, an untracked
+# file, a wholly untracked directory (which git collapses to "un/"), and an
+# untracked directory nested under a tracked one (collapsed at "sub/only/").
+python3 - "$P25" <<'PY'
+import os, sys
+d = sys.argv[1]
+open(d + '/has space.txt', 'w').write('x\ny\n')          # will be staged
+open(d + '/staged_new.txt', 'w').write('s\n')            # will be staged
+# Staged too, and for a reason the preconditions below check: a file that is
+# committed but never touched again appears in no diff at all, so a fixture
+# can claim to cover binary rows and quoted names while covering neither.
+open(d + '/bin.dat', 'wb').write(bytes(range(256)) * 5)
+open(d + '/ctl\there.txt', 'w').write('t\nu\n')
+os.makedirs(d + '/un/a', exist_ok=True)
+os.makedirs(d + '/un/b', exist_ok=True)
+open(d + '/un/a/1.txt', 'w').write('u\n')
+open(d + '/un/b/2.txt', 'w').write('u\n')
+os.makedirs(d + '/sub/only', exist_ok=True)
+open(d + '/sub/only/deeper.txt', 'w').write('u\n')
+open(d + '/untracked.txt', 'w').write('u\n')
+PY
+(cd "$P25" && "$SG" add "has space.txt" staged_new.txt bin.dat \
+    "$(printf 'ctl\there.txt')") > /dev/null 2>&1
+python3 - "$P25" <<'PY'
+import os, sys
+d = sys.argv[1]
+open(d + '/tracked.txt', 'w').write('a\nB\nc\nd\ne\n')   # unstaged modify
+os.remove(d + '/sub/deep.txt')                            # unstaged delete
+PY
+
+# --- status: porcelain, byte for byte -------------------------------------
+(cd "$P25" && "$SG" status --porcelain) 2>/dev/null > "$WORKDIR/p25_st_sg.txt"
+(cd "$P25" && LC_ALL=C git -c core.quotepath=false status --porcelain) 2>/dev/null \
+    > "$WORKDIR/p25_st_git.txt"
+check "phase25: sg status --porcelain matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p25_st_sg.txt" "$WORKDIR/p25_st_git.txt"
+
+# The cmp above is only worth anything if the fixture actually exercises the
+# interesting rows. Each precondition below names one property that would
+# otherwise let the cmp pass vacuously.
+check "phase25 oracle: precondition -- git really does collapse the untracked dir" \
+    grep -q '^?? un/$' "$WORKDIR/p25_st_git.txt"
+check "phase25 oracle: precondition -- and collapses one nested under a tracked dir" \
+    grep -q '^?? sub/only/$' "$WORKDIR/p25_st_git.txt"
+check "phase25 oracle: precondition -- porcelain quotes a merely-spaced name" \
+    grep -q '^M  "has space.txt"$' "$WORKDIR/p25_st_git.txt"
+check "phase25 oracle: precondition -- and both XY columns are exercised" \
+    sh -c "grep -q '^ M ' '$WORKDIR/p25_st_git.txt' && grep -q '^ D ' '$WORKDIR/p25_st_git.txt' && grep -q '^A  ' '$WORKDIR/p25_st_git.txt'"
+
+# --- the two quoting oracles really are different -------------------------
+# Asserted head-on: a spaced name is quoted by porcelain and bare in the long
+# format. Without this, collapsing sg's two quoting rules into one would keep
+# every cmp above green as long as both sides used the same wrong rule.
+(cd "$P25" && "$SG" status) 2>/dev/null > "$WORKDIR/p25_long_sg.txt"
+check "phase25: the long format leaves the same spaced name unquoted" \
+    sh -c "grep -q 'has space.txt' '$WORKDIR/p25_long_sg.txt' && ! grep -q '\"has space.txt\"' '$WORKDIR/p25_long_sg.txt'"
+check "phase25: while porcelain quotes it" \
+    grep -q '"has space.txt"' "$WORKDIR/p25_st_sg.txt"
+check "phase25: and both formats quote a control-character name" \
+    sh -c "grep -q 'ctl\\\\there.txt' '$WORKDIR/p25_st_sg.txt'"
+
+# --- status: --short is the same output, -b adds one line -----------------
+(cd "$P25" && "$SG" status --short) 2>/dev/null > "$WORKDIR/p25_st_short.txt"
+check "phase25: --short and --porcelain produce identical bytes" \
+    cmp -s "$WORKDIR/p25_st_short.txt" "$WORKDIR/p25_st_sg.txt"
+(cd "$P25" && "$SG" status --porcelain -b) 2>/dev/null > "$WORKDIR/p25_st_b.txt"
+(cd "$P25" && LC_ALL=C git -c core.quotepath=false status --porcelain -b) 2>/dev/null \
+    > "$WORKDIR/p25_st_b_git.txt"
+check "phase25: --porcelain -b matches git, branch header included" \
+    cmp -s "$WORKDIR/p25_st_b.txt" "$WORKDIR/p25_st_b_git.txt"
+
+# --- status: the long format's untracked list collapses too ---------------
+# This one is a behaviour CHANGE, not a new flag: sg used to list every file
+# under a wholly-untracked directory. Compared against git's LONG format,
+# under LC_ALL=C because the section headers are translated.
+(cd "$P25" && LC_ALL=C "$SG" status) 2>/dev/null \
+    | sed -n '/^Untracked files:/,/^$/p' | sed -n 's/^\t//p' | LC_ALL=C sort \
+    > "$WORKDIR/p25_un_sg.txt"
+(cd "$P25" && LC_ALL=C git -c core.quotepath=false status) 2>/dev/null \
+    | sed -n '/^Untracked files:/,/^$/p' | sed -n 's/^\t//p' | LC_ALL=C sort \
+    > "$WORKDIR/p25_un_git.txt"
+check "phase25: the long format's untracked list matches git, collapsed dirs and all" \
+    cmp -s "$WORKDIR/p25_un_sg.txt" "$WORKDIR/p25_un_git.txt"
+check "phase25 oracle: precondition -- that list really does contain a collapsed dir" \
+    grep -q '^un/$' "$WORKDIR/p25_un_git.txt"
+
+# --- diff: the machine-readable formats, byte for byte --------------------
+for _fmt in --numstat --name-only --name-status --shortstat --stat; do
+    (cd "$P25" && "$SG" diff --cached "$_fmt") 2>/dev/null > "$WORKDIR/p25_dc_sg.txt"
+    (cd "$P25" && LC_ALL=C git -c core.quotepath=false diff --cached "$_fmt") 2>/dev/null \
+        > "$WORKDIR/p25_dc_git.txt"
+    check "phase25: sg diff --cached $_fmt matches git byte-for-byte" \
+        cmp -s "$WORKDIR/p25_dc_sg.txt" "$WORKDIR/p25_dc_git.txt"
+
+    (cd "$P25" && "$SG" diff "$_fmt") 2>/dev/null > "$WORKDIR/p25_dw_sg.txt"
+    (cd "$P25" && LC_ALL=C git -c core.quotepath=false diff "$_fmt") 2>/dev/null \
+        > "$WORKDIR/p25_dw_git.txt"
+    check "phase25: sg diff $_fmt (index vs worktree) matches git byte-for-byte" \
+        cmp -s "$WORKDIR/p25_dw_sg.txt" "$WORKDIR/p25_dw_git.txt"
+
+    (cd "$P25" && "$SG" diff HEAD "$_fmt") 2>/dev/null > "$WORKDIR/p25_dh_sg.txt"
+    (cd "$P25" && LC_ALL=C git -c core.quotepath=false diff HEAD "$_fmt") 2>/dev/null \
+        > "$WORKDIR/p25_dh_git.txt"
+    check "phase25: sg diff HEAD $_fmt matches git byte-for-byte" \
+        cmp -s "$WORKDIR/p25_dh_sg.txt" "$WORKDIR/p25_dh_git.txt"
+
+    (cd "$P25" && "$SG" diff "$P25_BASE" HEAD "$_fmt") 2>/dev/null > "$WORKDIR/p25_dt_sg.txt"
+    (cd "$P25" && LC_ALL=C git -c core.quotepath=false diff "$P25_BASE" HEAD "$_fmt") 2>/dev/null \
+        > "$WORKDIR/p25_dt_git.txt"
+    check "phase25: sg diff <commit> <commit> $_fmt matches git byte-for-byte" \
+        cmp -s "$WORKDIR/p25_dt_sg.txt" "$WORKDIR/p25_dt_git.txt"
+done
+
+# Preconditions for the loop above: a --stat that never met a binary file or a
+# quoted name proves much less than the count of green checks suggests.
+(cd "$P25" && LC_ALL=C git -c core.quotepath=false diff --cached --stat) 2>/dev/null \
+    > "$WORKDIR/p25_stat_git.txt"
+check "phase25 oracle: precondition -- the --stat fixture includes a binary file" \
+    grep -q ' Bin ' "$WORKDIR/p25_stat_git.txt"
+check "phase25 oracle: precondition -- and a control-character name it must quote" \
+    grep -q 'ctl' "$WORKDIR/p25_stat_git.txt"
+check "phase25 oracle: precondition -- --stat leaves a spaced name unquoted" \
+    sh -c "! grep -q '\"has space.txt\"' '$WORKDIR/p25_stat_git.txt'"
+
+# --- diff: the index decides the path set, not the working tree -----------
+# `git rm --cached f` leaves the bytes on disk, and git still calls it a
+# deletion. Getting this from the working tree instead would report nothing.
+P25_RM="$WORKDIR/p25_rm"
+(cd "$WORKDIR" && "$SG" init p25_rm) > /dev/null 2>&1
+(cd "$P25_RM" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'r\n' > "$P25_RM/rmcached.txt"
+(cd "$P25_RM" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P25_RM" && git rm -q --cached rmcached.txt)
+(cd "$P25_RM" && "$SG" diff HEAD --name-status) 2>/dev/null > "$WORKDIR/p25_rm_sg.txt"
+(cd "$P25_RM" && LC_ALL=C git diff HEAD --name-status) 2>/dev/null > "$WORKDIR/p25_rm_git.txt"
+check "phase25: a path dropped from the index is a deletion though the file is still there" \
+    cmp -s "$WORKDIR/p25_rm_sg.txt" "$WORKDIR/p25_rm_git.txt"
+check "phase25 oracle: precondition -- git really does call it a deletion here" \
+    grep -q '^D	rmcached.txt$' "$WORKDIR/p25_rm_git.txt"
+(cd "$P25_RM" && "$SG" status --porcelain) 2>/dev/null > "$WORKDIR/p25_rm_st_sg.txt"
+(cd "$P25_RM" && LC_ALL=C git status --porcelain) 2>/dev/null > "$WORKDIR/p25_rm_st_git.txt"
+check "phase25: and porcelain lists that one path twice, as D and as ??" \
+    cmp -s "$WORKDIR/p25_rm_st_sg.txt" "$WORKDIR/p25_rm_st_git.txt"
+check "phase25 oracle: precondition -- git really does list it twice" \
+    sh -c "grep -q '^D  rmcached.txt$' '$WORKDIR/p25_rm_st_git.txt' && grep -q '^?? rmcached.txt$' '$WORKDIR/p25_rm_st_git.txt'"
+
+# --- status: the branch header's two unusual shapes -----------------------
+P25_UNBORN="$WORKDIR/p25_unborn"
+(cd "$WORKDIR" && "$SG" init p25_unborn) > /dev/null 2>&1
+(cd "$P25_UNBORN" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'n\n' > "$P25_UNBORN/n.txt"
+(cd "$P25_UNBORN" && "$SG" add .) > /dev/null 2>&1
+(cd "$P25_UNBORN" && "$SG" status --porcelain -b) 2>/dev/null | head -1 \
+    > "$WORKDIR/p25_unborn_sg.txt"
+(cd "$P25_UNBORN" && LC_ALL=C git status --porcelain -b) 2>/dev/null | head -1 \
+    > "$WORKDIR/p25_unborn_git.txt"
+check "phase25: an unborn HEAD's branch header matches git" \
+    cmp -s "$WORKDIR/p25_unborn_sg.txt" "$WORKDIR/p25_unborn_git.txt"
+
+# Detached is produced with real git so that the check is about sg's *reading*
+# of a detached HEAD, not about whichever sg command happens to detach one.
+(cd "$P25" && git checkout -q --detach) > /dev/null 2>&1
+(cd "$P25" && "$SG" status --porcelain -b) 2>/dev/null | head -1 > "$WORKDIR/p25_det_sg.txt"
+(cd "$P25" && LC_ALL=C git status --porcelain -b) 2>/dev/null | head -1 > "$WORKDIR/p25_det_git.txt"
+check "phase25: a detached HEAD's branch header matches git" \
+    cmp -s "$WORKDIR/p25_det_sg.txt" "$WORKDIR/p25_det_git.txt"
+check "phase25 oracle: precondition -- that header really is the detached one" \
+    grep -q '^## HEAD (no branch)$' "$WORKDIR/p25_det_git.txt"
+(cd "$P25" && git checkout -q -) > /dev/null 2>&1
+
+# --- an unknown flag is refused, not ignored ------------------------------
+check "phase25: sg diff rejects an unknown flag" \
+    sh -c "! (cd '$P25' && '$SG' diff --bogus) > /dev/null 2>&1"
+check "phase25: sg status rejects an unknown flag" \
+    sh -c "! (cd '$P25' && '$SG' status --bogus) > /dev/null 2>&1"
+
+# --- status --ignored, including the nested fold -------------------------
+# The fold rule applies recursively to the ignored listing too: a
+# subdirectory whose contents are ALL ignored is folded to "dir/", while
+# ignored files sitting directly in a folded untracked directory are listed
+# one by one. Measured against git 2.55.0 -- and the deciding question is
+# "is everything under here ignored", not "does a pattern match this
+# directory's own name", which is a distinction a name-matching
+# implementation passes every flat fixture without ever getting right.
+P25_IGN="$WORKDIR/p25_ign"
+(cd "$WORKDIR" && "$SG" init p25_ign) > /dev/null 2>&1
+(cd "$P25_IGN" && git config user.email "a@b.c" && git config user.name "git user")
+printf '*.tmp\n' > "$P25_IGN/.gitignore"
+(cd "$P25_IGN" && "$SG" add .gitignore && "$SG" commit -m base) > /dev/null 2>&1
+mkdir -p "$P25_IGN/d/subignored" "$P25_IGN/d/mixedsub"
+printf 'k\n' > "$P25_IGN/d/keep.txt"
+printf 'a\n' > "$P25_IGN/d/subignored/a.tmp"
+printf 'b\n' > "$P25_IGN/d/subignored/b.tmp"
+printf 'c\n' > "$P25_IGN/d/mixedsub/c.txt"
+printf 'd\n' > "$P25_IGN/d/mixedsub/d.tmp"
+printf 'x\n' > "$P25_IGN/d/x.tmp"
+(cd "$P25_IGN" && "$SG" status --porcelain --ignored) 2>/dev/null > "$WORKDIR/p25_ign_sg.txt"
+(cd "$P25_IGN" && LC_ALL=C git -c core.quotepath=false status --porcelain --ignored) 2>/dev/null \
+    > "$WORKDIR/p25_ign_git.txt"
+check "phase25: sg status --porcelain --ignored matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p25_ign_sg.txt" "$WORKDIR/p25_ign_git.txt"
+check "phase25 oracle: precondition -- a wholly-ignored SUBdirectory is folded" \
+    grep -q '^!! d/subignored/$' "$WORKDIR/p25_ign_git.txt"
+check "phase25 oracle: precondition -- a subdirectory with one non-ignored file is NOT folded" \
+    grep -q '^!! d/mixedsub/d\.tmp$' "$WORKDIR/p25_ign_git.txt"
+check "phase25 oracle: precondition -- an ignored file directly inside the folded dir is listed alone" \
+    grep -q '^!! d/x\.tmp$' "$WORKDIR/p25_ign_git.txt"
+check "phase25 oracle: precondition -- and the untracked dir above them all is folded" \
+    grep -q '^?? d/$' "$WORKDIR/p25_ign_git.txt"
+
+# The long format's Ignored section, same tree, same oracle split as the
+# untracked one above.
+(cd "$P25_IGN" && LC_ALL=C "$SG" status --ignored) 2>/dev/null \
+    | sed -n '/^Ignored files:/,/^$/p' | sed -n 's/^\t//p' | LC_ALL=C sort \
+    > "$WORKDIR/p25_ignlong_sg.txt"
+(cd "$P25_IGN" && LC_ALL=C git -c core.quotepath=false status --ignored) 2>/dev/null \
+    | sed -n '/^Ignored files:/,/^$/p' | sed -n 's/^\t//p' | LC_ALL=C sort \
+    > "$WORKDIR/p25_ignlong_git.txt"
+check "phase25: the long format's Ignored section matches git" \
+    cmp -s "$WORKDIR/p25_ignlong_sg.txt" "$WORKDIR/p25_ignlong_git.txt"
+
+# --- -u<mode>: three modes, three different answers ----------------------
+for _um in "-uall" "-unormal" "-uno"; do
+    (cd "$P25_IGN" && "$SG" status --porcelain "$_um") 2>/dev/null > "$WORKDIR/p25_um_sg.txt"
+    (cd "$P25_IGN" && LC_ALL=C git -c core.quotepath=false status --porcelain "$_um") 2>/dev/null \
+        > "$WORKDIR/p25_um_git.txt"
+    check "phase25: sg status --porcelain $_um matches git" \
+        cmp -s "$WORKDIR/p25_um_sg.txt" "$WORKDIR/p25_um_git.txt"
+done
+# Vacuous-pass guard: the three modes must not all produce the same bytes.
+(cd "$P25_IGN" && "$SG" status --porcelain -uall) 2>/dev/null > "$WORKDIR/p25_um_all.txt"
+(cd "$P25_IGN" && "$SG" status --porcelain -unormal) 2>/dev/null > "$WORKDIR/p25_um_norm.txt"
+(cd "$P25_IGN" && "$SG" status --porcelain -uno) 2>/dev/null > "$WORKDIR/p25_um_no.txt"
+check "phase25: -uall and -unormal really do differ on this tree" \
+    sh -c "! cmp -s '$WORKDIR/p25_um_all.txt' '$WORKDIR/p25_um_norm.txt'"
+check "phase25: -uno really does drop the untracked rows" \
+    sh -c "! grep -q '^??' '$WORKDIR/p25_um_no.txt'"
+check "phase25: the flagless default equals -unormal byte-for-byte" \
+    sh -c "(cd '$P25_IGN' && '$SG' status --porcelain) 2>/dev/null | cmp -s - '$WORKDIR/p25_um_norm.txt'"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

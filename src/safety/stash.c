@@ -387,7 +387,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     }
 
     if (untracked_flag) {
-        if (sg_status_list_untracked(git_dir, repo_root, &idx, opts->include_ignored, &untracked_paths,
+        if (sg_status_list_untracked(git_dir, repo_root, &idx, opts->include_ignored,
+                                     SG_STATUS_UNTRACKED_LIST_FILES, &untracked_paths,
                                      &untracked_path_count) != 0) {
             sg_index_free(&idx);
             return -1;

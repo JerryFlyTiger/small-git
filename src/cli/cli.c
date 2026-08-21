@@ -18,7 +18,7 @@ static const sg_command_info COMMANDS[] = {
     {"commit", "建立一個 commit"},
     {"log", "顯示 commit 歷史"},
     {"status", "顯示工作目錄狀態"},
-    {"diff", "顯示尚未暫存的變更"},
+    {"diff", "顯示變更（index/工作目錄/兩個 rev 之間），可切換多種輸出格式"},
     {"branch", "列出、建立或刪除分支"},
     {"tag", "列出、建立或刪除標籤"},
     {"switch", "切換分支"},
