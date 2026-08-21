@@ -128,6 +128,35 @@ static int run_status_capture(int argc, char **argv, char *out, size_t out_size)
     return rc;
 }
 
+/* True if `needle` (a full line, e.g. "\te/x.tmp\n") appears within the
+   section that starts right after `header` (e.g. "Ignored files:\n") and
+   ends at the next blank line or end of string -- i.e. scoped to just that
+   section, not anywhere else in the output. A loose whole-output strstr
+   would find "e/" inside BOTH the "Untracked files:" and "Ignored files:"
+   sections (or find "d/" as a substring of "d/subignored/"), which is
+   exactly the kind of imprecision that let a real bug (list_diff_sorted's
+   cmp==0 branch disabled -- every untracked-but-not-ignored path spuriously
+   added to the ignored set) pass every existing assertion here: they only
+   ever checked that the RIGHT things were present, never that the WRONG
+   things were absent. */
+static int section_contains_line(const char *out, const char *header, const char *needle)
+{
+    const char *start = strstr(out, header);
+    const char *end;
+    const char *hit;
+
+    if (start == NULL)
+        return 0;
+    start += strlen(header);
+    end = strstr(start, "\n\n");
+    hit = strstr(start, needle);
+    if (hit == NULL)
+        return 0;
+    if (end != NULL && hit >= end)
+        return 0;
+    return 1;
+}
+
 /* ---- print_porcelain_branch_header: three shapes, zero coverage before ---- */
 
 static void test_branch_header_unborn(void)
@@ -234,6 +263,15 @@ static void test_ignored_cli_flat(void)
          out_porcelain);
     CHECK(strstr(out_porcelain, "!! e/x.tmp\n") != NULL,
          "expected '!! e/x.tmp' listed individually, got:\n%s", out_porcelain);
+    /* Negative: e/ itself is untracked but NOT ignored (it holds keep.txt),
+       so it must never show up on the "!!" side, and the ignored file must
+       never leak onto the "??" side either -- list_diff_sorted's cmp==0
+       branch is exactly what keeps these two lists disjoint. */
+    CHECK(strstr(out_porcelain, "!! e/\n") == NULL,
+         "e/ is untracked-but-not-ignored and must NOT appear on the '!!' side, got:\n%s",
+         out_porcelain);
+    CHECK(strstr(out_porcelain, "?? e/x.tmp\n") == NULL,
+         "e/x.tmp is ignored and must NOT appear on the '?\?' side, got:\n%s", out_porcelain);
 
     argv_l[0] = "status";
     argv_l[1] = "--ignored";
@@ -241,9 +279,17 @@ static void test_ignored_cli_flat(void)
     CHECK(rc == 0, "sg status --ignored failed");
     CHECK(strstr(out_long, "Ignored files:") != NULL,
          "expected an 'Ignored files:' section, got:\n%s", out_long);
-    CHECK(strstr(out_long, "e/x.tmp") != NULL, "expected e/x.tmp in the Ignored files section, "
-                                               "got:\n%s",
-         out_long);
+    CHECK(section_contains_line(out_long, "Ignored files:", "\te/x.tmp\n"),
+         "expected e/x.tmp inside the Ignored files section, got:\n%s", out_long);
+    /* Negative, section-scoped (not a loose whole-output strstr): e/ itself
+       must not appear inside the Ignored files section, and e/x.tmp must
+       not appear inside the Untracked files section. A loose strstr for
+       "e/" would find it in the Untracked files section regardless of this
+       bug and give a false pass. */
+    CHECK(!section_contains_line(out_long, "Ignored files:", "\te/\n"),
+         "e/ must NOT appear inside the Ignored files section, got:\n%s", out_long);
+    CHECK(!section_contains_line(out_long, "Untracked files:", "\te/x.tmp\n"),
+         "e/x.tmp must NOT appear inside the Untracked files section, got:\n%s", out_long);
 
     free(repo_root);
 }
@@ -284,6 +330,15 @@ static void test_ignored_cli_nested_all_ignored_subdir_folds(void)
     CHECK(strstr(out, "d/subignored/b.tmp") == NULL,
          "d/subignored/b.tmp must NOT be listed individually once its directory folds, got:\n%s",
          out);
+    /* Negative: d/ itself is untracked but NOT ignored (it holds
+       keep.txt), so it must never leak onto the "!!" side even though it
+       shares a textual prefix with the ignored "d/subignored/" line --
+       this is exactly the shape list_diff_sorted's cmp==0 branch exists to
+       keep disjoint. */
+    CHECK(strstr(out, "!! d/\n") == NULL,
+         "d/ is untracked-but-not-ignored and must NOT appear on the '!!' side, got:\n%s", out);
+    CHECK(strstr(out, "?? d/subignored/\n") == NULL,
+         "d/subignored/ is ignored and must NOT appear on the '?\?' side, got:\n%s", out);
 
     free(repo_root);
 }
@@ -320,6 +375,21 @@ static void test_ignored_cli_nested_mixed_subdir_lists_individually(void)
          "expected d/subignored/a.tmp listed individually, got:\n%s", out);
     CHECK(strstr(out, "!! d/subignored/b.tmp\n") != NULL,
          "expected d/subignored/b.tmp listed individually, got:\n%s", out);
+    /* Negative: neither d/ (the outer fold) nor d/subignored/c.txt (the
+       one non-ignored file inside the mixed subdirectory) may appear on
+       the "!!" side -- c.txt in particular is the path this exact test is
+       named for, and is the one a disabled cmp==0 branch would spuriously
+       add to the ignored set. */
+    CHECK(strstr(out, "!! d/\n") == NULL,
+         "d/ is untracked-but-not-ignored and must NOT appear on the '!!' side, got:\n%s", out);
+    CHECK(strstr(out, "!! d/subignored/c.txt") == NULL,
+         "d/subignored/c.txt is untracked-but-not-ignored and must NOT appear on the '!!' side, "
+         "got:\n%s",
+         out);
+    CHECK(strstr(out, "?? d/subignored/a.tmp\n") == NULL,
+         "d/subignored/a.tmp is ignored and must NOT appear on the '?\?' side, got:\n%s", out);
+    CHECK(strstr(out, "?? d/subignored/b.tmp\n") == NULL,
+         "d/subignored/b.tmp is ignored and must NOT appear on the '?\?' side, got:\n%s", out);
 
     free(repo_root);
 }
