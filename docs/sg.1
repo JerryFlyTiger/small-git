@@ -1107,6 +1107,17 @@ side when comparing the two directly.
 .br
 .B sg stash list
 .br
+.B sg stash show
+.RB [ -p | \-\-patch ]
+.RB [ \-\-stat ]
+.RB [ \-\-numstat ]
+.RB [ \-\-shortstat ]
+.RB [ \-\-name\-only ]
+.RB [ \-\-name\-status ]
+.RB [ -u | \-\-include\-untracked ]
+.RB [ \-\-only\-untracked ]
+.RI [ stash ]
+.br
 .B sg stash apply
 .RB [ \-\-index ]
 .RI [ stash ]
@@ -1236,6 +1247,37 @@ A
 left over from an in-progress merge is always removed by a successful
 push, with an advisory line on standard error (real git removes it
 silently).
+.PP
+.B show
+prints a diff of the stashed changes without applying them, defaulting to a
+diffstat
+.RB ( \-\-stat ) ,
+.I not
+a patch \(em matching real git. Every format flag from
+.B "sg diff"
+is accepted
+.RB ( -p | \-\-patch ,
+.BR \-\-stat ,
+.BR \-\-numstat ,
+.BR \-\-shortstat ,
+.BR \-\-name\-only ,
+.BR \-\-name\-status ),
+and the diff is rendered by the same code as
+.BR "sg diff" .
+By default the comparison is the stash's tracked half (the commit made at
+push time) against its first parent (the tree at push time, before
+.BR push ).
+.B -u
+/
+.B \-\-include\-untracked
+additionally includes a stash's third-parent untracked files, merged into
+the same path-sorted list as an addition each; on a stash that has no
+third parent it falls back to the tracked-only diff instead of erroring.
+.B \-\-only\-untracked
+shows only the untracked half (as if diffed against nothing); on a stash
+with no third parent it prints nothing and exits 0. These two flags are a
+single selector, not independent toggles \(em whichever is named last on
+the command line wins (measured against real git 2.55.0).
 .PP
 .B apply
 and

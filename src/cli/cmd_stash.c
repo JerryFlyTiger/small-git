@@ -234,11 +234,25 @@ static int cmd_stash_clear(int argc, char **argv)
 }
 
 /* Which half(s) of a stash's changes `sg stash show` compares against
-   base_tree. Last flag wins (measured against real git 2.55.0: `git stash
-   show -u --only-untracked` prints only the untracked half, `git stash show
-   --only-untracked -u` prints both -- i.e. these are NOT independent
-   toggles that combine, they are one mode selector and whichever one is
-   named last decides). */
+   base_tree. Measured against real git 2.55.0 in a scratch repo (three
+   separate findings, kept together since the first two are easy to
+   misread as two independent boolean flags):
+
+     1. `-u` and `--only-untracked` are NOT independent toggles that
+        combine -- they are one mode selector, and whichever one is named
+        LAST on the command line decides. Measured by running the same
+        3-parent stash (tracked change to f.txt + untracked u.txt) through
+        both orderings:
+          `git stash show -u --only-untracked`  -> only "u.txt" (only-untracked wins)
+          `git stash show --only-untracked -u`  -> both "f.txt" and "u.txt" (-u wins)
+        If they were independent flags both orderings would print the same
+        thing; they don't, so this file tracks a single last-write-wins
+        enum instead of two separate booleans.
+     2. `--only-untracked` on a stash with NO untracked parent (a plain
+        2-parent `stash push`, no `-u`/`-a`): prints nothing and exits 0 --
+        not an error, not a fallback to the tracked diff.
+     3. `-u` on a stash with no untracked parent: falls back to exactly the
+        tracked-only diff (identical to no flag at all), also exits 0. */
 typedef enum {
     SHOW_UNTRACKED_NONE = 0,   /* default: base_tree vs theirs_tree only */
     SHOW_UNTRACKED_INCLUDE,    /* -u/--include-untracked: tracked + untracked */
@@ -246,8 +260,9 @@ typedef enum {
 } show_untracked_mode;
 
 /* Merges a (tracked half: base_tree vs theirs_tree) and b (untracked half:
-   base_tree vs untracked_tree -- every untracked path shows up as an
-   addition, since base_tree never has it) into one path-sorted list,
+   the EMPTY tree vs untracked_tree, not base_tree vs untracked_tree -- see
+   the call site's comment for why: every path in b is therefore an
+   addition) into one path-sorted list,
    transferring ownership of every entry from a/b into *out. sg_diff_print
    assumes its input is already sorted by path (diff_out.h); real git's own
    `stash show -u` output interleaves the two halves by name rather than
@@ -421,7 +436,20 @@ static int cmd_stash_show(int argc, char **argv)
 
         rc = sg_diff_trees(git_dir, trees.base_tree, trees.theirs_tree, &tracked_list, bad_path);
         if (rc == 0)
-            rc = sg_diff_trees(git_dir, trees.base_tree, trees.untracked_tree, &untracked_list, bad_path);
+            /* NULL (empty tree), not trees.base_tree, on the old side here:
+               diffing base_tree vs untracked_tree would also report every
+               path base_tree has that untracked_tree lacks (i.e. every
+               tracked path the untracked half never touches) as a spurious
+               DELETION -- untracked_tree only ever holds untracked paths,
+               so base_tree's own tracked paths are never in it by
+               construction. Comparing against the empty tree instead is
+               exactly what --only-untracked (below) already does, and
+               yields only additions, one per untracked path -- caught by a
+               real-repo repro (`sg stash show -u --name-only` printed
+               "a.txt\na.txt\nb.txt\nc.txt\nc.txt" -- a.txt/c.txt doubled,
+               once as the tracked_list's genuine modification and once as
+               a phantom "deletion" from this call -- before this fix). */
+            rc = sg_diff_trees(git_dir, NULL, trees.untracked_tree, &untracked_list, bad_path);
         if (rc == 0 && merge_diff_lists(&tracked_list, &untracked_list, &diff_list) != 0)
             rc = -1;
         if (rc != 0) {
