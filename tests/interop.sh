@@ -3172,7 +3172,7 @@ P9I_SG_SET="$WORKDIR/p9i_sg_set.txt"
 P9I_SG_OUT="$WORKDIR/p9i_sg_out.txt"
 (cd "$P9I_REPO" && git status --porcelain -uall -z) | tr '\0' '\n' \
     | sed -n 's/^?? //p' | LC_ALL=C sort > "$P9I_GIT_SET"
-(cd "$P9I_REPO" && "$SG" status) > "$P9I_SG_OUT" 2>&1
+(cd "$P9I_REPO" && "$SG" status -uall) > "$P9I_SG_OUT" 2>&1
 P9I_SG_RC=$?
 awk '/^Untracked files:/{f=1;next} /^$/{f=0} f && /^\t/{sub(/^\t/,"");print}' \
     "$P9I_SG_OUT" | LC_ALL=C sort > "$P9I_SG_SET"
@@ -3364,7 +3364,7 @@ check "phase9 status: working tree clean when only ignored files exist" \
 mkdir -p "$P9ST_REPO/subrepo/.git"
 printf 'junk not a real ref\n' > "$P9ST_REPO/subrepo/.git/HEAD"
 printf 'real\n' > "$P9ST_REPO/subrepo/file.txt"
-(cd "$P9ST_REPO" && "$SG" status) > "$P9ST_OUT" 2>&1
+(cd "$P9ST_REPO" && "$SG" status -uall) > "$P9ST_OUT" 2>&1
 check "phase9 status: a file next to a nested .git dir is still reported" \
     grep -q "subrepo/file.txt" "$P9ST_OUT"
 check "phase9 status: a nested .git dir is never descended into" \

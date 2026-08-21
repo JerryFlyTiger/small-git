@@ -75,4 +75,17 @@ const char *sg_quote_path_prefixed(const char *prefix, const char *path);
    space becomes invisible in the surrounding text. */
 const char *sg_quote_path_delimited(const char *path);
 
+/* Like sg_quote_path, but for `status --short`/`--porcelain` output, where
+   the difference is about LAYOUT, not source: a porcelain line is
+   "XY<space>path", so a space anywhere in path (even one that needs no
+   C-style escaping) would read as an extra field unless the whole thing is
+   quoted. Quotes if path needs C-quoting (same rule as sg_quote_path) OR
+   contains a space; otherwise returns it unmodified. The long-format
+   status output (kind_label(), the "Changes to be committed:"/"Untracked
+   files:" sections) must keep using sg_quote_path instead -- git measured
+   2.55.0 does NOT quote a plain space there, only real escape-needing
+   bytes, so applying this function to that output would diverge from git
+   for the common case. */
+const char *sg_quote_path_porcelain(const char *path);
+
 #endif

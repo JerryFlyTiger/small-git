@@ -98,7 +98,7 @@ static void test_include_ignored_flag(void)
 
     memset(&idx, 0, sizeof(idx));
 
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked (include_ignored=0) failed");
     CHECK(list_contains(untracked, count, "fresh.txt"), "fresh.txt missing under include_ignored=0");
     CHECK(list_contains(untracked, count, ".gitignore"),
@@ -109,7 +109,7 @@ static void test_include_ignored_flag(void)
 
     untracked = NULL;
     count = 0;
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked (include_ignored=1) failed");
     CHECK(list_contains(untracked, count, "fresh.txt"), "fresh.txt missing under include_ignored=1");
     CHECK(list_contains(untracked, count, "keep.log"),
@@ -135,7 +135,7 @@ static void test_nested_dirs_use_full_path(void)
     write_workdir_file(repo_root, "sub/dir/file.txt", "nested\n");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed");
     CHECK(list_contains(untracked, count, "sub/dir/file.txt"),
          "nested untracked file must use full relative path, not basename");
@@ -174,7 +174,7 @@ static void test_staged_delete_counts_as_untracked(void)
     free(entry.path);
 
     /* First: while it IS in the index, it must NOT show up as untracked. */
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed (tracked case)");
     CHECK(!list_contains(untracked, count, "tracked_then_uncached.txt"),
          "a file present in the index must not be reported as untracked");
@@ -186,7 +186,7 @@ static void test_staged_delete_counts_as_untracked(void)
 
     untracked = NULL;
     count = 0;
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed (staged-delete case)");
     CHECK(list_contains(untracked, count, "tracked_then_uncached.txt"),
          "a file dropped from the index but still on disk must count as untracked");
@@ -210,7 +210,7 @@ static void test_empty_dir_produces_no_entries(void)
     mkdir_p(repo_root, "emptydir");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed");
     CHECK(count == 0, "an empty untracked directory must not produce any entries, got %zu", count);
     free_list(untracked, count);
@@ -230,7 +230,7 @@ static void test_git_dir_never_appears(void)
     size_t i;
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed");
     for (i = 0; i < count; i++)
         CHECK(strncmp(untracked[i], ".git/", 5) != 0 && strcmp(untracked[i], ".git") != 0,
@@ -326,7 +326,7 @@ static void test_list_untracked_is_sorted(void)
     write_workdir_file(repo_root, "a.txt", "a\n");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed");
     CHECK(count == 5, "expected 5 untracked files, got %zu", count);
     for (i = 0; i + 1 < count; i++) {
@@ -397,6 +397,187 @@ static void test_tree_build_from_untracked_matches_sorted_reference(void)
     free(git_dir);
 }
 
+/* A directory that holds no tracked path anywhere below it, and at least
+   one non-ignored file, folds into a single "dir/" line -- individual files
+   inside it must NOT appear. */
+static void test_fold_wholly_untracked_dir(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    char **untracked = NULL;
+    size_t count = 0;
+
+    mkdir_p(repo_root, "un");
+    write_workdir_file(repo_root, "un/a.txt", "a\n");
+    write_workdir_file(repo_root, "un/b.txt", "b\n");
+
+    memset(&idx, 0, sizeof(idx));
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+                                   &untracked, &count) == 0,
+         "list_untracked (fold) failed");
+    CHECK(count == 1, "expected exactly one folded entry, got %zu", count);
+    CHECK(list_contains(untracked, count, "un/"), "expected folded entry 'un/'");
+    CHECK(!list_contains(untracked, count, "un/a.txt"), "un/a.txt must not appear individually");
+    CHECK(!list_contains(untracked, count, "un/b.txt"), "un/b.txt must not appear individually");
+    free_list(untracked, count);
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* A directory that DOES hold a tracked path somewhere below it must be
+   walked, not folded -- but a further-nested directory below it that is
+   itself wholly untracked still gets its own independent fold. */
+static void test_fold_is_per_directory_not_global(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    sg_index_entry entry;
+    unsigned char blob_id[SG_SHA1_RAW_LEN];
+    char **untracked = NULL;
+    size_t count = 0;
+
+    mkdir_p(repo_root, "hastracked");
+    mkdir_p(repo_root, "hastracked/sub");
+    write_workdir_file(repo_root, "hastracked/tracked.txt", "t\n");
+    write_workdir_file(repo_root, "hastracked/sub/x.txt", "x\n");
+    write_workdir_file(repo_root, "hastracked/sub/y.txt", "y\n");
+
+    memset(&idx, 0, sizeof(idx));
+    memset(&entry, 0, sizeof(entry));
+    entry.path = strdup("hastracked/tracked.txt");
+    entry.mode = 0100644;
+    entry.stage = 0;
+    memset(blob_id, 0, sizeof(blob_id));
+    memcpy(entry.sha1, blob_id, SG_SHA1_RAW_LEN);
+    CHECK(sg_index_upsert(&idx, &entry) == 0, "upsert failed");
+    free(entry.path);
+
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+                                   &untracked, &count) == 0,
+         "list_untracked (fold) failed");
+    CHECK(count == 1, "expected exactly one entry (the folded sub/), got %zu", count);
+    CHECK(list_contains(untracked, count, "hastracked/sub/"),
+         "hastracked/sub/ must be folded since it has no tracked descendant");
+    CHECK(!list_contains(untracked, count, "hastracked/"),
+         "hastracked/ itself must NOT be folded -- it has a tracked descendant");
+    free_list(untracked, count);
+
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* A folded directory that mixes non-ignored and ignored files: default
+   (include_ignored=0) shows only the folded "mixed/" line; include_ignored=1
+   ADDITIONALLY lists the ignored file individually alongside the fold. */
+static void test_fold_mixed_dir_lists_ignored_individually(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    char **untracked = NULL;
+    size_t count = 0;
+
+    write_workdir_file(repo_root, ".gitignore", "*.log\n");
+    mkdir_p(repo_root, "mixed");
+    write_workdir_file(repo_root, "mixed/keep.txt", "keep\n");
+    write_workdir_file(repo_root, "mixed/x.log", "log\n");
+
+    memset(&idx, 0, sizeof(idx));
+
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+                                   &untracked, &count) == 0,
+         "list_untracked (fold, include_ignored=0) failed");
+    CHECK(count == 2, "expected 'mixed/' and '.gitignore', got %zu", count);
+    CHECK(list_contains(untracked, count, "mixed/"), "expected folded entry 'mixed/'");
+    CHECK(!list_contains(untracked, count, "mixed/x.log"),
+         "ignored file must not appear under include_ignored=0");
+    free_list(untracked, count);
+
+    untracked = NULL;
+    count = 0;
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
+                                   &untracked, &count) == 0,
+         "list_untracked (fold, include_ignored=1) failed");
+    CHECK(list_contains(untracked, count, "mixed/"),
+         "'mixed/' must still be folded under include_ignored=1");
+    CHECK(list_contains(untracked, count, "mixed/x.log"),
+         "the ignored file must ALSO be listed individually under include_ignored=1");
+    free_list(untracked, count);
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* A folded directory whose files are ALL ignored: omitted entirely by
+   default; folded to a single "dir/" line (no individual files) under
+   include_ignored=1. */
+static void test_fold_all_ignored_dir(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    char **untracked = NULL;
+    size_t count = 0;
+
+    write_workdir_file(repo_root, ".gitignore", "*.log\n");
+    mkdir_p(repo_root, "allignored");
+    write_workdir_file(repo_root, "allignored/a.log", "a\n");
+    write_workdir_file(repo_root, "allignored/b.log", "b\n");
+
+    memset(&idx, 0, sizeof(idx));
+
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+                                   &untracked, &count) == 0,
+         "list_untracked (fold, include_ignored=0) failed");
+    CHECK(!list_contains(untracked, count, "allignored/"),
+         "a wholly-ignored directory must not appear at all under include_ignored=0");
+    CHECK(!list_contains(untracked, count, "allignored/a.log"),
+         "no individual file from a wholly-ignored directory should appear either");
+    free_list(untracked, count);
+
+    untracked = NULL;
+    count = 0;
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
+                                   &untracked, &count) == 0,
+         "list_untracked (fold, include_ignored=1) failed");
+    CHECK(list_contains(untracked, count, "allignored/"),
+         "a wholly-ignored directory must fold to one 'dir/' line under include_ignored=1");
+    CHECK(!list_contains(untracked, count, "allignored/a.log"),
+         "a wholly-ignored directory's files must NOT be listed individually, only folded");
+    free_list(untracked, count);
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* An untracked directory with nothing under it at all (recursively) must
+   not appear even when folding is enabled and include_ignored is set --
+   there is nothing to fold. */
+static void test_fold_empty_dir_produces_no_entries(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    char **untracked = NULL;
+    size_t count = 0;
+
+    mkdir_p(repo_root, "emptydir");
+
+    memset(&idx, 0, sizeof(idx));
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
+                                   &untracked, &count) == 0,
+         "list_untracked (fold) failed");
+    CHECK(count == 0, "an empty untracked directory must not produce any entries, got %zu", count);
+    free_list(untracked, count);
+
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_include_ignored_flag();
@@ -408,6 +589,11 @@ int main(void)
     test_tree_build_from_untracked_empty();
     test_tree_build_from_untracked_nonempty();
     test_tree_build_from_untracked_matches_sorted_reference();
+    test_fold_wholly_untracked_dir();
+    test_fold_is_per_directory_not_global();
+    test_fold_mixed_dir_lists_ignored_individually();
+    test_fold_all_ignored_dir();
+    test_fold_empty_dir_produces_no_entries();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
