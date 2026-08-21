@@ -197,6 +197,51 @@ static int run_stash_capture(const char *repo_root, int argc, char **argv, char 
     return rc;
 }
 
+/* Same as run_stash_capture, but captures stderr instead of stdout -- for
+   the error-message assertions below (out-of-range spec, malformed
+   --stat=). */
+static int run_stash_capture_stderr(const char *repo_root, int argc, char **argv, char *err, size_t err_size)
+{
+    char tmpl[] = "/tmp/sg_stash_show_stderr_XXXXXX";
+    int tmp_fd;
+    int saved_stderr;
+    off_t len;
+    ssize_t n;
+    char cwd[4096];
+    int rc;
+
+    CHECK(getcwd(cwd, sizeof(cwd)) != NULL, "getcwd failed");
+    CHECK(chdir(repo_root) == 0, "chdir to repo_root failed");
+
+    tmp_fd = mkstemp(tmpl);
+    if (tmp_fd < 0) {
+        fprintf(stderr, "mkstemp failed\n");
+        exit(1);
+    }
+    unlink(tmpl);
+
+    fflush(stderr);
+    saved_stderr = dup(STDERR_FILENO);
+    dup2(tmp_fd, STDERR_FILENO);
+
+    rc = sg_cmd_stash(argc, argv);
+
+    fflush(stderr);
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+
+    len = lseek(tmp_fd, 0, SEEK_CUR);
+    if (len < 0 || (size_t)len >= err_size)
+        len = (off_t)err_size - 1;
+    lseek(tmp_fd, 0, SEEK_SET);
+    n = read(tmp_fd, err, (size_t)len);
+    err[n > 0 ? n : 0] = '\0';
+    close(tmp_fd);
+
+    CHECK(chdir(cwd) == 0, "chdir back failed");
+    return rc;
+}
+
 /* ---- default format is --stat, not patch -------------------------------- */
 
 static void test_default_is_stat(void)
@@ -296,6 +341,28 @@ static void test_format_flags_map(void)
     CHECK(run_stash_capture(repo_root, 3, argv, out, sizeof(out)) == 0, "--stat failed");
     CHECK(strstr(out, "a.txt") != NULL && strstr(out, "file changed") != NULL,
          "--stat mismatch: %s", out);
+
+    /* --stat=<width>[,<name-width>] -- sg_diff_print's own byte-exact
+       layout for a given width is already pinned in test_diff_out.c; this
+       only needs to prove sg_stash_show's argv loop actually recognizes
+       "--stat=..." (it did not, before this was wired to
+       sg_diff_parse_stat_arg -- it fell into the unrecognized-flag branch
+       and printed usage instead). */
+    argv[2] = (char *)"--stat=40,10";
+    CHECK(run_stash_capture(repo_root, 3, argv, out, sizeof(out)) == 0, "--stat=40,10 failed");
+    CHECK(strstr(out, "a.txt") != NULL && strstr(out, "file changed") != NULL,
+         "--stat=40,10 mismatch: %s", out);
+
+    {
+        char errbuf[1024];
+        int rc;
+
+        argv[2] = (char *)"--stat=bogus";
+        rc = run_stash_capture_stderr(repo_root, 3, argv, errbuf, sizeof(errbuf));
+        CHECK(rc == 1, "--stat=bogus should be a usage error, got %d", rc);
+        CHECK(strstr(errbuf, "usage: sg stash show") != NULL,
+             "--stat=bogus should print usage, got: %s", errbuf);
+    }
 
     free(git_dir);
     free(repo_root);
@@ -404,6 +471,47 @@ static void test_include_untracked_is_sorted_union(void)
     free(repo_root);
 }
 
+/* -u and --only-untracked are a single mode selector, not two independent
+   toggles -- whichever is named LAST on the command line wins (measured
+   against real git 2.55.0, see cmd_stash.c's show_untracked_mode comment).
+   Both orderings are exercised on the same 3-parent stash so a regression
+   that made them "combine" (or made the first one always win) would show up
+   as one of these two assertions failing. */
+static void test_untracked_mode_last_flag_wins(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    const char *paths[2] = {"a.txt", "c.txt"};
+    const char *contents[2] = {"hello\n", "world\n"};
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    char out[4096];
+    char *argv[4];
+
+    commit_initial_files(git_dir, repo_root, paths, contents, 2);
+    write_workdir_file(repo_root, "a.txt", "hello\nchanged\n");
+    write_workdir_file(repo_root, "c.txt", "world\nchanged\n");
+    write_workdir_file(repo_root, "b.txt", "new\n");
+    CHECK(stash_push_untracked(git_dir, repo_root, "wip", commit_id) == 0, "stash push -u failed");
+
+    argv[0] = (char *)"stash";
+    argv[1] = (char *)"show";
+    argv[2] = (char *)"-u";
+    argv[3] = (char *)"--only-untracked";
+    CHECK(run_stash_capture(repo_root, 4, argv, out, sizeof(out)) == 0, "-u --only-untracked failed");
+    CHECK(strstr(out, "b.txt") != NULL, "-u --only-untracked (only-untracked wins) missing b.txt: %s", out);
+    CHECK(strstr(out, "a.txt") == NULL && strstr(out, "c.txt") == NULL,
+         "-u --only-untracked (only-untracked wins) should not list tracked paths: %s", out);
+
+    argv[2] = (char *)"--only-untracked";
+    argv[3] = (char *)"-u";
+    CHECK(run_stash_capture(repo_root, 4, argv, out, sizeof(out)) == 0, "--only-untracked -u failed");
+    CHECK(strstr(out, "a.txt") != NULL && strstr(out, "b.txt") != NULL && strstr(out, "c.txt") != NULL,
+         "--only-untracked -u (-u wins) should list the full tracked+untracked union: %s", out);
+
+    free(git_dir);
+    free(repo_root);
+}
+
 /* -u with no untracked parent falls back to the tracked-only diff. */
 static void test_include_untracked_no_untracked_parent_falls_back(void)
 {
@@ -442,15 +550,9 @@ static void test_out_of_range_spec(void)
     const char *paths[1] = {"a.txt"};
     const char *contents[1] = {"hello\n"};
     unsigned char commit_id[SG_SHA1_RAW_LEN];
-    char out[4096];
     char *argv[3];
-    int rc;
-    char tmpl[] = "/tmp/sg_stash_show_stderr_XXXXXX";
-    int tmp_fd;
-    int saved_stderr;
     char errbuf[4096];
-    off_t len;
-    ssize_t n;
+    int rc;
 
     commit_initial_files(git_dir, repo_root, paths, contents, 1);
     write_workdir_file(repo_root, "a.txt", "hello\nworld\n");
@@ -459,33 +561,47 @@ static void test_out_of_range_spec(void)
     argv[0] = (char *)"stash";
     argv[1] = (char *)"show";
     argv[2] = (char *)"stash@{5}";
-
-    CHECK(chdir(repo_root) == 0, "chdir failed");
-    tmp_fd = mkstemp(tmpl);
-    CHECK(tmp_fd >= 0, "mkstemp failed");
-    unlink(tmpl);
-    fflush(stderr);
-    saved_stderr = dup(STDERR_FILENO);
-    dup2(tmp_fd, STDERR_FILENO);
-
-    rc = sg_cmd_stash(3, argv);
-
-    fflush(stderr);
-    dup2(saved_stderr, STDERR_FILENO);
-    close(saved_stderr);
-    len = lseek(tmp_fd, 0, SEEK_CUR);
-    if (len < 0 || (size_t)len >= sizeof(errbuf))
-        len = (off_t)sizeof(errbuf) - 1;
-    lseek(tmp_fd, 0, SEEK_SET);
-    n = read(tmp_fd, errbuf, (size_t)len);
-    errbuf[n > 0 ? n : 0] = '\0';
-    close(tmp_fd);
+    rc = run_stash_capture_stderr(repo_root, 3, argv, errbuf, sizeof(errbuf));
 
     CHECK(rc == 1, "out-of-range stash@{5} should fail, got %d", rc);
     CHECK(strstr(errbuf, "log for 'stash' only has") != NULL,
          "out-of-range message should match drop/apply's wording: %s", errbuf);
 
-    (void)out;
+    free(git_dir);
+    free(repo_root);
+}
+
+/* The precise off-by-one boundary: stash@{1} against a stack that has
+   EXACTLY 1 entry (index == count, not index > count). A range check
+   mistakenly written as `index > list.count` instead of `index >=
+   list.count` would let this one through -- stash@{5} above (index way
+   past count) cannot tell the two apart, since 5 > 1 either way. */
+static void test_out_of_range_spec_exact_boundary(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    const char *paths[1] = {"a.txt"};
+    const char *contents[1] = {"hello\n"};
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    char *argv[3];
+    char errbuf[4096];
+    int rc;
+
+    commit_initial_files(git_dir, repo_root, paths, contents, 1);
+    write_workdir_file(repo_root, "a.txt", "hello\nworld\n");
+    CHECK(stash_push_plain(git_dir, repo_root, "wip", commit_id) == 0, "stash push failed");
+    /* Exactly one entry on the stack now: stash@{0}. stash@{1} is the
+       precise boundary. */
+
+    argv[0] = (char *)"stash";
+    argv[1] = (char *)"show";
+    argv[2] = (char *)"stash@{1}";
+    rc = run_stash_capture_stderr(repo_root, 3, argv, errbuf, sizeof(errbuf));
+
+    CHECK(rc == 1, "stash@{1} on a 1-entry stack should fail, got %d", rc);
+    CHECK(strstr(errbuf, "log for 'stash' only has") != NULL,
+         "boundary out-of-range message should match drop/apply's wording: %s", errbuf);
+
     free(git_dir);
     free(repo_root);
 }
@@ -530,6 +646,8 @@ int main(void)
     test_include_untracked_is_sorted_union();
     test_include_untracked_no_untracked_parent_falls_back();
     test_out_of_range_spec();
+    test_out_of_range_spec_exact_boundary();
+    test_untracked_mode_last_flag_wins();
     test_load_trees_has_untracked();
 
     if (failures > 0) {

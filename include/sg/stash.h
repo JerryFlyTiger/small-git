@@ -244,7 +244,12 @@ int sg_stash_clear(const char *git_dir);
        push time.
      - untracked_tree / has_untracked: parents[2]'s tree, present only for a
        `stash -u`/`-a` entry (3 parents). has_untracked is 0 and
-       untracked_tree is left unset otherwise. */
+       untracked_tree is GUARANTEED all-zero bytes otherwise (sg_stash_load_trees
+       zeroes *out on entry before filling in whichever fields apply) --
+       not left as whatever garbage happened to be on the caller's stack, so
+       a future caller that forgets to check has_untracked before reading
+       untracked_tree gets a deterministic all-zero id rather than
+       uninitialized memory. */
 typedef struct {
     unsigned char base_tree[SG_SHA1_RAW_LEN];
     unsigned char theirs_tree[SG_SHA1_RAW_LEN];

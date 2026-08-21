@@ -12,6 +12,36 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+/* ---- --stat=<width>[,<name-width>] argument parsing ------------------ */
+
+int sg_diff_parse_stat_arg(const char *arg, int *width_out, int *name_width_out)
+{
+    char *end;
+    long width;
+    long name_width = 0;
+
+    if (*arg == '\0')
+        return -1;
+    width = strtol(arg, &end, 10);
+    if (width <= 0 || width > SG_DIFF_STAT_ARG_MAX)
+        return -1;
+    if (*end == ',') {
+        const char *nw = end + 1;
+
+        if (*nw == '\0')
+            return -1;
+        name_width = strtol(nw, &end, 10);
+        if (name_width <= 0 || name_width > SG_DIFF_STAT_ARG_MAX)
+            return -1;
+    }
+    if (*end != '\0')
+        return -1;
+
+    *width_out = (int)width;
+    *name_width_out = (int)name_width;
+    return 0;
+}
+
 /* ---- small numeric/status helpers ---------------------------------- */
 
 static int digits(long long v)

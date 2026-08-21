@@ -278,7 +278,22 @@ typedef enum {
    touching the path strings, which now belong to *out); a caller must still
    NOT call sg_diff_list_free on them afterward. On the (out-of-memory)
    failure path, a and b are left untouched and *out is zeroed -- the caller
-   is responsible for freeing a and b itself. */
+   is responsible for freeing a and b itself.
+
+   INVARIANT this merge relies on and does NOT defend against: a and b never
+   share a path. b only ever comes from diffing the empty tree against a
+   stash's untracked_tree (parents[2]), and sg_stash_push builds that tree
+   solely from sg_status_list_untracked's output -- paths the INDEX does not
+   already have (see sg_tree_build_from_untracked's header comment) -- so a
+   path a (built from base_tree/theirs_tree, both real trees the index and
+   HEAD agree are tracked) reports can never also be a path b reports. The
+   `<= 0` tie-break below exists only to make the merge deterministic if
+   that invariant is ever violated (e.g. by a future caller constructing b
+   from something other than an untracked tree) -- it does NOT make a
+   same-path collision correct: sg_diff_print would receive two rows for
+   that one path and silently print it twice, the same class of bug as the
+   base_tree-vs-untracked_tree "phantom deletion" this file's git history
+   already fixed once. */
 static int merge_diff_lists(sg_diff_list *a, sg_diff_list *b, sg_diff_list *out)
 {
     size_t ia = 0, ib = 0, n = 0;
@@ -328,9 +343,10 @@ static void report_bad_stash_tree_path(const char *bad_path)
 static int cmd_stash_show(int argc, char **argv)
 {
     static const char usage[] =
-        "usage: sg stash show [-p|--patch] [--stat] [--numstat] [--shortstat] [--name-only] "
-        "[--name-status]\n"
-        "                      [-u|--include-untracked] [--only-untracked] [<stash>]\n";
+        "usage: sg stash show [-p|--patch] [--stat[=<w>[,<n>]]] [--numstat] [--shortstat] "
+        "[--name-only]\n"
+        "                      [--name-status] [-u|--include-untracked] [--only-untracked] "
+        "[<stash>]\n";
     sg_diff_out_opts opts;
     const char *spec = NULL;
     show_untracked_mode umode = SHOW_UNTRACKED_NONE;
@@ -355,6 +371,14 @@ static int cmd_stash_show(int argc, char **argv)
             opts.format = SG_DIFF_FORMAT_PATCH;
         } else if (strcmp(a, "--stat") == 0) {
             opts.format = SG_DIFF_FORMAT_STAT;
+            opts.stat_width = 0;
+            opts.stat_name_width = 0;
+        } else if (strncmp(a, "--stat=", 7) == 0) {
+            opts.format = SG_DIFF_FORMAT_STAT;
+            if (sg_diff_parse_stat_arg(a + 7, &opts.stat_width, &opts.stat_name_width) != 0) {
+                fputs(usage, stderr);
+                return 1;
+            }
         } else if (strcmp(a, "--numstat") == 0) {
             opts.format = SG_DIFF_FORMAT_NUMSTAT;
         } else if (strcmp(a, "--shortstat") == 0) {
@@ -737,8 +761,9 @@ int sg_cmd_stash(int argc, char **argv)
     static const char usage[] = "usage: sg stash [push] [-m <msg>] [-u|--include-untracked] [-a|--all] "
                                 "[--keep-index]\n"
                                 "   or: sg stash list\n"
-                                "   or: sg stash show [-p|--patch] [--stat] [--numstat] [--shortstat] "
-                                "[--name-only] [--name-status]\n"
+                                "   or: sg stash show [-p|--patch] [--stat[=<w>[,<n>]]] [--numstat] "
+                                "[--shortstat] [--name-only]\n"
+                                "                     [--name-status]\n"
                                 "                     [-u|--include-untracked] [--only-untracked] "
                                 "[<stash>]\n"
                                 "   or: sg stash apply [--index] [<stash>]\n"

@@ -19,49 +19,6 @@ static const char USAGE[] =
     "usage: sg diff [--cached|--staged] [--stat[=<w>[,<n>]]|--numstat|--shortstat|--name-only|"
     "--name-status] [<rev> [<rev>]]\n";
 
-/* Parses the optional "=<width>[,<name-width>]" suffix of --stat. Malformed
-   input (non-digits, negative, trailing garbage) is rejected rather than
-   guessed at -- the caller treats that the same as an unrecognized flag. */
-/* Upper bound for both fields below. The --stat layout algorithm does
-   arithmetic like "W * 3 / 8" and "name_width + number_width + 6 +
-   graph_width" on these as plain `int`s; a value near INT_MAX (or one that
-   strtol silently clamped to LONG_MAX on overflow) would either overflow
-   that arithmetic or narrow to a negative/implementation-defined int and
-   then get silently swallowed by the "stat_width > 0" fallback-to-terminal-
-   width check in diff_out.c, which is exactly the "silently ignored bogus
-   input" this guards against. No real terminal is anywhere close to this
-   wide, so rejecting anything past it as a malformed argument costs
-   nothing. */
-#define SG_STAT_ARG_MAX 1000000
-
-static int parse_stat_arg(const char *arg, int *width_out, int *name_width_out)
-{
-    char *end;
-    long width;
-    long name_width = 0;
-
-    if (*arg == '\0')
-        return -1;
-    width = strtol(arg, &end, 10);
-    if (width <= 0 || width > SG_STAT_ARG_MAX)
-        return -1;
-    if (*end == ',') {
-        const char *nw = end + 1;
-
-        if (*nw == '\0')
-            return -1;
-        name_width = strtol(nw, &end, 10);
-        if (name_width <= 0 || name_width > SG_STAT_ARG_MAX)
-            return -1;
-    }
-    if (*end != '\0')
-        return -1;
-
-    *width_out = (int)width;
-    *name_width_out = (int)name_width;
-    return 0;
-}
-
 /* Resolves rev to a tree id via sg_rev_parse_commit + sg_commit_tree_of --
    the one path every rev argument in this command goes through, per
    CLAUDE.md's "use sg_rev_parse_commit, don't hand-roll rev resolution"
@@ -136,7 +93,7 @@ int sg_cmd_diff(int argc, char **argv)
             opts.stat_name_width = 0;
         } else if (strncmp(a, "--stat=", 7) == 0) {
             opts.format = SG_DIFF_FORMAT_STAT;
-            if (parse_stat_arg(a + 7, &opts.stat_width, &opts.stat_name_width) != 0) {
+            if (sg_diff_parse_stat_arg(a + 7, &opts.stat_width, &opts.stat_name_width) != 0) {
                 fputs(USAGE, stderr);
                 return 1;
             }
