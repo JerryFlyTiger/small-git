@@ -135,7 +135,8 @@ int sg_cmd_diff(int argc, char **argv)
                 continue;
             }
             if (read_rc != 0) {
-                fprintf(stderr, "sg: warning: cannot read staged blob for '%s'\n", idx.entries[i].path);
+                fprintf(stderr, "sg: warning: cannot read staged blob for %s\n",
+                       sg_quote_path_delimited(idx.entries[i].path));
                 continue;
             }
         }
@@ -144,7 +145,8 @@ int sg_cmd_diff(int argc, char **argv)
            this entry undiffed and `sg diff` would report a changed file as
            unchanged instead. */
         if (sg_path_join(abspath, sizeof(abspath), repo_root, idx.entries[i].path) != 0) {
-            fprintf(stderr, "sg: warning: 路徑過長,無法比較 '%s'\n", idx.entries[i].path);
+            fprintf(stderr, "sg: warning: 路徑過長,無法比較 %s\n",
+                   sg_quote_path_delimited(idx.entries[i].path));
             free(a_content);
             had_chunk_error = 1;
             continue;
@@ -171,7 +173,8 @@ int sg_cmd_diff(int argc, char **argv)
                   sg_quote_path_prefixed("a/", idx.entries[i].path),
                   sg_quote_path_prefixed("b/", idx.entries[i].path));
         } else if (print_text_diff(idx.entries[i].path, a_content, a_len, b_content, b_len) != 0) {
-            fprintf(stderr, "sg: warning: out of memory diffing '%s'\n", idx.entries[i].path);
+            fprintf(stderr, "sg: warning: out of memory diffing %s\n",
+                   sg_quote_path_delimited(idx.entries[i].path));
         }
 
         free(a_content);

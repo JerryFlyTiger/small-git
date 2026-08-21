@@ -1066,6 +1066,36 @@ stored: whether it is chunked, its original size, its chunk count, and (if
 chunked) how many of its chunks are also referenced by some other chunked
 blob in the repository (\(dqshared chunks\(dq). This is a read-only
 diagnostic command; it does not modify anything.
+.SS Path quoting in output
+.PP
+Wherever
+.B sg
+prints a path \(em
+.BR status ,
+.BR diff ,
+.B cat\-file
+on a tree, and its own diagnostics \(em a path containing a byte that would
+otherwise reach the terminal unchanged is wrapped in double quotes with
+C\-style escapes, exactly as
+.B git
+does it: \(rs\(rs and \(rs" for a backslash and a double quote, the named
+forms \(rsa \(rsb \(rst \(rsn \(rsv \(rsf \(rsr, and a zero\-padded
+three\-digit octal escape such as \(rs033 for every other byte below 0x20 and
+for DEL. A space is never escaped and never causes quoting on its own, so an
+ordinary name containing one is printed bare.
+.PP
+Bytes at or above 0x80 are printed as they are, which is
+.B git
+run with
+.BR core.quotepath=false ,
+not its default. A path in a non\-ASCII script therefore appears as itself
+rather than as octal escapes.
+.B sg
+has no configuration file, so this is fixed rather than a setting; pass
+.B \-c core.quotepath=false
+on the
+.B git
+side when comparing the two directly.
 .SS stash
 .B sg stash
 .RB [ push ]

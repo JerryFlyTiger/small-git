@@ -8339,6 +8339,40 @@ P23_ERR_PLAIN="$WORKDIR/p23_err_plain.txt"
 check "phase23: a path inside a sentence is delimited even when nothing needs escaping" \
     grep -q '"missing.txt"' "$P23_ERR_PLAIN"
 
+# --- Q8: the error paths that only a damaged repository reaches. A cold read
+# found three sites in cmd_diff.c and three in cmd_chunk_info.c still printing
+# raw bytes while the rest of the same files had been converted -- and nothing
+# was watching them, so the miss was invisible. Reaching them needs an index
+# entry whose blob is gone, which is exactly what this fixture builds. ---
+P23_DMG="$WORKDIR/p23_damaged"
+(cd "$WORKDIR" && "$SG" init p23_damaged) > /dev/null 2>&1
+(cd "$P23_DMG" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "
+import sys
+open(sys.argv[1] + '/ev\x1bil.txt', 'w').write('body\n')" "$P23_DMG"
+(cd "$P23_DMG" && "$SG" add .) > /dev/null 2>&1
+P23_DMG_BLOB=$(cd "$P23_DMG" && git ls-files -s | awk '{print $2}' | head -1)
+rm -f "$P23_DMG/.git/objects/$(printf '%s' "$P23_DMG_BLOB" | cut -c1-2)/$(printf '%s' "$P23_DMG_BLOB" | cut -c3-)"
+check "phase23 oracle: precondition -- the staged blob really is gone" \
+    sh -c "! git -C '$P23_DMG' cat-file -e '$P23_DMG_BLOB' 2>/dev/null"
+
+P23_DMG_DIFF="$WORKDIR/p23_damaged_diff.txt"
+(cd "$P23_DMG" && "$SG" diff) 2> "$P23_DMG_DIFF" > /dev/null
+check "phase23: sg diff's missing-blob warning escapes the path" \
+    sh -c "! LC_ALL=C grep -q \"\$(printf '\\033')\" '$P23_DMG_DIFF'"
+check "phase23: and renders it as the literal escape" grep -q '\\033' "$P23_DMG_DIFF"
+
+P23_DMG_CI="$WORKDIR/p23_damaged_chunkinfo.txt"
+python3 - "$SG" "$P23_DMG" "$P23_DMG_CI" <<'PYD'
+import subprocess, sys
+sg, d, out = sys.argv[1], sys.argv[2], sys.argv[3]
+r = subprocess.run([sg, 'chunk-info', 'ev\x1bil.txt'], cwd=d, capture_output=True)
+open(out, 'wb').write(r.stderr)
+PYD
+check "phase23: sg chunk-info's missing-object error escapes the path too" \
+    sh -c "! LC_ALL=C grep -q \"\$(printf '\\033')\" '$P23_DMG_CI'"
+check "phase23: and renders it as the literal escape" grep -q '\\033' "$P23_DMG_CI"
+
 # --- Q4: control characters alone, compared against git with NO flag. Both
 # implementations quote these regardless of core.quotepath, so this group
 # pins that the divergence is confined to bytes >= 0x80. ---
