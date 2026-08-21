@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1320 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1403 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 41 個單元測試二進位,任一失敗即整體失敗
+make test                         # 47 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -27,7 +27,7 @@ python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
 
 - 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
   的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
-- `make test` 那行的 `N/41 個跑到`,N 少於 41 就是**中途中止**(Makefile 在第一
+- `make test` 那行的 `N/47 個跑到`,N 少於 47 就是**中途中止**(Makefile 在第一
   個失敗的二進位就停),不是「其他都過了」。
 - 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
 - interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
@@ -88,9 +88,9 @@ staging 的驗證。本機綠燈不是充分證據。**
 | `util/` | zlib、SHA-1、levenshtein、LCS 表 | — |
 | `storage/` | 物件與 ref 落磁碟:loose、pack、chunk、refs、reflog、repo、revparse | object, workdir |
 | `net/` | smart-HTTP:libcurl 封裝、pkt-line、transport | — |
-| `workdir/` | 工作目錄:路徑/檔案 I/O、ignore、status、apply、merge、tree_build | 幾乎全部 |
+| `workdir/` | 工作目錄:路徑/檔案 I/O、ignore、status、diff(變更清單)、apply、merge、tree_build | 幾乎全部 |
 | `safety/` | snapshot(可救回的備份 ref)、rebase 序列器狀態、stash | storage, workdir |
-| `cli/` | 24 個 `sg_cmd_*` + 派發器,唯一的組裝點 | 全部 |
+| `cli/` | 24 個 `sg_cmd_*` + 派發器 + diff 的六種輸出格式(`diff_out.c`),唯一的組裝點 | 全部 |
 
 - **讀物件一律走 `sg_object_read`**(`include/sg/objstore.h:16`):先 loose 再 pack。
   除了 `loose.c`/`pack.c` 自己以外不要直接呼叫底層。
@@ -141,6 +141,35 @@ staging 的驗證。本機綠燈不是充分證據。**
   ⚠ **明文禁止引用**:commit/tag 訊息與 author 字串(會破壞 `cat-file -p` 的位元組保真)、
   ref/branch/tag 名稱(真 git 也不引用,**沒有 oracle**)、`Cloning into` 這類 stdout
   資訊訊息(真 git 也不引用,已實測)。
+- **「哪些路徑變了」一律走 `sg_diff_*`**(`include/sg/diff.h`,Phase 25):四個建構器
+  對應 tree↔tree、tree↔index、index↔工作目錄、tree↔工作目錄,輸出一份**依 path 排序**
+  的 `sg_diff_list`。**不要再手刻走訪 index 的迴圈**——改寫前 `sg diff` 只可能比較
+  index 與工作目錄,原因就是「找出變更」與「印出來」是同一個迴圈。`old_tree` 傳 `NULL`
+  表示空 tree,unborn HEAD 因此不必為了 diff 而寫一個空 tree 物件。
+  ⚠ **衝突路徑在三種比較下是三個不同答案**(`--cached` 給一列 `U`;`<rev>` 給一般的
+  `M`,因為 index 只決定成員資格、內容仍取自工作目錄;index-vs-工作目錄給 `U` 加上
+  stage 2 vs 工作目錄共兩列)。三者都是實測真 git 2.55.0 得到的,不要憑直覺統一。
+  ⚠ **blob 讀不到時不可以讓整個呼叫失敗**:建構器要把該路徑當成有變放進清單,
+  讓渲染層帶著路徑印出 actionable 訊息。整份清單陣亡的話,連「是哪個檔案壞了」
+  都沒有人知道了。
+- **印 diff 一律走 `sg_diff_print`**(`include/sg/diff_out.h`,Phase 25),六種格式
+  (patch/`--stat`/`--numstat`/`--shortstat`/`--name-only`/`--name-status`)。
+  `sg diff` 與 `sg stash show` 共用這一份,不要再寫第二份格式化。
+  patch body **刻意不追**真 git(整檔單一 hunk、無 `index` 行、無多 hunk 切分),
+  所以與 git 逐位元組比對的是**機器可讀的那四種**。
+- **兩種引用規則不可以「統一」**(Phase 25):`sg status --porcelain`/`-s` 用
+  `sg_quote_path_porcelain`——**只要含空格就引用**,因為 `?? ` 前綴讓空格變成欄位
+  分隔符;長格式與四種機器格式用 `sg_quote_path`——**空格不引**。兩者都引控制字元。
+  `tests/interop.sh` 有一組**正面對撞**的檢查在守這件事(同一個 `has space.txt`,
+  porcelain 必須引、長格式必須不引),因為若把兩支收斂成同一套錯的規則,
+  所有 `cmp` 仍會全綠。
+- **`sg_status_list_untracked` 的摺疊參數是必填的**(Phase 25),理由與
+  `sg_tree_build_from_workdir` 的 `sg_workdir_missing` 完全相同:靜默挑一邊正是它要
+  消滅的 bug。`safety/stash.c` 與 `workdir/tree_build.c` 一律傳「不摺疊」——它們要的是
+  **真實檔名**,摺疊會讓 `sg stash -u` 存到一個目錄路徑。
+- **unmerged 的七種 stage 組合只有一份對照表**(`cmd_status.c` 的 `unmerged_label`),
+  長格式與 porcelain 共用。長格式標籤欄寬 **17**,staged/unstaged 區段是 **12**,
+  兩者不同,不要弄混。
 - **不受信任的路徑一律過 `sg_path_component_is_safe` / `sg_relpath_is_safe`**
   (`include/sg/workdir.h`,Phase 22)。它們擋 `""`/`.`/`..`/含 `/`,以及 `.git` 的
   任何大小寫變體、尾綴 `.`/空白的形式、和折掉 HFS+ 忽略碼位後等於 `.git` 的名稱。
@@ -244,6 +273,15 @@ staging 的驗證。本機綠燈不是充分證據。**
 - **使用者給的 commit/tag 訊息一律先過 `sg_message_cleanup`**
   (`include/sg/object.h`),否則產生的物件 id 與真 git 不同。**例外是
   `cmd_rebase.c`**——它轉發既有訊息,必須逐位元組保真,刻意不套用。
+- **`sg stash show` 走 diff 地基,不自己解 stash commit**(Phase 25)。四棵樹由
+  `sg_stash_load_trees`(`include/sg/stash.h`)一次解出來:`base_tree`(parents[0],
+  也就是 diff 的基準)、`theirs_tree`(stash commit 自己)、`index_tree`(parents[1])、
+  以及可選的 `untracked_tree`(parents[2])。輸出走 `sg_diff_print`。
+  ⚠ **預設格式是 `--stat` 不是 patch**(實測真 git)。⚠ `-u` 與 `--only-untracked`
+  **不是兩個獨立布林,是同一個模式選擇器、後寫的贏**(兩種順序都實測過)。
+  ⚠ `-u` 的未追蹤那半要拿**空 tree**(`NULL`)vs `untracked_tree` 比,**不是**
+  `base_tree` vs `untracked_tree`——後者會把每個只存在於已追蹤側的路徑多報一筆
+  幽靈刪除,於是同一路徑印兩次。
 - **`sg stash` 支援 `-u`/`--include-untracked`、`-a`/`--all`、`--keep-index`、
   `--index`(Phase 20)**。`sg_stash_push` 吃 `sg_stash_push_opts`
   (`include/sg/stash.h`),不是一串位置參數。列舉未追蹤檔案一律走
@@ -342,7 +380,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 41 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 47 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。
@@ -359,11 +397,27 @@ staging 的驗證。本機綠燈不是充分證據。**
   完整重建、回報哪些具名檢查變紅。**不要用 `git checkout --` 還原**,曾因此清掉
   整個檔案。這一步由主對話執行,不交給寫測試的人自己驗。
 
-  腳本內建三條踩過坑才有的行為,看輸出時要認得:每輪都從乾淨複本**完整重建**
+  腳本內建四條踩過坑才有的行為,看輸出時要認得:每輪都從乾淨複本**完整重建**
   (舊 `.o` 的 mtime 會讓 make 跳過重編,mutation 會無聲跨輪累積);**退出碼非 0
   就算被抓到**,不論有沒有 FAIL 行(邊界 mutation 曾讓測試二進位 segfault,只
   grep FAIL 會誤報成死角);perl 運算式**沒匹配到任何東西時直接退出碼 3**,不會
-  假裝跑完(什麼都沒改當然不會紅,那是假陰性最常見的來源)。
+  假裝跑完(什麼都沒改當然不會紅,那是假陰性最常見的來源);以及 `SG_MUTATE_TIMEOUT`
+  (預設 300 秒)把**卡死**轉成標示為「逾時」的失敗——mutation 可以讓歸併迴圈的游標
+  不再前進而永遠不結束,而「永遠不退出」既不是 0 也不是非 0,舊版腳本只會安靜地
+  佔住終端機(Phase 25 實測卡了三十分鐘)。**逾時與崩潰是分開標示的**,因為兩者都只
+  證明「改壞了會出事」,不證明那條具名斷言有鑑別力。
+
+  **沒紅的 mutation 有三種,不要混為一談**(Phase 25):**真死角**(那個維度沒有測試,
+  要補,而且要錨在外部 oracle);**冗餘守衛**(真正的防線在下一層,把守衛刪掉讓
+  mutation 打在那裡);**數學上不可觀測**(那個值後續會被無條件覆寫,記下證明、
+  換一條驗得到的性質)。只有第一種是覆蓋缺口,把三者當成同一件事會讓下一個人
+  去找一個不存在的測試。
+
+  ⚠ **逐站點 vs 整批**:腳本註解說「字面量出現不只一次一定要加 `/g`」,那是為了回答
+  「這條規則有沒有被強制」。要回答「**每個站點是不是各自有覆蓋**」時 `/g` 恰恰是錯的
+  ——它把各站的結果糊成一團,只要任一站有覆蓋整體就變紅。分辨同字面量的站點
+  用周邊文脈(縮排深度、前一行的呼叫)就夠了,不必靠 `/g`(Phase 25 實測:
+  `sg_chunk_effective_id` 的兩個站點,一個有覆蓋、一個是真死角)。
 
   紅了還不夠,**要紅得有道理**:確認失敗訊息指的正是你要驗的性質。曾經有測試
   在 2-commit 的 fixture 下確實變紅,但原因是 root commit 沒有 parent,與守衛

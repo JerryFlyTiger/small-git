@@ -2423,3 +2423,164 @@ author small_git <sg@localhost> 1787294422 +0000
 5. 再 `sg add` 第二個 5 MiB 隨機檔,`sleep 1.2`,然後 push。
 6. 比對遠端 ref 與本機 ref;**並斷言 `remote_before` 是合法 sha**,
    否則走的是建立分支而非合併分支。
+
+## Phase 25:diff 的地基,與 `sg status` 的短格式
+
+`sg diff` 與 `sg status` 先前**一個參數都不收**(`(void)argv` + `argc != 1` 就印 usage)。
+這一輪把兩支的旗標補上,並且在補之前先把 `sg diff` 拆開——因為它收不了參數的原因是結構性的。
+
+### 為什麼是「地基」而不只是「加旗標」
+
+改寫前,「哪些路徑變了」與「怎麼把它印出來」是**同一個 `for` 迴圈**
+(舊 `cmd_diff.c` 的 `for (i = 0; i < idx.count; i++)`)。那個迴圈直接走 index 條目、
+直接讀工作目錄檔案,所以 `sg diff` **只可能**比較 index 與工作目錄——要支援
+`--cached`、`<rev>`、`<rev> <rev>`,不是加分支,是要有另一個答案來源。
+
+拆成兩層:
+
+- `include/sg/diff.h` / `src/workdir/diff.c` —— **只回答「哪些路徑變了、兩側各是什麼」**。
+  四個建構器對應四種來源配對(tree↔tree、tree↔index、index↔工作目錄、tree↔工作目錄),
+  輸出一份依 path 排序的 `sg_diff_list`。不印任何東西。
+- `include/sg/diff_out.h` / `src/cli/diff_out.c` —— **只回答「怎麼印」**,六種格式。
+  `sg diff` 與 `sg stash show` 共用同一份。
+
+`old_tree` 傳 `NULL` 表示空 tree,unborn HEAD 因此不必為了 diff 而寫一個空 tree 物件。
+
+### 實測到的 oracle(真 git 2.55.0,全程 `LC_ALL=C`)
+
+**衝突路徑在三種比較下是三個不同答案**,這是最容易寫錯的一組:
+
+| 比較 | 真 git | 為什麼 |
+|---|---|---|
+| `diff --cached` | `U` / `\| Unmerged` | 沒有單一 staged blob 可比 |
+| `diff <rev>` | 一般的 `M` | index 只決定成員資格,內容仍取自工作目錄 |
+| `diff`(index vs 工作目錄) | `U` 一列 **+** stage 2 vs 工作目錄一列 | 同一路徑兩列 |
+
+第三格的「第二列拿哪個 stage」是這樣認出來的:把工作目錄內容寫成與 stage 2
+**逐位元組相同**,第二列整個消失;換成 stage 1 或 stage 3 的內容則第二列還在。
+
+**`N files changed` 不計 unmerged 列**。只有 unmerged 列時印 ` 0 files changed`,
+而且**兩個子句都不印**——這與「兩者皆 0 時兩句都印」的規則並存,差別只在 `files_changed`:
+
+| 情境 | 輸出 |
+|---|---|
+| binary,`files_changed == 1`,ins/del 皆 0 | ` 1 file changed, 0 insertions(+), 0 deletions(-)` |
+| 全是 unmerged,`files_changed == 0` | ` 0 files changed` |
+
+**`diff <rev>` 的路徑集合由 index 決定,不是工作目錄**:`git rm --cached f` 之後檔案
+還在磁碟上,`git diff HEAD` 仍報 `D f`;未追蹤檔案完全不出現。
+
+**未追蹤目錄的摺疊是遞迴且逐目錄的**:底下任意深度有已追蹤路徑就進去;否則有非
+ignored 檔案就印一次 `dir/`;否則(全部 ignored)預設不列、`--ignored` 時印一次 `dir/`;
+空目錄什麼都不印。⚠ 判準是「**遞迴看來內容是否全部 ignored**」,不是「目錄名有沒有被
+pattern 命中」——`*.tmp` 從來不會命中 `d/subignored/` 這個名字,git 照樣把它摺疊。
+扁平 fixture 分不出這兩種實作。
+
+**七種 unmerged 組合**(依 index 裡存在哪些 stage):`{1}`=`DD`/`both deleted:`、
+`{1,2}`=`UD`/`deleted by them:`、`{1,2,3}`=`UU`/`both modified:`、`{1,3}`=`DU`/`deleted by us:`、
+`{2}`=`AU`/`added by us:`、`{2,3}`=`AA`/`both added:`、`{3}`=`UA`/`added by them:`。
+長格式標籤欄寬 **17**(staged/unstaged 區段是 12)。改動前 `print_unmerged` 對七種全印
+`both modified:`,七分之六是錯的。
+
+**兩種引用規則**:porcelain **只要含空格就引用**(`?? ` 前綴讓空格變成欄位分隔符),
+長格式與四種機器格式(`--stat`/`--numstat`/`--name-only`/`--name-status`)**不引空格**,
+但兩邊都引控制字元。Phase 23 就是拿錯 oracle 而產生假紅燈,這次把兩者**正面對撞**寫進
+interop:同一個 `has space.txt`,porcelain 必須引、長格式必須不引。
+
+### `--stat` 的版面演算法
+
+這是本輪唯一有真演算法的部分,用實測反推,通過 24 組邊界案例 + 240 組隨機交叉驗證。
+要點:版面預算是 `name + number + 6 + graph ≤ width`(飽和時行長 `width - 1`);
+`COLUMNS` 即使非 tty 也生效;bar 縮放**整數截斷無四捨五入**,先縮較小的一邊、
+較大的一邊吃餘數;欄寬算的是**引用後**的字串且是 **display width 不是 byte length**。
+
+反推過程本身有一條值得記:第一版斷定「binary 列不參與欄寬競爭」,那是從一個
+`max_change` 壓倒性大的案例得來的**假陰性**;補做 binary-only 的 `COLUMNS` 掃描後才解出
+`max_graph = max(max_change, bin_width - 4)`。
+
+### 這次最該記的三件事
+
+**(1) 契約寫在正確的地方,但只寫在一個地方,而責任橫跨兩層。**
+
+`diff_out.h` 的註解寫著「一顆讀不到的 blob 不可以讓整份 diff 消音」,渲染層也確實遵守。
+但**建構器自己也讀 chunk 資料**(為了回答「有沒有變」),而它在那裡 `return -1`
+——整份清單陣亡,而且 actionable 訊息也消失了,因為失敗發生在渲染層被呼叫**之前**,
+沒有任何下游還知道是哪個檔案壞了。
+
+修法:建構器把該路徑**當成有變**放進清單,讓渲染層帶著路徑再撞一次同樣的失敗。
+
+**這個缺口在任何單一工作樹裡都不可能被發現**:建構器那邊 `cmd_diff.c` 還是舊版,
+interop 1325/1325 全綠;渲染器那邊沒有修正可測。兩邊各自都誠實地報告「全綠」,
+缺口只存在於兩者之間。
+
+**(2) 逐站點打 mutation,與 `mutate.sh` 自己的建議相衝突。**
+
+腳本註解說「字面量出現不只一次一定要加 `/g`」——那是為了回答「這條規則有沒有被強制」。
+要回答「**每個站點是不是各自有覆蓋**」時,`/g` 恰恰是錯的:它把兩站的結果糊成一團,
+只要任一站有覆蓋整體就變紅。
+
+實例:`sg_chunk_effective_id` 有兩個呼叫站點。逐站點打之後,站點 A 紅、
+站點 B **退出碼 0 零 FAIL**——測試只走過 index-vs-workdir,從沒走過 tree-vs-workdir,
+而後者在真實使用中一定會走到(commit 過的 chunked 檔案,tree 裡存的就是 pointer id)。
+沒有正規化的話**每個未修改的大檔案都會被誤報成有變更**。
+
+分辨同字面量的站點不必靠 `/g`:把周邊文脈(縮排深度、前一行的呼叫)納入樣式就夠了。
+
+**(3) 沒紅的 mutation 有三種,不要混為一談。**
+
+| 沒紅的原因 | 實例 | 該做什麼 |
+|---|---|---|
+| **真死角**:那個維度沒有測試 | `--stat` 的 `W*3/8` 夾擠常數改成 `1/2`,全部單元測試照過 | 補測試,而且要錨在外部 oracle |
+| **冗餘守衛**:真正的防線在下一層 | `name_width <= 3` 的提前返回——一般路徑本來就產生 `"..."` | **刪掉守衛**,讓 mutation 打在真正決定行為的地方 |
+| **數學上不可觀測** | `graph_width` 的下限值 6——後面的 reclaim 分支會無條件蓋掉它 | 記下證明,換一條驗得到的性質 |
+
+第三種是實作者用代數 + 20 萬次隨機探測**證明**給我看的,而不是硬做出一個假覆蓋的測試。
+
+### 驗證
+
+`tests/interop.sh` 新增 **78 條**,其中 **22 條是 `oracle: precondition`**——它們不驗 sg,
+只驗 fixture 真的包含那個情境。這批立刻付了代價:第一次跑就紅了三條,全部是**我的**
+fixture 寫錯——`bin.dat` 與控制字元檔名在第一個 commit 就進去、之後沒再修改,
+所以既不出現在 `--cached` 的 diff 裡也不出現在 porcelain 裡。也就是說那組宣稱
+「涵蓋二進位列與引用名稱」的 `cmp` 檢查,**兩者都沒涵蓋**,而它會顯示為通過。
+
+`--stat` 的夾擠常數刻意驗在 interop 而不是單元測試:單元測試的預期字串有一部分是從
+**被測程式自己的輸出**抄進去的,那種斷言對「實作與真 git 不符」零鑑別力,
+只證明程式沒有隨機變動。真正的 oracle 只有並排比對真 git 這一個。
+
+`tests/mutate.sh` 也在這一輪長出第三條規則:一條 mutation 讓 `list_diff_sorted` 的
+歸併游標不再前進,測試**跑了三十分鐘還在跑**,而「永遠不退出」既不是 0 也不是非 0。
+現在有 `SG_MUTATE_TIMEOUT`(預設 300s),並且把「逾時」與「崩潰」**分開標示**
+——兩者都只證明「改壞了會出事」,不證明那條具名斷言有鑑別力。
+
+### `sg stash show`
+
+一個 stash entry 需要的四棵樹早就算好了:`load_stash_trees` 從 Phase 15 起就在把
+`stash@{N}` 解成 base / index / worktree / 可選的 untracked,只是它是 `static`,
+`cmd_stash.c` 看不到。這一輪把它提升為公開 API,而不是讓 `cmd_stash_show` 再解一次
+parent——本專案已經有八份 `env_or()` 逐字複本的教訓。
+
+實測而非假設的三條:預設格式是 **diffstat 不是 patch**;`-u` 與 `--only-untracked`
+**不是兩個獨立布林,而是同一個模式選擇器、後寫的贏**(兩種順序各跑一次才分得出來);
+沒有 untracked parent 時 `--only-untracked` 印空、`-u` 退回一般 diff,兩者都退出 0。
+
+**`-u` 的聯集有一個 bug,是那條「排序」測試抓到的**:未追蹤那半原本拿
+`base_tree` vs `untracked_tree` 比,而每個只存在於已追蹤側的路徑在 `untracked_tree`
+裡都不存在,於是各被多報一筆**幽靈刪除**——同一路徑印兩次。正確做法是拿**空 tree**
+vs `untracked_tree`(`--only-untracked` 本來就是這樣做的)。
+
+讓它現形的是 fixture 的一個刻意選擇:未追蹤檔名取 `b.txt`,**排在兩個已追蹤檔名
+`a.txt` 與 `c.txt` 中間**。若它排最後,「兩份清單串接」與「合併排序」的輸出完全相同,
+那條測試就會零鑑別力。
+
+### 這一輪刻意沒做的
+
+- **patch body 不追真 git**:整檔仍是單一 hunk `@@ -1,N +1,M @@`,沒有 `index` 行、
+  沒有 `/dev/null`、沒有 3 行 context 的多 hunk 切分、沒有 `\ No newline at end of file`。
+  因此 unmerged 列在 patch 格式**直接跳過**(真 git 印 `diff --cc` 合併格式)。
+  機器可讀的四種格式才是這一輪拿來與 git 逐位元組比對的。
+- **沒有 pathspec 過濾、沒有 rename 偵測**(`sg_status_kind` 連資料結構都容不下)。
+- **符號連結**在三條走訪路徑都不列出——既有行為,與本專案「symlink 刻意延後」一致。
+- **index 同時有 stage 0 與 stage 1/2/3 時**,殘留的衝突條目被靜默略過。sg 自己的寫入
+  路徑產生不出那個狀態(`cmd_add.c` 寫 stage 0 前必先 `sg_index_remove_all_stages`),
+  失敗方向是「安全但不完整」,已在 `index_group_end` 上方註明。

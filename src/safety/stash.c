@@ -387,7 +387,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     }
 
     if (untracked_flag) {
-        if (sg_status_list_untracked(git_dir, repo_root, &idx, opts->include_ignored, &untracked_paths,
+        if (sg_status_list_untracked(git_dir, repo_root, &idx, opts->include_ignored,
+                                     SG_STATUS_UNTRACKED_LIST_FILES, &untracked_paths,
                                      &untracked_path_count) != 0) {
             sg_index_free(&idx);
             return -1;
@@ -726,21 +727,11 @@ static int restore_untracked_flat(const char *git_dir, const char *repo_root, co
     return 0;
 }
 
-/* Everything sg_stash_apply and sg_stash_apply_check_dirty both need to know
-   about entry `index` before they can even start comparing trees: the base
-   (parents[0]), theirs (the stash's own tree), index (parents[1]) trees, and
-   -- when present -- the untracked (parents[2]) tree. Factored out so the
-   two never drift on what counts as a valid stash-shaped commit (parent
+/* sg_stash_trees / sg_stash_load_trees are declared in sg/stash.h -- shared
+   by sg_stash_apply, sg_stash_apply_check_dirty and `sg stash show` so the
+   three never drift on what counts as a valid stash-shaped commit (parent
    count 2 or 3). */
-typedef struct {
-    unsigned char base_tree[SG_SHA1_RAW_LEN];
-    unsigned char theirs_tree[SG_SHA1_RAW_LEN];
-    unsigned char index_tree[SG_SHA1_RAW_LEN];
-    int has_untracked;
-    unsigned char untracked_tree[SG_SHA1_RAW_LEN];
-} stash_trees;
-
-static int load_stash_trees(const char *git_dir, size_t index, stash_trees *out)
+int sg_stash_load_trees(const char *git_dir, size_t index, sg_stash_trees *out)
 {
     sg_stash_list list;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
@@ -748,6 +739,16 @@ static int load_stash_trees(const char *git_dir, size_t index, stash_trees *out)
     unsigned char *content = NULL;
     size_t content_len;
     sg_commit stash_commit;
+
+    /* has_untracked == 0 leaves untracked_tree untouched below (it is only
+       ever written for a 3-parent stash) -- zero it up front so a caller
+       that someday forgets to check has_untracked first reads 20 zero
+       bytes, not uninitialized stack garbage. There is no sanitizer for
+       this project that would ever catch the alternative: ASan does not
+       flag a pure read of an uninitialized value the way it flags a
+       use-after-free or an out-of-bounds access, and this project has no
+       MemorySanitizer build. */
+    memset(out, 0, sizeof(*out));
 
     if (sg_stash_list_read(git_dir, &list) != 0)
         return -1;
@@ -858,7 +859,7 @@ static int path_is_touched(const sg_merge_result *result, const char *path)
 int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_t index,
                                char ***dirty_paths_out, size_t *dirty_count_out)
 {
-    stash_trees trees;
+    sg_stash_trees trees;
     unsigned char head_commit_id[SG_SHA1_RAW_LEN];
     unsigned char ours_tree[SG_SHA1_RAW_LEN];
     sg_merge_result result;
@@ -872,7 +873,7 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
     *dirty_paths_out = NULL;
     *dirty_count_out = 0;
 
-    if (load_stash_trees(git_dir, index, &trees) != 0)
+    if (sg_stash_load_trees(git_dir, index, &trees) != 0)
         return -1;
 
     if (sg_ref_resolve_head(git_dir, head_commit_id) != 0)
@@ -985,7 +986,7 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
 
 int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int restore_index)
 {
-    stash_trees trees;
+    sg_stash_trees trees;
     unsigned char base_tree[SG_SHA1_RAW_LEN];
     unsigned char ours_tree[SG_SHA1_RAW_LEN];
     unsigned char theirs_tree[SG_SHA1_RAW_LEN];
@@ -1004,7 +1005,7 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
 
     memset(&untracked_flat, 0, sizeof(untracked_flat));
 
-    if (load_stash_trees(git_dir, index, &trees) != 0)
+    if (sg_stash_load_trees(git_dir, index, &trees) != 0)
         return -1;
     memcpy(base_tree, trees.base_tree, SG_SHA1_RAW_LEN);
     memcpy(theirs_tree, trees.theirs_tree, SG_SHA1_RAW_LEN);
