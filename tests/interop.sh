@@ -8964,6 +8964,42 @@ check "phase26: sg stash show refuses a stash whose tree has a '..' entry" \
 check "phase26: and names the offending path in its error message" \
     grep -q '\.\.' "$WORKDIR/p26_bad_stash.txt"
 
+# --- Phase 27: sg_status_diff_unstaged collapsed into a thin adapter over
+# sg_diff_index_workdir. A pure chmod (no content change) is now real signal
+# to `sg status` too, matching git; and it now counts as "dirty" for the
+# switch/reset --hard safety gate, since that gate is sg_status_diff_unstaged's
+# own third caller. ---
+P27_MODE="$WORKDIR/p27_mode"
+(cd "$WORKDIR" && "$SG" init p27_mode) > /dev/null 2>&1
+(cd "$P27_MODE" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'a\nb\n' > "$P27_MODE/exec.txt"
+(cd "$P27_MODE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+chmod +x "$P27_MODE/exec.txt"
+(cd "$P27_MODE" && "$SG" status --porcelain) > "$WORKDIR/p27_mode_sg.txt" 2>&1
+(cd "$P27_MODE" && LC_ALL=C git -c core.quotepath=false status --porcelain) > "$WORKDIR/p27_mode_git.txt" 2>&1
+check "phase27: sg status --porcelain reports a mode-only chmod, matching git byte-for-byte" \
+    cmp -s "$WORKDIR/p27_mode_sg.txt" "$WORKDIR/p27_mode_git.txt"
+check "phase27 oracle: precondition -- git really does print ' M exec.txt' for a mode-only chmod" \
+    grep -qx ' M exec.txt' "$WORKDIR/p27_mode_git.txt"
+
+# switch: a mode-only dirty change must now block it, same as an ordinary
+# content change already did -- and a control repo with NO dirty change (only
+# the branch differs) must still switch cleanly, so this isn't switch simply
+# refusing everything.
+(cd "$P27_MODE" && "$SG" branch other) > /dev/null 2>&1
+(cd "$P27_MODE" && "$SG" switch other) > "$WORKDIR/p27_switch_dirty.txt" 2>&1
+check "phase27: sg switch refuses to switch branches with an unstaged mode-only change" \
+    sh -c "! (cd '$P27_MODE' && '$SG' switch other) > /dev/null 2>&1"
+
+P27_CLEAN="$WORKDIR/p27_clean"
+(cd "$WORKDIR" && "$SG" init p27_clean) > /dev/null 2>&1
+(cd "$P27_CLEAN" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'a\nb\n' > "$P27_CLEAN/exec.txt"
+(cd "$P27_CLEAN" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P27_CLEAN" && "$SG" branch other) > /dev/null 2>&1
+check "phase27 control: sg switch still succeeds when the working tree is clean" \
+    sh -c "cd '$P27_CLEAN' && '$SG' switch other > /dev/null 2>&1"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

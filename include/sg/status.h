@@ -45,13 +45,27 @@ typedef enum {
    failure. */
 int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg_status_list *out);
 
-/* Changes not yet staged: compares idx against the actual working directory
-   contents under repo_root. A path missing from the working directory (or
-   unreadable) counts as SG_STATUS_DELETED. git_dir is used to normalize a
-   chunked-storage pointer id from idx into the id of its actual content (see
-   sg/chunk.h's sg_chunk_effective_id) before comparing against the working
-   file's hash, so a chunked file that hasn't actually changed doesn't show up
-   as permanently modified. Returns 0 on success, -1 on allocation failure. */
+/* Changes not yet staged: a thin adapter over sg_diff_index_workdir
+   (include/sg/diff.h), which does the actual index-vs-workdir walk. A path
+   missing from the working directory, or that exists but is unreadable (e.g.
+   permission denied), counts as SG_STATUS_DELETED -- it is never enough to
+   fail this whole call, and never silently omitted either: unlike a plain
+   allocation failure, one unreadable path must not take down the rest of the
+   list. git_dir is passed through so the underlying builder can normalize a
+   chunked-storage pointer id from idx into the id of its actual content, so a
+   chunked file that hasn't actually changed doesn't show up as permanently
+   modified. Mode is compared too (mode-only changes, e.g. a bare chmod with
+   unchanged content, show up as SG_STATUS_MODIFIED). An unresolved conflict
+   (any path with a stage 1/2/3 index entry) is deliberately excluded: `sg
+   status` surfaces those through its own "Unmerged paths" section instead,
+   and the associated stage-2-vs-workdir comparison row that
+   sg_diff_index_workdir may also emit for the same path is likewise excluded
+   -- see the .c file's comment on sg_status_diff_unstaged.
+
+   Returns 0 on success, -1 on allocation failure (this function's own, or
+   sg_diff_index_workdir's -- see sg/diff.h; a chunk pointer whose data is
+   missing or corrupt does NOT fail the call, it just falls back to comparing
+   against the working file's own hash). */
 int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg_index *idx,
                             sg_status_list *out);
 

@@ -2,33 +2,55 @@
    index and the working tree" implementations: sg_status_diff_unstaged
    (src/workdir/status.c) and sg_diff_index_workdir (src/workdir/diff.c).
    Both answer the same question -- Phase 26 confirmed at least one place
-   where they disagree (mode-only changes) purely by accident, with no test
-   catching it. This file enumerates the disagreements deliberately and pins
-   them down as regression detectors, so any future change to either side is
-   forced to be a conscious decision rather than a silent drift.
+   where they disagreed (mode-only changes) purely by accident, with no test
+   catching it, plus a second divergence (a broken chunk pointer aborting the
+   whole status scan) found while writing this file.
+
+   As of the collapse of sg_status_diff_unstaged into a thin adapter over
+   sg_diff_index_workdir (see status.c), only ONE divergence remains, and it
+   is deliberate:
+     - mode-only changes: FIXED -- sg_status_diff_unstaged now goes through
+       the same builder, so it sees mode too.
+     - a broken/unresolvable chunk pointer aborting the entire scan: FIXED --
+       the adapter can no longer hard-fail on a single bad path, since it is
+       sg_diff_index_workdir doing the walk.
+     - unmerged paths: KEPT, on purpose. sg_status_diff_unstaged skips every
+       row sg_diff_index_workdir marks `unmerged`, AND the row immediately
+       following it when that row shares the same path (the stage-2-vs-
+       workdir companion row sg_diff_index_workdir may also emit) -- `sg
+       status` reports conflicts through its own "Unmerged paths" section
+       instead of this list.
+   This file still enumerates all of this deliberately and pins it down as a
+   regression detector, so a future change to either side is forced to be a
+   conscious decision rather than a silent drift back apart.
 
    Normalizing sg_diff_list -> sg_status_kind (derived from the two headers'
    documented contracts, sg/diff.h and sg/status.h):
+     old ABSENT + new present -> SG_STATUS_NEW (not actually reachable through
+                                  sg_status_diff_unstaged today, since every
+                                  row it sees comes from an existing idx
+                                  entry -- old is therefore always BLOB -- but
+                                  documented for completeness)
      old BLOB   + new ABSENT  -> SG_STATUS_DELETED
-     old BLOB   + new WORKDIR -> SG_STATUS_MODIFIED (the only "both present"
-                                  shape sg_diff_index_workdir ever produces --
-                                  the index side is always BLOB, never
-                                  ABSENT, since every row it emits comes from
-                                  an existing idx entry)
-     unmerged row              -> no sg_status_kind equivalent at all;
-                                  sg_status_kind only has NEW/MODIFIED/DELETED.
+     old BLOB   + new WORKDIR -> SG_STATUS_MODIFIED (also what a pure mode
+                                  change now maps to, since both sides are
+                                  "present" regardless of whether content or
+                                  mode is what actually differs)
+     unmerged row (and its stage-2 companion row) -> skipped entirely, no
+                                  sg_status_kind equivalent.
    Both builders only ever operate on paths that already have an index entry
-   (that's what they're iterating), so SG_STATUS_NEW never occurs here --
-   it is sg_status_diff_staged's/sg_diff_tree_index's shape (HEAD vs index),
-   not this pair's.
+   (that's what they're iterating), so SG_STATUS_NEW never occurs here in
+   practice -- it is sg_status_diff_staged's/sg_diff_tree_index's shape (HEAD
+   vs index), not this pair's.
 
    Style follows tests/test_fuzz_pack.c: deterministic xorshift64 PRNG (not
    rand(), for cross-platform reproducibility), SG_FUZZ_ITERS/
    SG_FUZZ_SEED_BASE env vars, and every failure message names the exact
    seed to reproduce it. Named deterministic scenario tests pin the specific
-   divergences called out in the task; the randomized fuzz loop combines
-   many independent per-path scenarios in one repo to look for interactions
-   or additional divergences neither of us anticipated. */
+   divergences (and now-fixed former divergences) called out in the task; the
+   randomized fuzz loop combines many independent per-path scenarios in one
+   repo to look for interactions or additional divergences neither of us
+   anticipated. */
 #include "sg/chunk.h"
 #include "sg/diff.h"
 #include "sg/hash.h"
@@ -266,14 +288,12 @@ static size_t diff_count_unmerged(const sg_diff_list *list, const char *path)
  * divergence, plus a couple of "these actually agree" sanity checks.
  * ==================================================================== */
 
-/* Divergence #1 (already known before this task, Phase 26): a bare chmod
-   with unchanged content. sg_status_diff_unstaged never reads .mode at all;
-   sg_diff_index_workdir compares it (blob_sides_differ). Classification:
-   status-side bug (mode is a real part of what changed; `git status
-   --porcelain` prints " M" for this, per the task's oracle), OR a
-   deliberate divergence if status.c's mode-blindness turns out to be
-   load-bearing elsewhere -- flagged for the user's call, not assumed here. */
-static void test_mode_only_divergence(void)
+/* Former divergence #1 (Phase 26), now FIXED by collapsing
+   sg_status_diff_unstaged into an adapter over sg_diff_index_workdir: a bare
+   chmod with unchanged content is real signal (`git status --porcelain`
+   prints " M" for this, per the task's oracle), and both sides now report
+   it. */
+static void test_mode_only_now_reported(void)
 {
     char *git_dir = make_tmp_repo("mode_only");
     char *repo_root = sg_repo_root(git_dir);
@@ -291,10 +311,14 @@ static void test_mode_only_divergence(void)
 
     CHECK(sg_status_diff_unstaged(git_dir, repo_root, &idx, &slist) == 0,
          "sg_status_diff_unstaged failed");
-    CHECK(status_find(&slist, "exec.txt") == NULL,
-         "DIVERGENCE CONFIRMED (expected): sg_status_diff_unstaged reports nothing for a "
-         "mode-only chmod, but found an entry -- has status.c started comparing mode? update "
-         "this test's expectation");
+    {
+        const sg_status_entry *e = status_find(&slist, "exec.txt");
+
+        CHECK(e != NULL && e->kind == SG_STATUS_MODIFIED,
+             "PARITY RESTORED (expected): sg_status_diff_unstaged should now report a mode-only "
+             "chmod as SG_STATUS_MODIFIED, same as sg_diff_index_workdir -- has the adapter "
+             "stopped going through the diff builder?");
+    }
 
     CHECK(sg_diff_index_workdir(git_dir, repo_root, &idx, &dlist) == 0,
          "sg_diff_index_workdir failed");
@@ -474,28 +498,27 @@ static void test_unmerged_stage2_matches_workdir(void)
     free(git_dir);
 }
 
-/* Divergence #4 (most severe found this round): an index entry whose sha1
-   does not resolve to any object at all (simulating a broken/garbage chunk
-   pointer id -- sg_chunk_effective_id's -1 path, "the underlying object
-   read of id itself fails", is reached the same way whether the id is a
-   genuinely corrupt chunk pointer or simply garbage; both hit the identical
+/* Former divergence #4 (most severe found before this task), now FIXED by
+   the same collapse as the mode-only case: an index entry whose sha1 does
+   not resolve to any object at all (simulating a broken/garbage chunk
+   pointer id -- sg_chunk_effective_id's -1 path, "the underlying object read
+   of id itself fails", is reached the same way whether the id is a genuinely
+   corrupt chunk pointer or simply garbage; both hit the identical
    `sg_object_read` failure inside chunk_resolve).
 
-   sg_status_diff_unstaged's header only documents "-1 on allocation
-   failure", but the implementation returns -1 here too (status.c: "if
-   (sg_chunk_effective_id(...) != 0) return -1;" -- unconditional, not just
-   on the allocation path) -- so ONE broken entry fails the ENTIRE call,
-   silently discarding whatever it already found for every other path.
-   Because sg_status_diff_unstaged iterates idx in (sorted) path order, a
-   broken entry sorting BEFORE another, perfectly ordinary modified path
-   means that modified path is never even reached, let alone reported.
+   sg_status_diff_unstaged used to hard-fail (-1) here, aborting the ENTIRE
+   call and silently discarding whatever it already found for every other
+   path -- since it iterated idx in (sorted) path order, a broken entry
+   sorting BEFORE another, perfectly ordinary modified path meant that
+   modified path was never even reached, let alone reported.
 
-   sg_diff_index_workdir's contract (sg/diff.h) explicitly designs around
-   this: "must NOT fail the whole call... records the path as changed and
-   leaves the complaining to the renderer". It reports the broken path as an
-   ordinary changed row and keeps going -- the other (real) modification is
-   still found. */
-static void test_chunked_broken_pointer_diverges(void)
+   Now that sg_status_diff_unstaged is a thin adapter over
+   sg_diff_index_workdir, it inherits that builder's resilience (sg/diff.h:
+   "must NOT fail the whole call... records the path as changed and leaves
+   the complaining to the renderer"): the broken path is reported as an
+   ordinary SG_STATUS_MODIFIED entry, and the unrelated, real modification is
+   still found too. */
+static void test_chunked_broken_pointer_now_resilient(void)
 {
     char *git_dir = make_tmp_repo("broken_chunk");
     char *repo_root = sg_repo_root(git_dir);
@@ -513,8 +536,8 @@ static void test_chunked_broken_pointer_diverges(void)
     memset(garbage_id, 0xAB, sizeof(garbage_id)); /* not any object this fresh repo has */
 
     /* "aaa_broken.txt" sorts before "zzz_modified.txt", so if the broken
-       entry aborts the whole scan, zzz_modified.txt's real, unrelated
-       modification never even gets a chance to be seen. */
+       entry aborted the whole scan, zzz_modified.txt's real, unrelated
+       modification would never even get a chance to be seen. */
     index_upsert(&idx, "aaa_broken.txt", 0, 0100644, garbage_id);
     write_workdir_bytes(repo_root, "aaa_broken.txt", broken_wd_content, sizeof(broken_wd_content) - 1);
 
@@ -523,17 +546,20 @@ static void test_chunked_broken_pointer_diverges(void)
     write_workdir_bytes(repo_root, "zzz_modified.txt", new_content, sizeof(new_content) - 1);
 
     status_rc = sg_status_diff_unstaged(git_dir, repo_root, &idx, &slist);
-    CHECK(status_rc != 0,
-         "DIVERGENCE CONFIRMED (expected): sg_status_diff_unstaged used to hard-fail (-1) when "
-         "an index entry's chunk pointer can't be resolved; it returned %d instead -- has this "
-         "been made resilient like sg_diff_index_workdir? if so this is a status-side fix, "
-         "update this test",
+    CHECK(status_rc == 0,
+         "PARITY RESTORED (expected): sg_status_diff_unstaged should no longer hard-fail when an "
+         "index entry's chunk pointer can't be resolved -- it returned %d",
          status_rc);
     if (status_rc == 0) {
-        /* If a future fix makes this resilient, at minimum the unrelated
-           modified path must still be found. */
-        CHECK(status_find(&slist, "zzz_modified.txt") != NULL,
-             "even in the resilient case, the unrelated modification must still be reported");
+        const sg_status_entry *broken = status_find(&slist, "aaa_broken.txt");
+        const sg_status_entry *modified = status_find(&slist, "zzz_modified.txt");
+
+        CHECK(broken != NULL && broken->kind == SG_STATUS_MODIFIED,
+             "the broken-pointer path itself should still be reported as changed (renderer's job "
+             "to diagnose further)");
+        CHECK(modified != NULL && modified->kind == SG_STATUS_MODIFIED,
+             "the unrelated, perfectly ordinary modification must still be reported -- a "
+             "hard-failing status.c would have silently dropped this");
         sg_status_list_free(&slist);
     }
 
@@ -699,11 +725,13 @@ static void test_untracked_file_not_reported(void)
 /* ==================================================================== *
  * Randomized parity fuzzer: many independent per-path scenarios combined
  * into one repo per round, cross-checked against the mapping documented at
- * the top of this file. Excludes the two scenarios that cannot be mixed
- * with others: SC_CHUNKED_BROKEN (kills the whole sg_status_diff_unstaged
- * call, so combining it would make every OTHER path's expectation
- * meaningless too -- covered on its own, deterministically, above) and
- * SC_UNTRACKED is fine to mix in (it never touches the index) so it stays.
+ * the top of this file. There is no SC_CHUNKED_BROKEN scenario in this pool
+ * (unlike an earlier version of this file): now that
+ * sg_status_diff_unstaged no longer hard-fails the whole call over one
+ * broken chunk pointer, it could in principle be mixed in like any other
+ * scenario, but it stays covered on its own, deterministically, above
+ * (test_chunked_broken_pointer_now_resilient) rather than being added here.
+ * SC_UNTRACKED is fine to mix in (it never touches the index).
  * ==================================================================== */
 
 typedef enum {
@@ -780,8 +808,9 @@ static void setup_one(const char *git_dir, const char *repo_root, sg_index *idx,
         index_upsert(idx, path, 0, 0100644, id);
         write_workdir_bytes(repo_root, path, content, sizeof(content) - 1);
         chmod_workdir(repo_root, path, 0755);
-        /* KNOWN DIVERGENCE: status says nothing, diff reports a row. */
-        exp->status_reported = 0;
+        /* PARITY RESTORED: status now goes through the same builder, so it
+           reports this row too. */
+        exp->status_reported = 1;
         exp->diff_row_count = 1;
         break;
     }
@@ -1047,11 +1076,11 @@ int main(void)
     long seed_base = env_long("SG_FUZZ_SEED_BASE", 0);
     long i;
 
-    test_mode_only_divergence();
+    test_mode_only_now_reported();
     test_unmerged_no_stage2();
     test_unmerged_stage2_differs();
     test_unmerged_stage2_matches_workdir();
-    test_chunked_broken_pointer_diverges();
+    test_chunked_broken_pointer_now_resilient();
     test_unreadable_path_agrees();
     test_chunked_unmodified_agrees();
     test_untracked_file_not_reported();
