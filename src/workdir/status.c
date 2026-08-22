@@ -1,6 +1,6 @@
 #include "sg/status.h"
 
-#include "sg/chunk.h"
+#include "sg/diff.h"
 #include "sg/hash.h"
 #include "sg/ignore.h"
 #include "sg/quote.h"
@@ -107,47 +107,87 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
     return 0;
 }
 
+/* sg_status_diff_unstaged is a thin adapter over sg_diff_index_workdir
+   (include/sg/diff.h): that builder already walks index-vs-workdir once and
+   knows every rule this function used to duplicate (chunk-pointer
+   normalization, mode comparison, unmerged rows), so this just translates its
+   sg_diff_list into an sg_status_list rather than re-scanning the index.
+
+   Translation rule, read straight off sg_diff_side_kind:
+     old ABSENT, new present   -> SG_STATUS_NEW
+     old present, new ABSENT   -> SG_STATUS_DELETED
+     old present, new present  -> SG_STATUS_MODIFIED (this is what makes a
+                                  mode-only chmod, with unchanged content,
+                                  finally show up here -- sg_diff_index_workdir
+                                  compares mode, the old hand-rolled loop below
+                                  never did)
+   Both ABSENT never appears for a non-unmerged row, since the builder only
+   ever emits rows that actually differ.
+
+   Unmerged paths are skipped entirely, on purpose: distinct #3 is a
+   deliberate, kept difference from sg diff, since `sg status` reports
+   conflicts through its own "Unmerged paths" section (cmd_status.c), not
+   through this list. sg_diff_index_workdir emits the `unmerged` row, and, for
+   the same path, may also emit a second, ordinary row comparing stage 2 vs
+   the working tree (see its header comment) -- that second row does not carry
+   the `unmerged` flag, but it directly follows the unmerged row it belongs to
+   and shares its path, so "the previous entry is unmerged AND shares this
+   entry's path" is what's used to catch it here too. Checking both, not just
+   path equality, matters because sg_index_read (src/index/index.c) does not
+   validate that idx is sorted or deduplicated on load: a corrupted or
+   hand-edited index can put two unrelated ordinary rows for the same path in
+   two separate, non-adjacent groups that happen to land next to each other in
+   sg_diff_index_workdir's output (see include/sg/status.h's documented
+   invariant); bare path equality would misclassify the second one as the
+   first one's unmerged companion and silently drop a real change. Without
+   the unmerged-row skip at all, a conflicted file's stage-2-vs-worktree row
+   would leak into the unstaged list -- an unmerged path showing up here for
+   the first time -- which is exactly the regression #3 exists to prevent. */
 int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg_index *idx,
                             sg_status_list *out)
 {
+    sg_diff_list dl;
     size_t i;
 
     memset(out, 0, sizeof(*out));
 
-    for (i = 0; i < idx->count; i++) {
-        char abspath[SG_PATH_MAX];
-        unsigned char wd_sha1[SG_SHA1_RAW_LEN];
-        unsigned char effective_sha1[SG_SHA1_RAW_LEN];
-        struct stat st;
+    if (sg_diff_index_workdir(git_dir, repo_root, idx, &dl) != 0)
+        return -1;
 
-        if (idx->entries[i].stage != 0)
+    for (i = 0; i < dl.count; i++) {
+        sg_status_kind kind;
+
+        if (dl.entries[i].unmerged)
+            continue;
+        /* The stage-2-vs-worktree companion row for the unmerged path just
+           skipped: same path as the entry before it, AND that previous entry
+           was itself the unmerged row. Checking unmerged-ness of the
+           previous row too (not just path equality) matters when idx is not
+           actually sorted/deduplicated -- sg_index_read (src/index/index.c)
+           does not validate either invariant on load, so a corrupted or
+           hand-edited index can legitimately contain two unrelated ordinary
+           rows for the same path in two non-adjacent groups that happen to
+           land next to each other here (nothing differs in between). Bare
+           path equality would silently drop the second one as if it were an
+           unmerged companion row; requiring the previous row to be unmerged
+           closes that. */
+        if (i > 0 && dl.entries[i - 1].unmerged &&
+           strcmp(dl.entries[i].path, dl.entries[i - 1].path) == 0)
             continue;
 
-        /* A truncated path must not be silently skipped: that would drop a
-           path from the unstaged-diff list, which `sg status` reports as
-           "nothing changed" for a file that may well be dirty. */
-        if (sg_path_join(abspath, sizeof(abspath), repo_root, idx->entries[i].path) != 0)
+        if (dl.entries[i].old_side.kind == SG_DIFF_SIDE_ABSENT)
+            kind = SG_STATUS_NEW;
+        else if (dl.entries[i].new_side.kind == SG_DIFF_SIDE_ABSENT)
+            kind = SG_STATUS_DELETED;
+        else
+            kind = SG_STATUS_MODIFIED;
+
+        if (status_list_add(out, dl.entries[i].path, kind) != 0) {
+            sg_diff_list_free(&dl);
             return -1;
-        if (stat(abspath, &st) != 0) {
-            if (status_list_add(out, idx->entries[i].path, SG_STATUS_DELETED) != 0)
-                return -1;
-            continue;
-        }
-        if (sg_hash_file_blob(abspath, wd_sha1) != 0) {
-            if (status_list_add(out, idx->entries[i].path, SG_STATUS_DELETED) != 0)
-                return -1;
-            continue;
-        }
-        /* idx's id may be a chunked-storage pointer's id rather than the
-           content's own id -- normalize before comparing, or a chunked file
-           that never actually changed would show up as modified forever. */
-        if (sg_chunk_effective_id(git_dir, idx->entries[i].sha1, effective_sha1) != 0)
-            return -1;
-        if (memcmp(wd_sha1, effective_sha1, SG_SHA1_RAW_LEN) != 0) {
-            if (status_list_add(out, idx->entries[i].path, SG_STATUS_MODIFIED) != 0)
-                return -1;
         }
     }
+    sg_diff_list_free(&dl);
     return 0;
 }
 

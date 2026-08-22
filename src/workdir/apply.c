@@ -353,7 +353,7 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
         for (i = 0; i < staged.count; i++)
             strbuf_append_path(&msg, "staged: ", staged.entries[i].path);
         if (!staged_ok || !unstaged_ok)
-            strbuf_append(&msg, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足），為安全起見要求確認\n");
+            strbuf_append(&msg, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足，或路徑過長），為安全起見要求確認\n");
         if (sg_index_has_unmerged(&idx))
             strbuf_append(&msg, "sg: 目前有一個尚未完成的合併，繼續會放棄它\n");
         if (sg_rebase_state_exists(git_dir))
@@ -459,7 +459,7 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
         for (i = 0; i < unstaged.count; i++)
             fprintf(stderr, "\tmodified (unstaged): %s\n", sg_quote_path(unstaged.entries[i].path));
         if (!staged_ok || !unstaged_ok)
-            fprintf(stderr, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足）\n");
+            fprintf(stderr, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足，或路徑過長）\n");
         fprintf(stderr,
                "請先處理這些變更，再重新執行：\n"
                "  sg commit -m \"...\"      把它們提交進來\n"

@@ -2735,3 +2735,82 @@ fixture 只能釘住有人想得到的對齊,而**想不到的那些正是實作
   **新增**那條路徑會印警告,代價是 header 帶一個 `0000000` 的新 id。
 - 測試用「把追蹤路徑做成目錄」製造讀取失敗(避開 `chmod 000`,root 執行會失效)。
   macOS 實測 `fopen` 成功、`fread` 設 `ferror`/EISDIR;**Linux 只由 CI 覆蓋**。
+
+## Phase 27:`sg status` 與 `sg diff` 對同一個問題只留一個答案
+
+Phase 26 補完 patch 保真時,順手發現 `sg diff` 看得到純 chmod 而 `sg status` 看不到。
+成因不是漏改一行,而是**兩份獨立實作**在回答同一個問題:
+`sg_status_diff_unstaged`(`src/workdir/status.c`)與 `sg_diff_index_workdir`
+(`src/workdir/diff.c`)都在算「index 與工作目錄之間有哪些路徑變了」。
+
+### 先列舉,再收斂
+
+沒有直接改。先寫 `tests/test_status_diff_parity.c`(具名案例 + 隨機情境,體例照
+`tests/test_fuzz_pack.c`),把兩支的輸出正規化後並排比對,**列舉出所有分歧**。
+
+理由:mode 那一個是**偶然撞見**的——沒有任何測試會抓到它。既然如此,沒有理由相信它是
+唯一的一個。盲目收斂的風險是把一個沒人知道存在的行為差異當成 bug 修掉、或當成 feature 留著,
+而三個呼叫端裡有兩個是安全閘門。
+
+結果:**恰好三類**,5000 輪隨機沒有再多。
+
+| # | 分歧 | 裁決 |
+|---|---|---|
+| mode | diff 比較、status 完全不看 | status 側的 bug(真 git 對純 chmod 印 ` M`) |
+| chunk pointer 解不開 | diff 優雅降級、status 回 `-1` 放棄整個掃描 | status 側的 bug |
+| unmerged | status 跳過所有非 stage-0、diff 產生 unmerged 列 + stage-2 對照列 | **刻意分歧,保留** |
+
+第三類保留的理由:`cmd_status.c` 有自己的 Unmerged paths 區段。兩支的標頭註解都已寫明。
+
+### 收斂之後的行為改變
+
+`sg_status_diff_unstaged` 成為 `sg_diff_index_workdir` 的薄轉接層。三個呼叫端:
+`cmd_status.c` 與 `apply.c` 的**兩道髒工作目錄閘門**。所以這不只是重構:
+
+- `sg status` 開始回報純 chmod。
+- **`sg switch` / `sg reset --hard` / `sg merge` / `sg rebase` 開始把純 chmod 算成髒。**
+  實測真 git 同樣會擋(`error: Your local changes to the following files would be
+  overwritten by checkout`),對照組(工作目錄乾淨、其他條件相同)則正常切換。
+
+⚠ **閘門的失敗方向要親自確認,不能假設。** 收斂前 chunk pointer 解不開會讓函式回 `-1`,
+而 `apply.c` 寫的是 `dirty = !unstaged_ok || ...`——判斷不出來就當成髒,fail closed。
+收斂後那條路徑不再回 `-1`,改成把該路徑列成有變更。結果仍是髒,但**機制從失敗保護變成正常回報**。
+逐條查證過沒有引入 fail-open:路徑截斷仍回 `-1`(`diff.c:363`),chunk 失敗列在清單裡,
+hash 失敗變 ABSENT 也列在清單裡——沒有「回 0 又把路徑省略」的路徑。
+
+### 收斂帶來的一個新風險,以及它為什麼差點沒人發現
+
+轉接層要濾掉 unmerged 路徑的 stage-2 對照列。第一版判準是**「與前一列同路徑就跳過」**。
+
+這在正常 index 下正確,但 **`sg_index_read` 載入時不驗證排序也不去重**
+(`src/index/index.c`,它信任磁碟上的檔案)。手改或損毀的 index 可以讓同一路徑落在
+兩個不連續的群組;`index_group_end` 只合併連續的一段,於是兩個群組各產生一列,
+若中間的路徑恰好都沒有差異,兩列就會**相鄰**——第二列被當成 stage-2 對照列**靜默丟棄**。
+
+方向很重要:舊實作在同樣情境最多是重複計算(無害),新實作是**漏報**,而它餵的正是
+`switch`/`reset --hard` 的髒判斷。判準改嚴成「**前一列是 unmerged 列且路徑相同**」即可。
+
+⚠ 改嚴之後跑 mutation:把判準改回寬鬆的,**零測試變紅**——真死角。
+情境建得出來(測試可以直接操作 `sg_index` 的陣列繞過排序插入),只是沒人建。
+`test_corrupt_index_duplicate_path_is_not_dropped` 就是補這個。
+**一個修法如果沒有任何測試能區分它與被修掉的那個 bug,那個修法等於沒有落地。**
+
+「非 unmerged 路徑絕不產生第二列」這個不變量已寫進 `include/sg/diff.h` 的公開合約——
+先前它只活在轉接層自己的註解裡,而未來若 `sg_diff_index_workdir` 因為新功能
+(例如 rename 偵測)讓一般路徑多出第二列,那個 bug 會是靜默的。
+
+### 已知的診斷降級
+
+收斂前 chunk pointer 解不開會讓閘門印出「無法完整判斷工作目錄狀態」;收斂後該路徑被當成
+一般 `SG_STATUS_MODIFIED` 列出,那則警告不再出現,使用者看到的和普通編輯過的檔案一樣。
+**安全性沒有退化**(仍然算髒),但在最需要準確資訊的時刻(即將覆蓋工作目錄)少了一個信號。
+已記在 `include/sg/status.h` 的合約裡。
+
+### harness 自己的盲點
+
+parity fuzzer 一開始只數「路徑有沒有被回報」,**不看 `kind`**。實測:把轉接層的
+`SG_STATUS_MODIFIED` 改成 `SG_STATUS_DELETED`,5000 輪 fuzzer 一輪都不紅,只有兩條具名測試紅。
+補上 kind 斷言後同一個 mutation 產生 619 條 FAIL。
+
+⚠ 補的時候期望值要**明確寫死**,不可以拿 diff 側算出來的當期望——那是自我循環,
+兩邊一起錯就驗不到,而「兩邊會不會一起錯」正是這支 harness 存在的理由。

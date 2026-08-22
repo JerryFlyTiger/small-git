@@ -563,8 +563,8 @@ int sg_cmd_status(int argc, char **argv)
 
     if (sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) != 0)
         fprintf(stderr,
-               "sg: warning: failed to compute unstaged changes (out of memory, or a chunked "
-               "file's data is missing/corrupt -- see sg restore for details)\n");
+               "sg: warning: failed to compute unstaged changes (out of memory, or a path too "
+               "long)\n");
 
     if (opts.u_mode != STATUS_U_NO) {
         sg_status_untracked_fold fold =

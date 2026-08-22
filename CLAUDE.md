@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1425 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1432 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -240,10 +240,15 @@ staging 的驗證。本機綠燈不是充分證據。**
   逐字複本:`storage/reflog.c`、`storage/chunk.c`、`safety/stash.c`、
   `safety/snapshot.c`、`cli/cmd_rebase.c`、`cli/cmd_merge.c`、`cli/cmd_tag.c`、
   `cli/cmd_commit.c`。碰到時順手收斂,不要再增加下一份。
-  **Phase 26 新發現一對**:`sg status` 的未 staged 比較走
-  `sg_status_diff_unstaged`(`src/workdir/status.c:110`),與 `sg_diff_index_workdir`
-  是兩份獨立實作。後者 Phase 26 起會比較 mode,前者不會,所以 `sg diff` 看得到
-  純 chmod 而 **`sg status` 看不到**(真 git 兩者都報 ` M`)。這個分歧仍開著。
+  **Phase 27 已收斂**:`sg_status_diff_unstaged`(`src/workdir/status.c`)現在是
+  `sg_diff_index_workdir` 的薄轉接層,不再是第二份掃描迴圈。收斂前列舉出**恰好三類**
+  分歧(`tests/test_status_diff_parity.c`),兩類修掉、一類刻意保留:
+  **unmerged 列與其 stage-2 對照列不進 status 清單**(`cmd_status.c` 有自己的
+  Unmerged paths 區段)。⚠ 過濾判準必須是「**前一列是 unmerged 且同路徑**」,
+  不可以只比路徑——`sg_index_read` 不驗證排序也不去重,損毀的 index 會讓兩個獨立的
+  同路徑列相鄰而被靜默丟掉一個,而這份清單餵的是 `switch`/`reset --hard` 的髒判斷。
+  ⚠ 收斂後 **純 chmod 會讓工作目錄算成髒**(`switch`/`reset --hard`/`merge`/`rebase`
+  都會擋),這與真 git 一致,已實測。
   Phase 25 又長出**一對**:`report_bad_tree_path`(`cli/cmd_diff.c:62`)與
   `report_bad_stash_tree_path`(`cli/cmd_stash.c:337`)幾乎逐字相同(都是把
   `sg_tree_flatten` 的 `-2` 轉成一行指名 `bad_path` 的錯誤)。**Phase 26 已補上兩條 interop 檢查**
