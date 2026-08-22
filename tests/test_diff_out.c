@@ -1299,12 +1299,13 @@ static char *repeat_same_lines(size_t n)
 static void build_gap_fixture(size_t gap, char **base_out, char **changed_out)
 {
     char *middle = repeat_same_lines(gap);
-    char *base = malloc(strlen("c1\nc2\n") + strlen(middle) + strlen("d1\nd2\n") + 1);
-    char *changed = malloc(strlen("C1\nC2\n") + strlen(middle) + strlen("D1\nD2\n") + 1);
+    size_t n = strlen("c1\nc2\n") + strlen(middle) + strlen("d1\nd2\n") + 1;
+    char *base = malloc(n);
+    char *changed = malloc(n);
 
     CHECK(base != NULL && changed != NULL, "OOM building gap fixture");
-    sprintf(base, "c1\nc2\n%sd1\nd2\n", middle);
-    sprintf(changed, "C1\nC2\n%sD1\nD2\n", middle);
+    snprintf(base, n, "c1\nc2\n%sd1\nd2\n", middle);
+    snprintf(changed, n, "C1\nC2\n%sD1\nD2\n", middle);
     free(middle);
     *base_out = base;
     *changed_out = changed;
