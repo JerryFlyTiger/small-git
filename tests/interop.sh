@@ -8192,9 +8192,9 @@ check "phase23: and no raw ESC byte survives into that output" \
 check "phase23 oracle: precondition -- the fixture really does carry an ESC byte" \
     sh -c "ls -b '$P23_CF' | grep -q 'esc'"
 
-# --- Q2: diff headers. sg's hunk and body format differ from git's, so only
-# the header lines are compared; a whole-file cmp would be red forever and
-# would say nothing about quoting. ---
+# --- Q2: diff, whole-output byte compare. sg's patch body now tracks git's
+# closely enough (Phase 26) that the full output is worth comparing, not just
+# the header lines. ---
 P23_DIFF="$WORKDIR/p23_diff"
 (cd "$WORKDIR" && "$SG" init p23_diff) > /dev/null 2>&1
 (cd "$P23_DIFF" && git config user.email "a@b.c" && git config user.name "git user")
@@ -8214,9 +8214,9 @@ for n in os.listdir(sys.argv[1]):
     else:
         open(p, 'w').write('CHANGED\n')
 PY
-(cd "$P23_DIFF" && "$SG" diff) 2>/dev/null | grep -aE '^(diff --git|---|\+\+\+|Binary files)' | sort > "$WORKDIR/p23_d_sg.txt"
-(cd "$P23_DIFF" && git -c core.quotepath=false diff) 2>/dev/null | grep -aE '^(diff --git|---|\+\+\+|Binary files)' | sort > "$WORKDIR/p23_d_git.txt"
-check "phase23: sg diff headers match real git byte-for-byte" \
+(cd "$P23_DIFF" && "$SG" diff) 2>/dev/null > "$WORKDIR/p23_d_sg.txt"
+(cd "$P23_DIFF" && git -c core.quotepath=false diff) 2>/dev/null > "$WORKDIR/p23_d_git.txt"
+check "phase23: sg diff matches real git byte-for-byte" \
     cmp -s "$WORKDIR/p23_d_sg.txt" "$WORKDIR/p23_d_git.txt"
 # The trailing TAB after ---/+++ is git's disambiguator for a name containing
 # a space, and only for those two lines. Asserted on its own because a whole
@@ -8561,6 +8561,34 @@ for _fmt in --numstat --name-only --name-status --shortstat --stat; do
         cmp -s "$WORKDIR/p25_dt_sg.txt" "$WORKDIR/p25_dt_git.txt"
 done
 
+# --- diff: the default (patch) format, byte for byte -----------------------
+# The default format can't join the loop above -- an empty "$_fmt" argument
+# is itself a value ("sg diff --cached ''" fails with "invalid reference: "),
+# not an absent one -- so the three comparison directions are spelled out.
+(cd "$P25" && "$SG" diff --cached) 2>/dev/null > "$WORKDIR/p26_pc_sg.txt"
+(cd "$P25" && LC_ALL=C git -c core.quotepath=false diff --cached) 2>/dev/null \
+    > "$WORKDIR/p26_pc_git.txt"
+check "phase26: sg diff --cached (patch) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p26_pc_sg.txt" "$WORKDIR/p26_pc_git.txt"
+
+(cd "$P25" && "$SG" diff) 2>/dev/null > "$WORKDIR/p26_pw_sg.txt"
+(cd "$P25" && LC_ALL=C git -c core.quotepath=false diff) 2>/dev/null \
+    > "$WORKDIR/p26_pw_git.txt"
+check "phase26: sg diff (index vs worktree, patch) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p26_pw_sg.txt" "$WORKDIR/p26_pw_git.txt"
+
+(cd "$P25" && "$SG" diff HEAD) 2>/dev/null > "$WORKDIR/p26_ph_sg.txt"
+(cd "$P25" && LC_ALL=C git -c core.quotepath=false diff HEAD) 2>/dev/null \
+    > "$WORKDIR/p26_ph_git.txt"
+check "phase26: sg diff HEAD (patch) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p26_ph_sg.txt" "$WORKDIR/p26_ph_git.txt"
+
+(cd "$P25" && "$SG" diff "$P25_BASE" HEAD) 2>/dev/null > "$WORKDIR/p26_pt_sg.txt"
+(cd "$P25" && LC_ALL=C git -c core.quotepath=false diff "$P25_BASE" HEAD) 2>/dev/null \
+    > "$WORKDIR/p26_pt_git.txt"
+check "phase26: sg diff <commit> <commit> (patch) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p26_pt_sg.txt" "$WORKDIR/p26_pt_git.txt"
+
 # Preconditions for the loop above: a --stat that never met a binary file or a
 # quoted name proves much less than the count of green checks suggests.
 (cd "$P25" && LC_ALL=C git -c core.quotepath=false diff --cached --stat) 2>/dev/null \
@@ -8634,13 +8662,13 @@ printf 'r\n' > "$P25_RM/rmcached.txt"
 (cd "$P25_RM" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
 (cd "$P25_RM" && git rm -q --cached rmcached.txt)
 (cd "$P25_RM" && "$SG" diff HEAD --name-status) 2>/dev/null > "$WORKDIR/p25_rm_sg.txt"
-(cd "$P25_RM" && LC_ALL=C git diff HEAD --name-status) 2>/dev/null > "$WORKDIR/p25_rm_git.txt"
+(cd "$P25_RM" && LC_ALL=C git -c core.quotepath=false diff HEAD --name-status) 2>/dev/null > "$WORKDIR/p25_rm_git.txt"
 check "phase25: a path dropped from the index is a deletion though the file is still there" \
     cmp -s "$WORKDIR/p25_rm_sg.txt" "$WORKDIR/p25_rm_git.txt"
 check "phase25 oracle: precondition -- git really does call it a deletion here" \
     grep -q '^D	rmcached.txt$' "$WORKDIR/p25_rm_git.txt"
 (cd "$P25_RM" && "$SG" status --porcelain) 2>/dev/null > "$WORKDIR/p25_rm_st_sg.txt"
-(cd "$P25_RM" && LC_ALL=C git status --porcelain) 2>/dev/null > "$WORKDIR/p25_rm_st_git.txt"
+(cd "$P25_RM" && LC_ALL=C git -c core.quotepath=false status --porcelain) 2>/dev/null > "$WORKDIR/p25_rm_st_git.txt"
 check "phase25: and porcelain lists that one path twice, as D and as ??" \
     cmp -s "$WORKDIR/p25_rm_st_sg.txt" "$WORKDIR/p25_rm_st_git.txt"
 check "phase25 oracle: precondition -- git really does list it twice" \
@@ -8674,9 +8702,9 @@ check "phase25 oracle: precondition -- that header really is the detached one" \
 # The stash is created by sg and read back by both, so this checks two
 # things at once: that sg's stash commit still has the shape git expects,
 # and that sg's rendering of it agrees with git's byte for byte.
-# The patch body is deliberately not compared -- sg emits one hunk per file
-# by design this round -- but -p is still asserted to produce a patch, so
-# that "the flag is accepted" cannot pass by printing a diffstat.
+# The patch body (-p) is compared byte for byte too (Phase 26): sg's hunk
+# splitting and body now track git's closely enough to be a whole-output
+# oracle, not just the header lines.
 P25_SS="$WORKDIR/p25_stashshow"
 (cd "$WORKDIR" && "$SG" init p25_stashshow) > /dev/null 2>&1
 (cd "$P25_SS" && git config user.email "a@b.c" && git config user.name "git user")
@@ -8700,7 +8728,7 @@ check "phase25 oracle: precondition -- and it has the 3-parent shape -u produces
 check "phase25 oracle: precondition -- the default stash show really is a diffstat" \
     sh -c "(cd '$P25_SS' && LC_ALL=C git stash show) 2>/dev/null | grep -q 'files changed'"
 
-for _sfmt in "" "--stat" "--numstat" "--shortstat" "--name-only" "--name-status"; do
+for _sfmt in "" "-p" "--stat" "--numstat" "--shortstat" "--name-only" "--name-status"; do
     (cd "$P25_SS" && "$SG" stash show $_sfmt) 2>/dev/null > "$WORKDIR/p25_ss_sg.txt"
     (cd "$P25_SS" && LC_ALL=C git -c core.quotepath=false stash show $_sfmt) 2>/dev/null \
         > "$WORKDIR/p25_ss_git.txt"
@@ -8724,8 +8752,8 @@ check "phase25 oracle: precondition -- the untracked name really does sort in th
 check "phase25: and sg lists a path exactly once under -u, never twice" \
     sh -c "(cd '$P25_SS' && '$SG' stash show -u --name-only) 2>/dev/null | LC_ALL=C sort | uniq -d | wc -l | tr -d ' ' | grep -q '^0\$'"
 
-check "phase25: sg stash show -p produces a patch, not a diffstat" \
-    sh -c "(cd '$P25_SS' && '$SG' stash show -p) 2>/dev/null | grep -q '^diff --git'"
+check "phase26 oracle: precondition -- -p really does produce a patch, not a diffstat" \
+    sh -c "(cd '$P25_SS' && LC_ALL=C git -c core.quotepath=false stash show -p) 2>/dev/null | grep -q '^diff --git'"
 check "phase25: sg stash show rejects an unknown flag" \
     sh -c "! (cd '$P25_SS' && '$SG' stash show --bogus) > /dev/null 2>&1"
 
@@ -8798,6 +8826,143 @@ check "phase25: -uno really does drop the untracked rows" \
     sh -c "! grep -q '^??' '$WORKDIR/p25_um_no.txt'"
 check "phase25: the flagless default equals -unormal byte-for-byte" \
     sh -c "(cd '$P25_IGN' && '$SG' status --porcelain) 2>/dev/null | cmp -s - '$WORKDIR/p25_um_norm.txt'"
+
+# ==========================================================================
+# Phase 26: the patch oracle upgraded to whole-output cmp above; these
+# fixtures fill in the body dimensions no earlier check ever exercised --
+# multi-hunk splitting/merging, missing-trailing-newline combinations,
+# new/deleted files, mode-only changes, binary files, and the hunk header's
+# function-name suffix. Each is its own tiny repo so a failure names exactly
+# which dimension broke.
+# ==========================================================================
+
+# --- multi-hunk: two edits far apart split into two hunks, two edits close
+# together merge into one. Only testing one side would miss the boundary. ---
+P26_HUNKS="$WORKDIR/p26_hunks"
+(cd "$WORKDIR" && "$SG" init p26_hunks) > /dev/null 2>&1
+(cd "$P26_HUNKS" && git config user.email "a@b.c" && git config user.name "git user")
+python3 - "$P26_HUNKS" <<'PY'
+import sys
+d = sys.argv[1]
+lines = [f"line{i}\n" for i in range(1, 41)]
+open(d + '/split.txt', 'w').writelines(lines)
+open(d + '/merge.txt', 'w').writelines(lines)
+PY
+(cd "$P26_HUNKS" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+python3 - "$P26_HUNKS" <<'PY'
+import sys
+d = sys.argv[1]
+lines = [f"line{i}\n" for i in range(1, 41)]
+s = lines[:]
+s[1] = "CHANGED2\n"      # line 2
+s[19] = "CHANGED20\n"     # line 20 -- 17 unchanged lines between edits: splits
+open(d + '/split.txt', 'w').writelines(s)
+m = lines[:]
+m[1] = "CHANGED2\n"       # line 2
+m[5] = "CHANGED6\n"       # line 6 -- 3 unchanged lines between edits: merges
+open(d + '/merge.txt', 'w').writelines(m)
+PY
+(cd "$P26_HUNKS" && "$SG" diff) 2>/dev/null > "$WORKDIR/p26_hunks_sg.txt"
+(cd "$P26_HUNKS" && LC_ALL=C git -c core.quotepath=false diff) 2>/dev/null > "$WORKDIR/p26_hunks_git.txt"
+check "phase26: a far-apart pair of edits and a close pair match git byte-for-byte" \
+    cmp -s "$WORKDIR/p26_hunks_sg.txt" "$WORKDIR/p26_hunks_git.txt"
+check "phase26 oracle: precondition -- the far-apart edits really do split into two hunks" \
+    sh -c "test \$(grep -c '^@@' '$WORKDIR/p26_hunks_git.txt') = 3"
+check "phase26 oracle: precondition -- the close edits really do merge into one hunk" \
+    sh -c "(cd '$P26_HUNKS' && LC_ALL=C git diff -- merge.txt) 2>/dev/null | grep -c '^@@' | grep -q '^1\$'"
+# The split hunk's second header happens to land on a line the default
+# funcname regex recognises ("line16"), and the first does not -- covering
+# both the found and not-found cases, including that not-found leaves no
+# trailing space on the "@@ ... @@" line.
+check "phase26 oracle: precondition -- one hunk header gets a funcname suffix" \
+    grep -q '^@@ -17,7 +17,7 @@ line16$' "$WORKDIR/p26_hunks_git.txt"
+check "phase26 oracle: precondition -- and the other does not, with no trailing space" \
+    grep -q '^@@ -1,5 +1,5 @@$' "$WORKDIR/p26_hunks_git.txt"
+
+# --- missing trailing newline: old side, new side, and both -----------------
+P26_EOL="$WORKDIR/p26_eol"
+(cd "$WORKDIR" && "$SG" init p26_eol) > /dev/null 2>&1
+(cd "$P26_EOL" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'a\nb\nc' > "$P26_EOL/oldmissing.txt"
+printf 'a\nb\nc\n' > "$P26_EOL/newmissing.txt"
+printf 'a\nb\nc' > "$P26_EOL/bothmissing.txt"
+(cd "$P26_EOL" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+printf 'a\nb\nCHANGED\n' > "$P26_EOL/oldmissing.txt"
+printf 'a\nb\nCHANGED' > "$P26_EOL/newmissing.txt"
+printf 'a\nb\nCHANGED' > "$P26_EOL/bothmissing.txt"
+(cd "$P26_EOL" && "$SG" diff) 2>/dev/null > "$WORKDIR/p26_eol_sg.txt"
+(cd "$P26_EOL" && LC_ALL=C git -c core.quotepath=false diff) 2>/dev/null > "$WORKDIR/p26_eol_git.txt"
+check "phase26: old-missing/new-missing/both-missing newline all match git byte-for-byte" \
+    cmp -s "$WORKDIR/p26_eol_sg.txt" "$WORKDIR/p26_eol_git.txt"
+check "phase26 oracle: precondition -- git really does emit 'No newline' 4 times here" \
+    sh -c "test \$(grep -Fc '\ No newline at end of file' '$WORKDIR/p26_eol_git.txt') = 4"
+
+# --- new file, deleted file, chmod-only, chmod+content, binary --------------
+P26_MODE="$WORKDIR/p26_mode"
+(cd "$WORKDIR" && "$SG" init p26_mode) > /dev/null 2>&1
+(cd "$P26_MODE" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'a\nb\n' > "$P26_MODE/chmodonly.txt"
+printf 'a\nb\n' > "$P26_MODE/chmodcontent.txt"
+printf 'gone\n' > "$P26_MODE/deleted.txt"
+printf '\x00\x01binary\n' > "$P26_MODE/bin.dat"
+(cd "$P26_MODE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+chmod +x "$P26_MODE/chmodonly.txt" "$P26_MODE/chmodcontent.txt"
+printf 'a\nCHANGED\n' > "$P26_MODE/chmodcontent.txt"
+rm "$P26_MODE/deleted.txt"
+printf 'newfile content\n' > "$P26_MODE/newfile.txt"
+(cd "$P26_MODE" && "$SG" add newfile.txt) > /dev/null 2>&1
+printf '\x00\x01binaryCHANGED\n' > "$P26_MODE/bin.dat"
+(cd "$P26_MODE" && "$SG" diff) 2>/dev/null > "$WORKDIR/p26_mode_sg.txt"
+(cd "$P26_MODE" && LC_ALL=C git -c core.quotepath=false diff) 2>/dev/null > "$WORKDIR/p26_mode_git.txt"
+check "phase26: chmod-only, chmod+content, deletion, and a rewritten binary all match git" \
+    cmp -s "$WORKDIR/p26_mode_sg.txt" "$WORKDIR/p26_mode_git.txt"
+(cd "$P26_MODE" && "$SG" diff --cached) 2>/dev/null > "$WORKDIR/p26_mode_c_sg.txt"
+(cd "$P26_MODE" && LC_ALL=C git -c core.quotepath=false diff --cached) 2>/dev/null > "$WORKDIR/p26_mode_c_git.txt"
+check "phase26: a staged new file (--cached) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p26_mode_c_sg.txt" "$WORKDIR/p26_mode_c_git.txt"
+check "phase26 oracle: precondition -- chmod-only really has no index line and no hunk" \
+    sh -c "! sed -n '/^diff --git a.chmodonly/,/^diff --git a.deleted/p' '$WORKDIR/p26_mode_git.txt' | grep -qE '^index |^@@'"
+check "phase26 oracle: precondition -- and the new file really is 'new file mode' + /dev/null" \
+    sh -c "grep -A1 '^diff --git a/newfile.txt' '$WORKDIR/p26_mode_c_git.txt' | grep -q 'new file mode' && grep -q '^--- /dev/null\$' '$WORKDIR/p26_mode_c_git.txt'"
+check "phase26 oracle: precondition -- and the deletion really is 'deleted file mode' + /dev/null" \
+    sh -c "grep -A1 '^diff --git a/deleted.txt' '$WORKDIR/p26_mode_git.txt' | grep -q 'deleted file mode' && grep -q '^+++ /dev/null\$' '$WORKDIR/p26_mode_git.txt'"
+check "phase26 oracle: precondition -- git really does call bin.dat binary here" \
+    grep -q 'Binary files a/bin.dat and b/bin.dat differ' "$WORKDIR/p26_mode_git.txt"
+
+# --- a hostile tree entry name ("..") reaches sg diff and sg stash show, and
+# is refused by name rather than silently expanded to a real path. Built with
+# real git's plumbing (mktree/commit-tree), since neither sg nor git's normal
+# porcelain will construct such a tree; this is Phase 25's noted zero-coverage
+# gap for report_bad_tree_path / report_bad_stash_tree_path. ---
+P26_BAD="$WORKDIR/p26_bad"
+(cd "$WORKDIR" && "$SG" init p26_bad) > /dev/null 2>&1
+(cd "$P26_BAD" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'x\n' > "$P26_BAD/f.txt"
+(cd "$P26_BAD" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+P26_BAD_BASE=$(git -C "$P26_BAD" rev-parse HEAD)
+P26_BAD_BLOB=$(git -C "$P26_BAD" hash-object -w f.txt)
+P26_BAD_TREE=$(printf '100644 blob %s\t..\n' "$P26_BAD_BLOB" | git -C "$P26_BAD" mktree)
+P26_BAD_COMMIT=$(git -C "$P26_BAD" commit-tree "$P26_BAD_TREE" -p "$P26_BAD_BASE" -m badcommit)
+
+(cd "$P26_BAD" && "$SG" diff "$P26_BAD_BASE" "$P26_BAD_COMMIT") > "$WORKDIR/p26_bad_diff.txt" 2>&1
+check "phase26: sg diff refuses a tree containing a '..' entry" \
+    sh -c "! (cd '$P26_BAD' && '$SG' diff '$P26_BAD_BASE' '$P26_BAD_COMMIT') > /dev/null 2>&1"
+check "phase26: and names the offending path in its error message" \
+    grep -q '\.\.' "$WORKDIR/p26_bad_diff.txt"
+
+P26_BAD_IDXCOMMIT=$(git -C "$P26_BAD" commit-tree "$(git -C "$P26_BAD" rev-parse "$P26_BAD_BASE^{tree}")" \
+    -p "$P26_BAD_BASE" -m "index on stash test")
+P26_BAD_STASHCOMMIT=$(git -C "$P26_BAD" commit-tree "$P26_BAD_TREE" \
+    -p "$P26_BAD_BASE" -p "$P26_BAD_IDXCOMMIT" -m "WIP on stash test")
+printf '%s' "$P26_BAD_STASHCOMMIT" > "$P26_BAD/.git/refs/stash"
+printf '0000000000000000000000000000000000000000 %s small_git <sg@localhost> 1787403998 +0000\tWIP on stash test\n' \
+    "$P26_BAD_STASHCOMMIT" > "$P26_BAD/.git/logs/refs/stash"
+
+(cd "$P26_BAD" && "$SG" stash show) > "$WORKDIR/p26_bad_stash.txt" 2>&1
+check "phase26: sg stash show refuses a stash whose tree has a '..' entry" \
+    sh -c "! (cd '$P26_BAD' && '$SG' stash show) > /dev/null 2>&1"
+check "phase26: and names the offending path in its error message" \
+    grep -q '\.\.' "$WORKDIR/p26_bad_stash.txt"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
