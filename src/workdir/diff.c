@@ -64,13 +64,44 @@ static sg_diff_side side_blob(unsigned int mode, const unsigned char id[SG_SHA1_
     return s;
 }
 
-static sg_diff_side side_workdir(void)
+/* mode is expected already normalized to 100644/100755 by
+   workdir_entry_mode() below; id is the file's own content hash
+   (sg_hash_file_blob), reused rather than recomputed -- see sg/diff.h's
+   sg_diff_side contract for why that is already the "effective" id for a
+   WORKDIR side. */
+static sg_diff_side side_workdir(const unsigned char id[SG_SHA1_RAW_LEN], unsigned int mode)
 {
     sg_diff_side s;
 
     memset(&s, 0, sizeof(s));
     s.kind = SG_DIFF_SIDE_WORKDIR;
+    s.mode = mode;
+    if (id != NULL)
+        memcpy(s.id, id, SG_SHA1_RAW_LEN);
     return s;
+}
+
+/* Normalizes path's on-disk permission bits to a tree/index-entry mode.
+   Deliberately lstat, not stat: a following stat() would report the
+   *target's* mode for a symlink, which this codebase has no way to act on
+   correctly here (a symlink has no exec bit of its own to read, and 120000
+   is out of scope this round -- see sg/diff.h).
+
+   The exec bit is only read off a *regular* file. Anything else -- a
+   symlink, a directory, a fifo standing where a tracked file should be, or
+   a path lstat can't reach at all -- falls back to 100644. Those all carry
+   permission bits that mean something other than "git should record this
+   as executable", and a directory in particular is almost always exec for
+   reasons that have nothing to do with the blob that was supposed to be
+   there; reading its 0755 would put a mode in the patch header that no
+   content ever justified. */
+static unsigned int workdir_entry_mode(const char *abspath)
+{
+    struct stat lst;
+
+    if (lstat(abspath, &lst) != 0 || !S_ISREG(lst.st_mode))
+        return 0100644;
+    return (lst.st_mode & S_IXUSR) ? 0100755 : 0100644;
 }
 
 /* Appends the fixed "unresolved conflict" row: both sides ABSENT, unmerged
@@ -87,9 +118,11 @@ static int list_append_unmerged(sg_diff_list *list, const char *path)
     return rc;
 }
 
-/* Two BLOB sides differ if their ids differ, or if both modes are known and
+/* Two sides differ if their ids differ, or if both modes are known and
    differ -- an unknown (0) mode on either side skips the mode comparison, per
-   sg/diff.h's sg_diff_side contract. */
+   sg/diff.h's sg_diff_side contract. Despite the name, this is also used to
+   compare a BLOB side against a WORKDIR side (both now carry a real mode as
+   of Phase 26) -- id/mode are read the same way off either kind. */
 static int blob_sides_differ(const sg_diff_side *a, const sg_diff_side *b)
 {
     if (memcmp(a->id, b->id, SG_SHA1_RAW_LEN) != 0)
@@ -321,6 +354,7 @@ static int append_index_entry_vs_workdir(const char *git_dir, const char *repo_r
     unsigned char wd_sha1[SG_SHA1_RAW_LEN];
     unsigned char effective_sha1[SG_SHA1_RAW_LEN];
     struct stat st;
+    unsigned int wd_mode;
     sg_diff_side os = side_blob(entry->mode, entry->sha1);
 
     /* A truncated path must not be silently skipped: sg/diff.h and
@@ -335,6 +369,17 @@ static int append_index_entry_vs_workdir(const char *git_dir, const char *repo_r
         return list_append(out, entry->path, &os, &ns);
     }
 
+    wd_mode = workdir_entry_mode(abspath);
+
+    /* Existing-but-unreadable (permission denied, race with a delete, ...)
+       is treated the same as "not there at all" -- ABSENT, not a WORKDIR
+       side with a placeholder zero id. Same convention as
+       sg_status_diff_unstaged (src/workdir/status.c), which reports this
+       exact failure as SG_STATUS_DELETED. A placeholder zero id would
+       instead print as a real BLOB/WORKDIR pair whose "new" id happens to be
+       all-zero -- indistinguishable, at render time, from git's genuine
+       0000000 (which only ever appears on an add/delete row, never with a
+       mode suffix) -- see sg/diff.h's sg_diff_side contract. */
     if (sg_hash_file_blob(abspath, wd_sha1) != 0) {
         sg_diff_side ns = side_absent();
 
@@ -350,19 +395,33 @@ static int append_index_entry_vs_workdir(const char *git_dir, const char *repo_r
        so it reports the path as changed instead and leaves the complaining
        to the renderer, which re-reads the same blob through
        sg_diff_side_read and, holding the path, can name it in an
-       actionable message (see sg/diff.h's sg_diff_index_workdir contract).
-       Failing here instead would silence every OTHER path in the same
-       diff too, which is worse than dropping just this one. */
+       actionable message (see sg/diff.h's sg_diff_index_workdir contract). */
     if (sg_chunk_effective_id(git_dir, entry->sha1, effective_sha1) != 0) {
-        sg_diff_side ns = side_workdir();
+        sg_diff_side ns = side_workdir(wd_sha1, wd_mode);
 
         return list_append(out, entry->path, &os, &ns);
     }
 
-    if (memcmp(wd_sha1, effective_sha1, SG_SHA1_RAW_LEN) != 0) {
-        sg_diff_side ns = side_workdir();
+    /* Compared against effective_sha1 (content-normalized), never entry->sha1
+       directly -- os itself still carries the raw/pointer id for
+       sg_diff_side_read's sake, so the comparison uses a throwaway side
+       built with the effective id instead of mutating os. Mode is compared
+       here too (Phase 26): a bare chmod with unchanged content used to be
+       invisible to this builder, since WORKDIR sides carried no mode at all.
+       This is what makes `sg diff` start reporting mode-only changes -- NOT
+       `sg status`, which walks a completely separate implementation
+       (sg_status_diff_unstaged in src/workdir/status.c) that never goes
+       through sg/diff.h's builders at all and does not compare .mode. That
+       second implementation's own mode-only blind spot is unchanged by this
+       file (measured: `sg diff` correctly shows old/new mode lines after a
+       bare chmod, `sg status --porcelain` still prints nothing for the same
+       change) -- see sg/diff.h's sg_diff_side contract and blob_sides_differ. */
+    {
+        sg_diff_side os_effective = side_blob(entry->mode, effective_sha1);
+        sg_diff_side ns = side_workdir(wd_sha1, wd_mode);
 
-        return list_append(out, entry->path, &os, &ns);
+        if (blob_sides_differ(&os_effective, &ns))
+            return list_append(out, entry->path, &os, &ns);
     }
     return 0;
 }
@@ -474,8 +533,13 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
             } else {
                 unsigned char wd_sha1[SG_SHA1_RAW_LEN];
                 unsigned char effective_sha1[SG_SHA1_RAW_LEN];
+                unsigned int wd_mode = workdir_entry_mode(abspath);
 
                 if (sg_hash_file_blob(abspath, wd_sha1) != 0) {
+                    /* Same convention as append_index_entry_vs_workdir above
+                       and sg_status_diff_unstaged: existing-but-unreadable is
+                       ABSENT, not a WORKDIR side with a placeholder zero
+                       id -- see sg/diff.h's sg_diff_side contract. */
                     sg_diff_side ns = side_absent();
 
                     if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
@@ -491,18 +555,26 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                        diff goes silent along with it. Report the path as
                        changed and let the renderer's own sg_diff_side_read
                        hit the same failure with the path in hand. */
-                    sg_diff_side ns = side_workdir();
+                    sg_diff_side ns = side_workdir(wd_sha1, wd_mode);
 
                     if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
                         rc = -1;
                         goto done;
                     }
-                } else if (memcmp(wd_sha1, effective_sha1, SG_SHA1_RAW_LEN) != 0) {
-                    sg_diff_side ns = side_workdir();
+                } else {
+                    /* Compared against effective_sha1, not old_flat's raw
+                       sha1 -- os itself keeps the raw/pointer id for
+                       sg_diff_side_read. Mode is compared too (Phase 26): see
+                       append_index_entry_vs_workdir's matching comment. */
+                    sg_diff_side os_effective =
+                        side_blob(old_flat.entries[oi].mode, effective_sha1);
+                    sg_diff_side ns = side_workdir(wd_sha1, wd_mode);
 
-                    if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
-                        rc = -1;
-                        goto done;
+                    if (blob_sides_differ(&os_effective, &ns)) {
+                        if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
+                            rc = -1;
+                            goto done;
+                        }
                     }
                 }
             }
@@ -523,9 +595,26 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
             oi++;
         } else {
             /* In the index (at any stage), not in the tree: an addition,
-               sourced from the working tree if the file is actually there;
-               if it was deleted from disk after being staged, both sides
-               are absent and nothing is reported. */
+               sourced from the working tree if the file is actually there.
+               Deleted from disk after being staged (stat fails) means both
+               sides are absent and nothing is reported.
+
+               Existing-but-unreadable is NOT folded into that case. The row
+               is appended with a WORKDIR side carrying the lstat mode and a
+               placeholder zero id, precisely so the renderer tries the read
+               itself, fails, and names the file in an actionable message --
+               dropping the row instead loses the only report the user would
+               ever get, which is the failure mode sg/diff.h's builder
+               contract exists to prevent. The header this produces is
+               "new file mode <mode>" + "index 0000000..0000000": the mode
+               suffix is suppressed because a mode line was written, so the
+               all-zero new id is the one part git would never write. That
+               is a deliberate trade -- a slightly wrong id on a row that is
+               immediately followed by a warning, over a silently missing
+               file. Real git does neither: it aborts the whole command
+               (fatal: cannot hash <path>, exit 128). sg does not, on
+               purpose; one unreadable path must not blind the user to every
+               other path in the diff. */
             char abspath[SG_PATH_MAX];
             struct stat st;
             sg_diff_side os = side_absent();
@@ -535,7 +624,12 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                 goto done;
             }
             if (stat(abspath, &st) == 0) {
-                sg_diff_side ns = side_workdir();
+                unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+                unsigned int wd_mode = workdir_entry_mode(abspath);
+
+                sg_diff_side ns = sg_hash_file_blob(abspath, wd_sha1) == 0
+                                      ? side_workdir(wd_sha1, wd_mode)
+                                      : side_workdir(NULL, wd_mode);
 
                 if (list_append(out, idx_path, &os, &ns) != 0) {
                     rc = -1;

@@ -73,48 +73,41 @@ static int is_binary_data(const unsigned char *data, size_t len)
     return data != NULL && memchr(data, '\0', len) != NULL;
 }
 
-/* Counts added/deleted *lines* between the two sides with the same O(n*m)
-   LCS classification cmd_diff.c's patch printer uses, but without printing
-   anything -- --stat/--numstat only need the totals. On allocation failure
-   the counts are left at 0, matching this file's general "best effort, never
-   crash" policy for the stat machinery (a wrong stat count is far less bad
-   than aborting the whole diff). */
+/* Counts added/deleted *lines* between the two sides by summing an
+   sg_diff_script's groups -- --stat/--numstat only need the totals, not the
+   alignment choice, so this deliberately skips group compaction and the
+   indent heuristic (indent_heuristic=0): the total count of added/deleted
+   lines is identical no matter which reachable position a pure group is
+   slid to, so paying for the extra work here would only ever change
+   nothing. On allocation failure the counts are left at 0, matching this
+   file's general "best effort, never crash" policy for the stat machinery
+   (a wrong stat count is far less bad than aborting the whole diff). */
 static void count_lines(const unsigned char *a_data, size_t a_len, const unsigned char *b_data,
                         size_t b_len, long *added, long *deleted)
 {
     size_t na, nb;
     sg_diff_line *a = sg_diff_split_lines(a_data, a_len, &na);
     sg_diff_line *b = sg_diff_split_lines(b_data, b_len, &nb);
-    size_t **dp;
-    size_t i, j;
+    sg_diff_script *script;
+    size_t k;
     long add = 0, del = 0;
 
     *added = 0;
     *deleted = 0;
 
-    dp = sg_diff_lcs_table(a, na, b, nb);
-    if (dp == NULL) {
+    script = sg_diff_build_script(a, na, b, nb, 0);
+    if (script == NULL) {
         free(a);
         free(b);
         return;
     }
 
-    i = 0;
-    j = 0;
-    while (i < na || j < nb) {
-        if (i < na && j < nb && sg_diff_lines_equal(a[i], b[j])) {
-            i++;
-            j++;
-        } else if (i < na && (j >= nb || dp[i + 1][j] >= dp[i][j + 1])) {
-            del++;
-            i++;
-        } else {
-            add++;
-            j++;
-        }
+    for (k = 0; k < script->count; k++) {
+        add += (long)script->groups[k].b_len;
+        del += (long)script->groups[k].a_len;
     }
 
-    sg_diff_lcs_free_table(dp, na);
+    sg_diff_script_free(script);
     free(a);
     free(b);
     *added = add;
@@ -361,12 +354,19 @@ static int get_columns(void)
 
 typedef struct {
     int unmerged;
-    /* 0 iff both sides are BLOB with the identical id -- a pure mode change.
-       Whenever this is 1, the two sides' bytes are genuinely different (the
-       diff.h builders never emit a row unless the sides differ), so a text
-       row reaching the line-count step always yields added>0 or deleted>0;
-       there is no ambiguity between "pure mode change" and "content change
-       that happens to touch 0 lines" for the callers below. */
+    /* 0 iff both sides are BLOB with the identical id -- the ONLY case this
+       flag can identify as a pure mode change without actually reading both
+       sides' bytes. It is NOT true in general that content_changed==1 means
+       the bytes differ: a tree/index BLOB vs a WORKDIR side (Phase 26) can
+       be a bare chmod with byte-identical content, and since a WORKDIR side
+       is never BLOB, the check below unconditionally sets content_changed=1
+       for it -- the callers below still read both sides' bytes in that case
+       and correctly get added==0, deleted==0 from the line-count step
+       (measured against git 2.55.0: --stat prints "| 0", --numstat prints
+       "0\t0", --shortstat's clauses both read 0). So a text row reaching the
+       line-count step with content_changed==1 does NOT always yield
+       added>0||deleted>0 -- a mode-only WORKDIR row is the one case where it
+       legitimately doesn't. */
     int content_changed;
     int is_binary;
     long added, deleted;
@@ -438,43 +438,210 @@ static int build_entry_stat(const char *git_dir, const char *repo_root, const sg
 
 /* ---- PATCH format ----------------------------------------------------- */
 
-static int print_text_diff_body(const char *path, const unsigned char *a_data, size_t a_len,
+/* index/mode-line plumbing shares this: git's "index <old>..<new>" line and
+   an entry's "old/new mode" lines want the id/mode an ordinary tree/index
+   entry would carry, resolved off whichever kind of side actually produced
+   it. See sg/diff.h's sg_diff_side contract for why BLOB and WORKDIR need
+   different treatment here.
+
+   Always fills *out with SOMETHING displayable, falling back to the side's
+   raw id when resolution fails, but returns 0 only when that id is actually
+   verified -- -1 means "could not verify" (a broken/missing chunk pointer).
+   That distinction matters to the caller beyond cosmetics: two "unverified"
+   ids that happen to come out byte-equal are NOT proof the content matches,
+   and print_patch must not treat them as a mode-only row on that basis --
+   doing so would silently skip the sg_diff_side_read call that is the only
+   place this failure gets reported to the user (measured: the
+   append_index_entry_vs_workdir builder deliberately force-appends a row
+   whenever chunk resolution fails, precisely so the renderer gets a chance
+   to hit and report the same failure with the path in hand). */
+static int side_effective_id(const char *git_dir, const sg_diff_side *side,
+                             unsigned char out[SG_SHA1_RAW_LEN])
+{
+    if (side->kind == SG_DIFF_SIDE_BLOB) {
+        if (sg_chunk_effective_id(git_dir, side->id, out) == 0)
+            return 0;
+        memcpy(out, side->id, SG_SHA1_RAW_LEN);
+        return -1;
+    }
+    if (side->kind == SG_DIFF_SIDE_WORKDIR) {
+        memcpy(out, side->id, SG_SHA1_RAW_LEN);
+        return 0;
+    }
+    /* ABSENT: git's "0000000" -- the hex of an all-zero id happens to start
+       with 7 zeros, so no special-casing is needed at the print site. */
+    memset(out, 0, SG_SHA1_RAW_LEN);
+    return 0;
+}
+
+/* Unified-diff context width and the merge-adjacent-hunks threshold --
+   both measured against real git 2.55.0 (CLAUDE.md's Phase 26 note: 5/6
+   equal lines between two changes merge into one hunk, 7/8/9 stay split). */
+#define SG_DIFF_CONTEXT 3
+#define SG_DIFF_MERGE_GAP (2 * SG_DIFF_CONTEXT)
+
+/* Prints "\ No newline at end of file" right after the line just printed,
+   if that line is genuinely the file's last line and lacked a trailing
+   newline -- otherwise a no-op. `idx` is the index just printed, `n` the
+   line count of the array it came from. */
+static void maybe_print_no_newline(const sg_diff_line *arr, size_t idx, size_t n)
+{
+    if (idx + 1 == n && !arr[idx].has_nl)
+        printf("\\ No newline at end of file\n");
+}
+
+/* Function-name hunk suffix: scans backward from a[0..before) for the
+   nearest line whose first byte is alnum/'_'/'$' (measured against git
+   2.55.0 -- see CLAUDE.md's Phase 26 note for the exact character-class
+   boundary). Returns that line, or a zero-length line (ptr non-NULL only
+   for a non-empty search space) if none is found -- callers check len==0
+   to know whether to print the trailing " <name>" at all. */
+static sg_diff_line find_function_name(const sg_diff_line *a, size_t before)
+{
+    sg_diff_line none;
+    size_t k;
+
+    none.ptr = "";
+    none.len = 0;
+    none.has_nl = 1;
+
+    for (k = before; k-- > 0;) {
+        if (a[k].len > 0) {
+            char c = a[k].ptr[0];
+
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '$')
+                return a[k];
+        }
+    }
+    return none;
+}
+
+/* "-s,c" / "+s,c" half of an @@ line, with git's two omission rules
+   (CLAUDE.md's Phase 26 note, both measured against 2.55.0): c == 1 omits
+   ",c" entirely; c == 0 prints s as 0 regardless of where it would
+   otherwise land. */
+static void print_hunk_range(char sign, size_t start, size_t count)
+{
+    size_t disp_start = (count == 0) ? 0 : start + 1;
+
+    if (count == 1)
+        printf("%c%zu", sign, disp_start);
+    else
+        printf("%c%zu,%zu", sign, disp_start, count);
+}
+
+static int print_text_diff_body(const char *path, int old_present, int new_present,
+                                const unsigned char *a_data, size_t a_len,
                                 const unsigned char *b_data, size_t b_len)
 {
     size_t na, nb;
     sg_diff_line *a = sg_diff_split_lines(a_data, a_len, &na);
     sg_diff_line *b = sg_diff_split_lines(b_data, b_len, &nb);
-    size_t **dp;
-    size_t i, j;
+    sg_diff_script *script;
+    size_t hi; /* index of the first group of the NEXT hunk, i.e. loop cursor */
 
-    dp = sg_diff_lcs_table(a, na, b, nb);
-    if (dp == NULL) {
+    script = sg_diff_build_script(a, na, b, nb, 1 /* diff.indentHeuristic, on by default */);
+    if (script == NULL) {
         free(a);
         free(b);
         return -1;
     }
 
-    printf("--- %s%s\n", sg_quote_path_prefixed("a/", path), diff_name_terminator(path));
-    printf("+++ %s%s\n", sg_quote_path_prefixed("b/", path), diff_name_terminator(path));
-    printf("@@ -1,%zu +1,%zu @@\n", na, nb);
+    /* /dev/null for the side that doesn't exist -- measured against git
+       2.55.0: no a/ or b/ prefix, no quoting, no TAB terminator even when the
+       path has a space. */
+    if (old_present)
+        printf("--- %s%s\n", sg_quote_path_prefixed("a/", path), diff_name_terminator(path));
+    else
+        printf("--- /dev/null\n");
+    if (new_present)
+        printf("+++ %s%s\n", sg_quote_path_prefixed("b/", path), diff_name_terminator(path));
+    else
+        printf("+++ /dev/null\n");
 
-    i = 0;
-    j = 0;
-    while (i < na || j < nb) {
-        if (i < na && j < nb && sg_diff_lines_equal(a[i], b[j])) {
-            printf(" %.*s\n", (int)a[i].len, a[i].ptr);
-            i++;
-            j++;
-        } else if (i < na && (j >= nb || dp[i + 1][j] >= dp[i][j + 1])) {
-            printf("-%.*s\n", (int)a[i].len, a[i].ptr);
-            i++;
-        } else {
-            printf("+%.*s\n", (int)b[j].len, b[j].ptr);
-            j++;
+    hi = 0;
+    while (hi < script->count) {
+        size_t lo = hi;
+        size_t prev_a_end = (lo == 0) ? 0 : script->groups[lo - 1].a_off + script->groups[lo - 1].a_len;
+        size_t a_ctx_before, b_ctx_before, a_start, b_start;
+        size_t next_a_start, a_ctx_after, a_end, b_end;
+        sg_diff_line func;
+        size_t pos_a, pos_b;
+        size_t gi;
+
+        /* Grow the hunk while the gap to the next group is small enough
+           to merge (SG_DIFF_MERGE_GAP, i.e. <= 6 equal lines between). */
+        while (hi + 1 < script->count) {
+            size_t gap = script->groups[hi + 1].a_off - (script->groups[hi].a_off + script->groups[hi].a_len);
+
+            if (gap > SG_DIFF_MERGE_GAP)
+                break;
+            hi++;
         }
+
+        {
+            size_t avail_before = script->groups[lo].a_off - prev_a_end;
+
+            a_ctx_before = avail_before < SG_DIFF_CONTEXT ? avail_before : SG_DIFF_CONTEXT;
+        }
+        b_ctx_before = a_ctx_before; /* context lines are identical/equal-length on both sides */
+        a_start = script->groups[lo].a_off - a_ctx_before;
+        b_start = script->groups[lo].b_off - b_ctx_before;
+
+        next_a_start = (hi + 1 == script->count) ? na : script->groups[hi + 1].a_off;
+        {
+            size_t last_a_end = script->groups[hi].a_off + script->groups[hi].a_len;
+            size_t avail_after = next_a_start - last_a_end;
+
+            a_ctx_after = avail_after < SG_DIFF_CONTEXT ? avail_after : SG_DIFF_CONTEXT;
+            a_end = last_a_end + a_ctx_after;
+            b_end = script->groups[hi].b_off + script->groups[hi].b_len + a_ctx_after;
+        }
+
+        func = find_function_name(a, a_start);
+
+        printf("@@ ");
+        print_hunk_range('-', a_start, a_end - a_start);
+        printf(" ");
+        print_hunk_range('+', b_start, b_end - b_start);
+        printf(" @@");
+        if (func.len > 0)
+            printf(" %.*s", (int)func.len, func.ptr);
+        printf("\n");
+
+        pos_a = a_start;
+        pos_b = b_start;
+        for (gi = lo; gi <= hi; gi++) {
+            const sg_diff_group *g = &script->groups[gi];
+
+            while (pos_a < g->a_off) {
+                printf(" %.*s\n", (int)a[pos_a].len, a[pos_a].ptr);
+                maybe_print_no_newline(a, pos_a, na);
+                pos_a++;
+                pos_b++;
+            }
+            while (pos_a < g->a_off + g->a_len) {
+                printf("-%.*s\n", (int)a[pos_a].len, a[pos_a].ptr);
+                maybe_print_no_newline(a, pos_a, na);
+                pos_a++;
+            }
+            while (pos_b < g->b_off + g->b_len) {
+                printf("+%.*s\n", (int)b[pos_b].len, b[pos_b].ptr);
+                maybe_print_no_newline(b, pos_b, nb);
+                pos_b++;
+            }
+        }
+        while (pos_a < a_end) {
+            printf(" %.*s\n", (int)a[pos_a].len, a[pos_a].ptr);
+            maybe_print_no_newline(a, pos_a, na);
+            pos_a++;
+            pos_b++;
+        }
+
+        hi++;
     }
 
-    sg_diff_lcs_free_table(dp, na);
+    sg_diff_script_free(script);
     free(a);
     free(b);
     return 0;
@@ -491,7 +658,10 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
         size_t a_len = 0, b_len = 0;
         sg_chunk_missing_info missing;
         int rc;
-        int mode_changed;
+        int old_present, new_present;
+        unsigned char old_eff[SG_SHA1_RAW_LEN], new_eff[SG_SHA1_RAW_LEN];
+        char old_hex[SG_SHA1_HEX_LEN + 1], new_hex[SG_SHA1_HEX_LEN + 1];
+        int wrote_mode_line;
         int content_changed;
 
         /* Deliberate divergence from real git, which prints a "diff --cc"
@@ -502,22 +672,67 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
         if (e->unmerged)
             continue;
 
-        mode_changed = e->old_side.kind == SG_DIFF_SIDE_BLOB && e->new_side.kind == SG_DIFF_SIDE_BLOB &&
-                       e->old_side.mode != 0 && e->new_side.mode != 0 &&
-                       e->old_side.mode != e->new_side.mode;
-        content_changed = !(e->old_side.kind == SG_DIFF_SIDE_BLOB && e->new_side.kind == SG_DIFF_SIDE_BLOB &&
-                            memcmp(e->old_side.id, e->new_side.id, SG_SHA1_RAW_LEN) == 0);
+        old_present = e->old_side.kind != SG_DIFF_SIDE_ABSENT;
+        new_present = e->new_side.kind != SG_DIFF_SIDE_ABSENT;
+
+        {
+            int old_verified = side_effective_id(git_dir, &e->old_side, old_eff) == 0;
+            int new_verified = side_effective_id(git_dir, &e->new_side, new_eff) == 0;
+
+            /* An add or a delete always counts as "content changed" even
+               though one side's id is the all-zero ABSENT id and can never
+               legitimately equal the other -- spelled out anyway rather than
+               relying on that, since a diff.h builder is free to emit a row
+               whenever mode OR content changed and every entry here is
+               guaranteed to differ in at least one of the two. An
+               unverified id on either side also forces this true: see
+               side_effective_id's contract for why treating a coincidental
+               byte-match as proof of "unchanged" here would swallow a read
+               error the code below is about to hit and report. */
+            content_changed = !old_present || !new_present || !old_verified || !new_verified ||
+                              memcmp(old_eff, new_eff, SG_SHA1_RAW_LEN) != 0;
+        }
 
         printf("diff --git %s %s\n", sg_quote_path_prefixed("a/", e->path),
               sg_quote_path_prefixed("b/", e->path));
 
-        if (mode_changed) {
+        wrote_mode_line = 0;
+        if (!old_present && new_present) {
+            printf("new file mode %06o\n", e->new_side.mode);
+            wrote_mode_line = 1;
+        } else if (old_present && !new_present) {
+            printf("deleted file mode %06o\n", e->old_side.mode);
+            wrote_mode_line = 1;
+        } else if (old_present && new_present && e->old_side.mode != 0 && e->new_side.mode != 0 &&
+                  e->old_side.mode != e->new_side.mode) {
             printf("old mode %06o\n", e->old_side.mode);
             printf("new mode %06o\n", e->new_side.mode);
+            wrote_mode_line = 1;
         }
 
+        /* A pure mode change (content unchanged) prints NO index line at all
+           -- measured against git 2.55.0 (oracle rule 3 in sg/diff.h's Phase
+           26 note): "diff --git" + "old mode"/"new mode" is the entire
+           entry, nothing else. Every other case (add/delete/modify/binary)
+           always has content_changed true, since a diff.h builder never
+           emits a row unless mode or content differs and add/delete are
+           unconditionally "content changed" above. */
         if (!content_changed)
             continue;
+
+        /* "index <old7>..<new7>[ <mode>]" -- the mode suffix appears only
+           when no mode line was printed above (measured against git 2.55.0,
+           see sg/diff.h's Phase 26 note): new-file/deleted-file/old+new-mode
+           already said the mode, so the suffix would be redundant there. */
+        sg_sha1_to_hex(old_eff, old_hex);
+        sg_sha1_to_hex(new_eff, new_hex);
+        old_hex[7] = '\0';
+        new_hex[7] = '\0';
+        if (wrote_mode_line)
+            printf("index %s..%s\n", old_hex, new_hex);
+        else
+            printf("index %s..%s %06o\n", old_hex, new_hex,
+                  new_present ? e->new_side.mode : e->old_side.mode);
 
         rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->old_side, &a_data, &a_len, &missing);
         if (rc == -2) {
@@ -545,14 +760,16 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
         }
 
         if (is_binary_data(a_data, a_len) || is_binary_data(b_data, b_len)) {
-            printf("Binary files %s and %s differ\n", sg_quote_path_prefixed("a/", e->path),
-                  sg_quote_path_prefixed("b/", e->path));
+            printf("Binary files %s and %s differ\n",
+                  old_present ? sg_quote_path_prefixed("a/", e->path) : "/dev/null",
+                  new_present ? sg_quote_path_prefixed("b/", e->path) : "/dev/null");
             free(a_data);
             free(b_data);
             continue;
         }
 
-        if (print_text_diff_body(e->path, a_data, a_len, b_data, b_len) != 0) {
+        if (print_text_diff_body(e->path, old_present, new_present, a_data, a_len, b_data, b_len) !=
+           0) {
             fprintf(stderr, "sg: warning: out of memory diffing %s\n", sg_quote_path_delimited(e->path));
             had_error = 1;
         }

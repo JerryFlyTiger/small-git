@@ -2616,3 +2616,122 @@ vs `untracked_tree`(`--only-untracked` 本來就是這樣做的)。
 - **index 同時有 stage 0 與 stage 1/2/3 時**,殘留的衝突條目被靜默略過。sg 自己的寫入
   路徑產生不出那個狀態(`cmd_add.c` 寫 stage 0 前必先 `sg_index_remove_all_stages`),
   失敗方向是「安全但不完整」,已在 `index_group_end` 上方註明。
+
+## Phase 26:patch 的位元組保真
+
+Phase 25 把 diff 拆成「找變更」與「印出來」兩層,但 patch body 刻意沒追真 git:
+整檔單一 hunk、沒有 `index` 行、沒有多 hunk 切分。代價是 `tests/interop.sh` 對 patch
+只能 grep header 行再比對——**六種輸出格式裡最主要的那一種,body 完全沒有 oracle**。
+
+這一輪把 patch 補到與真 git 逐位元組相同,並把 interop 升級成全輸出 `cmp`。
+
+### 實測到的 oracle(真 git 2.55.0,`core.fileMode=true`)
+
+| 情況 | 輸出 |
+|---|---|
+| 純內容修改 | `index <old7>..<new7> <mode>` |
+| 新增 | `new file mode 100644` + `index 0000000..<new7>` + `--- /dev/null` |
+| 刪除 | `deleted file mode 100644` + `index <old7>..0000000` + `+++ /dev/null` |
+| 純 chmod | 只有 `old mode`/`new mode` —— **沒有 index 行、沒有 `---`/`+++`、沒有 hunk** |
+| chmod + 內容 | `old mode`/`new mode` + `index <old7>..<new7>`(**無** mode 後綴) |
+| 二進位 | (mode 行,若有)+ `index <old7>..<new7>[ <mode>]` + `Binary files a/f and b/f differ` |
+
+- **index 行的 mode 後綴,只在這個 entry 沒印過任何 mode 行時才出現。** 這是單一規則,
+  不是四種情況各判一次;實作上由 `wrote_mode_line` 一個布林決定,不要在兩處各算一遍。
+- 縮寫固定 **7 hex**(實測 loose object 數 10/100/500/1000/2000/4000 都還是 7,
+  本專案不讀 `~/.gitconfig`,不做動態 abbrev)。
+- 不存在的一側是 `0000000`;**空檔是 `e69de29`**。「存在但空」與「不存在」是兩回事。
+- **純 chmod 在機器格式裡是會列出來的**:`--stat` 印 ` f | 0`、`--numstat` 印 `0\t0\tf`、
+  `--shortstat` 印 ` 1 file changed, 0 insertions(+), 0 deletions(-)`、`--name-status` 印 `M`。
+
+hunk 的部分:
+
+- `@@ -s,c +s,c @@`,**`c == 1` 省略 `,c`**,**`c == 0` 時 `s` 寫 0**(`@@ -1,16 +0,0 @@`)。
+- context = 3,兩處變更間隔 **≤6 合併、≥7 切開**(實測 5/6 合併、7/8/9 切開)。
+- 函式名後綴:往回找第一個開頭屬於 `[A-Za-z_$]` 的行,整行原樣接在 `@@ ` 之後。
+  **不算**的開頭實測有:數字、`#`、`/`、`}`、`.`、`@`、空白、tab。
+  找不到時**行尾沒有多餘空格**(用 `od -c` 確認的,不要憑看起來判斷)。
+- `\ No newline at end of file` 緊接在缺換行的那一行之後,**不計入 range**。
+  「文字相同但換行狀態不同」算**不同的行**,所以行相等判斷要看 `has_nl`——但
+  `sg_diff_lines_equal` 被 `workdir/merge.c` 共用,不能改它的語意,因此另開了一支嚴格版。
+
+### 資料層先前根本印不出 `index` 行
+
+這一輪最容易被低估的地方:`index` 行不是渲染層的問題。`sg_diff_side` 的 WORKDIR 側
+**`mode` 恆 0、`id` 從不填**,而 `sg diff` 不帶參數(最常用的那條)兩側都經過它。
+諷刺的是 `sg_hash_file_blob` 其實**已經算過**那個雜湊,比完就丟。
+
+補上 id 與 mode 之後,`sg diff` 第一次看得到純 chmod。**但 `sg status` 仍然看不到**——
+它走 `src/workdir/status.c` 的 `sg_status_diff_unstaged`,是**另一份實作**,不經過
+`sg/diff.h` 的任何建構器、也完全不比較 `.mode`。這是本輪新發現的重複,分歧仍然開著。
+
+### 對齊:壓縮與縮排啟發式
+
+`diff.indentHeuristic` **預設開啟**,而且真的會改變 hunk 位置(同一輸入,開/關差出
+`@@ -3,6 +3,10 @@` vs `@@ -4,5 +4,9 @@`)。這一層與真 git 的 `xdiff/xdiffi.c`
+**逐條核對過**,不是憑記憶:14 個評分常數、`measure_split`、`get_indent` 的空白處理、
+以及 `xdl_change_compact` 驅動迴圈的三件事——`else if` 鏈的優先權
+(`end_matching_other` **壓過**啟發式)、三個滑動下界(`earliest_end`、
+`g.end - groupsize - 1`、`g.end - MAX_SLIDING`)、以及 `<=0` 讓最下方的位置贏平手。
+
+git 不把刪除側與新增側綁在一起:兩者分別住在各自檔案的 `changed` bitmap 裡、
+**各自獨立滑動**,再由 `end_matching_other` 決定要不要保持對齊。sg 原本綁成一對,
+於是同時含刪除與新增的群組**完全不能滑動**——那是殘留歧異的主要來源。
+
+### 殘留的 2–3%,以及它**不是**什麼
+
+fuzzer 實測(見下)剩約 2–3% 的位置歧異。**成因不在壓縮層**,那一層已經逐條對過原始碼。
+它在**底層對齊演算法**:sg 用 LCS 動態規劃回溯,git 預設用 Myers,兩者都最小但配對不同,
+而壓縮只正規化位置、不正規化配對。
+
+證據:把 11 個殘留案例拿去跟 git 的其他演算法比,**6 個與 `git diff --histogram`
+逐位元組相同**(其中 3 個也等於 `--patience`),5 個不對應任何一種。
+
+⚠ **下一個人不要去找一個不存在的評分 bug。** 要吃掉這 2–3% 得實作 Myers 特有的切分選擇,
+那是換演算法,不是調參。
+
+### 驗證儀器:`tests/fuzz_diff.py`
+
+其他五種 diff 格式都由「哪些路徑變了」完全決定,手寫 fixture 就釘得死。**patch body 不是**:
+當同一個最小編輯腳本可以寫在好幾個位置時,git 會挑一個,而「挑哪一個」出自壓縮與啟發式。
+fixture 只能釘住有人想得到的對齊,而**想不到的那些正是實作會漂走的地方**。
+
+所以生成器刻意偏向歧異:重複區塊、不同縮排、複製既有文字的插入。它拿真 git 當 oracle
+做逐位元組比對。收斂曲線(seeds 0-199):
+
+| 階段 | mismatch |
+|---|---|
+| 只做壓縮 | 40 |
+| 加縮排啟發式 | 33 |
+| 修 `score_cmp` 結構(effective_indent 主導) | 27 |
+| 改成先合併再評分 | 16 |
+| 兩側各自獨立滑動 | 4 |
+
+三個不相交的 seed 區間比率一致(2.0% / 3.0% / 2.3%),不是對 seed 0-199 過擬合。
+
+⚠ **`--max-failures 0` 是刻意加的**:預設停在前 3 個 mismatch(那是除錯模式),
+而收斂需要的是**比率**——「停在 3」不是比率,每次跑都回報同一個數字,看起來像進度停滯。
+
+### 兩個踩過的坑
+
+**一個為了讓測試變綠而調的參數,即使測試真的變綠了,也可能什麼都沒修好。**
+`RELATIVE_INDENT_PENALTY` 曾被從 `-4` 翻成 `+4`,理由是「這樣 A2 錨點就過了」。
+真 git 的原始碼裡它是 `-4`(是**獎勵**不是懲罰)。那個 `+4` 是在補償另一個 bug
+(群組不能各自滑動);等真正的 bug 修好,常數改回 `-4`,錨點照樣過。
+
+**拿 diff 去比對兩份 diff,會把「整體位移」呈現成「內容不同」。**
+一度據此判斷 sg 與 git 配出了不同的編輯腳本、需要改寫演算法。實際去比對兩邊
+`+`/`-` 行的**多重集合**之後:當時 33 個殘留**全部**是位移,不同腳本 **0 個**。
+要分辨這兩者就比多重集合,不要看 diff-of-diffs——渲染層本身就會製造那個假象。
+
+### 已知限制
+
+- 衝突路徑的 `diff --cc` 合併格式仍然直接跳過(`print_patch` 開頭 `continue`),未實作。
+- `sg diff` 仍不支援 pathspec(`sg diff -- <path>` 直接印 usage)。
+- rename 偵測沒做,`sg_diff_side` 的三態也還容不下。
+- 讀不到工作目錄檔案時,sg 不像真 git 那樣中止整個指令(`fatal: cannot hash`,退出碼 128),
+  而是把該列留在清單裡、讓渲染層印出指名該檔的警告。**修改/刪除**那兩條路徑會把它
+  當成刪除(與 `sg_status_diff_unstaged` 一致),**不印警告**——這是既有行為,仍開著。
+  **新增**那條路徑會印警告,代價是 header 帶一個 `0000000` 的新 id。
+- 測試用「把追蹤路徑做成目錄」製造讀取失敗(避開 `chmod 000`,root 執行會失效)。
+  macOS 實測 `fopen` 成功、`fread` 設 `ferror`/EISDIR;**Linux 只由 CI 覆蓋**。
