@@ -29,6 +29,12 @@ after touching src/cli/diff_out.c, src/util/diff_lcs.c, or src/workdir/diff.c:
     make && python3 tests/fuzz_diff.py            # 200 iterations
     python3 tests/fuzz_diff.py 1000              # longer soak
     python3 tests/fuzz_diff.py 200 --seed 4000   # shift the seed base
+    python3 tests/fuzz_diff.py 200 --max-failures 0   # count them all, print none
+
+By default it stops after 3 mismatches, which is what you want when you are
+looking at them. It is not what you want when you are converging: a rate is
+the whole measurement, and "stopped at 3" is not a rate. --max-failures 0
+runs every iteration and prints only the tally.
 
 Each iteration i uses seed base+i, and the seed is printed on every mismatch,
 so a failure reproduces exactly with `--seed <that seed> 1`.
@@ -190,12 +196,18 @@ def main():
         print("error: %s not built; run `make` first" % SG, file=sys.stderr)
         return 2
 
-    args = [a for a in sys.argv[1:] if a != "--seed"]
-    seed_base = 0
-    if "--seed" in sys.argv:
-        seed_base = int(sys.argv[sys.argv.index("--seed") + 1])
-        args = args[:-1] if args and args[-1] == str(seed_base) else args
-    iterations = int(args[0]) if args else 200
+    argv = sys.argv[1:]
+    seed_base, max_failures = 0, 3
+    for flag, setter in (("--seed", "seed"), ("--max-failures", "maxf")):
+        if flag in argv:
+            i = argv.index(flag)
+            value = int(argv[i + 1])
+            if setter == "seed":
+                seed_base = value
+            else:
+                max_failures = value
+            del argv[i:i + 2]
+    iterations = int(argv[0]) if argv else 200
 
     root = tempfile.mkdtemp(prefix="sg_fuzz_diff_")
     failures = 0
@@ -223,6 +235,11 @@ def main():
 
         failures += 1
         label, want, got, err, rc = mismatch
+        if max_failures == 0:
+            # Counting mode: the tally is the measurement, so keep neither the
+            # repo nor the output.
+            shutil.rmtree(repo, ignore_errors=True)
+            continue
         print("=== MISMATCH seed %d (%s) -- repo kept at %s" % (seed, label, repo))
         print("    reproduce: python3 tests/fuzz_diff.py 1 --seed %d" % seed)
         if rc != 0:
@@ -233,8 +250,8 @@ def main():
         # on, not a line of the file under test.
         for ln in list(difflib.unified_diff(want_s, got_s, "git", "sg", n=2))[:60]:
             print("    " + ln.rstrip("\n"))
-        if failures >= 3:
-            print("stopping after 3 mismatches")
+        if failures >= max_failures:
+            print("stopping after %d mismatches" % max_failures)
             break
 
     print("\nfuzz_diff: %d iterations from seed %d, %d mismatches"

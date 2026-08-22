@@ -816,14 +816,14 @@ static void test_patch_add_and_delete_index_lines(void)
                       "index 7898192..0000000\n"
                       "--- a/fileA.txt\n"
                       "+++ /dev/null\n"
-                      "@@ -1,1 +1,0 @@\n"
+                      "@@ -1 +0,0 @@\n"
                       "-a\n"
                       "diff --git a/fileB.txt b/fileB.txt\n"
                       "new file mode 100644\n"
                       "index 0000000..6178079\n"
                       "--- /dev/null\n"
                       "+++ b/fileB.txt\n"
-                      "@@ -1,0 +1,1 @@\n"
+                      "@@ -0,0 +1 @@\n"
                       "+b\n") == 0,
          "add/delete PATCH mismatch: %s", out);
     free(out);
@@ -902,7 +902,7 @@ static void test_patch_mode_and_content_change_index_has_no_suffix(void)
                       "index 5626abf..f719efd\n"
                       "--- a/f.txt\n"
                       "+++ b/f.txt\n"
-                      "@@ -1,1 +1,1 @@\n"
+                      "@@ -1 +1 @@\n"
                       "-one\n"
                       "+two\n") == 0,
          "mode+content PATCH mismatch: %s", out);
@@ -1109,6 +1109,433 @@ static void test_patch_unstaged_mode_only_change_has_no_index_or_body(void)
     free(root);
 }
 
+/* ---- Phase 26: patch body byte-fidelity (sg_diff_build_script) --------
+
+   The four fixtures below (A1/A2/A3/G) are anchored to real git 2.55.0
+   output pasted directly from CLAUDE.md's Phase 26 note -- they were not
+   independently re-derived here, they ARE the oracle measurement. A1/A2
+   demonstrate diff.indentHeuristic (on by default) actually moving a
+   pure-insert group's position; A3 is the CONTROL: same kind of fixture
+   (inserting a duplicate-shaped block into a class body) where the
+   heuristic and non-heuristic positions happen to coincide, included
+   specifically so a future reader does not mistake it for redundant
+   coverage -- it is the fixture that proves a passing A1/A2 isn't an
+   accident of always landing on the same answer regardless of scoring. */
+
+static void test_patch_indent_heuristic_blank_separated_duplicate_block(void)
+{
+    char *root = make_tmp_repo_and_cd("indent_a1");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "top\n{\n  x\n}\n\n{\n  y\n}\n");
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "top\n{\n  x\n}\n\n{\n  NEW\n}\n\n{\n  y\n}\n");
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "@@ -3,6 +3,10 @@ top\n"
+                     "   x\n"
+                     " }\n"
+                     " \n"
+                     "+{\n"
+                     "+  NEW\n"
+                     "+}\n"
+                     "+\n"
+                     " {\n"
+                     "   y\n"
+                     " }\n") != NULL,
+         "A1 (blank-separated duplicate block) mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+static void test_patch_indent_heuristic_no_blank_duplicate_block(void)
+{
+    char *root = make_tmp_repo_and_cd("indent_a2");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "top\n{\n  x\n}\n{\n  y\n}\n");
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "top\n{\n  x\n}\n{\n  NEW\n}\n{\n  y\n}\n");
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    /* Without the heuristic this group compacts to the BOTTOM of its slide
+       range, printing "+  NEW / +} / +{" (the inserted block shifted down
+       by one line) instead -- that is the OFF form CLAUDE.md's Phase 26
+       note records for this exact fixture. A wrong sign on the indent
+       heuristic's scoring constants reproduces exactly that OFF form even
+       with the heuristic "on" (Phase 26 implementation note: this is what
+       actually happened here before the constant's sign was corrected). */
+    CHECK(strstr(out, "@@ -2,6 +2,9 @@ top\n"
+                     " {\n"
+                     "   x\n"
+                     " }\n"
+                     "+{\n"
+                     "+  NEW\n"
+                     "+}\n"
+                     " {\n"
+                     "   y\n"
+                     " }\n") != NULL,
+         "A2 (no-blank duplicate block) mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* A3: the CONTROL fixture (see the file-level comment above) -- inserting a
+   sibling method into a class body lands in the same place whether or not
+   the heuristic runs, so a regression that always picks the "off" position
+   would NOT be caught by A1/A2 alone if their answers ever happened to
+   coincide too; A3 pins that this fixture's ON and OFF answers are the
+   SAME known value, so it stays green under either behaviour and is not,
+   by itself, evidence the heuristic is doing anything -- A1/A2 are what
+   carry that signal. */
+static void test_patch_indent_heuristic_class_method_insert_control(void)
+{
+    char *root = make_tmp_repo_and_cd("indent_a3");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "class A:\n    def f(self):\n        pass\n");
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "class A:\n    def g(self):\n        pass\n\n    def f(self):\n        pass\n");
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    /* No suffix here: the hunk starts at file offset 0 (nothing precedes
+       "class A:" itself), so the backward scan has nothing to search --
+       this is NOT the "not found" case (CLAUDE.md's Phase 26 note is about
+       a scan that runs and fails to match a character class; this is a
+       scan with an empty search space, "before == 0"). */
+    CHECK(strstr(out, "@@ -1,3 +1,6 @@\n"
+                     " class A:\n"
+                     "+    def g(self):\n"
+                     "+        pass\n"
+                     "+\n"
+                     "     def f(self):\n"
+                     "         pass\n") != NULL,
+         "A3 control fixture mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* G: a pure duplication of an existing repeated pattern with no indentation
+   to score on at all -- group compaction (not the heuristic, which has
+   nothing to distinguish here) must still land the insertion at the
+   BOTTOM of its slide range. */
+static void test_patch_group_compaction_slides_to_bottom(void)
+{
+    char *root = make_tmp_repo_and_cd("compact_g");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "h\nA\nB\nA\nB\nt\n");
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "h\nA\nB\nA\nB\nA\nB\nt\n");
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "@@ -3,4 +3,6 @@ A\n"
+                     " B\n"
+                     " A\n"
+                     " B\n"
+                     "+A\n"
+                     "+B\n"
+                     " t\n") != NULL,
+         "G (bottom-of-range compaction) mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* ---- Phase 26: hunk-merge gap boundary (CLAUDE.md: <=6 merges, >=7 splits) */
+
+static char *repeat_same_lines(size_t n)
+{
+    /* n lines of "same\n", used as the equal-run between two changes. */
+    char *buf = malloc(n * 5 + 1);
+    size_t i;
+
+    CHECK(buf != NULL, "OOM building repeat_same_lines fixture");
+    buf[0] = '\0';
+    for (i = 0; i < n; i++)
+        strcat(buf, "same\n");
+    return buf;
+}
+
+static void build_gap_fixture(size_t gap, char **base_out, char **changed_out)
+{
+    char *middle = repeat_same_lines(gap);
+    char *base = malloc(strlen("c1\nc2\n") + strlen(middle) + strlen("d1\nd2\n") + 1);
+    char *changed = malloc(strlen("C1\nC2\n") + strlen(middle) + strlen("D1\nD2\n") + 1);
+
+    CHECK(base != NULL && changed != NULL, "OOM building gap fixture");
+    sprintf(base, "c1\nc2\n%sd1\nd2\n", middle);
+    sprintf(changed, "C1\nC2\n%sD1\nD2\n", middle);
+    free(middle);
+    *base_out = base;
+    *changed_out = changed;
+}
+
+static void test_patch_hunk_merge_boundary_six_lines_merges(void)
+{
+    char *root = make_tmp_repo_and_cd("gap6");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+    char *base, *changed;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    build_gap_fixture(6, &base, &changed);
+    write_file("f.txt", base);
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", changed);
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "@@ -1,10 +1,10 @@\n") != NULL,
+         "a 6-line gap must merge into a single hunk: %s", out);
+    {
+        const char *first = strstr(out, "@@ ");
+
+        CHECK(first != NULL && strstr(first + 1, "@@ ") == NULL,
+             "expected exactly one hunk (6-line gap must not split): %s", out);
+    }
+
+    free(base);
+    free(changed);
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+static void test_patch_hunk_split_boundary_seven_lines_splits(void)
+{
+    char *root = make_tmp_repo_and_cd("gap7");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+    char *base, *changed;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    build_gap_fixture(7, &base, &changed);
+    write_file("f.txt", base);
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", changed);
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "@@ -1,5 +1,5 @@\n") != NULL,
+         "a 7-line gap's first hunk mismatch: %s", out);
+    CHECK(strstr(out, "@@ -7,5 +7,5 @@ same\n") != NULL,
+         "a 7-line gap's second hunk mismatch (must split, not merge): %s", out);
+
+    free(base);
+    free(changed);
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* ---- Phase 26: function-name hunk suffix -------------------------------- */
+
+/* Lines 1..6 all start with a digit, so the backward scan must walk past
+   all of them to reach line 0 ("def handler():", first char alnum) --
+   this pins BOTH the character-class boundary (digits don't count) and
+   that the search finds the NEAREST qualifying line, not just any. */
+static void test_patch_function_name_suffix_found(void)
+{
+    char *root = make_tmp_repo_and_cd("funcname_found");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "def handler():\n1a\n2b\n3c\n4d\n5e\n6f\ntarget\n8g\n9h\n10i\n");
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "def handler():\n1a\n2b\n3c\n4d\n5e\n6f\nTARGET\n8g\n9h\n10i\n");
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "@@ -5,7 +5,7 @@ def handler():\n") != NULL,
+         "expected the nearest preceding alnum-first line as the hunk suffix: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* No line in the file starts with alnum/_/$ (every line starts with a
+   digit), so no suffix is printed -- and critically, the "@@ ... @@" line
+   must have NO trailing space in that case. Asserted as a full string
+   (CLAUDE.md: "請斷言完整字串,不要只 strstr"), not just presence, because a
+   stray trailing space would be invisible to a strstr-only check that only
+   looked for the substring up to "@@". */
+static void test_patch_function_name_suffix_not_found_no_trailing_space(void)
+{
+    char *root = make_tmp_repo_and_cd("funcname_absent");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+    const char *line;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "1a\n2b\n3c\ntarget\n5e\n6f\n7g\n");
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "1a\n2b\n3c\nTARGET\n5e\n6f\n7g\n");
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    line = strstr(out, "@@ ");
+    CHECK(line != NULL, "expected an @@ hunk line at all: %s", out);
+    CHECK(line != NULL && strncmp(line, "@@ -1,7 +1,7 @@\n", strlen("@@ -1,7 +1,7 @@\n")) == 0,
+         "expected no function-name suffix and no trailing space: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* ---- Phase 26: "\ No newline at end of file", all three combinations --- */
+
+static void test_patch_no_newline_old_only(void)
+{
+    char *root = make_tmp_repo_and_cd("nonl_old");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "keep\ntail"); /* old side: "tail" has NO trailing newline */
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "keep\ntail\n"); /* new side: same text, WITH a trailing newline */
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "@@ -1,2 +1,2 @@\n"
+                     " keep\n"
+                     "-tail\n"
+                     "\\ No newline at end of file\n"
+                     "+tail\n") != NULL,
+         "old-side-only missing newline mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+static void test_patch_no_newline_new_only(void)
+{
+    char *root = make_tmp_repo_and_cd("nonl_new");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "keep\ntail\n"); /* old side: trailing newline present */
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "keep\ntail"); /* new side: same text, NO trailing newline */
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "@@ -1,2 +1,2 @@\n"
+                     " keep\n"
+                     "-tail\n"
+                     "+tail\n"
+                     "\\ No newline at end of file\n") != NULL,
+         "new-side-only missing newline mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+static void test_patch_no_newline_both(void)
+{
+    char *root = make_tmp_repo_and_cd("nonl_both");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "keep\noldtail"); /* neither side ends in a newline, AND */
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "keep\nnewtail"); /* ...the final line's content also changed */
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "@@ -1,2 +1,2 @@\n"
+                     " keep\n"
+                     "-oldtail\n"
+                     "\\ No newline at end of file\n"
+                     "+newtail\n"
+                     "\\ No newline at end of file\n") != NULL,
+         "both-sides missing newline mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
 /* Fix 4 regression: content_changed's "!old_verified || !new_verified"
    disjuncts must not be removable without a unit test noticing. Two BLOB
    sides sharing the exact same (nonexistent) id are constructed by hand --
@@ -1182,6 +1609,17 @@ int main(void)
     test_patch_binary_modify_index_line();
     test_patch_chunk_pointer_index_line_uses_effective_id();
     test_patch_unstaged_mode_only_change_has_no_index_or_body();
+    test_patch_indent_heuristic_blank_separated_duplicate_block();
+    test_patch_indent_heuristic_no_blank_duplicate_block();
+    test_patch_indent_heuristic_class_method_insert_control();
+    test_patch_group_compaction_slides_to_bottom();
+    test_patch_hunk_merge_boundary_six_lines_merges();
+    test_patch_hunk_split_boundary_seven_lines_splits();
+    test_patch_function_name_suffix_found();
+    test_patch_function_name_suffix_not_found_no_trailing_space();
+    test_patch_no_newline_old_only();
+    test_patch_no_newline_new_only();
+    test_patch_no_newline_both();
     test_patch_unreadable_blob_with_matching_ids_is_not_silently_skipped();
 
     if (failures > 0) {
