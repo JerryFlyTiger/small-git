@@ -22,6 +22,26 @@ void sg_diff_list_free(sg_diff_list *list)
     list->cap = 0;
 }
 
+void sg_diff_list_filter(sg_diff_list *list, const sg_pathspec *ps)
+{
+    size_t read;
+    size_t write = 0;
+
+    if (list == NULL || ps == NULL || ps->count == 0)
+        return;
+
+    for (read = 0; read < list->count; read++) {
+        if (sg_pathspec_matches(ps, list->entries[read].path)) {
+            if (write != read)
+                list->entries[write] = list->entries[read];
+            write++;
+        } else {
+            free(list->entries[read].path);
+        }
+    }
+    list->count = write;
+}
+
 static int list_append(sg_diff_list *list, const char *path, const sg_diff_side *old_side,
                        const sg_diff_side *new_side)
 {
