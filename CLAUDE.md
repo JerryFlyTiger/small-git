@@ -2,7 +2,7 @@
 
 C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟格式位元相容**——
 物件、index v2、packfile、pkt-line 協定都要能被真 git 直接讀懂,這條由
-`tests/interop.sh`(1403 項檢查,拿真 `git` 當 oracle)守住。
+`tests/interop.sh`(1425 項檢查,拿真 `git` 當 oracle)守住。
 
 在此之上有兩個真 git 沒有的東西:`src/safety/`(破壞性操作前自動快照)與
 `src/storage/chunk.c`(大檔案的 content-defined chunking)。
@@ -17,6 +17,7 @@ make test                         # 47 個單元測試二進位,任一失敗即�
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
+python3 tests/fuzz_diff.py        # patch 輸出一致性 fuzzer(預設 200 輪)
 ```
 
 **前四道一次跑完:`bash tests/gates.sh`**(`--sanitize` 連第四道一起跑,
@@ -155,8 +156,16 @@ staging 的驗證。本機綠燈不是充分證據。**
 - **印 diff 一律走 `sg_diff_print`**(`include/sg/diff_out.h`,Phase 25),六種格式
   (patch/`--stat`/`--numstat`/`--shortstat`/`--name-only`/`--name-status`)。
   `sg diff` 與 `sg stash show` 共用這一份,不要再寫第二份格式化。
-  patch body **刻意不追**真 git(整檔單一 hunk、無 `index` 行、無多 hunk 切分),
-  所以與 git 逐位元組比對的是**機器可讀的那四種**。
+  patch body 從 Phase 26 起**與真 git 逐位元組相同**(`index` 行、`new file mode`/
+  `deleted file mode`/`/dev/null`、context 3 的多 hunk 切分、函式名後綴、
+  `\ No newline at end of file`),interop 因此對**六種格式全部**做全輸出 `cmp`。
+  ⚠ 剩約 **2–3% 的位置歧異**,成因是**底層對齊演算法**(sg 用 LCS 回溯、git 預設 Myers),
+  **不是**壓縮或縮排啟發式——那一層已與 `xdiff/xdiffi.c` 逐條核對過(14 個常數、
+  `measure_split`、`xdl_change_compact` 的 `else if` 優先權與三個滑動下界)。
+  實測 11 個殘留案例中有 6 個與 `git diff --histogram` 逐位元組相同。
+  **不要去找一個不存在的評分 bug**;細節見 `docs/DESIGN.md` Phase 26。
+  動到 `diff_out.c` / `diff_lcs.c` / `workdir/diff.c` 時,`make test` 綠**不算數**,
+  要跑 `python3 tests/fuzz_diff.py 200 --max-failures 0` 並比對殘留數字。
 - **兩種引用規則不可以「統一」**(Phase 25):`sg status --porcelain`/`-s` 用
   `sg_quote_path_porcelain`——**只要含空格就引用**,因為 `?? ` 前綴讓空格變成欄位
   分隔符;長格式與四種機器格式用 `sg_quote_path`——**空格不引**。兩者都引控制字元。
@@ -231,11 +240,15 @@ staging 的驗證。本機綠燈不是充分證據。**
   逐字複本:`storage/reflog.c`、`storage/chunk.c`、`safety/stash.c`、
   `safety/snapshot.c`、`cli/cmd_rebase.c`、`cli/cmd_merge.c`、`cli/cmd_tag.c`、
   `cli/cmd_commit.c`。碰到時順手收斂,不要再增加下一份。
+  **Phase 26 新發現一對**:`sg status` 的未 staged 比較走
+  `sg_status_diff_unstaged`(`src/workdir/status.c:110`),與 `sg_diff_index_workdir`
+  是兩份獨立實作。後者 Phase 26 起會比較 mode,前者不會,所以 `sg diff` 看得到
+  純 chmod 而 **`sg status` 看不到**(真 git 兩者都報 ` M`)。這個分歧仍開著。
   Phase 25 又長出**一對**:`report_bad_tree_path`(`cli/cmd_diff.c:62`)與
   `report_bad_stash_tree_path`(`cli/cmd_stash.c:337`)幾乎逐字相同(都是把
-  `sg_tree_flatten` 的 `-2` 轉成一行指名 `bad_path` 的錯誤)。**兩者目前都沒有
-  測試觸達**——`tests/interop.sh` 沒有任何一條用惡意 tree 名稱去走 `sg diff`
-  或 `sg stash show`,所以收斂它們之前要先有一條能觀測的檢查,否則改壞了不會有人發現。
+  `sg_tree_flatten` 的 `-2` 轉成一行指名 `bad_path` 的錯誤)。**Phase 26 已補上兩條 interop 檢查**
+  (用 `git mktree` 造出含 `..` entry 的 tree,分別走 `sg diff <rev> <rev>` 與
+  `sg stash show`,斷言錯誤訊息指名該路徑),所以現在**可以安全收斂了**。
 - 遠端/使用者字串轉成檔案路徑前必須先過閘門函式:`sg_ref_name_is_safe`
   (`include/sg/transport.h:38`)、`sg_ref_branch_name_is_safe`(`include/sg/refs.h:13`)。
   **建立**新 ref 時的 check-ref-format 驗證另有一支
@@ -440,7 +453,8 @@ staging 的驗證。本機綠燈不是充分證據。**
 - **subagent 回報的「全綠」在本專案屢次是錯的**——`make test` / interop.sh 的
   最終閘門由主對話親自重跑,不採信轉述的數字。
 - 派工規格要額外寫明:完成標準見本檔「建置與驗證」(含 interop.sh,agent 常
-  只跑 `make test` 就宣告完成),以及動到 ignore/走訪時要跑 fuzz_ignore.py。
+  只跑 `make test` 就宣告完成),動到 ignore/走訪時要跑 fuzz_ignore.py,
+  動到 diff 輸出時要跑 fuzz_diff.py 並**回報實際 mismatch 數**(不是「有沒有失敗」)。
 
 ## token 節流
 
