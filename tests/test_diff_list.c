@@ -1464,6 +1464,72 @@ static void test_tree_workdir_unreadable_workdir_file_is_absent(void)
     free(git_dir);
 }
 
+/* The addition branch (path in the index, absent from the old tree) when the
+   working-tree file exists but cannot be read.
+
+   The row must still be appended. Dropping it is the tempting shape -- there
+   is no content to report -- but it is the one outcome that tells the user
+   nothing at all: sg deliberately does not abort the whole diff the way real
+   git does (fatal: cannot hash <path>), so the appended row IS the report.
+   The renderer re-reads the side, fails, and names the file. A dropped row
+   leaves `sg diff <rev>` exiting 0 with the file silently missing from the
+   output, which is what this asserts against. */
+static void test_tree_workdir_unreadable_addition_is_still_reported(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char id[SG_SHA1_RAW_LEN];
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    tree_spec specs[] = {
+        {"unrelated.txt", 0100644, "unrelated\n"},
+    };
+    char abspath[4096];
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    build_tree(git_dir, specs, 1, old_tree);
+    blob(git_dir, "staged content\n", id);
+
+    snprintf(abspath, sizeof(abspath), "%s/unrelated.txt", repo_root);
+    CHECK(sg_write_file_mkdirs(abspath, (const unsigned char *)"unrelated\n", 10, 0100644) == 0,
+         "seeding unrelated.txt failed");
+
+    snprintf(abspath, sizeof(abspath), "%s/added.txt", repo_root);
+    CHECK(mkdir(abspath, 0755) == 0, "mkdir (standing in for an unreadable file) failed");
+
+    /* In the index, not in old_tree: this is the addition branch. */
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "added.txt", 0100644, id);
+    index_upsert_blob(&idx, "unrelated.txt", 0100644, id);
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+         "sg_diff_tree_workdir failed");
+
+    e = find_entry(&list, "added.txt");
+    CHECK(e != NULL,
+         "an unreadable added file must still appear in the diff list -- dropping it makes "
+         "sg diff <rev> exit 0 with no mention of the file anywhere");
+    if (e != NULL) {
+        CHECK(e->old_side.kind == SG_DIFF_SIDE_ABSENT, "added.txt's old side should be ABSENT");
+        CHECK(e->new_side.kind == SG_DIFF_SIDE_WORKDIR,
+             "added.txt's new side must stay WORKDIR so the renderer attempts the read and "
+             "reports it (got kind %d)", e->new_side.kind);
+        /* 100644, not 100755: the stand-in is a directory, and directories are
+           almost always exec for reasons that have nothing to do with the blob
+           that should have been there. workdir_entry_mode reads the exec bit
+           off regular files only. */
+        CHECK(e->new_side.mode == 0100644,
+             "a non-regular stand-in must report 100644, not its own permission bits (got %06o)",
+             e->new_side.mode);
+    }
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_trees_add_delete_modify();
@@ -1491,6 +1557,7 @@ int main(void)
     test_symlink_guard_reports_fixed_mode();
     test_index_workdir_unreadable_workdir_file_is_absent();
     test_tree_workdir_unreadable_workdir_file_is_absent();
+    test_tree_workdir_unreadable_addition_is_still_reported();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

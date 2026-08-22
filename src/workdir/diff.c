@@ -85,15 +85,21 @@ static sg_diff_side side_workdir(const unsigned char id[SG_SHA1_RAW_LEN], unsign
    Deliberately lstat, not stat: a following stat() would report the
    *target's* mode for a symlink, which this codebase has no way to act on
    correctly here (a symlink has no exec bit of its own to read, and 120000
-   is out of scope this round -- see sg/diff.h). A symlink, or a path lstat
-   can't reach at all (should not happen given the caller already confirmed
-   the path exists), falls back to 100644 conservatively rather than
-   guessing. */
+   is out of scope this round -- see sg/diff.h).
+
+   The exec bit is only read off a *regular* file. Anything else -- a
+   symlink, a directory, a fifo standing where a tracked file should be, or
+   a path lstat can't reach at all -- falls back to 100644. Those all carry
+   permission bits that mean something other than "git should record this
+   as executable", and a directory in particular is almost always exec for
+   reasons that have nothing to do with the blob that was supposed to be
+   there; reading its 0755 would put a mode in the patch header that no
+   content ever justified. */
 static unsigned int workdir_entry_mode(const char *abspath)
 {
     struct stat lst;
 
-    if (lstat(abspath, &lst) != 0 || S_ISLNK(lst.st_mode))
+    if (lstat(abspath, &lst) != 0 || !S_ISREG(lst.st_mode))
         return 0100644;
     return (lst.st_mode & S_IXUSR) ? 0100755 : 0100644;
 }
@@ -589,22 +595,26 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
             oi++;
         } else {
             /* In the index (at any stage), not in the tree: an addition,
-               sourced from the working tree if the file is actually there;
-               if it was deleted from disk after being staged, both sides
-               are absent and nothing is reported. Existing-but-unreadable
-               (permission denied, ...) is folded into that same "nothing to
-               report" case, not appended as a WORKDIR side with a
-               placeholder zero id: unlike the modification builders above,
-               `os` here is already ABSENT (this row has no tree blob to
-               anchor a comparison against), so a placeholder new_side would
-               not misclassify M/D -- but it WOULD still print a malformed,
-               unsuffixed "index 0000000..0000000" line with a bogus all-zero
-               mode, since neither "new file mode" nor "deleted file mode"
-               would fire for an ABSENT/WORKDIR-placeholder pair whose
-               new_side never got a real id. Skipping the append instead
-               keeps this branch's existing "can't get content -> don't
-               report" convention (see the stat() failure case just above)
-               rather than inventing a third, differently-broken shape. */
+               sourced from the working tree if the file is actually there.
+               Deleted from disk after being staged (stat fails) means both
+               sides are absent and nothing is reported.
+
+               Existing-but-unreadable is NOT folded into that case. The row
+               is appended with a WORKDIR side carrying the lstat mode and a
+               placeholder zero id, precisely so the renderer tries the read
+               itself, fails, and names the file in an actionable message --
+               dropping the row instead loses the only report the user would
+               ever get, which is the failure mode sg/diff.h's builder
+               contract exists to prevent. The header this produces is
+               "new file mode <mode>" + "index 0000000..0000000": the mode
+               suffix is suppressed because a mode line was written, so the
+               all-zero new id is the one part git would never write. That
+               is a deliberate trade -- a slightly wrong id on a row that is
+               immediately followed by a warning, over a silently missing
+               file. Real git does neither: it aborts the whole command
+               (fatal: cannot hash <path>, exit 128). sg does not, on
+               purpose; one unreadable path must not blind the user to every
+               other path in the diff. */
             char abspath[SG_PATH_MAX];
             struct stat st;
             sg_diff_side os = side_absent();
@@ -617,13 +627,13 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                 unsigned char wd_sha1[SG_SHA1_RAW_LEN];
                 unsigned int wd_mode = workdir_entry_mode(abspath);
 
-                if (sg_hash_file_blob(abspath, wd_sha1) == 0) {
-                    sg_diff_side ns = side_workdir(wd_sha1, wd_mode);
+                sg_diff_side ns = sg_hash_file_blob(abspath, wd_sha1) == 0
+                                      ? side_workdir(wd_sha1, wd_mode)
+                                      : side_workdir(NULL, wd_mode);
 
-                    if (list_append(out, idx_path, &os, &ns) != 0) {
-                        rc = -1;
-                        goto done;
-                    }
+                if (list_append(out, idx_path, &os, &ns) != 0) {
+                    rc = -1;
+                    goto done;
                 }
             }
             ii = group_end;
