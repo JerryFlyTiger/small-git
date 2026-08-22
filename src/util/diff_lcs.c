@@ -204,6 +204,18 @@ static int backtrack_into_groups(const sg_diff_line *a, size_t na, const sg_diff
 #define SG_INDENT_RELATIVE_DEDENT_PENALTY 23
 #define SG_INDENT_RELATIVE_DEDENT_WITH_BLANK_PENALTY 17
 
+/* Verified against git's xdiff/xdiffi.c (score_cmp): the comparison between
+   two candidate split positions is NOT the sum of the two penalty scalars
+   alone. It is dominated by "effective_indent" -- the sum, over the two
+   splits bracketing the group, of each split's indent (or its post_indent
+   when the split itself falls on a blank/EOF line) -- weighted by
+   SG_INDENT_WEIGHT, with `penalty` only used to break ties on
+   effective_indent. Omitting effective_indent entirely (an earlier version
+   of this file did) picks the wrong position whenever the two candidates
+   differ in indentation, which given INDENT_WEIGHT's size is most of the
+   time -- confirmed against git 2.55.0 via tests/fuzz_diff.py. */
+#define SG_INDENT_WEIGHT 60
+
 /* -1 for a blank (all-whitespace, including empty) line; otherwise the
    leading-whitespace width (space = 1, tab = round up to next multiple of
    8), capped at SG_INDENT_MAX. */
@@ -277,50 +289,70 @@ static void measure_split(const sg_diff_line *rec, size_t n, size_t split, split
     }
 }
 
-static int score_split(const sg_diff_line *rec, size_t n, size_t split)
+typedef struct {
+    int effective_indent;
+    int penalty;
+} split_score;
+
+/* Mirrors git's score_add_split(): ACCUMULATES into *s rather than returning
+   a fresh value, because a position's score is the sum of the two splits
+   that bracket the group (see score_position below), not either split in
+   isolation. */
+static void score_add_split(const sg_diff_line *rec, size_t n, size_t split, split_score *s)
 {
     split_measurement m;
-    int penalty = 0;
     int post_blank, total_blank, indent, any_blanks;
 
     measure_split(rec, n, split, &m);
 
     if (m.pre_indent == -1 && m.pre_blank == 0)
-        penalty += SG_INDENT_START_OF_FILE_PENALTY;
+        s->penalty += SG_INDENT_START_OF_FILE_PENALTY;
     if (m.end_of_file)
-        penalty += SG_INDENT_END_OF_FILE_PENALTY;
+        s->penalty += SG_INDENT_END_OF_FILE_PENALTY;
 
     post_blank = (m.indent == -1) ? (int)(1 + m.post_blank) : 0;
     total_blank = (int)m.pre_blank + post_blank;
 
-    penalty += SG_INDENT_TOTAL_BLANK_WEIGHT * total_blank;
-    penalty += SG_INDENT_POST_BLANK_WEIGHT * post_blank;
+    s->penalty += SG_INDENT_TOTAL_BLANK_WEIGHT * total_blank;
+    s->penalty += SG_INDENT_POST_BLANK_WEIGHT * post_blank;
 
     indent = (m.indent != -1) ? m.indent : m.post_indent;
     any_blanks = (total_blank != 0);
 
+    s->effective_indent += indent;
+
     if (indent == -1 || m.pre_indent == -1) {
         /* no adjustment */
     } else if (indent > m.pre_indent) {
-        penalty += any_blanks ? SG_INDENT_RELATIVE_INDENT_WITH_BLANK_PENALTY : SG_INDENT_RELATIVE_INDENT_PENALTY;
+        s->penalty += any_blanks ? SG_INDENT_RELATIVE_INDENT_WITH_BLANK_PENALTY : SG_INDENT_RELATIVE_INDENT_PENALTY;
     } else if (indent == m.pre_indent) {
         /* no adjustment */
     } else if (m.post_indent != -1 && m.post_indent > indent) {
-        penalty += any_blanks ? SG_INDENT_RELATIVE_OUTDENT_WITH_BLANK_PENALTY : SG_INDENT_RELATIVE_OUTDENT_PENALTY;
+        s->penalty += any_blanks ? SG_INDENT_RELATIVE_OUTDENT_WITH_BLANK_PENALTY : SG_INDENT_RELATIVE_OUTDENT_PENALTY;
     } else {
-        penalty += any_blanks ? SG_INDENT_RELATIVE_DEDENT_WITH_BLANK_PENALTY : SG_INDENT_RELATIVE_DEDENT_PENALTY;
+        s->penalty += any_blanks ? SG_INDENT_RELATIVE_DEDENT_WITH_BLANK_PENALTY : SG_INDENT_RELATIVE_DEDENT_PENALTY;
     }
+}
 
-    return penalty;
+/* Mirrors git's score_cmp(): effective_indent (weighted) dominates, penalty
+   only breaks ties. Negative means s1 is the better (more favored) split. */
+static int score_cmp(const split_score *s1, const split_score *s2)
+{
+    int cmp_indents = (s1->effective_indent > s2->effective_indent) - (s1->effective_indent < s2->effective_indent);
+
+    return SG_INDENT_WEIGHT * cmp_indents + (s1->penalty - s2->penalty);
 }
 
 /* Scores candidate position p (an index into the group's OWN axis: a_off
-   for a pure delete, b_off for a pure insert) by summing the split penalty
-   just above and just below the group's content in that axis's line array.
-   Lower is better -- this mirrors score_split's "penalty" convention. */
-static int score_position(const sg_diff_line *rec, size_t n, size_t pos, size_t len)
+   for a pure delete, b_off for a pure insert) by summing the two splits
+   just above and just below the group's content in that axis's line array. */
+static split_score score_position(const sg_diff_line *rec, size_t n, size_t pos, size_t len)
 {
-    return score_split(rec, n, pos) + score_split(rec, n, pos + len);
+    split_score s = {0, 0};
+
+    score_add_split(rec, n, pos + len, &s);
+    score_add_split(rec, n, pos, &s);
+    return s;
 }
 
 /* Computes the reachable slide range for a pure insert/delete group.
@@ -373,18 +405,23 @@ static void slide_range(const sg_diff_line *pos_file, size_t pos_n, const sg_dif
 static size_t pick_indent_position(const sg_diff_line *content, size_t content_n, size_t low, size_t high,
                                    size_t content_off_at_low, size_t len)
 {
-    size_t best = high;
-    int best_score;
+    size_t best = low;
+    split_score best_score;
     size_t p;
+    int best_valid = 0;
 
-    best_score = score_position(content, content_n, content_off_at_low + (high - low), len);
-    for (p = low; p < high; p++) {
+    /* Ascending, <=0 (not <0): git's loop walks shift from low to high and
+       replaces the best candidate on ties too, so among equally-good splits
+       the LAST (highest) one wins -- this is what makes "no heuristic
+       preference" default to the bottom of the range. */
+    for (p = low; p <= high; p++) {
         size_t content_off = content_off_at_low + (p - low);
-        int score = score_position(content, content_n, content_off, len);
+        split_score score = score_position(content, content_n, content_off, len);
 
-        if (score < best_score) {
+        if (!best_valid || score_cmp(&score, &best_score) <= 0) {
             best_score = score;
             best = p;
+            best_valid = 1;
         }
     }
     return best;
@@ -396,7 +433,7 @@ sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_
     size_t **dp;
     group_builder gb;
     sg_diff_script *script;
-    size_t k;
+    size_t out, k;
 
     dp = sg_diff_lcs_table_exact(a, na, b, nb);
     if (dp == NULL)
@@ -414,39 +451,120 @@ sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_
 
     /* Group compaction: slide every pure insert/delete group to the bottom
        of its reachable range (or, with the heuristic, the best-scoring
-       position in that range). "Replace" groups (both a_len and b_len
-       non-zero) are left exactly where the backtrack put them -- sliding
-       them is ambiguous in a way this reconstruction does not attempt (see
-       sg_diff_group's own comment). */
-    for (k = 0; k < gb.count; k++) {
-        sg_diff_group *g = &gb.groups[k];
-        size_t lower_a = (k == 0) ? 0 : gb.groups[k - 1].a_off + gb.groups[k - 1].a_len;
-        size_t upper_a = (k + 1 == gb.count) ? na : gb.groups[k + 1].a_off;
-        size_t lower_b = (k == 0) ? 0 : gb.groups[k - 1].b_off + gb.groups[k - 1].b_len;
-        size_t upper_b = (k + 1 == gb.count) ? nb : gb.groups[k + 1].b_off;
+       position in that range).
 
-        if (g->a_len == 0 && g->b_len > 0) {
-            /* Pure insert: marker lives in a-space (g->a_off), content in b. */
-            size_t low, high, chosen;
+       Critically -- mirroring git's xdl_change_compact do-while, which
+       slides a group fully up and then fully down, merging in any adjacent
+       group it bumps into via group_previous/group_next, and repeats until
+       a full up+down pass changes nothing -- the merge decision is made
+       BEFORE the heuristic runs, purely from whether sliding reaches all
+       the way to a same-kind neighbour, and the heuristic then scores
+       across the *whole merged cluster's* range. Deciding placement first
+       and merging only if the heuristic happened to land on the boundary
+       (an earlier version of this file did that) is backwards: a
+       backtrack that matched a duplicated line to the "wrong" (but equally
+       optimal) occurrence produces two separate pure groups with a single
+       matched line between them that CAN slide away entirely, and scoring
+       each group only against its own unmerged range never lets the
+       heuristic see the option of treating them as one bigger insert --
+       confirmed against git 2.55.0 via tests/fuzz_diff.py (a case where the
+       unmerged scoring reliably picked the wrong split because it was
+       comparing the wrong two candidate splits).
 
-            slide_range(a, na, b, nb, g->a_off, g->b_off, g->b_len, lower_a, upper_a, &low, &high);
-            chosen = indent_heuristic ? pick_indent_position(b, nb, low, high, g->b_off - (g->a_off - low),
-                                                             g->b_len)
-                                      : high;
-            g->b_off = g->b_off + (chosen - g->a_off);
-            g->a_off = chosen;
-        } else if (g->b_len == 0 && g->a_len > 0) {
-            /* Pure delete: marker lives in b-space (g->b_off), content in a. */
-            size_t low, high, chosen;
+       "Replace" groups (both a_len and b_len non-zero) are left exactly
+       where the backtrack put them and are never merged -- sliding them,
+       and merging across the insert/delete boundary, would require
+       tracking each side on its own axis the way git's xdf1/xdf2 do, which
+       this reconstruction does not attempt (see the module comment). */
+    out = 0;
+    k = 0;
+    while (k < gb.count) {
+        sg_diff_group cur = gb.groups[k];
+        size_t next_k = k + 1;
 
-            slide_range(b, nb, a, na, g->b_off, g->a_off, g->a_len, lower_b, upper_b, &low, &high);
-            chosen = indent_heuristic ? pick_indent_position(a, na, low, high, g->a_off - (g->b_off - low),
-                                                             g->a_len)
-                                      : high;
-            g->a_off = g->a_off + (chosen - g->b_off);
-            g->b_off = chosen;
+        if (cur.a_len > 0 && cur.b_len > 0) {
+            gb.groups[out] = cur;
+            out++;
+            k++;
+            continue;
         }
+
+        for (;;) {
+            size_t lower_a = (out == 0) ? 0 : gb.groups[out - 1].a_off + gb.groups[out - 1].a_len;
+            size_t upper_a = (next_k == gb.count) ? na : gb.groups[next_k].a_off;
+            size_t lower_b = (out == 0) ? 0 : gb.groups[out - 1].b_off + gb.groups[out - 1].b_len;
+            size_t upper_b = (next_k == gb.count) ? nb : gb.groups[next_k].b_off;
+            size_t low, high;
+            int merged = 0;
+
+            if (cur.a_len == 0 && cur.b_len > 0)
+                slide_range(a, na, b, nb, cur.a_off, cur.b_off, cur.b_len, lower_a, upper_a, &low, &high);
+            else
+                slide_range(b, nb, a, na, cur.b_off, cur.a_off, cur.a_len, lower_b, upper_b, &low, &high);
+
+            if (out > 0) {
+                sg_diff_group *prev = &gb.groups[out - 1];
+
+                if (cur.a_len == 0 && cur.b_len > 0 && prev->a_len == 0 && prev->b_len > 0 && low == lower_a) {
+                    cur.a_off = prev->a_off;
+                    cur.b_off = prev->b_off;
+                    cur.b_len = prev->b_len + cur.b_len;
+                    out--;
+                    merged = 1;
+                } else if (cur.b_len == 0 && cur.a_len > 0 && prev->b_len == 0 && prev->a_len > 0 &&
+                           low == lower_b) {
+                    cur.b_off = prev->b_off;
+                    cur.a_off = prev->a_off;
+                    cur.a_len = prev->a_len + cur.a_len;
+                    out--;
+                    merged = 1;
+                }
+            }
+            if (!merged && next_k < gb.count) {
+                sg_diff_group *nxt = &gb.groups[next_k];
+
+                if (cur.a_len == 0 && cur.b_len > 0 && nxt->a_len == 0 && nxt->b_len > 0 && high == upper_a) {
+                    cur.b_len = cur.b_len + nxt->b_len;
+                    next_k++;
+                    merged = 1;
+                } else if (cur.b_len == 0 && cur.a_len > 0 && nxt->b_len == 0 && nxt->a_len > 0 &&
+                           high == upper_b) {
+                    cur.a_len = cur.a_len + nxt->a_len;
+                    next_k++;
+                    merged = 1;
+                }
+            }
+            if (merged)
+                continue;
+
+            /* Stable: [low, high] is the group's full reachable range
+               (after absorbing every mergeable same-kind neighbour).
+               Now, and only now, pick the final position within it. */
+            if (cur.a_len == 0 && cur.b_len > 0) {
+                size_t chosen = indent_heuristic
+                                    ? pick_indent_position(b, nb, low, high, cur.b_off - (cur.a_off - low),
+                                                           cur.b_len)
+                                    : high;
+
+                cur.b_off = cur.b_off + (chosen - cur.a_off);
+                cur.a_off = chosen;
+            } else {
+                size_t chosen = indent_heuristic
+                                    ? pick_indent_position(a, na, low, high, cur.a_off - (cur.b_off - low),
+                                                           cur.a_len)
+                                    : high;
+
+                cur.a_off = cur.a_off + (chosen - cur.b_off);
+                cur.b_off = chosen;
+            }
+            break;
+        }
+
+        gb.groups[out] = cur;
+        out++;
+        k = next_k;
     }
+    gb.count = out;
 
     script = malloc(sizeof(*script));
     if (script == NULL) {
