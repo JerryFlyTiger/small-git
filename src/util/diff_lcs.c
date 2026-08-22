@@ -179,30 +179,32 @@ static int backtrack_into_groups(const sg_diff_line *a, size_t na, const sg_diff
 
 /* ---- indentation heuristic (git's diff.indentHeuristic, reconstructed) --
 
-   This is a best-effort reproduction from memory of git's xdiffi.c scoring
-   (measure_split / score_add_split), NOT a verified transcription of git's
-   source. The weight constants below are marked as such; tests/fuzz_diff.py
-   -- which compares sg's actual output against real git's -- is the sole
-   judge of whether they are close enough. If the fuzzer disagrees with this
-   file, the fuzzer is right and this file is wrong. */
+   Checked against git's xdiff/xdiffi.c (get_indent / measure_split /
+   score_add_split / score_cmp, current `master` as of this check) line by
+   line. Every constant below now matches git's #define of the same
+   quantity (renamed with the SG_INDENT_ prefix; see each line for the
+   git name being mirrored). None of them are "from memory" any more. */
 
-#define SG_INDENT_MAX 200      /* UNVERIFIED: cap on the indent score itself */
-#define SG_INDENT_MAX_BLANKS 20 /* UNVERIFIED: how far to look past blank lines */
+#define SG_INDENT_MAX 200      /* git: MAX_INDENT */
+#define SG_INDENT_MAX_BLANKS 20 /* git: MAX_BLANKS */
 
-#define SG_INDENT_START_OF_FILE_PENALTY 1
-#define SG_INDENT_END_OF_FILE_PENALTY 21
-#define SG_INDENT_TOTAL_BLANK_WEIGHT (-30)
-#define SG_INDENT_POST_BLANK_WEIGHT 6
-/* Was -4 (a bonus) from memory; flipped to a small penalty after
-   tests/fuzz_diff.py disagreed with CLAUDE.md's A2 anchor (a duplicate
-   block inserted with no blank-line separator) -- see this file's own
-   history / the Phase 26 implementation note for the reproduction. */
-#define SG_INDENT_RELATIVE_INDENT_PENALTY 4
-#define SG_INDENT_RELATIVE_INDENT_WITH_BLANK_PENALTY 10
-#define SG_INDENT_RELATIVE_OUTDENT_PENALTY 24
-#define SG_INDENT_RELATIVE_OUTDENT_WITH_BLANK_PENALTY 17
-#define SG_INDENT_RELATIVE_DEDENT_PENALTY 23
-#define SG_INDENT_RELATIVE_DEDENT_WITH_BLANK_PENALTY 17
+#define SG_INDENT_START_OF_FILE_PENALTY 1  /* git: START_OF_FILE_PENALTY */
+#define SG_INDENT_END_OF_FILE_PENALTY 21   /* git: END_OF_FILE_PENALTY */
+#define SG_INDENT_TOTAL_BLANK_WEIGHT (-30) /* git: TOTAL_BLANK_WEIGHT */
+#define SG_INDENT_POST_BLANK_WEIGHT 6      /* git: POST_BLANK_WEIGHT */
+/* git's RELATIVE_INDENT_PENALTY is (-4) -- a BONUS, not a penalty (it makes
+   splitting after a more-indented line more, not less, favored). An earlier
+   revision of this file had it as a memory-reconstructed +4 (a penalty),
+   which happened to pass the fuzzer's A1 anchor but produced the wrong
+   position on A2 (tests/test_diff_out.c's no-blank-separator duplicate
+   block) -- see that test's comment for the exact wrong output this sign
+   error reproduced. Corrected to git's actual -4 here. */
+#define SG_INDENT_RELATIVE_INDENT_PENALTY (-4) /* git: RELATIVE_INDENT_PENALTY */
+#define SG_INDENT_RELATIVE_INDENT_WITH_BLANK_PENALTY 10 /* git: RELATIVE_INDENT_WITH_BLANK_PENALTY */
+#define SG_INDENT_RELATIVE_OUTDENT_PENALTY 24 /* git: RELATIVE_OUTDENT_PENALTY */
+#define SG_INDENT_RELATIVE_OUTDENT_WITH_BLANK_PENALTY 17 /* git: RELATIVE_OUTDENT_WITH_BLANK_PENALTY */
+#define SG_INDENT_RELATIVE_DEDENT_PENALTY 23 /* git: RELATIVE_DEDENT_PENALTY */
+#define SG_INDENT_RELATIVE_DEDENT_WITH_BLANK_PENALTY 17 /* git: RELATIVE_DEDENT_WITH_BLANK_PENALTY */
 
 /* Verified against git's xdiff/xdiffi.c (score_cmp): the comparison between
    two candidate split positions is NOT the sum of the two penalty scalars
