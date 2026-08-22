@@ -357,6 +357,8 @@ being dropped silently.
 .RB [ --cached | --staged ]
 .RB [ --stat [= <width> [, <name-width> ]]| --numstat | --shortstat | --name-only | --name-status ]
 .RI [ rev " [" rev ]]
+.RB [ -- ]
+.RI [ path ...]
 .PP
 Shows a difference between two of: a commit's tree, the index, and the
 working directory. With no arguments it compares the index to the working
@@ -421,15 +423,63 @@ and
 .B "new mode"
 lines with no hunk.
 .PP
-The line-level diff algorithm is a plain LCS-based implementation: it is
-correct but does not replicate git's exact hunk-splitting or context-window
-conventions, and always emits a single hunk covering the whole file. The
-patch body therefore differs from git's, deliberately; the machine-readable
-formats above are the ones checked against git byte for byte. For the same
-reason an unresolved conflict is skipped in patch output rather than being
-rendered as git's combined
+Trailing
+.I path
+arguments restrict the output to the paths they cover. They are resolved
+against the current directory, not the repository root, and need not exist:
+naming a deleted file is the only way to ask about it. Three rules decide a
+match, and they are git's:
+an exact match; a leading directory, so
+.B sub
+covers
+.BR sub/deep/c.txt ;
+and, for a
+.I path
+containing
+.BR * ", " ? ", " [ " or " \e ,
+a wildcard match in which
+.B *
+crosses
+.BR / .
+The last two do not combine \(em
+.B \(dqo[tx]her\(dq
+reports nothing even when
+.B other/
+has changes underneath, because the leading-directory rule applies only to
+a literal
+.IR path .
+A trailing
+.B /
+asks for entries under the name, so
+.B sub/
+lists sub's contents while
+.B a.txt/
+matches nothing. Pathspec magic
+.RB ( :(icase) ", " :! ", " :/ )
+is rejected rather than taken literally.
+.PP
+.B --
+separates revisions from paths. Without it, each argument is examined as git
+examines it: an argument that is both a valid revision and an existing file
+is refused as ambiguous, the first argument that names an existing path ends
+the revision list, and every argument after that one must exist too. An
+argument carrying a wildcard is taken as a path without being looked up on
+disk.
+.PP
+The patch body matches git byte for byte in the great majority of cases,
+including the
+.B index
+line, mode and
+.B /dev/null
+lines for additions and deletions, hunk splitting at three lines of context,
+the function-name suffix and
+.BR "\e No newline at end of file" .
+Around two to three percent of hunks differ in position: sg aligns lines
+with an LCS backtrack where git defaults to Myers, and the two produce
+equally minimal but differently paired edit scripts. An unresolved conflict
+is skipped in patch output rather than being rendered as git's combined
 .B "diff --cc"
-format. There is no path filtering, and no rename detection.
+format. There is no rename detection.
 .SS branch
 .B sg branch
 .RB [ -d | --delete ]

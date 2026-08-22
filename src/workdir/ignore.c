@@ -1,5 +1,6 @@
 #include "sg/ignore.h"
 
+#include "sg/wildmatch.h"
 #include "sg/workdir.h"
 
 #include <stdint.h>
@@ -9,7 +10,11 @@
 /* gitignore matching engine. Patterns arrive inside cloned repos and are
    attacker-controlled, so all wildcard matching below is iterative (the
    classic two-pointer backtracking algorithm, O(n*m) worst case) -- no
-   recursion anywhere, no fixed-size buffers for pattern or path content. */
+   recursion anywhere, no fixed-size buffers for pattern or path content.
+
+   The per-segment matcher itself is sg_wildmatch (include/sg/wildmatch.h),
+   shared with pathspec matching; what stays here is the segment layer that
+   makes '/' special, which is exactly what gitignore adds over a pathspec. */
 
 typedef struct {
     char *pattern; /* processed pattern text; escapes are kept for the matcher */
@@ -46,129 +51,6 @@ enum {
 
 /* ---- wildcard matching ------------------------------------------------- */
 
-/* Matches c against the character class starting at pat[0] == '['. On a
-   well-formed class sets *consumed to the bytes the class occupies (through
-   the closing ']') and returns 1 (member) or 0 (not). Returns -1 for an
-   unterminated class which -- exactly like git's wildmatch, verified against
-   git 2.55 -- can never match anything at all. A ']' right after the '[' (or
-   after the negation) is a literal member; '-' is a range only between two
-   members; '\\' escapes the next character. */
-static int class_match(const char *pat, size_t plen, char text_ch, size_t *consumed)
-{
-    size_t i = 1;
-    int negated = 0;
-    int matched = 0;
-    int have_prev = 0;
-    int first = 1;
-    unsigned char prev = 0;
-    unsigned char c = (unsigned char)text_ch;
-
-    if (i < plen && (pat[i] == '!' || pat[i] == '^')) {
-        negated = 1;
-        i++;
-    }
-    while (i < plen) {
-        unsigned char pc = (unsigned char)pat[i];
-
-        if (pc == ']' && !first) {
-            *consumed = i + 1;
-            return matched != negated;
-        }
-        first = 0;
-        if (pc == '-' && have_prev && i + 1 < plen && pat[i + 1] != ']') {
-            unsigned char hi;
-
-            i++;
-            hi = (unsigned char)pat[i];
-            if (hi == '\\') {
-                i++;
-                if (i >= plen)
-                    return -1;
-                hi = (unsigned char)pat[i];
-            }
-            if (c >= prev && c <= hi)
-                matched = 1;
-            prev = hi;
-            i++;
-            continue;
-        }
-        if (pc == '\\') {
-            i++;
-            if (i >= plen)
-                return -1;
-            pc = (unsigned char)pat[i];
-        }
-        if (c == pc)
-            matched = 1;
-        prev = pc;
-        have_prev = 1;
-        i++;
-    }
-    return -1;
-}
-
-/* Matches one path segment (never contains '/') against one pattern segment.
-   Iterative two-pointer backtracking: on a mismatch after a '*', re-extend
-   the most recent star by one character and retry -- O(plen*tlen) worst
-   case, zero recursion, so a pattern of 10,000 '*'s cannot smash the stack.
-   Consecutive stars (an embedded "**") collapse to plain '*' semantics. */
-static int seg_match(const char *pat, size_t plen, const char *text, size_t tlen)
-{
-    size_t p = 0;
-    size_t t = 0;
-    size_t star_p = SIZE_MAX; /* pattern pos right after the last '*' seen */
-    size_t star_t = 0;        /* text pos that star has consumed up to */
-
-    while (t < tlen) {
-        int advance = 0;
-
-        if (p < plen) {
-            char pc = pat[p];
-
-            if (pc == '*') {
-                star_p = ++p;
-                star_t = t;
-                continue;
-            }
-            if (pc == '?') {
-                p++;
-                advance = 1;
-            } else if (pc == '[') {
-                size_t consumed;
-
-                if (class_match(pat + p, plen - p, text[t], &consumed) > 0) {
-                    p += consumed;
-                    advance = 1;
-                }
-                /* 0: not a member; -1: unterminated class, which never
-                   matches (git behavior) -- both take the backtrack path. */
-            } else if (pc == '\\') {
-                if (p + 1 < plen && pat[p + 1] == text[t]) {
-                    p += 2;
-                    advance = 1;
-                }
-                /* a lone trailing backslash matches nothing */
-            } else if (pc == text[t]) {
-                p++;
-                advance = 1;
-            }
-        }
-        if (advance) {
-            t++;
-            continue;
-        }
-        if (star_p != SIZE_MAX) {
-            t = ++star_t;
-            p = star_p;
-            continue;
-        }
-        return 0;
-    }
-    while (p < plen && pat[p] == '*')
-        p++;
-    return p == plen;
-}
-
 static size_t seg_end(const char *s, size_t len, size_t pos)
 {
     while (pos < len && s[pos] != '/')
@@ -181,10 +63,11 @@ static int is_dstar_seg(const char *pat, size_t start, size_t end)
     return end - start == 2 && pat[start] == '*' && pat[start + 1] == '*';
 }
 
-/* Anchored whole-path match. '*', '?' and classes never cross '/'; a full
-   "**" segment matches zero or more whole directories. The same two-pointer
-   backtracking as seg_match, lifted to segment granularity, so this too is
-   fully iterative. One asymmetry, verified against git: a trailing
+/* Anchored whole-path match. '*', '?' and classes never cross '/' (that is
+   this layer's whole job -- sg_wildmatch on its own lets them); a full "**"
+   segment matches zero or more whole directories. The same two-pointer
+   backtracking as sg_wildmatch, lifted to segment granularity, so this too
+   is fully iterative. One asymmetry, verified against git: a trailing
    slash-plus-"**" needs at least one segment left (the pattern "ab" + "/"
    + "**" matches "ab/f" but not "ab" itself), which falls out naturally
    because a "**" segment the loop never reached still sits in the
@@ -206,7 +89,7 @@ static int path_match(const char *pat, size_t plen, const char *path, size_t tle
             p = star_p;
             continue;
         }
-        if (p < plen && seg_match(pat + p, pe - p, path + t, te - t)) {
+        if (p < plen && sg_wildmatch(pat + p, pe - p, path + t, te - t)) {
             p = (pe < plen) ? pe + 1 : pe;
             t = (te < tlen) ? te + 1 : te;
             continue;
@@ -429,7 +312,7 @@ static int frame_verdict(const sg_ignore_frame *f, const char *path, size_t len,
         if (r->anchored)
             hit = path_match(r->pattern, r->len, rel, rel_len);
         else
-            hit = seg_match(r->pattern, r->len, bn, bn_len);
+            hit = sg_wildmatch(r->pattern, r->len, bn, bn_len);
         if (hit)
             return r->negated ? SG_IGN_KEPT : SG_IGN_IGNORED;
     }

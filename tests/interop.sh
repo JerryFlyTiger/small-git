@@ -9020,6 +9020,217 @@ printf 'a\nb\n' > "$P27_CLEAN/exec.txt"
 check "phase27 control: sg switch still succeeds when the working tree is clean" \
     sh -c "cd '$P27_CLEAN' && '$SG' switch other > /dev/null 2>&1"
 
+# --- Phase 28: `sg diff` pathspec ---------------------------------------
+#
+# Every case here is a byte compare against real git for the SAME argument
+# list, because the pathspec rules are the kind that feel obvious and are
+# not: '*' crosses '/', a spec that contains a wildcard gets no
+# leading-directory treatment at all, and a trailing '/' is not noise.
+# Asserting sg's output on its own would have frozen whatever sg happened to
+# do; only git can say which of those is right.
+P28="$WORKDIR/p28_pathspec"
+(cd "$WORKDIR" && "$SG" init p28_pathspec) > /dev/null 2>&1
+(cd "$P28" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P28/sub/deep" "$P28/other"
+printf 'a1\na2\n' > "$P28/a.txt"
+printf 'b1\nb2\n' > "$P28/sub/b.txt"
+printf 'c1\nc2\n' > "$P28/sub/deep/c.txt"
+printf 'd1\nd2\n' > "$P28/other/d.c"
+printf 'e1\ne2\n' > "$P28/e.c"
+(cd "$P28" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+for f in a.txt sub/b.txt sub/deep/c.txt other/d.c e.c; do
+    printf 'CHANGED\n' >> "$P28/$f"
+done
+
+# Runs one argument list through both implementations from $1 and compares
+# the whole output. git needs core.quotepath=false to match sg's ">=0x80 is
+# printed raw" rule (CLAUDE.md); it is harmless for the ASCII names here and
+# keeps this helper usable if a hostile name is ever added to the fixture.
+p28_cmp() {
+    p28_dir="$1"
+    p28_label="$2"
+    shift 2
+    (cd "$p28_dir" && "$SG" diff "$@") > "$WORKDIR/p28_sg.txt" 2>/dev/null
+    (cd "$p28_dir" && git -c core.quotepath=false diff "$@") > "$WORKDIR/p28_git.txt" 2>/dev/null
+    check "phase28: sg diff $p28_label matches real git byte-for-byte" \
+        cmp -s "$WORKDIR/p28_sg.txt" "$WORKDIR/p28_git.txt"
+}
+
+# All six output formats through one leading-directory spec: the filter runs
+# before the renderer, so a format that lost the pathspec would show up here
+# and nowhere else.
+for p28_fmt in "" --stat --numstat --shortstat --name-only --name-status; do
+    if [ -z "$p28_fmt" ]; then
+        p28_cmp "$P28" "(patch) -- sub" -- sub
+    else
+        p28_cmp "$P28" "$p28_fmt -- sub" "$p28_fmt" -- sub
+    fi
+done
+
+# Literal specs: exact, directory, nested directory, no match at all.
+p28_cmp "$P28" "--name-only -- a.txt" --name-only -- a.txt
+p28_cmp "$P28" "--name-only -- sub/deep" --name-only -- sub/deep
+p28_cmp "$P28" "--name-only -- nosuch" --name-only -- nosuch
+p28_cmp "$P28" "--name-only -- two specs" --name-only -- a.txt sub
+p28_cmp "$P28" "--name-only -- ." --name-only -- .
+p28_cmp "$P28" "--name-only with a bare --" --name-only --
+
+# The trailing slash pair. These two differ from each other in git, so a
+# normalizer that dropped the slash would pass the first and fail the second.
+p28_cmp "$P28" "--name-only -- sub/" --name-only -- sub/
+p28_cmp "$P28" "--name-only -- a.txt/" --name-only -- 'a.txt/'
+
+# Wildcards. The three negatives are the point: 'o[tx]her', 'su?' and
+# 's*b' all match a directory NAME with changes underneath, and git reports
+# nothing for any of them.
+p28_cmp "$P28" "--name-only -- '*.c'" --name-only -- '*.c'
+p28_cmp "$P28" "--name-only -- 'sub/*'" --name-only -- 'sub/*'
+p28_cmp "$P28" "--name-only -- 'sub*'" --name-only -- 'sub*'
+p28_cmp "$P28" "--name-only -- 'o[tx]her'" --name-only -- 'o[tx]her'
+p28_cmp "$P28" "--name-only -- 'su?'" --name-only -- 'su?'
+p28_cmp "$P28" "--name-only -- 's*b'" --name-only -- 's*b'
+p28_cmp "$P28" "--name-only -- 'sub/dee?'" --name-only -- 'sub/dee?'
+
+# Pathspec against the other three comparisons, not just index-vs-worktree.
+(cd "$P28" && "$SG" add sub/b.txt) > /dev/null 2>&1
+p28_cmp "$P28" "--cached --name-status -- sub" --cached --name-status -- sub
+p28_cmp "$P28" "--cached --name-status -- a.txt" --cached --name-status -- a.txt
+p28_cmp "$P28" "HEAD --name-status -- sub" HEAD --name-status -- sub
+p28_cmp "$P28" "HEAD HEAD --name-status -- sub" HEAD HEAD --name-status -- sub
+
+# Specs are relative to the current directory, not the repository root.
+p28_cmp "$P28/sub" "--name-only -- b.txt (from sub/)" --name-only -- b.txt
+p28_cmp "$P28/sub" "--name-only -- . (from sub/)" --name-only -- .
+p28_cmp "$P28/sub" "--name-only -- deep (from sub/)" --name-only -- deep
+p28_cmp "$P28/sub" "--name-only -- ../a.txt (from sub/)" --name-only -- ../a.txt
+p28_cmp "$P28/sub" "--name-only -- '*.txt' (from sub/)" --name-only -- '*.txt'
+
+# The bare (no "--") form: git's disambiguation, reproduced.
+p28_cmp "$P28" "--name-only a.txt (no --)" --name-only a.txt
+p28_cmp "$P28" "--name-only sub (no --)" --name-only sub
+p28_cmp "$P28" "--name-only '*.zzz' (no --)" --name-only '*.zzz'
+p28_cmp "$P28" "--name-only a.txt sub (no --)" --name-only a.txt sub
+p28_cmp "$P28" "HEAD --name-only a.txt (no --)" HEAD --name-only a.txt
+
+# A file that is gone from the working tree can only be named after "--";
+# bare, git calls it ambiguous. Both halves are asserted, because getting
+# only the permissive half right would still lose the error.
+rm -f "$P28/e.c"
+p28_cmp "$P28" "--name-only -- e.c (deleted file)" --name-only -- e.c
+check "phase28: a deleted path is rejected in the bare form, as git does" \
+    sh -c "! (cd '$P28' && '$SG' diff --name-only e.c) > /dev/null 2>&1"
+check "phase28 oracle: real git rejects it too" \
+    sh -c "! (cd '$P28' && git diff --name-only e.c) > /dev/null 2>&1"
+(cd "$P28" && git checkout -- e.c) > /dev/null 2>&1
+
+# Errors. Exit codes cannot be compared (git uses 128, sg only ever 0/1 per
+# CLAUDE.md), so each pair asserts that both refuse -- and each sg message is
+# asserted separately, since "exits non-zero" is satisfied by a crash too.
+P28_ERR="$WORKDIR/p28_err.txt"
+
+(cd "$P28" && "$SG" diff --name-only -- '') > "$P28_ERR" 2>&1
+check "phase28: sg diff rejects an empty pathspec" test $? != 0
+check "phase28: and says so, pointing at '.' the way git does" \
+    grep -q '空字串不是有效的路徑' "$P28_ERR"
+check "phase28 oracle: real git rejects an empty pathspec too" \
+    sh -c "! (cd '$P28' && git diff --name-only -- '') > /dev/null 2>&1"
+
+(cd "$P28" && "$SG" diff --name-only -- /etc/passwd) > "$P28_ERR" 2>&1
+check "phase28: sg diff rejects a pathspec outside the worktree" test $? != 0
+check "phase28: and names the repository it is outside of" \
+    grep -q '在版本庫' "$P28_ERR"
+check "phase28 oracle: real git rejects it too" \
+    sh -c "! (cd '$P28' && git diff --name-only -- /etc/passwd) > /dev/null 2>&1"
+
+(cd "$P28" && "$SG" diff --name-only ':(icase)a.txt') > "$P28_ERR" 2>&1
+check "phase28: sg diff rejects pathspec magic instead of taking it literally" test $? != 0
+check "phase28: and says which spec it could not understand" \
+    grep -q 'pathspec magic' "$P28_ERR"
+
+(cd "$P28" && "$SG" diff --name-only nosuch) > "$P28_ERR" 2>&1
+check "phase28: a bare argument that is neither rev nor path is refused" test $? != 0
+check "phase28: and the message points at --" \
+    grep -q '有歧義的參數' "$P28_ERR"
+check "phase28 oracle: real git refuses it too" \
+    sh -c "! (cd '$P28' && git diff --name-only nosuch) > /dev/null 2>&1"
+
+(cd "$P28" && "$SG" diff --name-only a.txt HEAD) > "$P28_ERR" 2>&1
+check "phase28: once an argument is a path, a later revision is refused" test $? != 0
+check "phase28: and the message names HEAD as the path that is missing" \
+    grep -q 'HEAD' "$P28_ERR"
+check "phase28 oracle: real git refuses that ordering too" \
+    sh -c "! (cd '$P28' && git diff --name-only a.txt HEAD) > /dev/null 2>&1"
+
+# A name that is BOTH a branch and a file is git's other ambiguity error.
+(cd "$P28" && "$SG" branch a.txt) > /dev/null 2>&1
+(cd "$P28" && "$SG" diff --name-only a.txt) > "$P28_ERR" 2>&1
+check "phase28: an argument that is both a revision and a file is refused" test $? != 0
+check "phase28: and the message says it is both" \
+    grep -q '可同時是版本和檔案' "$P28_ERR"
+check "phase28 oracle: real git refuses it too" \
+    sh -c "! (cd '$P28' && git diff --name-only a.txt) > /dev/null 2>&1"
+p28_cmp "$P28" "--name-only -- a.txt (ambiguous name, after --)" --name-only -- a.txt
+(cd "$P28" && "$SG" branch -d a.txt) > /dev/null 2>&1
+
+# Positive control. Everything above is a cmp against git, which stays green
+# if BOTH sides print everything -- so this pins down that the filter really
+# removes something: unfiltered output mentions a.txt, filtered output must
+# not, and must still mention the path that was asked for.
+(cd "$P28" && "$SG" diff --name-only) > "$WORKDIR/p28_all.txt" 2>/dev/null
+(cd "$P28" && "$SG" diff --name-only -- sub) > "$WORKDIR/p28_filtered.txt" 2>/dev/null
+check "phase28 control: the unfiltered list really does contain a.txt" \
+    grep -q '^a\.txt$' "$WORKDIR/p28_all.txt"
+check "phase28 control: the filtered list drops it" \
+    sh -c "! grep -q '^a\\.txt\$' '$WORKDIR/p28_filtered.txt'"
+# sub/b.txt is staged by this point, so the unstaged list under sub/ is
+# sub/deep/c.txt -- naming the wrong one here would make this control assert
+# something that is false for a reason that has nothing to do with filtering.
+check "phase28 control: and keeps what was asked for" \
+    grep -q '^sub/deep/c\.txt$' "$WORKDIR/p28_filtered.txt"
+
+# An unresolved conflict is the one shape where a single path occupies TWO
+# adjacent rows of the change list (a "U" row and a stage-2-vs-worktree row,
+# Phase 25). Filtering must keep or drop the pair together, and the three
+# comparisons disagree about what a conflicted path even looks like -- so
+# each one is compared against git with a pathspec that selects the conflict
+# and one that excludes it.
+P28_CONF="$WORKDIR/p28_conflict"
+(cd "$WORKDIR" && "$SG" init p28_conflict) > /dev/null 2>&1
+(cd "$P28_CONF" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P28_CONF/sub"
+printf 'orig1\norig2\n' > "$P28_CONF/sub/c.txt"
+printf 'plain\n' > "$P28_CONF/a.txt"
+(cd "$P28_CONF" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P28_CONF" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P28_CONF/sub/c.txt"
+(cd "$P28_CONF" && "$SG" add sub/c.txt && "$SG" commit -m feature) > /dev/null 2>&1
+(cd "$P28_CONF" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P28_CONF/sub/c.txt"
+(cd "$P28_CONF" && "$SG" add sub/c.txt && "$SG" commit -m master) > /dev/null 2>&1
+(cd "$P28_CONF" && "$SG" merge feature < /dev/null) > /dev/null 2>&1
+printf 'also changed\n' >> "$P28_CONF/a.txt"
+check "phase28 oracle: the fixture really is in a conflicted state" \
+    sh -c "cd '$P28_CONF' && git status --porcelain | grep -q '^UU sub/c.txt'"
+p28_cmp "$P28_CONF" "--name-status -- sub (conflicted path)" --name-status -- sub
+p28_cmp "$P28_CONF" "--name-status -- a.txt (conflict excluded)" --name-status -- a.txt
+p28_cmp "$P28_CONF" "--cached --name-status -- sub (conflicted path)" --cached --name-status -- sub
+p28_cmp "$P28_CONF" "--cached --name-status -- a.txt (conflict excluded)" --cached --name-status -- a.txt
+p28_cmp "$P28_CONF" "HEAD --name-status -- sub (conflicted path)" HEAD --name-status -- sub
+# The pair is what makes this fixture different from every other case above:
+# plain `sg diff` reports the conflicted path twice, and a pathspec naming it
+# must not return just one of the two rows.
+(cd "$P28_CONF" && "$SG" diff --name-status -- sub) > "$WORKDIR/p28_conf_pair.txt" 2>/dev/null
+check "phase28: a pathspec on a conflicted path keeps both of its rows" \
+    sh -c "grep -c 'sub/c.txt' '$WORKDIR/p28_conf_pair.txt' | grep -q '^2\$'"
+check "phase28: one of them is the U row" \
+    grep -q '^U' "$WORKDIR/p28_conf_pair.txt"
+
+# `sg diff -- --stat` must diff a file named "--stat", not switch formats.
+printf 'x\n' > "$P28/--stat"
+(cd "$P28" && "$SG" add -- './--stat' && "$SG" commit -m dashfile) > /dev/null 2>&1
+printf 'y\n' >> "$P28/--stat"
+p28_cmp "$P28" "-- --stat (a file named like an option)" -- '--stat'
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

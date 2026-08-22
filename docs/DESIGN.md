@@ -2611,7 +2611,7 @@ vs `untracked_tree`(`--only-untracked` 本來就是這樣做的)。
   沒有 `/dev/null`、沒有 3 行 context 的多 hunk 切分、沒有 `\ No newline at end of file`。
   因此 unmerged 列在 patch 格式**直接跳過**(真 git 印 `diff --cc` 合併格式)。
   機器可讀的四種格式才是這一輪拿來與 git 逐位元組比對的。
-- **沒有 pathspec 過濾、沒有 rename 偵測**(`sg_status_kind` 連資料結構都容不下)。
+- **沒有 pathspec 過濾**(Phase 28 已補)、**沒有 rename 偵測**(`sg_status_kind` 連資料結構都容不下)。
 - **符號連結**在三條走訪路徑都不列出——既有行為,與本專案「symlink 刻意延後」一致。
 - **index 同時有 stage 0 與 stage 1/2/3 時**,殘留的衝突條目被靜默略過。sg 自己的寫入
   路徑產生不出那個狀態(`cmd_add.c` 寫 stage 0 前必先 `sg_index_remove_all_stages`),
@@ -2727,7 +2727,7 @@ fixture 只能釘住有人想得到的對齊,而**想不到的那些正是實作
 ### 已知限制
 
 - 衝突路徑的 `diff --cc` 合併格式仍然直接跳過(`print_patch` 開頭 `continue`),未實作。
-- `sg diff` 仍不支援 pathspec(`sg diff -- <path>` 直接印 usage)。
+- `sg diff` 仍不支援 pathspec(`sg diff -- <path>` 直接印 usage)。**Phase 28 已補。**
 - rename 偵測沒做,`sg_diff_side` 的三態也還容不下。
 - 讀不到工作目錄檔案時,sg 不像真 git 那樣中止整個指令(`fatal: cannot hash`,退出碼 128),
   而是把該列留在清單裡、讓渲染層印出指名該檔的警告。**修改/刪除**那兩條路徑會把它
@@ -2814,3 +2814,120 @@ parity fuzzer 一開始只數「路徑有沒有被回報」,**不看 `kind`**。
 
 ⚠ 補的時候期望值要**明確寫死**,不可以拿 diff 側算出來的當期望——那是自我循環,
 兩邊一起錯就驗不到,而「兩邊會不會一起錯」正是這支 harness 存在的理由。
+
+## Phase 28:`sg diff` 的 pathspec
+
+`sg diff -- <path>` 先前直接印 usage。這一輪把它補上,順帶把 `sg diff` 的引數解析
+換成真 git 那套「版本還是路徑」的消歧規則。
+
+### 規則全部是實測來的,而且沒有一條符合直覺
+
+開工前先拿 git 2.55.0 量了一張表(`git diff --name-only -- <spec>`,worktree 裡有
+`a.txt`、`sub/b.txt`、`sub/deep/c.txt`、`other/d.c`、`e.c`,全部都有改動):
+
+| spec | git 的答案 | 為什麼會猜錯 |
+|---|---|---|
+| `sub` | `sub/b.txt`, `sub/deep/c.txt` | 目錄前綴,符合直覺 |
+| `*.c` | `e.c`, `other/d.c` | **`*` 會跨 `/`**——pathspec 用的是 WM_PATHNAME 關掉的 wildmatch |
+| `sub*` | `sub/b.txt`, `sub/deep/c.txt` | 中的原因是上面那條,**不是**遞迴進目錄 |
+| `o[tx]her` | (空) | 含萬用字元就**沒有**目錄前綴規則 |
+| `su?` / `s*b` / `sub/dee?` | (空) | 同上,三個都是空的 |
+| `sub/` | `sub/b.txt`, `sub/deep/c.txt` | 尾綴 `/` = 「這個名字底下的東西」 |
+| `a.txt/` | (空) | 同一條規則的另一半:一般檔案底下沒有東西 |
+| `lit*st`(檔名真的含 `*`) | `lit*st` | 字面量比對先跑,萬用字元字元被當成自己 |
+| `nosuch` | (空,退出 0) | `git diff` 對匹配不到的 pathspec **不報錯** |
+| `""` | fatal | 空字串不是有效的 pathspec |
+
+於是比對是**三條有順序的規則**(`spec_matches`,`src/workdir/pathspec.c`):字面量精確 →
+字面量目錄前綴 → 含萬用字元才走 `sg_wildmatch`。⚠ **前兩條與第三條不相加**。
+這正好是 git `match_pathspec_item` 的形狀:`ps_strncmp` 的字面量比對之後,
+才輪到 `wildmatch`,而字面量那一支要求整個 spec 是 path 的前綴,`o[tx]her` 過不了。
+
+### 共用 wildmatch,而不是寫第二個 glob
+
+`src/workdir/ignore.c` 裡的 `seg_match` 早就是一支純位元組的 wildmatch(`*` `?` `[]`
+`\` 全有,而且**不認識 `/`**)——那正是 pathspec 要的東西。gitignore 之所以看起來不同,
+是因為它在上面疊了一層 segment 邏輯讓 `*` 停在 `/`、讓 `**` 跨目錄。在真 git 裡這兩者
+也只差一個 `WM_PATHNAME` 旗標。
+
+所以 `seg_match` + `class_match` 原封不動搬進 `src/util/wildmatch.c` 成為 `sg_wildmatch`,
+ignore.c 保留 segment 層並改呼叫它。搬完先跑 `python3 tests/fuzz_ignore.py`(拿真 git
+當 oracle)200 輪 0 mismatch,確認搬移沒有改變 gitignore 的行為——這種重構最危險的
+失敗方式是「行為變了但沒有人發現」,而 ignore 這塊剛好有現成的差分 oracle。
+
+### 過濾放在清單建好之後
+
+`sg_diff_list_filter`(`src/workdir/diff.c`)吃一份已完成的 `sg_diff_list`。**不**下放到
+四個建構器裡面:四份各自的 pathspec 判斷,每一份對「哪些路徑參與比較」都有自己的
+理解,正是 Phase 27 花一個里程碑消滅的形狀。代價是被濾掉的檔案仍然被雜湊過一次
+——那是速度帳單,不是錯答案,已寫進標頭。
+
+unmerged 路徑在 index-vs-工作目錄下佔**相鄰兩列**(Phase 25),兩列同路徑,所以一起留或
+一起走,不可能被拆散。
+
+### 裸引數的消歧
+
+`--` 之後不做任何檢查(那就是打 `--` 的意義)。沒有 `--` 時每個引數逐一判斷,規則同樣
+是實測的:
+
+- 既是有效版本、又是既有檔案 → **直接拒絕**,不猜。
+- 第一個「是路徑」的引數結束版本清單,**其後每個引數都必須存在**——`git diff a.txt HEAD`
+  會指名 `HEAD` 失敗,即使它是完美的版本。
+- 兩者皆非 → 「有歧義的參數」。
+- ⚠ **含萬用字元的引數不做存在性檢查**:`git diff '*.zzz'` 匹配不到任何東西仍然退出 0,
+  而 `git diff nosuch` 是硬錯誤。這條由 `sg_pathspec_looks_like_spec` 回答,字元集只有
+  那一份,和給那些字元意義的比對器放在同一個檔案。
+
+magic(`:(icase)`、`:!`、`:/`)**拒絕而不是當成字面路徑**。當成字面路徑的話,使用者得到的
+是一個匹配不到東西的空 diff,或者更糟——匹配到一個真的叫 `:!sub` 的檔案。兩者都是在回答
+使用者沒問的問題,而 diff 靜默少印檔案是這裡最糟的失敗方式。
+
+### 驗證:正向與反向 mutation
+
+interop 新增 68 條檢查(1432 → 1500),**幾乎每一條都是同一組引數在 sg 與真 git 之間的
+全輸出 `cmp`**;斷言 sg 自己的輸出等於把「sg 當下的行為」凍結起來,只有 git 說得出哪一種才對。
+錯誤案例不能比對退出碼(git 用 128,本專案只有 0/1),所以拆成兩半:sg 拒絕、
+而且訊息指名理由;旁邊再放一條「真 git 也拒絕」的 oracle 檢查。
+
+定向 mutation 八條,全部被抓到:
+
+| mutation | 變紅 |
+|---|---|
+| 拿掉目錄前綴規則 | interop 15 條 + 單元測試 6 條 |
+| 讓 `sg_diff_list_filter` 什麼都不濾 | interop 約 30 條(含正面對照組) |
+| 拿掉萬用字元分支(`if (has_wildcard(spec))` → `if (0)`) | interop 4 條 |
+| 不把尾綴 `/` 接回去 | interop 1 條(`a.txt/`) |
+| `arg_exists_in_worktree` 恆真 | interop 6 條 |
+| 拿掉「既是版本又是檔案」的拒絕 | interop 2 條 |
+| `looks_like_spec` 不認 `:` | interop **1 條,而且只有訊息那條** |
+| **反向**:讓含萬用字元的 spec 也吃目錄前綴規則 | interop 3 條(`su?`、`s*b`、`sub/dee?`) |
+
+最後一條是**反向 mutation**,也是這一輪真正的驗證重點:規則寫得**過寬**完全沒有徵兆,
+所有正向檢查照樣全綠。`su?`/`s*b`/`sub/dee?` 那三條「必須是空的」檢查,唯一的存在理由
+就是讓這條變紅。⚠ 誠實記下:`o[tx]her` 那條**沒有**紅——不是它沒鑑別力,而是這個特定的
+過寬規則(拿 spec 去比對 path 的前 `slen` 個位元組)剛好打不到它;換一種過寬寫法會打到。
+**一條 mutation 沒紅只證明這條 mutation 打不到那裡,不證明那個維度沒有覆蓋。**
+
+倒數第二條同樣值得記:把 `sg_pathspec_looks_like_spec` 裡的 `:` 拿掉之後,
+`sg diff :(icase)a.txt` 仍然退出非 0(改走「有歧義的參數」那條路),於是「拒絕 magic」
+那條檢查照樣綠——只有「訊息說得出理由」那條紅了。**把「拒絕」和「說出為什麼拒絕」拆成
+兩條斷言,是這條 mutation 唯一的可觀測性來源。**
+
+還有一條正面對照組(`phase28 control`):未過濾的清單裡確實有 `a.txt`,過濾後必須沒有、
+而且必須還留著被指名的那個路徑。理由是所有 `cmp` 檢查在「兩邊都印出全部」時**照樣全綠**
+——過濾器整支變成 no-op 的話,只有這條抓得到。
+
+衝突路徑另有一組:unmerged 在 index-vs-工作目錄下佔相鄰兩列,是唯一可能被過濾器
+「拆散」的結構。三種比較各配一個選中衝突、一個排除衝突的 pathspec 與 git 對比,
+再加一條直接數列數的檢查(必須是 2,其中一條是 `U`)。
+
+### 這一輪刻意沒做的
+
+- **magic pathspec** 全部拒絕,沒有實作。
+- **`core.ignorecase`**:比對一律逐位元組,即使在 macOS 的大小寫不敏感檔案系統上
+  (實測真 git 在同樣環境也是逐位元組:`git diff -- A.TXT` 對 `a.txt` 印不出東西)。
+- **`sg stash show`、`sg status` 的 pathspec**:兩者都吃得到同一份 `sg_pathspec`,
+  但這一輪只接 `sg diff`。
+- **三個以上的 rev**:真 git 的 `git diff HEAD HEAD HEAD` 退出 0(合併 diff 的路徑),
+  sg 判成 usage 錯誤。已知分歧。
+- 效能:被濾掉的路徑仍然會被雜湊。見上。

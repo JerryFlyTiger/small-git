@@ -6,6 +6,7 @@
 #include "sg/chunk.h"
 #include "sg/hash.h"
 #include "sg/index.h"
+#include "sg/pathspec.h"
 
 /* Building a list of changed paths, decoupled from where the two sides come
    from. Before this existed `sg diff` could only ever compare the index to the
@@ -150,6 +151,23 @@ int sg_diff_index_workdir(const char *git_dir, const char *repo_root,
 int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                          const unsigned char *old_tree, const sg_index *idx,
                          sg_diff_list *out, char *bad_path);
+
+/* Drops every entry whose path the pathspec does not cover, freeing it. An
+   empty pathspec matches everything, so an unfiltered `sg diff` and a
+   filtered one run the same code.
+
+   Filtering happens here, after the four builders above have already done
+   their work, rather than inside them: one filter cannot disagree with
+   itself, whereas four pathspec checks -- one per builder, each with its own
+   idea of when a path takes part -- is exactly the shape of the bug Phase 27
+   spent a milestone removing. The cost is that a filtered `sg diff` still
+   hashes every working-tree file before throwing most of them away; that is
+   a speed bill, not a wrong answer.
+
+   An unmerged path can occupy two adjacent entries (see
+   sg_diff_index_workdir); both carry the same path, so both survive or both
+   go, and the pair can never be split. */
+void sg_diff_list_filter(sg_diff_list *list, const sg_pathspec *ps);
 
 /* Loads one side's bytes. An ABSENT side yields (NULL, 0), which is what the
    renderers want for an addition or a deletion. BLOB sides go through

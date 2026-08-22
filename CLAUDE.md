@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 48 個單元測試二進位,任一失敗即整體失敗
+make test                         # 49 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -28,7 +28,7 @@ python3 tests/fuzz_diff.py        # patch 輸出一致性 fuzzer(預設 200 輪)
 
 - 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
   的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
-- `make test` 那行的 `N/48 個跑到`,N 少於 48 就是**中途中止**(Makefile 在第一
+- `make test` 那行的 `N/49 個跑到`,N 少於 49 就是**中途中止**(Makefile 在第一
   個失敗的二進位就停),不是「其他都過了」。
 - 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
 - interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
@@ -86,7 +86,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 |---|---|---|
 | `object/` | 物件的序列化/解析,純記憶體,不碰 fs | hash |
 | `index/` | index v2 二進位讀寫與有序條目操作,不讀物件 | hash |
-| `util/` | zlib、SHA-1、levenshtein、LCS 表 | — |
+| `util/` | zlib、SHA-1、levenshtein、LCS 表、wildmatch | — |
 | `storage/` | 物件與 ref 落磁碟:loose、pack、chunk、refs、reflog、repo、revparse | object, workdir |
 | `net/` | smart-HTTP:libcurl 封裝、pkt-line、transport | — |
 | `workdir/` | 工作目錄:路徑/檔案 I/O、ignore、status、diff(變更清單)、apply、merge、tree_build | 幾乎全部 |
@@ -117,7 +117,12 @@ staging 的驗證。本機綠燈不是充分證據。**
   **損壞的 HEAD 要由呼叫端先擋掉**——NULL 自己分不出這兩者,函式若擅自猜測就
   等於把 Phase 18 費力建立的區分洗掉。
 - **`util/` 裡沒有路徑*解析***(那些在 `workdir.h`),但從 Phase 23 起有一支純位元組
-  轉換 `util/quote.c`。路徑解析、`mkdir -p`、讀寫檔
+  轉換 `util/quote.c`,Phase 28 起再加一支 `util/wildmatch.c`。後者是 git 的
+  wildmatch 在「`/` 不特別」模式下的實作,**gitignore 與 pathspec 共用同一份**:
+  `src/workdir/ignore.c` 在它上面疊 segment 層讓 `*` 停在 `/`、讓 `**` 跨目錄,
+  那一層就是 gitignore 比 pathspec 多出來的東西(在真 git 裡也只差一個 WM_PATHNAME
+  旗標)。**不要為了 pathspec 再寫第二個 glob 比對器。**
+路徑解析、`mkdir -p`、讀寫檔
   在 `include/sg/workdir.h`(`sg_resolve_repo_path`、`sg_mkdir_parents`、
   `sg_read_file`、`sg_write_file_mkdirs`、`sg_hash_file_blob`)。找路徑工具要去
   `workdir.h`,不要去 `util/`,也不要自己再寫一份。
@@ -166,6 +171,26 @@ staging 的驗證。本機綠燈不是充分證據。**
   **不要去找一個不存在的評分 bug**;細節見 `docs/DESIGN.md` Phase 26。
   動到 `diff_out.c` / `diff_lcs.c` / `workdir/diff.c` 時,`make test` 綠**不算數**,
   要跑 `python3 tests/fuzz_diff.py 200 --max-failures 0` 並比對殘留數字。
+- **pathspec 一律走 `sg_pathspec_*`**(`include/sg/pathspec.h`,Phase 28),比對規則
+  是**三條、有順序**:字面量精確、字面量的目錄前綴、含萬用字元才走 `sg_wildmatch`。
+  ⚠ **前兩條與第三條不相加**:含萬用字元的 spec **沒有**目錄前綴規則。實測真 git
+  2.55.0:`o[tx]her` 對 `other/d.c` 印不出東西、`su?` 與 `s*b` 對 `sub/` 底下也是空的;
+  `sub*` 之所以會中,是因為 **`*` 會跨 `/`**(pathspec 用的是 WM_PATHNAME 關掉的
+  wildmatch),不是因為遞迴進目錄。憑直覺把兩者統一會讓 `sg diff` 靜默多印或少印檔案。
+  ⚠ **尾綴 `/` 有意義,不是雜訊**:`sub/` 列出 sub 的內容,`a.txt/` **什麼都不匹配**
+  (它問的是「這個名字底下的東西」)。`sg_resolve_repo_path_allow_root` 會把它正規化掉,
+  所以 `sg_pathspec_add` 記得再接回去——這一對是唯一分得出「有沒有接回去」的測試。
+  ⚠ **magic(`:(icase)`、`:!`、`:/`)一律拒絕,不可以當成字面路徑**:靜默匹配不到、
+  或匹配到一個真的叫 `:!sub` 的檔案,都是在回答使用者沒問的問題。
+  過濾發生在**清單建好之後**(`sg_diff_list_filter`),不在四個建構器裡面——四份各自
+  的 pathspec 判斷正是 Phase 27 花一個里程碑消滅的形狀。代價是被過濾掉的檔案仍然被
+  雜湊過一次,那是速度帳單不是錯答案。
+- **裸引數(不加 `--`)的消歧規則是實測來的,不要簡化**(Phase 28):既是版本又是既有
+  檔案 → 直接拒絕;**第一個路徑之後的每個引數都必須存在**(`sg diff a.txt HEAD` 會
+  指名 HEAD 失敗,即使它是完美的版本);兩者皆非 → 「有歧義的參數」。⚠ **含萬用字元
+  的引數不做存在性檢查**——`git diff '*.zzz'` 匹配不到任何東西仍然退出 0,而
+  `git diff nosuch` 是硬錯誤。判斷「這看起來像 pathspec 嗎」用
+  `sg_pathspec_looks_like_spec`,字元集只有那一份,與比對器放在一起。
 - **兩種引用規則不可以「統一」**(Phase 25):`sg status --porcelain`/`-s` 用
   `sg_quote_path_porcelain`——**只要含空格就引用**,因為 `?? ` 前綴讓空格變成欄位
   分隔符;長格式與四種機器格式用 `sg_quote_path`——**空格不引**。兩者都引控制字元。
@@ -403,7 +428,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 48 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 49 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。
