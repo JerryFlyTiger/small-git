@@ -8990,6 +8990,26 @@ check "phase27 oracle: precondition -- git really does print ' M exec.txt' for a
 (cd "$P27_MODE" && "$SG" switch other) > "$WORKDIR/p27_switch_dirty.txt" 2>&1
 check "phase27: sg switch refuses to switch branches with an unstaged mode-only change" \
     sh -c "! (cd '$P27_MODE' && '$SG' switch other) > /dev/null 2>&1"
+check "phase27: and names the mode-only change as the reason (not a generic failure)" \
+    grep -q 'modified (unstaged): exec.txt' "$WORKDIR/p27_switch_dirty.txt"
+
+# sg_require_clean_workdir (src/workdir/apply.c) is a structurally different
+# caller from sg_safe_apply_tree above -- it is what `sg merge`/`sg rebase`
+# use to refuse a dirty working tree before doing anything, rather than
+# confirm-and-snapshot. It shares sg_status_diff_unstaged, so the same
+# mode-only chmod must trip it too.
+P27_MERGE="$WORKDIR/p27_merge"
+(cd "$WORKDIR" && "$SG" init p27_merge) > /dev/null 2>&1
+(cd "$P27_MERGE" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'a\nb\n' > "$P27_MERGE/exec.txt"
+(cd "$P27_MERGE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P27_MERGE" && "$SG" branch other) > /dev/null 2>&1
+chmod +x "$P27_MERGE/exec.txt"
+(cd "$P27_MERGE" && "$SG" merge other) > "$WORKDIR/p27_merge_dirty.txt" 2>&1
+check "phase27: sg merge refuses (via sg_require_clean_workdir) an unstaged mode-only change" \
+    sh -c "! (cd '$P27_MERGE' && '$SG' merge other) > /dev/null 2>&1"
+check "phase27: and names the mode-only change as the reason" \
+    grep -q 'modified (unstaged): exec.txt' "$WORKDIR/p27_merge_dirty.txt"
 
 P27_CLEAN="$WORKDIR/p27_clean"
 (cd "$WORKDIR" && "$SG" init p27_clean) > /dev/null 2>&1

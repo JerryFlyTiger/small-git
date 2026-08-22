@@ -130,13 +130,19 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
    through this list. sg_diff_index_workdir emits the `unmerged` row, and, for
    the same path, may also emit a second, ordinary row comparing stage 2 vs
    the working tree (see its header comment) -- that second row does not carry
-   the `unmerged` flag, but it shares the same path as the row before it, and
-   an unmerged path is exactly the only case where two consecutive entries can
-   share a path, so "shares the previous entry's path" is what's used to catch
-   it here too. Without that second check, a conflicted file's stage-2-vs-
-   worktree row would leak into the unstaged list -- an unmerged path showing
-   up here for the first time -- which is exactly the regression #3 exists to
-   prevent. */
+   the `unmerged` flag, but it directly follows the unmerged row it belongs to
+   and shares its path, so "the previous entry is unmerged AND shares this
+   entry's path" is what's used to catch it here too. Checking both, not just
+   path equality, matters because sg_index_read (src/index/index.c) does not
+   validate that idx is sorted or deduplicated on load: a corrupted or
+   hand-edited index can put two unrelated ordinary rows for the same path in
+   two separate, non-adjacent groups that happen to land next to each other in
+   sg_diff_index_workdir's output (see include/sg/status.h's documented
+   invariant); bare path equality would misclassify the second one as the
+   first one's unmerged companion and silently drop a real change. Without
+   the unmerged-row skip at all, a conflicted file's stage-2-vs-worktree row
+   would leak into the unstaged list -- an unmerged path showing up here for
+   the first time -- which is exactly the regression #3 exists to prevent. */
 int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg_index *idx,
                             sg_status_list *out)
 {
@@ -154,10 +160,19 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
         if (dl.entries[i].unmerged)
             continue;
         /* The stage-2-vs-worktree companion row for the unmerged path just
-           skipped: same path as the entry before it, which cannot happen any
-           other way (sg_diff_list is sorted by path, one row per ordinary
-           path). */
-        if (i > 0 && strcmp(dl.entries[i].path, dl.entries[i - 1].path) == 0)
+           skipped: same path as the entry before it, AND that previous entry
+           was itself the unmerged row. Checking unmerged-ness of the
+           previous row too (not just path equality) matters when idx is not
+           actually sorted/deduplicated -- sg_index_read (src/index/index.c)
+           does not validate either invariant on load, so a corrupted or
+           hand-edited index can legitimately contain two unrelated ordinary
+           rows for the same path in two non-adjacent groups that happen to
+           land next to each other here (nothing differs in between). Bare
+           path equality would silently drop the second one as if it were an
+           unmerged companion row; requiring the previous row to be unmerged
+           closes that. */
+        if (i > 0 && dl.entries[i - 1].unmerged &&
+           strcmp(dl.entries[i].path, dl.entries[i - 1].path) == 0)
             continue;
 
         if (dl.entries[i].old_side.kind == SG_DIFF_SIDE_ABSENT)

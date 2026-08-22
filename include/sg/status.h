@@ -62,10 +62,28 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
    sg_diff_index_workdir may also emit for the same path is likewise excluded
    -- see the .c file's comment on sg_status_diff_unstaged.
 
+   Invariant relied on above (in the "unresolved conflict" paragraph) and by
+   the adapter's own implementation: a non-unmerged path never produces more
+   than one row in sg_diff_index_workdir's output, so two consecutive rows
+   sharing the same path can only happen for an unmerged path's stage-2-vs-
+   workdir companion row. Anything that makes sg_diff_index_workdir emit a
+   second row for an ordinary path (e.g. a future rename-detection feature)
+   must update this adapter's row-skipping logic in lockstep, or it will
+   silently start dropping that path's second row here too.
+
    Returns 0 on success, -1 on allocation failure (this function's own, or
    sg_diff_index_workdir's -- see sg/diff.h; a chunk pointer whose data is
-   missing or corrupt does NOT fail the call, it just falls back to comparing
-   against the working file's own hash). */
+   missing or corrupt does NOT fail the call -- sg_diff_index_workdir cannot
+   answer "did this path change" in that case, so it reports the path as
+   modified instead of failing the whole walk, and this adapter passes that
+   through unchanged; see sg_diff_index_workdir's own contract in sg/diff.h
+   for the full reasoning. This is a deliberate diagnostic downgrade: before
+   this adapter existed, a broken chunk pointer made this function print "無法
+   完整判斷工作目錄狀態" through its callers' safety gates; now the same path
+   is indistinguishable from an ordinary edit. Safety is unaffected --
+   unstaged.count > 0 still makes every dirty-workdir gate refuse -- but the
+   caller no longer learns that the underlying cause was a corrupt chunk
+   pointer rather than a real edit). */
 int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg_index *idx,
                             sg_status_list *out);
 

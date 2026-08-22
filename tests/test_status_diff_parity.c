@@ -350,6 +350,78 @@ static void test_mode_only_now_reported(void)
     free(git_dir);
 }
 
+/* The stage-2 filter must key on "the previous row was unmerged", not on
+   "the previous row had the same path".
+
+   sg_index_read does not validate ordering or de-duplicate (src/index/index.c
+   -- it trusts the on-disk file), so a hand-edited or corrupted index can put
+   one path into two non-contiguous groups. diff.c's index_group_end only
+   coalesces a contiguous run, so both groups produce their own row, and if
+   nothing between them differs the two rows end up adjacent. A filter that
+   only compares paths reads the second one as the first one's stage-2
+   companion and drops it -- a real change, silently missing, from the list
+   that sg switch and sg reset --hard use to decide whether the working tree
+   is dirty. Reporting the path twice (what this asserts) is the harmless
+   direction and is what the pre-convergence implementation did too. */
+static void test_corrupt_index_duplicate_path_is_not_dropped(void)
+{
+    char *git_dir = make_tmp_repo("dup_path");
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    unsigned char id_a[SG_SHA1_RAW_LEN];
+    unsigned char id_b[SG_SHA1_RAW_LEN];
+    const unsigned char staged_a[] = "a staged\n";
+    const unsigned char workdir_a[] = "a CHANGED\n";
+    const unsigned char same_b[] = "b unchanged\n";
+    sg_status_list slist;
+
+    memset(&idx, 0, sizeof(idx));
+    blob_write(git_dir, staged_a, sizeof(staged_a) - 1, id_a);
+    blob_write(git_dir, same_b, sizeof(same_b) - 1, id_b);
+    index_upsert(&idx, "a.txt", 0, 0100644, id_a);
+    index_upsert(&idx, "b.txt", 0, 0100644, id_b);
+
+    /* a.txt differs from its blob, b.txt does not -- so b.txt contributes no
+       row and the two a.txt rows land next to each other. */
+    write_workdir_bytes(repo_root, "a.txt", workdir_a, sizeof(workdir_a) - 1);
+    write_workdir_bytes(repo_root, "b.txt", same_b, sizeof(same_b) - 1);
+
+    /* Append a second a.txt AFTER b.txt, bypassing sg_index_upsert, which
+       would have kept the array sorted and merged the two. This is the
+       corrupt on-disk shape sg_index_read would hand us verbatim. */
+    {
+        sg_index_entry *grown = realloc(idx.entries, (idx.count + 1) * sizeof(*grown));
+
+        if (grown == NULL) {
+            fprintf(stderr, "setup failed: realloc\n");
+            exit(1);
+        }
+        idx.entries = grown;
+        idx.entries[idx.count] = idx.entries[0];
+        idx.entries[idx.count].path = strdup("a.txt"); /* own copy: sg_index_free frees each */
+        if (idx.entries[idx.count].path == NULL) {
+            fprintf(stderr, "setup failed: strdup\n");
+            exit(1);
+        }
+        idx.count++;
+    }
+
+    CHECK(sg_status_diff_unstaged(git_dir, repo_root, &idx, &slist) == 0,
+         "sg_status_diff_unstaged failed");
+    CHECK(status_count(&slist, "a.txt") == 2,
+         "both rows for the duplicated path must survive: a filter keyed on path equality "
+         "instead of on the previous row being unmerged drops the second one, and that row is "
+         "a real change the dirty gates need to see (got %zu)",
+         status_count(&slist, "a.txt"));
+    CHECK(status_count(&slist, "b.txt") == 0, "b.txt is unchanged and must not be reported");
+
+    sg_status_list_free(&slist);
+    sg_index_free(&idx);
+    rm_rf(repo_root);
+    free(repo_root);
+    free(git_dir);
+}
+
 /* Divergence #2: an unresolved conflict with only stage 1/3 (no stage 2).
    sg_status_diff_unstaged silently skips every non-zero-stage entry (its own
    documented contract -- "sg status"'s separate "Unmerged paths" section is
@@ -756,6 +828,7 @@ typedef enum {
    documented emission order). */
 typedef struct {
     int status_reported; /* 0 or 1 */
+    sg_status_kind status_kind; /* meaningful only when status_reported */
     int diff_row_count;  /* 0, 1, or 2 */
     int diff_row_unmerged[2];
 } expectation;
@@ -786,6 +859,7 @@ static void setup_one(const char *git_dir, const char *repo_root, sg_index *idx,
         index_upsert(idx, path, 0, 0100644, id);
         write_workdir_bytes(repo_root, path, new_content, sizeof(new_content) - 1);
         exp->status_reported = 1;
+        exp->status_kind = SG_STATUS_MODIFIED;
         exp->diff_row_count = 1;
         break;
     }
@@ -797,6 +871,7 @@ static void setup_one(const char *git_dir, const char *repo_root, sg_index *idx,
         index_upsert(idx, path, 0, 0100644, id);
         /* deliberately never written to the working tree */
         exp->status_reported = 1;
+        exp->status_kind = SG_STATUS_DELETED;
         exp->diff_row_count = 1;
         break;
     }
@@ -811,6 +886,7 @@ static void setup_one(const char *git_dir, const char *repo_root, sg_index *idx,
         /* PARITY RESTORED: status now goes through the same builder, so it
            reports this row too. */
         exp->status_reported = 1;
+        exp->status_kind = SG_STATUS_MODIFIED;
         exp->diff_row_count = 1;
         break;
     }
@@ -837,6 +913,7 @@ static void setup_one(const char *git_dir, const char *repo_root, sg_index *idx,
         index_upsert(idx, path, 0, 0100644, id);
         write_workdir_bytes(repo_root, path, new_content, sizeof(new_content));
         exp->status_reported = 1;
+        exp->status_kind = SG_STATUS_MODIFIED;
         exp->diff_row_count = 1;
         break;
     }
@@ -884,6 +961,7 @@ static void setup_one(const char *git_dir, const char *repo_root, sg_index *idx,
         write_workdir_bytes(repo_root, path, data, len);
         free(data);
         exp->status_reported = 1;
+        exp->status_kind = SG_STATUS_MODIFIED;
         exp->diff_row_count = 1;
         break;
     }
@@ -1037,6 +1115,23 @@ static void fuzz_parity_round(uint64_t seed)
              "seed %llu path %s scenario %s: sg_status_diff_unstaged reported %zu entries, "
              "expected %zu",
              (unsigned long long)seed, paths[i], scenario_name(scenarios[i]), got, want);
+
+        if (got == 1 && want == 1) {
+            const sg_status_entry *e = status_find(&slist, paths[i]);
+
+            /* status_find returning NULL here would contradict status_count
+               just having found exactly one entry for this path -- treated
+               as a hard CHECK failure rather than silently skipping the kind
+               check, so a bug in either helper cannot hide behind the other. */
+            CHECK(e != NULL, "seed %llu path %s: status_find returned NULL despite status_count == 1",
+                 (unsigned long long)seed, paths[i]);
+            if (e != NULL)
+                CHECK(e->kind == expectations[i].status_kind,
+                     "seed %llu path %s scenario %s: sg_status_diff_unstaged reported kind %d, "
+                     "expected %d",
+                     (unsigned long long)seed, paths[i], scenario_name(scenarios[i]),
+                     (int)e->kind, (int)expectations[i].status_kind);
+        }
     }
     sg_status_list_free(&slist);
 
@@ -1084,6 +1179,7 @@ int main(void)
     test_unreadable_path_agrees();
     test_chunked_unmodified_agrees();
     test_untracked_file_not_reported();
+    test_corrupt_index_duplicate_path_is_not_dropped();
 
     for (i = 0; i < iters; i++)
         fuzz_parity_round((uint64_t)(seed_base + i));
