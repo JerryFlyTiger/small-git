@@ -355,85 +355,219 @@ static split_score score_position(const sg_diff_line *rec, size_t n, size_t pos,
     return s;
 }
 
-/* Computes the reachable slide range for a pure insert/delete group.
+/* ---- per-file group sliding (mirrors git's struct xdlgroup / group_*) --
 
-   `pos` is the group's position marker on its own axis (a_off for a pure
-   delete group, b_off for a pure insert group -- the axis where the group
-   has zero length). `content` is the OTHER array (b for insert, a for
-   delete), where the group's actual `len` lines live, starting at
-   `content_off` (which is NOT generally equal to `pos` -- the two axes can
-   have drifted apart by however much earlier groups added/removed).
-   `lower`/`upper` bound the marker axis (from the neighbouring groups, or
-   the file ends).
+   Unlike the paired sg_diff_group the backtrack produces, sliding operates
+   on ONE file's own "changed" bitmap at a time: changed[i] is true iff
+   line i of THIS file was touched by some edit (deleted, for the a-side;
+   inserted, for the b-side -- a "replace" simply means both sides have a
+   changed run at once, with no requirement that the runs line up). A
+   group is a maximal run of changed lines, or the (possibly empty) gap
+   between two runs -- there is one such gap immediately before every
+   changed[i]==false position, including one at index 0 and one at n, so
+   group_next/group_previous can always find a next/previous group by
+   walking exactly one context line at a time.
 
-   Sliding down step i (0<=i<down): at marker position pos+i, the context
-   line about to be swallowed, pos_file[pos+i], must equal the group's
-   current first content line, content[content_off+i] -- i.e. that context
-   line becomes the new first content line and the group's old first
-   content line becomes the new context line, sliding the window down by
-   one. Sliding up step i (0<=i<up): at marker position pos-i, the
-   preceding context line, pos_file[pos-i-1], must equal the group's
-   current LAST content line, content[content_off-i+len-1] (NOT
-   content_off-i-1+len-1 -- an earlier version of this function had that
-   off-by-one and it went undetected until tests/fuzz_diff.py caught a
-   delete group sliding onto the wrong line; see the Phase 26 note in
-   CLAUDE.md's own history of this file for the reproduction). */
-static void slide_range(const sg_diff_line *pos_file, size_t pos_n, const sg_diff_line *content,
-                        size_t content_n, size_t pos, size_t content_off, size_t len, size_t lower,
-                        size_t upper, size_t *low_out, size_t *high_out)
+   `changed` must point at a buffer of n+2 bytes offset by 1 (index -1 and
+   index n both readable and zero) -- see sg_diff_build_script, which owns
+   the allocation. start/end are `long`, not size_t, purely so start-1 and
+   end-1 can be formed and compared without wraparound; git's own xdlgroup
+   uses the same signed-index trick for the same reason. */
+typedef struct {
+    long start, end;
+} slide_group;
+
+static void group_init(const unsigned char *changed, slide_group *g)
 {
-    size_t down = 0, up = 0;
-
-    (void)pos_n;
-    (void)content_n;
-    while (pos + down < upper &&
-          sg_diff_lines_equal_exact(pos_file[pos + down], content[content_off + down]))
-        down++;
-    while (pos > lower + up &&
-          sg_diff_lines_equal_exact(pos_file[pos - up - 1], content[content_off - up + len - 1]))
-        up++;
-
-    *low_out = pos - up;
-    *high_out = pos + down;
+    g->start = g->end = 0;
+    while (changed[g->end])
+        g->end++;
 }
 
-/* Picks the best position in [low, high] using the indent heuristic,
-   ties broken toward `high` (the no-heuristic default). `content` is
-   scored (it is the file the group's own lines live in -- see
-   slide_range). content_off_at_low is the content-array offset
-   corresponding to position `low`. */
-static size_t pick_indent_position(const sg_diff_line *content, size_t content_n, size_t low, size_t high,
-                                   size_t content_off_at_low, size_t len)
+static int group_next(const unsigned char *changed, long n, slide_group *g)
 {
-    size_t best = low;
-    split_score best_score;
-    size_t p;
-    int best_valid = 0;
+    if (g->end == n)
+        return -1;
+    g->start = g->end + 1;
+    for (g->end = g->start; changed[g->end]; g->end++)
+        ;
+    return 0;
+}
 
-    /* Ascending, <=0 (not <0): git's loop walks shift from low to high and
-       replaces the best candidate on ties too, so among equally-good splits
-       the LAST (highest) one wins -- this is what makes "no heuristic
-       preference" default to the bottom of the range. */
-    for (p = low; p <= high; p++) {
-        size_t content_off = content_off_at_low + (p - low);
-        split_score score = score_position(content, content_n, content_off, len);
+static int group_previous(const unsigned char *changed, slide_group *g)
+{
+    if (g->start == 0)
+        return -1;
+    g->end = g->start - 1;
+    for (g->start = g->end; changed[g->start - 1]; g->start--)
+        ;
+    return 0;
+}
 
-        if (!best_valid || score_cmp(&score, &best_score) <= 0) {
-            best_score = score;
-            best = p;
-            best_valid = 1;
+/* If g can be slid one line toward the end of its own file, do so (merging
+   into whatever changed run it bumps into). Only valid within THIS file:
+   the line released (rec[g->start]) and the line absorbed (rec[g->end])
+   must be equal, because releasing/absorbing swaps which of two
+   identical-content lines plays "changed" vs "context" -- it never changes
+   what the diff represents. */
+static int group_slide_down(const sg_diff_line *rec, long n, unsigned char *changed, slide_group *g)
+{
+    if (g->end < n && sg_diff_lines_equal_exact(rec[g->start], rec[g->end])) {
+        changed[g->start++] = 0;
+        changed[g->end++] = 1;
+        while (changed[g->end])
+            g->end++;
+        return 0;
+    }
+    return -1;
+}
+
+static int group_slide_up(const sg_diff_line *rec, unsigned char *changed, slide_group *g)
+{
+    if (g->start > 0 && sg_diff_lines_equal_exact(rec[g->start - 1], rec[g->end - 1])) {
+        changed[--g->start] = 1;
+        changed[--g->end] = 0;
+        while (changed[g->start - 1])
+            g->start--;
+        return 0;
+    }
+    return -1;
+}
+
+#define SG_INDENT_HEURISTIC_MAX_SLIDING 100 /* verified: xdiffi.c's own constant, same name */
+
+/* Mirrors git's xdl_change_compact(): slides every maximal changed run in
+   `changed` (this file's own bitmap, scored against `rec`/`n`, this file's
+   own lines) as far up and down as group_slide_up/down allow, merging same
+   -file neighbours it bumps into along the way. `other_changed`/`on` is the
+   OTHER file's bitmap -- git's xdf1/xdf2 pairing guarantees the two files
+   have the same number of unchanged (context) lines in the same relative
+   order, so walking group_next/group_previous on both in lockstep visits
+   the "same" gap index in each; that is used ONLY as a tie-breaker: once a
+   group has been slid to its full up+down reachable range, prefer whatever
+   position (if any) still has a changed run in the other file at the same
+   gap (avoiding splitting what was really one edit into a separate
+   delete-then-add), and only fall back to the indent heuristic when no
+   such alignment exists anywhere in range. */
+static void compact_one_side(const sg_diff_line *rec, long n, unsigned char *changed,
+                             const unsigned char *other_changed, long on, int indent_heuristic)
+{
+    slide_group g, go;
+
+    (void)on;
+    group_init(changed, &g);
+    group_init(other_changed, &go);
+
+    for (;;) {
+        long earliest_end, end_matching_other, groupsize;
+
+        if (g.end == g.start)
+            goto next;
+
+        do {
+            groupsize = g.end - g.start;
+            end_matching_other = -1;
+
+            while (group_slide_up(rec, changed, &g) == 0)
+                group_previous(other_changed, &go);
+
+            earliest_end = g.end;
+            if (go.end > go.start)
+                end_matching_other = g.end;
+
+            for (;;) {
+                if (group_slide_down(rec, n, changed, &g) != 0)
+                    break;
+                group_next(other_changed, on, &go);
+                if (go.end > go.start)
+                    end_matching_other = g.end;
+            }
+        } while (groupsize != g.end - g.start);
+
+        if (g.end == earliest_end) {
+            /* fully unmovable -- nothing to decide */
+        } else if (end_matching_other != -1) {
+            while (go.end == go.start) {
+                group_slide_up(rec, changed, &g);
+                group_previous(other_changed, &go);
+            }
+        } else if (indent_heuristic) {
+            long shift, best_shift = -1;
+            split_score best_score = {0, 0};
+
+            shift = earliest_end;
+            if (g.end - groupsize - 1 > shift)
+                shift = g.end - groupsize - 1;
+            if (g.end - SG_INDENT_HEURISTIC_MAX_SLIDING > shift)
+                shift = g.end - SG_INDENT_HEURISTIC_MAX_SLIDING;
+            /* Ascending, <=0 (not <0): among equally-good splits the LAST
+               (highest, i.e. furthest down) one wins, matching git and this
+               module's own no-heuristic default of sliding to the bottom. */
+            for (; shift <= g.end; shift++) {
+                split_score score = score_position(rec, (size_t)n, (size_t)(shift - groupsize),
+                                                   (size_t)groupsize);
+
+                if (best_shift == -1 || score_cmp(&score, &best_score) <= 0) {
+                    best_score = score;
+                    best_shift = shift;
+                }
+            }
+            while (g.end > best_shift) {
+                group_slide_up(rec, changed, &g);
+                group_previous(other_changed, &go);
+            }
+        }
+
+    next:
+        if (group_next(changed, n, &g) != 0)
+            break;
+        group_next(other_changed, on, &go);
+    }
+}
+
+/* Rebuilds the final paired sg_diff_group list from the two (now
+   compacted) per-file bitmaps. Because achanged/bchanged share the same
+   count of unchanged positions in the same order (see compact_one_side's
+   comment), walking both index cursors forward together and only
+   advancing one past a changed run when THAT file's bitmap says so keeps
+   them synchronized: whenever neither is changed at the current pair, the
+   two positions are the same matched context line and both advance
+   together; whenever either is changed, the full run in each file
+   (independently -- possibly zero-length in one of them) becomes one
+   sg_diff_group, which is a plain "replace" only when both runs happen to
+   be non-empty at the same synchronized position, not a distinguished
+   case the caller has to special-case. */
+static int build_groups_from_changed(const unsigned char *achanged, size_t na, const unsigned char *bchanged,
+                                     size_t nb, group_builder *gb)
+{
+    size_t i = 0, j = 0;
+
+    while (i < na || j < nb) {
+        if ((i < na && achanged[i]) || (j < nb && bchanged[j])) {
+            size_t a_off = i, b_off = j;
+
+            while (i < na && achanged[i])
+                i++;
+            while (j < nb && bchanged[j])
+                j++;
+            if (gb_push(gb, a_off, i - a_off, b_off, j - b_off) != 0)
+                return -1;
+        } else {
+            i++;
+            j++;
         }
     }
-    return best;
+    return 0;
 }
 
 sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
                                     int indent_heuristic)
 {
     size_t **dp;
-    group_builder gb;
+    group_builder gb, final_gb;
     sg_diff_script *script;
-    size_t out, k;
+    unsigned char *achanged_buf, *bchanged_buf, *achanged, *bchanged;
+    size_t k;
 
     dp = sg_diff_lcs_table_exact(a, na, b, nb);
     if (dp == NULL)
@@ -449,130 +583,61 @@ sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_
     }
     sg_diff_lcs_free_table(dp, na);
 
-    /* Group compaction: slide every pure insert/delete group to the bottom
-       of its reachable range (or, with the heuristic, the best-scoring
-       position in that range).
-
-       Critically -- mirroring git's xdl_change_compact do-while, which
-       slides a group fully up and then fully down, merging in any adjacent
-       group it bumps into via group_previous/group_next, and repeats until
-       a full up+down pass changes nothing -- the merge decision is made
-       BEFORE the heuristic runs, purely from whether sliding reaches all
-       the way to a same-kind neighbour, and the heuristic then scores
-       across the *whole merged cluster's* range. Deciding placement first
-       and merging only if the heuristic happened to land on the boundary
-       (an earlier version of this file did that) is backwards: a
-       backtrack that matched a duplicated line to the "wrong" (but equally
-       optimal) occurrence produces two separate pure groups with a single
-       matched line between them that CAN slide away entirely, and scoring
-       each group only against its own unmerged range never lets the
-       heuristic see the option of treating them as one bigger insert --
-       confirmed against git 2.55.0 via tests/fuzz_diff.py (a case where the
-       unmerged scoring reliably picked the wrong split because it was
-       comparing the wrong two candidate splits).
-
-       "Replace" groups (both a_len and b_len non-zero) are left exactly
-       where the backtrack put them and are never merged -- sliding them,
-       and merging across the insert/delete boundary, would require
-       tracking each side on its own axis the way git's xdf1/xdf2 do, which
-       this reconstruction does not attempt (see the module comment). */
-    out = 0;
-    k = 0;
-    while (k < gb.count) {
-        sg_diff_group cur = gb.groups[k];
-        size_t next_k = k + 1;
-
-        if (cur.a_len > 0 && cur.b_len > 0) {
-            gb.groups[out] = cur;
-            out++;
-            k++;
-            continue;
-        }
-
-        for (;;) {
-            size_t lower_a = (out == 0) ? 0 : gb.groups[out - 1].a_off + gb.groups[out - 1].a_len;
-            size_t upper_a = (next_k == gb.count) ? na : gb.groups[next_k].a_off;
-            size_t lower_b = (out == 0) ? 0 : gb.groups[out - 1].b_off + gb.groups[out - 1].b_len;
-            size_t upper_b = (next_k == gb.count) ? nb : gb.groups[next_k].b_off;
-            size_t low, high;
-            int merged = 0;
-
-            if (cur.a_len == 0 && cur.b_len > 0)
-                slide_range(a, na, b, nb, cur.a_off, cur.b_off, cur.b_len, lower_a, upper_a, &low, &high);
-            else
-                slide_range(b, nb, a, na, cur.b_off, cur.a_off, cur.a_len, lower_b, upper_b, &low, &high);
-
-            if (out > 0) {
-                sg_diff_group *prev = &gb.groups[out - 1];
-
-                if (cur.a_len == 0 && cur.b_len > 0 && prev->a_len == 0 && prev->b_len > 0 && low == lower_a) {
-                    cur.a_off = prev->a_off;
-                    cur.b_off = prev->b_off;
-                    cur.b_len = prev->b_len + cur.b_len;
-                    out--;
-                    merged = 1;
-                } else if (cur.b_len == 0 && cur.a_len > 0 && prev->b_len == 0 && prev->a_len > 0 &&
-                           low == lower_b) {
-                    cur.b_off = prev->b_off;
-                    cur.a_off = prev->a_off;
-                    cur.a_len = prev->a_len + cur.a_len;
-                    out--;
-                    merged = 1;
-                }
-            }
-            if (!merged && next_k < gb.count) {
-                sg_diff_group *nxt = &gb.groups[next_k];
-
-                if (cur.a_len == 0 && cur.b_len > 0 && nxt->a_len == 0 && nxt->b_len > 0 && high == upper_a) {
-                    cur.b_len = cur.b_len + nxt->b_len;
-                    next_k++;
-                    merged = 1;
-                } else if (cur.b_len == 0 && cur.a_len > 0 && nxt->b_len == 0 && nxt->a_len > 0 &&
-                           high == upper_b) {
-                    cur.a_len = cur.a_len + nxt->a_len;
-                    next_k++;
-                    merged = 1;
-                }
-            }
-            if (merged)
-                continue;
-
-            /* Stable: [low, high] is the group's full reachable range
-               (after absorbing every mergeable same-kind neighbour).
-               Now, and only now, pick the final position within it. */
-            if (cur.a_len == 0 && cur.b_len > 0) {
-                size_t chosen = indent_heuristic
-                                    ? pick_indent_position(b, nb, low, high, cur.b_off - (cur.a_off - low),
-                                                           cur.b_len)
-                                    : high;
-
-                cur.b_off = cur.b_off + (chosen - cur.a_off);
-                cur.a_off = chosen;
-            } else {
-                size_t chosen = indent_heuristic
-                                    ? pick_indent_position(a, na, low, high, cur.a_off - (cur.b_off - low),
-                                                           cur.a_len)
-                                    : high;
-
-                cur.a_off = cur.a_off + (chosen - cur.b_off);
-                cur.b_off = chosen;
-            }
-            break;
-        }
-
-        gb.groups[out] = cur;
-        out++;
-        k = next_k;
-    }
-    gb.count = out;
-
-    script = malloc(sizeof(*script));
-    if (script == NULL) {
+    /* Two independent per-file "changed" bitmaps, offset by 1 so index -1
+       and index n both read as 0 (see compact_one_side/group_*'s own
+       comments for why that sentinel matters). Seeded from the backtrack's
+       paired groups -- a "replace" group simply marks both bitmaps over
+       its own range, with no other special-casing needed from here on. */
+    achanged_buf = calloc(na + 2, 1);
+    bchanged_buf = calloc(nb + 2, 1);
+    if (achanged_buf == NULL || bchanged_buf == NULL) {
+        free(achanged_buf);
+        free(bchanged_buf);
         free(gb.groups);
         return NULL;
     }
-    script->groups = gb.groups;
-    script->count = gb.count;
+    achanged = achanged_buf + 1;
+    bchanged = bchanged_buf + 1;
+
+    for (k = 0; k < gb.count; k++) {
+        sg_diff_group *grp = &gb.groups[k];
+        size_t t;
+
+        for (t = 0; t < grp->a_len; t++)
+            achanged[grp->a_off + t] = 1;
+        for (t = 0; t < grp->b_len; t++)
+            bchanged[grp->b_off + t] = 1;
+    }
+    free(gb.groups);
+
+    /* Mirrors git's xdl_build_script call order: xdf1 (a's deletions) is
+       compacted first, consulting b's bitmap as it was right after the
+       backtrack; THEN xdf2 (b's insertions) is compacted consulting a's
+       bitmap as compact_one_side above just left it. Swapping this order
+       changes output on any hunk where both sides have room to slide --
+       matching git means matching the order, not just the algorithm. */
+    compact_one_side(a, (long)na, achanged, bchanged, (long)nb, indent_heuristic);
+    compact_one_side(b, (long)nb, bchanged, achanged, (long)na, indent_heuristic);
+
+    final_gb.groups = NULL;
+    final_gb.count = 0;
+    final_gb.cap = 0;
+    if (build_groups_from_changed(achanged, na, bchanged, nb, &final_gb) != 0) {
+        free(achanged_buf);
+        free(bchanged_buf);
+        free(final_gb.groups);
+        return NULL;
+    }
+    free(achanged_buf);
+    free(bchanged_buf);
+
+    script = malloc(sizeof(*script));
+    if (script == NULL) {
+        free(final_gb.groups);
+        return NULL;
+    }
+    script->groups = final_gb.groups;
+    script->count = final_gb.count;
     return script;
 }
 

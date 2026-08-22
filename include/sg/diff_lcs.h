@@ -48,15 +48,19 @@ size_t **sg_diff_lcs_table_exact(const sg_diff_line *a, size_t na, const sg_diff
 
 /* ---- minimal edit script (patch-body intermediate representation) ---- */
 
-/* One maximal run of consecutive non-matching lines: a[a_off, a_off+a_len)
-   is removed, b[b_off, b_off+b_len) is added, in that order (a diff-table
-   backtrack from a "no common elements in this gap" region always produces
-   a deletion run followed by an insertion run, never interleaved -- see
-   src/util/diff_lcs.c's sg_diff_build_script for why). Either a_len or
+/* One maximal run of change at a given synchronized gap: a[a_off,
+   a_off+a_len) is removed, b[b_off, b_off+b_len) is added. Either a_len or
    b_len (but not both) may be 0 for a pure insertion/deletion; both
-   non-zero is a "replace" group, which sg_diff_build_script does not slide
-   (see below). Between two consecutive groups (or before the first / after
-   the last), a[..]==b[..] line for line. */
+   non-zero is a "replace", meaning the two files each independently have a
+   changed run at this same gap index -- NOT a distinguished case the
+   backtrack pins in place. Internally (src/util/diff_lcs.c) each side is
+   tracked as its own per-file "changed" bitmap and slid independently
+   (mirroring git's xdiff/xdiffi.c: two xdfile_t structures, each compacted
+   on its own, synchronized only by an end_matching_other tie-break so an
+   edit that really is a single replace doesn't get split into a
+   free-floating delete and a free-floating add); this struct is just the
+   final, re-paired output of that process. Between two consecutive groups
+   (or before the first / after the last), a[..]==b[..] line for line. */
 typedef struct {
     size_t a_off, a_len;
     size_t b_off, b_len;
