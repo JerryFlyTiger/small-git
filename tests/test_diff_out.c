@@ -16,10 +16,12 @@
    is where an actual implementation/real-git mismatch would be caught. */
 #include "sg/cli.h"
 
+#include "sg/chunk.h"
 #include "sg/diff.h"
 #include "sg/diff_out.h"
 #include "sg/hash.h"
 #include "sg/index.h"
+#include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -272,7 +274,11 @@ static void test_six_formats(void)
 
     opts.format = SG_DIFF_FORMAT_PATCH;
     out = render(git_dir, root, &list, &opts);
+    /* Blob ids 83db48f/e0c9b5e are this fixture's actual `blob <len>\0<data>`
+       sha1 (first 7 hex chars), matching what `git hash-object` computes for
+       the same bytes -- see Phase 26's index-line addition in sg/diff.h. */
     CHECK(strcmp(out, "diff --git a/f.txt b/f.txt\n"
+                      "index 83db48f..e0c9b5e 100644\n"
                       "--- a/f.txt\n"
                       "+++ b/f.txt\n"
                       "@@ -1,3 +1,4 @@\n"
@@ -767,6 +773,397 @@ static void test_display_width_cjk_vs_ascii(void)
     free(root);
 }
 
+/* Phase 26: "index <old7>..<new7>[ <mode>]" plus new-file/deleted-file lines.
+   fileA.txt (deleted) and fileB.txt (added) between two commits -- same
+   fixture shape as test_name_status_add_delete, but asserting the full PATCH
+   text this time. Blob ids 7898192/6178079 are "a\n"/"b\n"'s actual
+   `blob <len>\0<data>` sha1 (first 7 hex chars), independently computed. */
+static void test_patch_add_and_delete_index_lines(void)
+{
+    char *root = make_tmp_repo_and_cd("addel_patch");
+    char git_dir[4096];
+    unsigned char old_commit[SG_SHA1_RAW_LEN];
+    unsigned char new_commit[SG_SHA1_RAW_LEN];
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    unsigned char new_tree[SG_SHA1_RAW_LEN];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+
+    write_file("fileA.txt", "a\n");
+    run_add_all();
+    run_commit("base");
+    CHECK(sg_ref_resolve_head(git_dir, old_commit) == 0, "resolve HEAD (old) failed");
+
+    CHECK(unlink("fileA.txt") == 0, "unlink fileA.txt failed");
+    write_file("fileB.txt", "b\n");
+    run_add_all();
+    run_commit("second");
+    CHECK(sg_ref_resolve_head(git_dir, new_commit) == 0, "resolve HEAD (new) failed");
+
+    CHECK(sg_commit_tree_of(git_dir, old_commit, old_tree) == 0, "commit_tree_of(old) failed");
+    CHECK(sg_commit_tree_of(git_dir, new_commit, new_tree) == 0, "commit_tree_of(new) failed");
+
+    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL) == 0, "sg_diff_trees failed");
+
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strcmp(out, "diff --git a/fileA.txt b/fileA.txt\n"
+                      "deleted file mode 100644\n"
+                      "index 7898192..0000000\n"
+                      "--- a/fileA.txt\n"
+                      "+++ /dev/null\n"
+                      "@@ -1,1 +1,0 @@\n"
+                      "-a\n"
+                      "diff --git a/fileB.txt b/fileB.txt\n"
+                      "new file mode 100644\n"
+                      "index 0000000..6178079\n"
+                      "--- /dev/null\n"
+                      "+++ b/fileB.txt\n"
+                      "@@ -1,0 +1,1 @@\n"
+                      "+b\n") == 0,
+         "add/delete PATCH mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* Oracle rule 3 (sg/diff.h's Phase 26 note): a pure mode change -- content
+   byte-identical, only the mode bit differs -- prints "diff --git" plus
+   "old mode"/"new mode" and NOTHING else: no index line, no ---/+++, no
+   hunk. */
+static void test_patch_pure_mode_change_has_no_index_or_body(void)
+{
+    char *root = make_tmp_repo_and_cd("modeonly_patch");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+    char *addargv[2];
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("mode.txt", "body\n");
+    run_add_all();
+    run_commit("base");
+    CHECK(chmod("mode.txt", 0755) == 0, "chmod failed");
+    addargv[0] = "add";
+    addargv[1] = "mode.txt";
+    CHECK(sg_cmd_add(2, addargv) == 0, "sg add mode.txt failed");
+
+    build_cached_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strcmp(out, "diff --git a/mode.txt b/mode.txt\n"
+                      "old mode 100644\n"
+                      "new mode 100755\n") == 0,
+         "pure mode-change PATCH mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* Mode AND content both changed: "old mode"/"new mode" lines are printed, and
+   the index line therefore carries NO mode suffix (oracle rule 1's "only
+   when no mode line was printed" -- sg/diff.h's Phase 26 note). Blob ids
+   5626abf/f719efd are "one\n"/"two\n"'s actual blob sha1 (first 7 hex),
+   independently computed. */
+static void test_patch_mode_and_content_change_index_has_no_suffix(void)
+{
+    char *root = make_tmp_repo_and_cd("modecontent_patch");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+    char *addargv[2];
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("f.txt", "one\n");
+    run_add_all();
+    run_commit("base");
+    write_file("f.txt", "two\n");
+    CHECK(chmod("f.txt", 0755) == 0, "chmod failed");
+    addargv[0] = "add";
+    addargv[1] = "f.txt";
+    CHECK(sg_cmd_add(2, addargv) == 0, "sg add f.txt failed");
+
+    build_cached_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strcmp(out, "diff --git a/f.txt b/f.txt\n"
+                      "old mode 100644\n"
+                      "new mode 100755\n"
+                      "index 5626abf..f719efd\n"
+                      "--- a/f.txt\n"
+                      "+++ b/f.txt\n"
+                      "@@ -1,1 +1,1 @@\n"
+                      "-one\n"
+                      "+two\n") == 0,
+         "mode+content PATCH mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* Binary content: an index line is still printed (oracle rule 4), and the
+   /dev/null substitution applies to the "Binary files" line's names exactly
+   like it does to ---/+++, for a newly-added binary file. Blob id 4731d8e is
+   "\x00bin1"'s actual blob sha1 (first 7 hex), independently computed. */
+static void test_patch_binary_new_file_has_index_and_devnull(void)
+{
+    char *root = make_tmp_repo_and_cd("binary_add_patch");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_bytes("bin.dat", (const unsigned char *)"\x00""bin1", 5);
+    run_add_all();
+
+    build_cached_list(git_dir, root, &list); /* unborn HEAD: a fresh add */
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strcmp(out, "diff --git a/bin.dat b/bin.dat\n"
+                      "new file mode 100644\n"
+                      "index 0000000..4731d8e\n"
+                      "Binary files /dev/null and b/bin.dat differ\n") == 0,
+         "binary add PATCH mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* Binary content, ordinary modification (both sides present, same mode): the
+   index line carries the mode suffix, matching the text-content case. Blob
+   ids 4731d8e/29a070e are "\x00bin1"/"\x00bin2"'s actual blob sha1 (first 7
+   hex), independently computed. */
+static void test_patch_binary_modify_index_line(void)
+{
+    char *root = make_tmp_repo_and_cd("binary_mod_patch");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_bytes("bin.dat", (const unsigned char *)"\x00""bin1", 5);
+    run_add_all();
+    run_commit("base");
+    write_bytes("bin.dat", (const unsigned char *)"\x00""bin2", 5);
+
+    build_workdir_list(git_dir, root, &list);
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strcmp(out, "diff --git a/bin.dat b/bin.dat\n"
+                      "index 4731d8e..29a070e 100644\n"
+                      "Binary files a/bin.dat and b/bin.dat differ\n") == 0,
+         "binary modify PATCH mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* The index line's ids are the CONTENT id (git_hash-object-compatible),
+   never a chunked-storage pointer's own object id, even though sg_diff_side
+   stores the raw/pointer id internally for sg_diff_side_read's sake (see
+   sg/diff.h's Phase 26 note on sg_diff_side.id). Built by hand rather than
+   through `sg add`, since chunking needs a config threshold this fixture
+   sets directly via sg_chunk_store_blob. */
+static void test_patch_chunk_pointer_index_line_uses_effective_id(void)
+{
+    char *root = make_tmp_repo_and_cd("chunkptr_patch");
+    char git_dir[4096];
+    size_t len = 3 * 1024 * 1024;
+    unsigned char *data = malloc(len);
+    unsigned char pointer_id[SG_SHA1_RAW_LEN];
+    unsigned char content_id[SG_SHA1_RAW_LEN];
+    char content_hex[SG_SHA1_HEX_LEN + 1];
+    char expect_index_line[64];
+    int chunked = -1;
+    sg_diff_list list;
+    sg_diff_side old_side, new_side;
+    sg_diff_out_opts opts;
+    char *out;
+    size_t i;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+
+    CHECK(data != NULL, "OOM allocating chunk fixture data");
+    if (data == NULL) {
+        free(root);
+        return;
+    }
+    for (i = 0; i < len; i++)
+        data[i] = (unsigned char)(i * 2654435761u);
+
+    CHECK(sg_chunk_store_blob(git_dir, data, len, 1024 * 1024, pointer_id, &chunked) == 0 &&
+             chunked == 1,
+         "sg_chunk_store_blob did not produce a chunked pointer for this fixture");
+    sg_object_hash(SG_OBJ_BLOB, data, len, content_id);
+    free(data);
+
+    /* CHECK(memcmp(pointer_id, content_id, ...)) would be a stronger
+       assertion of "these two differ" but is deliberately skipped: on the
+       vanishingly unlikely chance the pointer and content ids collided, the
+       test below (index line prints content_id, not pointer_id) would still
+       be the correct behavior to assert, and would still fail loudly if the
+       renderer regressed to printing the raw/pointer id. */
+
+    memset(&old_side, 0, sizeof(old_side));
+    old_side.kind = SG_DIFF_SIDE_ABSENT;
+    memset(&new_side, 0, sizeof(new_side));
+    new_side.kind = SG_DIFF_SIDE_BLOB;
+    new_side.mode = 0100644;
+    memcpy(new_side.id, pointer_id, SG_SHA1_RAW_LEN);
+
+    memset(&list, 0, sizeof(list));
+    list.entries = malloc(sizeof(*list.entries));
+    CHECK(list.entries != NULL, "OOM building manual diff list");
+    list.entries[0].path = strdup("big.bin");
+    list.entries[0].old_side = old_side;
+    list.entries[0].new_side = new_side;
+    list.entries[0].unmerged = 0;
+    list.count = 1;
+    list.cap = 1;
+
+    /* No mode suffix: this is an add, so "new file mode" already said the
+       mode (oracle rule 2 -- see sg/diff.h's Phase 26 note). */
+    sg_sha1_to_hex(content_id, content_hex);
+    content_hex[7] = '\0';
+    snprintf(expect_index_line, sizeof(expect_index_line), "index 0000000..%s\n", content_hex);
+
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strstr(out, "new file mode 100644\n") != NULL, "expected new file mode line: %s", out);
+    CHECK(strstr(out, expect_index_line) != NULL,
+         "expected index line with the content id %s, got: %s", expect_index_line, out);
+    {
+        char pointer_hex[SG_SHA1_HEX_LEN + 1];
+
+        sg_sha1_to_hex(pointer_id, pointer_hex);
+        pointer_hex[7] = '\0';
+        if (strcmp(pointer_hex, content_hex) != 0)
+            CHECK(strstr(out, pointer_hex) == NULL,
+                 "the raw/pointer id %s must not leak into the rendered index line: %s", pointer_hex,
+                 out);
+    }
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* Phase 26 fix-round: a chmod-only change that is NOT staged (index vs
+   workdir, unlike test_patch_pure_mode_change_has_no_index_or_body above
+   which goes through the tree-vs-index BLOB/BLOB path) still prints exactly
+   "old mode"/"new mode" and nothing else. This is the render-layer coverage
+   for side_effective_id's SG_DIFF_SIDE_WORKDIR branch (diff_out.c): the old
+   side is BLOB (its effective id comes from sg_chunk_effective_id) and the
+   new side is genuinely SG_DIFF_SIDE_WORKDIR (its effective id is just its
+   own already-content id, always "verified"). Mutating that branch to
+   report unverified would force content_changed=true and print a full
+   (redundant, since content is unchanged) index line + hunk instead of
+   stopping after the mode lines -- make test caught nothing here before,
+   since every prior PATCH mode-only fixture used build_cached_list (both
+   sides BLOB), never build_workdir_list. */
+static void test_patch_unstaged_mode_only_change_has_no_index_or_body(void)
+{
+    char *root = make_tmp_repo_and_cd("modeonly_workdir_patch");
+    char git_dir[4096];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    write_file("mode.txt", "body\n");
+    run_add_all();
+    run_commit("base");
+    CHECK(chmod("mode.txt", 0755) == 0, "chmod failed");
+
+    build_workdir_list(git_dir, root, &list);
+    CHECK(list.count == 1, "expected exactly the mode-only row, got %zu", list.count);
+
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    out = render(git_dir, root, &list, &opts);
+    CHECK(strcmp(out, "diff --git a/mode.txt b/mode.txt\n"
+                      "old mode 100644\n"
+                      "new mode 100755\n") == 0,
+         "unstaged pure mode-change PATCH mismatch: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
+/* Fix 4 regression: content_changed's "!old_verified || !new_verified"
+   disjuncts must not be removable without a unit test noticing. Two BLOB
+   sides sharing the exact same (nonexistent) id are constructed by hand --
+   memcmp alone would call this "unchanged" and print nothing but the "diff
+   --git" header with return 0, silently swallowing the fact neither side
+   could actually be read. With the disjuncts intact, an unreadable id forces
+   content_changed=true regardless of the coincidental id match, so the
+   index line still prints and the subsequent content read fails loudly
+   (stderr warning, sg_diff_print returning -1) instead of being skipped. */
+static void test_patch_unreadable_blob_with_matching_ids_is_not_silently_skipped(void)
+{
+    char *root = make_tmp_repo_and_cd("ghostblob");
+    char git_dir[4096];
+    unsigned char ghost_id[SG_SHA1_RAW_LEN];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+    char *out;
+    int rc;
+
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
+    memset(ghost_id, 0xAB, sizeof(ghost_id));
+
+    memset(&list, 0, sizeof(list));
+    list.entries = malloc(sizeof(*list.entries));
+    CHECK(list.entries != NULL, "OOM building manual diff list");
+    list.entries[0].path = strdup("ghost.bin");
+    memset(&list.entries[0].old_side, 0, sizeof(list.entries[0].old_side));
+    list.entries[0].old_side.kind = SG_DIFF_SIDE_BLOB;
+    list.entries[0].old_side.mode = 0100644;
+    memcpy(list.entries[0].old_side.id, ghost_id, SG_SHA1_RAW_LEN);
+    list.entries[0].new_side = list.entries[0].old_side; /* byte-identical id, on purpose */
+    list.entries[0].unmerged = 0;
+    list.count = 1;
+    list.cap = 1;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+
+    capture_start();
+    rc = sg_diff_print(git_dir, root, &list, &opts);
+    out = capture_end();
+
+    CHECK(rc == -1, "sg_diff_print must report failure for an unreadable blob, got %d", rc);
+    CHECK(strstr(out, "diff --git a/ghost.bin b/ghost.bin\n") != NULL,
+         "expected the diff --git header line: %s", out);
+    CHECK(strstr(out, "index abababa..abababa 100644\n") != NULL,
+         "expected the index line to still print (content_changed forced true): %s", out);
+    CHECK(strstr(out, "---") == NULL,
+         "must not print a hunk body for content it never actually managed to read: %s", out);
+    free(out);
+
+    sg_diff_list_free(&list);
+    free(root);
+}
+
 int main(void)
 {
     test_six_formats();
@@ -778,6 +1175,14 @@ int main(void)
     test_unmerged_only_zero_files_changed();
     test_binary_forces_number_width();
     test_display_width_cjk_vs_ascii();
+    test_patch_add_and_delete_index_lines();
+    test_patch_pure_mode_change_has_no_index_or_body();
+    test_patch_mode_and_content_change_index_has_no_suffix();
+    test_patch_binary_new_file_has_index_and_devnull();
+    test_patch_binary_modify_index_line();
+    test_patch_chunk_pointer_index_line_uses_effective_id();
+    test_patch_unstaged_mode_only_change_has_no_index_or_body();
+    test_patch_unreadable_blob_with_matching_ids_is_not_silently_skipped();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

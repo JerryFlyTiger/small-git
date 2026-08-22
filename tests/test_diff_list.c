@@ -518,6 +518,142 @@ static void test_index_workdir(void)
     free(git_dir);
 }
 
+/* Phase 26: a WORKDIR side now carries a real mode and id (previously always
+   0/unset -- see sg/diff.h). This is what makes a bare chmod, with content
+   unchanged, show up at all: mode==0 on the WORKDIR side used to make
+   blob_sides_differ() skip the mode comparison entirely, so
+   append_index_entry_vs_workdir's final memcmp (content only) found nothing
+   and the path never made it into the list. */
+static void test_index_workdir_mode_only_change(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char id[SG_SHA1_RAW_LEN];
+    unsigned char expect_content_id[SG_SHA1_RAW_LEN];
+    char abspath[4096];
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    blob(git_dir, "same bytes\n", id);
+    sg_object_hash(SG_OBJ_BLOB, "same bytes\n", strlen("same bytes\n"), expect_content_id);
+
+    write_workdir_file(repo_root, "exe.sh", "same bytes\n");
+    snprintf(abspath, sizeof(abspath), "%s/exe.sh", repo_root);
+    CHECK(chmod(abspath, 0755) == 0, "chmod +x failed");
+
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "exe.sh", 0100644, id);
+
+    CHECK(sg_diff_index_workdir(git_dir, repo_root, &idx, &list) == 0,
+         "sg_diff_index_workdir failed");
+    CHECK(list.count == 1, "expected exe.sh's mode-only change to appear, got %zu rows", list.count);
+
+    e = find_entry(&list, "exe.sh");
+    CHECK(e != NULL, "exe.sh missing from diff list");
+    if (e != NULL) {
+        CHECK(e->old_side.mode == 0100644, "exe.sh old mode should be 100644, got 0%o",
+             e->old_side.mode);
+        CHECK(e->new_side.kind == SG_DIFF_SIDE_WORKDIR, "exe.sh new side should be WORKDIR");
+        CHECK(e->new_side.mode == 0100755, "exe.sh new (workdir) mode should be 100755, got 0%o",
+             e->new_side.mode);
+        CHECK(memcmp(e->new_side.id, expect_content_id, SG_SHA1_RAW_LEN) == 0,
+             "exe.sh new (workdir) side's id should be the file's own content hash");
+    }
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* A WORKDIR side's id is the file's own content hash, not left zeroed, when
+   content (not just mode) actually changed. */
+static void test_index_workdir_side_carries_content_id(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char id_old[SG_SHA1_RAW_LEN];
+    unsigned char expect_new_id[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    blob(git_dir, "old content\n", id_old);
+    sg_object_hash(SG_OBJ_BLOB, "new content\n", strlen("new content\n"), expect_new_id);
+
+    write_workdir_file(repo_root, "f.txt", "new content\n");
+
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "f.txt", 0100644, id_old);
+
+    CHECK(sg_diff_index_workdir(git_dir, repo_root, &idx, &list) == 0,
+         "sg_diff_index_workdir failed");
+
+    e = find_entry(&list, "f.txt");
+    CHECK(e != NULL, "f.txt missing from diff list");
+    if (e != NULL) {
+        CHECK(e->new_side.kind == SG_DIFF_SIDE_WORKDIR, "f.txt new side should be WORKDIR");
+        CHECK(e->new_side.mode == 0100644, "f.txt new (workdir) mode should be 100644, got 0%o",
+             e->new_side.mode);
+        CHECK(memcmp(e->new_side.id, expect_new_id, SG_SHA1_RAW_LEN) == 0,
+             "f.txt new (workdir) side's id should be the new content's hash, not left zeroed");
+    }
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Phase 26: sg_diff_tree_workdir's addition branch (index-only path present
+   on disk) used to build a WORKDIR side with no id/mode at all -- confirm it
+   now fills both. */
+static void test_tree_workdir_addition_side_has_id_and_mode(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    unsigned char id[SG_SHA1_RAW_LEN];
+    unsigned char expect_id[SG_SHA1_RAW_LEN];
+    char abspath[4096];
+    tree_spec specs[] = {
+        {"unrelated.txt", 0100644, "unrelated\n"},
+    };
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    build_tree(git_dir, specs, 1, old_tree);
+    blob(git_dir, "brand new\n", id);
+    sg_object_hash(SG_OBJ_BLOB, "brand new\n", strlen("brand new\n"), expect_id);
+
+    write_workdir_file(repo_root, "added.sh", "brand new\n");
+    snprintf(abspath, sizeof(abspath), "%s/added.sh", repo_root);
+    CHECK(chmod(abspath, 0755) == 0, "chmod +x failed");
+
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "added.sh", 0100755, id);
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+         "sg_diff_tree_workdir failed");
+
+    e = find_entry(&list, "added.sh");
+    CHECK(e != NULL, "added.sh missing from diff list");
+    if (e != NULL) {
+        CHECK(e->new_side.kind == SG_DIFF_SIDE_WORKDIR, "added.sh new side should be WORKDIR");
+        CHECK(e->new_side.mode == 0100755, "added.sh new (workdir) mode should be 100755, got 0%o",
+             e->new_side.mode);
+        CHECK(memcmp(e->new_side.id, expect_id, SG_SHA1_RAW_LEN) == 0,
+             "added.sh new (workdir) side's id should be its content hash");
+    }
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
 /* 8. sg_diff_index_workdir: an unresolved conflict whose stage-2 (ours) blob
       differs from the working tree's actual bytes produces TWO rows, in
       order: the fixed unmerged row, then an ordinary row comparing stage 2
@@ -1181,6 +1317,153 @@ static void test_tree_workdir_unreadable_blob_does_not_silence_others(void)
     free(git_dir);
 }
 
+/* workdir_entry_mode's S_ISLNK guard (diff.c): a tracked path that is
+   actually a symlink on disk must be reported as mode 100644, never 100755,
+   regardless of the symlink's OWN permission bits -- which on both Linux and
+   macOS are conventionally lrwxrwxrwx (all exec bits set) no matter what the
+   *target* file's permissions are. Without the guard, workdir_entry_mode
+   would read the symlink's own S_IXUSR bit (always set) via lstat and
+   compute 100755, a mode this codebase never intends to produce for a
+   symlink (120000 is out of scope this round -- see sg/diff.h). This is the
+   codebase's ACTUAL current behavior, confirmed by this test, not merely the
+   author's expectation: it is what makes the row below stay absent from the
+   diff list even though the symlink's own mode bits look executable. */
+static void test_symlink_guard_reports_fixed_mode(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char id[SG_SHA1_RAW_LEN];
+    char target_abspath[4096];
+    char link_abspath[4096];
+    sg_index idx;
+    sg_diff_list list;
+
+    blob(git_dir, "target content\n", id);
+    write_workdir_file(repo_root, "target.txt", "target content\n");
+
+    snprintf(target_abspath, sizeof(target_abspath), "%s/target.txt", repo_root);
+    snprintf(link_abspath, sizeof(link_abspath), "%s/link.txt", repo_root);
+    CHECK(symlink("target.txt", link_abspath) == 0, "symlink() failed");
+    (void)target_abspath;
+
+    /* link.txt is tracked at mode 100644 with the SAME content id as the
+       symlink's target -- sg_hash_file_blob follows the symlink via fopen(),
+       so its computed content matches. If workdir_entry_mode reported
+       100755 for this path (the mutated, guard-less behavior), the mode
+       mismatch alone would put link.txt in the list even though its content
+       is unchanged. */
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "link.txt", 0100644, id);
+
+    CHECK(sg_diff_index_workdir(git_dir, repo_root, &idx, &list) == 0,
+         "sg_diff_index_workdir failed");
+    CHECK(list.count == 0,
+         "a tracked symlink whose target content is unchanged must not appear in the diff list "
+         "(got %zu rows) -- workdir_entry_mode must report 100644 for a symlink, not its own "
+         "(always-executable) permission bits",
+         list.count);
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Phase 26 fix-round regression (F1, site A): a tracked file that stat()s
+   successfully but cannot actually be read (here: the path is a directory,
+   not chmod 000, since a test running as root would bypass permission bits
+   entirely -- fopen()+fread() on a directory reliably fails with ferror set
+   on both Linux and macOS, exercising the exact same sg_hash_file_blob
+   failure without depending on the test's uid) must be reported as an
+   ordinary deletion (new_side ABSENT), not a WORKDIR side carrying a
+   placeholder all-zero id -- see append_index_entry_vs_workdir in
+   src/workdir/diff.c and sg/diff.h's sg_diff_index_workdir contract. */
+static void test_index_workdir_unreadable_workdir_file_is_absent(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char id[SG_SHA1_RAW_LEN];
+    char abspath[4096];
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    blob(git_dir, "was a file\n", id);
+
+    snprintf(abspath, sizeof(abspath), "%s/was_file.txt", repo_root);
+    CHECK(mkdir(abspath, 0755) == 0, "mkdir (standing in for an unreadable file) failed");
+
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "was_file.txt", 0100644, id);
+
+    CHECK(sg_diff_index_workdir(git_dir, repo_root, &idx, &list) == 0,
+         "sg_diff_index_workdir failed");
+    CHECK(list.count == 1, "expected exactly one row, got %zu", list.count);
+
+    e = find_entry(&list, "was_file.txt");
+    CHECK(e != NULL, "was_file.txt missing from diff list");
+    if (e != NULL) {
+        CHECK(e->old_side.kind == SG_DIFF_SIDE_BLOB, "was_file.txt's old side should be BLOB");
+        CHECK(e->new_side.kind == SG_DIFF_SIDE_ABSENT,
+             "was_file.txt's new side must be ABSENT when the workdir path exists but its content "
+             "cannot be read, not a WORKDIR side with a placeholder id (got kind %d)",
+             e->new_side.kind);
+    }
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Phase 26 fix-round regression (F1, site B): the same rule at
+   sg_diff_tree_workdir's OWN cmp==0 content-compare call site, independent
+   of the append_index_entry_vs_workdir site above. */
+static void test_tree_workdir_unreadable_workdir_file_is_absent(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char id[SG_SHA1_RAW_LEN];
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    tree_spec specs[] = {
+        {"was_file.txt", 0100644, "was a file\n"},
+    };
+    char abspath[4096];
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    build_tree(git_dir, specs, 1, old_tree);
+    blob(git_dir, "was a file\n", id);
+
+    snprintf(abspath, sizeof(abspath), "%s/was_file.txt", repo_root);
+    CHECK(mkdir(abspath, 0755) == 0, "mkdir (standing in for an unreadable file) failed");
+
+    /* cmp==0 requires the path present in the index too, per
+       sg_diff_tree_workdir's membership rule (sg/diff.h). */
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "was_file.txt", 0100644, id);
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+         "sg_diff_tree_workdir failed");
+    CHECK(list.count == 1, "expected exactly one row, got %zu", list.count);
+
+    e = find_entry(&list, "was_file.txt");
+    CHECK(e != NULL, "was_file.txt missing from diff list");
+    if (e != NULL) {
+        CHECK(e->old_side.kind == SG_DIFF_SIDE_BLOB, "was_file.txt's old side should be BLOB");
+        CHECK(e->new_side.kind == SG_DIFF_SIDE_ABSENT,
+             "was_file.txt's new side must be ABSENT when the workdir path exists but its content "
+             "cannot be read, not a WORKDIR side with a placeholder id (got kind %d)",
+             e->new_side.kind);
+    }
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_trees_add_delete_modify();
@@ -1190,6 +1473,9 @@ int main(void)
     test_tree_index_stage0_add_delete_modify();
     test_tree_index_unmerged_is_single_row();
     test_index_workdir();
+    test_index_workdir_mode_only_change();
+    test_index_workdir_side_carries_content_id();
+    test_tree_workdir_addition_side_has_id_and_mode();
     test_index_workdir_unmerged_two_rows();
     test_index_workdir_unmerged_no_second_row();
     test_tree_workdir_rm_cached_is_deletion();
@@ -1202,6 +1488,9 @@ int main(void)
     test_chunk_pointer_normalization_tree_workdir();
     test_index_workdir_unreadable_blob_does_not_silence_others();
     test_tree_workdir_unreadable_blob_does_not_silence_others();
+    test_symlink_guard_reports_fixed_mode();
+    test_index_workdir_unreadable_workdir_file_is_absent();
+    test_tree_workdir_unreadable_workdir_file_is_absent();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
