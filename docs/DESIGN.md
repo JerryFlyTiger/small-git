@@ -2573,6 +2573,38 @@ vs `untracked_tree`(`--only-untracked` 本來就是這樣做的)。
 `a.txt` 與 `c.txt` 中間**。若它排最後,「兩份清單串接」與「合併排序」的輸出完全相同,
 那條測試就會零鑑別力。
 
+### Mutation 驗證:34 條,由主對話執行
+
+寫下來是為了讓下一個人不必重跑就知道哪些行被守著(慣例見 Phase 24)。
+清單由各輪 reviewer 設計、主對話執行——實作者不驗證自己的修法。
+
+| 範圍 | 條數 | 守住的性質(舉其要者) |
+|---|---|---|
+| `workdir/diff.c` 第一輪 | 5 | blob id 比較、mode 比較、`NULL` tree = 空 tree、merge-join 的比較方向 |
+| `workdir/diff.c` 尾段 | 13 | `index_group_end` 的群組推進、三支建構器**各自**的衝突行為、第二列取 stage 2(改成 stage 1 會紅)、`-2` 不可壓成 `-1`、內容比對的正反兩個方向 |
+| `cmd_status.c` / `status.c` / `quote.c` | 9 | 七種 unmerged 標籤與兩碼、摺疊的三條規則、porcelain 的空格引用、二分搜尋的 `/` 邊界、`--ignored` 的否定式斷言 |
+| `cli/diff_out.c` | 11 | graph 的 `total<2` 保底與平手方向、截斷推到 `/`、CJK 欄寬、binary 計入而 unmerged 不計入 `files changed`、`files_changed > 0` 閘門 |
+| `cli/cmd_stash.c` | 4+ | 幽靈刪除的修法(`NULL` vs `base_tree`)、合併方向、`--only-untracked` 的三元、「後寫的贏」 |
+
+**三條特別值得記的結果:**
+
+1. **逐站點才看得見的死角**:`sg_chunk_effective_id` 有兩個呼叫站點,站點 A 有覆蓋、
+   站點 B **退出碼 0 零 FAIL**。若用 `/g` 一次打兩站,整體會變紅、結論會是「已驗過」。
+   站點 B 在真實使用中一定會走到(commit 過的 chunked 檔案,tree 裡存的是 pointer id),
+   沒有正規化的話**每個未修改的大檔案都會被誤報成有變更**。已補測試。
+2. **被大書特書的規則反而沒測試**:`-u` 與 `--only-untracked`「後寫的贏」有二十行註解、
+   commit 訊息專段、兩種順序都實測過——而沒有任何測試同時給兩個旗標。
+   廢掉整條規則,9 個測試全過。已補測試。
+3. **「拿掉守衛」多半會崩,改成「讓守衛回傳錯誤碼」才驗得到**:驗
+   `tree_id == NULL` 的語意時,整段拿掉會 segfault(rc 139、零 FAIL 行),
+   具名檢查根本沒跑到;保留守衛但讓它 `return -1`,
+   `test_null_tree_is_empty_tree` 立刻紅在該紅的地方。
+
+`--stat` 的 `W*3/8` 夾擠常數**刻意驗在 interop 而不是單元測試**:單元測試的預期字串
+有一部分是從被測程式自己的輸出抄進去的,那種斷言對「實作與真 git 不符」零鑑別力。
+以 COLUMNS 40/60/80/120 與真 git 並排之後,同一條 mutation 讓其中三條變紅
+(120 那條不觸發夾擠,綠得有道理)。
+
 ### 這一輪刻意沒做的
 
 - **patch body 不追真 git**:整檔仍是單一 hunk `@@ -1,N +1,M @@`,沒有 `index` 行、
