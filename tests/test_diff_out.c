@@ -1340,6 +1340,7 @@ static void test_patch_hunk_merge_boundary_six_lines_merges(void)
              "expected exactly one hunk (6-line gap must not split): %s", out);
     }
 
+    free(out);
     free(base);
     free(changed);
     sg_diff_list_free(&list);
@@ -1371,6 +1372,7 @@ static void test_patch_hunk_split_boundary_seven_lines_splits(void)
     CHECK(strstr(out, "@@ -7,5 +7,5 @@ same\n") != NULL,
          "a 7-line gap's second hunk mismatch (must split, not merge): %s", out);
 
+    free(out);
     free(base);
     free(changed);
     sg_diff_list_free(&list);
