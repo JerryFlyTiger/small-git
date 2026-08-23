@@ -9188,6 +9188,37 @@ check "phase28 control: the filtered list drops it" \
 check "phase28 control: and keeps what was asked for" \
     grep -q '^sub/deep/c\.txt$' "$WORKDIR/p28_filtered.txt"
 
+# Rules 1 and 2 (the byte compare) run even for a spec containing wildcard
+# characters, so a directory whose REAL name holds '[' or '*' is recursed
+# into by a spec spelling it literally. Its own fixture, because adding
+# these names to the repo above would change the expected output of every
+# check there. Measured: git reports o[tx]her/f.txt for `-- 'o[tx]her'`.
+P28_LIT="$WORKDIR/p28_literal_wildcards"
+(cd "$WORKDIR" && "$SG" init p28_literal_wildcards) > /dev/null 2>&1
+(cd "$P28_LIT" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P28_LIT/o[tx]her" "$P28_LIT/st*ar" "$P28_LIT/other"
+printf 'f1\nf2\n' > "$P28_LIT/o[tx]her/f.txt"
+printf 'g1\ng2\n' > "$P28_LIT/st*ar/g.txt"
+printf 'h1\nh2\n' > "$P28_LIT/other/h.txt"
+(cd "$P28_LIT" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+for f in 'o[tx]her/f.txt' 'st*ar/g.txt' other/h.txt; do
+    printf 'CHANGED\n' >> "$P28_LIT/$f"
+done
+p28_cmp "$P28_LIT" "--name-only -- 'o[tx]her' (a real directory of that name)" \
+    --name-only -- 'o[tx]her'
+p28_cmp "$P28_LIT" "--name-only -- 'st*ar' (a real directory of that name)" \
+    --name-only -- 'st*ar'
+p28_cmp "$P28_LIT" "--name-only -- 'o[tx]her/' (same, trailing slash)" \
+    --name-only -- 'o[tx]her/'
+# The control that keeps the case above from licensing the over-broad rule:
+# in THIS repo "other/" also exists, and the wildcard reading of the same
+# spec must still not reach into it.
+(cd "$P28_LIT" && "$SG" diff --name-only -- 'o[tx]her') > "$WORKDIR/p28_lit.txt" 2>/dev/null
+check "phase28 control: the literal name is matched" \
+    grep -q 'o\[tx\]her/f\.txt' "$WORKDIR/p28_lit.txt"
+check "phase28 control: and the wildcard reading still does not recurse into other/" \
+    sh -c "! grep -q '^other/' '$WORKDIR/p28_lit.txt'"
+
 # An unresolved conflict is the one shape where a single path occupies TWO
 # adjacent rows of the change list (a "U" row and a stage-2-vs-worktree row,
 # Phase 25). Filtering must keep or drop the pair together, and the three

@@ -2605,6 +2605,48 @@ vs `untracked_tree`(`--only-untracked` 本來就是這樣做的)。
 以 COLUMNS 40/60/80/120 與真 git 並排之後,同一條 mutation 讓其中三條變紅
 (120 那條不觸發夾擠,綠得有道理)。
 
+### 冷讀審查找到的:一個真死角(規則是對的,但沒有人守著)
+
+併入 master 之後補了一輪第三方冷讀。**沒有找到記憶體正確性問題**——`pos` 陣列在
+六條早期 return 與 `goto done` 上的釋放、`sg_pathspec_add` 的兩條 realloc 失敗路徑、
+`sg_diff_list_filter` 就地壓縮的 free 順序、`sg_quote_path_delimited` 的 4 槽借用規則、
+`spec_matches` 的 `spec[slen-1]`/`path[slen]` 索引,逐條核過都成立。
+
+但它指出一件我沒想到的事:`spec_matches` 的規則 1/2(字面量比對)是**無條件**跑的,
+並沒有以 `!has_wildcard(spec)` 為前提。於是一個**真的叫 `o[tx]her` 的目錄**會被
+spec `o[tx]her` 用目錄前綴規則遞迴進去——這看起來與「含萬用字元的 spec 沒有目錄前綴
+規則」矛盾。
+
+先實測再說:真 git 2.55.0 對 `git diff -- 'o[tx]her'` 印出 `o[tx]her/f.txt`,
+對 `st*ar` 印出 `st*ar/g.txt`。**sg 的行為與 git 完全一致,程式碼是對的**——這正是
+git `match_pathspec_item` 的順序(`ps_strncmp` 先、`wildmatch` 後),而「規則 3 不加
+規則 2」講的是*萬用字元那一次比對*不吃目錄前綴,不是「含萬用字元的 spec 一律不吃」。
+
+**真正的問題是沒有任何測試守著這件事。** 定向 mutation 證實:把規則 1/2 收窄成
+`!has_wildcard(spec) && ...`(那正是看到 `test_wildcards` 那幾條負面檢查之後最自然的
+「修法」),interop **1500/1500 全過、退出碼 0**——不是「打不到」,是**真死角**。
+
+補了兩組(單元 4 條 + interop 3 條 cmp + 2 條對照),並重跑同一條 mutation 確認現在
+會紅:單元 4 條、interop 4 條。同時重跑反向 mutation,確認那三條「必須是空的」檢查
+**仍然**有鑑別力——新案例沒有反過來把過寬規則合法化。**兩個方向要同時釘住,
+只釘一邊的話另一邊會在下一次「順手統一」時無聲消失。**
+
+其餘發現與裁決:
+
+| 發現 | 裁決 |
+|---|---|
+| 過長的 pathspec 會被誤報成「在版本庫之外」(`sg_resolve_repo_path_allow_root` 把 OOM 與越界都回 NULL) | 既有共用函式的既有行為,`pathspec.h` 已明文承認;Phase 28 是第一個把**任意使用者字串**餵給它的呼叫端,所以更容易被感知。**不改**,收在已知缺口 |
+| `--cached && rev2` 的 usage 檢查移到 repo 探索之後 | 良性:與其他所有 `sg_cmd_*` 一致(都先 `sg_require_git_dir`),而且真 git 在非 repo 目錄也是先報 not-a-repo |
+| `report_pathspec_error` 的 `default:` 會讓未來新增的錯誤碼靜默印成「在版本庫之外」 | **已修**:改成列舉每個值,`-Wswitch` 因此守得住 |
+
+⚠ 兩條 mutation 的結果要照實記,不可以當成「已驗過」:
+
+- **M10**(把 `free` 搬到 keep 分支製造 double-free)退出碼 133 被抓到,但抓到它的是
+  **崩潰**,不是任何具名斷言。它證明的是「記憶體被亂用會出事」,**不**證明有哪條檢查
+  在驗釋放順序。
+- **M9**(拿掉 `reserve()` 失敗分支裡的 `free(rel)`)**無法用現有測試驗證**:那條路徑
+  只有 realloc 失敗才走得到,本專案沒有故障注入。這條防線只有冷讀,不宣稱有覆蓋。
+
 ### 這一輪刻意沒做的
 
 - **patch body 不追真 git**:整檔仍是單一 hunk `@@ -1,N +1,M @@`,沒有 `index` 行、

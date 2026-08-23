@@ -76,7 +76,13 @@ static void report_pathspec_error(sg_pathspec_error err, const char *arg, const 
     case SG_PATHSPEC_ERR_MAGIC:
         fprintf(stderr, "sg: 不支援 pathspec magic：%s\n", sg_quote_path_delimited(arg));
         break;
-    default:
+    /* No `default:` on purpose. NONE cannot reach here -- sg_pathspec_add
+       fills err only when it fails -- but naming every value keeps the
+       switch exhaustive, so -Wswitch complains if a future error code is
+       added and nobody teaches this function to print it. A `default` would
+       silently render it as "outside the repository". */
+    case SG_PATHSPEC_ERR_NONE:
+    case SG_PATHSPEC_ERR_OUTSIDE:
         fprintf(stderr, "sg: %s 在版本庫 %s 之外\n",
                sg_quote_path_delimited(arg), sg_quote_path_delimited(repo_root));
         break;
