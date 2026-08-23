@@ -12,6 +12,7 @@
 #include "sg/revparse.h"
 #include "sg/workdir.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,7 +20,7 @@
 
 static const char USAGE[] =
     "usage: sg diff [--cached|--staged] [--stat[=<w>[,<n>]]|--numstat|--shortstat|--name-only|"
-    "--name-status] [<rev> [<rev>]] [--] [<path>...]\n";
+    "--name-status] [-M[<n>]|--no-renames] [<rev> [<rev>]] [--] [<path>...]\n";
 
 /* Resolves rev to a tree id via sg_rev_parse_commit + sg_commit_tree_of --
    the one path every rev argument in this command goes through, per
@@ -65,6 +66,24 @@ static void report_bad_tree_path(const char *bad_path)
 {
     fprintf(stderr, "sg: 路徑 %s 無效，拒絕將這棵 tree 展開成檔案路徑\n",
            sg_quote_path_delimited(bad_path));
+}
+
+/* git's -M<n>/--find-renames=<n> threshold: a plain integer percentage
+   1-100. git also takes a fraction ("-M0.5") and a trailing '%'; neither is
+   accepted here, and both are rejected rather than guessed at. */
+static int parse_rename_score(const char *arg, int *out)
+{
+    long v;
+    char *end;
+
+    if (arg[0] == '\0')
+        return -1;
+    errno = 0;
+    v = strtol(arg, &end, 10);
+    if (errno != 0 || *end != '\0' || v < 1 || v > 100)
+        return -1;
+    *out = (int)v;
+    return 0;
 }
 
 static void report_pathspec_error(sg_pathspec_error err, const char *arg, const char *repo_root)
@@ -171,6 +190,10 @@ int sg_cmd_diff(int argc, char **argv)
     char **pos;
     int n_pos = 0;
     int dashdash = -1; /* index into pos[] where "--" split the line */
+    /* git's -M default: 50%. 0 means --no-renames. Exact renames score 100
+       so any threshold finds them; the value only starts to matter once
+       inexact detection exists. */
+    int rename_score = 50;
     int rev_count;
     char bad_path[SG_PATH_MAX];
     int rc;
@@ -218,6 +241,18 @@ int sg_cmd_diff(int argc, char **argv)
             opts.format = SG_DIFF_FORMAT_NAME_ONLY;
         } else if (strcmp(a, "--name-status") == 0) {
             opts.format = SG_DIFF_FORMAT_NAME_STATUS;
+        } else if (strcmp(a, "--no-renames") == 0) {
+            rename_score = 0;
+        } else if (strcmp(a, "-M") == 0 || strcmp(a, "--find-renames") == 0) {
+            rename_score = 50;
+        } else if (strncmp(a, "-M", 2) == 0 || strncmp(a, "--find-renames=", 15) == 0) {
+            const char *v = a[1] == 'M' ? a + 2 : a + 15;
+
+            if (parse_rename_score(v, &rename_score) != 0) {
+                fputs(USAGE, stderr);
+                free(pos);
+                return 1;
+            }
         } else if (a[0] == '-' && a[1] != '\0') {
             fputs(USAGE, stderr);
             free(pos);
@@ -344,6 +379,15 @@ int sg_cmd_diff(int argc, char **argv)
        four builders -- see sg_diff_list_filter in include/sg/diff.h for why
        that is deliberate and what it costs. */
     sg_diff_list_filter(&list, &pathspec);
+
+    /* Rename detection runs AFTER the filter, never before -- measured
+       against git 2.55.0, `git diff --cached --name-status -- b1.txt` on a
+       renamed pair prints "A b1.txt", because git filters by pathspec first
+       and a spec naming half a rename leaves nothing to pair with. */
+    if (sg_diff_detect_renames(git_dir, &list, rename_score) != 0) {
+        fprintf(stderr, "sg: 記憶體不足,無法偵測改名\n");
+        goto done;
+    }
 
     exit_rc = sg_diff_print(git_dir, repo_root, &list, &opts) != 0 ? 1 : 0;
 

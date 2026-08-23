@@ -9262,6 +9262,170 @@ printf 'x\n' > "$P28/--stat"
 printf 'y\n' >> "$P28/--stat"
 p28_cmp "$P28" "-- --stat (a file named like an option)" -- '--stat'
 
+# --- Phase 29: rename detection (exact renames) --------------------------
+#
+# Same discipline as Phase 28: every positive case is a whole-output cmp of
+# the SAME argument list against real git, because the shapes here (the
+# "R100" score field, the "{a => b}" compression, where the rename lines sit
+# relative to the mode lines) are formats sg has no independent claim to.
+P29="$WORKDIR/p29_rename"
+(cd "$WORKDIR" && "$SG" init p29_rename) > /dev/null 2>&1
+(cd "$P29" && git config user.email "a@b.c" && git config user.name "git user")
+
+p29_mk() {
+    mkdir -p "$(dirname "$2")"
+    python3 -c "
+import sys
+open(sys.argv[1], 'w').write(''.join('%s-%d\n' % (sys.argv[2], i) for i in range(1, 21)))
+" "$2" "$3"
+}
+
+p29_cmp() {
+    p29_dir="$1"
+    p29_label="$2"
+    shift 2
+    (cd "$p29_dir" && "$SG" diff "$@") > "$WORKDIR/p29_sg.txt" 2>/dev/null
+    (cd "$p29_dir" && git -c core.quotepath=false diff "$@") > "$WORKDIR/p29_git.txt" 2>/dev/null
+    check "phase29: sg diff $p29_label matches real git byte-for-byte" \
+        cmp -s "$WORKDIR/p29_sg.txt" "$WORKDIR/p29_git.txt"
+}
+
+# One fixture carrying every compression shape at once, so a change to the
+# prefix/suffix rule cannot pass by being right for one shape only:
+#   a/b/c.txt      -> a/z/c.txt        common prefix AND suffix
+#   h/i/j.txt      -> h2/i/j.txt       suffix only
+#   x/y.txt        -> x/y2.txt         prefix only
+#   pre.txt        -> pre.txt.bak      bytes in common but no component
+#   one.txt        -> two.txt          nothing in common
+p29_mk "$P29" "$P29/a/b/c.txt" A
+p29_mk "$P29" "$P29/h/i/j.txt" B
+p29_mk "$P29" "$P29/x/y.txt" C
+p29_mk "$P29" "$P29/pre.txt" D
+p29_mk "$P29" "$P29/one.txt" E
+(cd "$P29" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mkdir -p "$P29/a/z" "$P29/h2/i"
+mv "$P29/a/b/c.txt" "$P29/a/z/c.txt"
+mv "$P29/h/i/j.txt" "$P29/h2/i/j.txt"
+mv "$P29/x/y.txt" "$P29/x/y2.txt"
+mv "$P29/pre.txt" "$P29/pre.txt.bak"
+mv "$P29/one.txt" "$P29/two.txt"
+(cd "$P29" && "$SG" add .) > /dev/null 2>&1
+
+for p29_fmt in "" --stat --numstat --shortstat --name-only --name-status; do
+    if [ -z "$p29_fmt" ]; then
+        p29_cmp "$P29" "--cached (patch)" --cached
+    else
+        p29_cmp "$P29" "--cached $p29_fmt" --cached "$p29_fmt"
+    fi
+done
+p29_cmp "$P29" "HEAD --name-status (staged rename against HEAD)" HEAD --name-status
+p29_cmp "$P29" "--cached --no-renames --name-status" --cached --no-renames --name-status
+p29_cmp "$P29" "--cached -M --name-status" --cached -M --name-status
+p29_cmp "$P29" "--cached -M100 --name-status" --cached -M100 --name-status
+
+# Tree vs tree sees the same renames once they are committed.
+(cd "$P29" && "$SG" commit -m moved) > /dev/null 2>&1
+p29_cmp "$P29" "HEAD~1 HEAD --name-status (tree vs tree)" HEAD~1 HEAD --name-status
+p29_cmp "$P29" "HEAD~1 HEAD --stat (tree vs tree)" HEAD~1 HEAD --stat
+
+# ⚠ The ordering rule, and the single most likely thing to regress: pathspec
+# is applied BEFORE rename detection, so a spec naming only one half of a
+# rename leaves nothing to pair with. Measured: git prints "A", not "R100".
+p29_cmp "$P29" "HEAD~1 HEAD --name-status -- a/z/c.txt (new half only)" \
+    HEAD~1 HEAD --name-status -- a/z/c.txt
+p29_cmp "$P29" "HEAD~1 HEAD --name-status -- a/b/c.txt (old half only)" \
+    HEAD~1 HEAD --name-status -- a/b/c.txt
+p29_cmp "$P29" "HEAD~1 HEAD --name-status -- both halves" \
+    HEAD~1 HEAD --name-status -- a/b/c.txt a/z/c.txt
+(cd "$P29" && "$SG" diff HEAD~1 HEAD --name-status -- a/z/c.txt) > "$WORKDIR/p29_order.txt" 2>/dev/null
+check "phase29 control: a pathspec naming only the new half reports an addition" \
+    grep -q '^A' "$WORKDIR/p29_order.txt"
+check "phase29 control: and does NOT report a rename" \
+    sh -c "! grep -q '^R' '$WORKDIR/p29_order.txt'"
+
+# Rename plus a mode change: the mode lines come first, then the rename
+# lines. A fixture with only content-identical renames never reaches that
+# ordering at all.
+P29_MODE="$WORKDIR/p29_mode"
+(cd "$WORKDIR" && "$SG" init p29_mode) > /dev/null 2>&1
+(cd "$P29_MODE" && git config user.email "a@b.c" && git config user.name "git user")
+p29_mk "$P29_MODE" "$P29_MODE/m.txt" M
+(cd "$P29_MODE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P29_MODE/m.txt" "$P29_MODE/m2.txt"
+chmod +x "$P29_MODE/m2.txt"
+(cd "$P29_MODE" && "$SG" add .) > /dev/null 2>&1
+p29_cmp "$P29_MODE" "--cached (patch, rename + mode change)" --cached
+p29_cmp "$P29_MODE" "--cached --name-status (rename + mode change)" --cached --name-status
+check "phase29: the mode lines precede the similarity line, as git orders them" \
+    sh -c "(cd '$P29_MODE' && '$SG' diff --cached) | tr '\n' '|' | grep -q 'old mode 100644|new mode 100755|similarity index 100%|'"
+
+# A renamed path that needs C-quoting. Measured: quoting turns the "{a => b}"
+# compression OFF entirely, in --stat and --numstat alike.
+P29_Q="$WORKDIR/p29_quote"
+(cd "$WORKDIR" && "$SG" init p29_quote) > /dev/null 2>&1
+(cd "$P29_Q" && git config user.email "a@b.c" && git config user.name "git user")
+p29_mk "$P29_Q" "$P29_Q/d/plain.txt" Q
+(cd "$P29_Q" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P29_Q/d/plain.txt" "$P29_Q/d/$(printf 'tab\there.txt')"
+(cd "$P29_Q" && "$SG" add .) > /dev/null 2>&1
+p29_cmp "$P29_Q" "--cached --name-status (quoted rename)" --cached --name-status
+p29_cmp "$P29_Q" "--cached --numstat (quoted rename)" --cached --numstat
+p29_cmp "$P29_Q" "--cached --stat (quoted rename)" --cached --stat
+p29_cmp "$P29_Q" "--cached (patch, quoted rename)" --cached
+check "phase29: a quoted rename is NOT printed in the braced form" \
+    sh -c "! (cd '$P29_Q' && '$SG' diff --cached --numstat) | grep -q '{'"
+
+# Pairing when several candidates have identical content.
+P29_TIE="$WORKDIR/p29_tie"
+(cd "$WORKDIR" && "$SG" init p29_tie) > /dev/null 2>&1
+(cd "$P29_TIE" && git config user.email "a@b.c" && git config user.name "git user")
+p29_mk "$P29_TIE" "$P29_TIE/a1.txt" SAME
+p29_mk "$P29_TIE" "$P29_TIE/a2.txt" SAME
+(cd "$P29_TIE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P29_TIE/a1.txt" "$P29_TIE/b1.txt"
+mv "$P29_TIE/a2.txt" "$P29_TIE/b2.txt"
+(cd "$P29_TIE" && "$SG" add .) > /dev/null 2>&1
+p29_cmp "$P29_TIE" "--cached --name-status (two identical sources)" --cached --name-status
+
+P29_ONE="$WORKDIR/p29_one_source"
+(cd "$WORKDIR" && "$SG" init p29_one_source) > /dev/null 2>&1
+(cd "$P29_ONE" && git config user.email "a@b.c" && git config user.name "git user")
+p29_mk "$P29_ONE" "$P29_ONE/src.txt" SAME
+(cd "$P29_ONE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P29_ONE/src.txt"
+p29_mk "$P29_ONE" "$P29_ONE/d1.txt" SAME
+p29_mk "$P29_ONE" "$P29_ONE/d2.txt" SAME
+(cd "$P29_ONE" && "$SG" add .) > /dev/null 2>&1
+p29_cmp "$P29_ONE" "--cached --name-status (one source, two destinations)" \
+    --cached --name-status
+
+# ⚠ KNOWN DIVERGENCE, asserted on purpose. sg only finds EXACT renames; a
+# rename plus an edit is still a delete and an add here, where git says
+# "R093". Asserting it means the day inexact detection lands, these two
+# checks fail and have to be updated -- rather than the gap quietly
+# persisting because no test ever looked.
+P29_INEX="$WORKDIR/p29_inexact"
+(cd "$WORKDIR" && "$SG" init p29_inexact) > /dev/null 2>&1
+(cd "$P29_INEX" && git config user.email "a@b.c" && git config user.name "git user")
+p29_mk "$P29_INEX" "$P29_INEX/t.txt" T
+(cd "$P29_INEX" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P29_INEX/t.txt" "$P29_INEX/t2.txt"
+printf 'one more line\n' >> "$P29_INEX/t2.txt"
+(cd "$P29_INEX" && "$SG" add .) > /dev/null 2>&1
+(cd "$P29_INEX" && "$SG" diff --cached --name-status) > "$WORKDIR/p29_inex_sg.txt" 2>/dev/null
+(cd "$P29_INEX" && git diff --cached --name-status) > "$WORKDIR/p29_inex_git.txt" 2>/dev/null
+check "phase29 oracle: real git detects the inexact rename" \
+    grep -q '^R0' "$WORKDIR/p29_inex_git.txt"
+check "phase29 known gap: sg reports it as a delete plus an add instead" \
+    sh -c "grep -q '^D' '$WORKDIR/p29_inex_sg.txt' && grep -q '^A' '$WORKDIR/p29_inex_sg.txt'"
+check "phase29 known gap: and sg claims no rename at all here" \
+    sh -c "! grep -q '^R' '$WORKDIR/p29_inex_sg.txt'"
+# The control that keeps the gap honest: with --no-renames git agrees with
+# sg exactly, which proves the divergence is the detection and nothing else.
+p29_cmp "$P29_INEX" "--cached --no-renames --name-status (inexact, both agree)" \
+    --cached --no-renames --name-status
+
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

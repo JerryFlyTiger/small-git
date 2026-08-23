@@ -1031,6 +1031,11 @@ static void test_patch_chunk_pointer_index_line_uses_effective_id(void)
     memset(&list, 0, sizeof(list));
     list.entries = malloc(sizeof(*list.entries));
     CHECK(list.entries != NULL, "OOM building manual diff list");
+    /* Zero the whole entry before filling it in. Setting only the fields
+       this test cares about leaves every other one holding malloc garbage,
+       and sg_diff_entry has grown fields since (old_path, score) that the
+       renderer dereferences -- ASan caught exactly that. */
+    memset(&list.entries[0], 0, sizeof(list.entries[0]));
     list.entries[0].path = strdup("big.bin");
     list.entries[0].old_side = old_side;
     list.entries[0].new_side = new_side;
@@ -1564,6 +1569,7 @@ static void test_patch_unreadable_blob_with_matching_ids_is_not_silently_skipped
     memset(&list, 0, sizeof(list));
     list.entries = malloc(sizeof(*list.entries));
     CHECK(list.entries != NULL, "OOM building manual diff list");
+    memset(&list.entries[0], 0, sizeof(list.entries[0]));
     list.entries[0].path = strdup("ghost.bin");
     memset(&list.entries[0].old_side, 0, sizeof(list.entries[0].old_side));
     list.entries[0].old_side.kind = SG_DIFF_SIDE_BLOB;
