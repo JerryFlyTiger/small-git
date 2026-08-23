@@ -119,6 +119,35 @@ static void test_literal_wildcard_characters(const char *root)
     CHECK(matches(root, "lit\\*st", "litXXst") == 0, "an escaped '*' does not glob");
 }
 
+/* Rules 1 and 2 are a plain byte compare, and they run even when the spec
+   contains wildcard characters -- so a DIRECTORY whose real name contains
+   '[' or '*' is recursed into by a spec spelling that name literally. That
+   is not a loophole in "a wildcard spec gets no leading-directory rule"
+   above; it is git's own order (ps_strncmp first, wildmatch second).
+
+   Measured against git 2.55.0 in a worktree holding a directory literally
+   named "o[tx]her" and one named "st*ar": `git diff -- 'o[tx]her'` reports
+   o[tx]her/f.txt, and `git diff -- 'st*ar'` reports st*ar/g.txt.
+
+   Without this case, gating rules 1 and 2 behind !has_wildcard(spec) -- the
+   obvious "fix" for the negatives in test_wildcards -- reddens nothing at
+   all, in this file or in interop.sh. Verified by mutation. */
+static void test_literal_rules_run_for_wildcard_specs(const char *root)
+{
+    CHECK(matches(root, "o[tx]her", "o[tx]her/f.txt") == 1,
+          "a directory literally named o[tx]her is recursed into");
+    CHECK(matches(root, "st*ar", "st*ar/g.txt") == 1,
+          "so is one literally named st*ar");
+    CHECK(matches(root, "o[tx]her", "o[tx]her") == 1, "and the name itself matches exactly");
+    CHECK(matches(root, "o[tx]her/", "o[tx]her/f.txt") == 1,
+          "the trailing-slash form works on such a name too");
+    /* The control: the same spec must still NOT recurse into a directory it
+       only matches via wildmatch. Losing this pairing would turn the case
+       above into a licence for the over-broad rule test_wildcards forbids. */
+    CHECK(matches(root, "o[tx]her", "other/d.c") == 0,
+          "...while the wildcard reading of it still gets no leading-dir rule");
+}
+
 static void test_match_everything(const char *root)
 {
     sg_pathspec ps;
@@ -317,6 +346,7 @@ int main(void)
     test_literal_and_leading_directory(root);
     test_trailing_slash(root);
     test_wildcards(root);
+    test_literal_rules_run_for_wildcard_specs(root);
     test_literal_wildcard_characters(root);
     test_match_everything(root);
     test_multiple_specs(root);
