@@ -252,6 +252,49 @@ static void test_empty_and_single_lists(void)
     sg_diff_list_free(&l);
 }
 
+/* The safety gate with no coverage until now: a side whose effective id
+   could not be VERIFIED must never be paired. sg_diff_side_effective_id
+   returns -1 for exactly that case, and two unverified ids that happen to be
+   byte-equal are not proof the content matches -- pairing on them would
+   invent a rename that never happened.
+
+   Reaching it needs a BLOB side (a WORKDIR side's id is its own content
+   hash, always verified) whose id cannot be resolved through the object
+   store. Pointing git_dir at a directory that does not exist does that
+   without a fixture: the object read fails, so the id stays unverified.
+
+   Note the ids here are deliberately IDENTICAL. That is the whole point: a
+   version of this code that skipped the verification check would pair them
+   and report a rename, and every other test in this file and in interop.sh
+   would still pass. */
+static void test_unverified_ids_are_never_paired(void)
+{
+    sg_diff_list l;
+
+    memset(&l, 0, sizeof(l));
+    add_deletion(&l, "old.txt", 0xAA);
+    add_addition(&l, "zew.txt", 0xAA);
+    l.entries[0].old_side.kind = SG_DIFF_SIDE_BLOB;
+    l.entries[1].new_side.kind = SG_DIFF_SIDE_BLOB;
+
+    CHECK(sg_diff_detect_renames("/nonexistent", &l, 50) == 0, "detection still succeeds");
+    CHECK(l.count == 2, "identical but unverified ids are not a rename");
+    CHECK(l.entries[0].old_path == NULL && l.entries[1].old_path == NULL,
+          "and neither row claims to be one");
+    sg_diff_list_free(&l);
+
+    /* The control that makes the check above mean something: the SAME ids on
+       WORKDIR sides -- where the id is the content hash and needs no
+       resolving -- do pair. Without this, "count == 2" above could equally
+       be satisfied by detection that never pairs anything at all. */
+    memset(&l, 0, sizeof(l));
+    add_deletion(&l, "old.txt", 0xAA);
+    add_addition(&l, "zew.txt", 0xAA);
+    CHECK(sg_diff_detect_renames("/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(l.count == 1, "the same ids on verified sides DO pair");
+    sg_diff_list_free(&l);
+}
+
 /* ---- rendering: the one property detection alone cannot pin ------------ */
 
 /* The score is printed zero-padded to three digits ("R093"), which is
@@ -363,6 +406,77 @@ static void test_score_is_zero_padded_to_three_digits(void)
     sg_diff_list_free(&l);
 }
 
+/* A renamed row's OLD side must be read from the OLD path. No builder
+   currently produces a WORKDIR old_side, so nothing in the normal flow can
+   tell the two apart -- which is exactly why this test fabricates the
+   configuration directly rather than going through a builder. Rewriting
+   old_side_path to return e->path leaves the entire suite green without it.
+
+   If the wrong path were used, both sides would be read from the SAME file
+   (the destination), the contents would match, and the patch would carry no
+   removal line at all. */
+static void test_rename_reads_its_old_side_from_the_old_path(void)
+{
+    char tmpl[] = "/tmp/sg_rename_oldside_XXXXXX";
+    char oldp[512], newp[512];
+    sg_diff_list l;
+    sg_diff_out_opts opts;
+    char *out;
+    FILE *f;
+
+    if (mkdtemp(tmpl) == NULL) {
+        fprintf(stderr, "setup failed: mkdtemp\n");
+        exit(1);
+    }
+    snprintf(oldp, sizeof(oldp), "%s/old.txt", tmpl);
+    snprintf(newp, sizeof(newp), "%s/new.txt", tmpl);
+    f = fopen(oldp, "w");
+    if (f == NULL) {
+        fprintf(stderr, "setup failed: write old.txt\n");
+        exit(1);
+    }
+    fputs("ONLY-IN-THE-OLD-FILE\n", f);
+    fclose(f);
+    f = fopen(newp, "w");
+    if (f == NULL) {
+        fprintf(stderr, "setup failed: write new.txt\n");
+        exit(1);
+    }
+    fputs("only-in-the-new-file\n", f);
+    fclose(f);
+
+    memset(&l, 0, sizeof(l));
+    /* Both sides WORKDIR, with different ids so the row counts as a content
+       change and a body actually gets rendered. */
+    add(&l, "new.txt", 1, 0xAA, 1, 0xBB);
+    l.entries[0].old_side.kind = SG_DIFF_SIDE_WORKDIR;
+    l.entries[0].new_side.kind = SG_DIFF_SIDE_WORKDIR;
+    l.entries[0].old_path = strdup("old.txt");
+    if (l.entries[0].old_path == NULL) {
+        fprintf(stderr, "setup failed: strdup\n");
+        exit(1);
+    }
+    l.entries[0].score = 100;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH;
+    capture_start();
+    sg_diff_print(tmpl, tmpl, &l, &opts);
+    out = capture_end();
+
+    CHECK(strstr(out, "-ONLY-IN-THE-OLD-FILE") != NULL,
+          "the old side's content comes from the old path, got [%s]", out);
+    CHECK(strstr(out, "+only-in-the-new-file") != NULL,
+          "and the new side's from the new path");
+    CHECK(strstr(out, "rename from old.txt") != NULL, "the header names the old path");
+
+    free(out);
+    sg_diff_list_free(&l);
+    unlink(oldp);
+    unlink(newp);
+    rmdir(tmpl);
+}
+
 int main(void)
 {
     test_exact_rename_becomes_one_row();
@@ -373,7 +487,9 @@ int main(void)
     test_zero_score_disables();
     test_list_stays_sorted();
     test_empty_and_single_lists();
+    test_unverified_ids_are_never_paired();
     test_score_is_zero_padded_to_three_digits();
+    test_rename_reads_its_old_side_from_the_old_path();
 
     if (failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);

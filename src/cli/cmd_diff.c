@@ -385,7 +385,7 @@ int sg_cmd_diff(int argc, char **argv)
        renamed pair prints "A b1.txt", because git filters by pathspec first
        and a spec naming half a rename leaves nothing to pair with. */
     if (sg_diff_detect_renames(git_dir, &list, rename_score) != 0) {
-        fprintf(stderr, "sg: 記憶體不足,無法偵測改名\n");
+        fprintf(stderr, "sg: 記憶體不足，無法偵測改名\n");
         goto done;
     }
 

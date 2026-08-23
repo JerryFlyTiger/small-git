@@ -99,6 +99,10 @@ int sg_diff_detect_renames(const char *git_dir, sg_diff_list *list, int min_scor
         write = 0;
         for (i = 0; i < list->count; i++) {
             if (taken[i]) {
+                /* Always NULL: a claimed entry is a source, and only
+                   destinations ever get an old_path. Freed anyway for the
+                   same reason sg_diff_list_filter does it -- so ownership
+                   here does not depend on that argument staying true. */
                 free(list->entries[i].old_path);
                 continue;
             }

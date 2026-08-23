@@ -510,9 +510,15 @@ turns detection off and
 .BI -M <n>
 sets the threshold, which
 .I n
-must be a whole percentage from 1 to 100 (git's fractional and
-.RB \(dq % \(dq-suffixed
-spellings are not accepted).
+must be a whole percentage from 1 to 100. git additionally accepts
+.BR -M0 ,
+.BR -M101 ,
+a fraction
+.RB ( -M0.5 )
+and a
+.RB \(dq % \(dq
+suffix; all four are refused here rather than accepted with a meaning that
+cannot be honoured while only exact renames are found.
 .PP
 Only exact renames are found. git also pairs files by similarity score, so a
 move plus an edit that git reports as

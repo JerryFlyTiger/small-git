@@ -13,6 +13,17 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+/* The path a row's OLD side belongs to. Only a rename makes this differ
+   from e->path, and today it makes no difference either way: a WORKDIR side
+   is the only kind sg_diff_side_read uses the path for, and no builder ever
+   puts one on an old_side. Spelled out anyway, because "harmless because of
+   an invariant three files away" is how a future builder silently reads a
+   renamed row's before-content out of the destination file. */
+static const char *old_side_path(const sg_diff_entry *e)
+{
+    return e->old_path != NULL ? e->old_path : e->path;
+}
+
 /* ---- --stat=<width>[,<name-width>] argument parsing ------------------ */
 
 int sg_diff_parse_stat_arg(const char *arg, int *width_out, int *name_width_out)
@@ -402,7 +413,7 @@ static int build_entry_stat(const char *git_dir, const char *repo_root, const sg
         sg_chunk_missing_info missing;
         int rc;
 
-        rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->old_side, &a_data, &a_len, &missing);
+        rc = sg_diff_side_read(git_dir, repo_root, old_side_path(e), &e->old_side, &a_data, &a_len, &missing);
         if (rc == -2) {
             sg_chunk_print_missing_error(e->path, &missing);
             return -1;
@@ -715,7 +726,7 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
             printf("index %s..%s %06o\n", old_hex, new_hex,
                   new_present ? e->new_side.mode : e->old_side.mode);
 
-        rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->old_side, &a_data, &a_len, &missing);
+        rc = sg_diff_side_read(git_dir, repo_root, old_side_path(e), &e->old_side, &a_data, &a_len, &missing);
         if (rc == -2) {
             sg_chunk_print_missing_error(e->path, &missing);
             had_error = 1;
@@ -817,29 +828,40 @@ static int print_name_status(const sg_diff_list *list)
    Quoting the pieces of a braced form would produce quotes in the middle of
    a path, which no consumer could unquote.
 
-   Writes into `buf` and returns it; on overflow returns the plain
-   `old => new` form, which is what a caller can still act on. */
-static const char *rename_pair_display(const char *old_path, const char *new_path,
-                                       char *buf, size_t buf_size)
+   Returns a malloc'd string the caller owns, or NULL if allocation fails.
+   Sized from the inputs rather than written into a fixed buffer on purpose:
+   a first version took a caller-supplied char[SG_PATH_MAX * 2], which two
+   4095-byte paths overflow (4095 + 4 + 4095 + 1 > 8192), and its overflow
+   path returned the destination path alone -- output indistinguishable from
+   an ordinary addition, with the rename silently gone. Quoting makes the
+   bound worse still, since one byte can expand to four. Tree entry names are
+   not length-validated anywhere in this codebase (src/object/tree.c), so
+   those lengths are reachable from a crafted tree, not just hypothetical. */
+static char *rename_pair_display(const char *old_path, const char *new_path)
 {
     const char *q_old = sg_quote_path(old_path);
+    const char *q_new = sg_quote_path(new_path);
     size_t len_old = strlen(old_path);
     size_t len_new = strlen(new_path);
     size_t pfx = 0;
     size_t sfx = 0;
     size_t i;
-    int n;
+    size_t need;
+    char *out;
 
     /* sg_quote_path only adds quotes when it had to escape something, so a
        leading '"' is exactly "this path needed quoting" -- a path whose own
-       first byte is '"' needs quoting for that very reason. */
-    if (q_old[0] == '"' || sg_quote_path(new_path)[0] == '"') {
-        /* Two calls, two of the four rotating buffers (sg/quote.h). */
-        n = snprintf(buf, buf_size, "%s => %s", sg_quote_path(old_path),
-                    sg_quote_path(new_path));
-        if (n < 0 || (size_t)n >= buf_size)
-            return new_path;
-        return buf;
+       first byte is '"' needs quoting for that very reason. Both quoted
+       forms are read here while still live: two of the ring's four slots
+       (sg/quote.h), and no further sg_quote_path call happens before they
+       are copied out. */
+    if (q_old[0] == '"' || q_new[0] == '"') {
+        need = strlen(q_old) + 4 + strlen(q_new) + 1;
+        out = malloc(need);
+        if (out == NULL)
+            return NULL;
+        snprintf(out, need, "%s => %s", q_old, q_new);
+        return out;
     }
 
     for (i = 0; i < len_old && i < len_new && old_path[i] == new_path[i]; i++) {
@@ -861,29 +883,36 @@ static const char *rename_pair_display(const char *old_path, const char *new_pat
     }
 
     if (pfx == 0 && sfx == 0) {
-        n = snprintf(buf, buf_size, "%s => %s", old_path, new_path);
-        if (n < 0 || (size_t)n >= buf_size)
-            return new_path;
-        return buf;
+        need = len_old + 4 + len_new + 1;
+        out = malloc(need);
+        if (out == NULL)
+            return NULL;
+        snprintf(out, need, "%s => %s", old_path, new_path);
+        return out;
     }
 
-    n = snprintf(buf, buf_size, "%.*s{%.*s => %.*s}%.*s",
-                (int)pfx, old_path,
-                (int)(len_old - pfx - sfx), old_path + pfx,
-                (int)(len_new - pfx - sfx), new_path + pfx,
-                (int)sfx, old_path + len_old - sfx);
-    if (n < 0 || (size_t)n >= buf_size)
-        return new_path;
-    return buf;
+    /* pfx + mid_old + " => " + mid_new + sfx + "{}" + NUL, bounded above by
+       both whole paths plus the fixed punctuation. */
+    need = len_old + len_new + 8;
+    out = malloc(need);
+    if (out == NULL)
+        return NULL;
+    snprintf(out, need, "%.*s{%.*s => %.*s}%.*s",
+            (int)pfx, old_path,
+            (int)(len_old - pfx - sfx), old_path + pfx,
+            (int)(len_new - pfx - sfx), new_path + pfx,
+            (int)sfx, old_path + len_old - sfx);
+    return out;
 }
 
 /* The display name for any row: the rename pair when there is one, the
-   quoted path otherwise. */
-static const char *entry_display_name(const sg_diff_entry *e, char *buf, size_t buf_size)
+   quoted path otherwise. Always malloc'd so the caller frees exactly one
+   thing either way; NULL on allocation failure. */
+static char *entry_display_name(const sg_diff_entry *e)
 {
     if (e->old_path != NULL)
-        return rename_pair_display(e->old_path, e->path, buf, buf_size);
-    return sg_quote_path(e->path);
+        return rename_pair_display(e->old_path, e->path);
+    return strdup(sg_quote_path(e->path));
 }
 
 static int print_numstat(const char *git_dir, const char *repo_root, const sg_diff_list *list)
@@ -901,15 +930,19 @@ static int print_numstat(const char *git_dir, const char *repo_root, const sg_di
         }
 
         {
-            char namebuf[SG_PATH_MAX * 2];
-            const char *name = entry_display_name(e, namebuf, sizeof(namebuf));
+            char *name = entry_display_name(e);
 
+            if (name == NULL) {
+                had_error = 1;
+                continue;
+            }
             if (st.unmerged)
                 printf("0\t0\t%s\n", name);
             else if (st.is_binary)
                 printf("-\t-\t%s\n", name);
             else
                 printf("%ld\t%ld\t%s\n", st.added, st.deleted, name);
+            free(name);
         }
     }
 
@@ -945,21 +978,16 @@ static int build_stat_rows(const char *git_dir, const char *repo_root, const sg_
     for (i = 0; i < list->count; i++) {
         const sg_diff_entry *e = &list->entries[i];
         entry_stat st;
-        const char *qname;
 
         if (build_entry_stat(git_dir, repo_root, e, &st) != 0) {
             *had_error = 1;
             continue;
         }
 
-        {
-            char namebuf[SG_PATH_MAX * 2];
-
-            /* Same display name --numstat uses, so the two formats can never
-               disagree about how a rename is spelled. */
-            qname = entry_display_name(e, namebuf, sizeof(namebuf));
-            rows[n].name = strdup(qname);
-        }
+        /* Same display name --numstat uses, so the two formats can never
+           disagree about how a rename is spelled. Already owned, so there is
+           nothing left to strdup. */
+        rows[n].name = entry_display_name(e);
         if (rows[n].name == NULL) {
             *had_error = 1;
             continue;
