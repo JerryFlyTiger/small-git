@@ -49,7 +49,20 @@ typedef struct {
 } sg_diff_side;
 
 typedef struct {
+    /* The path this row is displayed under: the NEW path for an addition, a
+       modification or a rename, and the only path for a deletion. The list
+       stays sorted by this field, which is what `git diff --name-only`
+       prints and the order it prints them in. */
     char *path; /* owned, repo-relative, '/' separated */
+    /* Non-NULL only for a rename: where the content came from. `path` is
+       still the destination, so every renderer that does not care about
+       renames keeps working unchanged, and only the ones that do go looking
+       here. Owned. */
+    char *old_path;
+    /* Similarity, 0-100, meaningful only when old_path != NULL. git prints
+       it as a three-digit zero-padded suffix ("R100", "R093") and as
+       "similarity index 93%". */
+    int score;
     sg_diff_side old_side;
     sg_diff_side new_side;
     /* 1 when this row stands for an unresolved conflict rather than a content
@@ -151,6 +164,48 @@ int sg_diff_index_workdir(const char *git_dir, const char *repo_root,
 int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                          const unsigned char *old_tree, const sg_index *idx,
                          sg_diff_list *out, char *bad_path);
+
+/* The content id a side stands for, resolving a chunk pointer to what it
+   points at. Returns 0 when that id is trustworthy, and -1 when it is the
+   side's raw id copied through unverified (a genuine chunk pointer that
+   could not be resolved). Callers must not treat two unverified ids that
+   happen to be equal as proof the content matches. */
+int sg_diff_side_effective_id(const char *git_dir, const sg_diff_side *side,
+                              unsigned char out[SG_SHA1_RAW_LEN]);
+
+/* Pairs deletions with additions of the same content and rewrites each pair
+   as a single rename row: the destination entry keeps its `path`, gains the
+   source's `old_path` and `old_side`, and the source entry is dropped.
+
+   Only EXACT renames are found -- the two sides must hold byte-identical
+   content (compared by effective object id, so chunked storage resolves to
+   what it points at). git also finds *inexact* renames by similarity score;
+   sg does not yet, so a `git mv` followed by an edit is still reported here
+   as a deletion plus an addition where git 2.55.0 would say "R093". That is
+   a divergence, not a design choice -- see docs/DESIGN.md Phase 29.
+
+   Pairing is by path order, each source used at most once: measured against
+   git 2.55.0, two identical sources and two identical destinations pair up
+   in order, and one source with two identical destinations claims the first
+   destination and leaves the second an ordinary addition.
+
+   MUST run after sg_diff_list_filter, never before. Measured: `git diff
+   --cached --name-status -- b1.txt` on a renamed pair prints "A b1.txt", not
+   the rename -- git filters by pathspec first, so a spec naming only one
+   half of a rename leaves nothing to pair with. Running detection first
+   would instead report a rename and then filter it, printing "R100" where
+   git prints "A".
+
+   The list stays sorted by `path` because only source entries are removed
+   and destinations keep the path they already had.
+
+   `min_score` is git's -M threshold, 1-100; it does not affect exact
+   renames (which always score 100) but is taken now so that turning on
+   inexact detection later does not change this signature. Passing 0 means
+   "do not detect renames at all", which is git's --no-renames.
+
+   Returns 0, or -1 on allocation failure with the list left untouched. */
+int sg_diff_detect_renames(const char *git_dir, sg_diff_list *list, int min_score);
 
 /* Drops every entry whose path the pathspec does not cover, freeing it. An
    empty pathspec matches everything, so an unfiltered `sg diff` and a

@@ -2973,3 +2973,113 @@ interop 新增 68 條檢查(1432 → 1500),**幾乎每一條都是同一組引�
 - **三個以上的 rev**:真 git 的 `git diff HEAD HEAD HEAD` 退出 0(合併 diff 的路徑),
   sg 判成 usage 錯誤。已知分歧。
 - 效能:被濾掉的路徑仍然會被雜湊。見上。
+
+## Phase 29:rename 偵測(exact)
+
+改名先前一律印成 delete + add。這一輪讓 `sg diff` 認得改名,六種格式全部與真 git
+逐位元組相同。**只做 exact(內容完全相同)**;git 另外會用相似度分數找 inexact
+改名,那一半還沒做,見末尾。
+
+### 實測推翻的兩件事
+
+1. **配對是全域的內容比對,不是 `git mv` 的歷史。** 把 `low.txt` 的內容整個換掉之後,
+   git 把它配到了 `sub/deep_new.txt`(內容相同的那個),原本的 `sub/deep.txt` 變成 `D`、
+   `low_new.txt` 變成 `A`。改名在 git 的模型裡是「刪除集合與新增集合之間的一場配對」,
+   與檔案怎麼移動無關。
+2. **工作目錄側等於沒有改名。** 未 stage 的改名,新檔是未追蹤的,根本不參與 diff——
+   `git diff` / `git diff HEAD` 只看得到 `D`,`git status` 是 `D` + `??`。
+   所以 index↔工作目錄那個建構器結構上產生不出改名列,`sg_diff_index_workdir`
+   不必特別處理。
+
+### 規格表(全部實測 git 2.55.0)
+
+| 格式 | 改名列長什麼樣 |
+|---|---|
+| `--name-status` | `R100\told\tnew`,分數**三位數補零** |
+| `--name-only` | 只印**新**路徑 |
+| `--numstat` | `0\t0\t<壓縮後的配對>` ——兩個路徑擠在**同一欄**,不是兩欄 |
+| `--stat` | 名稱欄放壓縮後的配對 |
+| `--shortstat` | 不受影響 |
+| patch | `diff --git a/old b/new`、`[old/new mode]`、`similarity index N%`、`rename from/to`;100% 時**沒有 `index` 行也沒有 hunk** |
+
+排序依**新路徑**(刪除列用自己的路徑),正好是 sg 的 `sg_diff_list` 既有的排序鍵,
+所以配對之後不需要重排——只有來源列被移除,目的地列保留原本的 path。
+
+`{a => b}` 壓縮的前後綴都在 **`/` 邊界**上計算:
+
+```
+a/b/c.txt  -> a/z/c.txt     =>  a/{b => z}/c.txt      前後綴都有
+h/i/j.txt  -> h2/i/j.txt    =>  {h => h2}/i/j.txt     只有後綴
+x/y.txt    -> x/y2.txt      =>  x/{y.txt => y2.txt}   只有前綴
+pre.txt    -> pre.txt.bak   =>  pre.txt => pre.txt.bak   位元組有共同、但沒有共同「元件」
+```
+
+⚠ 後綴迴圈要**掃到底、在每個 `/` 更新**(取最長的元件對齊後綴),不是遇到第一個 `/`
+就停——後者會把 `{h => h2}/i/j.txt` 印成 `{h/i => h2/i}/j.txt`。實作時就是這樣寫錯的,
+interop 的 cmp 抓到。
+⚠ **需要 C-quoting 的路徑會讓壓縮整個關掉**:git 印 `d/plain.txt => "d/tab\there.txt"`,
+不是 `d/{plain.txt => ...}`。把括號形式的片段各自加引號會在路徑中間生出引號,沒有
+消費端能解析。
+
+### 順序:pathspec 先,rename 偵測後
+
+實測:`git diff --cached --name-status -- b1.txt`(只指名改名的新那半)印出 **`A b1.txt`**,
+不是改名;只指名舊那半印出 `D`;兩半都給才是 `R100`。所以 git 是**先用 pathspec 過濾、
+再做偵測**,被濾掉的那半就沒有配對對象了。
+
+`cmd_diff.c` 因此是 `sg_diff_list_filter` → `sg_diff_detect_renames`。把順序寫反不會有
+任何編譯或執行期徵兆,只會在「pathspec 只指名一半」時給出 `R100` 而 git 給 `A`。
+定向 mutation(把偵測移到過濾之前)紅了 4 條檢查。
+
+### 配對規則
+
+目的地依路徑順序,各自認領**第一個尚未被認領**、內容相同的來源。實測支撐:
+兩個相同來源配兩個相同目的地會依序配(`a1→b1`、`a2→b2`,不交叉);
+一個來源配兩個相同目的地時,第一個目的地拿走它,第二個退回普通的 `A`
+(git 預設不做 copy 偵測,實測連 `-C` 都沒偵測到)。
+
+⚠ **比對用的是 effective id**。`sg_diff_side_effective_id` 原本是 `diff_out.c` 裡的
+static,這一輪提升成公開函式讓兩個消費端共用——它帶著一句要緊的合約:
+**兩個「未驗證」的 id 就算位元組相同,也不是內容相同的證據**。第一版的 rename.c
+自己寫了一份 helper 並在解析失敗時退回原始 id,那正是這句話警告的錯,會生出假改名。
+現在失敗方向是「不配對」。
+
+### 驗證
+
+interop 新增 31 條(1505 → 1536),定向 mutation 九條、八條被抓到。第九條值得記:
+
+**把 `R%03d` 改成 `R%d`,整套測試零變紅**——但這不是覆蓋缺口,是**數學上不可觀測**:
+目前每個改名都是 exact、分數恆為 100,兩種格式印出來完全一樣。處理方式不是記下來
+就算了,而是**把它變成可觀測的**:`tests/test_rename.c` 新增一條直接把 93 分餵進
+`sg_diff_print --name-status` 的渲染測試(該格式不讀內容,所以捏造的清單就夠)。
+重跑同一條 mutation 後變紅,訊息顯示 `R93`。
+
+### 加一個結構欄位的代價,是 ASan 抓到的
+
+`sg_diff_entry` 多了 `old_path` 與 `score` 之後踩到兩件事,兩件都不是邏輯錯:
+
+1. **Makefile 沒有標頭相依追蹤**(無 `-MMD`/`.d`/`-include`)。改了標頭之後 `make` 只重編
+   動過的 `.c`,其他 TU continue 用舊佈局的 `.o`,於是 `make test` 在 `cmd_stash.c` 的
+   `strcmp` 崩掉——看起來完全像新寫的邏輯有 bug。`make clean && make` 之後 50/50 全過,
+   程式碼一行沒改。已寫進 CLAUDE.md 的建置章節。
+2. **手工建構 entry 的地方會漏掉新欄位。** `tests/test_diff_out.c` 有兩處是
+   `malloc` 之後逐一指派欄位(沒有先 memset),新欄位因此是 malloc 垃圾,而
+   `print_patch` 會解參考 `old_path`。**普通建置跑過去沒事,只有 `make sanitize` 紅**
+   ——ASan 報 `SEGV ... in sg_quote_path_prefixed`,位址是 `0xbebebebe`(未初始化樣式)。
+
+第 2 點正是 CLAUDE.md 那條「動到記憶體管理時加跑 `make sanitize`」的價值:`make test`
+與 interop **雙雙全綠**,只有 sanitize 抓得到。往共用結構加欄位應該算進「動到記憶體管理」。
+
+### 這一輪刻意沒做的
+
+- **inexact 改名**(相似度分數)。這是最大的缺口,而且風險已經看得到:要讓 `R093`
+  與 `similarity index 93%` 與 git 逐位元組相同,必須複製 git `diffcore-delta.c` 的
+  spanhash 計數演算法,差一分整條 cmp 就紅。interop 有兩條檢查**明確斷言這個分歧**
+  (git 給 `R0..`、sg 給 `D`+`A`),外加一條 `--no-renames` 對照組證明分歧確實只出在
+  偵測而不是別處——等 inexact 做出來,那兩條會紅,必須更新,而不是靜靜地繼續錯。
+- **copy 偵測**(`-C`)。git 預設關閉,實測連加 `-C` 都沒偵測到,不做。
+- **`sg status` 的改名列**(`R  old -> new`)。`sg_status_diff_staged` 是 tree↔index 的
+  **第二份實作**(Phase 27 只收斂了 unstaged 那半),而且同時餵著 `apply.c` 的兩道
+  安全閘門——把改名塞進去會改變它們看到的列數。要做得對需要先像 Phase 27 那樣
+  列舉分歧,不是順手加。
+- `-M<n>` 只接受 1-100 的整數,不接受 git 的小數(`-M0.5`)與尾綴 `%`。

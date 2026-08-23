@@ -14,12 +14,51 @@ void sg_diff_list_free(sg_diff_list *list)
 {
     size_t i;
 
-    for (i = 0; i < list->count; i++)
+    for (i = 0; i < list->count; i++) {
         free(list->entries[i].path);
+        free(list->entries[i].old_path);
+    }
     free(list->entries);
     list->entries = NULL;
     list->count = 0;
     list->cap = 0;
+}
+
+/* index/mode-line plumbing and rename detection share this: git's "index <old>..<new>" line and
+   an entry's "old/new mode" lines want the id/mode an ordinary tree/index
+   entry would carry, resolved off whichever kind of side actually produced
+   it. See sg/diff.h's sg_diff_side contract for why BLOB and WORKDIR need
+   different treatment here.
+
+   Always fills *out with SOMETHING displayable, falling back to the side's
+   raw id when resolution fails, but returns 0 only when that id is actually
+   verified -- -1 means "could not verify" (a broken/missing chunk pointer).
+   That distinction matters to the caller beyond cosmetics: two "unverified"
+   ids that happen to come out byte-equal are NOT proof the content matches,
+   and neither print_patch's mode-only row nor sg_diff_detect_renames'
+   pairing may be decided on that basis --
+   doing so would silently skip the sg_diff_side_read call that is the only
+   place this failure gets reported to the user (measured: the
+   append_index_entry_vs_workdir builder deliberately force-appends a row
+   whenever chunk resolution fails, precisely so the renderer gets a chance
+   to hit and report the same failure with the path in hand). */
+int sg_diff_side_effective_id(const char *git_dir, const sg_diff_side *side,
+                             unsigned char out[SG_SHA1_RAW_LEN])
+{
+    if (side->kind == SG_DIFF_SIDE_BLOB) {
+        if (sg_chunk_effective_id(git_dir, side->id, out) == 0)
+            return 0;
+        memcpy(out, side->id, SG_SHA1_RAW_LEN);
+        return -1;
+    }
+    if (side->kind == SG_DIFF_SIDE_WORKDIR) {
+        memcpy(out, side->id, SG_SHA1_RAW_LEN);
+        return 0;
+    }
+    /* ABSENT: git's "0000000" -- the hex of an all-zero id happens to start
+       with 7 zeros, so no special-casing is needed at the print site. */
+    memset(out, 0, SG_SHA1_RAW_LEN);
+    return 0;
 }
 
 void sg_diff_list_filter(sg_diff_list *list, const sg_pathspec *ps)
@@ -37,6 +76,11 @@ void sg_diff_list_filter(sg_diff_list *list, const sg_pathspec *ps)
             write++;
         } else {
             free(list->entries[read].path);
+            /* Always NULL in practice -- filtering is defined to run before
+               rename detection (see sg_diff_detect_renames) -- but owning it
+               here keeps the two passes independent of each other's order
+               for the purpose of who frees what. */
+            free(list->entries[read].old_path);
         }
     }
     list->count = write;
@@ -57,6 +101,8 @@ static int list_append(sg_diff_list *list, const char *path, const sg_diff_side 
     list->entries[list->count].path = strdup(path);
     if (list->entries[list->count].path == NULL)
         return -1;
+    list->entries[list->count].old_path = NULL;
+    list->entries[list->count].score = 0;
     list->entries[list->count].old_side = *old_side;
     list->entries[list->count].new_side = *new_side;
     list->entries[list->count].unmerged = 0;

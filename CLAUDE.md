@@ -13,7 +13,7 @@ C11 實作的簡化版 git,可執行檔 `sg`。目標是**與真 git 的磁碟�
 
 ```bash
 make                              # build/sg,含 -g
-make test                         # 49 個單元測試二進位,任一失敗即整體失敗
+make test                         # 50 個單元測試二進位,任一失敗即整體失敗
 bash tests/interop.sh             # 與真 git 的互通測試(需先 make)
 make sanitize                     # clean + ASan/UBSan 重建 + 跑單元測試
 python3 tests/fuzz_ignore.py      # .gitignore 一致性 fuzzer(預設 200 輪)
@@ -28,7 +28,7 @@ python3 tests/fuzz_diff.py        # patch 輸出一致性 fuzzer(預設 200 輪)
 
 - 印 `0 個 TU 重編` 那一行**不會給你 warning 數**:make 這次什麼都沒編,數出來
   的 0 是「沒量到」而不是「量到 0」。要真的量,用 `--rebuild`。
-- `make test` 那行的 `N/49 個跑到`,N 少於 49 就是**中途中止**(Makefile 在第一
+- `make test` 那行的 `N/50 個跑到`,N 少於 50 就是**中途中止**(Makefile 在第一
   個失敗的二進位就停),不是「其他都過了」。
 - 退出碼非 0 但零 FAIL 行照樣判 FAIL:崩潰、逾時、ASan abort 都長這樣。
 - interop 抓不到 `interop: N/M passed` 那一行會直接判 FAIL,不會靜靜跳過;而行
@@ -68,6 +68,14 @@ python3 tests/fuzz_diff.py        # patch 輸出一致性 fuzzer(預設 200 輪)
 切換建置模式之間一定要 `make clean`:object 檔不記錄自己是用哪組旗標編的
 (`Makefile:76-80` 有完整說明)。`release`/`sanitize` 自帶 clean,回到普通
 `make` 則要手動清。
+
+**改任何 `include/sg/*.h` 之後也一定要 `make clean`。Makefile 沒有標頭相依追蹤**
+——沒有 `-MMD`、沒有 `.d` 檔、沒有 `-include`,所以 `make` 只會重編你動過的 `.c`,
+其他 TU 繼續用舊的 `.o`。改的若是結構定義(例如往 `sg_diff_entry` 加欄位),
+不同 `.o` 就會對同一個結構有不同的佈局,症狀是**隨機位置的 segfault**,而且
+看起來完全像是你新寫的邏輯有 bug。2026-08-23(Phase 29)實測:加一個欄位之後
+`make test` 在 `cmd_stash.c` 的 `strcmp` 崩掉,`make clean && make` 之後 49/49 全過,
+程式碼一行沒改。
 
 依賴 zlib / openssl / libcurl,全走 pkg-config(`Makefile:31-40`)。只支援
 macOS 與 Linux(直接用 POSIX API)。macOS 上 brew 的 openssl@3 不在預設路徑,
@@ -191,6 +199,23 @@ staging 的驗證。本機綠燈不是充分證據。**
   的引數不做存在性檢查**——`git diff '*.zzz'` 匹配不到任何東西仍然退出 0,而
   `git diff nosuch` 是硬錯誤。判斷「這看起來像 pathspec 嗎」用
   `sg_pathspec_looks_like_spec`,字元集只有那一份,與比對器放在一起。
+- **改名一律走 `sg_diff_detect_renames`**(`include/sg/diff.h`,Phase 29),它是**建好清單
+  之後的一個 pass**,不在四個建構器裡面(理由同 `sg_diff_list_filter`)。
+  ⚠ **必須排在 `sg_diff_list_filter` 之後**。實測真 git:`git diff --cached --name-status
+  -- b1.txt`(只指名改名的新那半)印 `A`,不是 `R100`——git 先用 pathspec 過濾、再偵測,
+  半個配對就配不成了。順序寫反沒有任何徵兆,只會在這種情況給出錯的答案。
+  ⚠ **只做 exact**(內容完全相同)。inexact(相似度分數)還沒做,interop 有兩條檢查
+  **明確斷言這個分歧**,做出來的時候那兩條會紅,要更新而不是繞過。
+  ⚠ **比對用 `sg_diff_side_effective_id`**(Phase 29 從 `diff_out.c` 提升成公開),
+  它回 -1 表示「這個 id 沒被驗證過」——**未驗證的兩個 id 就算相同也不算內容相同**,
+  那種側一律不配對。失敗方向是「不是改名」,不是「憑空生出一個改名」。
+  ⚠ **`sg status` 還沒有改名列**:`sg_status_diff_staged` 是 tree↔index 的第二份實作,
+  而且餵著 `apply.c` 的兩道安全閘門,要收斂得先照 Phase 27 的做法列舉分歧。
+- **改名的顯示格式有兩套,不要混**(Phase 29):`--name-status` 印成**兩個獨立欄位**
+  (`R100\told\tnew`,分數三位補零);`--stat`/`--numstat` 印成**一欄的壓縮配對**
+  (`a/{b => z}/c.txt`)。壓縮的前後綴都在 `/` 邊界上算,而且**後綴要掃到底、在每個 `/`
+  更新**(取最長的),遇到第一個 `/` 就停會印出 `{h/i => h2/i}/j.txt`。
+  ⚠ **需要引用的路徑會讓壓縮整個關掉**(實測),因為括號形式加引號會在路徑中間生出引號。
 - **兩種引用規則不可以「統一」**(Phase 25):`sg status --porcelain`/`-s` 用
   `sg_quote_path_porcelain`——**只要含空格就引用**,因為 `?? ` 前綴讓空格變成欄位
   分隔符;長格式與四種機器格式用 `sg_quote_path`——**空格不引**。兩者都引控制字元。
@@ -428,7 +453,7 @@ staging 的驗證。本機綠燈不是充分證據。**
 
 ## 測試慣例
 
-- 49 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
+- 50 個獨立單元測試 `.c`,**沒有共用 header、沒有測試框架**。每檔自帶
   `static int failures = 0;` 與同名 `CHECK(cond, ...)` 巨集(失敗印
   `FAIL %s:%d` 並 `failures++`,**不 abort**),`main` 結尾 `failures > 0` 就
   `return 1`。要新增測試就照抄 `tests/test_confirm.c`(75 行,最短完整範例)。

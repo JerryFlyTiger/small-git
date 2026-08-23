@@ -5,6 +5,7 @@
 #include "sg/diff_lcs.h"
 #include "sg/hash.h"
 #include "sg/quote.h"
+#include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -438,41 +439,6 @@ static int build_entry_stat(const char *git_dir, const char *repo_root, const sg
 
 /* ---- PATCH format ----------------------------------------------------- */
 
-/* index/mode-line plumbing shares this: git's "index <old>..<new>" line and
-   an entry's "old/new mode" lines want the id/mode an ordinary tree/index
-   entry would carry, resolved off whichever kind of side actually produced
-   it. See sg/diff.h's sg_diff_side contract for why BLOB and WORKDIR need
-   different treatment here.
-
-   Always fills *out with SOMETHING displayable, falling back to the side's
-   raw id when resolution fails, but returns 0 only when that id is actually
-   verified -- -1 means "could not verify" (a broken/missing chunk pointer).
-   That distinction matters to the caller beyond cosmetics: two "unverified"
-   ids that happen to come out byte-equal are NOT proof the content matches,
-   and print_patch must not treat them as a mode-only row on that basis --
-   doing so would silently skip the sg_diff_side_read call that is the only
-   place this failure gets reported to the user (measured: the
-   append_index_entry_vs_workdir builder deliberately force-appends a row
-   whenever chunk resolution fails, precisely so the renderer gets a chance
-   to hit and report the same failure with the path in hand). */
-static int side_effective_id(const char *git_dir, const sg_diff_side *side,
-                             unsigned char out[SG_SHA1_RAW_LEN])
-{
-    if (side->kind == SG_DIFF_SIDE_BLOB) {
-        if (sg_chunk_effective_id(git_dir, side->id, out) == 0)
-            return 0;
-        memcpy(out, side->id, SG_SHA1_RAW_LEN);
-        return -1;
-    }
-    if (side->kind == SG_DIFF_SIDE_WORKDIR) {
-        memcpy(out, side->id, SG_SHA1_RAW_LEN);
-        return 0;
-    }
-    /* ABSENT: git's "0000000" -- the hex of an all-zero id happens to start
-       with 7 zeros, so no special-casing is needed at the print site. */
-    memset(out, 0, SG_SHA1_RAW_LEN);
-    return 0;
-}
 
 /* Unified-diff context width and the merge-adjacent-hunks threshold --
    both measured against real git 2.55.0 (CLAUDE.md's Phase 26 note: 5/6
@@ -676,8 +642,8 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
         new_present = e->new_side.kind != SG_DIFF_SIDE_ABSENT;
 
         {
-            int old_verified = side_effective_id(git_dir, &e->old_side, old_eff) == 0;
-            int new_verified = side_effective_id(git_dir, &e->new_side, new_eff) == 0;
+            int old_verified = sg_diff_side_effective_id(git_dir, &e->old_side, old_eff) == 0;
+            int new_verified = sg_diff_side_effective_id(git_dir, &e->new_side, new_eff) == 0;
 
             /* An add or a delete always counts as "content changed" even
                though one side's id is the all-zero ABSENT id and can never
@@ -693,7 +659,10 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
                               memcmp(old_eff, new_eff, SG_SHA1_RAW_LEN) != 0;
         }
 
-        printf("diff --git %s %s\n", sg_quote_path_prefixed("a/", e->path),
+        /* The a/ side of a rename is where the content came from -- measured
+           against git 2.55.0: "diff --git a/exact.txt b/exact_new.txt". */
+        printf("diff --git %s %s\n",
+              sg_quote_path_prefixed("a/", e->old_path != NULL ? e->old_path : e->path),
               sg_quote_path_prefixed("b/", e->path));
 
         wrote_mode_line = 0;
@@ -708,6 +677,18 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
             printf("old mode %06o\n", e->old_side.mode);
             printf("new mode %06o\n", e->new_side.mode);
             wrote_mode_line = 1;
+        }
+
+        /* A rename's own three lines come AFTER any mode lines and BEFORE
+           the index line -- measured against git 2.55.0, which prints
+           "old mode"/"new mode", then "similarity index 100%", then
+           "rename from"/"rename to". The two paths are quoted with
+           sg_quote_path (no a//b/ prefix on these two lines: measured
+           `rename to "tab\there.txt"`). */
+        if (e->old_path != NULL) {
+            printf("similarity index %d%%\n", e->score);
+            printf("rename from %s\n", sg_quote_path(e->old_path));
+            printf("rename to %s\n", sg_quote_path(e->path));
         }
 
         /* A pure mode change (content unchanged) prints NO index line at all
@@ -798,12 +779,112 @@ static int print_name_status(const sg_diff_list *list)
     for (i = 0; i < list->count; i++) {
         const sg_diff_entry *e = &list->entries[i];
 
+        /* A rename is the one row with two paths and a score. Measured
+           against git 2.55.0: "R100\told\tnew", the score three digits and
+           zero-padded. Both paths get sg_quote_path, same as every other
+           row in this format. Two calls in one printf is within the four
+           rotating buffers sg_quote_path hands out (see sg/quote.h). */
+        if (e->old_path != NULL) {
+            printf("R%03d\t%s\t%s\n", e->score, sg_quote_path(e->old_path),
+                  sg_quote_path(e->path));
+            continue;
+        }
         printf("%c\t%s\n", entry_status(e), sg_quote_path(e->path));
     }
     return 0;
 }
 
 /* ---- NUMSTAT ------------------------------------------------------------ */
+
+/* git's pprint_rename: the display name for a rename row, shared by --stat
+   and --numstat (--name-status prints the two paths as separate fields
+   instead, and the patch header has its own shape).
+
+   The common prefix and the common suffix are measured at '/' boundaries
+   only, and what is left in the middle goes inside braces. Measured against
+   git 2.55.0:
+     a/b/c.txt   -> a/z/c.txt      =>  a/{b => z}/c.txt
+     deep/p/q/r  -> deep/p/q2/r    =>  deep/p/{q => q2}/r.txt
+     h/i/j.txt   -> h2/i/j.txt     =>  {h => h2}/i/j.txt
+     x/y.txt     -> x/y2.txt       =>  x/{y.txt => y2.txt}
+     pre.txt     -> pre.txt.bak    =>  pre.txt => pre.txt.bak
+   The last one is why the boundaries matter: "pre.txt" is a common prefix by
+   bytes but not up to a '/', so there is no compression at all rather than
+   "pre.txt{ => .bak}".
+
+   ⚠ A path that needs C-quoting turns compression OFF entirely -- measured,
+   git prints `d/plain.txt => "d/tab\there.txt"`, not `d/{plain.txt => ...}`.
+   Quoting the pieces of a braced form would produce quotes in the middle of
+   a path, which no consumer could unquote.
+
+   Writes into `buf` and returns it; on overflow returns the plain
+   `old => new` form, which is what a caller can still act on. */
+static const char *rename_pair_display(const char *old_path, const char *new_path,
+                                       char *buf, size_t buf_size)
+{
+    const char *q_old = sg_quote_path(old_path);
+    size_t len_old = strlen(old_path);
+    size_t len_new = strlen(new_path);
+    size_t pfx = 0;
+    size_t sfx = 0;
+    size_t i;
+    int n;
+
+    /* sg_quote_path only adds quotes when it had to escape something, so a
+       leading '"' is exactly "this path needed quoting" -- a path whose own
+       first byte is '"' needs quoting for that very reason. */
+    if (q_old[0] == '"' || sg_quote_path(new_path)[0] == '"') {
+        /* Two calls, two of the four rotating buffers (sg/quote.h). */
+        n = snprintf(buf, buf_size, "%s => %s", sg_quote_path(old_path),
+                    sg_quote_path(new_path));
+        if (n < 0 || (size_t)n >= buf_size)
+            return new_path;
+        return buf;
+    }
+
+    for (i = 0; i < len_old && i < len_new && old_path[i] == new_path[i]; i++) {
+        if (old_path[i] == '/')
+            pfx = i + 1;
+    }
+    /* Symmetric with the prefix loop above: keep scanning the whole common
+       tail and record the position each time it lands on a '/', so the
+       LONGEST component-aligned suffix wins. Stopping at the first '/' found
+       going backwards instead gives "{h/i => h2/i}/j.txt" where git says
+       "{h => h2}/i/j.txt". Only a '/' ever sets sfx, which is why "pre.txt"
+       vs "pre.txt.bak" -- bytes in common but no component in common --
+       comes out uncompressed. */
+    for (i = 0; i < len_old - pfx && i < len_new - pfx &&
+                old_path[len_old - i - 1] == new_path[len_new - i - 1]; ) {
+        i++;
+        if (old_path[len_old - i] == '/')
+            sfx = i;
+    }
+
+    if (pfx == 0 && sfx == 0) {
+        n = snprintf(buf, buf_size, "%s => %s", old_path, new_path);
+        if (n < 0 || (size_t)n >= buf_size)
+            return new_path;
+        return buf;
+    }
+
+    n = snprintf(buf, buf_size, "%.*s{%.*s => %.*s}%.*s",
+                (int)pfx, old_path,
+                (int)(len_old - pfx - sfx), old_path + pfx,
+                (int)(len_new - pfx - sfx), new_path + pfx,
+                (int)sfx, old_path + len_old - sfx);
+    if (n < 0 || (size_t)n >= buf_size)
+        return new_path;
+    return buf;
+}
+
+/* The display name for any row: the rename pair when there is one, the
+   quoted path otherwise. */
+static const char *entry_display_name(const sg_diff_entry *e, char *buf, size_t buf_size)
+{
+    if (e->old_path != NULL)
+        return rename_pair_display(e->old_path, e->path, buf, buf_size);
+    return sg_quote_path(e->path);
+}
 
 static int print_numstat(const char *git_dir, const char *repo_root, const sg_diff_list *list)
 {
@@ -819,12 +900,17 @@ static int print_numstat(const char *git_dir, const char *repo_root, const sg_di
             continue;
         }
 
-        if (st.unmerged)
-            printf("0\t0\t%s\n", sg_quote_path(e->path));
-        else if (st.is_binary)
-            printf("-\t-\t%s\n", sg_quote_path(e->path));
-        else
-            printf("%ld\t%ld\t%s\n", st.added, st.deleted, sg_quote_path(e->path));
+        {
+            char namebuf[SG_PATH_MAX * 2];
+            const char *name = entry_display_name(e, namebuf, sizeof(namebuf));
+
+            if (st.unmerged)
+                printf("0\t0\t%s\n", name);
+            else if (st.is_binary)
+                printf("-\t-\t%s\n", name);
+            else
+                printf("%ld\t%ld\t%s\n", st.added, st.deleted, name);
+        }
     }
 
     return had_error ? -1 : 0;
@@ -866,8 +952,14 @@ static int build_stat_rows(const char *git_dir, const char *repo_root, const sg_
             continue;
         }
 
-        qname = sg_quote_path(e->path);
-        rows[n].name = strdup(qname);
+        {
+            char namebuf[SG_PATH_MAX * 2];
+
+            /* Same display name --numstat uses, so the two formats can never
+               disagree about how a rename is spelled. */
+            qname = entry_display_name(e, namebuf, sizeof(namebuf));
+            rows[n].name = strdup(qname);
+        }
         if (rows[n].name == NULL) {
             *had_error = 1;
             continue;

@@ -356,6 +356,7 @@ being dropped silently.
 .B sg diff
 .RB [ --cached | --staged ]
 .RB [ --stat [= <width> [, <name-width> ]]| --numstat | --shortstat | --name-only | --name-status ]
+.RB [ -M [ <n> ]| --no-renames ]
 .RI [ rev " [" rev ]]
 .RB [ -- ]
 .RI [ path ...]
@@ -479,7 +480,51 @@ with an LCS backtrack where git defaults to Myers, and the two produce
 equally minimal but differently paired edit scripts. An unresolved conflict
 is skipped in patch output rather than being rendered as git's combined
 .B "diff --cc"
-format. There is no rename detection.
+format.
+.PP
+A path whose content is byte-identical to one that disappeared in the same
+diff is reported as a rename, as git does by default:
+.B R100
+in
+.BR --name-status ,
+the destination alone in
+.BR --name-only ,
+and
+.B "similarity index"
+with
+.B "rename from" / "rename to"
+in a patch.
+.B --stat
+and
+.B --numstat
+compress the pair around its common directories, so a move from
+.B a/b/c.txt
+to
+.B a/z/c.txt
+prints as
+.BR "a/{b => z}/c.txt" ;
+a path needing quoting is printed in full instead, since quotes cannot
+appear in the middle of a path.
+.B --no-renames
+turns detection off and
+.BI -M <n>
+sets the threshold, which
+.I n
+must be a whole percentage from 1 to 100 (git's fractional and
+.RB \(dq % \(dq-suffixed
+spellings are not accepted).
+.PP
+Only exact renames are found. git also pairs files by similarity score, so a
+move plus an edit that git reports as
+.B R093
+is still a deletion and an addition here. Detection runs after any
+.I path
+arguments have been applied, which is git's order: naming only one half of a
+rename leaves nothing to pair with, and the half that remains is reported as
+an ordinary addition or deletion. Renames are not shown by
+.BR "sg status" ,
+and copies are never detected \(em git does not detect them by default
+either.
 .SS branch
 .B sg branch
 .RB [ -d | --delete ]
