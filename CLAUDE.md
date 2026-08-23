@@ -60,6 +60,13 @@ python3 tests/fuzz_diff.py        # patch 輸出一致性 fuzzer(預設 200 輪)
 `python3 tests/fuzz_ignore.py`(2026-08-07 起也已接進 CI 的 `fuzz-ignore` job,
 但本機先跑一次能更快抓到問題)。動到記憶體管理或 pack/chunk 時加跑 `make sanitize`。
 
+**「往共用結構加欄位」也算動到記憶體管理**,要跑 `make sanitize`。2026-08-23
+(Phase 29)實測:`sg_diff_entry` 多兩個欄位之後,`tests/test_diff_out.c` 有兩處是
+`malloc` 之後逐一指派欄位(沒有先 memset),新欄位因此是 malloc 垃圾,而 `print_patch`
+會解參考它。**`make test` 與 interop 雙雙全綠**,只有 ASan 紅(`SEGV ... in
+sg_quote_path_prefixed`,位址 `0xbebebebe`)。加欄位時要同時搜尋所有**不是**經由
+配置函式建出來的實例。
+
 **沒有 formatter 也沒有 linter**——無 `.clang-format`、無 `clang-tidy`、Makefile
 無 `fmt`/`lint` 目標。全域規則裡的 `cargo fmt`/`clippy` 在這裡沒有對應物,
 不要去找。另外 `CFLAGS` 只有 `-Wall -Wextra -Wpedantic`,**沒有 `-Werror`**,
