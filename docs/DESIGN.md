@@ -3723,3 +3723,229 @@ give a wrong answer." When inexact detection is done, the full grammar needs to 
   see. Doing this correctly requires first enumerating divergences the way Phase 27 did, not
   adding it in passing.
 - `-M<n>` only accepts an integer from 1-100, not git's decimals (`-M0.5`) or trailing `%`.
+
+## Phase 30: rename detection (inexact)
+
+`sg diff` now reports a rename plus an edit as a rename, with git's own similarity score:
+`R086`, `similarity index 86%`. Phase 29 had only exact detection, and left two interop checks
+asserting that gap on purpose so that closing it could not pass unnoticed -- those two failed on
+the first build of this milestone, which is exactly what they were for.
+
+### The score is a machine-readable field, so "close" is wrong
+
+This is the Phase 26 situation (LCS vs Myers) with the escape route removed. There, a 2-3%
+residue of hunk-placement differences was acceptable, because the disagreement lived in *where*
+identical content was shown. Here the disagreement would print as `R086` versus `R085`, in a
+field tools parse. One point off and every byte-for-byte `cmp` in interop goes red -- correctly.
+
+So the estimator (`src/util/similarity.c`, `include/sg/similarity.h`) is a deliberate port of
+git 2.55.0's `diffcore-delta.c`, not an independent design. The header says so and says why: an
+estimate that is better but different is, here, simply wrong.
+
+### How it was verified before a line of C was written
+
+Reading an algorithm and believing you have read it correctly is the failure mode this project
+keeps rediscovering. The sequence used instead:
+
+1. The real `diffcore-delta.c` / `diffcore-rename.c` / `diff.c` were fetched at tag `v2.55.0`,
+   the version installed on this machine -- not recalled, and not read from `master`.
+2. The algorithm was re-implemented **in Python** and run against real git on random file pairs
+   spanning text, CRLF, binary (NUL), no-newline-at-all, and byte-identical inputs. First run:
+   **200/200**. Widening to five seeds surfaced 9 mismatches, all of one shape -- and they were
+   not an algorithm error at all: `mutate()` had occasionally produced content identical to the
+   source, which git settles in its **exact** pass and never scores. Modelling that: **750/750**.
+3. Only then was the C written, and it was cross-checked against the *Python*, not against git,
+   on 1200 more random pairs including empty buffers and a file of nothing but newlines:
+   **1200/1200**.
+
+Two independent ports agreeing is the evidence; either one alone would only have proved it
+agrees with itself. Step 2's detour is the reusable lesson: **a differential harness that finds
+mismatches has not necessarily found bugs**, and the three mismatch shapes here (score wrong /
+pairing wrong / not scored at all) had to be told apart before any of them meant anything.
+
+### Three passes, and the order is observable
+
+git runs exact detection (by object id), then a **basename** shortcut, then the full matrix, and
+this is not an internal optimization that could be collapsed into "score every pair and keep the
+best". The basename pass pairs files sharing a name at a **raised** threshold --
+`min + 0.5 * (MAX - min)`, i.e. 75% by default -- *without ever comparing them to anything else*.
+git's own comment concedes the result may be sub-optimal and keeps it.
+
+Two fixtures pin this down, and they deliberately disagree about which side wins, so no single
+wrong threshold satisfies both (both measured against git 2.55.0):
+
+| fixture | same-name pair | rival | git's answer |
+|---|---|---|---|
+| `p30_basename`     | `dir1/foo.txt` -> `dir2/foo.txt`, 79% | `other.txt`, 98% | the **name** wins, rival left `A` |
+| `p30_basename_low` | `d1/x.txt` -> `d2/x.txt`, 60%         | `zz.txt`, 98%    | the **score** wins, name pair left `A` |
+
+Three further tie-breaks, each reachable only through a built-on-purpose fixture and each
+measured:
+
+- **Exact ties go to the file name, not to path order.** Two identical sources `a/g.txt` and
+  `b/f.txt` against `c/f.txt`: git takes `b/f.txt`, the one it meets second.
+- **Only the best FOUR sources per destination are ranked** (`NUM_CANDIDATE_PER_DST`), and that
+  table is sorted **stably**. So a tie is settled by which *slot* a candidate was written into,
+  which stops matching the order candidates were considered in as soon as an eviction has moved
+  one. Five sources scoring 50/60/89/80/89 make the two come apart: git answers `s5.txt`, and
+  ranking by discovery order would answer `s3.txt`. `record_if_better` therefore copies fields
+  one at a time rather than assigning the struct, so that a slot's position is structurally
+  incapable of being overwritten by a candidate's.
+- **Equal scores are separated by whether the source shares the destination's file name.**
+  `a/y.txt` and `b/x.txt`, both 59%, against `c/x.txt`: `b/x.txt` wins despite sorting later.
+  The 59% is chosen on purpose -- above the 50% an ordinary pair needs, below the 75% the name
+  shortcut demands -- so the pair reaches the matrix instead of being settled beforehand.
+
+### `-M<n>` is a fraction, not a percentage
+
+The old parser took a plain integer 1-100 and rejected everything else, which Phase 29 recorded
+as a deliberate divergence. Filling it in turned up a rule that is the opposite of the obvious
+reading. Measured on a fixture scoring 86%:
+
+| argument | means | rename found? |
+|---|---|---|
+| `-M`, `-M0`, `-M%` | use the default (50%) | yes |
+| `-M5`, `-M50`, `-M0.5`, `-M50%` | 50% | yes |
+| `-M05` | 5% | yes |
+| `-M0.5%` | 0.5% | yes |
+| `-M9`, `-M90` | 90% | no |
+| **`-M100`** | **10%** | **yes** |
+| `-M100%` | 100%, exact renames only | no |
+| `-M86%` / `-M87%` | 86% / 87% -- either side of the fixture | yes / no |
+
+`-M100` meaning ten percent is the trap: it reads like "exact renames only" and is nothing of
+the sort. The grammar lives in one place, `sg_similarity_parse_score`, next to the scale it
+produces, and `tests/test_similarity.c` writes the whole table out as numbers.
+
+This is also why the threshold is carried on **git's 0..60000 scale** rather than as a
+percentage: `-M005` asks for 0.5%, which a percentage cannot hold. Only `sg_diff_entry.score` is
+a percentage, converted once at the very end by `sg_similarity_percent` -- which **truncates**,
+so 59999 prints as 99%, not 100%. Rounding there would let a near-miss claim the `R100` that
+means "byte-identical".
+
+### Text vs binary changes the score of a file against itself
+
+The CR of a CRLF pair is skipped when hashing text, but it is **not** subtracted from the file's
+size. So a CRLF file scores about 66% against a byte-identical copy of itself; add a single NUL
+byte and the same bytes are binary, the CRs hash like any other content, and the same comparison
+is a perfect match. `tests/test_similarity.c` keeps that pair adjacent -- one byte apart, 34
+points apart -- because a port that drops the text/binary decision cannot stay green against it.
+
+This is also *why* git settles exact renames by object id before scoring anything: without that
+pass, renaming a CRLF file with no edit at all would print `R066`.
+
+### A bug that only became reachable now
+
+`sg diff`'s patch output named the **new** path on the `--- a/` line of a rename, and likewise on
+`Binary files a/... and b/... differ`. Nothing had ever caught it because an exact rename is
+byte-identical and therefore prints no body at all -- so no rename had ever emitted those lines.
+The first inexact rename did. Fixed in `print_text_diff_body`, which now takes both paths.
+
+The general shape is worth keeping: **a code path that is currently unreachable is not a code
+path that is correct.** Phase 29's cold read made the same point from the other direction.
+
+### What the mutation round found
+
+Twenty-six mutations, per-site rather than batched, ending with **every one caught**. Getting there
+was the useful part:
+
+- **One mutation expressed nothing.** Deleting the line that restored a slot's position looked
+  like it inverted the ordering rule, but the candidate's own `seq` was a dummy zero, so the
+  mutation was very nearly a no-op. It stayed green not because the property was uncovered but
+  because *the mutation did not test it*. Reversing the comparison instead caught it at once.
+  A green mutation is a claim about the mutation as much as about the tests -- and this one
+  would have been filed as a blind spot by anyone reading only the verdict.
+
+  The fix went further than the test: `record_if_better` now copies fields one at a time instead
+  of assigning the struct, so that a slot's position is *structurally* incapable of being taken
+  from a candidate. The dummy field that made the bad mutation possible is gone as a hazard.
+
+- **Five genuine blind spots were closed rather than recorded**, each by building a fixture that
+  reaches it -- and in every case **real git was measured first**, which is the only reason the
+  new assertions are anchored to anything rather than to this implementation's own output:
+
+  | property | fixture needed | git's answer |
+  |---|---|---|
+  | exact ties prefer the file name | 2 identical sources, dest sharing the later one's name | `b/f.txt` |
+  | only four candidates are ranked, stably | 5 sources scoring 50/60/89/80/89 | `s5.txt` |
+  | equal scores break on the file name | 2 sources at 59%, one sharing the dest's name | `b/x.txt` |
+  | a tie does not displace what is held | 6 sources all scoring 59% | `t1.txt` |
+  | the hundred-alternative cap | 101 identical sources, the last sharing the dest's name | `s001.txt` |
+  | a repeated name declines the shortcut | 2 sources both called `x.txt`, one at 80%, one at 98% | `b/x.txt` |
+
+  The last one is the one worth keeping: the port assumes git walks those sources in ascending
+  order, an assumption about a hashmap traversal inside git that nothing else could check. The
+  fixture answers it, and would answer it again against a future git.
+
+  The lesson from Phase 29 held up exactly: **"this cannot be reached right now" is not a reason
+  not to test it** -- ask instead what input would reach it. Every one of these five looked
+  unreachable until the fixture was designed backwards from the mutation.
+
+- The mutation runner **exited 0 twice while running nothing at all** (a mis-typed test name, and
+  a stale working directory), printing its error only in the body of the output. Reading the exit
+  code alone would have scored a whole batch as "all caught". The project's standing warning that
+  verification tooling fails in the "already verified" direction earned its keep again.
+
+### What the cold read found
+
+A reviewer was given the finished diff with instructions to try to break it, and cross-checked
+every arithmetic expression against git's own source. It found no memory-safety defect and no
+divergence from git, and three things worth acting on -- two of which were contract problems
+invisible from the outside:
+
+- **An allocation failure during scoring was reported as "not a rename".** `load_cand` collapsed
+  "this content cannot be read" and "malloc failed while hashing it" into one answer, and the
+  first of those is *supposed* to mean no rename. So under memory pressure `sg diff` would have
+  quietly found fewer renames and returned success, while the header promises -1 on allocation
+  failure. The two are now distinct all the way up: `score_pair` returns -1 for it, and both
+  passes propagate. This is the milestone's own rule turned on itself -- the failure direction of
+  a scoring failure must never be a silently different answer.
+- **`sg_diff_side_read`'s -2 is folded into "cannot be read" here**, which is a documented
+  prohibition everywhere else. It is right in this one place, and now says why in full: the
+  prohibition exists because diffing a chunk pointer's raw bytes produces meaningless hunks, and
+  nothing here diffs anything -- and no diagnostic is lost either way.
+- **One coverage gap**, the branch where a file name is repeated and the shortcut must decline
+  to guess. Closed, measured against git first, and the mutation confirms it (removing the
+  duplicate check answers `a/x.txt` at 80% instead of `b/x.txt` at 98%).
+
+One more thing was fixed on the way, not from the review: the compaction that drops claimed
+sources used to recognise them by the NULL path they had been left with. It now records them
+explicitly, so an entry that somehow arrived with no path is not silently deleted along with
+them.
+
+### Three defences with no test, stated rather than implied
+
+- **The rename limit** (`SG_RENAME_LIMIT`, git's `diff.renameLimit` default of 1000) is not
+  covered. Reaching it needs more than a million candidate pairs, and the honest problem is that
+  a fixture that big would not *observe* anything: with no real content behind those paths every
+  pair scores 0 and the answer is "no renames" either way. Making it observable needs ~2000 real
+  files whose contents actually match. Recorded rather than built.
+- **The exact pass is O(sources x destinations)** with a `memcmp` per pair, where git uses a hash
+  table -- and the rename limit guards only the matrix pass, so a changeset with very many adds
+  and deletes pays that quadratic cost before any limit applies. This shape predates the
+  milestone (the Phase 29 loop was the same), so it is not a regression, but it is now the only
+  unbounded cost left in detection.
+- **The allocation-failure path added during the fix round cannot be exercised at all.** Its two
+  mutations can only fire inside a real `sg_spanhash_build` failure, and this project has no
+  fault injection anywhere -- so the propagation was verified by cold reading and nothing else.
+  That is the third of the three reasons a mutation stays green, and it is the one that must be
+  written down rather than filed next to a coverage gap: there is no test to go and add.
+
+  What *is* covered is the other half of the same branch, and the distinction matters: mutating
+  "unreadable content" into a fatal error reddens three named checks, so the code does prove it
+  tells the two apart -- just not that the fatal side reports itself correctly.
+
+One mutation was caught only by a **segfault**, with no FAIL line: indexing `claimed[]` by slot
+instead of by list entry leaves a NULL path in the list and the next `strcmp` dies. The runner
+counts a non-zero exit as caught, and it is right to -- but a crash only proves that breaking
+this causes trouble, not that any named assertion watches the property. Recorded as such.
+
+### Still not done
+
+- **Copy detection (`-C`)**: not implemented, and `cmd_diff.c` has no branch for it at all -- it
+  falls into the generic usage error. The estimator and the pass structure would both support it;
+  what is missing is the source culling that copy mode changes.
+- **`sg status`'s rename row**: unchanged from Phase 29. `sg_status_diff_staged` is still a second
+  implementation of tree<->index and still feeds `apply.c`'s two safety gates, so renames cannot
+  be added to it without first enumerating divergences the way Phase 27 did.
+- **`diff --cc`** for conflicted paths, and the last 2-3% of Myers hunk placement, both unchanged.

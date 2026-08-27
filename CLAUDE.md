@@ -3,7 +3,7 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (1536 checks, using real `git` as
+git; this is guarded by `tests/interop.sh` (1579 checks, using real `git` as
 the oracle).
 
 On top of that there are two things real git does not have: `src/safety/`
@@ -166,7 +166,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 |---|---|---|
 | `object/` | Object serialization/parsing, pure in-memory, no fs access | hash |
 | `index/` | index v2 binary read/write and ordered entry operations, does not read objects | hash |
-| `util/` | zlib, SHA-1, levenshtein, LCS table, wildmatch | -- |
+| `util/` | zlib, SHA-1, levenshtein, LCS table, wildmatch, rename similarity | -- |
 | `storage/` | Objects and refs on disk: loose, pack, chunk, refs, reflog, repo, revparse | object, workdir |
 | `net/` | smart-HTTP: libcurl wrapper, pkt-line, transport | -- |
 | `workdir/` | Working directory: path/file I/O, ignore, status, diff (change list), apply, merge, tree_build | almost everything |
@@ -338,15 +338,49 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   detects second, so only half the pair remains and no match can form.
   Reversing the order has no visible symptom, it just gives a wrong answer in
   this exact scenario.
-  WARNING: **only exact detection is implemented** (content byte-for-byte
-  identical). Inexact (similarity score) is not done yet; interop has two
-  checks that **explicitly assert this gap**, and once inexact is implemented
-  those two need to be updated, not routed around.
+  **Since Phase 30 both exact and inexact detection are implemented**, and
+  the implementation lives in `src/workdir/rename.c` (**not** `workdir/diff.c`
+  -- the module table above will send you to the wrong file). The scoring
+  itself is `src/util/similarity.c` + `include/sg/similarity.h`, a deliberate
+  port of git's `diffcore-delta.c`.
+  WARNING: **the score is a machine-readable field**, printed as `R093` and
+  `similarity index 93%`, so being one point off is a wrong answer, not a
+  near miss -- `similarity.c` may be reproduced but never "improved". Two
+  independent ports agreeing is the only evidence that counts here: the
+  algorithm was first re-derived in Python and checked against real git on
+  750 random file pairs, and the C was then cross-checked against that.
+  When touching `similarity.c` or `rename.c`, a green `make test` **does not
+  count**: run `python3 tests/fuzz_rename.py 120 --seed <unused> --max-failures 0`
+  and report the actual mismatch count.
+  WARNING: **there are THREE passes and their ORDER is observable**, so they
+  cannot be collapsed into "score every pair and keep the best": exact (by
+  id), then same-basename pairs at a **raised** threshold
+  (`min + 0.5 * (MAX - min)`, i.e. 75% by default), then the full matrix.
+  Measured against git 2.55.0 with two fixtures that disagree about which
+  side wins, so no single wrong threshold satisfies both: a name match at 79%
+  beats an unrelated 98% match, while a name match at 60% loses to it.
+  WARNING: **`-M<n>`'s grammar is a fraction, not a percentage** (all
+  measured): `-M5` is 50%, `-M05` is 5%, and **`-M100` is TEN percent** --
+  only `-M100%` limits detection to exact renames. The grammar lives in
+  `sg_similarity_parse_score`; do not reimplement it at a call site.
+  WARNING: **the score is kept on git's 0..60000 scale, not as a percentage**
+  (`SG_SIMILARITY_MAX`), because `-M005` asks for 0.5% and a percentage
+  cannot hold that. Only `sg_diff_entry.score` is a percentage, converted
+  once at the end by `sg_similarity_percent` (which **truncates**: 59999 is
+  99%, not 100%).
+  WARNING: **text vs binary changes the score.** The CR of a CRLF pair is
+  skipped when hashing text but is still counted in the file's size, so a
+  CRLF file scores about 66% against *itself*; one NUL byte makes the same
+  bytes binary and the same comparison a perfect match. This is exactly why
+  git settles exact renames by id BEFORE scoring anything.
   WARNING: **matching uses `sg_diff_side_effective_id`** (promoted to public
   from `diff_out.c` in Phase 29); it returns -1 to mean "this id was never
   verified" -- **two unverified ids do not count as identical content even if
   they happen to be equal**, that side is never paired. The failure direction
   is "not a rename", never "conjure a rename out of nowhere".
+  WARNING: **copy detection (`-C`) is still not implemented**, not even a
+  rejecting branch in the option parser -- `-C` falls into `cmd_diff.c`'s
+  generic usage error.
   WARNING: **`sg status` still has no rename column**: `sg_status_diff_staged`
   is a second, independent implementation of tree<->index, and it also feeds
   the two safety gates in `apply.c`; converging it requires first enumerating

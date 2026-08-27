@@ -12,7 +12,6 @@
 #include "sg/revparse.h"
 #include "sg/workdir.h"
 
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,21 +67,21 @@ static void report_bad_tree_path(const char *bad_path)
            sg_quote_path_delimited(bad_path));
 }
 
-/* git's -M<n>/--find-renames=<n> threshold: a plain integer percentage
-   1-100. git also takes a fraction ("-M0.5") and a trailing '%'; neither is
-   accepted here, and both are rejected rather than guessed at. */
+/* git's -M<n>/--find-renames=<n> threshold. The grammar lives in
+   sg_similarity_parse_score because every one of its rules is
+   counter-intuitive and belongs next to the scale it produces; all this adds
+   is git's own rule that anything left over is an error rather than
+   something to guess at. An argument that parses to 0 -- "-M0", "-M%" --
+   means "use the default", exactly as it does in git. (A bare "-M" means the
+   same thing but never arrives here; it is matched a few lines below.) */
 static int parse_rename_score(const char *arg, int *out)
 {
-    long v;
-    char *end;
+    const char *end = arg;
+    int score = sg_similarity_parse_score(&end);
 
-    if (arg[0] == '\0')
+    if (*end != '\0')
         return -1;
-    errno = 0;
-    v = strtol(arg, &end, 10);
-    if (errno != 0 || *end != '\0' || v < 1 || v > 100)
-        return -1;
-    *out = (int)v;
+    *out = score != 0 ? score : SG_SIMILARITY_DEFAULT;
     return 0;
 }
 
@@ -190,10 +189,10 @@ int sg_cmd_diff(int argc, char **argv)
     char **pos;
     int n_pos = 0;
     int dashdash = -1; /* index into pos[] where "--" split the line */
-    /* git's -M default: 50%. 0 means --no-renames. Exact renames score 100
-       so any threshold finds them; the value only starts to matter once
-       inexact detection exists. */
-    int rename_score = 50;
+    /* git's -M default, 50%, on git's 0..SG_SIMILARITY_MAX scale rather than
+       as a percentage -- see sg/similarity.h for why a percentage cannot hold
+       every threshold the -M grammar can ask for. 0 means --no-renames. */
+    int rename_score = SG_SIMILARITY_DEFAULT;
     int rev_count;
     char bad_path[SG_PATH_MAX];
     int rc;
@@ -244,7 +243,7 @@ int sg_cmd_diff(int argc, char **argv)
         } else if (strcmp(a, "--no-renames") == 0) {
             rename_score = 0;
         } else if (strcmp(a, "-M") == 0 || strcmp(a, "--find-renames") == 0) {
-            rename_score = 50;
+            rename_score = SG_SIMILARITY_DEFAULT;
         } else if (strncmp(a, "-M", 2) == 0 || strncmp(a, "--find-renames=", 15) == 0) {
             const char *v = a[1] == 'M' ? a + 2 : a + 15;
 
@@ -384,7 +383,7 @@ int sg_cmd_diff(int argc, char **argv)
        against git 2.55.0, `git diff --cached --name-status -- b1.txt` on a
        renamed pair prints "A b1.txt", because git filters by pathspec first
        and a spec naming half a rename leaves nothing to pair with. */
-    if (sg_diff_detect_renames(git_dir, &list, rename_score) != 0) {
+    if (sg_diff_detect_renames(git_dir, repo_root, &list, rename_score) != 0) {
         fprintf(stderr, "sg: out of memory, cannot detect renames\n");
         goto done;
     }

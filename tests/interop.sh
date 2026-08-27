@@ -9413,31 +9413,303 @@ p29_mk "$P29_ONE" "$P29_ONE/d2.txt" SAME
 p29_cmp "$P29_ONE" "--cached --name-status (one source, two destinations)" \
     --cached --name-status
 
-# WARNING: KNOWN DIVERGENCE, asserted on purpose. sg only finds EXACT renames; a
-# rename plus an edit is still a delete and an add here, where git says
-# "R093". Asserting it means the day inexact detection lands, these two
-# checks fail and have to be updated -- rather than the gap quietly
-# persisting because no test ever looked.
-P29_INEX="$WORKDIR/p29_inexact"
-(cd "$WORKDIR" && "$SG" init p29_inexact) > /dev/null 2>&1
-(cd "$P29_INEX" && git config user.email "a@b.c" && git config user.name "git user")
-p29_mk "$P29_INEX" "$P29_INEX/t.txt" T
-(cd "$P29_INEX" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
-mv "$P29_INEX/t.txt" "$P29_INEX/t2.txt"
-printf 'one more line\n' >> "$P29_INEX/t2.txt"
-(cd "$P29_INEX" && "$SG" add .) > /dev/null 2>&1
-(cd "$P29_INEX" && "$SG" diff --cached --name-status) > "$WORKDIR/p29_inex_sg.txt" 2>/dev/null
-(cd "$P29_INEX" && git diff --cached --name-status) > "$WORKDIR/p29_inex_git.txt" 2>/dev/null
-check "phase29 oracle: real git detects the inexact rename" \
-    grep -q '^R0' "$WORKDIR/p29_inex_git.txt"
-check "phase29 known gap: sg reports it as a delete plus an add instead" \
-    sh -c "grep -q '^D' '$WORKDIR/p29_inex_sg.txt' && grep -q '^A' '$WORKDIR/p29_inex_sg.txt'"
-check "phase29 known gap: and sg claims no rename at all here" \
-    sh -c "! grep -q '^R' '$WORKDIR/p29_inex_sg.txt'"
-# The control that keeps the gap honest: with --no-renames git agrees with
-# sg exactly, which proves the divergence is the detection and nothing else.
-p29_cmp "$P29_INEX" "--cached --no-renames --name-status (inexact, both agree)" \
+# --------------------------------------------------------------------------
+# Phase 30: inexact renames -- a rename plus an edit. Until this milestone the
+# checks here asserted the OPPOSITE, that sg found no rename at all, on
+# purpose: an asserted gap fails the day it closes and forces this rewrite,
+# where an unasserted one just quietly persists because nothing ever looked.
+#
+# The score is not the kind of number a near miss is acceptable for. It is
+# printed in machine-readable form ("R086", "similarity index 86%"), so every
+# check below compares whole output against real git byte for byte.
+P30_INEX="$WORKDIR/p30_inexact"
+(cd "$WORKDIR" && "$SG" init p30_inexact) > /dev/null 2>&1
+(cd "$P30_INEX" && git config user.email "a@b.c" && git config user.name "git user")
+p29_mk "$P30_INEX" "$P30_INEX/t.txt" T
+python3 -c "
+import sys
+open(sys.argv[1], 'wb').write(bytes(range(256)) * 20)
+" "$P30_INEX/b.bin"
+(cd "$P30_INEX" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P30_INEX/t.txt" "$P30_INEX/t2.txt"
+printf 'one more line\n' >> "$P30_INEX/t2.txt"
+python3 -c "
+import sys
+d = bytearray(open(sys.argv[1], 'rb').read())
+d[0:10] = b'\x01' * 10
+open(sys.argv[2], 'wb').write(bytes(d))
+" "$P30_INEX/b.bin" "$P30_INEX/c.bin"
+rm "$P30_INEX/b.bin"
+(cd "$P30_INEX" && "$SG" add .) > /dev/null 2>&1
+(cd "$P30_INEX" && "$SG" diff --cached --name-status) > "$WORKDIR/p30_inex_sg.txt" 2>/dev/null
+(cd "$P30_INEX" && git diff --cached --name-status) > "$WORKDIR/p30_inex_git.txt" 2>/dev/null
+check "phase30 oracle: real git detects the inexact rename" \
+    grep -q '^R0' "$WORKDIR/p30_inex_git.txt"
+# Named apart from the byte compares below so that losing inexact detection
+# entirely reports itself as that, rather than only as "output differs".
+check "phase30: sg finds it too, and does not call it a perfect match" \
+    grep -q '^R0' "$WORKDIR/p30_inex_sg.txt"
+
+# All six formats. The patch one also covers two lines that no exact rename
+# could ever reach, because an exact rename is byte-identical and so prints
+# no body at all: the "--- a/<old>" line must name the path the content came
+# FROM, and so must the "Binary files a/<old> and b/<new> differ" line.
+p29_cmp "$P30_INEX" "--cached (inexact patch + binary rename)" --cached
+p29_cmp "$P30_INEX" "--cached --stat (inexact)" --cached --stat
+p29_cmp "$P30_INEX" "--cached --numstat (inexact)" --cached --numstat
+p29_cmp "$P30_INEX" "--cached --shortstat (inexact)" --cached --shortstat
+p29_cmp "$P30_INEX" "--cached --name-only (inexact)" --cached --name-only
+p29_cmp "$P30_INEX" "--cached --name-status (inexact)" --cached --name-status
+# Detection is a pass over a finished list, so every builder should feed it;
+# nothing had ever checked a builder other than tree-vs-index, for exact
+# renames either.
+p29_cmp "$P30_INEX" "HEAD (inexact, tree vs working tree)" HEAD
+p29_cmp "$P30_INEX" "HEAD --name-status (inexact, tree vs working tree)" \
+    HEAD --name-status
+# The control that keeps all of the above honest: with detection turned off
+# both sides must agree for a reason that is not detection working.
+p29_cmp "$P30_INEX" "--cached --no-renames --name-status (inexact)" \
     --cached --no-renames --name-status
+
+# The -M grammar. Every rule of it was measured against git 2.55.0 and every
+# one is counter-intuitive: the digits are a FRACTION unless a '%' follows,
+# so -M5 is 50% and -M100 is TEN percent -- not exact-renames-only, which is
+# -M100% alone. The fixture scores 86%, which is what separates these: -M9
+# and -M90 (both 90%) must find nothing, -M100 (10%) must find the rename,
+# and -M86%/-M87% straddle the threshold by one point.
+for p30_opt in -M -M5 -M05 -M50 -M9 -M90 -M100 "-M100%" -M0.5 "-M0.5%" \
+               "-M50%" "-M86%" "-M87%" --find-renames "--find-renames=86%"; do
+    p29_cmp "$P30_INEX" "--cached --name-status $p30_opt" \
+        --cached --name-status "$p30_opt"
+done
+
+# The three passes run in git's order, and the order is VISIBLE, so it is not
+# an implementation detail that could be collapsed into "score every pair and
+# keep the best". A source and a destination sharing a file name pair up on
+# the strength of that name at a raised threshold, without ever being
+# compared against a destination they resemble far more closely. Measured
+# against git 2.55.0: dir1/foo.txt becomes dir2/foo.txt at 79%, and
+# other.txt -- which is 99% the same file -- is left an ordinary addition.
+# Scoring everything and taking the best would pair it the other way round
+# and still look perfectly reasonable.
+P30_BASE="$WORKDIR/p30_basename"
+(cd "$WORKDIR" && "$SG" init p30_basename) > /dev/null 2>&1
+(cd "$P30_BASE" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P30_BASE/dir1" "$P30_BASE/dir2"
+p30_lines() {
+    python3 -c "
+import sys
+open(sys.argv[1], 'w').write(''.join('L-%d\n' % i for i in range(1, int(sys.argv[2]))))
+" "$1" "$2"
+}
+p30_lines "$P30_BASE/dir1/foo.txt" 101
+(cd "$P30_BASE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P30_BASE/dir1/foo.txt"
+p30_lines "$P30_BASE/dir2/foo.txt" 81
+p30_lines "$P30_BASE/other.txt" 100
+(cd "$P30_BASE" && "$SG" add .) > /dev/null 2>&1
+check "phase30 oracle: git pairs on the file name, not on the best score" \
+    sh -c "(cd '$P30_BASE' && git diff --cached --name-status) | grep -q '^R079.*dir1/foo.txt.*dir2/foo.txt'"
+p29_cmp "$P30_BASE" "--cached --name-status (name beats a better score)" \
+    --cached --name-status
+p29_cmp "$P30_BASE" "--cached --stat (name beats a better score)" --cached --stat
+
+# The same shape one notch weaker, which is what pins the RAISED threshold
+# down as a number rather than as "some threshold". d1/x.txt is only 60% of
+# d2/x.txt -- under the 75% a name match has to clear, though still over the
+# 50% an ordinary pair needs -- so here the name shortcut declines, the full
+# comparison runs, and the source goes to zz.txt, which it really does
+# resemble. The two fixtures disagree about which side wins, so no single
+# wrong threshold can satisfy both.
+P30_BASE2="$WORKDIR/p30_basename_low"
+(cd "$WORKDIR" && "$SG" init p30_basename_low) > /dev/null 2>&1
+(cd "$P30_BASE2" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P30_BASE2/d1" "$P30_BASE2/d2"
+p30_lines "$P30_BASE2/d1/x.txt" 101
+(cd "$P30_BASE2" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P30_BASE2/d1/x.txt"
+p30_lines "$P30_BASE2/d2/x.txt" 61
+p30_lines "$P30_BASE2/zz.txt" 100
+(cd "$P30_BASE2" && "$SG" add .) > /dev/null 2>&1
+check "phase30 oracle: a weak name match loses to the better score" \
+    sh -c "(cd '$P30_BASE2' && git diff --cached --name-status) | grep -q '^R098.*d1/x.txt.*zz.txt'"
+p29_cmp "$P30_BASE2" "--cached --name-status (weak name match loses)" \
+    --cached --name-status
+
+# Two tie-breaks that only a deliberately built fixture can reach, both
+# measured against git 2.55.0 and both wrong in a way nothing else notices.
+#
+# 1. Identical content on two sources: the tie goes to the source that shares
+#    the destination's FILE NAME, not to the first one in path order.
+P30_EXBN="$WORKDIR/p30_exact_basename"
+(cd "$WORKDIR" && "$SG" init p30_exact_basename) > /dev/null 2>&1
+(cd "$P30_EXBN" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P30_EXBN/a" "$P30_EXBN/b" "$P30_EXBN/c"
+p29_mk "$P30_EXBN" "$P30_EXBN/a/g.txt" SAME
+p29_mk "$P30_EXBN" "$P30_EXBN/b/f.txt" SAME
+(cd "$P30_EXBN" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P30_EXBN/a/g.txt" "$P30_EXBN/b/f.txt"
+p29_mk "$P30_EXBN" "$P30_EXBN/c/f.txt" SAME
+(cd "$P30_EXBN" && "$SG" add .) > /dev/null 2>&1
+check "phase30 oracle: git breaks an exact tie on the file name" \
+    sh -c "(cd '$P30_EXBN' && git diff --cached --name-status) | grep -q '^R100.*b/f.txt.*c/f.txt'"
+p29_cmp "$P30_EXBN" "--cached --name-status (exact tie goes to the file name)" \
+    --cached --name-status
+#
+# 2. Only the best FOUR sources per destination are ranked, and the ranking is
+#    sorted stably -- so when two sources tie exactly, the winner is decided
+#    by which slot a candidate was written into, not by the order candidates
+#    were considered. Five sources scoring 50/60/89/80/89 make the two come
+#    apart: git answers s5.txt, candidate order would answer s3.txt.
+P30_TIE4="$WORKDIR/p30_four_candidates"
+(cd "$WORKDIR" && "$SG" init p30_four_candidates) > /dev/null 2>&1
+(cd "$P30_TIE4" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "
+import sys
+root = sys.argv[1]
+base = ''.join('L-%d\n' % i for i in range(1, 81))
+for tag, want in ((1, 782), (2, 652), (3, 434), (4, 489), (5, 434)):
+    text = base
+    i = 1
+    while len(text) < want:
+        text += 'f%d-%d\n' % (tag, i)
+        i += 1
+    open('%s/s%d.txt' % (root, tag), 'w').write(text)
+" "$P30_TIE4"
+(cd "$P30_TIE4" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P30_TIE4"/s*.txt
+p30_lines "$P30_TIE4/p.txt" 81
+(cd "$P30_TIE4" && "$SG" add .) > /dev/null 2>&1
+check "phase30 oracle: git gives the tie to the fifth source, not the third" \
+    sh -c "(cd '$P30_TIE4' && git diff --cached --name-status) | grep -q '^R089.*s5.txt.*p.txt'"
+p29_cmp "$P30_TIE4" "--cached --name-status (only four candidates are ranked)" \
+    --cached --name-status
+#
+# 3. Two sources scoring exactly the same: the ranking's second key is
+#    whether the source shares the destination's file name. Scored at 59% --
+#    over the 50% an ordinary pair needs, under the 75% the name shortcut
+#    demands -- so this reaches the full comparison instead of being settled
+#    on the name beforehand, and b/x.txt wins despite sorting later.
+P30_NAMESCORE="$WORKDIR/p30_name_score"
+(cd "$WORKDIR" && "$SG" init p30_name_score) > /dev/null 2>&1
+(cd "$P30_NAMESCORE" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P30_NAMESCORE/a" "$P30_NAMESCORE/b" "$P30_NAMESCORE/c"
+python3 -c "
+import sys
+root = sys.argv[1]
+base = ''.join('L-%d\n' % i for i in range(1, 81))
+for tag, rel in ((1, 'a/y.txt'), (2, 'b/x.txt')):
+    text = base
+    i = 1
+    while len(text) < 652:
+        text += 'f%d-%d\n' % (tag, i)
+        i += 1
+    open('%s/%s' % (root, rel), 'w').write(text)
+" "$P30_NAMESCORE"
+(cd "$P30_NAMESCORE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P30_NAMESCORE/a/y.txt" "$P30_NAMESCORE/b/x.txt"
+p30_lines "$P30_NAMESCORE/c/x.txt" 81
+(cd "$P30_NAMESCORE" && "$SG" add .) > /dev/null 2>&1
+check "phase30 oracle: git breaks an equal score on the file name" \
+    sh -c "(cd '$P30_NAMESCORE' && git diff --cached --name-status) | grep -q '^R059.*b/x.txt.*c/x.txt'"
+p29_cmp "$P30_NAMESCORE" "--cached --name-status (equal scores, file name decides)" \
+    --cached --name-status
+#
+# 4. A tie must not displace what the ranking already holds. Six sources
+#    score identically, two more than the four slots, so the last two meet a
+#    full table of exact ties and are dropped -- git answers t1.txt, while
+#    replacing on a tie would answer t6.txt.
+P30_TIE6="$WORKDIR/p30_tie_keeps_first"
+(cd "$WORKDIR" && "$SG" init p30_tie_keeps_first) > /dev/null 2>&1
+(cd "$P30_TIE6" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "
+import sys
+root = sys.argv[1]
+base = ''.join('L-%d\n' % i for i in range(1, 81))
+for tag in range(1, 7):
+    text = base
+    i = 1
+    while len(text) < 652:
+        text += 'f%d-%d\n' % (tag, i)
+        i += 1
+    open('%s/t%d.txt' % (root, tag), 'w').write(text)
+" "$P30_TIE6"
+(cd "$P30_TIE6" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P30_TIE6"/t?.txt
+p30_lines "$P30_TIE6/p.txt" 81
+(cd "$P30_TIE6" && "$SG" add .) > /dev/null 2>&1
+check "phase30 oracle: git keeps the first of six equal-scoring sources" \
+    sh -c "(cd '$P30_TIE6' && git diff --cached --name-status) | grep -q '^R059.*t1.txt.*p.txt'"
+p29_cmp "$P30_TIE6" "--cached --name-status (an exact tie keeps the first)" \
+    --cached --name-status
+#
+# 5. git stops after a hundred identically-contented sources and settles for
+#    the best it has seen. The source sharing the destination's file name is
+#    the hundred-and-first, so the cap is the only thing between s001.txt and
+#    s101/target.txt -- and it also pins down the ORDER those sources are
+#    walked in, which is an assumption the port makes about a hashmap inside
+#    git and has no other way to check.
+P30_CAP="$WORKDIR/p30_alternatives_cap"
+(cd "$WORKDIR" && "$SG" init p30_alternatives_cap) > /dev/null 2>&1
+(cd "$P30_CAP" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P30_CAP/s101" "$P30_CAP/z"
+python3 -c "
+import sys
+root = sys.argv[1]
+text = ''.join('L-%d\n' % i for i in range(1, 21))
+for i in range(1, 101):
+    open('%s/s%03d.txt' % (root, i), 'w').write(text)
+open('%s/s101/target.txt' % root, 'w').write(text)
+" "$P30_CAP"
+(cd "$P30_CAP" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P30_CAP"/s0*.txt "$P30_CAP"/s1[0-9][0-9].txt "$P30_CAP/s101/target.txt"
+p29_mk "$P30_CAP" "$P30_CAP/z/target.txt" L
+python3 -c "
+import sys
+open(sys.argv[1], 'w').write(''.join('L-%d\n' % i for i in range(1, 21)))
+" "$P30_CAP/z/target.txt"
+(cd "$P30_CAP" && "$SG" add .) > /dev/null 2>&1
+check "phase30 oracle: git stops looking after a hundred identical sources" \
+    sh -c "(cd '$P30_CAP' && git diff --cached --name-status) | grep -q '^R100.*s001.txt.*z/target.txt'"
+p29_cmp "$P30_CAP" "--cached --name-status (the hundred-alternative cap)" \
+    --cached --name-status
+#
+# 6. The name shortcut only fires when the name identifies ONE file on each
+#    side. Two sources called x.txt make git decline to guess and let the
+#    full comparison decide, picking b/x.txt at 98% over a/x.txt at 80% --
+#    and 80% is deliberately above the 75% the shortcut demands, so taking
+#    the first of the repeated names instead of declining would answer
+#    a/x.txt.
+P30_DUPNAME="$WORKDIR/p30_repeated_name"
+(cd "$WORKDIR" && "$SG" init p30_repeated_name) > /dev/null 2>&1
+(cd "$P30_DUPNAME" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P30_DUPNAME/a" "$P30_DUPNAME/b" "$P30_DUPNAME/c"
+p30_lines "$P30_DUPNAME/a/x.txt" 81
+p30_lines "$P30_DUPNAME/b/x.txt" 101
+(cd "$P30_DUPNAME" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P30_DUPNAME/a/x.txt" "$P30_DUPNAME/b/x.txt"
+p30_lines "$P30_DUPNAME/c/x.txt" 100
+(cd "$P30_DUPNAME" && "$SG" add .) > /dev/null 2>&1
+check "phase30 oracle: git declines the shortcut when a name is repeated" \
+    sh -c "(cd '$P30_DUPNAME' && git diff --cached --name-status) | grep -q '^R098.*b/x.txt.*c/x.txt'"
+p29_cmp "$P30_DUPNAME" "--cached --name-status (a repeated name decides nothing)" \
+    --cached --name-status
+
+# A -M argument neither side can make sense of must be REJECTED, not quietly
+# read as far as it parses. Compared as behaviour rather than byte-for-byte:
+# git exits 128 and sg's convention is only ever 0 or 1, so the shared
+# assertion is "both refuse, and sg says so on stderr".
+check "phase30 oracle: real git rejects an unparsable -M argument" \
+    sh -c "! (cd '$P30_INEX' && git diff --cached --name-status -Mabc) > /dev/null 2>&1"
+check "phase30: sg rejects it too" \
+    sh -c "! (cd '$P30_INEX' && '$SG' diff --cached --name-status -Mabc) > /dev/null 2>&1"
+(cd "$P30_INEX" && "$SG" diff --cached --name-status -Mabc) > /dev/null 2>"$WORKDIR/p30_mbad.txt"
+check "phase30: and says so as a usage error" \
+    grep -q '^usage: sg diff' "$WORKDIR/p30_mbad.txt"
+# The control: the same argument with the garbage removed is accepted, so the
+# checks above are about the garbage and not about -M being broken outright.
+p29_cmp "$P30_INEX" "--cached --name-status -M86 (the control for -Mabc)" \
+    --cached --name-status -M86
 
 
 echo ""

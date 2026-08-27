@@ -507,7 +507,13 @@ static void print_hunk_range(char sign, size_t start, size_t count)
         printf("%c%zu,%zu", sign, disp_start, count);
 }
 
-static int print_text_diff_body(const char *path, int old_present, int new_present,
+/* `old_path` and `new_path` are the same for everything except a rename,
+   where the a/ side must name where the content came FROM. Nothing caught
+   this until Phase 30: an exact rename is byte-identical, so it prints no
+   hunks and therefore no ---/+++ lines at all, and those were the only
+   renames that existed. */
+static int print_text_diff_body(const char *old_path, const char *new_path,
+                                int old_present, int new_present,
                                 const unsigned char *a_data, size_t a_len,
                                 const unsigned char *b_data, size_t b_len)
 {
@@ -528,11 +534,13 @@ static int print_text_diff_body(const char *path, int old_present, int new_prese
        2.55.0: no a/ or b/ prefix, no quoting, no TAB terminator even when the
        path has a space. */
     if (old_present)
-        printf("--- %s%s\n", sg_quote_path_prefixed("a/", path), diff_name_terminator(path));
+        printf("--- %s%s\n", sg_quote_path_prefixed("a/", old_path),
+              diff_name_terminator(old_path));
     else
         printf("--- /dev/null\n");
     if (new_present)
-        printf("+++ %s%s\n", sg_quote_path_prefixed("b/", path), diff_name_terminator(path));
+        printf("+++ %s%s\n", sg_quote_path_prefixed("b/", new_path),
+              diff_name_terminator(new_path));
     else
         printf("+++ /dev/null\n");
 
@@ -752,16 +760,19 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
         }
 
         if (is_binary_data(a_data, a_len) || is_binary_data(b_data, b_len)) {
+            /* The a/ side names the OLD path, which differs from the new
+               one for a rename -- measured against git 2.55.0, which prints
+               "Binary files a/b.bin and b/c.bin differ". */
             printf("Binary files %s and %s differ\n",
-                  old_present ? sg_quote_path_prefixed("a/", e->path) : "/dev/null",
+                  old_present ? sg_quote_path_prefixed("a/", old_side_path(e)) : "/dev/null",
                   new_present ? sg_quote_path_prefixed("b/", e->path) : "/dev/null");
             free(a_data);
             free(b_data);
             continue;
         }
 
-        if (print_text_diff_body(e->path, old_present, new_present, a_data, a_len, b_data, b_len) !=
-           0) {
+        if (print_text_diff_body(old_side_path(e), e->path, old_present, new_present,
+                                 a_data, a_len, b_data, b_len) != 0) {
             fprintf(stderr, "sg: warning: out of memory diffing %s\n", sg_quote_path_delimited(e->path));
             had_error = 1;
         }

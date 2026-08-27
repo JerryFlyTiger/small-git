@@ -7,6 +7,7 @@
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/pathspec.h"
+#include "sg/similarity.h"
 
 /* Building a list of changed paths, decoupled from where the two sides come
    from. Before this existed `sg diff` could only ever compare the index to the
@@ -173,20 +174,29 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
 int sg_diff_side_effective_id(const char *git_dir, const sg_diff_side *side,
                               unsigned char out[SG_SHA1_RAW_LEN]);
 
-/* Pairs deletions with additions of the same content and rewrites each pair
-   as a single rename row: the destination entry keeps its `path`, gains the
-   source's `old_path` and `old_side`, and the source entry is dropped.
+/* Pairs deletions with additions and rewrites each pair as a single rename
+   row: the destination entry keeps its `path`, gains the source's `old_path`
+   and `old_side`, and the source entry is dropped.
 
-   Only EXACT renames are found -- the two sides must hold byte-identical
-   content (compared by effective object id, so chunked storage resolves to
-   what it points at). git also finds *inexact* renames by similarity score;
-   sg does not yet, so a `git mv` followed by an edit is still reported here
-   as a deletion plus an addition where git 2.55.0 would say "R093". That is
-   a divergence, not a design choice -- see docs/DESIGN.md Phase 29.
+   Both exact and inexact renames are found (Phase 30), in git's three
+   passes and in git's order -- identical content first, settled by effective
+   object id and always scoring 100; then same-file-name pairs at a raised
+   threshold; then everything else scored against everything else. The order
+   is part of the answer, not an optimization: a name match can settle on a
+   pair the full comparison would have rejected in favour of a better one.
+   See src/workdir/rename.c.
 
-   Pairing is by path order, each source used at most once: measured against
-   git 2.55.0, two identical sources and two identical destinations pair up
-   in order, and one source with two identical destinations claims the first
+   The score is git's, to the point: it is printed in machine-readable form
+   ("R093", "similarity index 93%"), so being one point off is a wrong
+   answer, not a near miss. src/util/similarity.c is a deliberate port of
+   git's diffcore-delta.c for that reason.
+
+   Each source is used at most once, and ties are settled the way git settles
+   them, which is NOT simply path order: among sources holding identical
+   content the one sharing the destination's file name wins, and only failing
+   that does the first in path order. Measured against git 2.55.0, as is the
+   rest: two identical sources and two identical destinations pair up in
+   order, and one source with two identical destinations claims the first
    destination and leaves the second an ordinary addition.
 
    MUST run after sg_diff_list_filter, never before. Measured: `git diff
@@ -199,13 +209,21 @@ int sg_diff_side_effective_id(const char *git_dir, const sg_diff_side *side,
    The list stays sorted by `path` because only source entries are removed
    and destinations keep the path they already had.
 
-   `min_score` is git's -M threshold, 1-100; it does not affect exact
-   renames (which always score 100) but is taken now so that turning on
-   inexact detection later does not change this signature. Passing 0 means
-   "do not detect renames at all", which is git's --no-renames.
+   `min_score` is on git's 0..SG_SIMILARITY_MAX scale (see sg/similarity.h),
+   NOT a percentage: the -M grammar can ask for a threshold finer than one
+   percent, so a percentage could not hold one without rounding it. Passing 0
+   means "do not detect renames at all", which is git's --no-renames;
+   SG_SIMILARITY_MAX means exact renames only, which is git's -M100%.
+
+   `repo_root` is needed because scoring reads both sides' bytes, and a
+   WORKDIR side lives on disk rather than in the object store.
+
+   A side whose content cannot be read is never paired -- the same failure
+   direction as an unverified id: no rename, never an invented one.
 
    Returns 0, or -1 on allocation failure with the list left untouched. */
-int sg_diff_detect_renames(const char *git_dir, sg_diff_list *list, int min_score);
+int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
+                           sg_diff_list *list, int min_score);
 
 /* Drops every entry whose path the pathspec does not cover, freeing it. An
    empty pathspec matches everything, so an unfiltered `sg diff` and a
