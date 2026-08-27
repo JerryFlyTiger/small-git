@@ -119,7 +119,17 @@ INIT_RC=$?
 check "sg init exits 0" test "$INIT_RC" = 0
 
 GIT_STATUS_OUT="$WORKDIR/git_status_out.txt"
-(cd "$INIT_DIR" && git status) > "$GIT_STATUS_OUT" 2>&1
+# LC_ALL=C, because the check below greps git's own prose and git translates
+# it (it ships 20 message catalogs). Measured on a zh_TW machine, where git
+# renders this message in Chinese: the negative grep could never match, so
+# the check passed no matter what --
+# proven by breaking sg_repo_init so it writes .gitx instead of .git, which
+# turned 721 other checks red and left this one green. A negative assertion
+# that cannot fail is worse than no assertion: it still counts toward the
+# total, so it reads as coverage. The exit-code check on the line above is
+# the load-bearing one; this is its backstop, and a backstop that cannot
+# fire is not one.
+(cd "$INIT_DIR" && LC_ALL=C git status) > "$GIT_STATUS_OUT" 2>&1
 GIT_STATUS_RC=$?
 check "git status exits 0 inside sg-inited repo" test "$GIT_STATUS_RC" = 0
 check "git status does not complain about an invalid repository" sh -c "! grep -qi 'not a git repository' '$GIT_STATUS_OUT'"
