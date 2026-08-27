@@ -224,7 +224,9 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
     struct dirent *ent;
 
     if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
-        fprintf(stderr, "sg: warning: 路徑過長,略過目錄 %s(未追蹤清單可能不完整)\n",
+        fprintf(stderr,
+               "sg: warning: path too long, skipping directory %s (untracked list may be "
+               "incomplete)\n",
                sg_quote_path_delimited(reldir));
         return 0;
     }
@@ -235,7 +237,9 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
            see -- but never silent: an unreadable directory means the
            untracked list below is incomplete, and under-reporting without
            saying so is how uncommitted work gets lost. */
-        fprintf(stderr, "sg: warning: 無法讀取目錄 %s: %s（未追蹤清單可能不完整）\n",
+        fprintf(stderr,
+               "sg: warning: cannot read directory %s: %s (untracked list may be "
+               "incomplete)\n",
                 sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."), strerror(errno));
         return 0;
     }
@@ -274,7 +278,9 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
                together with a literal "/" (which is exactly how a
                control-character name turns "dir"/"x\ty" into something that
                reads as two paths instead of one). */
-            fprintf(stderr, "sg: warning: 路徑過長,略過目錄 %s 底下的項目 %s(未追蹤清單可能不完整)\n",
+            fprintf(stderr,
+                   "sg: warning: path too long, skipping entry %s under directory %s "
+                   "(untracked list may be incomplete)\n",
                     sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."),
                     sg_quote_path_delimited(ent->d_name));
             continue;
@@ -286,7 +292,9 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
                platform's PATH_MAX, EACCES, ELOOP) means we are dropping a
                real entry, so say so rather than under-report in silence. */
             if (errno != ENOENT)
-                fprintf(stderr, "sg: warning: 無法讀取 %s: %s（未追蹤清單可能不完整）\n",
+                fprintf(stderr,
+                       "sg: warning: cannot read %s: %s (untracked list may be "
+                       "incomplete)\n",
                         sg_quote_path_delimited(relpath), strerror(errno));
             continue;
         }
@@ -380,7 +388,9 @@ static int untracked_append_folded(char ***out, size_t *count, size_t *cap, cons
     size_t len = strlen(reldir);
 
     if (len + 2 > sizeof(folded)) {
-        fprintf(stderr, "sg: warning: 路徑過長,無法摺疊目錄 %s(未追蹤清單可能不完整)\n",
+        fprintf(stderr,
+               "sg: warning: path too long, cannot fold directory %s (untracked list may be "
+               "incomplete)\n",
                sg_quote_path_delimited(reldir));
         return 0;
     }
@@ -472,13 +482,17 @@ static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *
     struct dirent *ent;
 
     if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
-        fprintf(stderr, "sg: warning: 路徑過長,略過目錄 %s(未追蹤清單可能不完整)\n",
+        fprintf(stderr,
+               "sg: warning: path too long, skipping directory %s (untracked list may be "
+               "incomplete)\n",
                sg_quote_path_delimited(reldir));
         return 0;
     }
     d = opendir(absdir);
     if (d == NULL) {
-        fprintf(stderr, "sg: warning: 無法讀取目錄 %s: %s（未追蹤清單可能不完整）\n",
+        fprintf(stderr,
+               "sg: warning: cannot read directory %s: %s (untracked list may be "
+               "incomplete)\n",
                 sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."), strerror(errno));
         return 0;
     }
@@ -495,14 +509,17 @@ static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *
         if (sg_path_join(relpath, sizeof(relpath), reldir, ent->d_name) != 0 ||
            sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
             fprintf(stderr,
-                   "sg: warning: 路徑過長,略過目錄 %s 底下的項目 %s(未追蹤清單可能不完整)\n",
+                   "sg: warning: path too long, skipping entry %s under directory %s "
+                   "(untracked list may be incomplete)\n",
                     sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."),
                     sg_quote_path_delimited(ent->d_name));
             continue;
         }
         if (lstat(abspath, &st) != 0) {
             if (errno != ENOENT)
-                fprintf(stderr, "sg: warning: 無法讀取 %s: %s（未追蹤清單可能不完整）\n",
+                fprintf(stderr,
+                       "sg: warning: cannot read %s: %s (untracked list may be "
+                       "incomplete)\n",
                         sg_quote_path_delimited(relpath), strerror(errno));
             continue;
         }
@@ -564,13 +581,17 @@ static int collect_ignored_within(const char *repo_root, const char *reldir, sg_
     struct dirent *ent;
 
     if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
-        fprintf(stderr, "sg: warning: 路徑過長,略過目錄 %s(未追蹤清單可能不完整)\n",
+        fprintf(stderr,
+               "sg: warning: path too long, skipping directory %s (untracked list may be "
+               "incomplete)\n",
                sg_quote_path_delimited(reldir));
         return 0;
     }
     d = opendir(absdir);
     if (d == NULL) {
-        fprintf(stderr, "sg: warning: 無法讀取目錄 %s: %s（未追蹤清單可能不完整）\n",
+        fprintf(stderr,
+               "sg: warning: cannot read directory %s: %s (untracked list may be "
+               "incomplete)\n",
                 sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."), strerror(errno));
         return 0;
     }
@@ -587,14 +608,17 @@ static int collect_ignored_within(const char *repo_root, const char *reldir, sg_
         if (sg_path_join(relpath, sizeof(relpath), reldir, ent->d_name) != 0 ||
            sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
             fprintf(stderr,
-                   "sg: warning: 路徑過長,略過目錄 %s 底下的項目 %s(未追蹤清單可能不完整)\n",
+                   "sg: warning: path too long, skipping entry %s under directory %s "
+                   "(untracked list may be incomplete)\n",
                     sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."),
                     sg_quote_path_delimited(ent->d_name));
             continue;
         }
         if (lstat(abspath, &st) != 0) {
             if (errno != ENOENT)
-                fprintf(stderr, "sg: warning: 無法讀取 %s: %s（未追蹤清單可能不完整）\n",
+                fprintf(stderr,
+                       "sg: warning: cannot read %s: %s (untracked list may be "
+                       "incomplete)\n",
                         sg_quote_path_delimited(relpath), strerror(errno));
             continue;
         }
@@ -681,14 +705,18 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
         struct dirent *ent;
 
         if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
-            fprintf(stderr, "sg: warning: 路徑過長,略過目錄 %s(未追蹤清單可能不完整)\n",
+            fprintf(stderr,
+                   "sg: warning: path too long, skipping directory %s (untracked list may be "
+                   "incomplete)\n",
                    sg_quote_path_delimited(reldir));
             return 0;
         }
 
         d = opendir(absdir);
         if (d == NULL) {
-            fprintf(stderr, "sg: warning: 無法讀取目錄 %s: %s（未追蹤清單可能不完整）\n",
+            fprintf(stderr,
+                   "sg: warning: cannot read directory %s: %s (untracked list may be "
+                   "incomplete)\n",
                     sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."), strerror(errno));
             return 0;
         }
@@ -706,7 +734,8 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
             if (sg_path_join(relpath, sizeof(relpath), reldir, ent->d_name) != 0 ||
                sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0) {
                 fprintf(stderr,
-                       "sg: warning: 路徑過長,略過目錄 %s 底下的項目 %s(未追蹤清單可能不完整)\n",
+                       "sg: warning: path too long, skipping entry %s under directory %s "
+                       "(untracked list may be incomplete)\n",
                         sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."),
                         sg_quote_path_delimited(ent->d_name));
                 continue;
@@ -714,7 +743,9 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
 
             if (lstat(abspath, &st) != 0) {
                 if (errno != ENOENT)
-                    fprintf(stderr, "sg: warning: 無法讀取 %s: %s（未追蹤清單可能不完整）\n",
+                    fprintf(stderr,
+                           "sg: warning: cannot read %s: %s (untracked list may be "
+                           "incomplete)\n",
                             sg_quote_path_delimited(relpath), strerror(errno));
                 continue;
             }

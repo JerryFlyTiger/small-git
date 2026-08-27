@@ -11,30 +11,30 @@ typedef struct {
 } sg_command_info;
 
 static const sg_command_info COMMANDS[] = {
-    {"init", "建立新的 repository"},
-    {"hash-object", "計算(並可選擇寫入)物件的雜湊"},
-    {"cat-file", "檢視 object 內容/型別/大小"},
-    {"add", "將檔案加入暫存區"},
-    {"commit", "建立一個 commit"},
-    {"log", "顯示 commit 歷史"},
-    {"status", "顯示工作目錄狀態"},
-    {"diff", "顯示變更（index/工作目錄/兩個 rev 之間），可切換多種輸出格式"},
-    {"branch", "列出、建立或刪除分支"},
-    {"tag", "列出、建立或刪除標籤"},
-    {"switch", "切換分支"},
-    {"restore", "還原檔案或取消暫存"},
-    {"reset", "把目前分支、index（與可選的工作目錄）重設到指定的 commit"},
-    {"undo", "列出或還原自動快照"},
-    {"repack", "將 loose object 打包成 packfile"},
-    {"merge", "合併另一個分支"},
-    {"merge-base", "找出兩個 commit 的最近共同祖先"},
-    {"rebase", "將目前分支重新套用到另一個分支之上"},
-    {"clone", "從遠端複製一個 repository"},
-    {"fetch", "從遠端取得新的 commit 與 ref"},
-    {"push", "將本地分支推送到遠端"},
-    {"chunk-info", "顯示檔案/物件的分塊儲存診斷資訊"},
-    {"stash", "暫存工作目錄與 index 的變更，之後可以還原"},
-    {"reflog", "顯示 ref 的更新歷史"},
+    {"init", "create a new repository"},
+    {"hash-object", "compute (and optionally write) an object's hash"},
+    {"cat-file", "inspect an object's content/type/size"},
+    {"add", "add files to the index"},
+    {"commit", "create a commit"},
+    {"log", "show commit history"},
+    {"status", "show the working directory status"},
+    {"diff", "show changes (index/working dir/between revs), several formats"},
+    {"branch", "list, create, or delete branches"},
+    {"tag", "list, create, or delete tags"},
+    {"switch", "switch branches"},
+    {"restore", "restore files or unstage them"},
+    {"reset", "reset branch, index (and optionally working dir) to a commit"},
+    {"undo", "list or restore automatic snapshots"},
+    {"repack", "pack loose objects into a packfile"},
+    {"merge", "merge another branch"},
+    {"merge-base", "find the nearest common ancestor of two commits"},
+    {"rebase", "reapply the current branch on top of another branch"},
+    {"clone", "clone a repository from a remote"},
+    {"fetch", "fetch new commits and refs from a remote"},
+    {"push", "push the local branch to a remote"},
+    {"chunk-info", "show chunk-storage diagnostics for a file/object"},
+    {"stash", "stash working directory and index changes for later restore"},
+    {"reflog", "show a ref's update history"},
 };
 #define COMMANDS_COUNT (sizeof(COMMANDS) / sizeof(COMMANDS[0]))
 
@@ -129,7 +129,7 @@ int sg_cli_run(int argc, char **argv)
 
         fprintf(stderr, "sg: '%s' is not a sg command\n", argv[1]);
         if (best_dist <= 2) {
-            fprintf(stderr, "\n你是不是想輸入 '%s'?\n", COMMANDS[best_idx].name);
+            fprintf(stderr, "\nDid you mean '%s'?\n", COMMANDS[best_idx].name);
         } else {
             fprintf(stderr, "\n");
             print_help(stderr);

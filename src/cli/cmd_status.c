@@ -514,7 +514,7 @@ int sg_cmd_status(int argc, char **argv)
                       onto_short);
             else
                 printf("You are currently rebasing.\n");
-            printf("（還剩 %zu 個 commit 待處理）\n", remaining);
+            printf("(%zu commits left to process)\n", remaining);
             if (rstate.has_current) {
                 printf("  (fix conflicts and run \"sg rebase --continue\")\n"
                       "  (use \"sg rebase --skip\" to skip this patch)\n"
@@ -572,7 +572,7 @@ int sg_cmd_status(int argc, char **argv)
 
         if (sg_status_list_untracked(git_dir, repo_root, &idx, 0, fold, &untracked,
                                      &untracked_count) != 0) {
-            fprintf(stderr, "sg: 記憶體不足，無法掃描未追蹤的檔案\n");
+            fprintf(stderr, "sg: out of memory, cannot scan untracked files\n");
             sg_status_list_free(&staged);
             sg_status_list_free(&unstaged);
             sg_index_free(&idx);
@@ -590,7 +590,7 @@ int sg_cmd_status(int argc, char **argv)
                    0 ||
                list_diff_sorted(untracked, untracked_count, untracked_and_ignored,
                                 untracked_and_ignored_count, &ignored, &ignored_count) != 0) {
-                fprintf(stderr, "sg: 記憶體不足，無法掃描 ignored 的檔案\n");
+                fprintf(stderr, "sg: out of memory, cannot scan ignored files\n");
                 for (i = 0; i < untracked_and_ignored_count; i++)
                     free(untracked_and_ignored[i]);
                 free(untracked_and_ignored);

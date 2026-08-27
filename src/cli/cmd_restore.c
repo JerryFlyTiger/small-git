@@ -58,7 +58,7 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
        gitdir, which is worse than the delete-side hole in apply.c: that one
        only removes, this one writes attacker-chosen bytes. */
     if (!sg_relpath_is_safe(rel)) {
-        fprintf(stderr, "sg: 路徑 %s 無效,拒絕還原\n", sg_quote_path_delimited(arg));
+        fprintf(stderr, "sg: path %s is invalid, refusing to restore\n", sg_quote_path_delimited(arg));
         return -1;
     }
     {
@@ -77,7 +77,7 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
     }
 
     if (sg_path_join(abspath, sizeof(abspath), repo_root, rel) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法還原 %s\n", sg_quote_path_delimited(arg));
+        fprintf(stderr, "sg: path too long, cannot restore %s\n", sg_quote_path_delimited(arg));
         free(content);
         return -1;
     }
@@ -267,7 +267,7 @@ int sg_cmd_restore(int argc, char **argv)
 
             lossy = would_lose_content(git_dir, repo_root, &idx, rel);
             if (lossy < 0) {
-                fprintf(stderr, "sg: 路徑過長,無法檢查 %s 是否會遺失變更\n",
+                fprintf(stderr, "sg: path too long, cannot check whether %s would lose changes\n",
                        sg_quote_path_delimited(argv[i]));
                 free(rel);
                 free(msg.buf);
@@ -281,8 +281,8 @@ int sg_cmd_restore(int argc, char **argv)
             if (lossy) {
                 if (!any_lossy)
                     strbuf_append(&msg,
-                                  "sg restore: 以下路徑目前的工作目錄內容跟 index 不同，"
-                                  "還原後這些變更會遺失：\n");
+                                  "sg restore: the following paths currently differ between the working directory and the index; "
+                                  "restoring them will lose those changes:\n");
                 else
                     strbuf_append(&affected, ",");
                 strbuf_append_path(&msg, rel);
@@ -312,7 +312,7 @@ int sg_cmd_restore(int argc, char **argv)
             snprintf(label, sizeof(label), "restore %s", affected.buf != NULL ? affected.buf : "");
             if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
                 fprintf(stderr,
-                       "sg: 自動快照失敗，為了安全起見中止這次還原（沒有做任何變更）\n");
+                       "sg: automatic snapshot failed, aborting this restore for safety (no changes made)\n");
                 free(msg.buf);
                 free(affected.buf);
                 sg_flat_list_free(&head_flat);

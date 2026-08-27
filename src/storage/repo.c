@@ -117,7 +117,7 @@ char *sg_require_git_dir(void)
 
     if (git_dir == NULL) {
         fprintf(stderr, "sg: not a git repository (or any parent up to the root)\n");
-        fprintf(stderr, "sg: 執行 `sg init` 建立一個新的 repository\n");
+        fprintf(stderr, "sg: run `sg init` to create a new repository\n");
     }
     return git_dir;
 }

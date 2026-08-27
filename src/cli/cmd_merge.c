@@ -64,13 +64,13 @@ static void print_conflict_message(char **conflict_paths, size_t conflict_count)
 {
     size_t i;
 
-    fprintf(stderr, "自動合併失敗，以下檔案有衝突：\n");
+    fprintf(stderr, "Automatic merge failed; the following files have conflicts:\n");
     for (i = 0; i < conflict_count; i++)
         fprintf(stderr, "    %s\n", sg_quote_path(conflict_paths[i]));
-    fprintf(stderr, "請編輯這些檔案解決衝突，然後：\n");
-    fprintf(stderr, "  sg add <file>...     標記為已解決\n");
-    fprintf(stderr, "  sg commit -m \"...\"   完成這次合併\n");
-    fprintf(stderr, "或放棄這次合併：\n");
+    fprintf(stderr, "Edit these files to resolve the conflicts, then:\n");
+    fprintf(stderr, "  sg add <file>...     mark as resolved\n");
+    fprintf(stderr, "  sg commit -m \"...\"   finish this merge\n");
+    fprintf(stderr, "Or give up this merge:\n");
     fprintf(stderr, "  sg merge --abort\n");
 }
 
@@ -122,7 +122,7 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
 
         snprintf(label, sizeof(label), "merge %s", branch_arg);
         if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: 自動快照失敗，為了安全起見中止這次合併（沒有做任何變更）\n");
+            fprintf(stderr, "sg: automatic snapshot failed, aborting this merge for safety (no changes made)\n");
             sg_index_free(&idx);
             return 1;
         }
@@ -131,7 +131,7 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
 
     if (sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, ours_label, branch_arg,
                        &result) != 0) {
-        fprintf(stderr, "sg: 合併過程中發生錯誤\n");
+        fprintf(stderr, "sg: an error occurred while merging\n");
         return 1;
     }
 
@@ -292,12 +292,12 @@ static int do_merge_abort(const char *git_dir, const char *repo_root)
        gates on the same file -- would leave the repository with no way out
        short of deleting .git/MERGE_HEAD by hand. */
     if (!sg_merge_head_exists(git_dir)) {
-        fprintf(stderr, "sg: 目前不在合併狀態（找不到 MERGE_HEAD）\n");
+        fprintf(stderr, "sg: not currently merging (MERGE_HEAD not found)\n");
         return 1;
     }
     if (sg_ref_resolve_head(git_dir, head_id) != 0 ||
        sg_commit_tree_of(git_dir, head_id, head_tree) != 0) {
-        fprintf(stderr, "sg: 無法讀取目前分支的 commit\n");
+        fprintf(stderr, "sg: cannot read the current branch's commit\n");
         return 1;
     }
     if (sg_index_read(git_dir, &idx) != 0) {
@@ -309,18 +309,18 @@ static int do_merge_abort(const char *git_dir, const char *repo_root)
        does -- take a safety snapshot first, and abort outright if that
        fails instead of proceeding unprotected. */
     if (sg_snapshot_create(git_dir, repo_root, &idx, "merge --abort", NULL) != 0) {
-        fprintf(stderr, "sg: 自動快照失敗，為了安全起見中止 abort（沒有做任何變更）\n");
+        fprintf(stderr, "sg: automatic snapshot failed, aborting the abort for safety (no changes made)\n");
         sg_index_free(&idx);
         return 1;
     }
     sg_index_free(&idx);
 
     if (sg_apply_tree_to_workdir(git_dir, repo_root, head_tree) != 0) {
-        fprintf(stderr, "sg: 還原工作目錄失敗\n");
+        fprintf(stderr, "sg: failed to restore the working directory\n");
         return 1;
     }
     if (sg_merge_head_remove(git_dir) != 0)
-        fprintf(stderr, "sg: warning: 無法移除 MERGE_HEAD\n");
+        fprintf(stderr, "sg: warning: failed to remove MERGE_HEAD\n");
 
     printf("Merge aborted.\n");
     return 0;
@@ -384,9 +384,9 @@ int sg_cmd_merge(int argc, char **argv)
            first one's MERGE_HEAD and conflict staging on the floor. */
         if (sg_merge_head_exists(git_dir)) {
             fprintf(stderr,
-                   "sg: 目前有一個尚未完成的合併\n"
-                   "請先完成它（解決衝突後 sg add <file>... 再 sg commit），"
-                   "或執行 sg merge --abort 放棄\n");
+                   "sg: an unfinished merge is in progress\n"
+                   "Finish it first (resolve conflicts, sg add <file>..., then sg commit), "
+                   "or run sg merge --abort to give up\n");
             free(git_dir);
             free(repo_root);
             return 1;
@@ -398,8 +398,8 @@ int sg_cmd_merge(int argc, char **argv)
            check above, just for the other direction. */
         if (sg_rebase_state_exists(git_dir)) {
             fprintf(stderr,
-                   "sg: 目前有一個進行中的 rebase\n"
-                   "請先完成它（sg rebase --continue）或執行 sg rebase --abort 放棄\n");
+                   "sg: a rebase is currently in progress\n"
+                   "Finish it first (sg rebase --continue) or run sg rebase --abort to give up\n");
             free(git_dir);
             free(repo_root);
             return 1;
@@ -422,7 +422,7 @@ int sg_cmd_merge(int argc, char **argv)
            makes the message name the actual problem. */
         current_branch = sg_ref_current_branch(git_dir);
         if (current_branch == NULL && sg_ref_head_is_detached(git_dir) != 1) {
-            fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
+            fprintf(stderr, "sg: cannot read HEAD (.git/HEAD is neither a branch nor a commit id)\n");
             free(git_dir);
             free(repo_root);
             return 1;
@@ -473,14 +473,14 @@ int sg_cmd_merge(int argc, char **argv)
 
         mb_rc = sg_merge_base(git_dir, ours_commit, theirs_commit, base_commit);
         if (mb_rc == -2) {
-            fprintf(stderr, "sg: 找到多個彼此獨立的共同祖先（criss-cross 歷史），無法自動合併\n");
+            fprintf(stderr, "sg: found multiple unrelated common ancestors (criss-cross history), cannot merge automatically\n");
             free(current_branch);
             free(git_dir);
             free(repo_root);
             return 1;
         }
         if (mb_rc == -1) {
-            fprintf(stderr, "sg: '%s' 與目前分支沒有共同的歷史，無法合併\n", branch_arg);
+            fprintf(stderr, "sg: '%s' has no common history with the current branch, cannot merge\n", branch_arg);
             free(current_branch);
             free(git_dir);
             free(repo_root);

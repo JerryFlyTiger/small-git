@@ -211,8 +211,8 @@ static int walk_add_object(const char *git_dir, const unsigned char id[SG_SHA1_R
 
                 sg_sha1_to_hex(cur, hex);
                 fprintf(stderr,
-                       "sg: push 中止：分塊檔案的物件 %s 在本地物件庫中有缺失或損毀的資料塊，"
-                       "無法確保推送完整資料\n",
+                       "sg: push aborted: chunked object %s has missing or corrupt chunk data in the local object "
+                       "store, cannot guarantee complete data is pushed\n",
                        hex);
                 free(content);
                 rc = -1;
@@ -503,7 +503,7 @@ static void print_lost_commits(const char *git_dir, const unsigned char old_id[S
     }
 
     if (total_lost > shown)
-        fprintf(stderr, "  ...還有 %zu 個\n", total_lost - shown);
+        fprintf(stderr, "  ...and %zu more\n", total_lost - shown);
 
 done:
     free(queue);
@@ -567,7 +567,7 @@ static int build_branch_candidate(const char *git_dir, const char *branch, push_
     char path[SG_PATH_MAX];
 
     if (sg_ref_read_branch(git_dir, branch, id) != 0) {
-        fprintf(stderr, "sg: 分支 '%s' 尚無任何 commit，沒有東西可以推送\n", branch);
+        fprintf(stderr, "sg: branch '%s' has no commits yet, nothing to push\n", branch);
         return -1;
     }
     snprintf(path, sizeof(path), "refs/heads/%s", branch);
@@ -668,7 +668,7 @@ int sg_cmd_push(int argc, char **argv)
 
     url = sg_repo_read_remote_url(git_dir, remote);
     if (url == NULL) {
-        fprintf(stderr, "sg: remote '%s' 未設定 (找不到 .git/config 裡的 [remote \"%s\"] url)\n", remote,
+        fprintf(stderr, "sg: remote '%s' is not configured (no [remote \"%s\"] url found in .git/config)\n", remote,
                remote);
         goto done;
     }
@@ -680,7 +680,7 @@ int sg_cmd_push(int argc, char **argv)
         size_t i;
 
         if (sg_ref_list_under(git_dir, "refs/tags/", &tag_names, &tag_name_count) != 0) {
-            fprintf(stderr, "sg: 無法列出本地的 tag\n");
+            fprintf(stderr, "sg: cannot list local tags\n");
             goto done;
         }
         /* tag_name_count == 0 is deliberately NOT an early return here: even
@@ -699,7 +699,7 @@ int sg_cmd_push(int argc, char **argv)
             snprintf(path, sizeof(path), "refs/tags/%s", tag_names[i]);
             memset(&cand, 0, sizeof(cand));
             if (sg_ref_read_path(git_dir, path, cand.new_id) != 0) {
-                fprintf(stderr, "sg: 無法讀取 tag '%s'\n", tag_names[i]);
+                fprintf(stderr, "sg: cannot read tag '%s'\n", tag_names[i]);
                 goto done;
             }
             cand.name = strdup(tag_names[i]);
@@ -754,10 +754,10 @@ int sg_cmd_push(int argc, char **argv)
         if (current_branch == NULL) {
             if (sg_ref_head_is_detached(git_dir) == 1)
                 fprintf(stderr,
-                       "sg: 目前是 detached HEAD，請明確指定要推送的分支：sg push %s <branch>\n",
+                       "sg: currently in detached HEAD, please name the branch to push explicitly: sg push %s <branch>\n",
                        remote);
             else
-                fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
+                fprintf(stderr, "sg: cannot read HEAD (.git/HEAD is neither a branch nor a commit id)\n");
             goto done;
         }
         if (build_branch_candidate(git_dir, current_branch, &candidates, &candidate_count,
@@ -797,18 +797,18 @@ int sg_cmd_push(int argc, char **argv)
 
                 if (status == SG_PUSH_UNKNOWN_REMOTE) {
                     fprintf(stderr,
-                           "sg: 拒絕推送：遠端的 %s 有我們不知道的 commit，"
-                           "無法判斷是否會覆蓋別人的工作，請先執行 sg fetch\n",
+                           "sg: push refused: the remote's %s has commits we don't know about, "
+                           "cannot tell whether this would overwrite someone else's work; run sg fetch first\n",
                            cand->name);
                     goto done;
                 }
                 if (status == SG_PUSH_NON_FF && !force) {
                     fprintf(stderr,
-                           "sg: 拒絕推送：這不是 fast-forward，會讓遠端 %s 上的以下 commit 遺失：\n",
+                           "sg: push refused: not a fast-forward, this would lose the following commits on the remote's %s:\n",
                            cand->name);
                     print_lost_commits(git_dir, remote_old_id, cand->new_id);
                     fprintf(stderr,
-                           "sg: 請先 sg fetch 後 sg merge 整合變更，或確定要覆蓋就加上 --force 重新執行\n");
+                           "sg: run sg fetch then sg merge to integrate the changes, or re-run with --force if you really want to overwrite\n");
                     goto done;
                 }
                 if (remote_ref_exists && memcmp(remote_old_id, cand->new_id, SG_SHA1_RAW_LEN) == 0)
@@ -924,8 +924,8 @@ int sg_cmd_push(int argc, char **argv)
                     if (sg_chunk_keepalive_merge_commit(git_dir, remote_chunks_old_id) != 0 ||
                        sg_ref_read_path(git_dir, SG_CHUNK_KEEPALIVE_REF, local_keepalive_id) != 0) {
                         fprintf(stderr,
-                               "sg: 拒絕推送：遠端的 refs/sg/chunks 有本地無法讀取的內容，"
-                               "無法安全合併，請先執行 sg fetch\n");
+                               "sg: push refused: the remote's refs/sg/chunks has content the local side cannot read, "
+                               "cannot merge safely; run sg fetch first\n");
                         goto done;
                     }
                     memcpy(chunks_old_id, remote_chunks_old_id, SG_SHA1_RAW_LEN);
@@ -933,8 +933,8 @@ int sg_cmd_push(int argc, char **argv)
                     send_chunks_update = 1;
                 } else {
                     fprintf(stderr,
-                           "sg: 拒絕推送：遠端的 refs/sg/chunks 有本地無法讀取的內容，"
-                           "無法安全合併，請先執行 sg fetch\n");
+                           "sg: push refused: the remote's refs/sg/chunks has content the local side cannot read, "
+                           "cannot merge safely; run sg fetch first\n");
                     goto done;
                 }
             }
@@ -979,7 +979,7 @@ int sg_cmd_push(int argc, char **argv)
         id_set_free(&send_set);
 
         if (!build_ok) {
-            fprintf(stderr, "sg: 計算要推送的物件時失敗\n");
+            fprintf(stderr, "sg: failed to compute the objects to push\n");
             goto done;
         }
 
@@ -995,7 +995,7 @@ int sg_cmd_push(int argc, char **argv)
             size_t update_count = 0;
 
             if (sg_pack_build_buf(git_dir, diff_ids, diff_count, &pack_data, &pack_len) != 0) {
-                fprintf(stderr, "sg: 建立要推送的 packfile 失敗\n");
+                fprintf(stderr, "sg: failed to build the packfile to push\n");
                 goto done;
             }
 
@@ -1033,13 +1033,13 @@ int sg_cmd_push(int argc, char **argv)
             free(pack_data);
 
             if (push_rc != 0) {
-                fprintf(stderr, "sg: push 到 %s 失敗\n", safe_url != NULL ? safe_url : "(remote)");
+                fprintf(stderr, "sg: push to %s failed\n", safe_url != NULL ? safe_url : "(remote)");
                 goto done;
             }
 
             if (!report.unpack_ok) {
-                fprintf(stderr, "sg: 遠端 unpack 失敗: %s\n",
-                       report.unpack_error != NULL ? report.unpack_error : "(未知錯誤)");
+                fprintf(stderr, "sg: remote unpack failed: %s\n",
+                       report.unpack_error != NULL ? report.unpack_error : "(unknown error)");
                 sg_push_report_free(&report);
                 goto done;
             }
@@ -1076,18 +1076,18 @@ int sg_cmd_push(int argc, char **argv)
                             const char *why = report.refs[j].message;
 
                             any_ng = 1;
-                            fprintf(stderr, "sg: 遠端拒絕更新 %s: ", e->ref_path);
+                            fprintf(stderr, "sg: remote rejected update of %s: ", e->ref_path);
                             if (why != NULL)
                                 sg_print_remote_text((const unsigned char *)why, strlen(why), stderr);
                             else
-                                fputs("(未知原因)", stderr);
+                                fputs("(unknown reason)", stderr);
                             fputc('\n', stderr);
                         }
                         break;
                     }
 
                     if (!found) {
-                        fprintf(stderr, "sg: 遠端回應未包含 %s 的結果\n", e->ref_path);
+                        fprintf(stderr, "sg: remote response did not include a result for %s\n", e->ref_path);
                         any_ng = 1;
                     }
                 }
@@ -1099,11 +1099,11 @@ int sg_cmd_push(int argc, char **argv)
                         } else {
                             const char *why = report.refs[i].message;
 
-                            fprintf(stderr, "sg: 遠端拒絕更新 %s: ", SG_CHUNK_KEEPALIVE_REF);
+                            fprintf(stderr, "sg: remote rejected update of %s: ", SG_CHUNK_KEEPALIVE_REF);
                             if (why != NULL)
                                 sg_print_remote_text((const unsigned char *)why, strlen(why), stderr);
                             else
-                                fputs("(未知原因)", stderr);
+                                fputs("(unknown reason)", stderr);
                             fputc('\n', stderr);
                         }
                     }
@@ -1123,7 +1123,7 @@ int sg_cmd_push(int argc, char **argv)
                    independently). */
                 if (send_chunks_update && !chunks_ref_ok) {
                     fprintf(stderr,
-                           "sg: chunk 資料的保護 ref (%s) 未能推送，遠端的分塊檔案將無法還原\n",
+                           "sg: the chunk-data protection ref (%s) failed to push, the remote's chunked files cannot be restored\n",
                            SG_CHUNK_KEEPALIVE_REF);
                     goto done;
                 }
@@ -1146,7 +1146,7 @@ int sg_cmd_push(int argc, char **argv)
                        local old value itself. */
                     if (sg_ref_update(git_dir, remote_ref_path, entries[i].new_id,
                                       "update by push") != 0) {
-                        fprintf(stderr, "sg: push 成功，但更新本地的 %s 失敗\n", remote_ref_path);
+                        fprintf(stderr, "sg: push succeeded, but failed to update local %s\n", remote_ref_path);
                         goto done;
                     }
                     break;

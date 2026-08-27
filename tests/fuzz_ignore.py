@@ -8,7 +8,7 @@ Any divergence is a bug in sg's matcher.
 
 This exists because hand-written cases only cover the combinations someone
 thought of. The interop suite's conformance sweep pins the rule families
-individually; this pins their *interactions* — a negation inside a nested
+individually; this pins their *interactions* -- a negation inside a nested
 .gitignore under a directory excluded by a `**` pattern three levels up, and
 so on. It found zero divergences over 600 iterations when the matcher landed,
 which is the evidence behind the claim that sg's ignore semantics match git's.

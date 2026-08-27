@@ -739,7 +739,8 @@ static void test_binary_forces_number_width(void)
    DIFFERENT padding before "|" in the same --stat output, because CJK
    codepoints in this table are 2 display columns wide and ASCII is 1 --
    the padding must therefore differ even though both names are 6 code
-   points long ("cc.txt" and "\xe4\xb8\xad\xe6\x96\x87.txt" == 中文.txt). */
+   points long ("cc.txt" and "\xe4\xb8\xad\xe6\x96\x87.txt" == U+4E2D U+6587
+   ".txt", a CJK filename). */
 static void test_display_width_cjk_vs_ascii(void)
 {
     char *root = make_tmp_repo_and_cd("cjk");
@@ -751,7 +752,7 @@ static void test_display_width_cjk_vs_ascii(void)
     snprintf(git_dir, sizeof(git_dir), "%s/.git", root);
 
     write_file("cc.txt", "a\n");
-    write_file("\xe4\xb8\xad\xe6\x96\x87.txt", "a\n"); /* 中文.txt */
+    write_file("\xe4\xb8\xad\xe6\x96\x87.txt", "a\n"); /* U+4E2D U+6587 ".txt" */
     run_add_all();
     run_commit("base");
     write_file("cc.txt", "a\nb\n");
@@ -1418,10 +1419,11 @@ static void test_patch_function_name_suffix_found(void)
 
 /* No line in the file starts with alnum/_/$ (every line starts with a
    digit), so no suffix is printed -- and critically, the "@@ ... @@" line
-   must have NO trailing space in that case. Asserted as a full string
-   (CLAUDE.md: "請斷言完整字串,不要只 strstr"), not just presence, because a
-   stray trailing space would be invisible to a strstr-only check that only
-   looked for the substring up to "@@". */
+   must have NO trailing space in that case. Asserted as a full string, not
+   just presence, per this project's convention of asserting the complete
+   string rather than a bare strstr, because a stray trailing space would be
+   invisible to a strstr-only check that only looked for the substring up to
+   "@@". */
 static void test_patch_function_name_suffix_not_found_no_trailing_space(void)
 {
     char *root = make_tmp_repo_and_cd("funcname_absent");

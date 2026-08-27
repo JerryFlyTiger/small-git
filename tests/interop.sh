@@ -52,9 +52,13 @@ REPO="$WORKDIR/repo"
 mkdir -p "$REPO"
 git init -q "$REPO"
 
-# a test file with a newline, CJK text, and an embedded raw NUL byte
+# a test file with a newline, CJK text, and an embedded raw NUL byte.
+# The \xNN escapes below are the UTF-8 bytes for the CJK words
+# "line 1" (U+7B2C U+4E00 U+884C), "line 2" (U+7B2C U+4E8C U+884C), and
+# "hello" (U+4F60 U+597D) -- written as hex so this file itself has no
+# literal Han characters, but the fixture's on-disk bytes are unchanged.
 FILE1="$WORKDIR/file1.bin"
-printf '第一行 hello\n第二行\xe4\xbd\xa0\xe5\xa5\xbd\n' > "$FILE1"
+printf '\xe7\xac\xac\xe4\xb8\x80\xe8\xa1\x8c hello\n\xe7\xac\xac\xe4\xba\x8c\xe8\xa1\x8c\xe4\xbd\xa0\xe5\xa5\xbd\n' > "$FILE1"
 printf '\000binary-tail' >> "$FILE1"
 
 # --- sg writes, git reads ---
@@ -926,7 +930,7 @@ printf 'base\ndup-change\n' > "$P4C_EMPTY_REPO/e.txt"
 P4C_EMPTY_OUT="$WORKDIR/p4c_empty_out.txt"
 (cd "$P4C_EMPTY_REPO" && "$SG" rebase master < /dev/null) > "$P4C_EMPTY_OUT" 2>&1
 check "phase4c case6: rebase with an already-upstream change exits 0" test $? = 0
-check "phase4c case6: sg reports the duplicate commit as skipped" grep -q "已跳過" "$P4C_EMPTY_OUT"
+check "phase4c case6: sg reports the duplicate commit as skipped" grep -q "Skipped" "$P4C_EMPTY_OUT"
 
 P4C_EMPTY_SUBJECTS="$WORKDIR/p4c_empty_subjects.txt"
 (cd "$P4C_EMPTY_REPO" && git log --format=%s) > "$P4C_EMPTY_SUBJECTS" 2>&1
@@ -1167,7 +1171,7 @@ PYEOF
     done
 
     if [ -z "$HTTP_PORT" ]; then
-        echo "warning: HTTP test server 未能在時限內就緒，跳過 phase 5b HTTP 測試" >&2
+        echo "warning: HTTP test server did not become ready in time, skipping phase 5b HTTP tests" >&2
         HTTP_AVAILABLE=0
     fi
 fi
@@ -1736,7 +1740,7 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     done
 
     if [ -z "$P6A_HTTP_PORT" ]; then
-        echo "warning: phase6a HTTP test server 未能在時限內就緒，跳過 phase6a push/clone HTTP 測試" >&2
+        echo "warning: phase6a HTTP test server did not become ready in time, skipping phase6a push/clone HTTP tests" >&2
         skip "phase6a: sg push over smart HTTP with a chunked blob"
         skip "phase6a: sg push transfers every referenced chunk blob to the remote"
         skip "phase6a: git fsck exits 0 on the bare repo after pushing a chunked blob"
@@ -2022,7 +2026,7 @@ P6B_MISSING_RESTORE_RC=$?
 check "phase6b: sg restore fails (non-zero) when a chunk object is missing from the object store" \
     test "$P6B_MISSING_RESTORE_RC" != 0
 check "phase6b: sg restore prints an actionable error naming the missing chunk(s)" \
-    grep -q "資料塊" "$P6B_MISSING_RESTORE_OUT"
+    grep -q "chunk" "$P6B_MISSING_RESTORE_OUT"
 check "phase6b: a failed restore never writes the pointer text in place of the file -- big.bin stays absent rather than being created with wrong (short) content" \
     test ! -e "$P6B_MISSING_FILE"
 
@@ -2070,7 +2074,7 @@ P6C_FIRSTCHUNK_RESTORE_RC=$?
 check "phase6c: sg restore fails (non-zero) when the FIRST chunk object is missing (residual silent-corruption regression)" \
     test "$P6C_FIRSTCHUNK_RESTORE_RC" != 0
 check "phase6c: sg restore prints an actionable error naming the missing chunk(s) when the first chunk is gone" \
-    grep -q "資料塊" "$P6C_FIRSTCHUNK_RESTORE_OUT"
+    grep -q "chunk" "$P6C_FIRSTCHUNK_RESTORE_OUT"
 check "phase6c: a failed restore never writes the pointer text in place of the file when the first chunk is gone -- big.bin stays absent" \
     test ! -e "$P6C_FIRSTCHUNK_FILE"
 
@@ -2133,7 +2137,7 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     done
 
     if [ -z "$P6B_PORT" ]; then
-        echo "warning: phase6b HTTP test server 未能在時限內就緒，跳過 phase6b sg push/clone chunk 測試" >&2
+        echo "warning: phase6b HTTP test server did not become ready in time, skipping phase6b sg push/clone chunk tests" >&2
         skip "phase6b: sg push to a genuinely empty remote exits 0"
         skip "phase6b: after a real sg push, the remote genuinely has refs/sg/chunks"
         skip "phase6b: sg clone over smart HTTP recovers a chunked file's chunk data byte-for-byte"
@@ -2240,7 +2244,7 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         check "phase6b: sg push fails (non-zero) when a locally chunked file has a missing chunk object" \
             test "$P6B_PUSHFAIL_RC" != 0
         check "phase6b: sg push prints an actionable abort message naming the broken chunked object" \
-            grep -q "push 中止" "$P6B_PUSHFAIL_OUT"
+            grep -q "push aborted" "$P6B_PUSHFAIL_OUT"
 
         P6B_PUSHFAIL_REMOTE_BRANCHES=$(git -C "$P6B_PUSHFAIL_BARE" for-each-ref --format='%(refname)' \
             2>/dev/null | grep -c '^refs/heads/')
@@ -2589,7 +2593,7 @@ P6F_BROKEN_RC=$?
 check "phase6f: sg diff fails (non-zero) when a staged file's chunk data is missing/corrupt" \
     test "$P6F_BROKEN_RC" != 0
 check "phase6f: sg diff prints an actionable error naming the missing chunk(s)" \
-    grep -q "資料塊" "$P6F_BROKEN_OUT"
+    grep -q "chunk" "$P6F_BROKEN_OUT"
 
 # ---- packed-refs: `git gc` moves refs out of loose files, and a reader that
 # only checks refs/heads/<name> concludes the branch has no commits -- after
@@ -4267,14 +4271,14 @@ check "phase14: switch rejection left HEAD unchanged" \
 check "phase14: switch rejection left the working directory unchanged" \
     sh -c "test \"\$(cd '$P14_SWITCH' && git status --porcelain)\" = '$P14_SWITCH_STATUS_BEFORE'"
 check "phase14: switch rejection is due to the rebase gate, not the dirty-workdir prompt" \
-    grep -q "無法切換分支" "$P14_SWITCH_ERR"
+    grep -q "cannot switch branches" "$P14_SWITCH_ERR"
 
 P14_SWITCH_FORCE_ERR="$WORKDIR/p14_switch_force_err.txt"
 (cd "$P14_SWITCH" && "$SG" switch --force master < /dev/null) > "$P14_SWITCH_FORCE_ERR" 2>&1
 check "phase14: sg switch --force during a paused rebase is still rejected" test $? != 0
 check "phase14: --force rejection left sg-rebase/ in place" test -d "$P14_SWITCH/.git/sg-rebase"
 check "phase14: --force rejection is due to the rebase gate, not skipped by --force" \
-    grep -q "無法切換分支" "$P14_SWITCH_FORCE_ERR"
+    grep -q "cannot switch branches" "$P14_SWITCH_FORCE_ERR"
 
 P14_SWITCH_C_ERR="$WORKDIR/p14_switch_c_err.txt"
 (cd "$P14_SWITCH" && "$SG" switch -c newbranch < /dev/null) > "$P14_SWITCH_C_ERR" 2>&1
@@ -4283,7 +4287,7 @@ check "phase14: -c rejection left sg-rebase/ in place" test -d "$P14_SWITCH/.git
 check "phase14: switch -c rejection did NOT create the new branch (matches real git)" \
     sh -c "! (cd '$P14_SWITCH' && git rev-parse --verify refs/heads/newbranch) > /dev/null 2>&1"
 check "phase14: -c rejection is due to the rebase gate, not the dirty-workdir prompt" \
-    grep -q "無法切換分支" "$P14_SWITCH_C_ERR"
+    grep -q "cannot switch branches" "$P14_SWITCH_C_ERR"
 
 # case D: sg undo has no real-git equivalent to use as an oracle -- it
 # deliberately still clears a paused rebase's sequencer state (sg-specific
@@ -4322,11 +4326,11 @@ check "phase14: precondition -- sg-rebase/ present before the message check" \
     test -d "$P14_MSG/.git/sg-rebase"
 (cd "$P14_MSG" && "$SG" undo 1 < /dev/null) > "$P14_MSG_ERR" 2>&1
 check "phase14: undo warns it will abandon the rebase before the confirmation is decided" \
-    grep -q "undo 會放棄" "$P14_MSG_ERR"
+    grep -q "undo will give up" "$P14_MSG_ERR"
 check "phase14: the shared dirty prompt does not promise the rebase survives" \
-    sh -c "! grep -q 'rebase 本身會保留' '$P14_MSG_ERR'"
+    sh -c "! grep -q 'the rebase will survive' '$P14_MSG_ERR'"
 check "phase14: the shared dirty prompt says what it actually does" \
-    grep -q "覆蓋工作目錄裡的衝突解決內容" "$P14_MSG_ERR"
+    grep -q "overwrite the conflict resolution content in the working directory" "$P14_MSG_ERR"
 check "phase14: a declined undo left sg-rebase/ alone" test -d "$P14_MSG/.git/sg-rebase"
 
 # --- --soft must not need to be able to resolve the target commit's tree ---
@@ -4433,7 +4437,7 @@ check "phase15 git->sg: sg stash pop dropped the stash (git stash list now empty
 
 # (5)+(7) mixed stack: sg, git, sg -- list identity, then drop the git-built
 # middle entry through sg and check identity again, which also exercises
-# ident/timestamp preservation for the surviving entries (§4.1).
+# ident/timestamp preservation for the surviving entries (section 4.1).
 P15_MIX="$WORKDIR/p15_mix"
 p15_base_repo "$P15_MIX"
 printf 'c1\n' > "$P15_MIX/a.txt"
@@ -4471,7 +4475,7 @@ check "phase15 mixed stack: git stash show stash@{0} still exits 0 after the dro
 check "phase15 mixed stack: git stash show stash@{1} still exits 0 after the drop" \
     sh -c "(cd '$P15_MIX' && git stash show 'stash@{1}') > /dev/null 2>&1"
 
-# --- extra: multi-line -m normalization (§4.1's copy_reflog_msg) -- targets
+# --- extra: multi-line -m normalization (section 4.1's copy_reflog_msg) -- targets
 # a broken sg_reflog_append that writes the raw message instead of
 # normalizing it, which would forge extra reflog lines and break `git stash
 # list`'s parse entirely, not just the text of one entry. ---
@@ -4491,7 +4495,7 @@ check "phase15 multi-line -m: the reflog subject is collapsed to a single line" 
     grep -q '^stash@{0}: On master: line1 line2 with tab$' "$P15_MULTILINE_GIT_LIST"
 
 # --- extra: the WIP form's abbreviated hash must match real git's own
-# --short=7 for the same commit (Risks §9.1). ---
+# --short=7 for the same commit (Risks section 9.1). ---
 P15_WIP="$WORKDIR/p15_wip"
 p15_base_repo "$P15_WIP"
 printf 'c1\n' > "$P15_WIP/a.txt"
@@ -4700,7 +4704,7 @@ check "phase15 row5 (pop index rule): exact porcelain -- ' M a.txt' AND 'A  newf
 
 # --- row 6: drop stash@{0} re-points refs/stash -- git stash list looks
 # identical either way for a "delete the line, leave the ref" bug, since
-# list never consults refs/stash (measured, §4.2's sg_stash_list_read
+# list never consults refs/stash (measured, section 4.2's sg_stash_list_read
 # comment); only the ref/reflog tip invariant and `git stash show` expose
 # it. ---
 P15_DROP0="$WORKDIR/p15_drop0"
@@ -4836,7 +4840,7 @@ check "phase15 apply/pop contrast: popping the same entry DOES remove it" \
 # "+0000", time(NULL)), only the wording is.
 #
 # The oracle runs under LC_ALL=C on purpose. git translates this message (a
-# zh_TW machine prints "捨棄了 refs/stash@{0}（...）", full-width parentheses
+# a zh_TW machine prints a translated form of this line, full-width parentheses
 # and all) while CI runners default to C -- without pinning the locale this
 # check would pass in CI and fail locally, the worst way for a check to be
 # wrong. ---
@@ -4916,7 +4920,7 @@ check "phase15 unmerged push: sg refuses (exit 1)" test $? != 0
 # index have unresolved conflicts?" and contains that phrase too, so the
 # looser pattern passed with the CLI guard removed. Measured.
 check "phase15 unmerged push: the refusal is the specific guard, not the generic fallback" \
-    grep -q '尚有未解決的衝突' "$P15_UNMERGED_ERR"
+    grep -q 'unresolved conflicts remain' "$P15_UNMERGED_ERR"
 check "phase15 unmerged push: no stash was created" \
     sh -c "! (cd '$P15_UNMERGED' && git rev-parse --verify refs/stash) > /dev/null 2>&1"
 check "phase15 unmerged push: the conflicted state was left intact" \
@@ -5543,9 +5547,9 @@ check "phase20 dirty-gate row D/E: sg's result matches real git's byte-for-byte"
 # silently cleared MERGE_HEAD and abandoned the merge.
 #
 # NOTE on discrimination: the rebase gate and the merge gate share the
-# "無法切換分支" wording, so grepping for that alone would pass even if the
+# "cannot switch branches" wording, so grepping for that alone would pass even if the
 # merge gate did not exist. Every rejection below is pinned to the
-# merge-specific "進行中的合併" instead, which no other refusal emits.
+# merge-specific "a merge is in progress" instead, which no other refusal emits.
 
 p16_merge_conflict_repo() {
     dir="$1"
@@ -5607,7 +5611,7 @@ check "phase16: switch rejection left HEAD unchanged" \
 check "phase16: switch rejection left the working directory and index unchanged" \
     sh -c "test \"\$(cd '$P16_SWITCH' && git status --porcelain)\" = '$P16_STATUS_BEFORE'"
 check "phase16: switch rejection is due to the merge gate, not the rebase gate or the dirty-workdir prompt" \
-    grep -q "進行中的合併" "$P16_SWITCH_ERR"
+    grep -q "a merge is in progress" "$P16_SWITCH_ERR"
 
 P16_SWITCH_FORCE_ERR="$WORKDIR/p16_switch_force_err.txt"
 (cd "$P16_SWITCH" && "$SG" switch --force other < /dev/null) > "$P16_SWITCH_FORCE_ERR" 2>&1
@@ -5616,7 +5620,7 @@ check "phase16: --force rejection left MERGE_HEAD in place" test -f "$P16_SWITCH
 check "phase16: --force rejection left HEAD unchanged" \
     sh -c "test \"\$(cd '$P16_SWITCH' && git rev-parse HEAD)\" = '$P16_HEAD_BEFORE'"
 check "phase16: --force rejection is due to the merge gate, not skipped by --force" \
-    grep -q "進行中的合併" "$P16_SWITCH_FORCE_ERR"
+    grep -q "a merge is in progress" "$P16_SWITCH_FORCE_ERR"
 
 P16_SWITCH_C_ERR="$WORKDIR/p16_switch_c_err.txt"
 (cd "$P16_SWITCH" && "$SG" switch -c newbranch < /dev/null) > "$P16_SWITCH_C_ERR" 2>&1
@@ -5625,7 +5629,7 @@ check "phase16: -c rejection left MERGE_HEAD in place" test -f "$P16_SWITCH/.git
 check "phase16: switch -c rejection did NOT create the new branch (matches real git)" \
     sh -c "! (cd '$P16_SWITCH' && git rev-parse --verify refs/heads/newbranch) > /dev/null 2>&1"
 check "phase16: -c rejection is due to the merge gate" \
-    grep -q "進行中的合併" "$P16_SWITCH_C_ERR"
+    grep -q "a merge is in progress" "$P16_SWITCH_C_ERR"
 
 # Real git refuses the same three, so the oracle agrees this is a refusal
 # rather than sg inventing a restriction git does not have.
@@ -5661,7 +5665,7 @@ P16_RESOLVED_ERR="$WORKDIR/p16_resolved_err.txt"
 (cd "$P16_RESOLVED" && "$SG" switch other < /dev/null) > "$P16_RESOLVED_ERR" 2>&1
 check "phase16 resolved: sg switch is still rejected once conflicts are resolved but uncommitted" test $? != 0
 check "phase16 resolved: rejection is due to the merge gate" \
-    grep -q "進行中的合併" "$P16_RESOLVED_ERR"
+    grep -q "a merge is in progress" "$P16_RESOLVED_ERR"
 (cd "$P16_RESOLVED" && "$SG" switch --force other < /dev/null) > /dev/null 2>&1
 check "phase16 resolved: --force is still rejected once conflicts are resolved but uncommitted" test $? != 0
 check "phase16 resolved: MERGE_HEAD survived both attempts" test -f "$P16_RESOLVED/.git/MERGE_HEAD"
@@ -5685,13 +5689,13 @@ P16_CORRUPT_ERR="$WORKDIR/p16_corrupt_err.txt"
 (cd "$P16_CORRUPT" && "$SG" switch --force other < /dev/null) > "$P16_CORRUPT_ERR" 2>&1
 check "phase16 corrupt: sg switch --force is rejected on a malformed MERGE_HEAD" test $? != 0
 check "phase16 corrupt: rejection is due to the merge gate, not a parse error elsewhere" \
-    grep -q "進行中的合併" "$P16_CORRUPT_ERR"
+    grep -q "a merge is in progress" "$P16_CORRUPT_ERR"
 : > "$P16_CORRUPT/.git/MERGE_HEAD"
 P16_EMPTY_ERR="$WORKDIR/p16_empty_err.txt"
 (cd "$P16_CORRUPT" && "$SG" switch --force other < /dev/null) > "$P16_EMPTY_ERR" 2>&1
 check "phase16 corrupt: sg switch --force is rejected on an empty MERGE_HEAD" test $? != 0
 check "phase16 corrupt: empty-MERGE_HEAD rejection is due to the merge gate" \
-    grep -q "進行中的合併" "$P16_EMPTY_ERR"
+    grep -q "a merge is in progress" "$P16_EMPTY_ERR"
 
 # a directory at the path is the third shape, and the one an S_ISREG filter
 # would wrongly let through. Real git refuses here too (measured), so this
@@ -5705,7 +5709,7 @@ P16_DIRMH_ERR="$WORKDIR/p16_dirmh_err.txt"
 (cd "$P16_DIRMH" && "$SG" switch --force other < /dev/null) > "$P16_DIRMH_ERR" 2>&1
 check "phase16 corrupt: sg switch --force is rejected when MERGE_HEAD is a directory" test $? != 0
 check "phase16 corrupt: directory-MERGE_HEAD rejection is due to the merge gate" \
-    grep -q "進行中的合併" "$P16_DIRMH_ERR"
+    grep -q "a merge is in progress" "$P16_DIRMH_ERR"
 
 P16_GIT_DIRMH="$WORKDIR/p16_git_dirmh"
 p16_git_merge_conflict_repo "$P16_GIT_DIRMH"
@@ -5816,7 +5820,7 @@ check "phase16 gates: a paused sg rebase writes no MERGE_HEAD (so the merge gate
     test ! -f "$P16_REBASE/.git/MERGE_HEAD"
 (cd "$P16_REBASE" && "$SG" switch --force master < /dev/null) > "$P16_REBASE_ERR" 2>&1
 check "phase16 gates: a paused rebase still reports the rebase gate, not the merge gate" \
-    sh -c "grep -q '進行中的 rebase' '$P16_REBASE_ERR' && ! grep -q '進行中的合併' '$P16_REBASE_ERR'"
+    sh -c "grep -q 'a rebase is in progress' '$P16_REBASE_ERR' && ! grep -q 'a merge is in progress' '$P16_REBASE_ERR'"
 
 P16_GIT_REBASE="$WORKDIR/p16_git_rebase"
 mkdir -p "$P16_GIT_REBASE"
@@ -5917,7 +5921,7 @@ P16_SOFT_ERR="$WORKDIR/p16_soft_err.txt"
 (cd "$P16_SOFT" && "$SG" reset --soft HEAD) > "$P16_SOFT_ERR" 2>&1
 check "phase16 escape: sg reset --soft still refuses on a corrupt MERGE_HEAD" test $? != 0
 check "phase16 escape: the --soft refusal is the merge/rebase guard" \
-    grep -q "無法執行 soft reset" "$P16_SOFT_ERR"
+    grep -q "cannot do a soft reset" "$P16_SOFT_ERR"
 
 P16_GIT_SOFT="$WORKDIR/p16_git_soft"
 p16_git_corrupt_repo "$P16_GIT_SOFT"
@@ -5938,7 +5942,7 @@ P16_CCOMMIT_ERR="$WORKDIR/p16_ccommit_err.txt"
 (cd "$P16_CCOMMIT" && "$SG" commit -m "merge feature") > "$P16_CCOMMIT_ERR" 2>&1
 check "phase16 corrupt commit: sg commit refuses on a corrupt MERGE_HEAD" test $? != 0
 check "phase16 corrupt commit: the refusal names the corrupt MERGE_HEAD" \
-    grep -q "損壞的 MERGE_HEAD" "$P16_CCOMMIT_ERR"
+    grep -q "corrupt MERGE_HEAD" "$P16_CCOMMIT_ERR"
 check "phase16 corrupt commit: no commit was created" \
     sh -c "test \"\$(cd '$P16_CCOMMIT' && git rev-parse HEAD)\" = '$P16_CCOMMIT_HEAD_BEFORE'"
 check "phase16 corrupt commit: MERGE_HEAD was left alone for the user to fix" \
@@ -6005,7 +6009,7 @@ P16_CSECOND_ERR="$WORKDIR/p16_csecond_err.txt"
 (cd "$P16_CSECOND" && "$SG" merge other < /dev/null) > "$P16_CSECOND_ERR" 2>&1
 check "phase16 corrupt second merge: sg refuses to start a second merge" test $? != 0
 check "phase16 corrupt second merge: the refusal is the unfinished-merge guard" \
-    grep -q "尚未完成的合併" "$P16_CSECOND_ERR"
+    grep -q "an unfinished merge is in progress" "$P16_CSECOND_ERR"
 check "phase16 corrupt second merge: the corrupt MERGE_HEAD was left intact" \
     test -f "$P16_CSECOND/.git/MERGE_HEAD"
 
@@ -6020,7 +6024,7 @@ P16_CREBASE_ERR="$WORKDIR/p16_crebase_err.txt"
 (cd "$P16_CREBASE" && "$SG" rebase other < /dev/null) > "$P16_CREBASE_ERR" 2>&1
 check "phase16 corrupt rebase: sg refuses to start a rebase (sg-specific, no git oracle)" test $? != 0
 check "phase16 corrupt rebase: the refusal is the unfinished-merge guard" \
-    grep -q "尚未完成的合併" "$P16_CREBASE_ERR"
+    grep -q "an unfinished merge is in progress" "$P16_CREBASE_ERR"
 
 # --- Phase 17 batch A: sg switch -c into a not-yet-existing refs/heads/
 # subdirectory (e.g. "feature/x" when "refs/heads/feature/" doesn't exist
@@ -6504,7 +6508,7 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     done
 
     if [ -z "$P17D_PORT" ]; then
-        echo "warning: phase17d HTTP test server 未能在時限內就緒，跳過 phase17d 網路 reflog 測試" >&2
+        echo "warning: phase17d HTTP test server did not become ready in time, skipping phase17d networked reflog tests" >&2
         skip "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)"
         skip "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'"
         skip "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'"
@@ -7086,9 +7090,9 @@ for p18e_cmd in reset rebase; do
         rebase) P18E_ERR=$(cd "$P18E_C" && "$SG" rebase p18e-other 2>&1 >/dev/null | head -1) ;;
     esac
     check "phase18e: sg $p18e_cmd does not blame a detached HEAD for a corrupt one (got '$P18E_ERR')" \
-        test "${P18E_ERR#sg: 目前是 detached HEAD}" = "$P18E_ERR"
+        test "${P18E_ERR#sg: currently in detached HEAD}" = "$P18E_ERR"
     check "phase18e: sg $p18e_cmd names the corrupt HEAD instead (got '$P18E_ERR')" \
-        test "${P18E_ERR#sg: 無法讀取 HEAD}" != "$P18E_ERR"
+        test "${P18E_ERR#sg: cannot read HEAD}" != "$P18E_ERR"
 done
 
 # ============================================================
@@ -7798,7 +7802,7 @@ printf 'neither a ref nor a sha\n' > "$P19H/.git/HEAD"
 for p19h_cmd in merge rebase; do
     P19H_ERR=$(cd "$P19H" && "$SG" "$p19h_cmd" p19h-other 2>&1 >/dev/null | head -1)
     check "phase19h: sg $p19h_cmd refuses a corrupt HEAD, naming it (got '$P19H_ERR')" \
-        test "${P19H_ERR#sg: 無法讀取 HEAD}" != "$P19H_ERR"
+        test "${P19H_ERR#sg: cannot read HEAD}" != "$P19H_ERR"
     check "phase19h: sg $p19h_cmd leaves the corrupt HEAD as evidence" \
         test "$(cat "$P19H/.git/HEAD")" = "neither a ref nor a sha"
 done
@@ -9131,14 +9135,14 @@ P28_ERR="$WORKDIR/p28_err.txt"
 (cd "$P28" && "$SG" diff --name-only -- '') > "$P28_ERR" 2>&1
 check "phase28: sg diff rejects an empty pathspec" test $? != 0
 check "phase28: and says so, pointing at '.' the way git does" \
-    grep -q '空字串不是有效的路徑' "$P28_ERR"
+    grep -q 'an empty string is not a valid path' "$P28_ERR"
 check "phase28 oracle: real git rejects an empty pathspec too" \
     sh -c "! (cd '$P28' && git diff --name-only -- '') > /dev/null 2>&1"
 
 (cd "$P28" && "$SG" diff --name-only -- /etc/passwd) > "$P28_ERR" 2>&1
 check "phase28: sg diff rejects a pathspec outside the worktree" test $? != 0
 check "phase28: and names the repository it is outside of" \
-    grep -q '在版本庫' "$P28_ERR"
+    grep -q 'outside the repository' "$P28_ERR"
 check "phase28 oracle: real git rejects it too" \
     sh -c "! (cd '$P28' && git diff --name-only -- /etc/passwd) > /dev/null 2>&1"
 
@@ -9150,7 +9154,7 @@ check "phase28: and says which spec it could not understand" \
 (cd "$P28" && "$SG" diff --name-only nosuch) > "$P28_ERR" 2>&1
 check "phase28: a bare argument that is neither rev nor path is refused" test $? != 0
 check "phase28: and the message points at --" \
-    grep -q '有歧義的參數' "$P28_ERR"
+    grep -q 'ambiguous argument' "$P28_ERR"
 check "phase28 oracle: real git refuses it too" \
     sh -c "! (cd '$P28' && git diff --name-only nosuch) > /dev/null 2>&1"
 
@@ -9166,7 +9170,7 @@ check "phase28 oracle: real git refuses that ordering too" \
 (cd "$P28" && "$SG" diff --name-only a.txt) > "$P28_ERR" 2>&1
 check "phase28: an argument that is both a revision and a file is refused" test $? != 0
 check "phase28: and the message says it is both" \
-    grep -q '可同時是版本和檔案' "$P28_ERR"
+    grep -q 'could be both a revision and a file' "$P28_ERR"
 check "phase28 oracle: real git refuses it too" \
     sh -c "! (cd '$P28' && git diff --name-only a.txt) > /dev/null 2>&1"
 p28_cmp "$P28" "--name-only -- a.txt (ambiguous name, after --)" --name-only -- a.txt
@@ -9328,7 +9332,7 @@ p29_cmp "$P29" "--cached -M100 --name-status" --cached -M100 --name-status
 p29_cmp "$P29" "HEAD~1 HEAD --name-status (tree vs tree)" HEAD~1 HEAD --name-status
 p29_cmp "$P29" "HEAD~1 HEAD --stat (tree vs tree)" HEAD~1 HEAD --stat
 
-# ⚠ The ordering rule, and the single most likely thing to regress: pathspec
+# WARNING: the ordering rule, and the single most likely thing to regress: pathspec
 # is applied BEFORE rename detection, so a spec naming only one half of a
 # rename leaves nothing to pair with. Measured: git prints "A", not "R100".
 p29_cmp "$P29" "HEAD~1 HEAD --name-status -- a/z/c.txt (new half only)" \
@@ -9399,7 +9403,7 @@ p29_mk "$P29_ONE" "$P29_ONE/d2.txt" SAME
 p29_cmp "$P29_ONE" "--cached --name-status (one source, two destinations)" \
     --cached --name-status
 
-# ⚠ KNOWN DIVERGENCE, asserted on purpose. sg only finds EXACT renames; a
+# WARNING: KNOWN DIVERGENCE, asserted on purpose. sg only finds EXACT renames; a
 # rename plus an edit is still a delete and an add here, where git says
 # "R093". Asserting it means the day inexact detection lands, these two
 # checks fail and have to be updated -- rather than the gap quietly

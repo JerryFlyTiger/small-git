@@ -29,7 +29,7 @@ static void print_unmerged_paths(const sg_index *idx)
 {
     size_t i;
 
-    fprintf(stderr, "sg: 尚有未解決的衝突，無法 commit：\n");
+    fprintf(stderr, "sg: unresolved conflicts remain, cannot commit:\n");
     for (i = 0; i < idx->count; i++) {
         if (idx->entries[i].stage == 0)
             continue;
@@ -37,7 +37,8 @@ static void print_unmerged_paths(const sg_index *idx)
             continue;
         fprintf(stderr, "\t%s\n", sg_quote_path(idx->entries[i].path));
     }
-    fprintf(stderr, "請先解決衝突並執行 `sg add <file>...` 標記為已解決，再重新 commit。\n");
+    fprintf(stderr, "Please resolve conflicts and run `sg add <file>...` to mark them resolved, "
+                    "then commit again.\n");
 }
 
 int sg_cmd_commit(int argc, char **argv)
@@ -105,9 +106,9 @@ int sg_cmd_commit(int argc, char **argv)
        Route the user through the rebase's own continuation instead. */
     if (sg_rebase_state_exists(git_dir)) {
         fprintf(stderr,
-               "sg: 目前有一個進行中的 rebase，無法直接 commit\n"
-               "請解決衝突並 `sg add <file>...` 後執行 `sg rebase --continue`，"
-               "或執行 `sg rebase --abort` 放棄\n");
+               "sg: a rebase is currently in progress, cannot commit directly\n"
+               "Resolve conflicts and `sg add <file>...`, then run `sg rebase --continue`, "
+               "or run `sg rebase --abort` to give up\n");
         free(git_dir);
         free(cleaned_message);
         return 1;
@@ -139,8 +140,8 @@ int sg_cmd_commit(int argc, char **argv)
        exactly the kind of divergence this project exists to avoid. */
     is_merge_commit = sg_merge_head_exists(git_dir);
     if (is_merge_commit && sg_merge_head_read(git_dir, merge_head_id) != 0) {
-        fprintf(stderr, "sg: 損壞的 MERGE_HEAD 檔案，無法建立 merge commit\n"
-                       "請修正 .git/MERGE_HEAD，或執行 sg merge --abort 放棄這次合併\n");
+        fprintf(stderr, "sg: corrupt MERGE_HEAD file, cannot create a merge commit\n"
+                       "Fix .git/MERGE_HEAD, or run sg merge --abort to give up this merge\n");
         sg_index_free(&idx);
         free(git_dir);
         free(cleaned_message);
@@ -159,7 +160,8 @@ int sg_cmd_commit(int argc, char **argv)
     has_parent = (sg_ref_resolve_head(git_dir, parent_id) == 0);
 
     if (is_merge_commit && !has_parent) {
-        fprintf(stderr, "sg: 損壞的合併狀態（MERGE_HEAD 存在，但目前分支還沒有任何 commit）\n");
+        fprintf(stderr, "sg: corrupt merge state (MERGE_HEAD exists, but the current branch has "
+                        "no commits yet)\n");
         free(git_dir);
         free(cleaned_message);
         return 1;

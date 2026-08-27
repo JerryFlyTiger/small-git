@@ -548,7 +548,8 @@ static int chunk_lock_acquire(const char *git_dir, char *lock_path, size_t lock_
             return 0;
         }
         if (errno != EEXIST) {
-            fprintf(stderr, "sg: 無法建立 chunk 保活鎖 %s: %s\n", lock_path, strerror(errno));
+            fprintf(stderr, "sg: cannot create chunk keep-alive lock %s: %s\n", lock_path,
+                   strerror(errno));
             return -1;
         }
 
@@ -562,8 +563,8 @@ static int chunk_lock_acquire(const char *git_dir, char *lock_path, size_t lock_
     }
 
     fprintf(stderr,
-           "sg: 無法取得 chunk 保活鎖 %s（可能有其他 sg 程序正在寫入，或有殘留的鎖檔案，"
-           "可手動確認後刪除）\n",
+           "sg: cannot acquire chunk keep-alive lock %s (another sg process may be writing, "
+           "or this is a stale lock file that can be removed after manual verification)\n",
            lock_path);
     return -1;
 }
@@ -873,7 +874,7 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
            just fall back to storing content as a single ordinary blob. */
         free(chunk_ids);
         fprintf(stderr,
-               "sg: warning: chunk 往返驗證失敗，改以一般 blob 儲存\n");
+               "sg: warning: chunk round-trip verification failed, falling back to a plain blob\n");
         if (sg_loose_write(git_dir, SG_OBJ_BLOB, content, len, id_out) != 0)
             return -1;
         *chunked_out = 0;
@@ -892,7 +893,8 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
     if (keep_alive_add(git_dir, chunk_ids, count) != 0) {
         free(chunk_ids);
         fprintf(stderr,
-               "sg: warning: 無法將 chunk 加入 %s 保活樹，改以一般 blob 儲存\n",
+               "sg: warning: cannot add chunk to keep-alive tree %s, falling back to a plain "
+               "blob\n",
                SG_CHUNK_KEEPALIVE_REF);
         if (sg_loose_write(git_dir, SG_OBJ_BLOB, content, len, id_out) != 0)
             return -1;
@@ -915,7 +917,8 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
     if (sg_repo_mark_chunking_used(git_dir) != 0) {
         free(chunk_ids);
         fprintf(stderr,
-               "sg: warning: 無法在 .git/config 標記本地端已使用過分塊儲存，改以一般 blob 儲存\n");
+               "sg: warning: cannot mark chunk storage as used in .git/config, falling back to "
+               "a plain blob\n");
         if (sg_loose_write(git_dir, SG_OBJ_BLOB, content, len, id_out) != 0)
             return -1;
         *chunked_out = 0;
@@ -946,30 +949,33 @@ int sg_chunk_store_blob(const char *git_dir, const unsigned char *content, size_
 void sg_chunk_print_missing_error(const char *path, const sg_chunk_missing_info *info)
 {
     if (info->keepalive_lost) {
-        fprintf(stderr, "sg: %s 是分塊儲存的檔案，但 %s 已經遺失\n", sg_quote_path_delimited(path),
+        fprintf(stderr, "sg: %s is a chunk-stored file, but %s is gone\n",
+               sg_quote_path_delimited(path), SG_CHUNK_KEEPALIVE_REF);
+        fprintf(stderr,
+               "sg: this repository's .git/config records that chunk storage was used before, "
+               "but %s, which protects the chunk data from being collected by git gc, no "
+               "longer exists (it may have been manually deleted, or never fetched/cloned)\n",
                SG_CHUNK_KEEPALIVE_REF);
         fprintf(stderr,
-               "sg: 這個 repository 的 .git/config 記錄了曾經使用過分塊儲存，"
-               "但用來保護分塊資料不被 git gc 回收的 %s 已經不存在（可能被手動刪除，"
-               "或從未被 fetch/clone 取得）\n",
-               SG_CHUNK_KEEPALIVE_REF);
-        fprintf(stderr,
-               "sg: 這代表這個 repository 裡所有分塊儲存的檔案都可能已經被 git gc 清除，"
-               "資料很可能已經遺失\n");
-        fprintf(stderr, "sg: 無法還原這個檔案的內容\n");
+               "sg: this means every chunk-stored file in this repository may have been "
+               "collected by git gc; the data is likely lost\n");
+        fprintf(stderr, "sg: cannot restore this file's content\n");
         return;
     }
     if (info->missing_count > 0) {
-        fprintf(stderr, "sg: %s 是分塊儲存的檔案，但有 %zu/%zu 個資料塊在物件庫中找不到\n",
+        fprintf(stderr, "sg: %s is a chunk-stored file, but %zu/%zu chunks are missing from "
+               "the object store\n",
                sg_quote_path_delimited(path), info->missing_count, info->chunk_count);
     } else {
         fprintf(stderr,
-               "sg: %s 是分塊儲存的檔案，但重組後的內容與記錄的雜湊碼不符（物件庫可能已損毀）\n",
+               "sg: %s is a chunk-stored file, but the reassembled content does not match the "
+               "recorded hash (the object store may be corrupt)\n",
                sg_quote_path_delimited(path));
     }
-    fprintf(stderr, "sg: 這通常表示物件庫被 git gc 清理過，或 clone 時未取得 %s\n",
+    fprintf(stderr, "sg: this usually means the object store was cleaned up by git gc, or %s "
+           "was not fetched during clone\n",
            SG_CHUNK_KEEPALIVE_REF);
-    fprintf(stderr, "sg: 無法還原這個檔案的內容\n");
+    fprintf(stderr, "sg: cannot restore this file's content\n");
 }
 
 /* Shared core of sg_chunk_read_blob/sg_chunk_effective_id. Always fills

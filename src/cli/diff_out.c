@@ -171,19 +171,19 @@ static int codepoint_width(unsigned int cp)
 {
     if (cp < 0x80)
         return 1;
-    if (cp >= 0x3040 && cp <= 0x309F) /* Hiragana -- measured via U+3042 (あ) */
+    if (cp >= 0x3040 && cp <= 0x309F) /* Hiragana -- measured via U+3042 */
         return 2;
-    if (cp >= 0x3400 && cp <= 0x4DBF) /* CJK Extension A -- measured via U+3400 (㐀) */
+    if (cp >= 0x3400 && cp <= 0x4DBF) /* CJK Extension A -- measured via U+3400 */
         return 2;
-    if (cp >= 0x4E00 && cp <= 0x9FFF) /* CJK Unified Ideographs -- measured via U+4E2D/U+6587 (中/文) */
+    if (cp >= 0x4E00 && cp <= 0x9FFF) /* CJK Unified Ideographs -- measured via U+4E2D/U+6587 */
         return 2;
-    if (cp >= 0xAC00 && cp <= 0xD7A3) /* Hangul syllables -- measured via U+AC00 (가) */
+    if (cp >= 0xAC00 && cp <= 0xD7A3) /* Hangul syllables -- measured via U+AC00 */
         return 2;
-    if (cp >= 0xF900 && cp <= 0xFAFF) /* CJK Compatibility Ideographs -- measured via U+F900 (豈) */
+    if (cp >= 0xF900 && cp <= 0xFAFF) /* CJK Compatibility Ideographs -- measured via U+F900 */
         return 2;
-    if (cp >= 0xFF01 && cp <= 0xFF60) /* Fullwidth forms -- measured via U+FF21/U+FF01 (Ａ/！) */
+    if (cp >= 0xFF01 && cp <= 0xFF60) /* Fullwidth forms -- measured via U+FF21/U+FF01 */
         return 2;
-    if (cp >= 0xFFE0 && cp <= 0xFFE6) /* fullwidth signs -- measured via U+FFE0/U+FFE5 (￠/￥) */
+    if (cp >= 0xFFE0 && cp <= 0xFFE6) /* fullwidth signs -- measured via U+FFE0/U+FFE5 */
         return 2;
     return 1;
 }
@@ -823,7 +823,7 @@ static int print_name_status(const sg_diff_list *list)
    bytes but not up to a '/', so there is no compression at all rather than
    "pre.txt{ => .bak}".
 
-   ⚠ A path that needs C-quoting turns compression OFF entirely -- measured,
+   WARNING: a path that needs C-quoting turns compression OFF entirely -- measured,
    git prints `d/plain.txt => "d/tab\there.txt"`, not `d/{plain.txt => ...}`.
    Quoting the pieces of a braced form would produce quotes in the middle of
    a path, which no consumer could unquote.

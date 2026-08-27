@@ -86,7 +86,7 @@ int sg_cmd_switch(int argc, char **argv)
     /* -c names a branch to create, --detach means "point HEAD at a commit and
        at no branch" -- asking for both is asking for two different HEADs. */
     if (create && detach) {
-        fprintf(stderr, "sg: -c 與 --detach 不能同時使用\n");
+        fprintf(stderr, "sg: -c and --detach cannot be used together\n");
         return 1;
     }
 
@@ -108,8 +108,8 @@ int sg_cmd_switch(int argc, char **argv)
        branch un-created when the switch is refused. */
     if (sg_rebase_state_exists(git_dir)) {
         fprintf(stderr,
-               "sg: 目前有一個進行中的 rebase，無法切換分支\n"
-               "請先完成它（sg rebase --continue）或執行 sg rebase --abort 放棄\n");
+               "sg: a rebase is in progress, cannot switch branches\n"
+               "Finish it first (sg rebase --continue) or run sg rebase --abort to give up\n");
         free(git_dir);
         free(repo_root);
         return 1;
@@ -134,8 +134,8 @@ int sg_cmd_switch(int argc, char **argv)
        after that call succeeds. */
     if (sg_merge_head_exists(git_dir)) {
         fprintf(stderr,
-               "sg: 目前有一個進行中的合併，無法切換分支\n"
-               "請先完成它（sg commit）或執行 sg merge --abort 放棄\n");
+               "sg: a merge is in progress, cannot switch branches\n"
+               "Finish it first (sg commit) or run sg merge --abort to give up\n");
         free(git_dir);
         free(repo_root);
         return 1;
@@ -247,8 +247,8 @@ int sg_cmd_switch(int argc, char **argv)
                detach. */
             if (sg_rev_parse_commit(git_dir, branch_arg, probe) == 0)
                 fprintf(stderr,
-                       "sg: '%s' 是一個 commit 而不是分支\n"
-                       "若要讓 HEAD 直接指向它（detached HEAD），請用 sg switch --detach %s\n",
+                       "sg: '%s' is a commit, not a branch\n"
+                       "To point HEAD directly at it (detached HEAD), use sg switch --detach %s\n",
                        branch_arg, branch_arg);
             else
                 fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);

@@ -21,7 +21,7 @@ static int list_branches(const char *git_dir)
     char *current;
 
     if (sg_ref_list_branches(git_dir, &names, &count) != 0) {
-        fprintf(stderr, "sg: 無法列出分支\n");
+        fprintf(stderr, "sg: cannot list branches\n");
         return 1;
     }
 
@@ -62,15 +62,15 @@ static int create_branch(const char *git_dir, const char *name)
     int rc;
 
     if (!sg_ref_name_valid_for_create(name)) {
-        fprintf(stderr, "sg: '%s' 不是有效的分支名稱\n", name);
+        fprintf(stderr, "sg: '%s' is not a valid branch name\n", name);
         return 1;
     }
     if (sg_ref_branch_exists(git_dir, name)) {
-        fprintf(stderr, "sg: 分支 '%s' 已經存在\n", name);
+        fprintf(stderr, "sg: branch '%s' already exists\n", name);
         return 1;
     }
     if (sg_ref_resolve_head(git_dir, head_id) != 0) {
-        fprintf(stderr, "sg: 無法建立分支 '%s'：目前的分支還沒有任何 commit\n", name);
+        fprintf(stderr, "sg: cannot create branch '%s': the current branch has no commits yet\n", name);
         return 1;
     }
     /* sg_ref_update (not the old sg_ref_write_path shortcut) so that
@@ -80,7 +80,7 @@ static int create_branch(const char *git_dir, const char *name)
        The name comes from argv: refusing an over-long one beats silently
        truncating it into a DIFFERENT (possibly valid) branch name. */
     if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", name) >= (int)sizeof(ref_path)) {
-        fprintf(stderr, "sg: 分支名稱太長\n");
+        fprintf(stderr, "sg: branch name too long\n");
         return 1;
     }
 
@@ -97,7 +97,7 @@ static int create_branch(const char *git_dir, const char *name)
 
     rc = sg_ref_update(git_dir, ref_path, head_id, reflog_msg);
     if (rc != 0) {
-        fprintf(stderr, "sg: 無法建立分支 '%s'\n", name);
+        fprintf(stderr, "sg: cannot create branch '%s'\n", name);
         return 1;
     }
     return 0;
@@ -108,7 +108,7 @@ static int create_branch(const char *git_dir, const char *name)
 static char *compose_unmerged_msg(const char *name, const char *tip_hex)
 {
     static const char fmt[] =
-        "sg branch: 分支 '%s' 尚未合併到 HEAD（目前指向 %s），刪除後將失去其獨有的 commit。\n";
+        "sg branch: branch '%s' is not yet merged into HEAD (currently at %s); deleting it will lose its unique commits.\n";
     int need = snprintf(NULL, 0, fmt, name, tip_hex);
     char *msg;
 
@@ -157,25 +157,25 @@ static int delete_branch(const char *git_dir, const char *name, int force)
        override it. */
     current = sg_ref_current_branch(git_dir);
     if (current != NULL && strcmp(current, name) == 0) {
-        fprintf(stderr, "sg: 無法刪除目前所在的分支 '%s'\n", name);
+        fprintf(stderr, "sg: cannot delete the currently checked-out branch '%s'\n", name);
         free(current);
         return 1;
     }
     free(current);
 
     if (!sg_ref_branch_exists(git_dir, name)) {
-        fprintf(stderr, "sg: 找不到分支 '%s'\n", name);
+        fprintf(stderr, "sg: branch '%s' not found\n", name);
         return 1;
     }
     if (sg_ref_read_branch(git_dir, name, tip) != 0) {
-        fprintf(stderr, "sg: 無法讀取分支 '%s'\n", name);
+        fprintf(stderr, "sg: cannot read branch '%s'\n", name);
         return 1;
     }
     sg_sha1_to_hex(tip, tip_hex);
 
     merged = branch_is_merged(git_dir, tip);
     if (merged < 0) {
-        fprintf(stderr, "sg: 無法判斷分支 '%s' 是否已合併\n", name);
+        fprintf(stderr, "sg: cannot determine whether branch '%s' is merged\n", name);
         return 1;
     }
     if (!merged) {
@@ -183,30 +183,30 @@ static int delete_branch(const char *git_dir, const char *name, int force)
         int ok;
 
         if (msg == NULL) {
-            fprintf(stderr, "sg: 記憶體不足\n");
+            fprintf(stderr, "sg: out of memory\n");
             return 1;
         }
         ok = sg_confirm_dangerous(msg, force);
         free(msg);
         if (!ok) {
-            fprintf(stderr, "sg: 已取消刪除分支\n");
+            fprintf(stderr, "sg: branch deletion aborted\n");
             return 1;
         }
     }
 
     rc = sg_ref_delete_branch(git_dir, name);
     if (rc == 1) {
-        fprintf(stderr, "sg: 找不到分支 '%s'\n", name);
+        fprintf(stderr, "sg: branch '%s' not found\n", name);
         return 1;
     }
     if (rc != 0) {
-        fprintf(stderr, "sg: 刪除分支 '%s' 失敗\n", name);
+        fprintf(stderr, "sg: failed to delete branch '%s'\n", name);
         return 1;
     }
 
     /* The full old tip is the ONLY recovery path -- snapshots cover the
        index and worktree, never refs -- so print all 40 hex digits. */
-    printf("已刪除分支 '%s'（原指向 %s）\n", name, tip_hex);
+    printf("Deleted branch '%s' (was %s)\n", name, tip_hex);
     return 0;
 }
 

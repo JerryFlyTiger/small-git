@@ -64,7 +64,7 @@ static int resolve_head_tree(const char *git_dir, unsigned char tree_id_out[SG_S
 
 static void report_bad_tree_path(const char *bad_path)
 {
-    fprintf(stderr, "sg: 路徑 %s 無效，拒絕將這棵 tree 展開成檔案路徑\n",
+    fprintf(stderr, "sg: path %s is invalid, refusing to expand this tree into file paths\n",
            sg_quote_path_delimited(bad_path));
 }
 
@@ -90,10 +90,10 @@ static void report_pathspec_error(sg_pathspec_error err, const char *arg, const 
 {
     switch (err) {
     case SG_PATHSPEC_ERR_EMPTY:
-        fprintf(stderr, "sg: 空字串不是有效的路徑；想要比對全部路徑請用 .\n");
+        fprintf(stderr, "sg: an empty string is not a valid path; use . to match all paths\n");
         break;
     case SG_PATHSPEC_ERR_MAGIC:
-        fprintf(stderr, "sg: 不支援 pathspec magic：%s\n", sg_quote_path_delimited(arg));
+        fprintf(stderr, "sg: unsupported pathspec magic: %s\n", sg_quote_path_delimited(arg));
         break;
     /* No `default:` on purpose. NONE cannot reach here -- sg_pathspec_add
        fills err only when it fails -- but naming every value keeps the
@@ -102,7 +102,7 @@ static void report_pathspec_error(sg_pathspec_error err, const char *arg, const 
        silently render it as "outside the repository". */
     case SG_PATHSPEC_ERR_NONE:
     case SG_PATHSPEC_ERR_OUTSIDE:
-        fprintf(stderr, "sg: %s 在版本庫 %s 之外\n",
+        fprintf(stderr, "sg: %s is outside the repository %s\n",
                sg_quote_path_delimited(arg), sg_quote_path_delimited(repo_root));
         break;
     }
@@ -149,7 +149,7 @@ static int split_revs_and_paths(const char *git_dir, char **pos, int n_pos)
         int is_path = arg_exists_in_worktree(arg);
 
         if (is_rev && is_path) {
-            fprintf(stderr, "sg: 有歧義的參數 %s：可同時是版本和檔案；用 -- 分隔版本與路徑\n",
+            fprintf(stderr, "sg: ambiguous argument %s: could be both a revision and a file; use -- to separate revisions from paths\n",
                    sg_quote_path_delimited(arg));
             return -1;
         }
@@ -159,16 +159,16 @@ static int split_revs_and_paths(const char *git_dir, char **pos, int n_pos)
         }
         if (is_path)
             break;
-        fprintf(stderr, "sg: 有歧義的參數 %s：不是版本，工作目錄中也沒有這個路徑；"
-                       "用 -- 分隔版本與路徑\n",
+        fprintf(stderr, "sg: ambiguous argument %s: not a revision, and no such path in the working directory; "
+                       "use -- to separate revisions from paths\n",
                sg_quote_path_delimited(arg));
         return -1;
     }
 
     for (i = rev_count; i < n_pos; i++) {
         if (!arg_exists_in_worktree(pos[i])) {
-            fprintf(stderr, "sg: %s：工作目錄中沒有這個路徑；"
-                           "要指定不存在的路徑請用 sg diff -- <路徑>\n",
+            fprintf(stderr, "sg: %s: no such path in the working directory; "
+                           "to name a path that does not exist, use sg diff -- <path>\n",
                    sg_quote_path_delimited(pos[i]));
             return -1;
         }
@@ -205,7 +205,7 @@ int sg_cmd_diff(int argc, char **argv)
 
     pos = malloc((size_t)(argc > 0 ? argc : 1) * sizeof(*pos));
     if (pos == NULL) {
-        fprintf(stderr, "sg: 記憶體不足\n");
+        fprintf(stderr, "sg: out of memory\n");
         return 1;
     }
 
@@ -385,7 +385,7 @@ int sg_cmd_diff(int argc, char **argv)
        renamed pair prints "A b1.txt", because git filters by pathspec first
        and a spec naming half a rename leaves nothing to pair with. */
     if (sg_diff_detect_renames(git_dir, &list, rename_score) != 0) {
-        fprintf(stderr, "sg: 記憶體不足，無法偵測改名\n");
+        fprintf(stderr, "sg: out of memory, cannot detect renames\n");
         goto done;
     }
 

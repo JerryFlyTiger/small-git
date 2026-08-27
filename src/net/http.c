@@ -121,8 +121,8 @@ static int perform_request(CURL *curl, const char *method, const char *url, sg_b
     if (http_code != 200) {
         fprintf(stderr, "sg: %s %s failed: HTTP %ld\n", method, shown_url, http_code);
         if (http_code == 401 || http_code == 403) {
-            fprintf(stderr, "sg: 認證失敗。請確認 ~/.netrc 內有此主機的帳密，"
-                            "或設定環境變數 SG_USERNAME / SG_PASSWORD 後再試一次\n");
+            fprintf(stderr, "sg: authentication failed. Check that ~/.netrc has credentials "
+                            "for this host, or set SG_USERNAME / SG_PASSWORD and try again\n");
         }
         print_error_body(out);
         free(safe_url);

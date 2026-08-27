@@ -890,7 +890,8 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
         int flatten_rc = sg_tree_flatten(git_dir, ours_tree, &head_flat, bad_path);
 
         if (flatten_rc == -2)
-            fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+            fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into "
+                            "file paths\n",
                    sg_quote_path_delimited(bad_path));
         if (flatten_rc != 0) {
             sg_merge_result_free(&result);
@@ -1027,7 +1028,8 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
         int flatten_rc = sg_tree_flatten(git_dir, ours_tree, &head_flat, bad_path);
 
         if (flatten_rc == -2)
-            fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+            fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into "
+                            "file paths\n",
                    sg_quote_path_delimited(bad_path));
         if (flatten_rc != 0) {
             sg_merge_result_free(&result);
@@ -1040,7 +1042,8 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
         int flatten_rc = sg_tree_flatten(git_dir, untracked_tree, &untracked_flat, bad_path);
 
         if (flatten_rc == -2)
-            fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+            fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into "
+                            "file paths\n",
                    sg_quote_path_delimited(bad_path));
         if (flatten_rc != 0) {
             sg_flat_list_free(&head_flat);

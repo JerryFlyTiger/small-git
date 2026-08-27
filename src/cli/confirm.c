@@ -8,7 +8,7 @@ int sg_confirm_dangerous(const char *message, int force)
     char line[64];
 
     if (force) {
-        printf("sg: --force，略過確認直接執行\n");
+        printf("sg: --force, skipping confirmation and proceeding\n");
         return 1;
     }
 
@@ -17,12 +17,13 @@ int sg_confirm_dangerous(const char *message, int force)
        here -- just refuse and tell the caller how to force it. */
     if (!isatty(STDIN_FILENO)) {
         fputs(message, stderr);
-        fputs("sg: 這是危險操作，如果你確定要繼續，請加上 --force\n", stderr);
+        fputs("sg: this is a destructive operation; add --force if you are sure you want to "
+              "continue\n", stderr);
         return 0;
     }
 
     fputs(message, stdout);
-    fputs("繼續嗎? (y/N) ", stdout);
+    fputs("Continue? (y/N) ", stdout);
     fflush(stdout);
     if (fgets(line, sizeof(line), stdin) == NULL)
         return 0;
