@@ -3,7 +3,7 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (1637 checks, using real `git` as
+git; this is guarded by `tests/interop.sh` (1700 checks, using real `git` as
 the oracle).
 
 On top of that there are two things real git does not have: `src/safety/`
@@ -385,9 +385,35 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   the source through the exact pass, demoting the real inexact rename beside
   it to a plain `A`. Detecting per-half, or before the merge, silently gives
   a different answer -- there is no special case for it, only the ordering.
-  WARNING: **copy detection (`-C`) is still not implemented**, not even a
-  rejecting branch in the option parser -- `-C` falls into `cmd_diff.c`'s
-  generic usage error.
+  **`sg diff -C` finds copies since Phase 33**, and a copy is
+  `old_path != NULL && is_copy`. The rule for which is which is git's, is one
+  line, and looks arbitrary until you know it: a source is paired N times,
+  each destination spends one use **in path order**, and a row is a copy while
+  uses remain after its own. A source that is not a deletion is charged one
+  use up front, so anything copied off an edited file is a copy by
+  construction. Consequence, measured: with one source and two destinations
+  the FIRST by path is the copy and the second is the rename, **however much
+  better the second matched**.
+  WARNING: **`-C` changes three things, not one.** A path present on both
+  sides becomes eligible as a source (the only way to find a copy from a
+  merely edited file); a source may be paired more than once; and **the
+  same-file-name shortcut is skipped entirely**. Dropping any one of them
+  gives a different answer from git.
+  WARNING: **`-C -C` / `--find-copies-harder` is REJECTED, not approximated**
+  (`cmd_diff.c` exits 1 with a named message). It offers every *unchanged*
+  path as a copy source, and `sg_diff_list` only holds paths that changed --
+  answering it as plain `-C` would be a quietly wrong answer. Real git accepts
+  it; interop pins both halves of that divergence.
+  WARNING: **`-M` and `-C` write the same mode; the LAST one wins.** Measured:
+  `git diff -C -M` finds renames only, `-M -C` finds copies. So every `-M`
+  branch in `cmd_diff.c` must clear `detect_copies`, and every `-C` branch
+  must set it. sg had `-C` sticky in the first order for exactly as long as
+  no test combined the two flags.
+  WARNING: **two copy-mode properties are masked by other machinery and need
+  deliberately built fixtures** (both cost a mutation round to find): copy
+  mode skipping the basename shortcut is invisible with ONE source, because
+  reuse makes both routes agree -- it takes two; and the exact pass's reuse is
+  invisible unless the matrix is out of the way, i.e. at `-C100%`.
   **`sg status` has a rename row since Phase 32**, and `sg_status_diff_staged`
   is no longer a second implementation of tree<->index -- it is a thin adapter
   over `sg_diff_tree_index`, the way `sg_status_diff_unstaged` has been over

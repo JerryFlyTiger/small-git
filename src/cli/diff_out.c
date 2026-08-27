@@ -705,9 +705,14 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
            sg_quote_path (no a//b/ prefix on these two lines: measured
            `rename to "tab\there.txt"`). */
         if (e->old_path != NULL) {
+            /* "copy from"/"copy to" when the source is still there --
+               measured against git 2.55.0; the similarity line above is
+               worded identically either way. */
             printf("similarity index %d%%\n", e->score);
-            printf("rename from %s\n", sg_quote_path(e->old_path));
-            printf("rename to %s\n", sg_quote_path(e->path));
+            printf("%s from %s\n", e->is_copy ? "copy" : "rename",
+                  sg_quote_path(e->old_path));
+            printf("%s to %s\n", e->is_copy ? "copy" : "rename",
+                  sg_quote_path(e->path));
         }
 
         /* A pure mode change (content unchanged) prints NO index line at all
@@ -807,7 +812,8 @@ static int print_name_status(const sg_diff_list *list)
            row in this format. Two calls in one printf is within the four
            rotating buffers sg_quote_path hands out (see sg/quote.h). */
         if (e->old_path != NULL) {
-            printf("R%03d\t%s\t%s\n", e->score, sg_quote_path(e->old_path),
+            printf("%c%03d\t%s\t%s\n", e->is_copy ? 'C' : 'R', e->score,
+                  sg_quote_path(e->old_path),
                   sg_quote_path(e->path));
             continue;
         }

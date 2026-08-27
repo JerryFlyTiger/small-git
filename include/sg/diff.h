@@ -64,6 +64,18 @@ typedef struct {
        it as a three-digit zero-padded suffix ("R100", "R093") and as
        "similarity index 93%". */
     int score;
+    /* 1 when this row is a COPY rather than a rename -- the source is still
+       there. Only meaningful when old_path != NULL, and only ever set when
+       the caller asked for copy detection.
+
+       git decides this at the very end rather than while pairing, and the
+       rule is worth knowing because it looks arbitrary: a source is used
+       some number of times, each paired destination consumes one use IN PATH
+       ORDER, and a destination is a copy exactly while uses remain after
+       its own. So with one source and two destinations the FIRST is the copy
+       and the second is the rename, however much better the second matched.
+       Measured against git 2.55.0; see docs/DESIGN.md Phase 33. */
+    int is_copy;
     sg_diff_side old_side;
     sg_diff_side new_side;
     /* 1 when this row stands for an unresolved conflict rather than a content
@@ -218,12 +230,20 @@ int sg_diff_side_effective_id(const char *git_dir, const sg_diff_side *side,
    `repo_root` is needed because scoring reads both sides' bytes, and a
    WORKDIR side lives on disk rather than in the object store.
 
+   `detect_copies` is git's -C. It changes three things, all measured:
+   a path that exists on BOTH sides becomes eligible as a source (so a copy
+   can be found from a file that was merely edited); a source may be paired
+   more than once; and the same-file-name shortcut is skipped entirely. It
+   does NOT reach git's -C -C, which additionally offers every UNCHANGED path
+   as a source -- this list only ever holds paths that changed, so that mode
+   is rejected by the CLI rather than approximated.
+
    A side whose content cannot be read is never paired -- the same failure
    direction as an unverified id: no rename, never an invented one.
 
    Returns 0, or -1 on allocation failure with the list left untouched. */
 int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
-                           sg_diff_list *list, int min_score);
+                           sg_diff_list *list, int min_score, int detect_copies);
 
 /* Drops every entry whose path the pathspec does not cover, freeing it. An
    empty pathspec matches everything, so an unfiltered `sg diff` and a

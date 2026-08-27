@@ -4138,3 +4138,131 @@ all. Every byte-for-byte check was green while testing nothing.
 This is the second time in three milestones that pairing each behavioural claim with an oracle
 check is what caught a fixture problem rather than a code problem. A `cmp` against real git
 proves the two agree; only the oracle proves they agree *about the thing you meant*.
+
+## Phase 33: copy detection (`-C`)
+
+`sg diff -C` finds a file that was copied from another, printing `C079 src.txt copy.txt`,
+`copy from` / `copy to`, and the same `a => b` column `--stat` already used for renames. The
+estimator and the three passes were all in place from Phase 30; what was missing was the part
+copy mode changes, which turned out to be more than "let a source be used twice".
+
+### The rule is one line, and it explains four counter-intuitive answers
+
+Measured first, then confirmed against git's source (`diff_resolve_rename_copy`):
+
+```c
+else if (--p->one->rename_used > 0)  p->status = DIFF_STATUS_COPIED;
+else                                 p->status = DIFF_STATUS_RENAMED;
+```
+
+A source is paired some number of times; each paired destination spends one use, **in path
+order**; a destination is a copy exactly while uses remain after its own. A source that is not a
+deletion is charged one use when it is registered, so anything copied off an edited file is a
+copy by construction.
+
+That single rule accounts for every measurement, including the ones that look wrong:
+
+| | fixture | git 2.55.0 |
+|---|---|---|
+| A | untouched source, exact copy | `A copy.txt` -- **plain `-C` finds nothing** |
+| B | edited source, 80% copy | `C079 src.txt copy.txt` **and** `M src.txt` -- the source stays |
+| C | deleted source, two exact copies | `C100 -> c1.txt` **and `R100 -> c2.txt`** |
+| D | deleted source, a 79% same-name match and a 98% other | `C079 -> dir2/foo.txt`, `R098 -> other.txt` |
+
+C and D are the same surprise: with one source and two destinations, the **first by path** is the
+copy and the second is the rename -- **however much better the second matched**. D makes it
+sharper still, because it is the exact fixture Phase 30 built to prove the same-file-name
+shortcut exists, and `-C` answers it differently: copy mode skips that shortcut entirely.
+
+The model was written down and checked against all four before a line of code was written. That
+ordering is the point -- a rule derived from one fixture would have fit C and been wrong about B.
+
+### What `-C` actually changes
+
+Three things, none of them "allow reuse" alone:
+
+1. A path present on **both** sides becomes eligible as a source, which is the only way B can be
+   found at all.
+2. The same-file-name shortcut is skipped.
+3. The ranked matrix is walked **twice**: once refusing already-claimed sources, then again with
+   that refusal lifted. One walk that allowed reuse from the start would hand a destination to a
+   claimed source before an unclaimed one had its turn.
+
+### `-C -C` is refused, not approximated
+
+`--find-copies-harder` additionally offers every **unchanged** path as a copy source -- which is
+why plain `-C` cannot find case A. `sg_diff_list` only ever holds paths that changed, so there is
+no source pool to draw from without teaching all four builders to emit unmodified rows.
+
+sg therefore **rejects** it with a named error, and interop pins the divergence from both sides:
+sg exits non-zero, and an oracle check asserts real git exits 0. Answering it as plain `-C` would
+have been the one failure direction this codebase does not allow -- a quietly different answer to
+the question that was asked.
+
+### Two properties that hid behind other machinery
+
+Seven mutations, all caught in the end -- but two only after building fixtures for them, and
+both were green for the same reason: something else in the pipeline reached the right answer
+anyway, so breaking the rule had no symptom.
+
+- **Copy mode skipping the same-file-name shortcut** is invisible with one source. Copy mode
+  lets a source be reused, so claiming it early through the shortcut costs nothing and the
+  matrix arrives at the same pairing. It takes TWO sources -- one sharing the destination's name
+  at 79%, one not at 98% -- before the shortcut changes the answer. Measured: without `-C` the
+  name wins, with `-C` the score does.
+- **The exact pass letting a source be claimed again** is invisible because the matrix's second
+  walk finds the same pair regardless. The exception is `-C100%`, where the matrix is skipped
+  entirely and the exact pass is all that is left.
+
+Neither was a missing rule; both were rules with no witness. The distinction matters, because
+"the mutation stayed green" reads as "nobody implemented this" and here it meant "nobody could
+see it from where the tests stood".
+
+### The one thing copy detection broke, and how
+
+Every outcome this function had before moved pointers around: a rename hands the source's path
+to the destination, the source row goes away, nothing is allocated. A COPY cannot do that -- the
+source row stays and keeps owning its path -- so it has to duplicate it, and duplication can
+fail. Written as one loop, a failure partway through left rows already rewritten and, worse, a
+source row whose path had been taken away, i.e. an entry with a NULL path in a list handed back
+to the caller.
+
+The header promises `-1` leaves the list untouched, and it had been true for free. It is now true
+on purpose: pass one decides and allocates, touching nothing but local state; pass two writes the
+list and cannot fail.
+
+Worth noting how it was found. The comment sitting on that loop still read "the source's path is
+handed over rather than copied, so this cannot fail partway and leave the list half-rewritten" --
+a sentence that had been accurate for three milestones and was made false by the line added
+directly beneath it. **A comment that explains why something is safe is also a test of whether
+it still is**, and this one failed loudly on re-reading.
+
+### What the cold read found
+
+Two defects, both in places the tests had no reason to look:
+
+- **`-C` was sticky.** `-M` and `-C` write the same mode field in git, so the last flag wins:
+  `git diff -C -M` finds renames only, `-M -C` finds copies. sg's `-M` branches only ever touched
+  the score, so `-C -M` stayed in copy mode. Measured against git 2.55.0 after the reviewer
+  named it, then fixed. **No check combined the two flags** -- the coverage gap sat exactly where
+  the defect was, which is the shape this log keeps recording.
+- **`list_append` never set `is_copy`.** It is the one canonical constructor for `sg_diff_entry`,
+  it assigns every other field by hand, and its storage comes from `realloc` -- so every entry
+  every builder produced carried garbage in the new field. Harmless today only because both
+  readers check `old_path != NULL` first, and invisible to every gate this project has: ASan is
+  not MSan, and heap storage draws no compiler warning.
+
+  Phase 29's lesson was "when you add a field, audit the sites that do NOT go through the
+  constructor". This is the same lesson from the other side: **audit the constructor too.**
+
+Both fixes were then mutated back to the broken version, since a fix a review found has, by
+construction, no test standing over it until one is written. Both reddened, on the checks written
+for them.
+
+### Verification
+
+Fifty-five new interop checks, every behavioural claim paired with an oracle assertion on real
+git -- the discipline Phase 32 earned the hard way, when a fixture using a flag sg does not have
+compared two identical rename-free states and passed. Four unit tests assert `is_copy` directly
+rather than through rendering, each with a `detect_copies = 0` control so the tests cannot pass
+by the feature simply being off.

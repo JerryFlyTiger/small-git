@@ -524,7 +524,7 @@ static int cmd_stash_show(int argc, char **argv)
        merge, would quietly give a different answer. It needs no special case
        here, only this ordering -- it falls out of the pass order documented
        in sg/diff.h. */
-    if (sg_diff_detect_renames(git_dir, repo_root, &diff_list, rename_score) != 0) {
+    if (sg_diff_detect_renames(git_dir, repo_root, &diff_list, rename_score, 0) != 0) {
         fprintf(stderr, "sg: out of memory, cannot detect renames\n");
         sg_diff_list_free(&diff_list);
         free(repo_root);

@@ -90,7 +90,7 @@ int sg_status_diff_staged(const char *git_dir, const char *repo_root,
     /* Detection runs here, on the finished list, so that the caller's single
        rename_score decision covers it -- see sg/status.h for why that
        decision has no default. A score of 0 makes this a no-op. */
-    if (sg_diff_detect_renames(git_dir, repo_root, &dl, rename_score) != 0) {
+    if (sg_diff_detect_renames(git_dir, repo_root, &dl, rename_score, 0) != 0) {
         sg_diff_list_free(&dl);
         return -1;
     }

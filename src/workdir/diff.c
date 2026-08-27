@@ -103,6 +103,13 @@ static int list_append(sg_diff_list *list, const char *path, const sg_diff_side 
         return -1;
     list->entries[list->count].old_path = NULL;
     list->entries[list->count].score = 0;
+    /* Set even though nothing reads it without old_path first: the storage
+       comes from realloc, so leaving it out means every entry in the codebase
+       carries garbage here, and the next reader to check it on its own would
+       be reading uninitialized memory that no gate this project has can see
+       (ASan is not MSan). Phase 29 lost a day to the same shape from the
+       other direction -- fixtures built without the factory. */
+    list->entries[list->count].is_copy = 0;
     list->entries[list->count].old_side = *old_side;
     list->entries[list->count].new_side = *new_side;
     list->entries[list->count].unmerged = 0;

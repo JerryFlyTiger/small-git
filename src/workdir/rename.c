@@ -50,6 +50,15 @@ static int is_addition(const sg_diff_entry *e)
            e->new_side.kind != SG_DIFF_SIDE_ABSENT;
 }
 
+/* A path that changed but is still there. Only copy detection cares: it is
+   what lets `sg diff -C` find a copy taken from a file that was merely
+   edited, which plain rename detection has no use for. */
+static int is_modification(const sg_diff_entry *e)
+{
+    return !e->unmerged && e->old_side.kind != SG_DIFF_SIDE_ABSENT &&
+           e->new_side.kind != SG_DIFF_SIDE_ABSENT;
+}
+
 /* Mode 0 means "unknown" in sg_diff_side, and no builder in this codebase
    ever produces a non-regular mode (symlinks are excluded from every
    tracked-file walk). So the only question worth asking is whether a mode
@@ -95,7 +104,12 @@ typedef struct {
     size_t entry;        /* index into list->entries */
     unsigned char id[SG_SHA1_RAW_LEN];
     int id_ok;           /* 1 when the effective id was verified */
-    int used;            /* source: claimed; destination: already paired */
+    int used;            /* source: claimed at least once; destination: paired */
+    /* git's rename_used. A source that exists on both sides starts at 1
+       (git increments when registering it), so every pairing off it leaves a
+       use behind and reads as a copy; a deletion starts at 0. Each paired
+       destination consumes one, in path order, at the very end. */
+    int uses;
     int loaded;          /* 0 not yet, 1 loaded, -1 unreadable */
     sg_spanhash *hash;
     size_t size;
@@ -186,7 +200,7 @@ static int score_pair(const char *git_dir, const char *repo_root,
 
 static void exact_pass(rename_cand *srcs, size_t nsrc, rename_cand *dsts,
                        size_t ndst, const sg_diff_list *list, int *pair_src,
-                       int *pair_score)
+                       int *pair_score, int detect_copies)
 {
     size_t di;
 
@@ -207,7 +221,13 @@ static void exact_pass(rename_cand *srcs, size_t nsrc, rename_cand *dsts,
             /* Two ids that were never verified are not proof of identical
                content even when they are equal (sg_diff_side_effective_id's
                contract), so such a side never takes part. */
-            if (!s->id_ok || s->used)
+            if (!s->id_ok)
+                continue;
+            /* Outside copy detection a source is spent once it is claimed.
+               Copy detection lets it be claimed again, but still prefers one
+               that has not been -- that is what makes the score below 1
+               rather than 0 for a fresh source. */
+            if (s->used && !detect_copies)
                 continue;
             if (memcmp(s->id, d->id, SG_SHA1_RAW_LEN) != 0)
                 continue;
@@ -222,7 +242,7 @@ static void exact_pass(rename_cand *srcs, size_t nsrc, rename_cand *dsts,
             /* Among identical sources git prefers the one that already has
                the destination's file name; otherwise the first in path
                order, which is what a strictly-greater comparison keeps. */
-            score = 1 + basename_same(se->path, de->path);
+            score = (s->used ? 0 : 1) + basename_same(se->path, de->path);
             if (score > best_score) {
                 best = (int)si;
                 best_score = score;
@@ -234,6 +254,7 @@ static void exact_pass(rename_cand *srcs, size_t nsrc, rename_cand *dsts,
         }
         if (best >= 0) {
             srcs[best].used = 1;
+            srcs[best].uses++;
             d->used = 1;
             pair_src[di] = best;
             pair_score[di] = SG_SIMILARITY_MAX;
@@ -346,6 +367,7 @@ static int basename_pass(const char *git_dir, const char *repo_root,
         if (score < min_basename)
             continue;
         srcs[i].used = 1;
+        srcs[i].uses++;
         dsts[di].used = 1;
         pair_src[di] = (int)i;
         pair_score[di] = score;
@@ -411,16 +433,47 @@ static void record_if_better(rename_slot *m, const rename_slot *o)
     }
 }
 
+/* git's find_renames, run once over the ranked matrix. `copies` is its
+   parameter of the same name: the first walk refuses a source that is
+   already claimed, so it produces real renames; copy detection then walks
+   the very same ranking a second time with that refusal lifted. Running one
+   walk that allowed reuse from the start would hand a destination to an
+   already-claimed source before an unclaimed one had its turn. */
+static void claim_from_matrix(const rename_slot *mx, size_t used_slots,
+                              rename_cand *srcs, rename_cand *dsts, int *pair_src,
+                              int *pair_score, int min_score, int copies)
+{
+    size_t i;
+
+    for (i = 0; i < used_slots; i++) {
+        int di = mx[i].dst, si = mx[i].src;
+
+        /* Sorted best first, so the first slot below the threshold ends it. */
+        if (di < 0 || mx[i].score < min_score)
+            break;
+        if (dsts[di].used)
+            continue;
+        if (!copies && srcs[si].used)
+            continue;
+        srcs[si].used = 1;
+        srcs[si].uses++;
+        dsts[di].used = 1;
+        pair_src[di] = si;
+        pair_score[di] = mx[i].score;
+    }
+}
+
 static int matrix_pass(const char *git_dir, const char *repo_root,
                        const sg_diff_list *list, rename_cand *srcs,
                        size_t nsrc, rename_cand *dsts, size_t ndst,
-                       int *pair_src, int *pair_score, int min_score)
+                       int *pair_src, int *pair_score, int min_score,
+                       int detect_copies)
 {
     rename_slot *mx;
     size_t live_src = 0, live_dst = 0, i, j, used_slots = 0;
 
     for (i = 0; i < nsrc; i++)
-        if (!srcs[i].used)
+        if (!srcs[i].used || detect_copies)
             live_src++;
     for (i = 0; i < ndst; i++)
         if (!dsts[i].used)
@@ -455,7 +508,10 @@ static int matrix_pass(const char *git_dir, const char *repo_root,
         for (j = 0; j < nsrc; j++) {
             rename_slot cand;
 
-            if (srcs[j].used)
+            /* A claimed source stays in the running under copy detection --
+               the second walk above is what may hand it another
+               destination, and it can only do that if it was ranked. */
+            if (srcs[j].used && !detect_copies)
                 continue;
             cand.score = score_pair(git_dir, repo_root, list, &srcs[j], &dsts[i],
                                     min_score);
@@ -474,19 +530,9 @@ static int matrix_pass(const char *git_dir, const char *repo_root,
 
     qsort(mx, used_slots, sizeof(*mx), slot_cmp_stable);
 
-    for (i = 0; i < used_slots; i++) {
-        int di = mx[i].dst, si = mx[i].src;
-
-        /* Sorted best first, so the first slot below the threshold ends it. */
-        if (di < 0 || mx[i].score < min_score)
-            break;
-        if (dsts[di].used || srcs[si].used)
-            continue;
-        srcs[si].used = 1;
-        dsts[di].used = 1;
-        pair_src[di] = si;
-        pair_score[di] = mx[i].score;
-    }
+    claim_from_matrix(mx, used_slots, srcs, dsts, pair_src, pair_score, min_score, 0);
+    if (detect_copies)
+        claim_from_matrix(mx, used_slots, srcs, dsts, pair_src, pair_score, min_score, 1);
 
     free(mx);
     return 0;
@@ -495,11 +541,13 @@ static int matrix_pass(const char *git_dir, const char *repo_root,
 /* --------------------------------------------------------------- driver */
 
 int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
-                           sg_diff_list *list, int min_score)
+                           sg_diff_list *list, int min_score, int detect_copies)
 {
     rename_cand *srcs = NULL, *dsts = NULL;
     int *pair_src = NULL, *pair_score = NULL;
     char *claimed = NULL;
+    char *is_copy = NULL;
+    char **copied_path = NULL;
     size_t nsrc = 0, ndst = 0, i;
     int rc = -1, paired = 0;
 
@@ -511,8 +559,10 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
     pair_src = malloc(list->count * sizeof(*pair_src));
     pair_score = malloc(list->count * sizeof(*pair_score));
     claimed = calloc(list->count, 1);
+    is_copy = calloc(list->count, 1);
+    copied_path = calloc(list->count, sizeof(*copied_path));
     if (srcs == NULL || dsts == NULL || pair_src == NULL || pair_score == NULL ||
-        claimed == NULL)
+        claimed == NULL || is_copy == NULL || copied_path == NULL)
         goto done;
 
     for (i = 0; i < list->count; i++) {
@@ -526,6 +576,13 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
         } else if (is_addition(e)) {
             c = &dsts[ndst++];
             side = &e->new_side;
+        } else if (detect_copies && is_modification(e)) {
+            c = &srcs[nsrc++];
+            side = &e->old_side;
+            /* git increments rename_used when it registers a source that is
+               not a deletion, which is exactly what makes every pairing off
+               such a source come out as a copy rather than a rename. */
+            c->uses = 1;
         } else {
             continue;
         }
@@ -541,22 +598,51 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
         goto done;
     }
 
-    exact_pass(srcs, nsrc, dsts, ndst, list, pair_src, pair_score);
+    exact_pass(srcs, nsrc, dsts, ndst, list, pair_src, pair_score, detect_copies);
 
     /* -M100% asks for exact renames only, and lands here as a threshold no
        score short of a perfect one can reach. git stops rather than compute
        comparisons whose answers it would then throw away. */
     if (min_score < SG_SIMILARITY_MAX) {
-        if (basename_pass(git_dir, repo_root, list, srcs, nsrc, dsts, ndst,
+        /* Copy detection skips the same-file-name shortcut entirely -- git
+           does, and it is observable: the Phase 30 fixture built to prove
+           that shortcut exists answers differently under -C. */
+        if (!detect_copies &&
+            basename_pass(git_dir, repo_root, list, srcs, nsrc, dsts, ndst,
                           pair_src, pair_score, min_score) != 0)
             goto done;
         if (matrix_pass(git_dir, repo_root, list, srcs, nsrc, dsts, ndst,
-                        pair_src, pair_score, min_score) != 0)
+                        pair_src, pair_score, min_score, detect_copies) != 0)
             goto done;
     }
 
     /* Everything above only decided; nothing has touched the list yet, so a
        failure up to this point leaves it exactly as it was found. */
+    /* Decided in two passes, and the split is the whole reason this function
+       can still promise that -1 leaves the list untouched. A COPY has to
+       duplicate the source's path -- the source row stays and keeps owning
+       its own -- so unlike every other outcome here it can fail. Failing
+       halfway through one combined pass would leave rows already rewritten
+       and, worse, a source row whose path had been taken away. Pass one
+       decides and allocates, touching nothing but local state; pass two
+       writes the list and cannot fail.
+
+       git spends one of the source's uses per destination, in path order,
+       and calls the row a copy exactly while uses remain afterwards -- so
+       with one source and two destinations the first is the copy and the
+       second is the rename, however much better the second matched. dsts is
+       filled in list order, so iterating it IS path order. */
+    for (i = 0; i < ndst; i++) {
+        if (pair_src[i] < 0)
+            continue;
+        if (--srcs[pair_src[i]].uses > 0) {
+            is_copy[i] = 1;
+            copied_path[i] = strdup(list->entries[srcs[pair_src[i]].entry].path);
+            if (copied_path[i] == NULL)
+                goto done; /* rc is still -1, and the list is as we found it */
+        }
+    }
+
     for (i = 0; i < ndst; i++) {
         sg_diff_entry *d;
         sg_diff_entry *s;
@@ -565,11 +651,17 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
             continue;
         d = &list->entries[dsts[i].entry];
         s = &list->entries[srcs[pair_src[i]].entry];
-        /* The source's path is handed over rather than copied, so this
-           cannot fail partway and leave the list half-rewritten. */
-        d->old_path = s->path;
-        s->path = NULL;
-        claimed[srcs[pair_src[i]].entry] = 1;
+        d->is_copy = is_copy[i];
+        if (is_copy[i]) {
+            d->old_path = copied_path[i];
+            copied_path[i] = NULL; /* ownership handed to the entry */
+        } else {
+            /* The source's LAST use: its row is going away, so the path is
+               handed over rather than copied. */
+            d->old_path = s->path;
+            s->path = NULL;
+            claimed[srcs[pair_src[i]].entry] = 1;
+        }
         d->old_side = s->old_side;
         d->score = sg_similarity_percent(pair_score[i]);
         paired = 1;
@@ -611,5 +703,13 @@ done:
     free(pair_src);
     free(pair_score);
     free(claimed);
+    free(is_copy);
+    /* Whatever pass one allocated that pass two did not take ownership of:
+       everything on the failure path, nothing on the happy one. */
+    if (copied_path != NULL) {
+        for (i = 0; i < ndst; i++)
+            free(copied_path[i]);
+        free(copied_path);
+    }
     return rc;
 }
