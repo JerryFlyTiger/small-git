@@ -251,3 +251,14 @@ int sg_similarity_parse_score(const char **cp_p)
     return (int)(num >= scale ? SG_SIMILARITY_MAX
                               : SG_SIMILARITY_MAX * (double)num / (double)scale);
 }
+
+int sg_similarity_parse_score_arg(const char *arg, int *out)
+{
+    const char *end = arg;
+    int score = sg_similarity_parse_score(&end);
+
+    if (*end != '\0')
+        return -1;
+    *out = score != 0 ? score : SG_SIMILARITY_DEFAULT;
+    return 0;
+}

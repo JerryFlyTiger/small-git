@@ -9711,6 +9711,98 @@ check "phase30: and says so as a usage error" \
 p29_cmp "$P30_INEX" "--cached --name-status -M86 (the control for -Mabc)" \
     --cached --name-status -M86
 
+# --- Phase 31: `sg stash show` gains rename detection ---------------------
+#
+# The stash is built with `sg stash -u` (sg's own stash commit shape is not
+# guaranteed to be byte-for-byte identical to git's), then read back by both
+# sg and git's `stash show` and compared byte for byte -- same discipline as
+# the Phase 25 stash-show block above and the Phase 29/30 diff-rename block.
+#
+# Fixture: tracked.txt (100 lines) committed, then renamed to tracked2.txt
+# and truncated to 80 lines (an inexact, ~79%, rename). Two untracked files:
+# untracked_a.txt is byte-identical to the ORIGINAL tracked.txt (so it can
+# steal the exact-rename match once -u merges tracked and untracked into one
+# list), and untracked_b.txt is unrelated content.
+P31="$WORKDIR/p31_stash_rename"
+(cd "$WORKDIR" && "$SG" init p31_stash_rename) > /dev/null 2>&1
+(cd "$P31" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "
+open('$P31/tracked.txt', 'w').write(''.join('T-%d\n' % i for i in range(1, 101)))
+"
+(cd "$P31" && "$SG" add tracked.txt && "$SG" commit -m base) > /dev/null 2>&1
+cp "$P31/tracked.txt" "$WORKDIR/p31_untracked_a.txt"
+git -C "$P31" mv tracked.txt tracked2.txt > /dev/null 2>&1
+python3 -c "
+lines = open('$P31/tracked2.txt').readlines()[:80]
+open('$P31/tracked2.txt', 'w').writelines(lines)
+"
+cp "$WORKDIR/p31_untracked_a.txt" "$P31/untracked_a.txt"
+python3 -c "
+open('$P31/untracked_b.txt', 'w').write(''.join('U-%d\n' % i for i in range(1, 51)))
+"
+(cd "$P31" && "$SG" add tracked2.txt) > /dev/null 2>&1
+(cd "$P31" && "$SG" stash -u) > /dev/null 2>&1
+
+check "phase31 oracle: precondition -- sg's -u stash really has an untracked parent" \
+    sh -c "(cd '$P31' && git cat-file -p 'stash@{0}') 2>/dev/null | grep -c '^parent ' | grep -q '^3\$'"
+check "phase31 oracle: real git detects the inexact rename on the default (tracked-only) diff" \
+    sh -c "(cd '$P31' && LC_ALL=C git stash show --name-status) 2>/dev/null | grep -q '^R079'"
+
+p31_cmp() {
+    p31_label="$1"
+    shift
+    (cd "$P31" && "$SG" stash show "$@") > "$WORKDIR/p31_sg.txt" 2>/dev/null
+    (cd "$P31" && LC_ALL=C git -c core.quotepath=false stash show "$@") \
+        > "$WORKDIR/p31_git.txt" 2>/dev/null
+    check "phase31: sg stash show $p31_label matches real git byte-for-byte" \
+        cmp -s "$WORKDIR/p31_sg.txt" "$WORKDIR/p31_git.txt"
+}
+
+p31_cmp "(default, inexact rename)"
+p31_cmp "-p (inexact rename)" -p
+p31_cmp "--name-status (inexact rename)" --name-status
+p31_cmp "--stat (inexact rename)" --stat
+p31_cmp "--numstat (inexact rename)" --numstat
+p31_cmp "--shortstat (inexact rename)" --shortstat
+p31_cmp "--name-only (inexact rename)" --name-only
+
+# -u merges tracked and untracked into one list before detection runs once,
+# so untracked_a.txt (byte-identical to the ORIGINAL tracked.txt) steals the
+# exact-rename match ahead of the real inexact rename -- measured against
+# real git 2.55.0, not a bug in this port.
+check "phase31 oracle: real git's -u lets the untracked exact match steal the source" \
+    sh -c "(cd '$P31' && LC_ALL=C git stash show -u --name-status) 2>/dev/null | grep -q \"^R100\$(printf '\\t')tracked.txt\$(printf '\\t')untracked_a.txt\$\""
+p31_cmp "-u --name-status (untracked steals the exact match)" -u --name-status
+
+check "phase31 oracle: --only-untracked has no tracked side to rename from" \
+    sh -c "(cd '$P31' && LC_ALL=C git stash show --only-untracked --name-status) 2>/dev/null | grep -q \"^A\$(printf '\\t')untracked_a.txt\$\""
+p31_cmp "--only-untracked --name-status" --only-untracked --name-status
+
+# The spellings that all mean "use the default". Worth their own checks here
+# rather than leaning on `sg diff`'s: the bare -M and --find-renames branches
+# in cmd_stash.c assign the default DIRECTLY and never reach the shared
+# parser, so nothing on the diff side can protect them. -M0 and -M% do reach
+# it, and pin down that the "a parsed 0 means the default" rule is wired up
+# at this call site too.
+for p31_dflt in -M --find-renames -M0 "-M%"; do
+    p31_cmp "$p31_dflt --name-status (spellings meaning the default)" \
+        "$p31_dflt" --name-status
+done
+p31_cmp "-M100% --name-status (exact-only threshold rejects the inexact rename)" \
+    -M100% --name-status
+p31_cmp "--no-renames --name-status (control)" --no-renames --name-status
+
+check "phase31 oracle: a threshold above the actual score also rejects it" \
+    sh -c "! (cd '$P31' && LC_ALL=C git stash show -M87% --name-status) 2>/dev/null | grep -q '^R'"
+p31_cmp "-M87% --name-status (threshold above the actual score)" -M87% --name-status
+
+check "phase31 oracle: real git rejects an unparsable -M argument" \
+    sh -c "! (cd '$P31' && git stash show -Mabc) > /dev/null 2>&1"
+check "phase31: sg rejects it too" \
+    sh -c "! (cd '$P31' && '$SG' stash show -Mabc) > /dev/null 2>&1"
+(cd "$P31" && "$SG" stash show -Mabc) > /dev/null 2>"$WORKDIR/p31_mbad.txt"
+check "phase31: and says so as a usage error" \
+    grep -q '^usage: sg stash show' "$WORKDIR/p31_mbad.txt"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

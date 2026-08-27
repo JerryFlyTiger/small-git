@@ -3,7 +3,7 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (1579 checks, using real `git` as
+git; this is guarded by `tests/interop.sh` (1603 checks, using real `git` as
 the oracle).
 
 On top of that there are two things real git does not have: `src/safety/`
@@ -378,6 +378,13 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   verified" -- **two unverified ids do not count as identical content even if
   they happen to be equal**, that side is never paired. The failure direction
   is "not a rename", never "conjure a rename out of nowhere".
+  WARNING: **`sg stash show` detects renames too, and only after `-u`'s
+  merge** (Phase 31): the tracked and untracked halves become one list first,
+  and detection runs once over the whole thing. Measured against git 2.55.0:
+  an untracked file that is byte-identical to a deleted tracked file takes
+  the source through the exact pass, demoting the real inexact rename beside
+  it to a plain `A`. Detecting per-half, or before the merge, silently gives
+  a different answer -- there is no special case for it, only the ordering.
   WARNING: **copy detection (`-C`) is still not implemented**, not even a
   rejecting branch in the option parser -- `-C` falls into `cmd_diff.c`'s
   generic usage error.
@@ -586,7 +593,11 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `cmd_rebase.c`** -- it forwards an existing message and must preserve it
   byte-for-byte, so it deliberately does not apply cleanup.
 - **`sg stash show` builds on the diff foundation, it does not parse the
-  stash commit itself** (Phase 25). The four trees are resolved in one shot
+  stash commit itself** (Phase 25), and since Phase 31 it also takes
+  `-M[<n>]`/`--find-renames[=<n>]`/`--no-renames`, sharing the one CLI-facing
+  copy of the grammar, `sg_similarity_parse_score_arg`. **Do not add a second
+  copy of that wrapper** -- it was extracted out of `cmd_diff.c` precisely so
+  this command would not grow one. The four trees are resolved in one shot
   by `sg_stash_load_trees` (`include/sg/stash.h`): `base_tree` (parents[0],
   i.e. the diff baseline), `theirs_tree` (the stash commit itself),
   `index_tree` (parents[1]), and the optional `untracked_tree` (parents[2]).
