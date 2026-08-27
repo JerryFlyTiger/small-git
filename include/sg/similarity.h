@@ -98,4 +98,13 @@ int sg_similarity_percent(int score);
    callers turn into SG_SIMILARITY_DEFAULT. */
 int sg_similarity_parse_score(const char **cp);
 
+/* The CLI-facing wrapper around sg_similarity_parse_score: consumes the
+   whole of `arg` (not just a prefix), rejects it if anything is left over,
+   and turns a parse of 0 (a bare "-M0", "-M%", or "" -- see above) into
+   SG_SIMILARITY_DEFAULT, exactly as -M/--find-renames does when its value
+   is empty. Shared by `sg diff -M<n>` and `sg stash show -M<n>` so the
+   grammar has exactly one CLI-facing copy. Returns 0 and fills *out on
+   success, -1 on a malformed argument. */
+int sg_similarity_parse_score_arg(const char *arg, int *out);
+
 #endif /* SG_SIMILARITY_H */

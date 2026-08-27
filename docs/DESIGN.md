@@ -3949,3 +3949,79 @@ this causes trouble, not that any named assertion watches the property. Recorded
   implementation of tree<->index and still feeds `apply.c`'s two safety gates, so renames cannot
   be added to it without first enumerating divergences the way Phase 27 did.
 - **`diff --cc`** for conflicted paths, and the last 2-3% of Myers hunk placement, both unchanged.
+
+## Phase 31: `sg stash show` gains rename detection
+
+Phase 30 gave `sg diff` git's full rename detection, but nothing else was wired to it: within
+`src/`, `sg_diff_detect_renames` had exactly one caller. So `sg stash show` still printed a
+rename as two rows -- and unlike most gaps of this kind, this one was visible in the **default**
+output, since `git stash show` defaults to `--stat`:
+
+| | `stash show` (default `--stat`) | `stash show --name-status` |
+|---|---|---|
+| git | `src2.txt => dst2.txt \| 20 ---`, one row | `R079 src2.txt dst2.txt` |
+| sg (before) | `dst2.txt` + `src2.txt`, two rows | `A dst2.txt` + `D src2.txt` |
+
+The fix is one call, and the whole milestone is about *where* it goes.
+
+### `-u` merges first, then detects once -- and that is observable
+
+Measured against git 2.55.0 with a fixture built to make the two orderings disagree: a tracked
+file renamed and edited down to 79%, plus an **untracked** file whose content is byte-identical
+to the original tracked file.
+
+```
+git stash show --name-status        R079 tracked.txt tracked2.txt
+
+git stash show -u --name-status     A    tracked2.txt
+                                    R100 tracked.txt untracked_a.txt
+                                    A    untracked_b.txt
+```
+
+Adding `-u` does not add a second, separate diff. It merges the tracked and untracked halves into
+one list and runs detection **once over the whole thing** -- so the untracked file takes the
+source through the exact pass, and the real inexact rename beside it is demoted to a plain `A`.
+
+That needs no special case. It is the Phase 30 pass order (exact before inexact) applied to a
+list that happens to span both halves; the only thing the code has to get right is calling
+detection *after* the merge rather than inside either half. The mutation that moves the call
+before the merge reddens **exactly one** interop check, the `-u` one, and leaves the other seven
+green -- which is the shape a well-aimed check should have.
+
+`--only-untracked` compares an empty tree against the untracked tree, so every row is an addition
+and there is nothing to pair; it is covered anyway, because "no renames here" is a claim too.
+
+### One CLI-facing copy of the `-M` grammar
+
+`git stash show` accepts `-M`, `-M<n>`, `--find-renames[=<n>]` and `--no-renames`, all measured.
+Rather than let `cmd_stash.c` grow a second copy of the wrapper `cmd_diff.c` had around
+`sg_similarity_parse_score` (consume the whole argument, reject leftovers, turn a parsed 0 into
+the default), the wrapper was promoted to `sg_similarity_parse_score_arg` and both commands call
+it. CLAUDE.md's standing rule is that the known-duplication list must not grow back; the cheapest
+moment to obey it is the moment a second caller appears.
+
+### Verification
+
+Twenty new interop checks, all byte-for-byte against real git across the six formats plus `-u`,
+`--only-untracked`, `-M100%`, `-M87%`, `--no-renames` and a rejected `-Mabc` (message included,
+not just the exit code). Each behavioural claim is paired with an **oracle** check asserting that
+real git does the thing being compared against -- including the `-u` steal, so that a future git
+changing its mind is reported as a changed oracle rather than as an sg regression.
+
+Five mutations, all caught: detection not running at all (8 checks red), detection running
+before the merge (1 check red, the right one), the default threshold silently becoming
+`--no-renames` (8 red), the shared parser no longer turning a parsed 0 into the default, and the
+`-M<n>` value being read from the wrong offset.
+
+The cold read found no defect but did find three coverage gaps, and one of them is worth keeping
+as a rule: **`sg stash show`'s bare `-M` and `--find-renames` never reach the shared parser at
+all** -- both branches assign the default directly, exactly as `cmd_diff.c` does -- so no amount
+of coverage on the `sg diff` side protects them. Sharing a function does not share its tests
+when the call sites short-circuit around it. All three gaps were closed: the default spellings
+(`-M`, `--find-renames`, `-M0`, `-M%`) now have their own `stash show` checks, and
+`sg_similarity_parse_score_arg` has a direct unit test now that promoting it made it reachable
+from `tests/` at all.
+
+The stash itself is created with `sg stash -u` and then read back by both sides, the same
+discipline as the Phase 25 stash-show block: sg's stash commit is not guaranteed byte-identical
+to git's, so building it twice would compare two different stashes and call the difference a bug.

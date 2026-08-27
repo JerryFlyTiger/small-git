@@ -345,8 +345,8 @@ static int cmd_stash_show(int argc, char **argv)
     static const char usage[] =
         "usage: sg stash show [-p|--patch] [--stat[=<w>[,<n>]]] [--numstat] [--shortstat] "
         "[--name-only]\n"
-        "                      [--name-status] [-u|--include-untracked] [--only-untracked] "
-        "[<stash>]\n";
+        "                      [--name-status] [-M[<n>]|--find-renames[=<n>]|--no-renames]\n"
+        "                      [-u|--include-untracked] [--only-untracked] [<stash>]\n";
     sg_diff_out_opts opts;
     const char *spec = NULL;
     show_untracked_mode umode = SHOW_UNTRACKED_NONE;
@@ -360,6 +360,8 @@ static int cmd_stash_show(int argc, char **argv)
     char bad_path[SG_PATH_MAX];
     int rc;
     int exit_rc;
+    /* Same scale and same default as `sg diff -M` -- see sg/similarity.h. */
+    int rename_score = SG_SIMILARITY_DEFAULT;
 
     memset(&opts, 0, sizeof(opts));
     opts.format = SG_DIFF_FORMAT_STAT; /* the default -- measured, `git stash show` prints a diffstat */
@@ -387,6 +389,17 @@ static int cmd_stash_show(int argc, char **argv)
             opts.format = SG_DIFF_FORMAT_NAME_ONLY;
         } else if (strcmp(a, "--name-status") == 0) {
             opts.format = SG_DIFF_FORMAT_NAME_STATUS;
+        } else if (strcmp(a, "--no-renames") == 0) {
+            rename_score = 0;
+        } else if (strcmp(a, "-M") == 0 || strcmp(a, "--find-renames") == 0) {
+            rename_score = SG_SIMILARITY_DEFAULT;
+        } else if (strncmp(a, "-M", 2) == 0 || strncmp(a, "--find-renames=", 15) == 0) {
+            const char *v = a[1] == 'M' ? a + 2 : a + 15;
+
+            if (sg_similarity_parse_score_arg(v, &rename_score) != 0) {
+                fputs(usage, stderr);
+                return 1;
+            }
         } else if (strcmp(a, "-u") == 0 || strcmp(a, "--include-untracked") == 0) {
             umode = SHOW_UNTRACKED_INCLUDE;
         } else if (strcmp(a, "--only-untracked") == 0) {
@@ -495,6 +508,25 @@ static int cmd_stash_show(int argc, char **argv)
     }
     if (rc != 0) {
         fprintf(stderr, "sg: failed to compute diff\n");
+        free(repo_root);
+        free(git_dir);
+        return 1;
+    }
+
+    /* One call, on the final list, AFTER -u's merge above has combined
+       tracked and untracked into a single diff_list -- so renames are found
+       across both halves in one pass rather than within each half.
+
+       That is not a detail: measured against git 2.55.0, an untracked file
+       whose content is byte-identical to a deleted tracked file STEALS the
+       source through the exact pass, and the real inexact rename next to it
+       is demoted to a plain addition. Detecting per-half, or before the
+       merge, would quietly give a different answer. It needs no special case
+       here, only this ordering -- it falls out of the pass order documented
+       in sg/diff.h. */
+    if (sg_diff_detect_renames(git_dir, repo_root, &diff_list, rename_score) != 0) {
+        fprintf(stderr, "sg: out of memory, cannot detect renames\n");
+        sg_diff_list_free(&diff_list);
         free(repo_root);
         free(git_dir);
         return 1;

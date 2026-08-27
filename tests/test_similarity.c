@@ -228,6 +228,44 @@ static void test_a_long_line_is_cut_at_64_bytes(void)
     sg_spanhash_free(h);
 }
 
+static void test_the_cli_wrapper_consumes_the_whole_argument(void)
+{
+    /* sg_similarity_parse_score_arg is what both `sg diff -M<n>` and
+       `sg stash show -M<n>` call. It adds exactly two rules to the grammar
+       above, and it became a public symbol in Phase 31 precisely so a second
+       copy of them would not appear -- so both get tested here rather than
+       only through the two commands. */
+    int out;
+
+    /* Rule one: the whole argument must be consumed. The grammar itself
+       stops at the first byte it cannot use and reports how far it got;
+       leaving that as "close enough" would read -M87xyz as -M87. */
+    out = -1;
+    CHECK(sg_similarity_parse_score_arg("87%", &out) == 0 && out == 52200,
+          "a well-formed argument parses, got %d", out);
+    CHECK(sg_similarity_parse_score_arg("87%x", &out) == -1, "trailing junk is rejected");
+    CHECK(sg_similarity_parse_score_arg("abc", &out) == -1, "so is an argument with no number");
+    CHECK(sg_similarity_parse_score_arg("-5", &out) == -1, "and a leading sign, which git has no rule for");
+
+    /* Rule two: a value that parses to zero means "use the default", not
+       "detect nothing" -- which is what --no-renames is for, and the two must
+       not collapse into each other. */
+    out = -1;
+    CHECK(sg_similarity_parse_score_arg("", &out) == 0 && out == SG_SIMILARITY_DEFAULT,
+          "an empty argument is the default, got %d", out);
+    out = -1;
+    CHECK(sg_similarity_parse_score_arg("0", &out) == 0 && out == SG_SIMILARITY_DEFAULT,
+          "-M0 is the default, got %d", out);
+    out = -1;
+    CHECK(sg_similarity_parse_score_arg("%", &out) == 0 && out == SG_SIMILARITY_DEFAULT,
+          "-M%% is the default, got %d", out);
+    /* The boundary the two rules meet at: a value that is small but not zero
+       must survive as itself. */
+    out = -1;
+    CHECK(sg_similarity_parse_score_arg("0.5%", &out) == 0 && out == 300,
+          "half a percent stays half a percent, got %d", out);
+}
+
 int main(void)
 {
     test_scores_match_git();
@@ -235,6 +273,7 @@ int main(void)
     test_size_alone_can_rule_a_pair_out();
     test_percent_truncates();
     test_m_grammar_matches_git();
+    test_the_cli_wrapper_consumes_the_whole_argument();
     test_a_chunk_can_be_a_single_byte();
     test_a_long_line_is_cut_at_64_bytes();
 

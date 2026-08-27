@@ -67,24 +67,6 @@ static void report_bad_tree_path(const char *bad_path)
            sg_quote_path_delimited(bad_path));
 }
 
-/* git's -M<n>/--find-renames=<n> threshold. The grammar lives in
-   sg_similarity_parse_score because every one of its rules is
-   counter-intuitive and belongs next to the scale it produces; all this adds
-   is git's own rule that anything left over is an error rather than
-   something to guess at. An argument that parses to 0 -- "-M0", "-M%" --
-   means "use the default", exactly as it does in git. (A bare "-M" means the
-   same thing but never arrives here; it is matched a few lines below.) */
-static int parse_rename_score(const char *arg, int *out)
-{
-    const char *end = arg;
-    int score = sg_similarity_parse_score(&end);
-
-    if (*end != '\0')
-        return -1;
-    *out = score != 0 ? score : SG_SIMILARITY_DEFAULT;
-    return 0;
-}
-
 static void report_pathspec_error(sg_pathspec_error err, const char *arg, const char *repo_root)
 {
     switch (err) {
@@ -247,7 +229,7 @@ int sg_cmd_diff(int argc, char **argv)
         } else if (strncmp(a, "-M", 2) == 0 || strncmp(a, "--find-renames=", 15) == 0) {
             const char *v = a[1] == 'M' ? a + 2 : a + 15;
 
-            if (parse_rename_score(v, &rename_score) != 0) {
+            if (sg_similarity_parse_score_arg(v, &rename_score) != 0) {
                 fputs(USAGE, stderr);
                 free(pos);
                 return 1;
