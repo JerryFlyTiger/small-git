@@ -13,7 +13,12 @@
 #include <string.h>
 #include <sys/stat.h>
 
-static int status_list_add(sg_status_list *list, const char *path, sg_status_kind kind)
+/* The one and only place an sg_status_entry is built. `old_path` may be NULL;
+   it is a parameter rather than something callers fill in afterwards so that
+   a row can never exist with the field unset -- the failure mode Phase 29 hit
+   when sg_diff_entry grew a field and two hand-built fixtures missed it. */
+static int status_list_add(sg_status_list *list, const char *path, const char *old_path,
+                           sg_status_kind kind)
 {
     if (list->count == list->cap) {
         size_t new_cap = list->cap == 0 ? 8 : list->cap * 2;
@@ -27,6 +32,14 @@ static int status_list_add(sg_status_list *list, const char *path, sg_status_kin
     list->entries[list->count].path = strdup(path);
     if (list->entries[list->count].path == NULL)
         return -1;
+    list->entries[list->count].old_path = NULL;
+    if (old_path != NULL) {
+        list->entries[list->count].old_path = strdup(old_path);
+        if (list->entries[list->count].old_path == NULL) {
+            free(list->entries[list->count].path);
+            return -1;
+        }
+    }
     list->entries[list->count].kind = kind;
     list->count++;
     return 0;
@@ -36,75 +49,74 @@ void sg_status_list_free(sg_status_list *list)
 {
     size_t i;
 
-    for (i = 0; i < list->count; i++)
+    for (i = 0; i < list->count; i++) {
         free(list->entries[i].path);
+        free(list->entries[i].old_path);
+    }
     free(list->entries);
     list->entries = NULL;
     list->count = 0;
     list->cap = 0;
 }
 
-/* True if idx has any stage 1/2/3 entry at path -- i.e. path is an
-   unresolved conflict, already surfaced by `sg status`'s "Unmerged paths"
-   section rather than here. */
-static int path_has_unmerged_stage(const sg_index *idx, const char *path)
+/* Both adapters below drop unmerged rows: a path with an unresolved conflict
+   has no single staged blob, so `sg status` reports it in its own "Unmerged
+   paths" section instead. Until Phase 32 the staged side needed a helper of
+   its own (path_has_unmerged_stage) to stop a HEAD path whose only index
+   entries are stages 1/2/3 from looking like a deletion; sg_diff_tree_index
+   reaches the same answer through its per-path group cursor, so the helper
+   went away with the walk it served -- and the differential harness proved
+   the two agreed on all three unmerged shapes before it did. */
+int sg_status_diff_staged(const char *git_dir, const char *repo_root,
+                          const unsigned char *head_tree, const sg_index *idx,
+                          int rename_score, sg_status_list *out)
 {
-    return sg_index_find_stage(idx, path, 1) >= 0 || sg_index_find_stage(idx, path, 2) >= 0 ||
-        sg_index_find_stage(idx, path, 3) >= 0;
-}
-
-/* Both loops below only ever look at stage-0 entries: a path with an
-   unresolved conflict has no stage-0 entry (only 1/2/3), so it is simply
-   absent from the staged/unstaged comparison here -- `sg status`'s
-   "Unmerged paths" section is what reports those separately, and treating
-   stage 1/2/3 rows as ordinary entries here would both misreport them and
-   break this loop's assumption of at most one idx entry per path. A HEAD
-   path with an unresolved conflict (no stage-0 counterpart) must likewise
-   not be reported as "deleted" here -- path_has_unmerged_stage catches that,
-   since otherwise it would look exactly like index really did drop it. */
-int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg_status_list *out)
-{
-    size_t hi = 0;
-    size_t ii = 0;
+    sg_diff_list dl;
+    size_t i;
+    int rc = 0;
 
     memset(out, 0, sizeof(*out));
 
-    while (hi < head_flat->count || ii < idx->count) {
-        int cmp;
+    /* Phase 32: this used to be a second, hand-rolled walk of the same two
+       sides. A differential harness (tests/test_status_staged_parity.c)
+       compared the two across every shape either could produce -- including
+       all three unmerged arrangements, a corrupt index, an unborn HEAD and
+       the path-ordering boundaries -- and found them equivalent, so this
+       replaced that walk without changing any answer. The harness stayed:
+       it now guards the normalisation below instead. */
+    if (sg_diff_tree_index(git_dir, head_tree, idx, &dl, NULL) != 0)
+        return -1;
 
-        if (ii < idx->count && idx->entries[ii].stage != 0) {
-            ii++;
+    /* Detection runs here, on the finished list, so that the caller's single
+       rename_score decision covers it -- see sg/status.h for why that
+       decision has no default. A score of 0 makes this a no-op. */
+    if (sg_diff_detect_renames(git_dir, repo_root, &dl, rename_score) != 0) {
+        sg_diff_list_free(&dl);
+        return -1;
+    }
+
+    for (i = 0; i < dl.count; i++) {
+        const sg_diff_entry *e = &dl.entries[i];
+        sg_status_kind kind;
+
+        /* An unresolved conflict has no single staged blob, so it never
+           belongs here; `sg status` prints it in its own section. */
+        if (e->unmerged)
             continue;
-        }
 
-        if (hi >= head_flat->count)
-            cmp = 1;
-        else if (ii >= idx->count)
-            cmp = -1;
-        else
-            cmp = strcmp(head_flat->entries[hi].path, idx->entries[ii].path);
-
-        if (cmp == 0) {
-            if (memcmp(head_flat->entries[hi].sha1, idx->entries[ii].sha1, SG_SHA1_RAW_LEN) != 0 ||
-               head_flat->entries[hi].mode != idx->entries[ii].mode) {
-                if (status_list_add(out, idx->entries[ii].path, SG_STATUS_MODIFIED) != 0)
-                    return -1;
-            }
-            hi++;
-            ii++;
-        } else if (cmp < 0) {
-            if (!path_has_unmerged_stage(idx, head_flat->entries[hi].path)) {
-                if (status_list_add(out, head_flat->entries[hi].path, SG_STATUS_DELETED) != 0)
-                    return -1;
-            }
-            hi++;
-        } else {
-            if (status_list_add(out, idx->entries[ii].path, SG_STATUS_NEW) != 0)
-                return -1;
-            ii++;
+        kind = e->old_side.kind == SG_DIFF_SIDE_ABSENT   ? SG_STATUS_NEW
+             : e->new_side.kind == SG_DIFF_SIDE_ABSENT   ? SG_STATUS_DELETED
+                                                         : SG_STATUS_MODIFIED;
+        if (status_list_add(out, e->path, e->old_path, kind) != 0) {
+            rc = -1;
+            break;
         }
     }
-    return 0;
+
+    sg_diff_list_free(&dl);
+    if (rc != 0)
+        sg_status_list_free(out);
+    return rc;
 }
 
 /* sg_status_diff_unstaged is a thin adapter over sg_diff_index_workdir
@@ -182,7 +194,7 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
         else
             kind = SG_STATUS_MODIFIED;
 
-        if (status_list_add(out, dl.entries[i].path, kind) != 0) {
+        if (status_list_add(out, dl.entries[i].path, NULL, kind) != 0) {
             sg_diff_list_free(&dl);
             return -1;
         }

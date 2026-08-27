@@ -9804,6 +9804,172 @@ check "phase31: sg rejects it too" \
 check "phase31: and says so as a usage error" \
     grep -q '^usage: sg stash show' "$WORKDIR/p31_mbad.txt"
 
+# --- Phase 32: `sg status` gains a rename row -----------------------------
+#
+# The staged half of `sg status` used to be a second, hand-rolled walk of
+# HEAD-tree vs index; it is now a thin adapter over sg_diff_tree_index, which
+# is what let rename detection reach it at all. A differential harness
+# (tests/test_status_staged_parity.c) proved the two walks equivalent before
+# the swap, so everything below is about the rename rows the swap made
+# possible, not about the swap itself.
+#
+# The long format cannot be compared whole: sg's hints say "sg restore ..."
+# where git's say "git restore ...", deliberately. So the entry lines are
+# extracted the way the Phase 23 block does it -- and for the staged section
+# WITHOUT sorting, because the row order is part of the answer (measured:
+# rename rows sort by the NEW path, exactly as `git diff --name-status` does).
+P32="$WORKDIR/p32_status_rename"
+(cd "$WORKDIR" && "$SG" init p32_status_rename) > /dev/null 2>&1
+(cd "$P32" && git config user.email "a@b.c" && git config user.name "git user")
+p32_mk() {
+    python3 -c "
+import sys
+open(sys.argv[1], 'w').write(''.join('%s-%d\n' % (sys.argv[2], i)
+                                     for i in range(1, int(sys.argv[3]) + 1)))
+" "$1" "$2" "$3"
+}
+p32_mk "$P32/exact.txt" E 20
+p32_mk "$P32/inexact.txt" I 100
+p32_mk "$P32/has space.txt" S 20
+p32_mk "$P32/rd.txt" R 20
+(cd "$P32" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P32/exact.txt" "$P32/exact2.txt"
+mv "$P32/inexact.txt" "$P32/inexact2.txt"
+python3 -c "
+import sys
+lines = open(sys.argv[1]).readlines()[:80]
+open(sys.argv[1], 'w').writelines(lines)
+" "$P32/inexact2.txt"
+mv "$P32/has space.txt" "$P32/renamed space.txt"
+mv "$P32/rd.txt" "$P32/rd2.txt"
+(cd "$P32" && "$SG" add .) > /dev/null 2>&1
+rm "$P32/rd2.txt"
+
+check "phase32 oracle: real git reports a staged rename as R" \
+    sh -c "(cd '$P32' && LC_ALL=C git status --porcelain) | grep -q '^R  exact.txt -> exact2.txt$'"
+check "phase32 oracle: and pairs the edited one too" \
+    sh -c "(cd '$P32' && LC_ALL=C git status --porcelain) | grep -q '^R  inexact.txt -> inexact2.txt$'"
+# Named apart from the byte compares so losing detection says so, rather than
+# only saying "output differs".
+check "phase32: sg reports it as a rename too" \
+    sh -c "(cd '$P32' && '$SG' status --porcelain) | grep -q '^R  exact.txt -> exact2.txt$'"
+
+p32_cmp() {
+    p32_label="$1"
+    shift
+    (cd "$P32" && "$SG" status "$@") > "$WORKDIR/p32_sg.txt" 2>&1
+    (cd "$P32" && LC_ALL=C git -c core.quotepath=false status "$@") > "$WORKDIR/p32_git.txt" 2>&1
+    check "phase32: sg status $p32_label matches real git byte-for-byte" \
+        cmp -s "$WORKDIR/p32_sg.txt" "$WORKDIR/p32_git.txt"
+}
+p32_cmp "--porcelain (exact, inexact, quoted and RD renames)" --porcelain
+p32_cmp "-s" -s
+# The staged section of the long format, in order.
+(cd "$P32" && "$SG" status) 2>/dev/null \
+    | sed -n '/^Changes to be committed:/,/^$/p' | sed -n 's/^\t//p' > "$WORKDIR/p32_ls.txt"
+(cd "$P32" && LC_ALL=C git -c core.quotepath=false status) 2>/dev/null \
+    | sed -n '/^Changes to be committed:/,/^$/p' | sed -n 's/^\t//p' > "$WORKDIR/p32_lg.txt"
+check "phase32: the long format's staged section matches real git, in order" \
+    cmp -s "$WORKDIR/p32_ls.txt" "$WORKDIR/p32_lg.txt"
+# A rename in the long format is NOT quoted even with a space in it, while
+# porcelain quotes both halves -- the two rules that CLAUDE.md says must not
+# be unified, now colliding head-on over a single row.
+check "phase32: the long format leaves a spaced rename unquoted" \
+    grep -q '^renamed:    has space.txt -> renamed space.txt$' "$WORKDIR/p32_ls.txt"
+check "phase32: while porcelain quotes both halves of it" \
+    sh -c "(cd '$P32' && '$SG' status --porcelain) | grep -q '^R  \"has space.txt\" -> \"renamed space.txt\"\$'"
+# ...and quotes them INDEPENDENTLY, which the fixture above cannot show
+# because both of its halves need quoting. Measured against git 2.55.0.
+P32Q="$WORKDIR/p32_one_sided_quote"
+(cd "$WORKDIR" && "$SG" init p32_one_sided_quote) > /dev/null 2>&1
+(cd "$P32Q" && git config user.email "a@b.c" && git config user.name "git user")
+p32_mk "$P32Q/has space.txt" S 20
+p32_mk "$P32Q/plain.txt" P 20
+(cd "$P32Q" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P32Q/has space.txt" "$P32Q/nospace.txt"
+mv "$P32Q/plain.txt" "$P32Q/new space.txt"
+(cd "$P32Q" && "$SG" add .) > /dev/null 2>&1
+check "phase32 oracle: git quotes only the half that needs it" \
+    sh -c "(cd '$P32Q' && LC_ALL=C git status --porcelain) | grep -q '^R  plain.txt -> \"new space.txt\"\$'"
+check "phase32 oracle: and only the other half in the other direction" \
+    sh -c "(cd '$P32Q' && LC_ALL=C git status --porcelain) | grep -q '^R  \"has space.txt\" -> nospace.txt\$'"
+(cd "$P32Q" && "$SG" status --porcelain) > "$WORKDIR/p32_q_sg.txt" 2>&1
+(cd "$P32Q" && LC_ALL=C git -c core.quotepath=false status --porcelain) > "$WORKDIR/p32_q_git.txt" 2>&1
+check "phase32: sg quotes each half independently too" \
+    cmp -s "$WORKDIR/p32_q_sg.txt" "$WORKDIR/p32_q_git.txt"
+# A staged rename whose new path is then deleted from the working tree is one
+# line, not two -- the staged R and the unstaged D merge on the new path.
+check "phase32 oracle: git merges a staged rename with an unstaged delete" \
+    sh -c "(cd '$P32' && LC_ALL=C git status --porcelain) | grep -q '^RD rd.txt -> rd2.txt$'"
+check "phase32: so does sg" \
+    sh -c "(cd '$P32' && '$SG' status --porcelain) | grep -q '^RD rd.txt -> rd2.txt$'"
+
+# The -M grammar, and the one place `status` and `diff` genuinely disagree.
+for p32_opt in --no-renames -M --find-renames -M5 -M05 "-M50%" "-M100%" "-M87%" \
+               "--find-renames=87%" -M0 "-M%"; do
+    p32_cmp "--porcelain $p32_opt" --porcelain "$p32_opt"
+done
+# MEASURED, and counter-intuitive: `git status -Mabc` exits 0 and quietly uses
+# the default, while `git diff -Mabc` exits 129 with an error. The two commands
+# do not share a rule, so sg cannot either.
+check "phase32 oracle: git status accepts an unparsable -M and carries on" \
+    sh -c "(cd '$P32' && LC_ALL=C git status --porcelain -Mabc) > /dev/null 2>&1"
+check "phase32 oracle: while git diff rejects the very same argument" \
+    sh -c "! (cd '$P32' && LC_ALL=C git diff --cached -Mabc) > /dev/null 2>&1"
+check "phase32: sg status accepts it too" \
+    sh -c "(cd '$P32' && '$SG' status --porcelain -Mabc) > /dev/null 2>&1"
+check "phase32: and sg diff still rejects it" \
+    sh -c "! (cd '$P32' && '$SG' diff --cached -Mabc) > /dev/null 2>&1"
+p32_cmp "--porcelain -Mabc (ignored, not rejected)" --porcelain -Mabc
+
+# Row order is the NEW path's, not the old one's. The two orders disagree
+# here on purpose, so sorting by the wrong half cannot pass.
+P32B="$WORKDIR/p32_order"
+(cd "$WORKDIR" && "$SG" init p32_order) > /dev/null 2>&1
+(cd "$P32B" && git config user.email "a@b.c" && git config user.name "git user")
+p32_mk "$P32B/b.txt" B 20
+p32_mk "$P32B/a2.txt" A 20
+(cd "$P32B" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P32B/b.txt" "$P32B/a.txt"
+mv "$P32B/a2.txt" "$P32B/z.txt"
+(cd "$P32B" && "$SG" add .) > /dev/null 2>&1
+check "phase32 oracle: git orders rename rows by the new path" \
+    sh -c "(cd '$P32B' && LC_ALL=C git status --porcelain) | head -1 | grep -q '^R  b.txt -> a.txt$'"
+(cd "$P32B" && "$SG" status --porcelain) > "$WORKDIR/p32_osg.txt" 2>&1
+(cd "$P32B" && LC_ALL=C git -c core.quotepath=false status --porcelain) > "$WORKDIR/p32_ogit.txt" 2>&1
+check "phase32: sg orders them the same way" \
+    cmp -s "$WORKDIR/p32_osg.txt" "$WORKDIR/p32_ogit.txt"
+
+# The safety gates in apply.c ask for this same staged list, and they pass
+# rename detection OFF on purpose: they enumerate it to tell the user what is
+# uncommitted, one path per row, so a rename row would silently stop naming
+# the path the content came FROM. Nothing else in this suite watches that
+# choice -- a mutation flipping both gates to the default threshold left
+# every other check green -- so it is pinned here, at the one place the
+# gates' list becomes visible: the message they print when they block.
+P32C="$WORKDIR/p32_gate_list"
+(cd "$WORKDIR" && "$SG" init p32_gate_list) > /dev/null 2>&1
+(cd "$P32C" && git config user.email "a@b.c" && git config user.name "git user")
+p32_mk "$P32C/a.txt" A 20
+(cd "$P32C" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P32C" && "$SG" switch -c other) > /dev/null 2>&1
+printf 'x\n' > "$P32C/other.txt"
+(cd "$P32C" && "$SG" add . && "$SG" commit -m other) > /dev/null 2>&1
+(cd "$P32C" && "$SG" switch master) > /dev/null 2>&1
+printf 'y\n' > "$P32C/m.txt"
+(cd "$P32C" && "$SG" add . && "$SG" commit -m master) > /dev/null 2>&1
+mv "$P32C/a.txt" "$P32C/b.txt"
+(cd "$P32C" && "$SG" add .) > /dev/null 2>&1
+# The precondition: `sg status` really does call this a rename, so the check
+# below is about the gate's own choice and not about detection being broken.
+check "phase32: precondition -- status calls the staged change a rename" \
+    sh -c "(cd '$P32C' && '$SG' status --porcelain) | grep -q '^R  a.txt -> b.txt$'"
+(cd "$P32C" && "$SG" merge other) > /dev/null 2>"$WORKDIR/p32_gate.txt"
+check "phase32: the clean-workdir gate still names the path it came from" \
+    grep -q '^	staged:              a.txt$' "$WORKDIR/p32_gate.txt"
+check "phase32: and the path it went to" \
+    grep -q '^	staged:              b.txt$' "$WORKDIR/p32_gate.txt"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

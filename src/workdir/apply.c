@@ -294,7 +294,8 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
                        const char *label, int force)
 {
     unsigned char head_id[SG_SHA1_RAW_LEN];
-    sg_flat_list head_flat;
+    unsigned char head_tree[SG_SHA1_RAW_LEN];
+    const unsigned char *head_tree_ptr = NULL; /* NULL == unborn HEAD == empty tree */
     sg_index idx;
     sg_status_list staged;
     sg_status_list unstaged;
@@ -303,32 +304,20 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
     int dirty;
     size_t i;
 
-    memset(&head_flat, 0, sizeof(head_flat));
     has_head = (sg_ref_resolve_head(git_dir, head_id) == 0);
-    if (has_head) {
-        sg_obj_type type;
-        unsigned char *content = NULL;
-        size_t content_len;
-        sg_commit commit;
-
-        if (sg_object_read(git_dir, head_id, &type, &content, &content_len) == 0 &&
-           type == SG_OBJ_COMMIT) {
-            if (sg_commit_parse(content, content_len, &commit) == 0) {
-                sg_tree_flatten(git_dir, commit.tree, &head_flat, NULL);
-                sg_commit_free(&commit);
-            }
-            free(content);
-        }
-    }
+    if (has_head && sg_commit_tree_of(git_dir, head_id, head_tree) == 0)
+        head_tree_ptr = head_tree;
 
     if (sg_index_read(git_dir, &idx) != 0) {
-        sg_flat_list_free(&head_flat);
         fprintf(stderr, "sg: failed to read index (corrupt?)\n");
         return -1;
     }
 
-    staged_ok = sg_status_diff_staged(&head_flat, &idx, &staged) == 0;
-    sg_flat_list_free(&head_flat);
+    /* Renames deliberately OFF: this list is enumerated below to tell the
+       user what is uncommitted, and a rename row carries two paths where
+       this loop prints one. See sg/status.h -- the parameter is mandatory
+       precisely so this choice is made here rather than inherited. */
+    staged_ok = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, &staged) == 0;
     unstaged_ok = sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) == 0;
 
     /* A failed diff (e.g. out of memory) must NOT be read as "clean" -- that
@@ -430,7 +419,8 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
 int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const char *what)
 {
     unsigned char head_id[SG_SHA1_RAW_LEN];
-    sg_flat_list head_flat;
+    unsigned char head_tree[SG_SHA1_RAW_LEN];
+    const unsigned char *head_tree_ptr = NULL; /* NULL == unborn HEAD == empty tree */
     sg_index idx;
     sg_status_list staged = {0};
     sg_status_list unstaged = {0};
@@ -442,16 +432,13 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
         return 1;
     }
 
-    memset(&head_flat, 0, sizeof(head_flat));
-    if (sg_ref_resolve_head(git_dir, head_id) == 0) {
-        unsigned char tree_id[SG_SHA1_RAW_LEN];
+    if (sg_ref_resolve_head(git_dir, head_id) == 0 &&
+        sg_commit_tree_of(git_dir, head_id, head_tree) == 0)
+        head_tree_ptr = head_tree;
 
-        if (sg_commit_tree_of(git_dir, head_id, tree_id) == 0)
-            sg_tree_flatten(git_dir, tree_id, &head_flat, NULL);
-    }
-
-    staged_ok = sg_status_diff_staged(&head_flat, &idx, &staged) == 0;
-    sg_flat_list_free(&head_flat);
+    /* Renames deliberately OFF, same reason as the gate above: the rejection
+       message below enumerates these rows one path at a time. */
+    staged_ok = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, &staged) == 0;
     unstaged_ok = sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) == 0;
 
     /* A failed diff must never read as "clean" -- same rule as the rest of
