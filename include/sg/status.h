@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "sg/index.h"
+#include "sg/similarity.h"
 #include "sg/tree_build.h"
 
 typedef enum {
@@ -13,7 +14,14 @@ typedef enum {
 } sg_status_kind;
 
 typedef struct {
-    char *path; /* malloc'd, owned */
+    char *path; /* malloc'd, owned; the NEW path when this row is a rename */
+    /* Non-NULL only for a rename: where the content came from. Owned.
+       A rename is spelled this way rather than as a fourth sg_status_kind so
+       that every existing switch over kind stays exhaustive and correct --
+       the same shape sg_diff_entry uses, and for the same reason. A renamed
+       row's `kind` is SG_STATUS_MODIFIED, so a caller that does not know
+       about renames still sees "this path changed", never "nothing here". */
+    char *old_path;
     sg_status_kind kind;
 } sg_status_entry;
 
@@ -37,13 +45,39 @@ typedef enum {
     SG_STATUS_UNTRACKED_FOLD_DIRS,  /* folds a wholly-untracked dir into one "dir/" entry */
 } sg_status_untracked_fold;
 
-/* Changes staged relative to HEAD: compares head_flat (the flattened HEAD
-   tree; pass a zeroed/empty sg_flat_list when there is no commit yet, in
-   which case every index entry shows up as SG_STATUS_NEW) against idx. Both
-   inputs must be sorted by path, which is always true for sg_tree_flatten's
-   output and for an sg_index. Returns 0 on success, -1 on allocation
-   failure. */
-int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg_status_list *out);
+/* Changes staged relative to HEAD: what `git status` lists under "Changes to
+   be committed". Since Phase 32 this is a thin adapter over sg_diff_tree_index
+   rather than a second walk of its own -- one place that decides cannot
+   disagree with itself, the same reasoning as sg_status_diff_unstaged. The
+   two implementations were first proven equivalent by a differential harness
+   (tests/test_status_staged_parity.c) across every shape either could see,
+   so the convergence changed no behaviour at all.
+
+   `head_tree` may be NULL for an unborn HEAD, which reads as an empty tree.
+
+   Unmerged paths are left out, exactly as before: they have no single staged
+   blob and `sg status` reports them in its own "Unmerged paths" section.
+
+   `rename_score` is on git's 0..SG_SIMILARITY_MAX scale (see sg/similarity.h)
+   and has NO default on purpose -- every caller must say which it wants:
+
+     0                      every rename stays a deletion plus an addition.
+     SG_SIMILARITY_DEFAULT  pair them, git's 50% threshold, as `git status` does.
+
+   The reason it is mandatory is that the two answers are not
+   interchangeable for the callers that already exist. src/workdir/apply.c's
+   two safety gates enumerate this list to tell the user what is uncommitted;
+   a rename row carries TWO paths, and a gate that reads only `path` would
+   quietly stop naming the old one. Those gates therefore pass 0 and keep the
+   list they have always had. Silently picking a side here would be exactly
+   the bug this parameter exists to prevent.
+
+   Returns 0, or -1 on failure -- including a HEAD tree that cannot be read.
+   A failure must never be read as "no changes": every caller here treats it
+   as dirty, which is the safe direction. */
+int sg_status_diff_staged(const char *git_dir, const char *repo_root,
+                          const unsigned char *head_tree, const sg_index *idx,
+                          int rename_score, sg_status_list *out);
 
 /* Changes not yet staged: a thin adapter over sg_diff_index_workdir
    (include/sg/diff.h), which does the actual index-vs-workdir walk. A path

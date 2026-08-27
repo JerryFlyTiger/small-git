@@ -3,7 +3,7 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (1603 checks, using real `git` as
+git; this is guarded by `tests/interop.sh` (1637 checks, using real `git` as
 the oracle).
 
 On top of that there are two things real git does not have: `src/safety/`
@@ -388,10 +388,31 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   WARNING: **copy detection (`-C`) is still not implemented**, not even a
   rejecting branch in the option parser -- `-C` falls into `cmd_diff.c`'s
   generic usage error.
-  WARNING: **`sg status` still has no rename column**: `sg_status_diff_staged`
-  is a second, independent implementation of tree<->index, and it also feeds
-  the two safety gates in `apply.c`; converging it requires first enumerating
-  the divergences the way Phase 27 did.
+  **`sg status` has a rename row since Phase 32**, and `sg_status_diff_staged`
+  is no longer a second implementation of tree<->index -- it is a thin adapter
+  over `sg_diff_tree_index`, the way `sg_status_diff_unstaged` has been over
+  `sg_diff_index_workdir` since Phase 27. The two walks were proven equivalent
+  first (`tests/test_status_staged_parity.c`, 12 named shapes + a fuzzer),
+  so the swap changed no answer.
+  WARNING: **`sg_status_diff_staged`'s `rename_score` is mandatory and has no
+  default**, same idiom as `sg_workdir_missing`. `apply.c`'s two safety gates
+  pass **0**: they enumerate the list to tell the user what is uncommitted,
+  and a rename row carries TWO paths where that loop prints one, so detection
+  there would silently stop naming the old path. `cmd_status.c` passes the
+  threshold. Do not give this parameter a default.
+  WARNING: **a rename is `old_path != NULL`, not a fourth `sg_status_kind`**
+  (same shape as `sg_diff_entry`), so every existing `switch` over kind stays
+  exhaustive. A renamed row's kind is `SG_STATUS_MODIFIED`, so a consumer
+  that knows nothing about renames still sees "this path changed".
+  WARNING: **`git status` and `git diff` disagree about a malformed `-M`**
+  (measured): `git status -Mabc` exits 0 and quietly uses the default, while
+  `git diff -Mabc` exits 129. sg matches each command separately -- do not
+  "unify" them onto the shared parser's reject-leftovers rule.
+  WARNING: **the porcelain row sort must stay a TOTAL order**
+  (`prow_cmp` breaks ties on append position): a path can carry a staged row
+  and an unstaged row, only the staged one holds `old_path`, and `qsort`
+  leaves equal elements in an unspecified order. Merging x/y across a group is
+  order-independent, so this did not matter before renames; it does now.
 - **There are two display formats for renames, do not mix them up** (Phase
   29): `--name-status` prints **two separate fields** (`R100\told\tnew`,
   score zero-padded to three digits); `--stat`/`--numstat` print a **single

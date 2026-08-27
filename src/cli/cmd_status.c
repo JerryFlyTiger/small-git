@@ -41,6 +41,8 @@ typedef struct {
     int branch;
     int ignored;
     status_u_mode u_mode;
+    /* git's 0..SG_SIMILARITY_MAX scale; 0 is --no-renames. */
+    int rename_score;
 } status_opts;
 
 /* Parses the mode suffix of -u<mode>/--untracked-files=<mode> (everything
@@ -78,6 +80,16 @@ static const char *kind_label(sg_status_kind kind)
     return "";
 }
 
+/* A rename is carried as old_path != NULL rather than as a fourth kind, so
+   both of these take the entry rather than the kind. The long label stays 12
+   columns wide, the same column every other label in these sections uses. */
+static const char *entry_label(const sg_status_entry *e)
+{
+    if (e->old_path != NULL)
+        return "renamed:    ";
+    return kind_label(e->kind);
+}
+
 static char kind_char(sg_status_kind kind)
 {
     switch (kind) {
@@ -89,6 +101,13 @@ static char kind_char(sg_status_kind kind)
         return 'D';
     }
     return '?';
+}
+
+static char entry_char(const sg_status_entry *e)
+{
+    if (e->old_path != NULL)
+        return 'R';
+    return kind_char(e->kind);
 }
 
 /* Single source of truth for "which stages are present at this unmerged
@@ -146,9 +165,18 @@ static void print_section(const char *title, const char **hints, size_t hint_cou
     printf("%s\n", title);
     for (i = 0; i < hint_count; i++)
         printf("  (%s)\n", hints[i]);
-    for (i = 0; i < list->count; i++)
-        printf("\t%s%s\n", kind_label(list->entries[i].kind),
-              sg_quote_path(list->entries[i].path));
+    for (i = 0; i < list->count; i++) {
+        const sg_status_entry *e = &list->entries[i];
+
+        /* The long format does NOT quote a space-bearing path, on either
+           half of a rename -- measured; that is the porcelain rule and the
+           two are deliberately different (see CLAUDE.md). */
+        if (e->old_path != NULL)
+            printf("\t%s%s -> %s\n", entry_label(e), sg_quote_path(e->old_path),
+                  sg_quote_path(e->path));
+        else
+            printf("\t%s%s\n", entry_label(e), sg_quote_path(e->path));
+    }
     printf("\n");
 }
 
@@ -199,16 +227,35 @@ static size_t print_unmerged(const sg_index *idx, int rebase_in_progress)
    never freed here. */
 typedef struct {
     const char *path;
+    /* Borrowed like `path`, non-NULL only for a rename. Porcelain prints
+       both halves ("R  old -> new"), so the row has to carry both. */
+    const char *old_path;
+    /* Position this row was appended at. It exists to make the sort below a
+       TOTAL order: rows are grouped by path, and a path can carry two of
+       them (a staged row and an unstaged one), whose relative order qsort
+       leaves unspecified. That did not matter while a row was only an x and
+       a y -- merging those is order-independent -- but the old path lives on
+       the staged row alone, so which of the two comes first decides whether
+       it is seen at all. Ordering by append position pins it down: unmerged
+       rows, then staged, then unstaged. */
+    size_t seq;
     char x;
     char y;
 } prow;
 
-static int prow_cmp(const void *a, const void *b)
+static int prow_cmp(const void *a_, const void *b_)
 {
-    return strcmp(((const prow *)a)->path, ((const prow *)b)->path);
+    const prow *a = a_;
+    const prow *b = b_;
+    int r = strcmp(a->path, b->path);
+
+    if (r != 0)
+        return r;
+    return a->seq < b->seq ? -1 : a->seq > b->seq ? 1 : 0;
 }
 
-static int prow_append(prow **rows, size_t *count, size_t *cap, const char *path, char x, char y)
+static int prow_append(prow **rows, size_t *count, size_t *cap, const char *path,
+                       const char *old_path, char x, char y)
 {
     if (*count == *cap) {
         size_t new_cap = *cap == 0 ? 16 : *cap * 2;
@@ -220,6 +267,8 @@ static int prow_append(prow **rows, size_t *count, size_t *cap, const char *path
         *cap = new_cap;
     }
     (*rows)[*count].path = path;
+    (*rows)[*count].old_path = old_path;
+    (*rows)[*count].seq = *count;
     (*rows)[*count].x = x;
     (*rows)[*count].y = y;
     (*count)++;
@@ -256,21 +305,21 @@ static int print_porcelain_tracked(const sg_index *idx, const sg_status_list *st
                       sg_index_find_stage(idx, idx->entries[i].path, 2) >= 0,
                       sg_index_find_stage(idx, idx->entries[i].path, 3) >= 0, code, &label);
         (void)label; /* porcelain output only needs the two-letter code */
-        if (prow_append(&rows, &count, &cap, idx->entries[i].path, code[0], code[1]) != 0) {
+        if (prow_append(&rows, &count, &cap, idx->entries[i].path, NULL, code[0], code[1]) != 0) {
             rc = -1;
             goto out;
         }
     }
     for (i = 0; i < staged->count; i++) {
         if (prow_append(&rows, &count, &cap, staged->entries[i].path,
-                        kind_char(staged->entries[i].kind), ' ') != 0) {
+                        staged->entries[i].old_path, entry_char(&staged->entries[i]), ' ') != 0) {
             rc = -1;
             goto out;
         }
     }
     for (i = 0; i < unstaged->count; i++) {
-        if (prow_append(&rows, &count, &cap, unstaged->entries[i].path, ' ',
-                        kind_char(unstaged->entries[i].kind)) != 0) {
+        if (prow_append(&rows, &count, &cap, unstaged->entries[i].path, NULL, ' ',
+                        entry_char(&unstaged->entries[i])) != 0) {
             rc = -1;
             goto out;
         }
@@ -289,6 +338,12 @@ static int print_porcelain_tracked(const sg_index *idx, const sg_status_list *st
         size_t j = i + 1;
         char x = rows[i].x;
         char y = rows[i].y;
+        /* The staged row sorts first within a group (see prow_cmp), and it
+           is the only one that can carry an old path, so the group's is
+           always the first row's. A staged rename and an unstaged change to
+           the same NEW path still merge into one line -- that is where
+           "RM old -> new" comes from, measured against git 2.55.0. */
+        const char *old_path = rows[i].old_path;
 
         while (j < count && strcmp(rows[j].path, rows[i].path) == 0) {
             if (rows[j].x != ' ')
@@ -297,7 +352,14 @@ static int print_porcelain_tracked(const sg_index *idx, const sg_status_list *st
                 y = rows[j].y;
             j++;
         }
-        printf("%c%c %s\n", x, y, sg_quote_path_porcelain(rows[i].path));
+        /* Both halves are quoted independently: porcelain quotes as soon as
+           a path contains a space, because the "R  " prefix and the " -> "
+           separator would otherwise be ambiguous. */
+        if (old_path != NULL)
+            printf("%c%c %s -> %s\n", x, y, sg_quote_path_porcelain(old_path),
+                  sg_quote_path_porcelain(rows[i].path));
+        else
+            printf("%c%c %s\n", x, y, sg_quote_path_porcelain(rows[i].path));
         i = j;
     }
 
@@ -414,7 +476,8 @@ int sg_cmd_status(int argc, char **argv)
     sg_index idx;
     unsigned char head_commit_id[SG_SHA1_RAW_LEN];
     int has_head;
-    sg_flat_list head_flat;
+    unsigned char head_tree[SG_SHA1_RAW_LEN];
+    const unsigned char *head_tree_ptr = NULL; /* NULL == unborn HEAD == empty tree */
     sg_status_list staged;
     sg_status_list unstaged;
     char **untracked = NULL;
@@ -433,6 +496,7 @@ int sg_cmd_status(int argc, char **argv)
     };
 
     memset(&opts, 0, sizeof(opts));
+    opts.rename_score = SG_SIMILARITY_DEFAULT; /* git detects renames here by default */
     for (arg_i = 1; arg_i < argc; arg_i++) {
         if (strcmp(argv[arg_i], "-s") == 0 || strcmp(argv[arg_i], "--short") == 0 ||
            strcmp(argv[arg_i], "--porcelain") == 0) {
@@ -441,6 +505,24 @@ int sg_cmd_status(int argc, char **argv)
             opts.branch = 1;
         } else if (strcmp(argv[arg_i], "--ignored") == 0) {
             opts.ignored = 1;
+        } else if (strcmp(argv[arg_i], "--no-renames") == 0) {
+            opts.rename_score = 0;
+        } else if (strcmp(argv[arg_i], "-M") == 0 || strcmp(argv[arg_i], "--find-renames") == 0) {
+            opts.rename_score = SG_SIMILARITY_DEFAULT;
+        } else if (strncmp(argv[arg_i], "-M", 2) == 0 ||
+                  strncmp(argv[arg_i], "--find-renames=", strlen("--find-renames=")) == 0) {
+            const char *v =
+                argv[arg_i][1] == 'M' ? argv[arg_i] + 2 : argv[arg_i] + strlen("--find-renames=");
+
+            /* A value this grammar cannot read is IGNORED here, not rejected
+               -- measured against git 2.55.0, where `git status -Mabc` exits
+               0 and detects renames at the default threshold while
+               `git diff -Mabc` exits 129 with "invalid argument to
+               find-renames". The two commands genuinely disagree, so sg
+               cannot share one rule between them; matching git means
+               matching it per command. */
+            if (sg_similarity_parse_score_arg(v, &opts.rename_score) != 0)
+                opts.rename_score = SG_SIMILARITY_DEFAULT;
         } else if (strcmp(argv[arg_i], "-u") == 0) {
             opts.u_mode = STATUS_U_ALL; /* bare -u == -uall, measured (git 2.55.0) */
         } else if (strncmp(argv[arg_i], "-u", 2) == 0 && argv[arg_i][2] != '\0') {
@@ -538,7 +620,6 @@ int sg_cmd_status(int argc, char **argv)
     free(branch);
 
     has_head = (sg_ref_resolve_head(git_dir, head_commit_id) == 0);
-    memset(&head_flat, 0, sizeof(head_flat));
     if (has_head) {
         sg_obj_type type;
         unsigned char *content = NULL;
@@ -548,7 +629,8 @@ int sg_cmd_status(int argc, char **argv)
         if (sg_object_read(git_dir, head_commit_id, &type, &content, &content_len) == 0 &&
            type == SG_OBJ_COMMIT) {
             if (sg_commit_parse(content, content_len, &commit) == 0) {
-                sg_tree_flatten(git_dir, commit.tree, &head_flat, NULL);
+                memcpy(head_tree, commit.tree, SG_SHA1_RAW_LEN);
+                head_tree_ptr = head_tree;
                 sg_commit_free(&commit);
             }
             free(content);
@@ -557,9 +639,16 @@ int sg_cmd_status(int argc, char **argv)
         printf("\nNo commits yet\n");
     }
 
-    if (sg_status_diff_staged(&head_flat, &idx, &staged) != 0)
-        fprintf(stderr, "sg: warning: out of memory computing staged changes\n");
-    sg_flat_list_free(&head_flat);
+    /* Renames ON here, unlike the safety gates in apply.c: this list is
+       rendered for a human, and `git status` pairs them. See sg/status.h. */
+    if (sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, opts.rename_score,
+                              &staged) != 0)
+        /* Not necessarily out of memory: sg_status_diff_staged folds an
+           unreadable HEAD tree into the same -1. `sg diff`/`sg stash show`
+           name the offending path here; this one cannot, because it does not
+           ask for it -- so it must not claim a cause it does not know. */
+        fprintf(stderr, "sg: warning: could not compute staged changes "
+                        "(out of memory, or an unreadable HEAD tree)\n");
 
     if (sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) != 0)
         fprintf(stderr,

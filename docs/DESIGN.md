@@ -4025,3 +4025,116 @@ from `tests/` at all.
 The stash itself is created with `sg stash -u` and then read back by both sides, the same
 discipline as the Phase 25 stash-show block: sg's stash commit is not guaranteed byte-identical
 to git's, so building it twice would compare two different stashes and call the difference a bug.
+
+## Phase 32: `sg status` gains a rename row, and the last duplicate walk goes
+
+`sg status` now prints `renamed:    old -> new` and `R  old -> new`, the last place rename
+detection had not reached. Getting there meant finishing what Phase 27 started: the staged half
+of `sg status` was still a hand-rolled walk of HEAD-tree vs index, a second implementation of
+what `sg_diff_tree_index` already did, and rename detection had nowhere to attach to it.
+
+### The convergence, done Phase 27's way
+
+The rule Phase 27 set was: do not converge first and check afterwards. So the differential
+harness came first (`tests/test_status_staged_parity.c`, written against the *unchanged* code):
+12 named shapes -- clean, content-only, mode-only, deleted, added, all three unmerged
+arrangements in both tree-has-the-path and tree-does-not variants, a corrupt duplicate-path
+index, an unborn HEAD, and the `a` / `a/b` / `a.txt` / `ab` byte-ordering boundary -- plus a
+seeded fuzzer combining up to 16 independently-shaped paths per round.
+
+It found **no divergence at all**: 0 classes at 200, 1000 and 5000 rounds.
+
+That is a claim about the harness as much as about the code, so it was not taken on trust. The
+harness self-checks by forcing its own normalisation to swap NEW and DELETED, and -- more to the
+point -- four mutations were run against the **product** code:
+
+| mutation | result |
+|---|---|
+| drop `path_has_unmerged_stage` (the false-deletion guard) | caught, named + fuzz |
+| ignore the mode half of the comparison | caught, named + fuzz |
+| report a deletion as a modification | caught, named + fuzz |
+| stop skipping stage 1/2/3 entries | caught, named + fuzz |
+
+So "equivalent" is a measurement, not an absence of evidence, and the swap was a pure refactor.
+`path_has_unmerged_stage` went with the walk it served: `sg_diff_tree_index` reaches the same
+answer through its per-path group cursor, which the harness had already confirmed on all three
+unmerged shapes.
+
+### Who is allowed to see a rename
+
+The obstacle named in Phase 29 was that this list also feeds `apply.c`'s two safety gates. Reading
+them settled it: both use `.count` for the dirty decision and `.path` to tell the user what is
+uncommitted, and neither reads `.kind` at all (grepped, 0 hits). So collapsing a delete plus an
+add into one row cannot flip either gate -- but it *would* silently stop the message naming the
+old path, because that loop prints one path per row.
+
+`rename_score` is therefore a **mandatory parameter with no default**, the same idiom as
+`sg_workdir_missing`: the gates pass 0 and keep exactly the list they have always had, and
+`cmd_status.c` passes the threshold. Silently picking one side for both is the bug the parameter
+exists to prevent.
+
+A rename is carried as `old_path != NULL` rather than a fourth `sg_status_kind`, so every
+existing `switch` stays exhaustive, and a renamed row's kind is `SG_STATUS_MODIFIED` -- a
+consumer that knows nothing about renames still sees "this path changed", never "nothing here".
+
+### What real git does, measured
+
+| | git 2.55.0 |
+|---|---|
+| long format | `renamed:    old -> new`, label column 12, same as `modified:` |
+| porcelain / `-s` | `R  old -> new` |
+| row order | by the **new** path, same as `git diff --name-status` |
+| rename + chmod | absorbed into the one row, no separate mode line |
+| staged rename, new path then deleted | one line, `RD old -> new` |
+| a path with a space | porcelain quotes **both halves**; the long format quotes neither |
+| working-tree move, not staged | ` D old` + `?? new` -- the unstaged half does **not** pair |
+| `-Mabc` | **exit 0, quietly the default** |
+
+Two of those are worth keeping in mind. The unstaged half never pairs renames, which is what
+kept this milestone to one function instead of two. And `git status -Mabc` succeeding is the
+exact opposite of `git diff -Mabc`, which exits 129 -- the two commands do not share a rule, so
+sg matches them one at a time rather than routing both through the shared parser's
+reject-leftovers behaviour.
+
+### A mutation that was not a coverage gap
+
+Removing the loop that carried a group's `old_path` forward left interop fully green, which reads
+like a missing test. It was not. Porcelain groups rows by path, a path can carry a staged row and
+an unstaged one, only the staged row holds `old_path` -- and `prow_cmp` compared paths alone, so
+**`qsort` was free to order those two either way**. Merging `x`/`y` across a group is
+order-independent, which is why this never mattered before; `old_path` is not.
+
+The fix was not to write a test for the forwarding loop but to remove the freedom: `prow_cmp`
+now breaks ties on append position, making the order total and the staged row always first. The
+forwarding loop then became provably dead and was deleted.
+
+Reversing the new tiebreak is caught (6 checks). Deleting it outright is **not**, and cannot be:
+it does not produce a wrong answer, it produces an unspecified one that happens to coincide on
+this libc. That is the third of the three reasons a mutation stays green, and it is recorded
+here rather than filed as a gap, because there is no fixture that would close it.
+
+### One behaviour did change, and it changed for the better
+
+The convergence was meant to be answer-for-answer identical, and for every input the harness
+covers it is. One input it does not cover behaves differently: a HEAD tree that cannot be read.
+
+The old code called `sg_tree_flatten` and ignored its return value, so a tree that failed partway
+left a *partial* flattened list, and the walk then reported every index entry it no longer had a
+counterpart for. For `sg status` that meant silently printing a wrong answer; for `apply.c`'s
+gates it was a theoretical fail-open, since differences past the failure point simply vanished.
+The adapter turns any failure into -1, which every caller already treats as dirty.
+
+So `sg status` now prints an empty staged section and a warning where it used to print a
+confident wrong one, and both gates became strictly more conservative. The warning's wording was
+corrected too: it used to blame memory, which is only one of the two reasons it can fire.
+
+### The fixture that tested nothing
+
+Eight of the first interop run's failures were the **oracle** checks -- the ones asserting that
+real git does the thing being compared against. The fixture used `sg add -A`, which sg does not
+have; nothing was staged, and sg and git agreed perfectly about a state containing no rename at
+all. Every byte-for-byte check was green while testing nothing.
+
+This is the second time in three milestones that pairing each behavioural claim with an oracle
+check is what caught a fixture problem rather than a code problem. A `cmp` against real git
+proves the two agree; only the oracle proves they agree *about the thing you meant*.
