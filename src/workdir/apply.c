@@ -51,7 +51,7 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
 
     flatten_rc = sg_tree_flatten(git_dir, tree_id, &target_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+        fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
                sg_quote_path_delimited(bad_path));
         return -1;
     }
@@ -85,13 +85,13 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
                left in the index by an old bug would still reach remove()
                here even after the tree-side hole is closed. */
             if (!sg_relpath_is_safe(old_idx.entries[i].path)) {
-                fprintf(stderr, "sg: index 裡的路徑 %s 無效,拒絕刪除\n",
+                fprintf(stderr, "sg: path %s in index is invalid, refusing to delete\n",
                        sg_quote_path_delimited(old_idx.entries[i].path));
                 rc = -1;
                 continue;
             }
             if (sg_path_join(abspath, sizeof(abspath), repo_root, old_idx.entries[i].path) != 0) {
-                fprintf(stderr, "sg: 路徑過長,無法刪除 %s\n",
+                fprintf(stderr, "sg: path too long, cannot delete %s\n",
                        sg_quote_path_delimited(old_idx.entries[i].path));
                 rc = -1;
                 continue;
@@ -111,7 +111,7 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         sg_index_entry entry;
 
         if (sg_path_join(abspath, sizeof(abspath), repo_root, target_flat.entries[i].path) != 0) {
-            fprintf(stderr, "sg: 路徑過長,無法寫入 %s\n",
+            fprintf(stderr, "sg: path too long, cannot write %s\n",
                    sg_quote_path_delimited(target_flat.entries[i].path));
             rc = -1;
             continue;
@@ -195,7 +195,7 @@ int sg_index_reset_to_tree(const char *git_dir, const unsigned char tree_id[SG_S
 
     flatten_rc = sg_tree_flatten(git_dir, tree_id, &target_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+        fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
                sg_quote_path_delimited(bad_path));
         return -1;
     }
@@ -346,19 +346,24 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
         strbuf_append(&msg, "sg: '");
         strbuf_append(&msg, label);
         strbuf_append(&msg,
-                      "' 會用新的內容覆蓋目前的工作目錄與 index，"
-                      "下列尚未提交的變更會遺失：\n");
+                      "' will overwrite the current working directory and index with new "
+                      "content, and the following uncommitted changes will be lost:\n");
         for (i = 0; i < unstaged.count; i++)
             strbuf_append_path(&msg, "modified (unstaged): ", unstaged.entries[i].path);
         for (i = 0; i < staged.count; i++)
             strbuf_append_path(&msg, "staged: ", staged.entries[i].path);
         if (!staged_ok || !unstaged_ok)
-            strbuf_append(&msg, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足，或路徑過長），為安全起見要求確認\n");
+            strbuf_append(&msg, "sg: warning: could not fully determine the working directory "
+                          "state (possibly out of memory, or path too long); requiring "
+                          "confirmation to be safe\n");
         if (sg_index_has_unmerged(&idx))
-            strbuf_append(&msg, "sg: 目前有一個尚未完成的合併，繼續會放棄它\n");
+            strbuf_append(&msg,
+                          "sg: an unfinished merge is currently in progress; continuing will "
+                          "abandon it\n");
         if (sg_rebase_state_exists(git_dir))
-            strbuf_append(&msg, "sg: 目前有一個進行中的 rebase，繼續會覆蓋工作目錄裡的衝突解決內容\n"
-                          "sg: 要結束這個 rebase 請用 `sg rebase --abort`\n");
+            strbuf_append(&msg, "sg: a rebase is in progress; continuing will overwrite the "
+                          "conflict resolution content in the working directory\n"
+                          "sg: to end this rebase, use `sg rebase --abort`\n");
 
         confirmed = sg_confirm_dangerous(msg.buf != NULL ? msg.buf : "", force);
         free(msg.buf);
@@ -373,7 +378,8 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
         /* --force only skips the interactive prompt above; it must never
            skip taking the safety snapshot */
         if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: 自動快照失敗，為了安全起見中止這次操作（沒有做任何變更）\n");
+            fprintf(stderr, "sg: automatic snapshot failed; aborting this operation to be safe "
+                            "(no changes were made)\n");
             sg_status_list_free(&staged);
             sg_status_list_free(&unstaged);
             sg_index_free(&idx);
@@ -414,7 +420,7 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
            `sg undo`, which has no git equivalent to use as an oracle) clear
            it themselves after this call returns. */
         if (merge_in_progress && sg_merge_head_remove(git_dir) != 0)
-            fprintf(stderr, "sg: warning: 未能清除 MERGE_HEAD\n");
+            fprintf(stderr, "sg: warning: failed to clear MERGE_HEAD\n");
         return 0;
     }
 }
@@ -453,17 +459,19 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
     dirty = !staged_ok || !unstaged_ok || staged.count > 0 || unstaged.count > 0;
 
     if (dirty) {
-        fprintf(stderr, "sg: %s 需要乾淨的工作目錄，但下列變更尚未提交：\n", what);
+        fprintf(stderr, "sg: %s requires a clean working directory, but the following changes "
+                        "are not yet committed:\n", what);
         for (i = 0; i < staged.count; i++)
             fprintf(stderr, "\tstaged:              %s\n", sg_quote_path(staged.entries[i].path));
         for (i = 0; i < unstaged.count; i++)
             fprintf(stderr, "\tmodified (unstaged): %s\n", sg_quote_path(unstaged.entries[i].path));
         if (!staged_ok || !unstaged_ok)
-            fprintf(stderr, "sg: 警告：無法完整判斷工作目錄狀態（可能記憶體不足，或路徑過長）\n");
+            fprintf(stderr, "sg: warning: could not fully determine the working directory "
+                            "state (possibly out of memory, or path too long)\n");
         fprintf(stderr,
-               "請先處理這些變更，再重新執行：\n"
-               "  sg commit -m \"...\"      把它們提交進來\n"
-               "  sg restore <file>...    丟棄工作目錄的修改\n");
+               "Please resolve these changes, then run again:\n"
+               "  sg commit -m \"...\"      to commit them\n"
+               "  sg restore <file>...    to discard the working directory changes\n");
     }
 
     sg_status_list_free(&staged);

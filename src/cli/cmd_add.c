@@ -79,7 +79,7 @@ static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
     unsigned int mode;
 
     if (sg_path_join(abs_path, sizeof(abs_path), repo_root, rel_path) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法處理 %s\n", sg_quote_path_delimited(display));
+        fprintf(stderr, "sg: path too long, cannot process %s\n", sg_quote_path_delimited(display));
         return -1;
     }
 
@@ -94,7 +94,7 @@ static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
         return -1;
     }
     if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "sg: %s 是不支援的檔案類型（不是一般檔案）\n", sg_quote_path_delimited(display));
+        fprintf(stderr, "sg: %s is an unsupported file type (not a regular file)\n", sg_quote_path_delimited(display));
         return -1;
     }
 
@@ -186,13 +186,13 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
     int rc = 0;
 
     if (sg_path_join(absdir, sizeof(absdir), repo_root, reldir) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法處理目錄 %s\n", sg_quote_path_delimited(reldir));
+        fprintf(stderr, "sg: path too long, cannot process directory %s\n", sg_quote_path_delimited(reldir));
         return -1;
     }
 
     d = opendir(absdir);
     if (d == NULL) {
-        fprintf(stderr, "sg: 無法讀取目錄 %s\n",
+        fprintf(stderr, "sg: cannot read directory %s\n",
                sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."));
         return -1;
     }
@@ -234,7 +234,7 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
     }
     closedir(d);
     if (rc != 0)
-        fprintf(stderr, "sg: 記憶體不足，無法列出目錄 %s\n",
+        fprintf(stderr, "sg: out of memory, cannot list directory %s\n",
                sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."));
 
     if (rc == 0 && count > 1)
@@ -261,7 +261,7 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
                pieces separately and naming the relationship in words
                avoids gluing two independently-quoted strings together with
                a literal "/" (see the identical fix in workdir/status.c). */
-            fprintf(stderr, "sg: 路徑過長,無法處理目錄 %s 底下的項目 %s\n",
+            fprintf(stderr, "sg: path too long, cannot process directory %s's entry %s\n",
                     sg_quote_path_delimited(reldir[0] != '\0' ? reldir : "."),
                     sg_quote_path_delimited(names[i]));
             rc = -1;
@@ -279,7 +279,7 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
                to run. */
             if (errno == ENOENT)
                 continue;
-            fprintf(stderr, "sg: 無法讀取 %s: %s\n", sg_quote_path_delimited(relpath), strerror(errno));
+            fprintf(stderr, "sg: cannot read %s: %s\n", sg_quote_path_delimited(relpath), strerror(errno));
             rc = -1;
             break;
         }
@@ -294,7 +294,7 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
                !tracked_under_dir(idx, relpath))
                 continue;
             if (sg_ignore_push_dir(ig, relpath) != 0) {
-                fprintf(stderr, "sg: 記憶體不足，無法載入 .gitignore 規則\n");
+                fprintf(stderr, "sg: out of memory, cannot load .gitignore rules\n");
                 rc = -1;
                 break;
             }
@@ -352,7 +352,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
            real path and make this conclude the file still exists -- which
            here would mean silently NOT staging a deletion. Refuse instead. */
         if (sg_path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
-            fprintf(stderr, "sg: 路徑過長,無法檢查 %s 是否已刪除\n", sg_quote_path_delimited(e->path));
+            fprintf(stderr, "sg: path too long, cannot check whether %s was deleted\n", sg_quote_path_delimited(e->path));
             rc = -1;
             break;
         }
@@ -386,7 +386,7 @@ static int stage_deletions_under(const char *repo_root, sg_index *idx, const cha
         /* Only the allocation failures get this message. The path-too-long
            bail above has already said what went wrong, and following it with
            "out of memory" would contradict it. */
-        fprintf(stderr, "sg: 記憶體不足，無法暫存刪除的檔案\n");
+        fprintf(stderr, "sg: out of memory, cannot stage deleted files\n");
     }
 
     for (i = 0; i < count; i++)
@@ -472,13 +472,13 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
        sg_cmd_add below), so refusing outright and exiting 1 fits sg's
        existing convention better than a silent per-argument skip. */
     if (rel[0] != '\0' && !sg_relpath_is_safe(rel)) {
-        fprintf(stderr, "sg: 路徑 %s 無效,無法加入索引\n", sg_quote_path_delimited(rel));
+        fprintf(stderr, "sg: path %s is invalid, cannot add to the index\n", sg_quote_path_delimited(rel));
         free(rel);
         return -1;
     }
 
     if (sg_path_join(abs_path, sizeof(abs_path), repo_root, rel) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法處理 %s\n", sg_quote_path_delimited(arg));
+        fprintf(stderr, "sg: path too long, cannot process %s\n", sg_quote_path_delimited(arg));
         free(rel);
         return -1;
     }
@@ -500,12 +500,12 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
         int pushed = push_parents(ig, rel, 1);
 
         if (pushed < 0) {
-            fprintf(stderr, "sg: 記憶體不足，無法載入 .gitignore 規則\n");
+            fprintf(stderr, "sg: out of memory, cannot load .gitignore rules\n");
             free(rel);
             return -1;
         }
         if (!force && rel[0] != '\0' && sg_ignore_is_ignored(ig, rel, 1)) {
-            fprintf(stderr, "sg: %s 被 .gitignore 規則忽略（使用 -f 強制加入）\n",
+            fprintf(stderr, "sg: %s is excluded by .gitignore rules (use -f to force add)\n",
                    sg_quote_path_delimited(arg));
             rc = -1;
         } else {
@@ -520,14 +520,14 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
         int pushed = push_parents(ig, rel, 0);
 
         if (pushed < 0) {
-            fprintf(stderr, "sg: 記憶體不足，無法載入 .gitignore 規則\n");
+            fprintf(stderr, "sg: out of memory, cannot load .gitignore rules\n");
             free(rel);
             return -1;
         }
         /* An explicitly named ignored file errors (git: exit 1 + advice)
            unless forced or already tracked -- tracked wins over ignore. */
         if (!force && !tracked_any_stage(idx, rel) && sg_ignore_is_ignored(ig, rel, 0)) {
-            fprintf(stderr, "sg: %s 被 .gitignore 規則忽略（使用 -f 強制加入）\n",
+            fprintf(stderr, "sg: %s is excluded by .gitignore rules (use -f to force add)\n",
                    sg_quote_path_delimited(arg));
             rc = -1;
         } else {
@@ -535,7 +535,7 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
         }
         pop_n(ig, pushed);
     } else {
-        fprintf(stderr, "sg: %s 是不支援的檔案類型（不是一般檔案）\n", sg_quote_path_delimited(arg));
+        fprintf(stderr, "sg: %s is an unsupported file type (not a regular file)\n", sg_quote_path_delimited(arg));
         rc = -1;
     }
 
@@ -590,7 +590,7 @@ int sg_cmd_add(int argc, char **argv)
     }
 
     if (sg_ignore_open(&ig, git_dir, repo_root) != 0) {
-        fprintf(stderr, "sg: 記憶體不足，無法載入 .gitignore 規則\n");
+        fprintf(stderr, "sg: out of memory, cannot load .gitignore rules\n");
         sg_index_free(&idx);
         free(git_dir);
         free(repo_root);

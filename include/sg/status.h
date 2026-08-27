@@ -78,8 +78,9 @@ int sg_status_diff_staged(const sg_flat_list *head_flat, const sg_index *idx, sg
    modified instead of failing the whole walk, and this adapter passes that
    through unchanged; see sg_diff_index_workdir's own contract in sg/diff.h
    for the full reasoning. This is a deliberate diagnostic downgrade: before
-   this adapter existed, a broken chunk pointer made this function print "無法
-   完整判斷工作目錄狀態" through its callers' safety gates; now the same path
+   this adapter existed, a broken chunk pointer made this function print
+   "cannot fully determine working directory status" through its callers'
+   safety gates; now the same path
    is indistinguishable from an ordinary edit. Safety is unaffected --
    unstaged.count > 0 still makes every dirty-workdir gate refuse -- but the
    caller no longer learns that the underlying cause was a corrupt chunk

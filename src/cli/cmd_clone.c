@@ -114,7 +114,7 @@ static int write_remote_and_tag_refs(const char *git_dir, const sg_ref_adv *adv,
            to chunk at all when it can't write the marker; a clone that keeps
            going here would be the one path left where the two disagree. */
         if (is_keepalive && sg_repo_mark_chunking_used(git_dir) != 0) {
-            fprintf(stderr, "sg: 無法在 .git/config 標記本地端已使用過分塊儲存\n");
+            fprintf(stderr, "sg: cannot mark chunk storage as used locally in .git/config\n");
             return -1;
         }
     }
@@ -242,7 +242,7 @@ static int write_config_stanza(const char *git_dir, const char *url, const char 
     FILE *f;
 
     if (!url_is_config_safe(url)) {
-        fprintf(stderr, "sg: URL 含有控制字元，拒絕寫入 config\n");
+        fprintf(stderr, "sg: URL contains control characters, refusing to write config\n");
         return -1;
     }
 
@@ -317,7 +317,7 @@ int sg_cmd_clone(int argc, char **argv)
     have_adv = 1;
 
     if (adv.count == 0) {
-        printf("warning: 遠端是空的 repository\n");
+        printf("warning: remote is an empty repository\n");
         if (write_config_stanza(git_dir, url, NULL) != 0) {
             fprintf(stderr, "sg: failed to write config\n");
             goto done;
@@ -341,7 +341,7 @@ int sg_cmd_clone(int argc, char **argv)
 
     default_branch = pick_default_branch(&adv);
     if (default_branch == NULL) {
-        printf("warning: 遠端沒有任何分支，只有 tag；跳過 checkout\n");
+        printf("warning: remote has no branches, only tags; skipping checkout\n");
         if (write_config_stanza(git_dir, url, NULL) != 0) {
             fprintf(stderr, "sg: failed to write config\n");
             goto done;
@@ -447,7 +447,7 @@ done:
        working clone. */
     if (rc != 0 && initialized)
         fprintf(stderr,
-               "sg: clone 未完成，'%s' 內容不完整，請自行刪除後再重試\n", target_dir);
+               "sg: clone did not finish, '%s' has incomplete contents, please remove it and retry\n", target_dir);
 
     if (have_adv)
         sg_ref_adv_free(&adv);

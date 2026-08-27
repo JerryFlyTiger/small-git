@@ -148,7 +148,7 @@ int sg_cmd_repack(int argc, char **argv)
     }
 
     if (count == 0) {
-        printf("沒有東西可以 repack\n");
+        printf("Nothing to repack\n");
         free(git_dir);
         return 0;
     }

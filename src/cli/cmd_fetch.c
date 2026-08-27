@@ -294,7 +294,7 @@ int sg_cmd_fetch(int argc, char **argv)
 
     url = sg_repo_read_remote_url(git_dir, remote);
     if (url == NULL) {
-        fprintf(stderr, "sg: remote '%s' 未設定 (找不到 .git/config 裡的 [remote \"%s\"] url)\n",
+        fprintf(stderr, "sg: remote '%s' is not configured (no [remote \"%s\"] url found in .git/config)\n",
                remote, remote);
         goto done;
     }
@@ -304,7 +304,7 @@ int sg_cmd_fetch(int argc, char **argv)
     have_adv = 1;
 
     if (adv.count == 0) {
-        printf("warning: 遠端是空的 repository\n");
+        printf("warning: remote is an empty repository\n");
         rc = 0;
         goto done;
     }
@@ -365,7 +365,7 @@ int sg_cmd_fetch(int argc, char **argv)
     for (i = 0; i < adv.count; i++) {
         if (strcmp(adv.refs[i].name, SG_CHUNK_KEEPALIVE_REF) == 0) {
             if (sg_chunk_keepalive_merge_commit(git_dir, adv.refs[i].id) != 0) {
-                fprintf(stderr, "sg: warning: 未能合併遠端的 %s\n", SG_CHUNK_KEEPALIVE_REF);
+                fprintf(stderr, "sg: warning: failed to merge remote's %s\n", SG_CHUNK_KEEPALIVE_REF);
             } else if (sg_repo_mark_chunking_used(git_dir) != 0) {
                 /* Fatal for the same reason as in cmd_clone.c: a repo holding
                    chunk pointers but missing this marker reads as "never
@@ -373,7 +373,7 @@ int sg_cmd_fetch(int argc, char **argv)
                    chunk_resolve then hands back pointer text as file
                    contents. sg_chunk_store_blob refuses to chunk when it
                    can't write the marker; fetch must not be laxer. */
-                fprintf(stderr, "sg: 無法在 .git/config 標記本地端已使用過分塊儲存\n");
+                fprintf(stderr, "sg: cannot mark chunk storage as used locally in .git/config\n");
                 goto done;
             }
             break;

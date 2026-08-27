@@ -32,7 +32,7 @@ static int list_tags(const char *git_dir)
     size_t i;
 
     if (sg_ref_list_under(git_dir, "refs/tags/", &names, &count) != 0) {
-        fprintf(stderr, "sg: 無法列出標籤\n");
+        fprintf(stderr, "sg: cannot list tags\n");
         return 1;
     }
 
@@ -62,20 +62,20 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
     char ref_path[SG_PATH_MAX];
 
     if (!sg_ref_name_valid_for_create(name)) {
-        fprintf(stderr, "sg: '%s' 不是有效的標籤名稱\n", name);
+        fprintf(stderr, "sg: '%s' is not a valid tag name\n", name);
         return 1;
     }
     if (!force && tag_exists(git_dir, name)) {
-        fprintf(stderr, "sg: 標籤 '%s' 已經存在\n", name);
+        fprintf(stderr, "sg: tag '%s' already exists\n", name);
         return 1;
     }
     if (sg_rev_parse_commit(git_dir, rev != NULL ? rev : "HEAD", target_id) != 0) {
-        fprintf(stderr, "sg: 無法解析 '%s'\n", rev != NULL ? rev : "HEAD");
+        fprintf(stderr, "sg: cannot resolve '%s'\n", rev != NULL ? rev : "HEAD");
         return 1;
     }
 
     if (snprintf(ref_path, sizeof(ref_path), "refs/tags/%s", name) >= (int)sizeof(ref_path)) {
-        fprintf(stderr, "sg: 標籤名稱太長\n");
+        fprintf(stderr, "sg: tag name too long\n");
         return 1;
     }
 
@@ -109,25 +109,25 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         tag.message = cleaned_message;
 
         if (sg_tag_serialize(&tag, &serialized, &serialized_len) != 0) {
-            fprintf(stderr, "sg: 無法序列化標籤物件\n");
+            fprintf(stderr, "sg: cannot serialize tag object\n");
             free(cleaned_message);
             return 1;
         }
         free(cleaned_message);
         if (sg_loose_write(git_dir, SG_OBJ_TAG, serialized, serialized_len, tag_id) != 0) {
-            fprintf(stderr, "sg: 無法寫入標籤物件\n");
+            fprintf(stderr, "sg: cannot write tag object\n");
             free(serialized);
             return 1;
         }
         free(serialized);
 
         if (sg_ref_write_path(git_dir, ref_path, tag_id) != 0) {
-            fprintf(stderr, "sg: 無法建立標籤 '%s'\n", name);
+            fprintf(stderr, "sg: cannot create tag '%s'\n", name);
             return 1;
         }
     } else {
         if (sg_ref_write_path(git_dir, ref_path, target_id) != 0) {
-            fprintf(stderr, "sg: 無法建立標籤 '%s'\n", name);
+            fprintf(stderr, "sg: cannot create tag '%s'\n", name);
             return 1;
         }
     }
@@ -140,14 +140,14 @@ static int delete_tag(const char *git_dir, const char *name)
     int rc = sg_ref_delete_under(git_dir, "refs/tags/", name);
 
     if (rc == 1) {
-        fprintf(stderr, "sg: 找不到標籤 '%s'\n", name);
+        fprintf(stderr, "sg: tag '%s' not found\n", name);
         return 1;
     }
     if (rc != 0) {
-        fprintf(stderr, "sg: 刪除標籤 '%s' 失敗\n", name);
+        fprintf(stderr, "sg: failed to delete tag '%s'\n", name);
         return 1;
     }
-    printf("已刪除標籤 '%s'\n", name);
+    printf("Deleted tag '%s'\n", name);
     return 0;
 }
 

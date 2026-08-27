@@ -335,7 +335,7 @@ static void test_demux_unknown_band_after_multiplex_is_protocol_error(void)
     rc = sg_demux_sideband_response(buf, len, &pack_out);
     CHECK(rc == -1,
          "an unknown band byte encountered after multiplexing has started must be a protocol "
-         "error (spec: \"其他值 = 協定錯誤\"), got rc=%d",
+         "error (spec: \"any other value = protocol error\"), got rc=%d",
          rc);
 
     sg_buf_free(&pack_out);

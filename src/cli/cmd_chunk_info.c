@@ -141,7 +141,8 @@ static void print_shared_chunks(const char *git_dir, const sg_chunk_pointer *ptr
             shared++;
     }
 
-    printf("shared chunks: %zu/%zu（也被其他分塊物件引用）\n", shared, ptr->chunk_count);
+    printf("shared chunks: %zu/%zu (also referenced by other chunked objects)\n", shared,
+           ptr->chunk_count);
     free(all.ids);
 }
 

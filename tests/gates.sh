@@ -1,50 +1,95 @@
 #!/bin/bash
-# 完成標準的四道閘門,跑成一支,印精簡摘要 + 原始 log 的路徑。
+# The four gates that make up the completion standard, run as one script,
+# printing a compact summary + the paths of the raw logs. There is also an
+# optional fifth, macOS-only gate (--leaks); it is not part of the completion
+# standard, it is a coarse local stand-in for the leak detection that only
+# CI's ubuntu ASan job can actually do.
 #
-# CLAUDE.md 的「建置與驗證」規定完成標準是 make + make test + interop.sh 全綠,
-# 動到記憶體管理或 pack/chunk 時加跑 make sanitize。這支腳本把那條管線固定
-# 下來,主要不是為了少打字,而是為了**每次都用同一套抽取規則讀結果**——
-# 即興 grep 抽錯數字會導致誤讀閘門結果,那是本專案最糟的失敗模式。
+# CLAUDE.md's "Build & verify" section requires make + make test + interop.sh
+# all green as the completion standard, plus make sanitize when memory
+# management or pack/chunk code was touched. This script pins that pipeline
+# down -- not mainly to save typing, but so that **every run reads the results
+# with the same extraction rules**: ad hoc grep on the wrong number leads to
+# misreading a gate, and that is this project's worst failure mode.
 #
-# 用法:
+# Usage:
 #   bash tests/gates.sh              # make + make test + interop.sh
-#   bash tests/gates.sh --sanitize   # 再加 make sanitize(會 clean 兩次,慢)
-#   bash tests/gates.sh --rebuild    # 先 make clean,讓 warning 數真的有意義
+#   bash tests/gates.sh --sanitize   # also run make sanitize (cleans twice, slow)
+#   bash tests/gates.sh --rebuild    # make clean first, so the warning count means something
+#   bash tests/gates.sh --leaks      # also run /usr/bin/leaks over the unit test binaries (macOS)
 #
-# 退出碼:全部跑到的閘門都綠才 0,否則 1(參數錯誤是 2)。
+# Exit code: 0 only if every gate that ran is green, otherwise 1 (bad
+# arguments give 2).
 #
-# 不含在這裡的:python3 tests/fuzz_ignore.py 是**條件式**閘門(只在動到
-# ignore 或目錄走訪時才跑),不是每次都要,所以刻意不併進來;CI 的觀察用
-# `gh run watch` 就夠。
+# Not included here: python3 tests/fuzz_ignore.py is a **conditional** gate
+# (only run when ignore handling or directory traversal is touched), not
+# something to run every time, so it is deliberately left out; watching CI
+# is a plain `gh run watch`.
 #
-# WHY(每一條都是踩過坑才有的,不要拿掉):
+# WHY (each one is here because of a bug that was hit; do not remove any):
 #
-#   1. warning 數要連「有幾個 TU 真的重編」一起報。CFLAGS 沒有 -Werror,所以
-#      綠燈不等於零警告——但 build/ 是最新的時候 make 什麼都不編,warning 自然
-#      是 0。那個 0 完全不代表沒有警告,只代表沒人看。不標註重編數就會把
-#      「沒量到」當成「量到 0」,而這種誤判的方向永遠是「已驗過」。
+#   1. The warning count must be reported alongside how many TUs actually got
+#      recompiled. CFLAGS has no -Werror, so green does not mean zero
+#      warnings -- but when build/ is already up to date, make compiles
+#      nothing and the warning count is naturally 0. That 0 does not mean
+#      "no warnings", it means "nobody looked". Failing to flag the recompile
+#      count turns "not measured" into "measured as 0", and that kind of
+#      misreading always points the wrong way: toward "already verified".
 #
-#   2. make test 在第一個失敗的二進位就停(Makefile 的 `$$t || exit 1`),所以
-#      FAIL 行的數量是**截斷過的**,而且後面的二進位根本沒跑。摘要報
-#      「跑到幾個 / 共幾個」,少於總數就是中途中止,不是「其他都過了」。
+#   2. make test stops at the first failing binary (the Makefile's
+#      `$$t || exit 1`), so the FAIL line count is **truncated**, and the
+#      binaries after the failure never ran at all. The summary reports
+#      "ran N of TOTAL"; fewer than the total means it stopped partway
+#      through, not "everything else passed".
 #
-#   3. 退出碼非 0 但一行 FAIL 都沒有,仍然是失敗(段錯誤、逾時、建置失敗)。
-#      只數 FAIL 行會把崩潰讀成綠燈。這條與 tests/mutate.sh 的規則 2 同源。
+#   3. A non-zero exit code with zero FAIL lines is still a failure (segfault,
+#      timeout, build failure). Counting only FAIL lines would read a crash as
+#      green. This rule shares its root cause with rule 2 in tests/mutate.sh.
 #
-#   4. interop.sh 的 `interop: N/M passed, K skipped` 只有跑到最後才會印。抓
-#      不到那一行時要明講「摘要行不存在」,絕不能靜靜地當成沒事。K > 0 一律
-#      標 warn:interop.sh 有 63 個 skip 呼叫,少一個 python3 或 git 就整組
-#      smart-HTTP 互通跳過,而它自己照樣退出 0。而且 K 還會低估——實測把
-#      HTTP_AVAILABLE 關掉,K 只有 32,但 M 從 998 掉到 886(skip() 只加 SKIP,
-#      不加 TOTAL,所以沒被 skip() 明講的那 80 項是連數字都不留就消失的)。
-#      這就是為什麼 M 自己也要看,不能只看 N == M。
+#   4. interop.sh's `interop: N/M passed, K skipped` line is only printed once
+#      the run reaches the end. When that line cannot be found, say so
+#      explicitly -- never silently treat it as fine. K > 0 is always flagged
+#      warn: interop.sh has 63 skip() calls, and missing python3 or git alone
+#      is enough to skip the entire smart-HTTP interop group, while the
+#      script itself still exits 0. And K understates it further -- measured:
+#      turning off HTTP_AVAILABLE gives K = 32, but M drops from 998 to 886
+#      (skip() only increments SKIP, not TOTAL, so the 80 checks it does not
+#      explicitly name vanish without leaving any number behind at all). That
+#      is why M itself must be checked too, not just N == M.
 #
-#   5. macOS 的 ASan **不做** leak 偵測(detect_leaks is not supported on this
-#      platform),所以本機 make sanitize 綠燈對記憶體洩漏是零證據——那要靠
-#      CI 的 ubuntu ASan job。Phase 16 就是這樣讓一個 strdup 洩漏過了本機。
+#   5. macOS's ASan does **not** do leak detection (detect_leaks is not
+#      supported on this platform), so a green `make sanitize` on this
+#      machine is zero evidence against memory leaks -- that has to come from
+#      CI's ubuntu ASan job. Phase 16 is exactly how a strdup leak slipped
+#      past this machine once.
 #
-#   6. sanitize 之後一定要 make clean。object 檔不記錄自己是用哪組旗標編的,
-#      不清就直接 make 會把 sanitizer 的 .o 連進普通建置(Makefile:76-80)。
+#   6. make clean is mandatory after sanitize. Object files do not record
+#      which flag set they were built with, so skipping the clean and running
+#      a plain make afterward links the sanitizer's .o files into the normal
+#      build (Makefile:76-80).
+#
+#   7. `leaks`'s exit code alone is not enough, and reading it alone would
+#      turn a crash into a green row. Measured on this machine, all four
+#      quadrants:
+#        - exits 1, leaks nothing        -> rc 0, "0 leaks for 0 total ..."
+#        - exits 0, leaks 200 blocks     -> rc 1, "200 leaks for 22937600 ..."
+#        - exits 1, leaks 200 blocks     -> rc 1, same line
+#        - SIGSEGV                       -> rc 0, and NO summary line at all
+#      So rc reflects the leak verdict and never the binary's own exit status
+#      (pass/fail is gate 2's job, not this one's), but a binary that dies
+#      before exit produces rc 0 with nothing measured. That is why this gate
+#      requires the "N leaks for M total leaked bytes" line from every binary
+#      and reports "analyzed N of TOTAL" -- the same shape as gate 2's
+#      "ran N of TOTAL", and for the same reason.
+#
+#   8. `leaks` is a CONSERVATIVE scanner, so a green row means "nothing it
+#      could prove leaked", not "no leaks". Measured: a single 4 KB malloc
+#      made in a helper that returns is NOT reported (the dead frame still
+#      holds the pointer value, and the scan treats the stack as a root),
+#      while 200 x 100 KB with the stack scrubbed afterwards is. Treat this
+#      gate as a net for accumulating leaks, never as a substitute for CI's
+#      LeakSanitizer, which is precise and is the only automated leak
+#      detection this project actually has (see .github/workflows/ci.yml).
 
 set -u
 
@@ -54,23 +99,30 @@ cd "$PROJECT_ROOT" || exit 1
 
 WANT_SANITIZE=0
 WANT_REBUILD=0
+WANT_LEAKS=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --sanitize) WANT_SANITIZE=1 ;;
         --rebuild)  WANT_REBUILD=1 ;;
+        --leaks)    WANT_LEAKS=1 ;;
         -h|--help)
-            # 印完整個開頭註解區塊(到第一個非註解、非空白行為止)。三個細節:
-            # 不要改成固定行號(之前寫死 2,30p,WHY 3~6 剛好被切掉,而那幾條正
-            # 是教人怎麼正確讀懂綠燈的);不要用 "$0"(上面已經 cd 過了,
-            # `cd tests && bash gates.sh --help` 會讀不到自己而靜靜印空的);
-            # 空行要跳過而不是當終止條件——否則有人在 shebang 後面加一行空白
-            # 排版,--help 就永遠印零行,而且照樣退出 0。
+            # Print the whole header comment block (up to the first
+            # non-comment, non-blank line). Three details: do not switch this
+            # to a fixed line range (it used to be hardcoded as 2,30p, which
+            # cut off WHY 3-6 right when those are exactly the ones that teach
+            # people how to read a green result correctly); do not use "$0"
+            # (we already cd'd above, so `cd tests && bash gates.sh --help`
+            # would silently print nothing because it cannot find itself);
+            # blank lines must be skipped rather than treated as a stop
+            # condition -- otherwise someone adding a blank formatting line
+            # right after the shebang would make --help print zero lines
+            # forever, while still exiting 0.
             awk 'NR > 1 { if (/^#/) print; else if (NF) exit }' "$SCRIPT_DIR/$(basename "$0")"
             exit 0
             ;;
         *)
-            echo "usage: bash tests/gates.sh [--sanitize] [--rebuild]" >&2
+            echo "usage: bash tests/gates.sh [--sanitize] [--rebuild] [--leaks]" >&2
             exit 2
             ;;
     esac
@@ -78,17 +130,20 @@ while [ "$#" -gt 0 ]; do
 done
 
 LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/sg_gates_XXXXXX") || exit 1
-echo "log 目錄: $LOGDIR"
+echo "log directory: $LOGDIR"
 echo ""
 
-# 摘要列累積在這裡,最後一次印出來——閘門跑很久,中途的輸出會被捲走。
+# Summary rows accumulate here and get printed all at once at the end -- the
+# gates take a while to run, and mid-run output would otherwise scroll away.
 ROWS=()
 OVERALL=0
 
-# row <狀態> <閘門名> <說明> <秒數> <log 檔名>
+# row <status> <gate name> <description> <seconds> <log filename>
 #
-# 定寬欄位只放 ASCII:printf 的 %-Ns 數的是位元組,中文一字三位元組,拿它排
-# 中文說明會歪掉。所以說明固定放最後一欄,不參與對齊。
+# Fixed-width fields only hold ASCII: printf's %-Ns counts bytes, and CJK
+# characters are three bytes each, which would throw off alignment for a
+# CJK description. That is why the description always goes in the last
+# column and does not participate in alignment.
 row() {
     ROWS+=("$(printf '%-4s %-9s %5ss  %-12s  %s' "$1" "$2" "$4" "$5" "$3")")
     if [ "$1" = "FAIL" ]; then
@@ -96,47 +151,86 @@ row() {
     fi
 }
 
-# 只認建置工具的診斷格式,三種:
-#   1. 「src/x.c:12:5: warning: ...」——檔案:行[:欄]。
-#   2. 「<command-line>: warning: "FOO" redefined」——GCC 的巨集重定義走這個
-#      格式,沒有檔名。本專案特別需要它:Makefile:5-18 整段就是在講
-#      _POSIX_C_SOURCE / _DEFAULT_SOURCE / _DARWIN_C_SOURCE 這組 feature-test
-#      巨集的跨平台衝突,真踩到的話警告正是長這樣。
-#   3. 「clang: warning:」「/usr/bin/ld: warning:」「make: warning: Clock skew」
-#      ——工具自己發的,前面可能帶完整路徑,所以不能用 ^ 直接錨住工具名。
-#      `make` 也收進來是因為 clock skew 會讓 make 的「誰比較新」判斷失準,連
-#      帶讓 count_tus 那條防線不可信,那種事必須看得見。
-# clang 結尾的「3 warnings generated.」沒有冒號,不會重複計數。
+# Only recognizes the build tools' diagnostic formats, three of them:
+#   1. "src/x.c:12:5: warning: ..." -- file:line[:col].
+#   2. "<command-line>: warning: \"FOO\" redefined" -- GCC's macro
+#      redefinition warning uses this format, with no filename. This project
+#      specifically needs it: Makefile:5-18 is entirely about the
+#      cross-platform clash between the _POSIX_C_SOURCE / _DEFAULT_SOURCE /
+#      _DARWIN_C_SOURCE feature-test macros, and hitting that in practice
+#      looks exactly like this.
+#   3. "clang: warning:" / "/usr/bin/ld: warning:" / "make: warning: Clock
+#      skew" -- emitted by the tool itself, possibly with a full path in
+#      front, so the tool name cannot be anchored with ^. `make` is included
+#      here because a clock skew warning undermines make's own idea of "what
+#      is newer than what", which in turn makes the count_tus safety net
+#      untrustworthy -- that has to be visible.
+# clang's trailing "3 warnings generated." line has no colon, so it will not
+# be double-counted.
 #
-# 不要放寬成 ': warning:' —— sg 自己執行時就會印「sg: warning: 忽略遠端不合法
-# 的 ref 名稱 ...」,而 make test 與 make sanitize 的 log 裡有測試二進位的輸出。
-# 實測:在 tests/ 種一個未使用變數,寬鬆版數出 7 個 warning(1 個真的 + 6 個
-# test_refadv 的執行期訊息)。摘要多報 warning 跟少報一樣糟——它會讓人去 log
-# 裡找不存在的東西,下次就不信這個數字了。第一段用 `.+` 而不是 `[^ ]+`,是為了
-# 讓含空白的路徑(repo 被 clone 到「My Projects」那種目錄底下)也抓得到;要求
-# 中間必須有 `:數字:` 就足以把執行期訊息擋在外面。
+# Do not loosen this to just ': warning:' -- sg itself prints
+# "sg: warning: ignoring invalid remote ref name ..." when it runs, and the
+# make test / make sanitize logs contain test-binary output too. Measured: a
+# planted unused variable in tests/ makes the loose version count 7 warnings
+# (1 real one + 6 runtime messages from test_refadv). Over-reporting warnings
+# is just as bad as under-reporting -- it sends people to the log looking for
+# something that is not there, and they stop trusting the number after that.
+# The first alternative uses `.+` rather than `[^ ]+` so that paths containing
+# spaces (a repo cloned under a directory like "My Projects") are still
+# matched; requiring a `:<number>:` in the middle is enough to keep runtime
+# messages out.
 count_warnings() {
     grep -cE '^(.+:[0-9]+(:[0-9]+)?|<[^>]*>|([^ ]*/)?(clang|gcc|cc|ld|as|cc1|cc1plus|make)[^: ]*): warning:' "$1"
 }
 
-# Makefile 沒有 @ 開頭,編譯指令會原樣印出來;數 `-c src/` 就知道有幾個 TU
-# 真的重編了(見 WHY 1)。
+# The Makefile has no @ prefix, so compile commands are echoed verbatim;
+# counting `-c src/` occurrences tells us how many TUs actually got
+# recompiled (see WHY 1).
 count_tus() { grep -c -- ' -c src/' "$1"; }
 
-# 單元測試的 FAIL 行是「FAIL file:line ...」,interop 的是「FAIL: label」,
-# 兩者都以 FAIL 開頭。
+# Unit test FAIL lines look like "FAIL file:line ...", interop's like
+# "FAIL: label" -- both start with FAIL.
 count_fails() { grep -c '^FAIL' "$1"; }
 
 TOTAL_BINS=$(find tests -name '*.c' | wc -l | tr -d ' ')
 
+# Gate 5 re-runs every test binary under `leaks`, so it inherits their
+# runtimes -- and a binary that hangs there would hold the terminal forever
+# with a status that is neither 0 nor non-zero. That is the exact shape
+# tests/mutate.sh grew SG_MUTATE_TIMEOUT for, so this gate gets the same
+# treatment. macOS ships no timeout(1); this returns 124 on expiry the way
+# GNU timeout does. Polled at 200 ms rather than 1 s because a 1 s poll adds
+# most of a second to each of 50 fast binaries -- nearly a minute of pure
+# waiting.
+LEAKS_TIMEOUT=${SG_LEAKS_TIMEOUT:-120}
+
+run_with_timeout() {
+    local secs=$1
+    shift
+    "$@" &
+    local pid=$!
+    local ticks=0
+    local limit=$((secs * 5))
+    while kill -0 "$pid" 2> /dev/null; do
+        if [ "$ticks" -ge "$limit" ]; then
+            kill -9 "$pid" 2> /dev/null
+            wait "$pid" 2> /dev/null
+            return 124
+        fi
+        sleep 0.2
+        ticks=$((ticks + 1))
+    done
+    wait "$pid"
+}
+
 # ---------------------------------------------------------------- gate 1: make
 
 if [ "$WANT_REBUILD" = 1 ]; then
-    echo "→ make clean(--rebuild)"
+    echo "-> make clean (--rebuild)"
     make clean > "$LOGDIR/clean.log" 2>&1
 fi
 
-echo "→ make"
+echo "-> make"
 t0=$SECONDS
 make > "$LOGDIR/build.log" 2>&1
 rc=$?
@@ -145,61 +239,66 @@ warns=$(count_warnings "$LOGDIR/build.log")
 tus=$(count_tus "$LOGDIR/build.log")
 
 if [ "$rc" -ne 0 ]; then
-    row "FAIL" "make" "建置失敗(退出碼 $rc)" "$dt" "build.log"
+    row "FAIL" "make" "build failed (exit code $rc)" "$dt" "build.log"
     echo ""
     tail -20 "$LOGDIR/build.log"
     echo ""
-    echo "建置失敗,後面的閘門沒有意義,停在這裡。log: $LOGDIR/build.log"
+    echo "build failed, later gates would be meaningless, stopping here. log: $LOGDIR/build.log"
     exit 1
 fi
 
 if [ "$tus" -eq 0 ]; then
-    # 見 WHY 1:什麼都沒重編時,warning 數是「沒量到」而不是「量到 0」。
-    row "ok" "make" "0 個 TU 重編 → warning 數無意義(要量請用 --rebuild)" "$dt" "build.log"
+    # See WHY 1: when nothing got recompiled, the warning count is "not
+    # measured", not "measured as 0".
+    row "ok" "make" "0 TUs recompiled -> warning count is meaningless (use --rebuild to measure)" "$dt" "build.log"
 elif [ "$warns" -gt 0 ]; then
-    # 沒有 -Werror,所以這裡是 ok 而不是 FAIL——但要看得見。
-    row "warn" "make" "$warns 個 warning($tus 個 TU 重編)" "$dt" "build.log"
+    # No -Werror, so this is ok rather than FAIL -- but it must be visible.
+    row "warn" "make" "$warns warning(s) ($tus TU(s) recompiled)" "$dt" "build.log"
 else
-    row "ok" "make" "0 個 warning($tus 個 TU 重編)" "$dt" "build.log"
+    row "ok" "make" "0 warnings ($tus TU(s) recompiled)" "$dt" "build.log"
 fi
 
 # ----------------------------------------------------------- gate 2: make test
 
-echo "→ make test"
+echo "-> make test"
 t0=$SECONDS
 make test > "$LOGDIR/test.log" 2>&1
 rc=$?
 dt=$((SECONDS - t0))
 ran=$(grep -c '^== build/tests/' "$LOGDIR/test.log")
 fails=$(count_fails "$LOGDIR/test.log")
-# 測試檔的 warning 也要數。tests/*.c 是一步編譯+連結(Makefile:65-67,沒有
-# `-c`),不會出現在 gate 1 的 log 裡——不在這裡數的話,tests/ 底下的警告在整
-# 份摘要中會完全消失,連 warn 都不會標。
+# Test-file warnings must be counted too. tests/*.c is compiled and linked in
+# one step (Makefile:65-67, no `-c`), so it never shows up in gate 1's log --
+# without counting it here, warnings under tests/ would vanish from the
+# summary entirely, without even being flagged warn.
 warns=$(count_warnings "$LOGDIR/test.log")
-# 這道也要分「沒量到」與「量到 0」,理由與 WHY 1 完全相同:連跑兩次而中間沒
-# 改任何原始碼時,make 一個測試二進位都不會重編,warns 必然是 0 而那個 0 什麼
-# 都不代表。測試二進位是一步編譯+連結,所以數 `-o build/tests/` 就是重編數。
+# This gate also needs to distinguish "not measured" from "measured as 0",
+# for exactly the same reason as WHY 1: running twice in a row with no
+# source changes in between recompiles zero test binaries, so warns is
+# necessarily 0 and that 0 means nothing. Test binaries are compiled and
+# linked in one step, so counting `-o build/tests/` gives the recompile count.
 built=$(grep -c -- '-o build/tests/' "$LOGDIR/test.log")
 
 if [ "$rc" -eq 0 ] && [ "$fails" -eq 0 ] && [ "$ran" -eq "$TOTAL_BINS" ]; then
     if [ "$warns" -gt 0 ]; then
-        row "warn" "make test" "$ran/$TOTAL_BINS 個二進位全過,但有 $warns 個 warning" "$dt" "test.log"
+        row "warn" "make test" "$ran/$TOTAL_BINS binaries all passed, but $warns warning(s)" "$dt" "test.log"
     elif [ "$built" -eq 0 ]; then
-        row "ok" "make test" "$ran/$TOTAL_BINS 個二進位全過(0 個重編 → warning 數無意義)" "$dt" "test.log"
+        row "ok" "make test" "$ran/$TOTAL_BINS binaries all passed (0 recompiled -> warning count is meaningless)" "$dt" "test.log"
     else
-        row "ok" "make test" "$ran/$TOTAL_BINS 個二進位全過,0 個 warning($built 個重編)" "$dt" "test.log"
+        row "ok" "make test" "$ran/$TOTAL_BINS binaries all passed, 0 warnings ($built recompiled)" "$dt" "test.log"
     fi
 elif [ "$fails" -gt 0 ]; then
-    # 見 WHY 2:$ran < $TOTAL_BINS 表示中途中止,不是「其他都過了」。
-    row "FAIL" "make test" "$ran/$TOTAL_BINS 個跑到,$fails 個 FAIL 行(第一個失敗即中止)" "$dt" "test.log"
+    # See WHY 2: $ran < $TOTAL_BINS means it stopped partway, not "everything
+    # else passed".
+    row "FAIL" "make test" "$ran/$TOTAL_BINS ran, $fails FAIL line(s) (stopped at the first failure)" "$dt" "test.log"
 else
-    # 見 WHY 3:沒有 FAIL 行但退出碼非 0,照樣是失敗。
-    row "FAIL" "make test" "$ran/$TOTAL_BINS 個跑到,0 個 FAIL 行但退出碼 $rc(崩潰或建置失敗)" "$dt" "test.log"
+    # See WHY 3: no FAIL lines but a non-zero exit code is still a failure.
+    row "FAIL" "make test" "$ran/$TOTAL_BINS ran, 0 FAIL lines but exit code $rc (crash or build failure)" "$dt" "test.log"
 fi
 
 # --------------------------------------------------------- gate 3: interop.sh
 
-echo "→ bash tests/interop.sh"
+echo "-> bash tests/interop.sh"
 t0=$SECONDS
 bash tests/interop.sh > "$LOGDIR/interop.log" 2>&1
 rc=$?
@@ -208,33 +307,118 @@ summary=$(grep '^interop:' "$LOGDIR/interop.log")
 fails=$(count_fails "$LOGDIR/interop.log")
 
 if [ -z "$summary" ]; then
-    # 見 WHY 4:摘要行不存在就是腳本中途死了,不能靜靜跳過。
-    row "FAIL" "interop" "沒有印出 interop: 摘要行(中途死掉,退出碼 $rc)" "$dt" "interop.log"
+    # See WHY 4: a missing summary line means the script died partway
+    # through, and that must not be silently skipped over.
+    row "FAIL" "interop" "no interop: summary line printed (died partway, exit code $rc)" "$dt" "interop.log"
 else
-    # 整行原樣帶出來,包含 skipped——skip 是「這項沒跑」,不是綠燈。
+    # Carry the whole line through as-is, including skipped -- skipped means
+    # "this check did not run", not green.
     line=${summary#interop: }
     skipped=$(printf '%s' "$line" | sed -n 's/.*, \([0-9]*\) skipped.*/\1/p')
     if [ "$rc" -eq 0 ] && [ "$fails" -eq 0 ]; then
         if [ -n "$skipped" ] && [ "$skipped" -gt 0 ] 2>/dev/null; then
-            # 狀態欄要標 warn 而不是 ok。interop.sh 有 63 個 skip 呼叫,少一個
-            # python3 或 git 就會讓整組 smart-HTTP 互通(clone/fetch/push 走真
-            # 的線路,格式相容性最關鍵的端到端驗證)全部跳過,而 interop.sh 自
-            # 己照樣退出 0。把那種情況印成綠色的 ok、只在句尾附一行小字,正是
-            # gate 2 用「跑到幾個/共幾個」擋掉的同一種謊。不判 FAIL 是因為依賴
-            # 缺席時 skip 是合法的,但它絕不是綠燈。
-            row "warn" "interop" "$line ← skipped 不是綠燈,那 $skipped 項沒跑" "$dt" "interop.log"
+            # The status column must say warn, not ok. interop.sh has 63
+            # skip() calls, and missing python3 or git alone is enough to
+            # skip the entire smart-HTTP interop group (clone/fetch/push over
+            # the real wire, the most critical end-to-end check of format
+            # compatibility), while interop.sh itself still exits 0. Printing
+            # that as green ok with only a small note at the end of the line
+            # is exactly the same lie that gate 2 blocks with "ran N of
+            # TOTAL". It is not marked FAIL because skipping is legitimate
+            # when a dependency is missing -- but it is never green either.
+            row "warn" "interop" "$line <- skipped is not green, $skipped item(s) did not run" "$dt" "interop.log"
         else
             row "ok" "interop" "$line" "$dt" "interop.log"
         fi
     else
-        row "FAIL" "interop" "$line($fails 個 FAIL 行,退出碼 $rc)" "$dt" "interop.log"
+        row "FAIL" "interop" "$line ($fails FAIL line(s), exit code $rc)" "$dt" "interop.log"
     fi
+fi
+
+# ------------------------------------------ gate 5: leaks (macOS, opt-in)
+#
+# Placed BEFORE gate 4 on purpose, and it has to be: `make sanitize` opens
+# with its own clean and closes with another one (WHY 6), so once gate 4 has
+# run there are no ordinary test binaries left to examine. Pointing `leaks`
+# at ASan-instrumented binaries would be wrong anyway -- ASan replaces the
+# allocator, which is the very thing `leaks` walks. The summary prints rows
+# in the order they ran, so this one appears above sanitize.
+
+if [ "$WANT_LEAKS" = 1 ]; then
+    if [ "$(uname -s)" != "Darwin" ]; then
+        # Not FAIL: on Linux the real LeakSanitizer runs in CI and is strictly
+        # better. But not silence either -- the row has to say it did not run.
+        ROWS+=("$(printf '%-4s %-9s %5s   %-12s  %s' "skip" "leaks" "-" "-" \
+            "not macOS -- CI's ubuntu ASan job runs the real LeakSanitizer instead")")
+    elif ! command -v leaks > /dev/null 2>&1; then
+        # Asked for explicitly and unavailable is a failure, not a skip.
+        row "FAIL" "leaks" "--leaks was requested but no leaks(1) was found on PATH" "0" "-"
+    else
+        echo "-> leaks (re-runs every unit test binary under /usr/bin/leaks)"
+        t0=$SECONDS
+        : > "$LOGDIR/leaks.log"
+        analyzed=0
+        leaking=0
+        leaked_bytes=0
+        problems=""
+        unreported=""
+        leakers=""
+        # -not -path '*.dSYM/*' so the debug bundles never get executed.
+        # MallocStackLogging is deliberately NOT set: measured, detection is
+        # identical without it and it costs time, and when something does leak
+        # the note at the end says how to get the stacks back.
+        bins=$(find build/tests -type f -perm -u+x -not -path '*.dSYM/*' | sort)
+        while IFS= read -r b; do
+            [ -z "$b" ] && continue
+            name=$(basename "$b")
+            echo "===== $name =====" >> "$LOGDIR/leaks.log"
+            run_with_timeout "$LEAKS_TIMEOUT" leaks -quiet --atExit -- "$b" \
+                > "$LOGDIR/one.log" 2>&1
+            lrc=$?
+            cat "$LOGDIR/one.log" >> "$LOGDIR/leaks.log"
+            sum=$(grep -oE '[0-9]+ leaks for [0-9]+ total leaked bytes' "$LOGDIR/one.log" | tail -1)
+            if [ "$lrc" -eq 124 ]; then
+                # See WHY 7: a hang measures nothing, and must never read green.
+                unreported="$unreported $name(timeout after ${LEAKS_TIMEOUT}s)"
+            elif [ -z "$sum" ]; then
+                # See WHY 7: this is what a crashed binary looks like -- rc 0
+                # and no summary line. Counting it as analyzed would be a lie.
+                unreported="$unreported $name(no summary line, exit $lrc)"
+            else
+                analyzed=$((analyzed + 1))
+                n=${sum%% leaks*}
+                if [ "$n" -gt 0 ]; then
+                    leaking=$((leaking + 1))
+                    leakers="$leakers $name($sum)"
+                    bytes=$(printf '%s' "$sum" | sed -n 's/.* for \([0-9]*\) total.*/\1/p')
+                    leaked_bytes=$((leaked_bytes + bytes))
+                fi
+            fi
+        done <<EOF
+$bins
+EOF
+        rm -f "$LOGDIR/one.log"
+        dt=$((SECONDS - t0))
+
+        [ -n "$unreported" ] && problems="$problems; no leak report from:$unreported"
+        [ "$leaking" -gt 0 ] && problems="$problems; leaking:$leakers ($leaked_bytes byte(s) total)"
+
+        if [ "$analyzed" -eq "$TOTAL_BINS" ] && [ -z "$problems" ]; then
+            # "conservative scan" is in the row on purpose (WHY 8): this line
+            # must not be read as "this build has no leaks".
+            row "ok" "leaks" "$analyzed/$TOTAL_BINS analyzed, 0 leaks (conservative scan, see WHY 8)" "$dt" "leaks.log"
+        else
+            row "FAIL" "leaks" "$analyzed/$TOTAL_BINS analyzed$problems" "$dt" "leaks.log"
+        fi
+    fi
+else
+    ROWS+=("$(printf '%-4s %-9s %5s   %-12s  %s' "skip" "leaks" "-" "-" "not run (add --leaks to run it)")")
 fi
 
 # ------------------------------------------------------ gate 4: make sanitize
 
 if [ "$WANT_SANITIZE" = 1 ]; then
-    echo "→ make sanitize(自帶 clean,會重建整份)"
+    echo "-> make sanitize (cleans and rebuilds everything itself)"
     t0=$SECONDS
     make sanitize > "$LOGDIR/sanitize.log" 2>&1
     rc=$?
@@ -242,48 +426,59 @@ if [ "$WANT_SANITIZE" = 1 ]; then
     ran=$(grep -c '^== build/tests/' "$LOGDIR/sanitize.log")
     fails=$(count_fails "$LOGDIR/sanitize.log")
     errs=$(grep -cE 'runtime error:|ERROR: (Address|Leak|UndefinedBehavior)Sanitizer' "$LOGDIR/sanitize.log")
-    # sanitizer 旗標會開出一些普通建置看不到的警告,同樣不要讓它消失。
+    # The sanitizer flags surface some warnings a normal build never shows;
+    # those must not disappear either.
     warns=$(count_warnings "$LOGDIR/sanitize.log")
 
     if [ "$rc" -eq 0 ] && [ "$errs" -eq 0 ] && [ "$fails" -eq 0 ] && [ "$ran" -eq "$TOTAL_BINS" ]; then
         if [ "$warns" -gt 0 ]; then
-            row "warn" "sanitize" "$ran/$TOTAL_BINS 個二進位,0 個 sanitizer 錯誤,但有 $warns 個 warning" "$dt" "sanitize.log"
+            row "warn" "sanitize" "$ran/$TOTAL_BINS binaries, 0 sanitizer errors, but $warns warning(s)" "$dt" "sanitize.log"
         else
-            row "ok" "sanitize" "$ran/$TOTAL_BINS 個二進位,0 個 sanitizer 錯誤" "$dt" "sanitize.log"
+            row "ok" "sanitize" "$ran/$TOTAL_BINS binaries, 0 sanitizer errors" "$dt" "sanitize.log"
         fi
     else
-        row "FAIL" "sanitize" "$ran/$TOTAL_BINS 個跑到,$errs 個 sanitizer 錯誤,$fails 個 FAIL 行(退出碼 $rc)" "$dt" "sanitize.log"
+        row "FAIL" "sanitize" "$ran/$TOTAL_BINS ran, $errs sanitizer error(s), $fails FAIL line(s) (exit code $rc)" "$dt" "sanitize.log"
     fi
 
-    # 見 WHY 6:不清的話,sanitizer 的 .o 會被普通 make 連進去。
-    echo "→ make clean(sanitize 之後必須清,見腳本 WHY 6)"
+    # See WHY 6: without a clean, the sanitizer's .o files would get linked
+    # into a subsequent plain make.
+    echo "-> make clean (mandatory after sanitize, see script WHY 6)"
     make clean >> "$LOGDIR/clean.log" 2>&1
     CLEANED=1
 else
-    ROWS+=("$(printf '%-4s %-9s %5s   %-12s  %s' "skip" "sanitize" "-" "-" "沒跑(要跑加 --sanitize)")")
+    ROWS+=("$(printf '%-4s %-9s %5s   %-12s  %s' "skip" "sanitize" "-" "-" "not run (add --sanitize to run it)")")
     CLEANED=0
 fi
 
-# --------------------------------------------------------------------- 摘要
+# --------------------------------------------------------------------- summary
 
 echo ""
-echo "=== gates.sh 摘要 ==="
-# ${ROWS[@]+"${ROWS[@]}"} 而不是 "${ROWS[@]}":macOS 的系統 bash 是 3.2,在
-# set -u 底下展開空陣列會直接 unbound variable 中止。目前 gate 1 保證至少放進
-# 一列,所以還踩不到,但那是很脆的不變量——之後只要多一條在 gate 1 之前就跳到
-# 摘要區的路徑,整支腳本會在 macOS 上無聲炸掉。
+echo "=== gates.sh summary ==="
+# ${ROWS[@]+"${ROWS[@]}"} instead of "${ROWS[@]}": macOS's system bash is 3.2,
+# where expanding an empty array under set -u aborts with an unbound variable
+# error. Right now gate 1 guarantees at least one row gets added, so this is
+# not hit today, but it is a fragile invariant -- if a path that jumps to the
+# summary before gate 1 is ever added, this script would die silently on
+# macOS.
 for r in ${ROWS[@]+"${ROWS[@]}"}; do
     echo "$r"
 done
 echo ""
-echo "原始 log: $LOGDIR"
+echo "raw logs: $LOGDIR"
 
 if [ "$WANT_SANITIZE" = 1 ] && [ "$(uname -s)" = "Darwin" ]; then
-    # 見 WHY 5。
-    echo "注意:macOS 的 ASan 不做 leak 偵測,上面 sanitize 那行對記憶體洩漏是零證據。"
+    # See WHY 5.
+    echo "note: macOS's ASan does not do leak detection, so the sanitize row above is zero evidence against memory leaks."
+    if [ "$WANT_LEAKS" != 1 ]; then
+        echo "note: --leaks is the local stand-in for that, though a coarse one (see WHY 8)."
+    fi
+fi
+if [ "$WANT_LEAKS" = 1 ] && [ "$(uname -s)" = "Darwin" ]; then
+    echo "note: the leaks row is a conservative scan (WHY 8) and proves less than CI's LeakSanitizer."
+    echo "note: for allocation stacks on a leaking binary, re-run it alone: MallocStackLogging=1 leaks --atExit -- build/tests/<name>"
 fi
 if [ "$CLEANED" = 1 ]; then
-    echo "注意:build/ 已清空,下一次 make 會是完整重建。"
+    echo "note: build/ has been cleaned, the next make will be a full rebuild."
 fi
 
 exit "$OVERALL"

@@ -70,7 +70,7 @@ int sg_cmd_reflog(int argc, char **argv)
     }
 
     if (sg_reflog_read(git_dir, ref_path, &log) != 0) {
-        fprintf(stderr, "sg: failed to read reflog for '%s'（檔案損壞？）\n", ref_arg);
+        fprintf(stderr, "sg: failed to read reflog for '%s' (corrupt file?)\n", ref_arg);
         free(git_dir);
         return 1;
     }

@@ -1,45 +1,59 @@
 #!/bin/bash
-# 定向 mutation 驗證:把一處修法故意改壞,確認「應該變紅的檢查真的變紅」。
+# Directed mutation verification: deliberately break one fix and confirm the
+# check that is supposed to catch it actually turns red.
 #
-# 這個專案的紀律是「新增或修改測試後,必須先證明它會紅再相信它」
-# (見 CLAUDE.md 的測試慣例)。這支腳本把那個步驟變成可執行的東西,並且
-# 內建三條踩過坑才學到的規則——見底下 WHY 段落(第 3 條在 report() 上方,
-# 因為它和逾時判定的實作綁在一起)。
+# This project's discipline is "after adding or changing a test, you must
+# prove it turns red before trusting it" (see the test conventions in
+# CLAUDE.md). This script turns that step into something runnable, and bakes
+# in three rules learned the hard way -- see the WHY section below (rule 3 is
+# written just above report(), because it is tied to how the timeout
+# detection is implemented).
 #
-# 用法:
-#   bash tests/mutate.sh <名稱> <目標檔> <perl -0pe 運算式> [測試二進位名]
-#   bash tests/mutate.sh <名稱> <目標檔> <perl -0pe 運算式> --interop
+# Usage:
+#   bash tests/mutate.sh <name> <target-file> <perl -0pe expression> [test-binary]
+#   bash tests/mutate.sh <name> <target-file> <perl -0pe expression> --interop
 #
-#   <目標檔> 是相對於專案根目錄的路徑,例如 src/storage/refs.c
-#   省略第四個參數時跑整個 make test。
+#   <target-file> is a path relative to the project root, e.g.
+#   src/storage/refs.c
+#   Omitting the fourth argument runs the whole make test.
 #
-# perl 運算式的分隔符要挑過,C 程式碼很容易撞到(每一條都實測踩過):
-#   s{...}{...}  樣式裡有不成對的 { 或 }(C 的區塊)就會壞掉
-#   s!...!...!   樣式裡有 != 就會壞掉
-#   s#...#...#   對 C 來說通常安全,優先用這個
-# 另外:**要改的字面量若在檔案裡出現不只一次,一定要加 /g**。實測踩過:同一個
-# 格式字串有兩份,沒加 /g 只改到第一份,結果看起來像「測試覆蓋不足」,其實是
-# mutation 只改了一半——驗證工具說謊的方向永遠是「已驗過」。
+# The perl expression's delimiter needs to be chosen carefully, since C code
+# collides with the common ones easily (each of these was hit in practice):
+#   s{...}{...}  breaks if the pattern has an unpaired { or } (a C block)
+#   s!...!...!   breaks if the pattern has !=
+#   s#...#...#   usually safe for C, prefer this one
+# Also: **if the literal being changed appears more than once in the file,
+# always add /g**. Measured in practice: the same format string existed in
+# two copies, and forgetting /g only changed the first one -- the result
+# looked like "insufficient test coverage" when it was actually a mutation
+# that only touched half its targets. The verification tooling's failure
+# mode always lies in the direction of "already verified".
 #
-# 例:
+# Example:
 #   bash tests/mutate.sh atn src/storage/revparse.c \
 #       's/entry->new_id/entry->old_id/' test_revparse
 #   bash tests/mutate.sh nomkdir src/storage/refs.c \
 #       's/sg_write_file_mkdirs/sg_write_file_no_such/' --interop
 #
-# 輸出:該 mutation 之下有哪些具名檢查變紅。若「什麼都沒紅」,那就是死角
-# ——這支腳本最有價值的用途正是找出那些「改了也不會有人發現」的修法。
+# Output: which named checks turn red under that mutation. If nothing turns
+# red at all, that is a blind spot -- this script's most valuable use is
+# finding exactly those fixes that can be broken without anyone noticing.
 #
-# WHY(三條規則都是踩過坑才加的,不要拿掉):
+# WHY (all three rules were added because of a bug that was hit; do not
+# remove any of them):
 #
-#   1. 每輪都從乾淨的複本重新完整建置。舊的 .o 檔不記錄自己是用哪份原始碼
-#      編的,mtime 一舊 make 就跳過重編,於是 mutation 會無聲地跨輪累積,
-#      讓後面每一輪的結論都不可信。
+#   1. Every run does a full rebuild from a fresh copy. A stale .o file does
+#      not record which source it was built from, and a stale mtime makes
+#      make skip recompiling it, so a mutation would silently accumulate
+#      across runs, making every later run's conclusion untrustworthy.
 #
-#   2. 退出碼非 0 就算「被抓到」,不論有沒有 FAIL 行。曾經有一個邊界
-#      mutation 讓測試二進位直接 segfault(沒有任何 FAIL 行),舊版腳本因此
-#      印「死角」——但 make test 其實抓得到。只 grep FAIL 會把崩潰誤報成
-#      沒有鑑別力,而這種誤報的方向永遠是「已驗過」,最危險。
+#   2. A non-zero exit code counts as "caught", regardless of whether there
+#      are any FAIL lines. A boundary mutation once made a test binary
+#      segfault outright (with no FAIL lines at all), and the old version of
+#      this script reported it as a blind spot -- but make test actually did
+#      catch it. Grepping only for FAIL would misreport a crash as having no
+#      discriminating power, and that kind of false report always lies in
+#      the direction of "already verified", which is the most dangerous kind.
 
 set -u
 
@@ -57,20 +71,25 @@ EXPR="$3"
 TARGET="${4:-}"
 
 if [ ! -f "$PROJECT_ROOT/$FILE" ]; then
-    echo "error: $FILE 不存在(路徑要相對於專案根目錄)" >&2
+    echo "error: $FILE does not exist (the path must be relative to the project root)" >&2
     exit 2
 fi
 
-# 名稱只是給人看的標籤,可以有空白、斜線、中文。斜線會被 mkdtemp 當成路徑
-# 分隔而整個失敗("No such file or directory"),所以這裡只取安全字元當目錄名。
-# 失敗是大聲的(mktemp 印錯誤、腳本退出 1),但錯誤訊息看起來像環境問題而不像
-# 「你的名字取壞了」,實測浪費了兩輪才看懂 —— 直接不讓它發生。
+# The name is just a human-facing label and may contain spaces, slashes,
+# anything. A slash would be read by mkdtemp as a path separator and fail
+# outright ("No such file or directory"), so only safe characters are kept
+# for the directory name. The failure is loud (mktemp prints an error, the
+# script exits 1), but the error message looks like an environment problem
+# rather than "your name choice broke this" -- measured wasting two runs
+# before that was understood. Just do not let it happen.
 NAME_SLUG=$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '_')
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sg_mutate_${NAME_SLUG}_XXXXXX") || exit 1
-echo "mutation '$NAME' 的工作目錄: $WORK"
+echo "working directory for mutation '$NAME': $WORK"
 
-# 用工作樹的現況而不是 HEAD:要驗的往往正是還沒 commit 的改動。
-# build/ 與 .git/ 不複製——前者要重建(見 WHY 1),後者沒必要且很大。
+# Use the working tree's current state rather than HEAD: what needs
+# verifying is usually a change that has not been committed yet. build/ and
+# .git/ are not copied -- the former has to be rebuilt anyway (see WHY 1),
+# and the latter is unnecessary and large.
 if command -v rsync > /dev/null 2>&1; then
     rsync -a --exclude build --exclude .git "$PROJECT_ROOT/" "$WORK/" || exit 1
 else
@@ -82,8 +101,8 @@ perl -0pi -e "$EXPR" "$WORK/$FILE" || exit 1
 AFTER=$(cksum < "$WORK/$FILE")
 
 if [ "$BEFORE" = "$AFTER" ]; then
-    echo "MUTATION-NOT-APPLIED: perl 運算式沒有匹配到任何東西"
-    echo "  這是假陰性的來源:什麼都沒改當然不會紅。修好運算式再跑。"
+    echo "MUTATION-NOT-APPLIED: the perl expression did not match anything"
+    echo "  This is a source of false negatives: nothing changed, so of course nothing turns red. Fix the expression and try again."
     exit 3
 fi
 
@@ -91,27 +110,36 @@ cd "$WORK" || exit 1
 if ! make > "$WORK/build.log" 2>&1; then
     echo "BUILD-FAILED:"
     tail -15 "$WORK/build.log"
-    echo "  壞掉的 mutation 給出的紅燈不算證據——要改到能編譯為止。"
+    echo "  A red result from a mutation that does not even compile is not evidence -- fix it until it builds."
     exit 4
 fi
 
-# WHY 3(第三條規則,和上面兩條一樣是踩過坑才加的):把「卡死」轉成乾淨的失敗。
+# WHY 3 (the third rule, added because of a bug hit in practice just like the
+# other two): turn "hung forever" into a clean failure.
 #
-# 上面第 2 條說「退出碼非 0 就算被抓到」。那條規則假設程式會結束——但 mutation
-# 可以讓程式**永遠不結束**:把一個歸併迴圈的比較方向反過來,游標就不再前進。
-# 2026-08-21 實測(Phase 25,`list_diff_sorted` 的 `cmp < 0` 改成 `cmp > 0`):
-# 測試二進位跑了 30 分鐘還在跑,而「永遠不退出」既不是 0 也不是非 0,腳本
-# 只會安靜地佔住終端機,不會給出任何結論。
+# Rule 2 above says "a non-zero exit code counts as caught". That rule
+# assumes the program eventually terminates -- but a mutation can make it
+# **never terminate**: flip the comparison direction in a merge loop and the
+# cursor stops advancing. Measured on 2026-08-21 (Phase 25, `list_diff_sorted`
+# `cmp < 0` flipped to `cmp > 0`): the test binary was still running 30
+# minutes later, and "never exits" is neither 0 nor non-zero -- the script
+# would just sit there quietly hogging the terminal, with no conclusion at
+# all.
 #
-# 逾時被視為「被抓到」(卡死在 CI 上一樣會被發現),但**單獨標示**出來,因為
-# 它和崩潰一樣,證明的是「改壞了會出事」而不是「那條具名斷言有鑑別力」——
-# 看到這行就要換一條不會卡死的 mutation 重驗。
+# A timeout is treated as "caught" (a hang would be found in CI too, just as
+# well), but it is **flagged separately**, because like a crash it only
+# proves "breaking this causes trouble", not "that named assertion has
+# discriminating power" -- seeing this line means picking a different
+# mutation that does not hang and re-verifying with that instead.
 SG_MUTATE_TIMEOUT=${SG_MUTATE_TIMEOUT:-300}
 TIMED_OUT=0
 
-# 逾時與否用 marker 檔判定,不用 `kill -0` 探 watchdog 是否還活著:watchdog
-# 砍完目標後才自己結束,兩者之間有一段race,探活會時而答錯。marker 只在
-# watchdog 真的開火時才存在,判定是確定的。
+# Whether a timeout happened is decided with a marker file, not by probing
+# whether the watchdog is still alive with `kill -0`: the watchdog only exits
+# itself after it has killed the target, and there is a race window between
+# the two, so a liveness probe would sometimes get the wrong answer. The
+# marker only exists when the watchdog actually fired, so the check is
+# deterministic.
 run_with_timeout() {
     _marker="$WORK/.timed_out"
     TIMED_OUT=0
@@ -139,16 +167,16 @@ report() {
     rc="$1"
     log="$2"
     if [ "$TIMED_OUT" -ne 0 ]; then
-        echo "  (逾時 ${SG_MUTATE_TIMEOUT}s 被砍 —— 算被抓到,但這是「卡死」不是"
-        echo "   「斷言看見了」。換一條不會卡死的 mutation 才驗得到鑑別力。)"
+        echo "  (timed out after ${SG_MUTATE_TIMEOUT}s and was killed -- counts as caught, but this is"
+        echo "   a hang, not \"the assertion saw it\". Pick a mutation that does not hang to verify discriminating power.)"
         tail -3 "$log" | sed 's/^/    /'
     elif grep -qE '^FAIL' "$log"; then
         grep -E '^FAIL' "$log"
     elif [ "$rc" -ne 0 ]; then
-        echo "  (沒有 FAIL 行,但退出碼 $rc —— 仍被抓到,可能是崩潰)"
+        echo "  (no FAIL lines, but exit code $rc -- still caught, possibly a crash)"
         tail -3 "$log" | sed 's/^/    /'
     else
-        echo "  (退出碼 0 且沒有 FAIL 行 —— 真死角:這處修法改了也沒人發現)"
+        echo "  (exit code 0 and no FAIL lines -- a real blind spot: this fix can be broken without anyone noticing)"
     fi
 }
 
@@ -156,25 +184,25 @@ case "$TARGET" in
     --interop)
         run_with_timeout bash tests/interop.sh > "$WORK/run.log" 2>&1
         rc=$?
-        echo "=== $NAME: interop.sh 退出碼 $rc ==="
+        echo "=== $NAME: interop.sh exit code $rc ==="
         grep -E '^interop:' "$WORK/run.log"
         report "$rc" "$WORK/run.log"
         ;;
     "")
         run_with_timeout make test > "$WORK/run.log" 2>&1
         rc=$?
-        echo "=== $NAME: make test 退出碼 $rc ==="
+        echo "=== $NAME: make test exit code $rc ==="
         report "$rc" "$WORK/run.log"
         ;;
     *)
         make "build/tests/$TARGET" > /dev/null 2>&1
         if [ ! -x "$WORK/build/tests/$TARGET" ]; then
-            echo "error: 建不出 build/tests/$TARGET(名字打錯?)" >&2
+            echo "error: could not build build/tests/$TARGET (name misspelled?)" >&2
             exit 2
         fi
         run_with_timeout "$WORK/build/tests/$TARGET" > "$WORK/run.log" 2>&1
         rc=$?
-        echo "=== $NAME: $TARGET 退出碼 $rc ==="
+        echo "=== $NAME: $TARGET exit code $rc ==="
         report "$rc" "$WORK/run.log"
         ;;
 esac

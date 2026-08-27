@@ -728,7 +728,7 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
 
     flatten_rc = sg_tree_flatten(git_dir, base_tree, &base_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+        fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
                sg_quote_path_delimited(bad_path));
         return -1;
     }
@@ -736,7 +736,7 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
         return -1;
     flatten_rc = sg_tree_flatten(git_dir, ours_tree, &ours_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+        fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
                sg_quote_path_delimited(bad_path));
         sg_flat_list_free(&base_flat);
         return -1;
@@ -747,7 +747,7 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
     }
     flatten_rc = sg_tree_flatten(git_dir, theirs_tree, &theirs_flat, bad_path);
     if (flatten_rc == -2) {
-        fprintf(stderr, "sg: 路徑 %s 無效,拒絕將這棵 tree 展開成檔案路徑\n",
+        fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
                sg_quote_path_delimited(bad_path));
         sg_flat_list_free(&base_flat);
         sg_flat_list_free(&ours_flat);
@@ -866,7 +866,7 @@ static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *
        caller treats a non-zero return like an sg_index_upsert failure and
        aborts the whole apply. */
     if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0) {
-        fprintf(stderr, "sg: 路徑過長,無法解析 %s\n", sg_quote_path_delimited(path));
+        fprintf(stderr, "sg: path too long, cannot resolve %s\n", sg_quote_path_delimited(path));
         return -1;
     }
     if (stat(abspath, &st) == 0) {
@@ -922,7 +922,8 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
            this entry must count as a failure the same way a missing chunk
            or unreadable object does -- never silently skipped. */
         if (sg_path_join(abspath, sizeof(abspath), repo_root, e->path) != 0) {
-            fprintf(stderr, "sg: 路徑過長,無法處理 %s\n", sg_quote_path_delimited(e->path));
+            fprintf(stderr, "sg: path too long, cannot process %s\n",
+                   sg_quote_path_delimited(e->path));
             content_missing = 1;
             continue;
         }

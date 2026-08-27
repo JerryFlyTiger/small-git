@@ -97,7 +97,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
 
             sg_index_free(&idx);
             if (unmerged) {
-                fprintf(stderr, "sg: 尚有未解決的衝突，無法 stash push\n");
+                fprintf(stderr, "sg: unresolved conflicts remain, cannot stash push\n");
                 free(git_dir);
                 free(repo_root);
                 return 1;
@@ -113,8 +113,8 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
        it either, so say so. The rebase sequencer state itself is untouched
        by this (see sg_stash_push's header comment). */
     if (sg_rebase_state_exists(git_dir)) {
-        fprintf(stderr, "sg: 目前有一個進行中的 rebase；這次 stash push 會把工作目錄與 index 重設回 "
-                        "HEAD，之後 `sg rebase --continue` 可能因此略過目前這個 commit\n");
+        fprintf(stderr, "sg: a rebase is currently in progress; this stash push will reset the working directory and "
+                        "index back to HEAD, after which `sg rebase --continue` may skip the current commit as a result\n");
     }
 
     rc = sg_stash_push(git_dir, repo_root, &opts, commit_id);
@@ -127,15 +127,15 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
     if (rc == -2) {
         /* The stash commit + refs/stash were already written durably (it IS
            on `sg stash list`) -- only the snapshot or the working-tree reset
-           back to HEAD failed after that. Saying "無法建立 stash" here would
+           back to HEAD failed after that. Saying "cannot create stash" here would
            be a lie: the entry exists, only its cleanup step is in doubt. */
         sg_stash_list list;
 
-        fprintf(stderr, "sg: stash 已建立，但後續步驟失敗（快照、還原工作目錄回 HEAD，或"
-                        "（在 -u/-a 下）移除已收進 stash 的未追蹤檔案／清理空目錄）；"
-                        "請自行確認工作目錄狀態\n");
+        fprintf(stderr, "sg: stash was created, but a later step failed (snapshot, restoring the working directory to "
+                        "HEAD, or (under -u/-a) removing untracked files now in the stash / pruning empty "
+                        "directories); please check the working directory state yourself\n");
         if (sg_stash_list_read(git_dir, &list) == 0 && list.count > 0) {
-            fprintf(stderr, "sg: 該 stash 為 stash@{0}: %s\n", list.entries[0].message);
+            fprintf(stderr, "sg: that stash is stash@{0}: %s\n", list.entries[0].message);
             sg_stash_list_free(&list);
         }
         free(git_dir);
@@ -143,7 +143,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         return 1;
     }
     if (rc != 0) {
-        fprintf(stderr, "sg: 無法建立 stash（未初始化的 HEAD，或 index 有未解決的衝突？）\n");
+        fprintf(stderr, "sg: cannot create stash (unborn HEAD, or the index has unresolved conflicts?)\n");
         free(git_dir);
         free(repo_root);
         return 1;
@@ -154,9 +154,9 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
     {
         if (sg_merge_head_exists(git_dir)) {
             if (sg_merge_head_remove(git_dir) != 0)
-                fprintf(stderr, "sg: warning: stash 成功，但清除 MERGE_HEAD 失敗\n");
+                fprintf(stderr, "sg: warning: stash succeeded, but failed to remove MERGE_HEAD\n");
             else
-                fprintf(stderr, "sg: 已清除進行中的合併狀態（MERGE_HEAD）\n");
+                fprintf(stderr, "sg: cleared the in-progress merge state (MERGE_HEAD)\n");
         }
     }
 
@@ -196,7 +196,7 @@ static int cmd_stash_list(int argc, char **argv)
         return 1;
 
     if (sg_stash_list_read(git_dir, &list) != 0) {
-        fprintf(stderr, "sg: failed to read stash list（reflog 損壞？）\n");
+        fprintf(stderr, "sg: failed to read stash list (corrupt reflog?)\n");
         free(git_dir);
         return 1;
     }
@@ -336,7 +336,7 @@ static int merge_diff_lists(sg_diff_list *a, sg_diff_list *b, sg_diff_list *out)
 
 static void report_bad_stash_tree_path(const char *bad_path)
 {
-    fprintf(stderr, "sg: 路徑 %s 無效，拒絕將這棵 tree 展開成檔案路徑\n",
+    fprintf(stderr, "sg: path %s is invalid, refusing to expand this tree into file paths\n",
            sg_quote_path_delimited(bad_path));
 }
 
@@ -434,7 +434,7 @@ static int cmd_stash_show(int argc, char **argv)
     sg_stash_list_free(&list);
 
     if (sg_stash_load_trees(git_dir, index, &trees) != 0) {
-        fprintf(stderr, "sg: stash@{%zu} 已損壞（不是有效的 stash commit）\n", index);
+        fprintf(stderr, "sg: stash@{%zu} is corrupt (not a valid stash commit)\n", index);
         free(git_dir);
         free(repo_root);
         return 1;
@@ -618,7 +618,7 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
         return 1;
     }
     if (sg_index_has_unmerged(&idx)) {
-        fprintf(stderr, "sg: 尚有未解決的衝突，無法 stash %s\n", cmd_name);
+        fprintf(stderr, "sg: unresolved conflicts remain, cannot stash %s\n", cmd_name);
         sg_index_free(&idx);
         free(git_dir);
         free(repo_root);
@@ -632,8 +632,8 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
        rule and sg/stash.h's sg_stash_apply header comment. */
     if (sg_rebase_state_exists(git_dir)) {
         fprintf(stderr,
-               "sg: 目前有一個進行中的 rebase，無法 stash %s\n"
-               "請先完成它（sg rebase --continue）或執行 sg rebase --abort 放棄\n",
+               "sg: a rebase is currently in progress, cannot stash %s\n"
+               "Finish it first (sg rebase --continue) or run sg rebase --abort to give up\n",
                cmd_name);
         free(git_dir);
         free(repo_root);
@@ -658,14 +658,14 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
     sg_stash_list_free(&list);
 
     if (sg_object_read(git_dir, commit_id, &type, &content, &content_len) != 0 || type != SG_OBJ_COMMIT) {
-        fprintf(stderr, "sg: stash@{%zu} 已損壞（不是有效的 commit）\n", index);
+        fprintf(stderr, "sg: stash@{%zu} is corrupt (not a valid commit)\n", index);
         free(content);
         free(git_dir);
         free(repo_root);
         return 1;
     }
     if (sg_commit_parse(content, content_len, &commit) != 0) {
-        fprintf(stderr, "sg: stash@{%zu} 已損壞（無法解析 commit）\n", index);
+        fprintf(stderr, "sg: stash@{%zu} is corrupt (cannot parse commit)\n", index);
         free(content);
         free(git_dir);
         free(repo_root);
@@ -691,8 +691,8 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
         if (rc == 1) {
             size_t j;
 
-            fprintf(stderr, "sg: 下列路徑的本地變更會被這次 stash %s 覆寫，請先處理（commit 或另外 "
-                            "stash）：\n",
+            fprintf(stderr, "sg: local changes to the following paths would be overwritten by this stash %s; deal with them "
+                            "first (commit them or stash them separately):\n",
                    cmd_name);
             for (j = 0; j < dirty_count; j++)
                 fprintf(stderr, "\t%s\n", sg_quote_path(dirty_paths[j]));
@@ -700,7 +700,7 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
                 free(dirty_paths[j]);
             free(dirty_paths);
         } else {
-            fprintf(stderr, "sg: 無法檢查工作目錄狀態\n");
+            fprintf(stderr, "sg: cannot check the working directory status\n");
         }
         free(git_dir);
         free(repo_root);
@@ -709,18 +709,19 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
 
     rc = sg_stash_apply(git_dir, repo_root, index, restore_index);
     if (rc == 1) {
-        fprintf(stderr, "自動合併失敗，工作目錄與 index 留下衝突標記（Updated upstream / Stashed "
-                        "changes）：\n"
-                        "請編輯衝突檔案並執行 `sg add <file>...` 標記為已解決；stash 本身沒有被丟棄\n");
+        fprintf(stderr, "Automatic merge failed, the working directory and index are left with conflict markers "
+                        "(Updated upstream / Stashed changes):\n"
+                        "Edit the conflicted files and run `sg add <file>...` to mark them resolved; "
+                        "the stash itself was not dropped\n");
         if (restore_index)
-            fprintf(stderr, "sg: 因為有衝突，index 未被還原成 stash 建立時的樣子（Index was not "
-                            "unstashed）\n");
+            fprintf(stderr, "sg: because of the conflicts, the index was not restored to how it looked when the stash was "
+                            "created (Index was not unstashed)\n");
         free(git_dir);
         free(repo_root);
         return 1;
     }
     if (rc != 0) {
-        fprintf(stderr, "sg: stash %s 失敗\n", cmd_name);
+        fprintf(stderr, "sg: stash %s failed\n", cmd_name);
         free(git_dir);
         free(repo_root);
         return 1;
@@ -743,7 +744,7 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
 
         sg_sha1_to_hex(commit_id, hex);
         if (sg_stash_drop(git_dir, index) != 0) {
-            fprintf(stderr, "sg: 套用成功，但刪除 stash@{%zu} 失敗\n", index);
+            fprintf(stderr, "sg: apply succeeded, but failed to drop stash@{%zu}\n", index);
             free(git_dir);
             free(repo_root);
             return 1;

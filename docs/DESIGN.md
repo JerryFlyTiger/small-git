@@ -1,2357 +1,2790 @@
-# small_git 設計文件
+# small_git design document
 
-## 專案定位
+## Project positioning
 
-紮實可用的 git 替代品(不是純教學玩具)。以純 C 撰寫,目標是解決以下四類實際痛點,同時維持與
-git 物件格式的完全相容,讓 `.git` 目錄可被真正的 `git`/`libgit2`/GitHub 等既有生態系工具正常讀取。
+A solid, usable git alternative (not a purely educational toy). Written in pure C, aiming to
+solve the four categories of real-world pain points below while maintaining full compatibility
+with git's object format, so that the `.git` directory can be read normally by real
+`git`/`libgit2`/GitHub and other existing ecosystem tools.
 
-優先解決的痛點(依開發順序排列,但彼此有交疊):
+Pain points to address, in priority order (development order, though they overlap):
 
-1. **CLI/UX 混亂難懂** — checkout 多重角色、staging area 難理解、錯誤訊息不友善
-2. **危險操作與救援機制** — force push / reset --hard 造成資料遺失、reflog 不易發現
-3. **大型/二進位檔案處理** — 無內建 dedup、大檔案讓 repo 肥大
-4. **巨型 repo 效能** — status/checkout/clone 在大型 monorepo 上變慢
+1. **Confusing CLI/UX** -- checkout's multiple roles, a staging area that's hard to understand,
+   unfriendly error messages
+2. **Destructive operations and recovery** -- force push / reset --hard causing data loss, reflog
+   being hard to discover
+3. **Large/binary file handling** -- no built-in dedup, large files bloating the repo
+4. **Performance on huge repos** -- status/checkout/clone slowing down on large monorepos
 
-## 核心工程原則
+## Core engineering principles
 
-- **相容優先於創新**:物件模型(blob/tree/commit/tag)、pack 格式、index 格式一律與 git 相容。
-  新功能以「相容模式為預設、進階功能為選配」的方式加入,絕不破壞既有 `.git` 目錄的可讀性。
-- **資料安全 > 效能 > 便利**:任何可能造成資料遺失的操作,預設要有救援路徑。
-- **允許使用基礎系統庫**:zlib(壓縮)、OpenSSL EVP(SHA-1/SHA-256)。不重造壓縮/雜湊演算法輪子,
-  把工程心力放在架構與 UX 差異化上。
-- **可驗證的相容性**:每個里程碑都要有「small_git 寫、真正的 git 讀」以及反過來的 round-trip 測試。
+- **Compatibility over innovation**: the object model (blob/tree/commit/tag), pack format, and
+  index format are all git-compatible. New features are added with "compatible mode as default,
+  advanced features opt-in", never breaking readability of an existing `.git` directory.
+- **Data safety > performance > convenience**: any operation that could cause data loss must have
+  a recovery path by default.
+- **Base system libraries are allowed**: zlib (compression), OpenSSL EVP (SHA-1/SHA-256). Don't
+  reinvent compression/hashing algorithms; spend engineering effort on architecture and UX
+  differentiation.
+- **Verifiable compatibility**: every milestone needs a round-trip test of "small_git writes, real
+  git reads" and vice versa.
 
-## 高層架構
+## High-level architecture
 
 ```
 small_git/
   src/
-    object/    blob / tree / commit / tag 的序列化與解析
-    storage/   loose object 讀寫、packfile 讀寫、refs、index
-    index/     staging area(.git/index)讀寫與比對
-    workdir/   working tree 掃描、status、checkout、diff
-    cli/       command dispatch、porcelain 指令實作
-    safety/    自動快照、undo/recovery、危險操作守門
-    util/       hash(SHA-1 wrapper)、zutil(zlib wrapper)、path、mmap 工具
-  include/sg/  對外(模組間)共用標頭
-  tests/       單元測試 + interop 測試(呼叫系統 git 驗證)
-  docs/        設計文件、路線圖
+    object/    serialization/parsing of blob / tree / commit / tag
+    storage/   loose object read/write, packfile read/write, refs, index
+    index/     staging area (.git/index) read/write and comparison
+    workdir/   working tree scanning, status, checkout, diff
+    cli/       command dispatch, porcelain command implementations
+    safety/    automatic snapshots, undo/recovery, destructive-operation guards
+    util/       hash (SHA-1 wrapper), zutil (zlib wrapper), path, mmap utilities
+  include/sg/  public (cross-module) shared headers
+  tests/       unit tests + interop tests (calling system git to verify)
+  docs/        design documents, roadmap
 ```
 
-不做 library/CLI 分離的過度設計;先以單一 `sg` 執行檔為主,內部模組化,未來若有需要再拆 libsg。
+No over-engineered library/CLI separation; start with a single `sg` executable, modularized
+internally, and split off libsg later if needed.
 
-## 各痛點的對應設計
+## Design mapping for each pain point
 
-### 1. CLI/UX 混亂難懂
-- 從第一天就把 `checkout` 拆成 `sg switch`(切換分支)與 `sg restore`(還原檔案),不重蹈 git 早期
-  的多重角色設計。
-- `sg status` 預設輸出更明確的下一步建議(例如衝突時列出具體指令而非只列檔名)。
-- 所有可能有歧義的指令,錯誤訊息要包含「你可能想要的指令」。
+### 1. Confusing CLI/UX
+- From day one, split `checkout` into `sg switch` (switch branches) and `sg restore` (restore
+  files), avoiding git's early multiple-role design.
+- `sg status` prints clearer next-step suggestions by default (e.g. listing concrete commands
+  rather than just file names on conflict).
+- All commands that could be ambiguous must include "the command you probably meant" in their
+  error messages.
 
-### 2. 危險操作與救援機制
-- 破壞性操作(reset --hard、branch -D、force push 等價操作)執行前,自動在
-  `refs/small-git/undo/<timestamp>` 建立快照 ref,不需使用者手動操作。
-- 提供 `sg undo`:列出最近的自動快照並可一鍵還原,比 reflog 更好發現、更好用。
-- force-push 類操作預設要求二次確認,並在可能覆蓋遠端非快進歷史時列出將遺失的 commit。
+### 2. Destructive operations and recovery
+- Before destructive operations (reset --hard, branch -D, force-push-equivalent operations), a
+  snapshot ref is automatically created at `refs/small-git/undo/<timestamp>`, with no manual
+  action required from the user.
+- `sg undo` is provided: lists recent automatic snapshots and can restore them with one command,
+  more discoverable and easier to use than reflog.
+- Force-push-type operations require confirmation by default, and list the commits that would be
+  lost when they might overwrite non-fast-forward remote history.
 
-### 3. 大型/二進位檔案處理
-- 早期(相容模式):大檔案仍以標準 git blob 儲存,只求正確可用。
-- 進階(選配):以內容切割(content-defined chunking, rolling hash)將大 blob 拆成 chunk,
-  透過小型 pointer blob 參照,checkout 時透明還原,概念類似內建、不需外部 server 的 Git LFS。
-  可選擇輸出與 Git LFS pointer 相容的格式,與既有 LFS repo 互通。
+### 3. Large/binary file handling
+- Early (compatibility mode): large files are still stored as standard git blobs, correctness
+  first.
+- Advanced (opt-in): content-defined chunking (rolling hash) splits large blobs into chunks,
+  referenced through a small pointer blob, transparently restored on checkout -- conceptually
+  like a built-in Git LFS that needs no external server. Can optionally emit a format compatible
+  with Git LFS pointers, interoperating with existing LFS repos.
 
-### 4. 巨型 repo 效能
-- object 存取採用 mmap,避免大檔案整檔讀入記憶體。
-- 支援 git 的 commit-graph 檔案格式,加速 log/merge-base 等歷史走訪。
-- 後期支援 partial clone / sparse checkout(需先完成 smart protocol v2 client)。
+### 4. Performance on huge repos
+- Object access uses mmap, avoiding reading large files entirely into memory.
+- Supports git's commit-graph file format to speed up history traversal such as log/merge-base.
+- Later, support partial clone / sparse checkout (requires a smart protocol v2 client first).
 
-## 分階段路線圖
+## Phased roadmap
 
-| Phase | 內容 | 狀態 | 交付驗證方式 |
+| Phase | Content | Status | Delivery verification |
 |---|---|---|---|
-| 0 | 專案骨架:build system、目錄結構、測試框架、CI | 完成 | `make && make test` 可執行;CI 於 Phase 8 補上 |
-| 1 | 物件模型:SHA-1/zlib wrapper、loose object 讀寫、`sg init`/`hash-object`/`cat-file` | 完成 | small_git 寫的 blob 能被系統 `git cat-file -p` 讀出;反之亦然 |
-| 2 | Index + 基礎 porcelain:`add`/`status`/`commit`/`log`/`diff`、refs、`switch`/`restore` | 完成 | 在 small_git 建立的 repo,`git log`/`git status` 可正常運作 |
-| 3 | UX 差異化層:友善錯誤訊息、guided status、危險操作二次確認 | 完成 | 手動 UX walkthrough |
-| 4 | 救援機制:自動快照 ref、`sg undo`、merge/rebase 與衝突 UX | 完成 | 模擬誤操作後可 100% 復原 |
-| 5 | Packfile 與網路互通:pack reader/writer、smart HTTP client(clone/fetch/push) | 完成 | 可 clone 真實 repo、可 push 上去 |
-| 6 | 大檔案 chunking(選配功能) | 完成(預設關閉) | 大檔案 repo 體積與 checkout 時間對比 |
-| 7 | 巨型 repo 效能 | 部分完成 | 見下方 Phase 7a;**實際做的與原規劃不同**,說明如下 |
-| 8 | 文件、打包、跨平台收尾 | 完成 | README、man page、`make release`/`install`;CI 設定為在 Linux(gcc/clang)與 macOS 上建置並跑完整測試 |
-| 9 | 可用性補完:`.gitignore`、`sg add` 遞迴、`sg branch` | 完成 | 見下方 Phase 9;以真 git 為 oracle 的 600 次隨機模糊測試零分歧 |
-| 12 | revision 解析、`sg tag`、`sg reset`、訊息正規化、loose 解壓上限 | 完成 | 見下方 Phase 12;interop 從 382 增至 642 項,全部以真 git 為 oracle |
-| 13 | `sg push` 推送 tag(`--tags`、名稱同時查 heads/tags) | 完成 | 見下方 Phase 13;interop 從 642 增至 680 項,以真 git 為 oracle |
+| 0 | Project skeleton: build system, directory layout, test framework, CI | Done | `make && make test` runs; CI added in Phase 8 |
+| 1 | Object model: SHA-1/zlib wrapper, loose object read/write, `sg init`/`hash-object`/`cat-file` | Done | Blobs written by small_git can be read by system `git cat-file -p`; and vice versa |
+| 2 | Index + basic porcelain: `add`/`status`/`commit`/`log`/`diff`, refs, `switch`/`restore` | Done | For a repo created in small_git, `git log`/`git status` work normally |
+| 3 | UX differentiation layer: friendly error messages, guided status, confirmation for destructive operations | Done | Manual UX walkthrough |
+| 4 | Recovery: automatic snapshot refs, `sg undo`, merge/rebase and conflict UX | Done | 100% recoverable after simulated mistakes |
+| 5 | Packfile and network interop: pack reader/writer, smart HTTP client (clone/fetch/push) | Done | Can clone a real repo, can push to it |
+| 6 | Large-file chunking (opt-in feature) | Done (disabled by default) | Compare repo size and checkout time for large files |
+| 7 | Huge-repo performance | Partially done | See Phase 7a below; **what was actually done differs from the original plan**, explained below |
+| 8 | Docs, packaging, cross-platform wrap-up | Done | README, man page, `make release`/`install`; CI set up to build and run the full test suite on Linux (gcc/clang) and macOS |
+| 9 | Usability completion: `.gitignore`, recursive `sg add`, `sg branch` | Done | See Phase 9 below; zero divergence over 600 random fuzz runs against real git as oracle |
+| 12 | revision parsing, `sg tag`, `sg reset`, message normalization, loose decompression cap | Done | See Phase 12 below; interop grew from 382 to 642 checks, all against real git as oracle |
+| 13 | `sg push` pushing tags (`--tags`, name lookup checks both heads/tags) | Done | See Phase 13 below; interop grew from 642 to 680 checks, against real git as oracle |
 
-Phase 7 的內容與原規劃不同,原因記錄在此以免日後誤解:原本列的是 commit-graph、multi-pack-index、平行化。實測後發現真正的瓶頸完全不在那裡——是物件查找每次都重讀整個 pack(見下方 Phase 7a)。修好之後 `sg log` 已與 `git log` 同級,commit-graph 的邊際效益因此大幅下降,故未實作,留待有實際需求時再評估。原規劃的三項都尚未完成。
+Phase 7's content differs from the original plan; the reason is recorded here to avoid future
+misunderstanding: the original plan listed commit-graph, multi-pack-index, and parallelization.
+Measurements found the real bottleneck was elsewhere entirely -- object lookup re-read the whole
+pack on every query (see Phase 7a below). Once fixed, `sg log` was already on par with `git log`,
+so commit-graph's marginal benefit dropped sharply and it was not implemented, left for evaluation
+if there is real demand later. None of the three original items has been done.
 
-另外,Phase 5 原本列有「delta 壓縮」,但寫入端至今仍是每個物件各自 zlib 壓縮、不做 delta;讀取端則完整支援 OFS_DELTA/REF_DELTA。表格已移除這個未兌現的描述。
+Also, Phase 5 originally listed "delta compression", but the writer side still zlib-compresses
+each object independently with no delta, to this day; the reader side fully supports
+OFS_DELTA/REF_DELTA. The table has removed this description that was never delivered.
 
 
-## Phase 9:可用性補完(`.gitignore`、`sg add` 遞迴、`sg branch`)
+## Phase 9: usability completion (`.gitignore`, recursive `sg add`, `sg branch`)
 
-前八個 Phase 做完後,`sg` 在真實專案上其實還不能用:`status` 會把 `node_modules`、build 產物
-全列出來,`add` 只吃單一檔案路徑,而且**沒有任何列出分支的指令**。Phase 9 補這三項。
+After the first eight phases, `sg` still wasn't usable on real projects: `status` would list
+`node_modules`, build artifacts and everything else; `add` only accepted a single file path; and
+there was **no command at all to list branches**. Phase 9 fills these three gaps.
 
-### 做法與驗證
+### Approach and verification
 
-- **`.gitignore` 引擎**(`src/workdir/ignore.c`):完整 `gitignore(5)` 語意——逐目錄規則堆疊
-  (深層覆蓋淺層)、`.git/info/exclude`(較低優先)、否定、錨定、目錄限定、`**` 三種形式、
-  字元類、跳脫與尾隨空白處理。**21 項語意規則全部先以真 git 實測確認才寫進規格**,而非憑記憶。
-- **`sg add` 遞迴**:`sg add .` 走訪整棵樹,略過 `.git`(任何深度)、剪除被忽略的目錄、
-  已追蹤檔案不受忽略影響、明確指名被忽略檔案需 `-f`、暫存刪除,並維持既有的全有全無索引寫入。
-- **`sg branch`**:列出(合併 loose 與 packed-refs、loose 優先)、建立、刪除。刪除**必須同時
-  清掉 loose 檔與 packed-refs 行**——只刪 loose 會讓陳舊的 packed 項目把分支復活到舊 commit。
+- **`.gitignore` engine** (`src/workdir/ignore.c`): full `gitignore(5)` semantics -- per-directory
+  rule stacking (deeper overrides shallower), `.git/info/exclude` (lower priority), negation,
+  anchoring, directory-only matches, the three forms of `**`, character classes, escaping, and
+  trailing-whitespace handling. **All 21 semantic rules were confirmed against real git
+  measurements before being written into the spec**, not from memory.
+- **Recursive `sg add`**: `sg add .` walks the whole tree, skips `.git` (at any depth), prunes
+  ignored directories, tracked files are unaffected by ignore rules, explicitly naming an ignored
+  file requires `-f`, deletions are staged, and the existing all-or-nothing index write is kept.
+- **`sg branch`**: list (merging loose and packed-refs, loose takes priority), create, delete.
+  Deletion **must clear both the loose file and the packed-refs line** -- deleting only the loose
+  file would let a stale packed entry resurrect the branch at an old commit.
 
-### 驗證方式
+### Verification method
 
-除了 377 項 interop 檢查與 ASan/UBSan 全綠之外,關鍵的一致性驗證是**以真 git 為 oracle 的隨機
-模糊測試**:自動產生 600 組隨機 pattern 集合與目錄樹,比對 `sg status` 的未追蹤集合與
-`git status --porcelain -uall` 是否完全相等——**600 次零分歧**。這比逐案手寫測試更能涵蓋
-matcher 的組合邊界。
+Beyond 377 interop checks and clean ASan/UBSan runs, the key consistency verification is
+**random fuzz testing with real git as the oracle**: 600 randomly generated pattern sets and
+directory trees, comparing `sg status`'s untracked set against
+`git status --porcelain -uall` for exact equality -- **600 runs, zero divergence**. This covers
+the matcher's combinatorial edge cases far better than case-by-case hand-written tests.
 
-### 過程中發現並修掉的缺陷
+### Defects found and fixed along the way
 
-**`sg add .` 會靜默漏檔**。新的走訪程式把 `lstat` 失敗一律當成「檔案在走訪途中被刪掉」而跳過,
-但 `lstat` 也會因 `ENAMETOOLONG`(sg 組絕對路徑,深樹會超過平台 `PATH_MAX`)、`EACCES`、
-`ELOOP` 失敗。結果是 `sg add .` 回傳 0、什麼都沒暫存,而 `git add .` 正常暫存——commit 會安靜
-地少掉內容。現在只有 `ENOENT` 視為良性,其餘明確報錯;`sg status` 則印警告說明清單可能不完整。
+**`sg add .` could silently drop files.** The new traversal code treated every `lstat` failure as
+"the file was deleted mid-walk" and skipped it, but `lstat` can also fail with `ENAMETOOLONG` (sg
+builds absolute paths, and a deep tree can exceed the platform `PATH_MAX`), `EACCES`, or `ELOOP`.
+The result was `sg add .` returning 0 with nothing staged, while `git add .` staged normally --
+the commit would silently lose content. Now only `ENOENT` is treated as benign; everything else is
+reported explicitly, and `sg status` prints a warning that the listing may be incomplete.
 
-值得記錄的是**第一版回歸測試是空的**:它用「巢狀到 mkdir 失敗」建樹,而失敗點落在
-`opendir`(那條路徑本來就有正確報錯),根本沒走到出問題的 `lstat`——把修正還原後測試照樣通過。
-改成用 `chdir` + 相對路徑建出「目錄開得起來、但裡面項目的絕對路徑超長」的確定性邊界後,
-還原修正的對照組才真的 FAIL。**測試必須先證明它會失敗,才能相信它的通過。**
+Worth recording: **the first version of the regression test was empty**. It built a tree "nested
+until mkdir fails", but the failure point landed in `opendir` (which already had correct error
+handling) and never reached the problematic `lstat` -- reverting the fix still passed the test.
+After switching to `chdir` + relative paths to build a deterministic boundary where "the directory
+can be opened, but an entry inside it has an absolute path that's too long", the control group
+with the fix reverted actually FAILed. **A test must first prove it can fail before its passing
+can be trusted.**
 
-### 已知限制
+### Known limitations
 
-- 不支援 `core.excludesFile` 與全域 ignore 檔。
-- 無法走訪絕對路徑超過平台 `PATH_MAX` 的目錄樹(git 用 `openat()` 相對走訪則不受限)。
-  這是既有限制,非本 Phase 引入;現在至少會明確報錯而非靜默略過。
-- 字元類中含 `/`(如 `a[x/]b`)與 POSIX 具名類別(`[[:alpha:]]`)未實作。
+- `core.excludesFile` and the global ignore file are not supported.
+- Cannot traverse directory trees whose absolute path exceeds the platform `PATH_MAX` (git's
+  relative traversal via `openat()` is not limited this way). This is a pre-existing limitation,
+  not introduced by this phase; it now at least reports an explicit error instead of silently
+  skipping.
+- Character classes containing `/` (e.g. `a[x/]b`) and POSIX named classes (`[[:alpha:]]`) are not
+  implemented.
 
-## 支援平台
+## Supported platforms
 
-- **macOS**:已在本機實際建置並跑過完整測試套件(release 與 ASan/UBSan 版本各一次)。
-- **Linux**:CI 設定為以 gcc 與 clang 建置並跑完整測試套件。開發機沒有 Linux 環境,因此 Linux 的建置結果**以 CI 為準**,而非本機驗證過的結論。
-- **Windows 不支援**。程式碼直接使用 POSIX API(`mmap`、`opendir`、`fcntl` 檔案鎖、POSIX 路徑分隔),要支援 Windows 需要一層相容層,目前不在範圍內。
-- 兩個平台需要不同的 feature-test macro:`-std=c11` 是嚴格 ISO C,glibc 會把 `strdup`、`strtok_r`、`mkstemp`、`getcwd` 以及 `struct stat` 的 `st_mtim` 都藏在 `_POSIX_C_SOURCE` 後面;而 Darwin 預設就看得到這些,反而是**定義了** `_POSIX_C_SOURCE` 會把 `st_mtimespec` 藏起來。因此 Makefile 依 `uname -s` 分別定義 `-D_POSIX_C_SOURCE=200809L` 與 `-D_DARWIN_C_SOURCE`,兩者不可互換。
+- **macOS**: actually built locally and run through the full test suite (once each for release and
+  ASan/UBSan builds).
+- **Linux**: CI is set up to build and run the full test suite with gcc and clang. There is no
+  Linux development machine, so the Linux build result **is taken on CI's word**, not a locally
+  verified conclusion.
+- **Windows is not supported.** The code uses POSIX APIs directly (`mmap`, `opendir`, `fcntl` file
+  locks, POSIX path separators); supporting Windows would need a compatibility layer, out of scope
+  for now.
+- The two platforms need different feature-test macros: `-std=c11` is strict ISO C, and glibc
+  hides `strdup`, `strtok_r`, `mkstemp`, `getcwd`, and `struct stat`'s `st_mtim` behind
+  `_POSIX_C_SOURCE`; Darwin exposes these by default, and conversely **defining**
+  `_POSIX_C_SOURCE` hides `st_mtimespec`. So the Makefile defines `-D_POSIX_C_SOURCE=200809L` and
+  `-D_DARWIN_C_SOURCE` separately based on `uname -s`; the two are not interchangeable.
 
-## 開放技術決策(隨開發過程確認)
+## Open technical decisions (confirmed as development proceeds)
 
-- 雜湊演算法預設 SHA-1(相容 git 舊格式),SHA-256 repo 支援排入 Phase 5 之後視需求評估。
-- Build system 採 Makefile(維持「small」精神),不引入 CMake,除非未來需要更複雜的跨平台矩陣。
-- 測試框架:輕量自製 assert-based test runner,避免引入大型測試框架依賴。
+- Hash algorithm defaults to SHA-1 (compatible with git's legacy format); SHA-256 repo support is
+  deferred past Phase 5, to be evaluated as needed.
+- Build system is Makefile (keeping the "small" spirit), no CMake unless a more complex
+  cross-platform matrix is needed in the future.
+- Test framework: a lightweight homegrown assert-based test runner, avoiding a dependency on a
+  large test framework.
 
-## Phase 6:大檔案內容分塊(CDC)—— 已知限制
+## Phase 6: large-file content-defined chunking (CDC) -- known limitations
 
-分塊功能**預設關閉**(`.git/config` 的 `[sg] chunking`)。未啟用時,repo 與 git 的相容性完全不變。
+Chunking is **disabled by default** (`[sg] chunking` in `.git/config`). When not enabled, the
+repo's compatibility with git is entirely unchanged.
 
-啟用後的取捨與已知限制:
+Trade-offs and known limitations once enabled:
 
-- **真正的 `git` 讀不到內容**。tree 裡放的是指標 blob,`git checkout` 會拿到指標文字而非檔案內容。這與 Git LFS 在未安裝 LFS 的環境下的表現相同,是啟用者接受的代價。`sg` 之間(clone/fetch/push)則完全正常。
-- **`refs/sg/chunks` 不可刪除**。所有 chunk 靠這個 keep-alive ref 在 git 的物件圖中保持可達,否則 `git gc` 會清掉它們。刪掉它之後,`sg` 會對每個分塊檔案硬失敗(不會靜默寫出指標文字),但資料可能已經無法復原。
-- **並發保護僅限單機**。`keep_alive_add` 用 `.git/sg-chunks.lock` 檔案鎖序列化同一個 repo 內的並發 `sg add`。跨機器共享檔案系統的情境未經測試。
-- **push 的原子性依賴伺服器**。`sg push` 在遠端宣告 `atomic` 能力時會請求它,讓分支 ref 與 `refs/sg/chunks` 綁成單一事務。伺服器不支援時,理論上仍可能出現「分支更新成功、keep-alive ref 被拒」的部分套用;此時 `sg push` 會明確報錯(不會靜默成功),但在使用者重試前,遠端若剛好執行 `git gc` 仍可能清掉新 chunk。
+- **Real `git` cannot read the content.** The tree holds a pointer blob, and `git checkout` gets
+  the pointer text instead of the file content. This matches Git LFS's behavior in an environment
+  without LFS installed, and is a cost accepted by whoever enables the feature. `sg`-to-`sg`
+  (clone/fetch/push) works fully normally.
+- **`refs/sg/chunks` must not be deleted.** All chunks stay reachable in git's object graph through
+  this keep-alive ref; otherwise `git gc` would clean them up. After it's deleted, `sg` hard-fails
+  on each chunked file (it does not silently write out pointer text), but the data may already be
+  unrecoverable.
+- **Concurrency protection is single-machine only.** `keep_alive_add` uses a `.git/sg-chunks.lock`
+  file lock to serialize concurrent `sg add` within the same repo. Sharing a filesystem across
+  machines is untested.
+- **Push atomicity depends on the server.** `sg push` requests the `atomic` capability when the
+  remote advertises it, binding the branch ref and `refs/sg/chunks` into a single transaction.
+  When the server doesn't support it, a partial application -- "branch update succeeded,
+  keep-alive ref rejected" -- is theoretically still possible; `sg push` will then report an
+  explicit error (not a silent success), but before the user retries, if the remote happens to run
+  `git gc`, the new chunk could still be cleaned up.
 
-## Phase 7a:物件存取層 —— 改動、量測與已知限制
+## Phase 7a: object access layer -- changes, measurements, and known limitations
 
-### 原本的問題
+### The original problem
 
-`pack_read_depth()` 每查詢**一個物件**就 `opendir` 一次 `objects/pack/`,並把整個 `.idx` 與整個 `.pack` 讀進 malloc 的緩衝區,用完整包丟掉。單次查詢的成本因此正比於**整個 repo 的 pack 體積**,一次歷史走訪就是 O(物件數 × pack 大小)。
+`pack_read_depth()` did an `opendir` on `objects/pack/` for **every single object** queried, and
+read the entire `.idx` and entire `.pack` into a malloc'd buffer, discarding it after use. The
+cost of a single query was therefore proportional to **the entire repo's pack size**, making one
+history walk O(number of objects x pack size).
 
-另有一個硬性缺陷:`idx_find()` 遇到 offset 表項目 MSB 被設定(idx v2 用來表示「這是 large-offset 表的索引」)就直接放棄,代表**超過 2GB 的 pack 完全無法讀取**。
+There was also a hard defect: `idx_find()` gave up outright whenever an offset table entry had its
+MSB set (idx v2 uses this to mean "this is an index into the large-offset table"), meaning
+**packs over 2GB could not be read at all**.
 
-### 改動
+### Changes
 
-1. `.idx` / `.pack` 改為 `mmap` 唯讀映射,不再整檔複製進堆積。
-2. 新增 process 生命週期的 pack registry(以 `git_dir` 為 key),每個 pack 只開啟與解析一次。
-3. `idx_find()` 改用 fanout 表把二分搜尋範圍先收斂到 `id[0]` 的桶。
-4. 讀取端支援 idx v2 的 64-bit large-offset 表(寫入端維持拒絕產生 >2GB 的 pack)。
+1. `.idx` / `.pack` are now `mmap`ed read-only instead of being copied whole into the heap.
+2. Added a process-lifetime pack registry (keyed by `git_dir`), so each pack is opened and parsed
+   only once.
+3. `idx_find()` now uses the fanout table to narrow the binary search range down to `id[0]`'s
+   bucket first.
+4. The reader now supports idx v2's 64-bit large-offset table (the writer still refuses to produce
+   packs >2GB).
 
-### 量測
+### Measurements
 
-基準 repo:811 commits、48MB pack,warm page cache,同機比較。
+Baseline repo: 811 commits, 48MB pack, warm page cache, compared on the same machine.
 
-| | 改動前 | 改動後 | 系統 `git` |
+| | Before | After | System `git` |
 |---|---|---|---|
-| `sg log`(走完 811 個 commit) | 2.64s | 0.007s | 0.005s |
+| `sg log` (walking all 811 commits) | 2.64s | 0.007s | 0.005s |
 | `sg status` | 0.27s | 0.03s | 0.03s |
 
-`sg log` 的輸出在改動前後**逐位元組相同**(三個不同大小的基準 repo 各驗證一次)。
+`sg log`'s output is **byte-for-byte identical** before and after the change (verified once each
+on three baseline repos of different sizes).
 
-### 兩個在審查與實測中發現、已修正的缺陷
+### Two defects found and fixed during review and measurement
 
-- **重入導致的 use-after-free**。`read_entry_at()` 解 REF_DELTA 時會遞迴回 `pack_read_depth()`;若那個巢狀查詢 miss 且此時 pack 目錄的 mtime 變了(例如同時有 `git gc` 在跑),它會觸發重掃,而重掃會釋放外層 `pack_read_from_dir()` 迴圈**正在走訪**的那個鏈結節點。已用手工合成的「REF_DELTA 但 base 不存在」物件搭配並行 toucher 在 ASan 下穩定重現(第 127 次迭代),修法是在讀取進行中把被替換的清單先寄放,等最外層讀取返回才真正回收;修正後同樣條件跑 1200 次無重現。
-- **秒級 mtime 造成的過期窗口**。以目錄 mtime 判斷是否需要重掃,而 `st_mtime` 只有秒級解析度:另一個行程若在我們掃描的**同一秒內**寫入新 pack,mtime 比較會相等,`sg` 就會把真實存在的物件回報為不存在——這是相對舊「每次查詢都重掃」實作的退化。修法沿用 git 對 racily-clean 的處理思路:掃描當下若記錄到的 mtime 就是當前這一秒,該次掃描結果視為不可信,miss 時一律重掃。已用合成的大 delta(把讀取窗口撐到約 100ms)搭配同秒內發布 base pack 的測試驗證:修正後 5/5 命中,關掉該防護的對照組 4 次有效測試中 3 次漏掉。
+- **Use-after-free caused by reentrancy.** When `read_entry_at()` resolves a REF_DELTA, it
+  recurses back into `pack_read_depth()`; if that nested query misses and the pack directory's
+  mtime changed at that moment (e.g. a concurrent `git gc`), it triggers a rescan, and the rescan
+  frees the linked list node the outer `pack_read_from_dir()` loop **is currently traversing**.
+  Reliably reproduced under ASan (at iteration 127) using a hand-crafted "REF_DELTA whose base is
+  missing" object together with a concurrent toucher; the fix defers reclaiming a replaced list
+  until the outermost read returns, and no longer reproduces after 1200 runs under the same
+  conditions.
+- **Staleness window from second-granularity mtime.** Whether a rescan is needed is decided by
+  directory mtime, and `st_mtime` only has second-level resolution: if another process writes a
+  new pack within **the same second** as our scan, the mtime comparison would be equal and `sg`
+  would report an object that actually exists as missing -- a regression relative to the older
+  "rescan on every query" implementation. The fix follows git's approach to racily-clean handling:
+  if the mtime recorded at scan time is the current second, that scan's result is treated as
+  untrustworthy and a rescan always happens on a miss. Verified with a test using a synthesized
+  large delta (stretching the read window to about 100ms) alongside publishing the base pack
+  within the same second: 5/5 hits after the fix, and 3 of 4 valid runs missed it with the guard
+  disabled as the control.
 
-### 已知限制
+### Known limitations
 
-- **pack registry 沒有上限**。一個 process 會把它查詢過的每個 `git_dir` 的所有 pack 都保持映射到結束為止。對短命的 CLI 指令沒有影響;若未來要做長時間常駐的行程,需要加上 LRU 與淘汰。
-- **尚未做 delta base cache**。深 delta 鏈上的每一層都會重新解壓縮它的 base,深度 N 的鏈成本是 O(N²)。git 用 `core.deltaBaseCacheLimit`(預設 96MiB)處理這件事。目前的量測顯示這不是主要瓶頸,但在 `--aggressive` 打包過的 repo 上做大量 checkout 時會浮現。
-- **commit-graph 與 multi-pack-index 尚未實作**。原路線圖把它們列在 Phase 7;實測顯示物件存取層修好之後,`sg log` 已與 `git log` 同級,commit-graph 的邊際效益因此大幅下降,留待有實際需求(例如 `--graph`、大量 merge-base 查詢)時再評估。
-- **寫入端仍不產生 >2GB 的 pack**。讀取已支援 large-offset,寫入遇到需要它的情況會明確報錯而非產生壞檔。
+- **The pack registry has no cap.** A process keeps every pack it has queried, for every
+  `git_dir`, mapped until it exits. No impact on short-lived CLI commands; a future long-running
+  daemon would need an LRU and eviction.
+- **No delta base cache yet.** Every level of a deep delta chain re-decompresses its base, making
+  a chain of depth N cost O(N^2). git handles this with `core.deltaBaseCacheLimit` (default
+  96MiB). Current measurements show this is not the primary bottleneck, but it will surface doing
+  a large number of checkouts on an `--aggressive`-packed repo.
+- **commit-graph and multi-pack-index are not implemented.** The original roadmap listed them in
+  Phase 7; measurements show that once the object access layer was fixed, `sg log` was already on
+  par with `git log`, so commit-graph's marginal benefit dropped sharply -- left for evaluation
+  if there is real demand (e.g. `--graph`, heavy merge-base queries).
+- **The writer still doesn't produce packs >2GB.** Reading already supports large-offset; writing
+  reports an explicit error rather than producing a broken file when it would be needed.
 
-## Phase 10:二進位解析器的 fuzzing —— 攻擊面、發現與已知限制
+## Phase 10: fuzzing the binary parsers -- attack surface, findings, and known limitations
 
-`sg` 會解析兩類**不可信的二進位輸入**:從網路收到的 packfile 與 `.idx`,以及
-磁碟上的 index v2。過去每次為這個專案手工合成惡意 pack 都會挖到真 bug
-(Phase 5a 的 REF_DELTA 環造成 stack overflow、Phase 7a 的 missing-base
-REF_DELTA 造成 use-after-free),所以把它系統化成常設的 fuzz harness。
+`sg` parses two classes of **untrusted binary input**: packfiles and `.idx` received over the
+network, and index v2 on disk. In the past, hand-crafting a malicious pack for this project always
+turned up a real bug (Phase 5a's REF_DELTA cycle causing a stack overflow, Phase 7a's missing-base
+REF_DELTA causing a use-after-free), so this was systematized into a standing fuzz harness.
 
-新增 `tests/test_fuzz_pack.c` 與 `tests/test_fuzz_index.c`,照既有測試慣例
-(無框架、`CHECK` 巨集、丟進 `tests/` 就被 `Makefile:48` 自動收集)。
+Added `tests/test_fuzz_pack.c` and `tests/test_fuzz_index.c`, following the existing test
+convention (no framework, `CHECK` macro, dropped into `tests/` and auto-collected by
+`Makefile:48`).
 
-### 為什麼不能照抄 `tests/fuzz_ignore.py` 的形狀
+### Why the shape of `tests/fuzz_ignore.py` couldn't be copied
 
-`fuzz_ignore.py` 是**差分測試**:拿真 `git` 當 oracle,比對語意分歧。二進位
-解析器要抓的是**記憶體安全問題**,而這裡沒有天然的 oracle——把同一份損毀資料
-餵給真 git,git 只會說「index 損毀」,不會告訴你 `sg` 有沒有越界。所以這兩支
-改成 in-process 的 C harness,鑑別力來自 sanitizer 而不是比對。CI 的接法也
-因此不同:`fuzz-ignore` job 是純 `make`,而這兩支真正有牙齒的地方是
-`sanitizers` job(見下方「哪些修法真的有回歸保護」)。
+`fuzz_ignore.py` is a **differential test**: it uses real `git` as oracle, comparing semantic
+divergence. What a binary parser needs to catch is **memory-safety issues**, and there's no
+natural oracle here -- feeding the same corrupted data to real git, git will just say "index
+corrupt" and won't tell you whether `sg` went out of bounds. So these two are instead in-process C
+harnesses, and their discriminating power comes from the sanitizer, not comparison. CI wiring is
+therefore different too: the `fuzz-ignore` job is plain `make`, while where these two actually have
+teeth is the `sanitizers` job (see "Which fixes actually have regression protection" below).
 
-### 兩個決定成敗的設計限制
+### Two design constraints that determine success or failure
 
-1. **破壞位元組後必須重算 trailer SHA-1**。`sg_index_read` 在解析任何 entry
-   **之前**就先驗全檔 checksum,pack 也一樣。純隨機 bit-flip 會 100% 卡在
-   checksum,永遠打不到後面的解析邏輯——那會是一支「看起來在 fuzz、其實什麼
-   都沒測到」的測試。
-2. **每輪要用全新的 `mkdtemp` git_dir**。pack registry 以 `git_dir` 為 key、
-   靠目錄 mtime 判斷是否重掃,而 `st_mtime` 只有秒級解析度;同一個 git_dir 在
-   一秒內反覆換 pack 內容會讀到 stale cache,測試就會假綠。
+1. **The trailer SHA-1 must be recomputed after corrupting bytes.** `sg_index_read` validates the
+   whole-file checksum **before** parsing any entry, and pack does the same. Pure random bit-flips
+   would get stuck on the checksum 100% of the time and never reach the parsing logic below --
+   that would be a test that "looks like fuzzing but tests nothing."
+2. **Each round must use a brand-new `mkdtemp` git_dir.** The pack registry is keyed by `git_dir`
+   and decides whether to rescan by directory mtime, and `st_mtime` only has second-level
+   resolution; swapping pack content repeatedly under the same git_dir within one second would
+   read stale cache and give the test a false green.
 
-### 找到並修掉的缺陷
+### Defects found and fixed
 
-| # | 位置 | 問題 |
+| # | Location | Problem |
 |---|---|---|
-| 1 | `index.c` 三處錯誤路徑 | 整個 index 檔的 `buf` 沒釋放 |
-| 2 | `index.c` 的 `padded_len` 檢查 | `free_entries(entries, i)` 上界不含當前 entry,剛 malloc 的 path 漏掉 |
-| 3 | `index.c` 的 `nentries` | 攻擊者可控的 u32 直接當 malloc 大小,無上限 |
-| 4 | `pack_inflate` | `strm.avail_out = (uInt)expected_len` 把 64-bit size varint 截成 32-bit |
-| 5 | `read_entry_at` 等五處 | 宣告的解壓大小未與可用壓縮位元組數對照就 malloc |
-| 6 | `sg_pack_delta_apply` | target size 是**已解壓 delta stream** 裡的獨立 varint,不受 5 的檢查管轄 |
+| 1 | Three error paths in `index.c` | The whole index file's `buf` was not freed |
+| 2 | The `padded_len` check in `index.c` | `free_entries(entries, i)`'s upper bound excluded the current entry, leaking the just-malloc'd path |
+| 3 | `nentries` in `index.c` | An attacker-controlled u32 used directly as a malloc size, with no cap |
+| 4 | `pack_inflate` | `strm.avail_out = (uInt)expected_len` truncated a 64-bit size varint to 32-bit |
+| 5 | `read_entry_at` and four other sites | Malloc'd the declared decompressed size without checking it against the available compressed byte count |
+| 6 | `sg_pack_delta_apply` | The target size is a separate varint inside the **already-decompressed delta stream**, not governed by the check in 5 |
 
-缺陷 1、2 之所以長期存在,是因為 CI 的 ASan 為了容忍兩個 process 生命週期的
-快取而全域關掉了 leak detection——等於洩漏偵測有個大洞。這個洞已在 Phase 11
-補起來(見下)。
+Defects 1 and 2 survived as long as they did because CI's ASan globally disabled leak detection to
+tolerate two process-lifetime caches -- effectively a big hole in leak detection. This hole was
+closed in Phase 11 (see below).
 
-缺陷 4 是唯一的記憶體**內容**安全問題(其餘是資源耗盡):宣告大小 `2^32+5`
-時 `avail_out` 被截成 5,壓縮流只要恰好解出 5 bytes,zlib 就回報成功,而呼叫端
-用的是未截斷的 `size`,於是回傳一個「宣告 4 GB、實際只有 5 個 byte 有效、
-其餘全是未初始化記憶體」的物件。修法是把 zlib 的餵料改成分塊,並加一道
-「本輪 `total_in`/`total_out` 都沒動就判定卡住」的獨立防線——這個迴圈在處理
-不可信輸入,卡死就是 DoS,不該把安全性外包給對 zlib 隱性契約的信任。
+Defect 4 is the only memory-**content** safety problem (the rest are resource exhaustion): with a
+declared size of `2^32+5`, `avail_out` was truncated to 5, and as soon as the compressed stream
+happened to decompress exactly 5 bytes, zlib reported success, while the caller used the
+untruncated `size` -- returning an object "declared as 4 GB, with only 5 bytes actually valid and
+the rest uninitialized memory." The fix feeds zlib in chunks and adds an independent guard that
+declares a stall if this round's `total_in`/`total_out` didn't move -- this loop handles untrusted
+input, and a hang is a DoS, which should not be outsourced to trust in zlib's implicit contract.
 
-### 壓縮比界限的實測
+### Measured compression-ratio bound
 
-缺陷 5、6 的修法都是「宣告大小 vs. 可用位元組數」的合理性檢查。pack 這邊用
-DEFLATE 的理論最大壓縮比。理論硬上限是 **1032:1**(258 bytes ÷ 2 bits),但
-實測真 zlib 對 8 MB 全零檔達到 **1026.8:1**(`git verify-pack -v` 量到
-size=8000000 / packed=7791),距離上限只剩 **0.45%**——而 pack 裡**最後一個**
-物件的可用位元組數幾乎等於它自己的壓縮大小,正是最緊的情況。1032 在數學上
-確實不會誤殺,但這種邊際沒有工程餘裕,因此常數放寬到 `1032 * 4`。這不損害
-檢查的目的:它要擋的是差了好幾個數量級的荒謬值(例如宣告 4 GB 卻只有 33
-bytes 可用)。
+The fixes for defects 5 and 6 are both plausibility checks of "declared size vs. available byte
+count." On the pack side this uses DEFLATE's theoretical maximum compression ratio. The
+theoretical hard limit is **1032:1** (258 bytes / 2 bits), but measurements show real zlib reaches
+**1026.8:1** on an 8 MB all-zero file (`git verify-pack -v` measures size=8000000 /
+packed=7791) -- only **0.45%** short of the limit -- and the **last** object in a pack has
+available byte count nearly equal to its own compressed size, which is the tightest case. 1032 is
+mathematically safe, but this margin leaves no engineering slack, so the constant was widened to
+`1032 * 4`. This doesn't undermine the check's purpose: it's meant to catch values off by orders
+of magnitude (e.g. declaring 4 GB with only 33 bytes available).
 
-`sg_pack_delta_apply` 不能用壓縮比,因為 target size 不是壓縮流的解壓結果,
-而是 copy/insert 指令重建出來的。界限改由指令流推導:一個 copy opcode byte
-最多帶出 65536 bytes,所以 target size 不可能超過「剩餘 delta 位元組數 ×
-65536」。
+`sg_pack_delta_apply` can't use the compression ratio, because the target size isn't the result of
+decompressing a compressed stream -- it's rebuilt from copy/insert instructions. The bound is
+instead derived from the instruction stream: a single copy opcode byte can bring out at most 65536
+bytes, so the target size can't exceed "remaining delta bytes x 65536."
 
-### 哪些修法真的有回歸保護(mutation 驗證實測)
+### Which fixes actually have regression protection (mutation-verified)
 
-逐一破壞每處修法、看對應測試會不會紅。**這一步由主對話執行,不交給寫測試的
-人自己驗**:
+Each fix was broken one at a time to see whether the corresponding test goes red. **This step was
+run by the primary conversation, not left to whoever wrote the test**:
 
-| 破壞的地方 | 普通建置 | ASan 建置 |
+| Broken location | Normal build | ASan build |
 |---|---|---|
-| 拿掉錯誤路徑的 `free(buf)` | **紅** | — |
-| `free_entries(i + 1)` 改回 `(i)` | **紅** | — |
-| 拿掉 `nentries` 上限 | 綠 | 綠 |
-| `decompressed_size_is_plausible` 恆真 | 綠 | **紅**(19 TB 配置請求) |
-| 拿掉 delta target 界限 | 綠 | **紅**(545 TB 配置請求) |
-| 還原 `pack_inflate` 的 chunking | **紅** | — |
-| 同時拿掉 `pack_inflate` 的兩個 guard | **紅**(看門狗) | — |
+| Removing `free(buf)` on the error path | **red** | -- |
+| Reverting `free_entries(i + 1)` to `(i)` | **red** | -- |
+| Removing the `nentries` cap | green | green |
+| Making `decompressed_size_is_plausible` always true | green | **red** (19 TB allocation request) |
+| Removing the delta target bound | green | **red** (545 TB allocation request) |
+| Reverting `pack_inflate`'s chunking | **red** | -- |
+| Removing both guards in `pack_inflate` at once | **red** (watchdog) | -- |
 
-最後一列原本是**卡死**而不是紅燈——`fork()` + `alarm()` 只保護了單一呼叫點,
-同一個二進位裡其他呼叫點照樣會無限期停住,而 GitHub Actions 的 job 預設
-timeout 是 6 小時。因此兩支 fuzzer 的 `main()` 都裝了整體看門狗
-(`SG_FUZZ_TIMEOUT`,預設 600 秒),把任何位置的卡死轉成帶診斷訊息的非 0 退出。
+The last row was originally a **hang** rather than a red test -- `fork()` + `alarm()` only
+protects a single call site, and other call sites in the same binary would still hang
+indefinitely, while GitHub Actions jobs default to a 6-hour timeout. So both fuzzers' `main()` got
+an overall watchdog (`SG_FUZZ_TIMEOUT`, default 600 seconds) that turns a hang at any location into
+a non-zero exit with diagnostics.
 
-⚠ **做 mutation 驗證時每次都要 `make clean`**。第一次跑這張表時出現「還原修法
-後測試仍然紅」的詭異結果,查下來是增量重建沒有正確反映還原(object 檔不記錄
-自己是從哪個版本編來的,見 `Makefile:76-80`),clean 重建後兩個方向都正常。
-差點把自己的建置殘留誤判成測試不穩定。
+Warning: **`make clean` every time when doing mutation verification.** The first run through this
+table produced the strange result of "test still red after reverting the fix" -- tracked down to
+an incremental rebuild not correctly reflecting the revert (object files don't record which
+version they were compiled from, see `Makefile:76-80`); after a clean rebuild both directions
+behaved correctly. This nearly got misread as test flakiness caused by leftover build state.
 
-重點結論:**「拒絕荒謬大小」這類加固,回傳值與未加固版本完全相同**(都是
--1,只是機制從顯式拒絕變成 malloc 失敗),透過公開 API 根本觀察不到差別。
-它們的鑑別力**只存在於 ASan 底下**——而且抓到它們的是隨機 fuzz 輪,不是手工
-構造的確定性測試。這也是為什麼 `sanitizers` job 裡加了一段長 campaign:那是
-這批加固唯一真正的守門員。
+Key conclusion: for hardening like "reject absurd sizes", **the return value is identical to the
+unhardened version** (both are -1, only the mechanism changes from an explicit rejection to a
+malloc failure), so no difference is observable through the public API at all. Their discriminating
+power **exists only under ASan** -- and what catches them is a random fuzz round, not a
+hand-constructed deterministic test. This is why a long campaign was added to the `sanitizers`
+job: it is the only real gatekeeper for this batch of hardening.
 
-### 已知限制
+### Known limitations
 
-- **`nentries` 上限沒有任何測試能分辨**。`0xFFFFFFFF × sizeof(sg_index_entry)`
-  約 344 GB,在 ASan 的 1 TB 配置上限之內,不會觸發 allocation-size-too-big;
-  普通建置下 malloc 失敗也一樣回 -1。這個檢查是 defense-in-depth,對應的測試
-  是 smoke test 而非鑑別性測試,已在測試註解裡明講,不假裝它守得住東西。
-- **macOS 完全不支援 LeakSanitizer**(指定 `detect_leaks=1` 會直接 abort,不是
-  「預設不啟用」)。洩漏偵測因此靠 `test_index_fail_path_leak` 的 RSS 探針,
-  而 ASan 的配置器 quarantine 會扣住已釋放的 chunk 撐大 RSS 造成偽陽性,所以
-  該探針在 ASan 建置下自我停用。結果是洩漏與記憶體安全兩種偵測分屬不同的 CI
-  job,不能只看其中一個。**更根本的問題是 CI 全域關掉了 `detect_leaks`,所以
-  除了 index 那一條失敗路徑之外,這個專案至今沒有任何自動化的洩漏偵測**——
-  缺陷 1、2 能存活這麼久就是這個原因。當初關掉它的理由是「pack registry 與
-  chunk keepalive 是刻意不釋放的 process 生命週期快取,會被誤報」,但那個前提
-  **很可能不成立**:兩者都掛在全域指標下(`pack.c:498`、`chunk.c:744`),而
-  LeakSanitizer 的可達性分析把全域變數當 root,仍然可達的記憶體本來就不會被
-  判定成 leak。也就是說在 Linux CI 上直接開 `detect_leaks=1` 有相當機會直接
-  通過,連抑制檔都不必寫。這是一次 CI 就能驗證的事,本機(macOS)測不到。
-- **只有 pack/idx/index 三個解析器被覆蓋**。`sg_decompress`
-  (`src/util/zutil.c`,loose object 的解壓路徑)是「每次滿了就 `cap*2`」的
-  無界成長,沒有輸出長度上限,是同類的 zip-bomb 攻擊面,但不在這次範圍內。
+- **No test can distinguish the `nentries` cap.** `0xFFFFFFFF x sizeof(sg_index_entry)` is about
+  344 GB, which is within ASan's 1 TB allocation limit and won't trigger
+  allocation-size-too-big; under a normal build a malloc failure also just returns -1. This check
+  is defense-in-depth, and its corresponding test is a smoke test, not a discriminating one --
+  already stated plainly in the test's comment, not pretending it guards anything.
+- **macOS has no LeakSanitizer support at all** (passing `detect_leaks=1` aborts immediately, not
+  "just disabled by default"). Leak detection therefore relies on `test_index_fail_path_leak`'s
+  RSS probe, and ASan's allocator quarantine holds onto freed chunks and inflates RSS causing
+  false positives, so the probe disables itself under an ASan build. The result is that leak
+  detection and memory-safety detection live in different CI jobs, and you can't look at just one.
+  **The more fundamental problem is that CI globally disabled `detect_leaks`, so aside from that
+  one index failure path, this project has had no automated leak detection at all until now** --
+  that's why defects 1 and 2 survived so long. The original reason for disabling it was "the pack
+  registry and chunk keepalive are process-lifetime caches deliberately never freed, they'd be
+  falsely flagged," but that premise **is probably false**: both hang off file-scope global
+  pointers (`pack.c:498`, `chunk.c:744`), and LeakSanitizer's reachability analysis treats global
+  variables as roots, so memory that's still reachable is never classified as a leak. In other
+  words, turning on `detect_leaks=1` directly on Linux CI has a good chance of just passing, with
+  no suppression file needed at all. This is something a single CI run can verify, and cannot be
+  tested locally (macOS).
+- **Only the pack/idx/index three parsers are covered.** `sg_decompress`
+  (`src/util/zutil.c`, the loose object decompression path) grows unbounded via "double the
+  capacity whenever full," with no output-length cap -- the same class of zip-bomb attack surface,
+  but out of scope this time.
 
-## Phase 11:把 CI 的 LeakSanitizer 開回來
+## Phase 11: turning CI's LeakSanitizer back on
 
-Phase 10 留下的第一順位 follow-up。改動只有一行語意:`.github/workflows/ci.yml`
-的 ASan job 從三處 `ASAN_OPTIONS=detect_leaks=0` 改成 `detect_leaks=1`。
+The top-priority follow-up left by Phase 10. The change is semantically one line:
+`.github/workflows/ci.yml`'s ASan job changed `ASAN_OPTIONS=detect_leaks=0` to `detect_leaks=1` in
+three places.
 
-### 原本關掉的理由是錯的
+### The original reason for disabling it was wrong
 
-當初的說法是「`pack.c:498` 的 mmap pack registry 與 `chunk.c:744` 的 chunk
-keepalive cache 是刻意不釋放的 process 生命週期快取,開了會被誤報」。這個前提
-不成立:兩者都是**檔案層級的全域變數**,而 LeakSanitizer 的可達性分析把全域
-當 root,仍然可達(still-reachable)的記憶體不會被判定成 leak。實測證實了這點
-——`detect_leaks=1` 在 Linux CI 上直接通過,三個矩陣格加 ASan job 全綠,
-**不需要任何 suppression 檔**。
+The original claim was "the mmap pack registry at `pack.c:498` and the chunk keepalive cache at
+`chunk.c:744` are process-lifetime caches deliberately never freed, and would be falsely flagged
+if enabled." This premise doesn't hold: both are **file-scope global variables**, and
+LeakSanitizer's reachability analysis treats globals as roots -- memory that's still-reachable is
+never classified as a leak. Measurement confirmed this -- `detect_leaks=1` passed outright on
+Linux CI, all three matrix cells plus the ASan job went green, **with no suppression file
+needed at all**.
 
-代價是實在的:缺陷 1、2 兩個 `index.c` 的洩漏能活到 Phase 10,靠的是
-`test_fuzz_index` 量 peak RSS 才抓到——比 LSan 鈍得多的工具。
+The cost was real: the two `index.c` leaks in defects 1 and 2 survived until Phase 10 only because
+`test_fuzz_index` measured peak RSS -- a far blunter tool than LSan.
 
-### 綠燈不算證據:植入洩漏的三次實測
+### A green light isn't evidence: three measured leak plantings
 
-「開了之後 CI 還是綠」有兩種解釋:沒有洩漏,或 LSan 根本沒在跑。分不出來就等於
-沒有這道閘門。所以在合併前種了故意的洩漏送 CI,結果值得記下來:
+"Still green after turning it on" has two explanations: no leak, or LSan isn't actually running.
+Without telling them apart, this gate doesn't really exist. So deliberate leaks were planted and
+sent to CI before merging; the results are worth recording:
 
-| 植入形態 | CI 結果 | 解讀 |
+| Planting shape | CI result | Reading |
 |---|---|---|
-| 1 塊 1234 B,指標存進 `sg_cli_run` 的區域變數後設 NULL | **綠**(382/382 通過) | 假陰性 |
-| 100 塊 1234 B,同一位置迴圈 | 紅,`detected memory leaks`,interop 200/382 | LSan 活著 |
-| 1 塊 1234 B,配置在一個會返回的 helper 內 | 紅,`Direct leak of 1234 byte(s) in 1 object(s)` | 單一洩漏抓得到 |
+| 1 block of 1234 B, pointer stored in a local variable of `sg_cli_run` then set to NULL | **green** (382/382 passed) | false negative |
+| 100 blocks of 1234 B, same site in a loop | red, `detected memory leaks`, interop 200/382 | LSan is alive |
+| 1 block of 1234 B, allocated inside a helper that returns | red, `Direct leak of 1234 byte(s) in 1 object(s)` | a single leak gets caught |
 
-第一列的假陰性不是 LSan 的缺陷,是**植入位置**的問題:那個指標被溢出到
-`sg_cli_run` 自己的堆疊框架,而該框架在整個指令執行期間都是活的祖先框架,
-保守掃描把它當成 root,於是那塊記憶體一直「可達」。真實的洩漏來自**會返回的
-函式**,框架隨即被後續更深的呼叫覆蓋——第三列證明那種形態單一一塊就會被抓到。
+The first row's false negative isn't a flaw in LSan, it's a **planting-location** problem: that
+pointer overflowed into `sg_cli_run`'s own stack frame, and that frame is a live ancestor frame for
+the whole duration of the command's execution -- the conservative scanner treats it as a root, so
+that memory stays "reachable" the whole time. A real leak comes from a **function that returns**,
+whose frame is then overwritten by later, deeper calls -- the third row proves that shape gets
+caught with just a single block.
 
-教訓一般化:**驗證一個保守式洩漏掃描器時,不要把植入放在會存活到 process
-結束的框架裡**,否則證明出來的是工具沒壞,而不是閘門有效。
+Generalized lesson: **when verifying a conservative leak scanner, don't plant in a frame that
+survives to process exit**, or what gets proven is that the tool isn't broken, not that the gate
+is effective.
 
-### macOS 本機怎麼先驗一輪
+### How to pre-verify locally on macOS
 
-Apple 的 ASan 沒有實作 LSan,`detect_leaks=1` 會直接 abort,所以本機測不到。
-替代品是系統內建的 `leaks(1)`:
+Apple's ASan doesn't implement LSan; `detect_leaks=1` aborts immediately, so it can't be tested
+locally. The substitute is the system's built-in `leaks(1)`:
 
 ```bash
 MallocStackLogging=1 leaks --atExit -- build/tests/test_foo
 MallocStackLogging=1 leaks --atExit -- build/sg status
 ```
 
-它會印 `N leaks for M total leaked bytes`。用它掃過 22 個測試二進位與 20 種
-CLI 呼叫,全部 0 leak——這是推 CI 前的信心來源。同樣的紀律適用:先用一支故意
-洩漏的小程式確認 `leaks` 會紅(它會印 "Process is not debuggable" 警告,但
-偵測照常運作),再相信那些 0。
+It prints `N leaks for M total leaked bytes`. It was run across 22 test binaries and 20 kinds of
+CLI invocations, all 0 leaks -- this was the confidence source before pushing to CI. The same
+discipline applies: first confirm with a small program with a deliberate leak that `leaks` goes
+red (it prints a "Process is not debuggable" warning, but detection still works normally), then
+trust those zeros.
 
-### 已知限制
+### Known limitations
 
-- 覆蓋範圍等於 ASan job 跑到的路徑:`make sanitize` 的單元測試 + `interop.sh`
-  + 兩支解析器 fuzzer。沒被這些跑到的程式碼一樣沒有洩漏偵測。
-- 保守掃描的本質:仍然可達的記憶體不算 leak。刻意留存的快取因此免疫,但
-  「本該釋放卻剛好還被某個全域或活框架指到」的真洩漏也會被漏掉。
-- 這是 Linux 專屬的閘門。macOS 那格 CI 不跑 ASan,本機也無法複製。
+- Coverage equals the paths the ASan job actually runs: `make sanitize`'s unit tests +
+  `interop.sh` + the two parser fuzzers. Code not exercised by these has no leak detection either.
+- The nature of conservative scanning: memory that's still reachable doesn't count as a leak.
+  Deliberately retained caches are therefore immune, but so are real leaks where "something that
+  should have been freed happens to still be pointed to by some global or live frame."
+- This is a Linux-only gate. The macOS CI cell doesn't run ASan, and it can't be reproduced
+  locally either.
 
 
-## Phase 12:`sg tag`、`sg reset`,與兩個位元相容缺口
+## Phase 12: `sg tag`, `sg reset`, and two bit-compatibility gaps
 
-新增 `sg_rev_parse_commit`(`include/sg/revparse.h`)——`HEAD`/分支/tag/40-hex
-加上 `~N`/`^N` 後綴的小型 rev 語法子集,以及 `sg tag`:輕量標籤只是
-`refs/tags/<name>` 直接指向 commit;`-a`/`-m` annotated 標籤額外寫入一個
-`SG_OBJ_TAG` 物件,ref 改指向該物件。`-m` 沒有 `-a` 時比照真 git 隱含
-annotated(已用真 git 實測確認)。與 `sg branch` 共用
-`sg_ref_list_under`/`sg_ref_delete_under`(loose+packed 合併/清除)及
-`sg_ref_name_valid_for_create`。
+Added `sg_rev_parse_commit` (`include/sg/revparse.h`) -- a small rev-syntax subset covering
+`HEAD`/branch/tag/40-hex plus `~N`/`^N` suffixes -- and `sg tag`: a lightweight tag is just
+`refs/tags/<name>` pointing directly at a commit; `-a`/`-m` annotated tags additionally write a
+`SG_OBJ_TAG` object, with the ref pointing at it instead. `-m` without `-a` implies annotated,
+matching real git (confirmed by measurement against real git). Shares
+`sg_ref_list_under`/`sg_ref_delete_under` (loose+packed merge/cleanup) and
+`sg_ref_name_valid_for_create` with `sg branch`.
 
-### 已知限制:`sg push` 不推送 tag(**已於 Phase 13 解除,見下方**)
+### Known limitation: `sg push` doesn't push tags (**lifted in Phase 13, see below**)
 
-`sg push` 當時寫死只推送 `refs/heads/`——不論本地是否有 `sg tag` 或真 git
-建立的 tag,`sg push` 都不會把它們傳到遠端,也不會報錯或警告,是靜默的範圍
-限制。因為 `sg` 與真 git 位元相容,使用者可以用真 git 的 `git push --tags`
-對同一個 repo 補推 tag 繞過。這一段保留下來是因為 Phase 13 的實作範圍正是
-由它界定的;現況以 Phase 13 為準。
+`sg push` was hardcoded to push only `refs/heads/` -- regardless of whether there were `sg tag` or
+real-git-created tags locally, `sg push` would not transmit them to the remote, nor would it error
+or warn; a silent scope limitation. Because `sg` is bit-compatible with real git, the user could
+work around it with real git's `git push --tags` on the same repo to push the tags separately.
+This section is kept because Phase 13's implementation scope was defined exactly by it; the
+current state is as of Phase 13.
 
-### `sg reset`:三種模式,三道不同的安全閘門
+### `sg reset`: three modes, three different safety gates
 
-`--soft` 只動分支指標,`--mixed`(預設)另外重寫 index,`--hard` 再加上工作
-目錄。目標 revision 走上面的 `sg_rev_parse_commit`。
+`--soft` only moves the branch pointer; `--mixed` (default) additionally rewrites the index;
+`--hard` additionally touches the working directory. The target revision goes through
+`sg_rev_parse_commit` above.
 
-**不把三種模式都塞進 `sg_safe_apply_tree`**,雖然那是既有的破壞性操作骨架。
-真 git 對 `--soft`/`--mixed` 不要求確認——它們根本不覆寫檔案——全部走同一條
-路會比它模仿的工具還礙事。折衷是:`--hard` 完整的確認加快照;`--mixed` 自動
-建快照但不打斷;`--soft` 兩者皆無。
+**Not all three modes are stuffed into `sg_safe_apply_tree`**, even though that's the existing
+destructive-operation skeleton. Real git doesn't require confirmation for `--soft`/`--mixed` --
+they never overwrite files at all -- routing everything through one path would be more annoying
+than the tool it's imitating. The compromise: `--hard` gets full confirmation plus a snapshot;
+`--mixed` snapshots automatically but doesn't interrupt; `--soft` gets neither.
 
-`--mixed` 需要一條「重寫 index、不碰工作目錄」的路徑,而
-`sg_apply_tree_to_workdir` 表達不了——它靠 `stat()` 剛寫出的檔案來填 index
-條目的 stat 欄位。不寫檔就沒有那個來源,而**沿用舊條目的 stat 比看起來更糟**:
-index 會宣稱檔案是最新的,同時記錄一個不同的 blob,而真 git 把 stat 當捷徑
-信任,於是對一個內容已經不同的檔案回報乾淨。`sg_index_reset_to_tree` 因此
-只在 sha 未變時沿用 stat 欄位,其餘一律歸零。
+`--mixed` needs a path for "rewrite the index, don't touch the working directory", which
+`sg_apply_tree_to_workdir` can't express -- it relies on `stat()`ing the file it just wrote to
+fill the index entry's stat fields. Without writing a file, that source doesn't exist, and
+**reusing the old entry's stat is worse than it looks**: the index would claim the file is
+up to date while recording a different blob, and real git trusts stat as a shortcut, so it would
+report clean for a file whose content has actually diverged. `sg_index_reset_to_tree` therefore
+only carries over the stat fields when the sha is unchanged, and zeroes them out otherwise.
 
-### 兩個位元相容缺口
+### Two bit-compatibility gaps
 
-**訊息沒有正規化。** `sg commit -m "x"` 把字串原封不動寫進物件,真 git 先套用
-預設的 `--cleanup=whitespace`。同一個邏輯 commit 在兩邊算出不同的物件 id:
-git 的訊息段結尾有換行,sg 沒有。git 讀得懂 sg 的物件、`fsck` 也乾淨,所以
-沒有壞掉——但「同一個 commit 在兩個工具下雜湊相同」正是這個專案的主張,而
-382 項 interop 檢查從來沒有逐位元組比對過訊息段。
+**Messages weren't normalized.** `sg commit -m "x"` wrote the string verbatim into the object,
+while real git first applies the default `--cleanup=whitespace`. The same logical commit computes
+different object ids on the two sides: git's message section ends with a newline, sg's doesn't.
+git can read sg's objects fine and `fsck` is clean, so nothing was broken -- but "the same commit
+hashes identically under both tools" is exactly this project's claim, and the 382 interop checks
+had never compared the message section byte-for-byte.
 
-規則是實測出來的,不是回想的:每行剝掉行尾空白、連續空行併成一個、去掉開頭
-與結尾的空行、結尾正好一個換行,行首空白保留。只有尾隨換行那條是顯而易見的
-——只補那一條會用一個分歧換來四個。**`\v` 與 `\f` 不算空白**(真 git 保留
-它們),`\r` 算。第一版把這兩個字元也剝了,審查時比對真 git 才發現。
+The rule was determined by measurement, not recall: strip trailing whitespace per line, collapse
+consecutive blank lines into one, drop leading and trailing blank lines, end with exactly one
+newline, keep leading whitespace on each line. Only the trailing-newline rule was obvious --
+fixing just that alone would trade one divergence for four. **`\v` and `\f` don't count as
+whitespace** (real git keeps them), `\r` does. The first version stripped those two characters
+too; it was only caught during review by comparing against real git.
 
-`sg_message_cleanup` 放在序列化函式旁邊,但**刻意不從序列化函式裡呼叫**:
-`cmd_rebase.c` 轉發既有 commit 的訊息,而真 git 用 `--cleanup=verbatim` 可以
-產生沒有尾隨換行的訊息,rebase 必須逐位元組保真。套用的是持有訊息的呼叫端
-——commit、tag、merge、snapshot、chunk。
+`sg_message_cleanup` sits next to the serialization functions, but is **deliberately not called
+from within them**: `cmd_rebase.c` forwards an existing commit's message, and real git's
+`--cleanup=verbatim` can produce a message with no trailing newline -- rebase must preserve it
+byte-for-byte. It's applied by whichever caller owns the message -- commit, tag, merge, snapshot,
+chunk.
 
-順帶記一個真 git 本身的不對稱,反直覺到值得寫下來免得日後被「順手統一」:
-**`git commit -m ""` 中止,`git tag -a -m ""` 接受**並建出訊息段為空的 tag。
+Worth noting a real-git asymmetry, counter-intuitive enough to write down so it doesn't get
+"helpfully unified" later: **`git commit -m ""` aborts, but `git tag -a -m ""` accepts it** and
+produces a tag with an empty message section.
 
-**loose object 解壓無上限。** `sg_decompress` 每次滿了就把緩衝區加倍,沒有
-天花板,所以一個解壓後有數 GB 的 loose object 檔會被完整解出來才輪到別人看它
-一眼。Phase 10 把這條記成剩下的 zip-bomb 面。
+**Loose object decompression had no cap.** `sg_decompress` doubled the buffer whenever it filled
+up, with no ceiling, so a loose object file that decompresses to several GB would be fully
+decompressed before anyone got to look at it. Phase 10 recorded this as the remaining zip-bomb
+surface.
 
-上限不是魔術數字:`sg_loose_read` 先只解壓開頭 64 個位元組,從中解析出
-`"<type> <size>\0"` 標頭,再把 `header_len + declared_size` 當硬天花板做真正的
-解壓——git 自己的形狀。zutil 保持泛用(`sg_decompress_bounded` 把天花板當
-參數,不認識物件),兩階段邏輯放在有資格認識格式的 `loose.c`。
+The cap isn't a magic number: `sg_loose_read` first decompresses only the leading 64 bytes,
+parses out the `"<type> <size>\0"` header from that, then uses `header_len + declared_size` as a
+hard ceiling for the actual decompression -- git's own shape. zutil stays generic
+(`sg_decompress_bounded` takes the ceiling as a parameter and knows nothing about objects); the
+two-stage logic lives in `loose.c`, which is entitled to know the format.
 
-同一輪修掉一個與 Phase 10 缺陷 4 同族的截斷:`avail_in` 讓 `size_t` 穿過
-32-bit 的 `uInt`,所以超過 4 GB 的 loose 檔會餵給 zlib 錯誤的長度。Phase 10
-修了 pack 那條,漏了這條。
+The same round fixed a truncation of the same family as Phase 10's defect 4: `avail_in` let a
+`size_t` pass through a 32-bit `uInt`, so a loose file over 4 GB would feed zlib the wrong length.
+Phase 10 fixed the pack side of this and missed this one.
 
-### 審查抓到的:一個假的 merge parent
+### Caught during review: a fake merge parent
 
-`sg reset` 沒有清掉 `.git/MERGE_HEAD`。在衝突的合併中用裸的 `sg reset` 放棄
-它、暫存修正、正常 commit——產出的 commit 有**兩個 parent**,第二個指向剛被
-放棄的 merge target,全程沒有任何警告。只有 `--hard` 會清理,因為它走
-`sg_safe_apply_tree`;soft 與 mixed 兩條路徑從來沒呼叫過 `sg_merge_head_remove`。
+`sg reset` didn't clear `.git/MERGE_HEAD`. Using bare `sg reset` to abandon a conflicted merge,
+stage a fix, and commit normally -- the resulting commit ended up with **two parents**, the second
+pointing at the merge target that had just been abandoned, with no warning anywhere along the way.
+Only `--hard` cleaned it up, because it goes through `sg_safe_apply_tree`; the soft and mixed
+paths never called `sg_merge_head_remove`.
 
-矩陣是實測三種模式 × 兩種進行中狀態量出來的,不是猜的:真 git 在合併中或
-rebase 暫停中**直接拒絕** `--soft`,`--mixed` 清掉 `MERGE_HEAD`,而**三種模式
-都不動 rebase 狀態**。sg 現在與此一致,唯一例外是 `--hard` 仍會經
-`sg_safe_apply_tree` 清掉 rebase 狀態——那條路徑與 `switch`、`undo` 共用,
-要改屬於另一次改動,已記在 `docs/sg.1` 的 BUGS 段落。
+The matrix was measured across three modes x two in-progress states, not guessed: real git
+**flatly rejects** `--soft` during a merge or a paused rebase, `--mixed` clears `MERGE_HEAD`, and
+**none of the three modes touch rebase state**. sg is now consistent with this, with the sole
+exception that `--hard` still clears rebase state via `sg_safe_apply_tree` -- that path is shared
+with `switch` and `undo`, and fixing it belongs to a different change, recorded in the BUGS
+section of `docs/sg.1`.
 
-614 項檢查裡沒有一項看得到這件事:**從來沒有任何測試在合併進行中呼叫過
-`sg reset`**。新的檢查斷言使用者會注意到的終態——後續 commit 只有一個 parent。
+None of the 614 checks could see this: **no test had ever called `sg reset` while a merge was in
+progress**. The new check asserts the end state a user would notice -- the following commit has
+only one parent.
 
-### 這一階段關於測試的三個教訓
+### Three testing lessons from this phase
 
-**優先序在同一個地方錯了兩次,方向相反。** 先是 tag 與 branch 誰優先(gitrevisions
-是 tag 勝),接著是完整 40-hex 的位置(它比任何 ref 都優先——名字剛好是別的
-commit 的 hex 的 branch 會被字面值蓋掉)。兩次都是憑對 gitrevisions 的記憶下
-判斷,兩次都錯。現在註解裡寫的是「哪個順序是實測來的」。
+**Priority ordering was wrong twice at the same spot, in opposite directions.** First, which wins
+between tag and branch (gitrevisions says tag wins), then where a full 40-hex sits (it beats any
+ref -- a branch that happens to be named the same as another commit's hex gets shadowed by the
+literal value). Both times the judgment was made from memory of gitrevisions, and both times it
+was wrong. The comment now states "which order was confirmed by measurement."
 
-**壞掉的 mutation 會給出看起來更漂亮的紅。** 驗證 hex 優先序時第一次改壞了
-`resolve_base` 的區塊順序,兩個測試都紅了——比正確的 mutation 多一個。重做成
-乾淨的 mutation 後只有目標測試紅,那才是有效證據。
+**A broken mutation can give a prettier-looking red.** When verifying hex priority, the first
+attempt broke the ordering of blocks in `resolve_base`, and both tests went red -- one more than
+the correct mutation. Redone as a clean mutation, only the target test went red -- that's the
+valid evidence.
 
-**保守式洩漏掃描與 stat 快取都會讓「沒紅」變得沒有意義。** 證明 CI 的
-LeakSanitizer 還活著時,種在會存活到 process 結束的框架裡的單一洩漏不會被報
-(見 Phase 11);而 `--mixed` 的 stat 守門,在檔案 mtime 與 index 同一秒時被
-git 的 racily-clean 規則遮住——所有其他檢查都在同一秒內寫檔與寫 index,所以
-整套測試都看不見它。把 mtime 用 `touch -t` 推到過去才顯形。
+**Both conservative leak scanning and the stat cache can make "no red" meaningless.** When
+proving CI's LeakSanitizer was still alive, a single leak planted in a frame that survives to
+process exit wasn't reported (see Phase 11); and `--mixed`'s stat gate is masked by git's
+racily-clean rule when the file's mtime and the index share the same second -- every other check
+writes the file and the index within the same second, so the whole test suite couldn't see it.
+Only pushing the mtime into the past with `touch -t` made it visible.
 
-### 已知限制
+### Known limitations
 
-- **沒有縮寫 sha。** `sg_rev_parse_commit` 只吃完整 40 字 hex;前綴匹配要同時
-  掃 loose 與每一個 pack,是另一個量級,標頭註解有寫明這是刻意的。
-- **`sg reset` 不吃 pathspec。** `sg restore --staged` 已經是
-  `git reset --mixed <path>` 的同義詞,硬做會變成第三份重疊邏輯。
-- **detached HEAD 一律拒絕。** sg 從來不寫裸 sha 進 HEAD,全專案沒有這個
-  primitive;`cmd_push.c` 與 `cmd_rebase.c` 已是「偵測到就拒絕」的既有慣例。
-- **`sg reset --soft --hard` 報用法錯誤**,真 git 則接受並讓最後一個旗標生效。
-  刻意收斂:模糊的呼叫寧可拒絕。寫進 man page 免得被當成 bug 修掉。
-- **4 GB 截斷的修法沒有測試覆蓋。** 要真的配置超過 1 GB 才觀測得到差異,與
-  專案「測試不配置大量記憶體」的既有約束衝突,只有程式碼審查層級的信心。
-- **`loose.c` 的溢位保護與「無進度即判定卡死」防線都沒有能鑑別的測試。**
-  前者需要 `declared_size` 接近 `SIZE_MAX` 的案例,後者需要一段病態的 deflate
-  串流,兩者都不容易自然構造。如實記錄,不假裝有覆蓋。
+- **No abbreviated sha.** `sg_rev_parse_commit` only accepts a full 40-character hex; prefix
+  matching would need to scan both loose objects and every pack, a different order of magnitude
+  of work -- the header comment states this is deliberate.
+- **`sg reset` doesn't accept a pathspec.** `sg restore --staged` is already a synonym for
+  `git reset --mixed <path>`; forcing it in would create a third overlapping piece of logic.
+- **Detached HEAD is always rejected.** sg never writes a bare sha into HEAD; this primitive
+  doesn't exist anywhere in the project. `cmd_push.c` and `cmd_rebase.c` already follow the
+  existing convention of "reject on detection."
+- **`sg reset --soft --hard` reports a usage error**, while real git accepts it and lets the last
+  flag win. Deliberately converged the other way: an ambiguous invocation is rejected rather than
+  guessed. Written into the man page so it isn't mistaken for a bug and "fixed" later.
+- **The fix for the 4 GB truncation has no test coverage.** Observing the difference requires
+  actually allocating over 1 GB, which conflicts with the project's existing constraint that
+  "tests don't allocate large amounts of memory"; confidence exists only at the code-review level.
+- **Neither `loose.c`'s overflow protection nor its "no progress means stuck" guard has a
+  discriminating test.** The former needs a case with `declared_size` near `SIZE_MAX`, the latter
+  needs a pathological deflate stream; neither is easy to construct naturally. Recorded honestly,
+  not pretending there's coverage.
 
-## Phase 13:`sg push` 推送 tag
+## Phase 13: `sg push` pushing tags
 
-`sg push` 從只認 `refs/heads/` 擴充到能推 tag。三種模式:不給名稱維持原本的
-「推當前分支」;給了名稱時**同時查 `refs/heads/<name>` 與 `refs/tags/<name>`**,
-兩邊都命中就報 `src refspec '<name>' matches more than one` 並拒絕;`--tags`
-推送 `refs/tags/` 底下全部。
+`sg push` was expanded from recognizing only `refs/heads/` to being able to push tags. Three
+modes: no name given keeps the original "push the current branch" behavior; when a name is given,
+it **checks both `refs/heads/<name>` and `refs/tags/<name>`**, and if both match it reports
+`src refspec '<name>' matches more than one` and rejects it; `--tags` pushes everything under
+`refs/tags/`.
 
-### 要改的比預期少
+### Less to change than expected
 
-踏勘的結論推翻了 Phase 12 對工作量的估計。當時記的是「需要擴充 ref 列舉範圍
-**與 pack 打包對象**(annotated tag 物件本身也要進 pack)」——後半句是錯的:
+The survey's conclusion overturned Phase 12's effort estimate. The note at the time was "needs
+to expand both the ref-enumeration scope **and the pack's set of packed objects** (the annotated
+tag object itself also needs to go into the pack)" -- the second half was wrong:
 
-- `cmd_push.c` 的 `walk_add_object` 早就是型別無關的,`SG_OBJ_TAG` 分支一直
-  存在且會走 `tag.object` 那條邊。餵一個 annotated tag 物件 id 進去,tag 物件
-  本身加它指向的 commit 與整棵樹都會被正確收進 send set。
-- `sg_pack_build_buf` 對 `SG_OBJ_TAG` 沒有任何排除或特判,與 blob/tree/commit
-  走同一條路。
-- 網路層(`sg_transport_push`、pkt-line 組包、report-status 解析)對 ref 命名
-  空間完全無知。`sg_ref_name_is_safe` 只用來過濾**遠端**廣播,不擋本地要送出
-  的 ref 名稱。
+- `cmd_push.c`'s `walk_add_object` was already type-agnostic; the `SG_OBJ_TAG` branch already
+  existed and already walks the `tag.object` edge. Feeding in an annotated tag object id correctly
+  pulls the tag object itself, plus the commit it points at and the whole tree, into the send set.
+- `sg_pack_build_buf` has no exclusion or special case for `SG_OBJ_TAG`; it goes through the same
+  path as blob/tree/commit.
+- The network layer (`sg_transport_push`, pkt-line assembly, report-status parsing) is entirely
+  unaware of the ref namespace. `sg_ref_name_is_safe` is only used to filter **remote**
+  advertisements, not to block local ref names being sent.
 
-於是整個里程碑的產品程式碼改動都落在 `src/cli/cmd_push.c` 一支函式裡。這是
-「先派人測繪再開規格」直接省下工作量的一次:照 Phase 12 的估計去做,會有一半
-的力氣花在改根本不需要改的 pack 與網路層上。
+So the entire milestone's production code change landed in a single function in
+`src/cli/cmd_push.c`. This is a case where "survey first, then write the spec" directly saved
+effort: following Phase 12's estimate would have spent half the effort changing pack and network
+layers that didn't need to change at all.
 
-### tag 的更新規則不是 fast-forward
+### Tags don't update by fast-forward
 
-真 git 對 tag **不算祖先關係**:遠端已有同名 tag 而 id 不同,一律拒絕
-(`! [rejected] lw -> lw (already exists)`),`--force` 才覆寫。這是實測出來的,
-不是回想的。
+Real git doesn't apply an ancestry check to tags at all: if the remote already has a tag with the
+same name but a different id, it's rejected outright
+(`! [rejected] lw -> lw (already exists)`); only `--force` overwrites it. This was determined by
+measurement, not recall.
 
-這件事直接決定了實作:tag **不走** `check_fast_forward`,tag 的 id 也不流進
-`sg_merge_base`。踏勘時發現「把 tag 物件 id 餵進 `sg_merge_base` 會被判成
-unrelated,於是變成 non-ff,於是要求 `--force`」——結果**碰巧**與真 git 一致。
-碰巧一致的路徑不能留:`sg_merge_base` 走的是 commit parent 鏈,它對非 commit
-輸入的行為沒有任何人保證過,而正確答案根本不需要它。tag 的規則寫成獨立分支:
-遠端沒有就新增、id 相同就跳過、id 不同看 `--force`。
+This directly decided the implementation: tags **don't go through** `check_fast_forward`, and a
+tag's id never flows into `sg_merge_base`. The survey found that "feeding an annotated tag object
+id into `sg_merge_base` gets judged unrelated, so it becomes non-ff, so `--force` gets required"
+-- which happens to **coincidentally** match real git. A path that coincidentally matches can't be
+kept: `sg_merge_base` walks the commit parent chain, and nobody has ever guaranteed its behavior
+on non-commit input, while the correct answer doesn't need it at all. The tag rule is written as
+an independent branch: add if the remote doesn't have it, skip if the id matches, check `--force`
+if the id differs.
 
-另外兩件也是實測而非記憶:遠端的 `refs/tags/<name>` 對 annotated tag 指向
-**tag 物件 id,不 peel**(所以本地 id 要用 `sg_ref_read_path` 讀原始值,不能
-用會 peel 的 `sg_rev_parse_commit`);push tag **不建立**
-`refs/remotes/<remote>/<tag>`,那個命名空間只屬於分支。
+Two other things were also measured rather than recalled: the remote's `refs/tags/<name>` for an
+annotated tag points at **the tag object id, not peeled** (so the local id must be read raw via
+`sg_ref_read_path`, not the peeling `sg_rev_parse_commit`); pushing a tag **does not create**
+`refs/remotes/<remote>/<tag>` -- that namespace belongs to branches only.
 
-### 部分成功
+### Partial success
 
-`--tags` 推多個 tag 時,其中一個因為已存在而被拒,其餘照樣送出,最終退出碼
-為 1——與真 git 一致。這使得原本的 `updates[2]` stack 陣列(1 分支 + 1 chunks
-ref)不夠用,改成動態配置,並且 report 解析從「比對單一 ref_name」推廣成逐一
-比對所有送出的 update。`sg_push_ref_update.ref_name` 是 borrowed 指標,所以
-持有字串的 entry 陣列必須活到 `sg_transport_push` 回來為止。
+When `--tags` pushes multiple tags and one of them is rejected because it already exists, the
+rest are still sent, and the final exit code is 1 -- matching real git. This made the original
+`updates[2]` stack array (1 branch + 1 chunks ref) insufficient, so it was switched to dynamic
+allocation, and report parsing was generalized from "match a single ref_name" to matching each
+sent update one by one. `sg_push_ref_update.ref_name` is a borrowed pointer, so the entry array
+holding the strings must stay alive until `sg_transport_push` returns.
 
-### 審查抓到的:零個 tag 時連遠端都不碰
+### Caught during review: not even touching the remote when there are zero tags
 
-第一版在 `--tags` 模式取得 tag 清單後,若一個 tag 都沒有就直接印
-`Everything up-to-date.` 退出 0。問題是這發生在 `sg_transport_ls_refs_push`
-**之前**,於是連帶跳過了整個 `refs/sg/chunks` keepalive 傳播區塊——而其他每
-一條 push 路徑都會走到那段。實測可觀測:零 tag 的 repo 對連不上的遠端下
-`sg push origin --tags` 得到 `Everything up-to-date.` 與退出碼 0、零連線嘗試,
-同一個遠端下 `sg push origin` 則正確報連線失敗。
+The first version, after collecting the tag list in `--tags` mode, would print
+`Everything up-to-date.` and exit 0 directly if there were zero tags. The problem was this
+happened **before** `sg_transport_ls_refs_push`, which also skipped the entire
+`refs/sg/chunks` keepalive propagation block -- something every other push path goes through.
+Observable by measurement: for a repo with zero tags against an unreachable remote,
+`sg push origin --tags` returns `Everything up-to-date.` with exit code 0 and zero connection
+attempts, while `sg push origin` on the same remote correctly reports a connection failure.
 
-一個用了分塊儲存但當下沒有任何 tag 的 repo,會在 `sg push --tags` 時靜默跳過
-chunk 可達性的同步。修法是移除那個提早返回:零 tag 只是讓候選集合保持空的,
-照常做 ls-refs、照常評估 chunks,最後由既有的統一判斷
-`entry_count == 0 && !send_chunks_update` 決定要不要印
-`Everything up-to-date.`。
+A repo using chunked storage but with no tags at the moment would silently skip chunk
+reachability synchronization on `sg push --tags`. The fix removes that early return: zero tags
+just keeps the candidate set empty; ls-refs runs as usual, chunks are evaluated as usual, and the
+existing unified check `entry_count == 0 && !send_chunks_update` decides at the end whether to
+print `Everything up-to-date.`.
 
-教訓的形狀值得記下來:**「沒有東西要做」與「不必問對方」是兩回事**。前者只有
-在問過遠端之後才成立,而這個專案有一個真 git 沒有的、掛在遠端狀態上的不變量
-(chunks keepalive),任何從純本地狀態就提早返回的捷徑都會把它漏掉。
+The shape of the lesson is worth recording: **"there's nothing to do" and "no need to ask the
+other side" are two different things.** The former only holds after asking the remote, and this
+project has an invariant tied to remote state that real git doesn't have (chunks keepalive) --
+any shortcut that returns early based on purely local state will miss it.
 
-### 測試紀律:否定式斷言需要定向 mutation
+### Test discipline: negative assertions need directed mutations
 
-新增 38 項 interop 檢查(642 → 680),全部以真 git 為 oracle。驗證分兩層,
-兩層都由主對話執行:
+38 new interop checks were added (642 -> 680), all against real git as oracle. Verification has
+two layers, both run by the primary conversation:
 
-**全面還原**——把 `cmd_push.c` 還原成改動前、保留新測試,26 項第一批檢查裡
-**21 項變紅**。剩下 5 項不紅,但它們並非都沒有鑑別力:其中 3 項是**否定式
-斷言**(「沒有建立 remote-tracking ref」「遠端沒有多出這個 tag」),在什麼都
-沒推成功的情況下自然成立。全面還原對這類斷言結構性地無效。
+**Full revert** -- reverting `cmd_push.c` to before the change while keeping the new tests, **21
+of the first batch of 26 checks** went red. The remaining 5 didn't go red, but not all of them
+lack discriminating power: 3 of them are **negative assertions** ("no remote-tracking ref was
+created", "the remote doesn't have this extra tag"), which naturally hold when nothing was
+successfully pushed at all. A full revert is structurally ineffective for this kind of assertion.
 
-**定向 mutation**——那 3 項要靠針對性的改動才看得出來,實跑確認:拿掉
-`if (!entries[i].is_tag)` 守衛 → 667/668,只有「不建立 remote-tracking ref」
-變紅;把 ambiguity 判斷改成 `if (0)` → 665/668,三項具名檢查變紅。修復輪的
-三處也各自實跑:重新植回提早返回 → 678/680;`rc = had_rejection ? 1 : 0;`
-改成 `rc = 0;` → 679/680;usage 守衛的 `return 1` 改成 `return 0` → 679/680。
-每一條都只有目標檢查變紅,沒有連帶災情——乾淨的 mutation 才是有效證據
-(Phase 12 已經吃過一次「改壞的 mutation 給出更漂亮的紅」的虧)。
+**Directed mutation** -- those 3 needed targeted changes to be observable, confirmed by actually
+running them: removing the `if (!entries[i].is_tag)` guard -> 667/668, with only "doesn't create
+a remote-tracking ref" going red; changing the ambiguity check to `if (0)` -> 665/668, with all
+three named checks going red. The three spots in the fix round were each run too: replanting the
+early return -> 678/680; changing `rc = had_rejection ? 1 : 0;` to `rc = 0;` -> 679/680; changing
+the usage guard's `return 1` to `return 0` -> 679/680. Each one turned only the target check red,
+with no collateral damage -- a clean mutation is what makes valid evidence (Phase 12 already
+learned the hard way that "a broken mutation gives a prettier-looking red").
 
-實作者最初回報「5 項空洞檢查」,冷讀的審查者只數到 2 項。兩邊都不完全對:
-正確的區分是「全面還原時不紅」(5 項)與「任何定向 mutation 都測不到」(2 項),
-這兩個數字量的不是同一件事。
+The implementer initially reported "5 hollow checks"; the reviewer, reading cold, only counted 2.
+Neither was entirely right: the correct distinction is "doesn't go red under a full revert" (5)
+versus "no directed mutation can catch it either" (2) -- the two numbers measure different
+things.
 
-### 已知限制
+### Known limitations
 
-- **沒有 refspec 語法。** 不支援 `src:dst`、`+force` 前綴、`--delete`。名稱
-  一律同時解讀為分支或 tag,同名就拒絕而不是猜。
-- **`--tags` 與明確名稱不能併用**,是用法錯誤。真 git 兩者可以並存,這裡刻意
-  收斂:模糊的呼叫寧可拒絕(與 Phase 12 的 `sg reset --soft --hard` 同一個
-  取捨)。
-- ~~**「只有 chunks 落後」的防線沒有能鑑別的測試。**~~ **2026-08-12 補上**
-  (interop phase6a case 8,5 項檢查,909 → 914)。缺口本身如實記在這裡:把
-  `entry_count == 0 && !send_chunks_update` 改成 `if (entry_count == 0)`,
-  當時 680 項檢查照樣全綠,因為現有的 chunks push 檢查都伴隨著真實的新 commit
-  一起送出。
+- **No refspec syntax.** `src:dst`, the `+force` prefix, and `--delete` are not supported. A name
+  is always interpreted as both a branch and a tag candidate; a name collision is rejected rather
+  than guessed.
+- **`--tags` and an explicit name can't be combined**; that's a usage error. Real git allows both
+  together; this was deliberately converged the other way: an ambiguous invocation is rejected
+  rather than guessed (the same trade-off as Phase 12's `sg reset --soft --hard`).
+- ~~**The "only chunks are behind" guard has no discriminating test.**~~ **Fixed 2026-08-12**
+  (interop phase6a case 8, 5 checks, 909 -> 914). The gap itself is recorded here honestly:
+  changing `entry_count == 0 && !send_chunks_update` to `if (entry_count == 0)` left all 680
+  checks green at the time, because every existing chunks-push check was accompanied by a real
+  new commit being sent along with it.
 
-  能鑑別的場景來自一個實測而非推理的事實:`sg add` 在**寫 blob 時**就把
-  chunk 併進 keepalive 樹(`chunk.c` 的 `keep_alive_add`),不是等到 commit。
-  所以推過一次之後再 `sg add` 一個大檔**而不 commit**,分支停在原地、
-  `refs/sg/chunks` 已經往前——正是這道守衛唯一能被觀測到的形狀。
+  The discriminating scenario comes from a fact confirmed by measurement, not reasoning:
+  `sg add` merges the chunk into the keepalive tree **while writing the blob**
+  (`keep_alive_add` in `chunk.c`), not at commit time. So after pushing once, running `sg add` on
+  a large file **without committing** leaves the branch where it was while `refs/sg/chunks` has
+  already moved forward -- exactly the only shape in which this guard can be observed.
 
-  同一個 mutation 現在殺掉 5 項裡的 3 項(914 → 911),且沒有連帶災情。
-  另外 2 項不紅是對的,而且各有用途:一項是**fixture 前提**(斷言 `sg add`
-  確實動了 keepalive ref 而沒動分支——哪天 `sg add` 改了行為,其餘檢查會
-  因為錯誤的理由變綠);另一項是「第二次 push 退出 0」,在 mutation 下**照樣
-  退出 0**,正好示範了只看退出碼就是假覆蓋。真正有鑑別力的斷言是**遠端自己的
-  `refs/sg/chunks` 有沒有前進到本地的 keepalive commit**,以及新檔案的每個
-  chunk 有沒有實際落到遠端。
-- **annotated tag 的 `object_type` 在本地建立時恆為 commit**
-  (`cmd_tag.c` 走 `sg_rev_parse_commit`,一定 peel 到 commit),所以 `sg` 自己
-  建不出指向 tree 或 blob 的 annotated tag。push 端不依賴這個假設(它推的是
-  ref 裡的原始 id,不看 `object_type`),從真 git clone 來的這類 tag 能正常
-  推送,但這條路徑沒有測試覆蓋——要造出這種 tag 需要真 git 參與。
+  The same mutation now kills 3 of the 5 checks (914 -> 911), with no collateral damage. The
+  other 2 not going red is correct, and each serves a purpose: one is a **fixture
+  precondition** (asserting that `sg add` actually moved the keepalive ref and not the branch --
+  if `sg add`'s behavior ever changes, the other checks would go green for the wrong reason);
+  the other is "the second push exits 0", which **still exits 0** under the mutation, a perfect
+  demonstration that looking only at the exit code is false coverage. The truly discriminating
+  assertion is **whether the remote's own `refs/sg/chunks` advanced to the local keepalive
+  commit**, and whether each chunk of the new file actually landed on the remote.
+- **A locally created annotated tag's `object_type` is always commit**
+  (`cmd_tag.c` goes through `sg_rev_parse_commit`, which always peels to a commit), so `sg`
+  itself cannot create an annotated tag pointing at a tree or blob. The push side doesn't rely on
+  this assumption (it pushes the raw id in the ref, not looking at `object_type`), so such a tag
+  cloned in from real git pushes normally, but this path has no test coverage -- constructing
+  such a tag requires real git's involvement.
 
-## Phase 14:paused rebase 不再被 `reset --hard` 與 `switch` 終結
+## Phase 14: a paused rebase is no longer terminated by `reset --hard` and `switch`
 
-Phase 12 留下的已知 divergence:`sg reset --hard` 會清掉進行中的 rebase 序列
-器狀態,真 git 不會。當時記在 `docs/sg.1` 的 BUGS 段落沒有修,因為根源在
-`sg_safe_apply_tree`——四個指令共用的那層安全包裝——不屬於 `sg reset` 的範圍。
+A known divergence left over from Phase 12: `sg reset --hard` cleared an in-progress rebase
+sequencer state, while real git doesn't. It was recorded in the BUGS section of `docs/sg.1` at the
+time and not fixed, because the root cause -- `sg_safe_apply_tree`, the safety wrapper shared by
+four commands -- wasn't within `sg reset`'s scope.
 
-### 先量,再改
+### Measure first, then change
 
-開工第一件事是把真 git 2.55.0 的行為量出來,不是回想。六格結果:
+The first thing done was measuring real git 2.55.0's behavior, not recalling it. Six-cell result:
 
-| 情境 | 真 git |
+| Scenario | Real git |
 |---|---|
-| `reset --hard`(含帶 commit 參數)在 paused rebase 期間 | 允許,**保留** `.git/rebase-merge`;之後 `--abort`/`--continue` 都還能用 |
-| `reset --hard` 在衝突 merge 期間 | 允許,**清掉** `MERGE_HEAD` |
-| `switch` / `switch --force` / `switch --discard-changes` | **拒絕**,exit 128,狀態原封不動 |
-| `switch -c <new>` | 一樣拒絕,而且**新分支不會被建立** |
-| `checkout -f` 在 rebase 期間 | 允許切換,**保留** rebase 狀態 |
-| `reset`(mixed)在 paused rebase 期間 | 保留(sg 原本就已做對) |
+| `reset --hard` (with or without a commit argument) during a paused rebase | allowed, **preserves** `.git/rebase-merge`; `--abort`/`--continue` both still work afterward |
+| `reset --hard` during a conflicted merge | allowed, **clears** `MERGE_HEAD` |
+| `switch` / `switch --force` / `switch --discard-changes` | **rejected**, exit 128, state untouched |
+| `switch -c <new>` | rejected the same way, and **the new branch is not created** |
+| `checkout -f` during a rebase | allowed to switch, **preserves** rebase state |
+| `reset` (mixed) during a paused rebase | preserved (sg already got this right) |
 
-歸納成一條規則:**`MERGE_HEAD` 會被任何重設工作目錄的操作清掉;rebase 序列器
-狀態只有 rebase 自己的子指令能結束。**
+This generalizes into one rule: **`MERGE_HEAD` is cleared by any operation that resets the
+working directory; rebase sequencer state can only be ended by rebase's own subcommands.**
 
-這條規則直接改變了里程碑的範圍。原本以為是「`reset --hard` 那一行不要清」,
-但 `sg_safe_apply_tree` 一旦不清了,`sg switch` 若照舊放行,就會留下一份指向
-另一個分支的殘留 rebase 狀態——**比修法前更糟**。所以 switch 必須同時改成拒
-絕。這不是範圍蔓延,是同一條規則的另一半。
+This rule directly changed the milestone's scope. The initial assumption was "just don't clear it
+in the `reset --hard` line," but once `sg_safe_apply_tree` stops clearing it, if `sg switch` kept
+allowing the operation as before, it would leave a leftover rebase state pointing at another
+branch -- **worse than before the fix**. So switch had to be changed to reject as well. This
+isn't scope creep, it's the other half of the same rule.
 
-### 三個呼叫端,三種答案
+### Three call sites, three answers
 
-- `cmd_reset.c`(`--hard`):保留狀態。真 git 如此。
-- `cmd_switch.c`:直接拒絕,`--force` 繞不過(真 git 的 `--force` 也繞不過),
-  且閘門必須在 `-c` 建立分支之前。
-- `cmd_undo.c`:**維持清除**,但改由呼叫端自己做。`sg undo` 沒有真 git 對應
-  物,沒有 oracle 可抄;把工作目錄倒回快照之後留著序列器狀態,`rebase
-  --continue` 會在一棵被抽掉的樹上續作,語意不通。
-- `cmd_merge.c`(fast-forward):不需要改,`cmd_merge.c:511-518` 早就在上游擋
-  掉 rebase 進行中。
+- `cmd_reset.c` (`--hard`): preserves state. That's what real git does.
+- `cmd_switch.c`: rejects outright, `--force` doesn't bypass it (real git's `--force` doesn't
+  bypass it either), and the gate must sit before `-c` creates the branch.
+- `cmd_undo.c`: **keeps clearing**, but the caller now does it itself. `sg undo` has no real-git
+  counterpart to copy an oracle from; rewinding the working directory to a snapshot while leaving
+  the sequencer state around would make no sense semantically -- `rebase --continue` would resume
+  on a tree that had just been yanked out from under it.
+- `cmd_merge.c` (fast-forward): no change needed, `cmd_merge.c:511-518` already blocks an
+  in-progress rebase upstream.
 
-於是 `sg_safe_apply_tree` 的職責收斂成一句可以寫進標頭的話:清 `MERGE_HEAD`,
-不碰 rebase 狀態,需要舊行為的呼叫端自己在回傳後處理。
+So `sg_safe_apply_tree`'s responsibility converges to a sentence that can go in a header comment:
+clear `MERGE_HEAD`, don't touch rebase state; callers that need the old behavior handle it
+themselves after it returns.
 
-### mutation 實測:9 條檢查裡只有 1 條有鑑別力
+### Mutation-verified: only 1 of 9 checks has discriminating power
 
-新增的 interop 檢查裡有 9 條跟 switch 有關。把 `cmd_switch.c` 的閘門停用後
-重跑,**只有 1 條變紅**(`sg switch --force ... is still rejected`)。
+9 of the newly added interop checks relate to switch. Disabling `cmd_switch.c`'s gate and rerunning,
+**only 1 went red** (`sg switch --force ... is still rejected`).
 
-原因是既有機制搶先一步:`sg_safe_apply_tree` 的 dirty 判斷(`apply.c:312`)
-本來就含 `sg_rebase_state_exists`,而 interop 在非 tty 下跑,
-`sg_confirm_dangerous` 會自動拒絕。於是沒有 `--force` 的 switch **在閘門存在
-與否兩種情況下退出碼都是 1**——只是理由完全不同。退出碼相同讓 8 條檢查看起來
-綠得很有信心,實際上什麼都沒守住。
+The reason is an existing mechanism got there first: `sg_safe_apply_tree`'s dirty check
+(`apply.c:312`) already includes `sg_rebase_state_exists`, and interop runs in a non-tty context,
+so `sg_confirm_dangerous` auto-rejects. So a switch without `--force` **exits 1 whether or not the
+gate exists** -- just for entirely different reasons. The matching exit code made 8 checks look
+confidently green while actually guarding nothing.
 
-修法是對這些案例額外斷言 stderr 的**訊息內容**(閘門的專屬字串),而不只是退
-出碼。教訓的形狀:**當被測行為與既有的保護機制在可觀測結果上重疊時,斷言必須
-往下探到「理由」那一層,否則覆蓋率是假的。**這與 Phase 10 記過的「加固前後回
-傳值完全一樣,只有 sanitizer 看得出差別」是同一類問題的不同外衣。
+The fix was to additionally assert the **message content** on stderr (the gate's own distinct
+string) for these cases, not just the exit code. The shape of the lesson: **when the behavior
+under test overlaps with an existing protection mechanism in its observable result, the assertion
+must dig down to the "reason" layer, or the coverage is fake.** This is the same class of problem
+in a different coat as what Phase 10 recorded: "the return value is identical before and after
+hardening, only a sanitizer can tell the difference."
 
-### 審查抓到的:確認提示對 `sg undo` 說謊
+### Caught during review: the confirmation prompt lied to `sg undo`
 
-`sg_safe_apply_tree` 的確認提示是四個呼叫端共用的。第一版寫「但 rebase 本身
-會保留,要結束它請用 `sg rebase --abort`」——對 `reset --hard` 為真,對
-`sg undo` 為假:使用者在同一個提示裡被承諾保留,按下 y 之後它被刪掉。
+`sg_safe_apply_tree`'s confirmation prompt is shared by four call sites. The first version said
+"but the rebase itself will be preserved; to end it use `sg rebase --abort`" -- true for
+`reset --hard`, false for `sg undo`: the user gets promised preservation in the very same prompt,
+then it gets deleted after they hit y.
 
-`switch` 和 `merge` 都在自己的閘門就被擋掉,永遠走不到這個提示,所以 `undo`
-是唯一會看到這句謊話的呼叫端。修法是把共用訊息降級成中性的真話(只講「會覆蓋
-衝突解決內容」),由 `cmd_undo.c` 在呼叫**之前**自己印出「會放棄 rebase」的告
-知——順序上會出現在確認提示之前,使用者決定 y/N 時就看得到。
+Both `switch` and `merge` get stopped by their own gates and never reach this prompt, so `undo` is
+the only call site that would ever see this lie. The fix demotes the shared message to a neutral
+truth (only mentioning "will overwrite conflict-resolution content"), with `cmd_undo.c` printing
+its own "this will abandon the rebase" notice **before** the call -- ordering it so it appears
+before the confirmation prompt, visible when the user decides y/N.
 
-這條原本測不到:interop 裡每一個 `sg undo` 都帶 `--force`,而 `force=1` 的
-`sg_confirm_dangerous` 會提早返回,**根本不印 message**。非 tty 且無 force
-那條分支才會把訊息印到 stderr(`confirm.c:18-21`),補測試要走那條路徑。
+This was originally untestable: every `sg undo` in interop carries `--force`, and
+`sg_confirm_dangerous` with `force=1` returns early **without printing the message at all**. Only
+the branch for non-tty and no force prints the message to stderr (`confirm.c:18-21`); the added
+test needed to go through that branch.
 
-### `reset --hard <另一個 commit>` 之後 continue
+### Continuing after `reset --hard <another commit>`
 
-原本所有案例都只用裸 `reset --hard`(等於原地不動),沒測過帶參數的版本。實測
-兩邊一致:剩下的 commit 會疊在 **reset 的目標** 之上,不是原本的 onto。sg 的
-`rebase --continue` 從 `sg_ref_resolve_head` 取父節點,真 git 的 sequencer 也
-是,所以碰巧一致——但這次是量過才寫下來的。
+Previously every case used only bare `reset --hard` (equivalent to staying in place), never the
+version with an argument. Measurement shows both sides agree: the remaining commits get replayed
+on top of **the reset target**, not the original onto. sg's `rebase --continue` takes the parent
+from `sg_ref_resolve_head`, and real git's sequencer does the same, so they coincidentally agree
+-- but this time it was written down only after measuring it.
 
-順帶記一個沒有處理的既有 divergence:sg 的 rebase 進行中 **HEAD 仍指在分支
-上**,真 git 是 detached。上面那組案例的最終 graph 兩邊相同,所以沒有動它。
+Also noting, in passing, an existing divergence that isn't being handled: during sg's rebase,
+**HEAD still points at the branch**, whereas real git detaches it. The final graph in the case
+group above is the same on both sides, so this wasn't touched.
 
-### 正規化過頭的比對,與否定式斷言
+### Over-normalized comparisons, and negative assertions
 
-第二輪冷讀抓到 `reset --hard <另一個 commit>` 那組的 graph 比對**正規化過頭**:
-把 `%P` 的 40-hex 全部換成 `X` 之後,線性歷史的每一行都塌成
-「`<subject> X`」,實際上只驗到「每個 commit 有幾個 parent」——而這組案例真正
-要驗的性質(重放出來的 commit 疊在 **reset 目標** 而不是原本的 onto)恰好被抹
-平掉了。跨 repo 比對必須正規化 sha(兩邊的 commit id 必然不同),但正規化的
-範圍要剛好停在「無法比較的部分」。補的是直接斷言 parent 身分:在各自的 repo
-裡驗 `feature^` 等於各自的 base sha,再加一條「不是 master 的後代」,真 git
-那側也照驗一次而不是預設它對。
+A second cold-read caught the `reset --hard <another commit>` group's graph comparison being
+**over-normalized**: after replacing every 40-hex in `%P` with `X`, every line of the linear
+history collapsed to `"<subject> X"`, actually only verifying "how many parents does each commit
+have" -- and the property this group was actually meant to verify (the replayed commits land on
+top of **the reset target**, not the original onto) got flattened away exactly. Cross-repo
+comparisons must normalize shas (the commit ids on the two sides are necessarily different), but
+the normalization scope must stop exactly at "the part that can't be compared." The fix directly
+asserts parent identity: within each repo, verify that `feature^` equals that repo's own base sha,
+plus one more check that it's "not a descendant of master," verified on the real-git side too
+instead of assuming it's correct there.
 
-否定式斷言(「提示不得承諾 rebase 會保留」)照 Phase 12 的教訓需要自己的
-mutation:把新句子留著、只把舊承諾**附加**回去,肯定式那條照樣綠,只有否定式
-那條變紅。這證明它不是多餘的。
+The negative assertion ("the prompt must not promise the rebase will be preserved") needed its own
+mutation, following Phase 12's lesson: keep the new sentence, and **append** the old promise back
+in; the positive assertion stays green while only the negative one goes red. That proves it isn't
+redundant.
 
-最終 `tests/interop.sh` 726 項檢查(Phase 13 結束時是 680),八條定向 mutation
-每一條都至少讓一條檢查變紅。
+The final `tests/interop.sh` has 726 checks (680 at the end of Phase 13); each of the eight
+directed mutations turned at least one check red.
 
-## Phase 15:`sg stash`
+## Phase 15: `sg stash`
 
-### 架構決策:為什麼實作真 reflog
+### Architecture decision: why a real reflog was implemented
 
-`stash@{N}` 完全建立在 reflog 上——這是實測結論,不是設計偏好。刪掉
-`.git/logs/refs/stash` 只留 `refs/stash`,真 git 的 `stash list` 變空、`pop`
-直接失敗且不 fallback。走「從 snapshot 長出一個 stash 堆疊,不碰 reflog」的
-路會產生真 git 完全看不見的 stash——比不實作更糟,因為它讓使用者以為變更被
-保存了。這條路直接違反專案第一原則:`tests/interop.sh` 拿真 `git` 當 oracle,
-一個 git 讀不到的 stash 沒有任何東西能測它。
+`stash@{N}` is built entirely on top of the reflog -- this is a conclusion from measurement, not a
+design preference. Deleting `.git/logs/refs/stash` while keeping `refs/stash` makes real git's
+`stash list` come up empty, and `pop` fails outright with no fallback. Going with a path that
+"grows a stash stack out of snapshots without touching the reflog" would produce stashes that
+real git can't see at all -- worse than not implementing it, because it would let the user believe
+their changes were saved. This path directly violates the project's first principle:
+`tests/interop.sh` uses real `git` as oracle, and there is nothing that can test a stash git can't
+read.
 
-決定性證據:手工偽造一個 sg 風格的 stash(身分 `small_git <sg@localhost>`、
-固定 `+0000` 時區、全零 old-oid、手寫 reflog 行),**真 git 全盤接受**——
-`list`/`show`/`pop` 都正常,產出正確的工作目錄與 index。於是 reflog 不是一個
-子系統,是「一行一筆的文字檔 + 一條硬性不變量」,详见下一節。
+Decisive evidence: hand-forging an sg-style stash (identity `small_git <sg@localhost>`, fixed
+`+0000` timezone, all-zero old-oid, hand-written reflog line), **real git accepted it entirely** --
+`list`/`show`/`pop` all worked, producing the correct working directory and index. So the reflog
+isn't a subsystem, it's "a one-line-per-entry text file plus one hard invariant" -- details in the
+next section.
 
-`sg_reflog_*`(`include/sg/reflog.h`)的 `ref_path` 刻意是**參數**而不是寫死
-的 `"refs/stash"`——格式層與「每次 ref 更新都寫一筆」的呼叫端覆蓋是兩件事,
-Phase 15 只做前者、只呼叫一次(`"refs/stash"`),日後的 HEAD reflog 直接重用
-同一個檔案層,把預算花在呼叫端覆蓋上。
+`sg_reflog_*`'s (`include/sg/reflog.h`) `ref_path` is deliberately a **parameter** rather than a
+hardcoded `"refs/stash"` -- the format layer and the caller-side coverage of "write one entry on
+every ref update" are two different things; Phase 15 only did the former, and only called it once
+(`"refs/stash"`); a future HEAD reflog reuses the same file layer directly, spending its budget
+on caller-side coverage.
 
-### 兩條硬性不變量(實測)
+### Two hard invariants (measured)
 
-- **`refs/stash` 必須等於 reflog 最後一行的 new-oid**,否則真 git 報
-  `log for ref refs/stash unexpectedly ended`,後續**所有** `stash@{N}` 一併
-  失效——不是只有出問題的那一筆。
-- **stash commit 必須有 ≥2 個 parent**。手工偽造的 1-parent 版本 `list` 看得到
-  (list 只讀 reflog,不驗證 commit 結構),但 `show`/`apply`/`pop` 全部以
-  `not a stash-like commit` 死掉。所以「index commit(parent 2)是必需品」不是
-  Phase 16 的加分項,`sg_stash_push` 無條件寫它。
+- **`refs/stash` must equal the new-oid of the reflog's last line**, or real git reports
+  `log for ref refs/stash unexpectedly ended`, and **every** subsequent `stash@{N}` becomes
+  invalid too -- not just the one that had the problem.
+- **A stash commit must have >= 2 parents.** A hand-forged 1-parent version is still visible to
+  `list` (list only reads the reflog, doesn't validate commit structure), but `show`/`apply`/`pop`
+  all die with `not a stash-like commit`. So "the index commit (parent 2) is required" is not a
+  Phase 16 nice-to-have -- `sg_stash_push` writes it unconditionally.
 
-### 位元相容的界線(兩個方向要求不同)
+### The boundary of bit compatibility (the two directions require different things)
 
-真 git 讀 sg 的 stash 只要求**結構有效**,不要求身分一致(上面的偽造測試已
-證明:`+0000`、`small_git`、全零 old-oid 全部被接受,git 從不驗證 commit 的
-author/committer 身分,只驗上面兩條不變量)。
+Real git reading an sg stash only requires **structural validity**, not identity consistency (the
+forgery test above already proved it: `+0000`, `small_git`, all-zero old-oid were all accepted --
+git never validates a commit's author/committer identity, only the two invariants above).
 
-sg 讀真 git 的 stash 要求**寬容解析**:任意名字(含空格、`<`、`>`)、任意時區
-(`+0800`)、3-parent(`git stash -u`)、以及 `git gc` 之後活在 packed-refs 裡
-的 `refs/stash`。`sg_commit_parse`(`src/object/commit.c`)本就會成長 parent
-陣列,3 parent 免費解析;`sg_ref_read_path` 本就會 fallback 到 packed-refs。
+sg reading a real-git stash requires **lenient parsing**: arbitrary names (including spaces, `<`,
+`>`), arbitrary timezones (`+0800`), 3 parents (`git stash -u`), and a `refs/stash` that lives in
+packed-refs after `git gc`. `sg_commit_parse` (`src/object/commit.c`) already grows the parent
+array, so 3 parents parse for free; `sg_ref_read_path` already falls back to packed-refs.
 
-因為 sg 的時區是固定字面量 `"+0000"`、時間戳來自 `time(NULL)`、不理會
-`GIT_AUTHOR_DATE`,**sg 的 stash commit id 永遠不可能等於真 git 對同樣內容
-產生的 id**——這不是 Phase 15 引入的新讓步,`sg` 寫的每一個 commit 本來就是
-這樣,只是 stash 是第一個「兩邊互相讀對方產出物」的功能,所以第一次必須把它
-寫進規格,免得日後有人設計出注定失敗的 oid 相等檢查。**因此任何 interop 檢查
-都不准比對兩邊的 commit id。** 最強的 oracle 是 `sg stash list` 與
-`git stash list` 逐位元組相同——這個字串來自 sg 自己寫的 reflog message,
-是唯一一處兩邊「應該」相同的東西。
+Because sg's timezone is the fixed literal `"+0000"`, its timestamp comes from `time(NULL)`, and it
+ignores `GIT_AUTHOR_DATE`, **sg's stash commit id can never equal the id real git produces for the
+same content** -- this isn't a new concession introduced by Phase 15; every commit sg writes was
+already like this, it's just that stash is the first feature where each side reads the other's
+output, so this had to be written into the spec for the first time, so nobody later designs an oid
+equality check doomed to fail. **So no interop check is allowed to compare commit ids between the
+two sides.** The strongest oracle is that `sg stash list` and `git stash list` are byte-for-byte
+identical -- this string comes from the reflog message sg itself writes, the one place where the
+two sides "should" be identical.
 
-### 「Dropped」訊息的規則被記錯又改正的經過
+### How the "Dropped" message rule was recorded wrong, then corrected
 
-最初抽樣兩個案例,記成「pop 帶 `refs/` 前綴、drop 不帶」。那是抽樣假象——
-碰巧那次 pop 沒帶參數而 drop 帶了。測完全部六種組合(pop/drop × {無參數,
-裸 `0`,`stash@{0}`})之後,真正的規則是**兩個子指令共用同一條**:git 只在
-參數已經是 `stash@{N}` 形式時原樣回印,無參數與裸 `0` 都解析成完整的
-`refs/stash@{N}`。
+The first pass sampled two cases and recorded it as "pop carries a `refs/` prefix, drop doesn't."
+That was a sampling illusion -- it just happened that that particular pop had no argument while
+drop had one. After testing all six combinations (pop/drop x {no argument, bare `0`,
+`stash@{0}`}), the real rule turned out to be **shared by both subcommands**: git only echoes the
+argument back verbatim when it's already in `stash@{N}` form; both no-argument and bare `0` get
+resolved into the full `refs/stash@{N}`.
 
-六種組合現在都有 interop 檢查,每條 sg 斷言都配一條 git oracle 斷言,這樣真
-git 改變行為時是 oracle 那一半先變紅,而不是檢查悄悄凍結一個過時的認知。
-過程中也踩到兩個與規則本身無關但值得記的坑:oracle 必須固定 `LC_ALL=C`
-(git 會翻譯這句訊息,`zh_TW` 環境印出全形括號的中文,CI 預設 `C`——不釘住
-會「CI 過、本機紅」);pop 的輸出含雙引號(`use "git add"` 狀態區塊),塞進
-`sh -c` 字串會被截斷成一半案例誤判,drop 的單行輸出沒有這問題——六案例正好
-一半一半誤判,像是個真的 product bug。
+All six combinations now have interop checks, with each sg assertion paired with a git-oracle
+assertion, so that when real git changes behavior, the oracle half goes red first instead of a
+check silently freezing an outdated understanding. Two pitfalls unrelated to the rule itself but
+worth recording were also hit along the way: the oracle must pin `LC_ALL=C` (git translates this
+message; a `zh_TW` environment prints it with full-width Chinese punctuation, while CI defaults to
+`C` -- without pinning this it would be "passes on CI, red locally"); pop's output contains double
+quotes (the `use "git add"` status block), which get truncated when stuffed into an `sh -c`
+string, misjudging half the cases, while drop's single-line output has no such problem -- exactly
+half of the six cases were misjudged, looking like a real product bug.
 
-### 與真 git 一致的危險行為
+### Dangerous behavior kept consistent with real git
 
-**rebase 暫停中執行 `stash push` 會讓正在 rebase 的 commit 消失**——實測 sg
-與真 git 2.55.0 **行為完全相同**:push exit 0;`rebase --continue` 印
-「Successfully rebased」exit 0;那個正在重放的 commit 從 log 消失;工作只留
-在 stash 裡。原因是 push 把 index 與工作目錄重設回 HEAD,`--continue` 於是
-判定「這個變更已經存在於 upstream」而跳過它。sg 不改這個行為(改了反而是與
-git 分歧),但**多印一行 stderr 告知**使用者,並用兩邊各跑一次的 interop
-檢查釘住「行為等價」(exit code、log 是否消失、stash 是否保住工作)。
+**Running `stash push` during a paused rebase makes the commit currently being rebased
+disappear** -- measurement confirms sg and real git 2.55.0 **behave identically**: push exits 0;
+`rebase --continue` prints "Successfully rebased" and exits 0; the commit currently being replayed
+disappears from the log; the work only remains in the stash. The reason is that push resets the
+index and working directory back to HEAD, so `--continue` decides "this change already exists
+upstream" and skips it. sg does not change this behavior (changing it would itself be a divergence
+from git), but it **prints one extra stderr line to notify** the user, and an interop check that
+runs both sides once each pins down "behavioral equivalence" (exit code, whether the commit
+disappears from the log, whether the stash retains the work).
 
-### 刻意的偏離(列表)
+### Deliberate deviations (list)
 
-- **pop/apply 要求工作目錄乾淨**,真 git 會嘗試三方合併已存在的骯髒變更。
-  比 git 嚴格,與 `sg merge` 既有先例一致(`merge_require_clean`)——乾淨的
-  工作目錄讓 apply 可以直接把 `sg_merge_trees` 的 ours 設成 HEAD 樹,不需要
-  額外一層合併邏輯。
-- **rebase 進行中 pop/apply 拒絕**(真 git 允許),比照 `cmd_switch.c`/
-  `cmd_merge.c` 的既有閘門先例,而不是新發明一條規則。
-- **sg 沒有 exit 128**,真 git 在「reflog 條目不存在」之類的情況用 128,
-  sg 一律用自己風格的訊息 + exit 1。
-- `sg stash apply`/`pop` 成功時印 `sg status` 的內容(真 git 印同等的 status
-  區塊,但 sg 的用詞是中文、提示裡是 `sg` 指令而非 `git`)。
+- **pop/apply require a clean working directory**; real git attempts a three-way merge with
+  existing dirty changes. Stricter than git, consistent with `sg merge`'s existing precedent
+  (`merge_require_clean`) -- a clean working directory lets apply set `sg_merge_trees`'s ours
+  directly to the HEAD tree, needing no extra merge layer.
+- **pop/apply are rejected during an in-progress rebase** (real git allows it), following the
+  existing gate precedent in `cmd_switch.c`/`cmd_merge.c`, rather than inventing a new rule.
+- **sg has no exit 128**; real git uses 128 for things like "the reflog entry doesn't exist",
+  while sg always uses its own message style + exit 1.
+- On success, `sg stash apply`/`pop` print `sg status` content (real git prints an equivalent
+  status block, but sg's wording is different and the tips reference `sg` commands rather than
+  `git`).
 
-### 明確不做(Phase 16+)
+### Explicitly not done (Phase 16+)
 
-| 項目 | 為什麼這個切點乾淨 |
+| Item | Why this cut point is clean |
 |---|---|
-| `-u`(儲存未追蹤檔案) | 需要把 `collect_untracked`(`cmd_status.c`,目前 `static`、回傳裸 `char **`)升格成公開 API、回傳 `sg_flat_entry`,加第三個 parent,加 overwrite 拒絕。純加法,commit builder 本就吃 parents 陣列,reflog 層完全不用動;但**這次已經加了強制守衛**:Phase 15 遇到 3-parent stash 一律拒絕,絕不悄悄只還原追蹤的那半而丟掉未追蹤檔案。 |
-| `show` | 唯一需要全新輸出格式器的子指令:git 預設 `--stat`,而 `sg diff` 沒有任何 flag、沒有 tree-vs-tree 模式。沒有其他東西依賴它,`git stash show` 對 sg 建的 stash 現在就能正常用。 |
-| `--keep-index` / `--index` | `--keep-index` 便宜但會讓 flag 矩陣變複雜;`--index` 不便宜——git 對 index 樹另外做合併,有自己的失敗模式。兩者都是純加法,不影響已寫的部分。 |
-| `--patch`、`--staged`、pathspec、`stash branch/create/store` | 各自獨立的介面,不影響已寫的部分。 |
-| 髒工作目錄下 apply | 見上面「刻意的偏離」,是本階段最不情願的取捨,但它是讓 apply 能直接重用 `sg_merge_trees` 而不必另寫一層的前提。 |
-| 通用 reflog(`HEAD@{N}`、`sg reflog`、branch 更新寫 reflog) | 檔案層(`src/storage/reflog.c`)這次就落地了,expensive 的一半——每個 ref 更新點都要接上呼叫——留給獨立的一個 phase。 |
+| `-u` (stash untracked files) | Would need to promote `collect_untracked` (`cmd_status.c`, currently `static`, returning a raw `char **`) into a public API returning `sg_flat_entry`, add a third parent, and add an overwrite rejection. Purely additive -- the commit builder already accepts a parents array, and the reflog layer needs no change at all; but **a mandatory guard has already been added this round**: Phase 15 unconditionally rejects a 3-parent stash, so it never silently restores only the tracked half and drops the untracked files. |
+| `show` | The only subcommand that needs a brand-new output formatter: git defaults to `--stat`, and `sg diff` has no such flag and no tree-vs-tree mode. Nothing else depends on it, and `git stash show` already works normally on stashes built by sg. |
+| `--keep-index` / `--index` | `--keep-index` is cheap but would complicate the flag matrix; `--index` isn't cheap -- git does a separate merge for the index tree, with its own failure modes. Both are purely additive, not affecting what's already written. |
+| `--patch`, `--staged`, pathspec, `stash branch/create/store` | Each is its own independent interface, not affecting what's already written. |
+| apply against a dirty working directory | See "Deliberate deviations" above -- the least comfortable trade-off in this phase, but it's the precondition for letting apply directly reuse `sg_merge_trees` without writing a separate layer. |
+| general-purpose reflog (`HEAD@{N}`, `sg reflog`, branch updates writing to the reflog) | The file layer (`src/storage/reflog.c`) landed this time; the expensive half -- wiring in a call at every ref-update site -- is left for its own separate phase. |
 
-### mutation 實測結果
+### Mutation-verified results
 
-| mutation | 變紅的檢查數 |
+| Mutation | Checks turned red |
 |---|---|
-| push 的 unmerged 守衛 | 原本 **0 條紅** → 補斷言後 1 條 |
-| drop 不重指 `refs/stash` | 1 條 |
-| push 寫 ref 但跳過 reflog append | 30 條 |
-| `-u` 三 parent 守衛 | 原本 **0 條紅** → 補斷言後 1 條 |
-| 衝突標籤換成分支名 | 2 條 |
-| push 改用 `sg_safe_apply_tree` | 9 條 |
-| pop 的 index 修正 | 11 條 |
-| clear 用 unlink 取代 `sg_ref_delete_under` | 1 條 |
-| list 順序反轉 | 2 條 |
-| `sg stash apply` 也去 drop | 5 條(**補之前 59 條全部沒抓到**) |
-| reflog message normalization 關掉 | 6 條 |
-| reflog rewrite 重新蓋 ident | 3 條 |
-| reflog count-0 寫空檔而非刪檔 | 1 條 |
-| reflog rewrite 不重新串接 old-id | 2 條(預先設計時就記成「應該測不到」,實測是唯二能測到的——見下方基礎設施小節的更正) |
-| `read_rc == -1` 降級成警告 | 3 條 |
-| `print_dropped` 一律加前綴 | 2 條 |
+| push's unmerged guard | originally **0 red** -> 1 after adding the assertion |
+| drop not repointing `refs/stash` | 1 |
+| push writes the ref but skips the reflog append | 30 |
+| `-u`'s three-parent guard | originally **0 red** -> 1 after adding the assertion |
+| swapping the conflict label for a branch name | 2 |
+| push switched to `sg_safe_apply_tree` | 9 |
+| pop's index fix | 11 |
+| clear using unlink instead of `sg_ref_delete_under` | 1 |
+| list order reversed | 2 |
+| `sg stash apply` also dropping | 5 (**59 checks added earlier all missed this**) |
+| reflog message normalization disabled | 6 |
+| reflog rewrite re-overwriting ident | 3 |
+| reflog count-0 writing an empty file instead of deleting it | 1 |
+| reflog rewrite not re-chaining the old-id | 2 (predicted at design time to be "probably untestable"; measurement showed these were the only two that could catch it -- see the correction in the infrastructure subsection below) |
+| `read_rc == -1` downgraded to a warning | 3 |
+| `print_dropped` always adding the prefix | 2 |
 
-**最有價值的兩條要特別寫一段。** push 的 unmerged 守衛與 `-u` 三 parent 守衛
-原本都是**0 條紅**,原因與 Phase 14 記過的教訓是同一個形狀:守衛存在於 CLI
-與 library 兩層,**任一層單獨關掉都由另一層接手**,退出碼相同,只是理由不
-同。修法也一樣——斷言要探到 stderr 的專屬訊息那一層,不能只看退出碼。
+**The two most valuable rows deserve their own paragraph.** push's unmerged guard and the `-u`
+three-parent guard were both originally **0 red**, for the same shape of reason recorded in Phase
+14: the guard exists at both the CLI and library layers, **disabling either layer alone gets
+covered by the other**, giving the same exit code for a different reason. The fix follows the
+same pattern too -- the assertion has to dig down to the level of the specific stderr message,
+not just the exit code.
 
-查 unmerged 守衛時還發現 push 路徑**根本沒有 CLI 層守衛**:library 拒絕
-之後,CLI 印的是既有的 catch-all 訊息「無法建立 stash(未初始化的 HEAD,
-或 index 有未解決的衝突?)」——一個問號,而使用者當下正卡在合併衝突中,
-明明知道答案卻只給猜測。修法是把檢查搬到「已經知道答案」的地方,直接給出
-陳述句而非問句,interop 斷言釘住那句具體訊息。這個斷言本身也踩過一次坑:
-第一版 grep 的是「unresolved conflict」,而 catch-all 訊息裡剛好也含這個
-片段,所以拿掉守衛之後這條檢查照樣綠——收斂成比對守衛自己專屬的措辭才有
-鑑別力。
+While examining the unmerged guard, it was also found that the push path **had no CLI-layer guard
+at all**: after the library rejected it, the CLI printed the existing catch-all message "cannot
+create a stash (uninitialized HEAD, or unresolved conflicts in the index?)" -- a question mark,
+while the user was in the middle of a merge conflict and clearly already knew the answer, yet was
+only offered a guess. The fix moves the check to where the answer is already known, giving a
+declarative sentence instead of a question, with the interop assertion pinning down that specific
+message. This assertion itself hit a pitfall too: the first version grepped for "unresolved
+conflict", and the catch-all message happened to contain that exact fragment too, so the check
+stayed green even after removing the guard -- converging on comparing the guard's own distinctly
+worded message was what made it discriminating.
 
-### 已知無覆蓋(誠實記錄,比照 Phase 10/12 的既有寫法)
+### Known non-coverage (recorded honestly, following the existing style of Phase 10/12)
 
-- **reflog 的 82-byte 最小行長守衛**:被後續的 hex 與格式驗證整個包住。試過
-  兩種構造(含正好 81 bytes、兩個 oid 都是合法 hex、緊接著截斷),普通 build
-  與 `make sanitize` **都不會紅**。與 `index.c` 的 `nentries` cap 同類缺口。
-- **`chunk_enabled` 的初始值**:`sg_repo_read_chunk_config`
-  (`src/storage/repo.c`)進門就無條件 `*enabled_out = 0`,呼叫端傳什麼都會
-  被覆寫,是個 dead store,與 stash 無關但踏勘時順手發現,記在這裡免得散佚。
-- **`sg_write_file_mkdirs` 失敗分支**:已補上單元測試(用同名目錄擋住寫入
-  路徑觸發 `EISDIR`),這條不再是缺口,但觸發手法值得記下來:目標路徑先建成
-  一個同名目錄,寫入時 `open()` 回 `EISDIR`,不必真的耗盡磁碟或權限。
+- **The reflog's 82-byte minimum line-length guard**: entirely subsumed by the subsequent hex and
+  format validation. Two constructions were tried (including exactly 81 bytes, both oids valid
+  hex, truncated right after), and **neither goes red** under a normal build or `make sanitize`.
+  Same class of gap as `index.c`'s `nentries` cap.
+- **`chunk_enabled`'s initial value**: `sg_repo_read_chunk_config`
+  (`src/storage/repo.c`) unconditionally sets `*enabled_out = 0` on entry, overwriting whatever
+  the caller passed in -- a dead store, unrelated to stash but noticed in passing during the
+  survey, recorded here so it isn't lost.
+- **The failure branch of `sg_write_file_mkdirs`**: a unit test has now been added (using a
+  same-named directory to block the write path, triggering `EISDIR`), so this is no longer a gap,
+  but the triggering technique is worth recording: pre-create a directory with the same name as
+  the target path, and `open()` returns `EISDIR` on write without needing to actually exhaust disk
+  space or permissions.
 
-### 測試基礎設施本身的教訓
+### Lessons about the test infrastructure itself
 
-跑 mutation 的過程中,**mutation 腳本自己出過三次錯**,每次都會偽造出「守衛
-有覆蓋」或「守衛沒覆蓋」的假結論:
+While running mutations, **the mutation script itself was wrong three separate times**, each time
+fabricating a false conclusion of "the guard has coverage" or "the guard has no coverage":
 
-1. 字串替換版的 mutation 先命中了 `free(entries[i].ident)` 那一行的
-   `entries[i].ident`,把它換成別的表達式後變成 free 一個字串常數而直接
-   abort——腳本以為這是「守衛消失」的效果,其實只是把程式碼改壞了。
-2. `sg_ref_delete_under` 在原始碼裡有兩處呼叫,腳本打到 drop 那一處而不是
-   `sg_stash_clear` 那一處,於是「clear 用 unlink 取代」這條 mutation 一開始
-   量到的其實是 drop 的行為。
-3. `make && interop.sh` 串接執行,編譯失敗時 interop 沒有真的跑,而舊的
-   log 檔沒被清掉,腳本讀到的是上一輪殘留的結果,誤判成「這輪也綠」。
+1. A string-substitution mutation first hit the `entries[i].ident` occurrence in the
+   `free(entries[i].ident)` line, and after being replaced with a different expression it ended
+   up freeing a string constant and aborting outright -- the script thought this was the effect of
+   "the guard disappearing", when it had actually just broken the code.
+2. `sg_ref_delete_under` has two call sites in the source; the script hit the drop one instead of
+   the `sg_stash_clear` one, so the "clear using unlink instead" mutation initially measured
+   drop's behavior instead.
+3. `make && interop.sh` were run chained; when compilation failed, interop never actually ran, and
+   the old log file wasn't cleared, so the script read the previous round's leftover results and
+   misjudged this round as green too.
 
-結論:**mutation 腳本與被測程式碼一樣需要驗證**——至少要確認編譯成功、確認
-改動的那一行真的命中預期的那一處(不是同名字串在別處的另一次出現)、每輪都
-清掉舊產出再重新產生新的。
+Conclusion: **the mutation script needs verifying just as much as the code under test** -- at
+minimum, confirm compilation succeeded, confirm the changed line actually hit the intended site
+(not another occurrence of the same identifier elsewhere), and clear old output before generating
+new output every round.
 
-interop 檢查本身也出過兩個同類問題,細節寫在程式碼註解裡:`LC_ALL` 未固定
-會讓某條檢查「在 CI 過、在本機紅」(見上面「Dropped」訊息那節);把含雙引號
-的輸出塞進 `sh -c` 字串會炸開命令列,只讓一半案例被正確判斷。
+The interop checks themselves also had two problems of the same class, with details written into
+the code comments: an unpinned `LC_ALL` made one check "pass on CI, red locally" (see the
+"Dropped" message section above); stuffing output containing double quotes into an `sh -c` string
+blew up the command line, correctly judging only half the cases.
 
-最終 `tests/interop.sh` 826 項檢查(Phase 14 結束時是 726),單元測試新增
-`tests/test_reflog.c`、`tests/test_stash.c`、`tests/test_objstore.c` 三支,
-`make test` 31 支二進位全過,`make sanitize` 乾淨。
+The final `tests/interop.sh` has 826 checks (726 at the end of Phase 14); three unit tests were
+added, `tests/test_reflog.c`, `tests/test_stash.c`, `tests/test_objstore.c`; all 31 `make test`
+binaries pass, and `make sanitize` is clean.
 
-## Phase 16:進行中的 merge 不再被 `switch` 終結
+## Phase 16: an in-progress merge is no longer terminated by `switch`
 
-Phase 15 交接時記著的追蹤項第一條:`sg switch --force` 在衝突 merge 期間會
-成功切走並清掉 `MERGE_HEAD`,真 git 拒絕。這是 Phase 14 修過的那個 bug 的
-同一個形狀,只是換一個子系統——rebase 換成 merge。
+The first item on the tracking list left over from Phase 15's handoff: `sg switch --force`
+during a conflicted merge would succeed in switching away and clear `MERGE_HEAD`, while real git
+rejects it. This is the same shape of bug fixed in Phase 14, just in a different subsystem --
+merge instead of rebase.
 
-### 先量,再改
+### Measure first, then change
 
-照 Phase 12 留下的規矩,開工第一件事是量真 git 2.55.0,不是回想:
+Following the discipline left by Phase 12, the first thing done was measuring real git 2.55.0,
+not recalling it:
 
-| 情境 | 真 git |
+| Scenario | Real git |
 |---|---|
-| `git switch <other>` 在衝突 merge 期間 | **拒絕**,exit 128 |
-| `git switch --force <other>` | **一樣拒絕**,`--force` 蓋不過 |
-| `git switch -c <new>` | 一樣拒絕,而且**新分支不會被建立** |
-| `git switch <目前已經在的分支>` | 一樣拒絕 |
-| 衝突已解決並 `git add`(index 乾淨、`MERGE_HEAD` 還在) | 一樣拒絕 |
-| `MERGE_HEAD` 內容壞掉 / 空檔 / 是一個目錄 | 一樣拒絕 |
-| `git checkout -f <other>` | **允許**,並清掉 `MERGE_HEAD` |
+| `git switch <other>` during a conflicted merge | **rejected**, exit 128 |
+| `git switch --force <other>` | **rejected the same way**, `--force` doesn't override it |
+| `git switch -c <new>` | rejected the same way, and **the new branch is not created** |
+| `git switch <the branch already checked out>` | rejected the same way |
+| Conflicts resolved and `git add`ed (index clean, `MERGE_HEAD` still present) | rejected the same way |
+| `MERGE_HEAD` content corrupt / empty / a directory | rejected the same way |
+| `git checkout -f <other>` | **allowed**, and clears `MERGE_HEAD` |
 
-歸納:**閘門看的是 `MERGE_HEAD` 存不存在,不是 index 還有沒有衝突**,而且
-`switch` 與 `checkout -f` 在這件事上是分裂的。sg 沒有 `checkout`,所以要對
-齊的是 `switch` 那一半。
+Summary: **the gate looks at whether `MERGE_HEAD` exists, not whether the index still has
+conflicts**, and `switch` and `checkout -f` are split on this. sg has no `checkout`, so the half
+to align is `switch`.
 
-### 這條閘門為什麼原本「看起來」是對的
+### Why this gate "looked" correct before the fix
 
-修法前 sg 並不是完全不擋——沒有 `--force` 的 `sg switch` 在衝突 merge 期間
-照樣退出 1。但理由是 `sg_safe_apply_tree` 的髒工作目錄確認,而 interop 在非
-tty 下跑,`sg_confirm_dangerous` 自動拒絕。**`--force` 正好是用來繞過這一層
-的**,於是唯一真正需要擋的那條路徑反而是唯一沒被擋住的。
+sg wasn't entirely unguarded before the fix -- `sg switch` without `--force` still exited 1 during
+a conflicted merge. But the reason was `sg_safe_apply_tree`'s dirty-working-directory
+confirmation, and interop runs in a non-tty context where `sg_confirm_dangerous` auto-rejects.
+**`--force` was exactly the mechanism meant to bypass this layer**, so the one path that actually
+needed to be blocked was the one path that wasn't blocked at all.
 
-這與 Phase 14 記過的教訓完全同型,而且這次是**在 mutation 裡再次現形**:把
-新閘門整個拿掉重跑,「plain switch 被拒絕」「拒絕後 `MERGE_HEAD` 還在」
-「HEAD 沒動」這幾條**照樣是綠的**,只有斷言 stderr 專屬字串的那幾條變紅。
-退出碼層級的斷言在這裡是假覆蓋,第二次驗證了同一件事。
+This is exactly the same shape as the lesson recorded in Phase 14, and this time it **showed up
+again in mutation testing**: removing the new gate entirely and rerunning, "plain switch is
+rejected", "`MERGE_HEAD` is still there after rejection", and "HEAD didn't move" **stayed green**,
+and only the checks asserting stderr's specific string went red. Exit-code-level assertions are
+false coverage here -- verified a second time.
 
-### `exists` 不是 `read`
+### `exists` is not `read`
 
-`sg_merge_head_read` 把「沒有 merge」與「merge 狀態損壞」壓進同一個 -1,拿
-它當閘門會讓損壞的 merge 狀態直接放行。所以新增了
-`sg_merge_head_exists`(`include/sg/merge.h`),與 `sg_rebase_state_exists`
-對稱,只問路徑上有沒有東西。
+`sg_merge_head_read` collapses "no merge" and "merge state is corrupt" into the same -1; using it
+as the gate would let a corrupt merge state through unblocked. So `sg_merge_head_exists`
+(`include/sg/merge.h`) was added, symmetric with `sg_rebase_state_exists`, only asking whether
+something is present at the path.
 
-實作用 `lstat` 且**不加** `S_ISREG` 過濾,因為真 git 用的是 `file_exists()`
-——實測連「`MERGE_HEAD` 是一個目錄」都照樣拒絕。第一版寫成
-`stat() == 0 && S_ISREG(...)`,是量了目錄那一格才改掉的。
+It's implemented with `lstat` and **without** an `S_ISREG` filter, because real git uses
+`file_exists()` -- measurement confirms even "`MERGE_HEAD` is a directory" is still rejected. The
+first version wrote `stat() == 0 && S_ISREG(...)`, and was changed only after measuring the
+directory case.
 
-這個決定有專屬的鑑別測試,不然它與 `read` 版在其他所有案例上結果完全相同:
-interop 的 `phase16 corrupt` 四條,以及 `tests/test_merge_head.c` 直接並排
-比對兩支 API 在「壞掉/空/截斷/目錄」四種狀態下的分歧。定向 mutation 驗過:
-把 `exists` 改成委派給 `read`,單元測試紅 4 條、interop 紅 4 條,其餘全綠。
+This decision has its own discriminating test, since it would otherwise produce identical results
+to the `read` version in every other case: four `phase16 corrupt` interop checks, plus
+`tests/test_merge_head.c` directly comparing the two APIs' divergence side by side across four
+states -- broken/empty/truncated/directory. Verified with a directed mutation: making `exists`
+delegate to `read` turned 4 unit-test checks and 4 interop checks red, everything else stayed
+green.
 
-### 兩個閘門的順序:量到「測不到」,就記下來
+### The order of the two gates: measured to be "unobservable", so record it
 
-`cmd_switch.c` 現在有兩道閘門(rebase 在前、merge 在後)。想寫一條檢查釘住
-順序,結果把兩者對調之後**整份 875 項全綠**。
+`cmd_switch.c` now has two gates (rebase first, merge second). Writing a check to pin down the
+order, swapping the two around left **all 875 checks green**.
 
-原因量出來了:paused rebase **不會**寫 `MERGE_HEAD`(sg 只留
-`.git/sg-rebase/`,真 git 留 `rebase-merge/` 加 `REBASE_HEAD`,兩邊都不寫
-`MERGE_HEAD`)。兩個條件從任何可達路徑都不可能同時成立,只有手工偽造兩份狀
-態檔才到得了,而那個狀態真 git 也沒有,沒有 oracle。
+The reason was measured: a paused rebase **does not** write `MERGE_HEAD` (sg only leaves
+`.git/sg-rebase/`; real git leaves `rebase-merge/` plus `REBASE_HEAD`; neither writes
+`MERGE_HEAD`). The two conditions cannot both hold along any reachable path -- only hand-forging
+both state files gets there, and that state doesn't exist under real git either, so there's no
+oracle.
 
-所以順序是**真的不可觀測**。照本專案既有的作法,把它記進「已知測不到的守衛」
-而不是假裝有覆蓋,並改成釘住那條真正撐住結論的事實:paused rebase 期間
-`MERGE_HEAD` 不存在(sg 與真 git 各驗一次)。
+So the ordering is **genuinely unobservable**. Following the project's existing practice, it's
+recorded under "known-untestable guards" rather than pretending there's coverage, and the check
+was rewritten to pin down the fact that actually supports the conclusion: `MERGE_HEAD` doesn't
+exist during a paused rebase (verified once on each of sg and real git).
 
-### fixture 汙染:過度反應的 mutation 會為錯的理由變紅
+### Fixture contamination: an over-triggering mutation can go red for the wrong reason
 
-「閘門不可過度觸發」那組檢查(merge 結束後 switch 要恢復正常)第一版用
-`sg switch` 建 fixture 的分支結構。把閘門改成永遠觸發之後那組確實變紅了——
-但**是 fixture 自己沒建起來**,precondition 就先掛了,根本沒走到被測行為。
-這正是「結果相同、理由不同」的另一種版本,只是這次假的是紅燈而不是綠燈。
+The check group for "the gate must not over-trigger" (switch must return to normal after the
+merge is finished) initially used `sg switch` to build the fixture's branch structure. After
+making the gate always trigger, that group did go red -- but **the fixture itself failed to
+build**, the precondition failed first, and the behavior under test was never reached. This is
+another version of "same outcome, different reason," except this time the false result is a red
+light instead of a green one.
 
-修法是那組改用真 git 建分支結構,只留 merge 與最後那次 switch 給 sg。再跑
-一次同樣的 mutation,precondition 全綠、只有四條「應該恢復正常」變紅。
+The fix was to have that group use real git to build the branch structure instead, leaving only
+the merge and the final switch for sg. Rerunning the same mutation, the preconditions all stayed
+green, and only the four "should return to normal" checks went red.
 
-### 沒有動的東西
+### What wasn't touched
 
-`reset --hard` 照舊清 `MERGE_HEAD`(Phase 14 定下的規則沒變),新閘門只在
-`cmd_switch.c`,沒有下沉到 `sg_safe_apply_tree`——後者是四個呼叫端共用的,
-下沉會連 `reset --hard` 一起擋掉。`phase16 reset` 那組就是釘這件事的。
+`reset --hard` still clears `MERGE_HEAD` as before (the rule set in Phase 14 didn't change); the
+new gate lives only in `cmd_switch.c`, not pushed down into `sg_safe_apply_tree` -- the latter is
+shared by four call sites, and pushing it down would block `reset --hard` too. The `phase16
+reset` group exists to pin exactly this.
 
-### 冷讀抓到的:新閘門把既有的不一致變成了死路
+### Caught by a cold read: the new gate turned an existing inconsistency into a dead end
 
-reviewer 冷讀時指出:`sg_merge_head_exists` 只用在 `switch` 一個呼叫端,其餘
-八處判斷「merge 是否進行中」的地方仍然用 `sg_merge_head_read(...) == 0`——
-而那正是新標頭註解自己點名的缺陷。獨立重現後確認成立,而且比回報的更嚴重。
+During the cold read, the reviewer pointed out: `sg_merge_head_exists` is only used at the one
+`switch` call site; the other eight places that check "is a merge in progress" still use
+`sg_merge_head_read(...) == 0` -- exactly the defect named in the new header comment itself.
+Reproduced independently and confirmed, and worse than reported.
 
-`MERGE_HEAD` 損壞時(空檔、非法內容、目錄),量到的分歧:
+With `MERGE_HEAD` corrupted (empty, invalid content, a directory), the measured divergence:
 
-| 指令 | 真 git 2.55.0 | 修法前的 sg |
+| Command | Real git 2.55.0 | sg before the fix |
 |---|---|---|
-| `merge --abort` | rc 0,**清掉** | rc 1,**留著** |
-| `reset --hard` | rc 0,**清掉** | rc 0,**留著** |
-| `reset --mixed` | rc 0,**清掉** | rc 0,**留著** |
-| `reset --soft` | **拒絕** | **放行** |
-| `stash push` | rc 0,**清掉** | rc 0,**留著** |
-| `status` | 報告「有尚未合併的路徑」 | **不報告** |
-| `commit` | **大聲拒絕**「損壞的 MERGE_HEAD 檔案」 | rc 0,**靜默產出單 parent commit** |
+| `merge --abort` | rc 0, **clears it** | rc 1, **leaves it** |
+| `reset --hard` | rc 0, **clears it** | rc 0, **leaves it** |
+| `reset --mixed` | rc 0, **clears it** | rc 0, **leaves it** |
+| `reset --soft` | **rejects** | **allows it** |
+| `stash push` | rc 0, **clears it** | rc 0, **leaves it** |
+| `status` | reports "you have unmerged paths" | **doesn't report it** |
+| `commit` | **loudly rejects** with "corrupted MERGE_HEAD file" | rc 0, **silently produces a single-parent commit** |
 
-最後一列最嚴重:merge 語意從 commit graph 裡悄悄消失,而 sg 回報成功。這正是
-本專案存在的理由要擋的那類分歧,而且**單看退出碼永遠測不到**——所以那組測試
-除了斷言 exit != 0,還斷言「沒有產生任何新 commit」。
+The last row is the most serious: merge semantics silently disappear from the commit graph while
+sg reports success. This is exactly the class of divergence this project exists to prevent, and
+**it can never be caught by looking at the exit code alone** -- so that test group asserts not
+just exit != 0, but also "no new commit was produced at all."
 
-前六列合起來構成一個死路:新閘門讓 `switch` 永久拒絕,而沒有任何指令清得掉那
-個檔案,連 `switch` 自己印的錯誤訊息建議的兩條路(`sg commit`、
-`sg merge --abort`)都走不通,唯一出路是手動 `rm .git/MERGE_HEAD`。**這個死路
-是新閘門造成的**:修法前 `switch --force` 至少還走得掉(雖然行為是錯的)。
+The first six rows together form a dead end: the new gate makes `switch` reject permanently, and
+no command can clear that file -- even the two paths `switch`'s own error message suggests
+(`sg commit`, `sg merge --abort`) don't work, leaving manually `rm .git/MERGE_HEAD` as the only
+way out. **This dead end was caused by the new gate**: before the fix, `switch --force` could at
+least still get through (even though the behavior was wrong).
 
-修法是把「merge 是否進行中」的判斷全部收斂到 `sg_merge_head_exists`。收斂後
-`sg_merge_head_read` 在 `src/` 裡只剩**一個**呼叫端——`cmd_commit.c`,唯一真
-正需要那個「值」(第二個 parent)的地方,而它現在把兩個問題分開問:先問存不
-存在,再問讀不讀得出來,讀不出來就照真 git 拒絕。
+The fix was to converge every "is a merge in progress" check onto `sg_merge_head_exists`. After
+converging, `sg_merge_head_read` has only **one** call site left in `src/` -- `cmd_commit.c`, the
+only place that actually needs the "value" (the second parent), and it now asks the two questions
+separately: first whether it exists, then whether it can be read; if it can't be read, it rejects,
+matching real git.
 
-`cmd_rebase.c` 那道是唯一沒有 oracle 的:實測 `git rebase` 在乾淨工作樹下**根
-本不看 `MERGE_HEAD`**(合法或損壞都一樣,直接跑完並清掉它),sg 是刻意拒絕。
-既然刻意拒絕,就必須連損壞狀態一起涵蓋,否則 rebase 與 switch 會對「有沒有
-merge 在進行」給出不同答案。這一點寫在註解裡。
+The `cmd_rebase.c` one is the only one with no oracle: measurement shows `git rebase` on a clean
+working tree **doesn't look at `MERGE_HEAD` at all** (valid or corrupt makes no difference, it
+just runs to completion and clears it); sg rejects deliberately. Given the deliberate rejection,
+it must cover the corrupt state too, or rebase and switch would give different answers to "is a
+merge in progress." This is written into the comment.
 
-### 這一輪的 mutation
+### This round's mutations
 
-- 把**除了 switch 以外**全部八處還原成 `read`:18 條變紅,涵蓋每一列;而
-  「合法 merge 仍然產出雙 parent commit」保持綠,證明拒絕是針對損壞而不是針
-  對 merge 本身。
-- 只還原 `cmd_commit.c`:精準 3 條紅,全在 commit 那組——逐處歸屬成立。
-- 加回 `S_ISREG`:第一版只有單元測試會紅,interop 全綠(reviewer 指出這個覆蓋
-  缺口)。補上「`MERGE_HEAD` 是目錄」的 CLI + oracle 案例後,同一條 mutation
-  現在讓 interop 也紅 2 條。
+- Reverting all eight sites **other than switch** back to `read`: 18 checks went red, covering
+  every row; while "a valid merge still produces a two-parent commit" stayed green, proving the
+  rejection targets corruption, not merges themselves.
+- Reverting only `cmd_commit.c`: exactly 3 red, all in the commit group -- per-site attribution
+  holds.
+- Adding `S_ISREG` back: the first version only turned a unit test red, with interop entirely
+  green (the reviewer pointed out this coverage gap). After adding a "`MERGE_HEAD` is a directory"
+  CLI + oracle case, the same mutation now turns 2 interop checks red too.
 
-教訓的形狀:**收斂一個判斷式的時候,沒被收斂的呼叫端不是「維持現狀」,而是
-與新行為產生互動**。這裡的互動剛好是最壞的一種——新守衛把舊的寬鬆行為變成了
-無法脫身的狀態。範圍看起來只有一個檔案的修法,實際邊界是「所有問同一個問題的
-地方」。
+The shape of the lesson: **when converging a predicate, a call site that isn't converged doesn't
+"stay as-is" -- it interacts with the new behavior.** Here the interaction happened to be the
+worst kind -- the new guard turned old lenient behavior into a state with no way out. A fix that
+looks like it touches only one file actually has a boundary of "every place asking the same
+question."
 
-最終 `tests/interop.sh` 909 項檢查(Phase 15 結束時是 826),單元測試新增
-`tests/test_merge_head.c`,`make test` 32 支二進位全過,`make sanitize` 乾淨。
-八條定向 mutation(拿掉閘門、`exists`→`read`、永遠觸發、對調順序、
-`exists` 委派 `read`、加回 `S_ISREG`、還原全部非 switch 呼叫端、只還原
-`cmd_commit.c`)每一條的紅燈範圍都逐條核對過。
+The final `tests/interop.sh` has 909 checks (826 at the end of Phase 15); `tests/test_merge_head.c`
+was added as a unit test; all 32 `make test` binaries pass, `make sanitize` is clean. Eight
+directed mutations (removing the gate, `exists` -> `read`, always-triggering, swapping the order,
+`exists` delegating to `read`, adding `S_ISREG` back, reverting all non-switch call sites,
+reverting only `cmd_commit.c`) each had their red-check scope verified individually.
 
-## Phase 17:通用 reflog(`HEAD@{N}`、`<ref>@{N}`、`sg reflog`)
+## Phase 17: general-purpose reflog (`HEAD@{N}`, `<ref>@{N}`, `sg reflog`)
 
-Phase 15 交接時把「通用 reflog」列成明確留到獨立 phase 的項目:檔案層
-(`src/storage/reflog.c`)那時已經落地,`stash@{N}` 也已經在用它,缺的是「每個
-ref 更新點都要接上呼叫」——本階段做的正是這一半。
+## Phase 17: general-purpose reflog (`HEAD@{N}`, `<ref>@{N}`, `sg reflog`)
 
-### 開工踏勘先推翻了「掛在 refs.c 就好」的預設
+Phase 15's handoff listed "general-purpose reflog" as an item explicitly deferred to its own
+phase: the file layer (`src/storage/reflog.c`) had already landed by then, and `stash@{N}` was
+already using it; what was missing was "every ref-update site needs to wire in a call" -- this
+phase does exactly that half.
 
-原本設想是在 `refs.c` 的寫入函式裡直接呼叫 `sg_reflog_append`。踏勘先發現這
-個假設不成立:**ref 寫入根本沒有收斂點**。`cmd_push.c`/`cmd_fetch.c`/
-`cmd_clone.c` 各自手刻一份逐字複製的 `write_ref_file`,HEAD 的 symbolic 寫入
-在 `cmd_switch.c`/`cmd_clone.c`/`repo.c` 各自手刻,而 `refs.c` 本身**沒有** HEAD
-寫入函式。把 reflog 掛在 `refs.c` 只會靜默漏掉 fetch/push/clone 的 ref 更新與
-所有 HEAD 移動——不是報錯,是那幾行 reflog 悄悄不存在。
+### The opening survey overturned the assumption of "just hang it off refs.c"
 
-決定收斂的理由不是「重複太多讓人不舒服」,而是它是 **ref 後端層的不變式**:
-「old 值該怎麼讀」「哪些 namespace 該記」「HEAD 何時連動記一行」這幾條規則,
-散到十幾個呼叫端各自實作,漏一處不會有任何錯誤訊息,結果只是 reflog 少幾
-行——這與 Phase 16 那個 bug 是同一個形狀(一條該在單一閘門實現的規則被分散到
-多個呼叫端,沒被收斂的那個就是漏洞)。於是先新增
-`sg_ref_update`/`sg_ref_set_head`(`include/sg/refs.h`)作為唯一寫入點,再把六
-個手刻的 ref 寫入呼叫端(push/fetch/clone 的 `write_ref_file`,以及三處 HEAD
-symbolic 寫入)全部改用它。old 值由寫入點自己讀,呼叫端不必再自己記账。收斂
-反而讓後續加 reflog 訊息的 diff 變小:`do_fast_forward`(`cmd_merge.c`)連函式
-簽名都不用改,只多填一個字串參數。順手還修掉 `cmd_push.c` 一個既有的語意
-bug——它原本把 remote-tracking ref 的 old 值記成**遠端廣播的舊值**,但本地
-remote-tracking 檔案該記的是**本地現值**,兩者在別人也推過同一個遠端之後會
-不同;`sg_ref_update` 統一從本地檔案讀 old,這個分歧連帶消失。
+The original plan was to call `sg_reflog_append` directly inside `refs.c`'s write function. The
+survey first found this assumption didn't hold: **ref writing has no convergence point at all.**
+`cmd_push.c`/`cmd_fetch.c`/`cmd_clone.c` each hand-roll their own verbatim copy of
+`write_ref_file`; HEAD's symbolic write is hand-rolled separately in `cmd_switch.c`/`cmd_clone.c`/
+`repo.c`; and `refs.c` itself has **no** HEAD-write function at all. Hanging the reflog off
+`refs.c` would silently miss fetch/push/clone's ref updates and every HEAD move -- not an error,
+just those reflog lines silently not existing.
 
-### 三條實測規則(真 git 2.55.0)
+The decision to converge wasn't because "too much duplication feels uncomfortable" -- it's because
+this is an **invariant of the ref backend layer**: rules like "how should the old value be read",
+"which namespaces should be logged", and "when does HEAD get a mirrored entry" scattered across a
+dozen independently implemented call sites means missing one produces no error at all, just a few
+missing reflog lines -- this is the same shape as the Phase 16 bug (a rule that should live in a
+single gate got scattered across multiple call sites, and the unconverged one was the hole). So
+`sg_ref_update`/`sg_ref_set_head` (`include/sg/refs.h`) were added first as the single write
+point, and all six hand-rolled ref-write call sites (push/fetch/clone's `write_ref_file`, plus
+three HEAD symbolic writes) were switched to use it. The old value is read by the write point
+itself; callers no longer have to track it themselves. Converging actually made the later diff for
+adding reflog messages smaller: `do_fast_forward` (`cmd_merge.c`) didn't even need its function
+signature changed, just one more string argument filled in. Along the way, an existing semantic
+bug in `cmd_push.c` also got fixed -- it had recorded a remote-tracking ref's old value as **the
+old value from the remote advertisement**, but a local remote-tracking file should record **the
+local current value**, and the two diverge once someone else has also pushed to the same remote;
+with `sg_ref_update` uniformly reading old from the local file, this divergence disappeared as a
+side effect.
 
-規則不是回想出來的,是逐條量出來的:
+### Three rules confirmed by measurement (real git 2.55.0)
 
-- **不對稱**:具體 ref(如 `refs/heads/master`)的 log 只在 `old != new` 時
-  追加一行;`logs/HEAD` 不論 `old == new` 與否都追加。實測
-  `git reset --hard HEAD`(目標就是自己)→ `logs/HEAD` +1 行、分支自己的
-  log +0 行。
-- **HEAD 連動**:更新 HEAD 目前所指的那個分支時,`logs/HEAD` 會拿到 old/new/
-  message **逐位元組相同**的一行。用 `git update-ref` 繞過所有 porcelain 也
-  照樣發生,證明這是 ref 後端層的不變式,不是某個子指令的特殊行為。反向不
-  成立:更新一個 HEAD 沒有指到的分支,`logs/HEAD` 不動。
-- **政策**:只有 `HEAD`、`refs/heads/*`、`refs/remotes/*`、`refs/stash` 記
-  reflog,tag、`refs/sg/chunks`、`refs/small-git/undo/*` 都不記——與真 git
-  一致(非 bare repo 下 `core.logAllRefUpdates` 預設涵蓋的範圍正是這幾個
-  namespace)。`sg_ref_update` 對政策外的 ref_path 傳非 NULL 訊息一律回 -1、
-  完全不寫任何東西(連 ref 本身都不動),所以「哪些地方不記 log」是一份靠一
-  次 grep 就能稽核的封閉清單,不必到處記憶哪個呼叫端該傳 NULL。
+The rules weren't recalled, they were measured one by one:
+
+- **Asymmetry**: a concrete ref's log (e.g. `refs/heads/master`) only appends a line when
+  `old != new`; `logs/HEAD` always appends regardless of whether `old == new`. Measured:
+  `git reset --hard HEAD` (target is itself) -> `logs/HEAD` +1 line, the branch's own log +0
+  lines.
+- **HEAD mirroring**: when updating the branch HEAD currently points at, `logs/HEAD` gets a line
+  with old/new/message **byte-for-byte identical** to it. This happens even using
+  `git update-ref` to bypass all porcelain, proving this is an invariant of the ref backend layer,
+  not a special behavior of some subcommand. The reverse doesn't hold: updating a branch HEAD
+  doesn't point at leaves `logs/HEAD` untouched.
+- **Policy**: only `HEAD`, `refs/heads/*`, `refs/remotes/*`, and `refs/stash` get a reflog; tags,
+  `refs/sg/chunks`, `refs/small-git/undo/*` don't -- consistent with real git (in a non-bare repo,
+  `core.logAllRefUpdates`'s default coverage is exactly these namespaces). `sg_ref_update` returns
+  -1 outright for any policy-excluded `ref_path` given a non-NULL message, writing absolutely
+  nothing (not even the ref itself), so "which places don't log" is a closed list auditable with a
+  single grep, rather than something to remember at every call site about which one should pass
+  NULL.
 
 ### `<ref>@{N}`
 
-`<ref>@{N}` 名的是該筆 reflog 條目的 **`new_id`**,不是 `old_id`——這個方向
-容易搞反:@{0} 的意思是「最近一次更新把 ref 移動**到**的值」,不是「移動前的
-值」;最舊那一筆的 `old_id` 是全零,取錯方向會在邊界上悄悄回全零而不是第一個
-commit。`HEAD@{N}` 與 `<branch>@{N}` 各讀 `logs/HEAD` 與
-`logs/refs/heads/<branch>` 兩份不同的檔案。
-
-索引與日期選擇器的分界不是語法層面的,是**數值大小**——真 git 對這件事沒有寫
-死的語法規則,是啟發式:實測 `@{10000000}`(1e7)被當成索引,`@{100000000}`
-(1e8)真 git 直接當 Unix 時間戳走 `@{<date>}` 路徑,印「日誌只能回到 <日期>」
-的警告。sg 不支援日期選擇器,所以刻意用**純數字白名單**定義「這是一個索
-引」,其餘內容(含 `@{u}`、`@{now}`、`@{-1}`)一律乾淨拒絕,而不是去模仿一個
-以 1e8 為界、連真 git 自己文件都沒寫明的啟發式。結果是 1e8 以上 sg 拒絕、
-git 接受(當日期解析)——這是刻意記下來的分歧,不是缺陷。
-
-裸 `@{N}`(前面沒有 ref 名)一律拒絕。真 git 的裸 `@{N}` 指的是**當前分支**
-而不是 HEAD——實測兩者在有过 `reset` 之類操作、HEAD 與分支自己的 log 分岔
-之後值不同。把它猜成 HEAD 會是一個**看起來能跑但答案錯誤**的實作,比直接拒
-絕更危險,所以選擇拒絕而不是猜。
-
-### 冷讀抓到的真 bug:`~`/`^` 後綴迴圈從不驗證 `op`
-
-`sg_rev_parse_commit` 的後綴迴圈長年只判斷 `if (op == '~') ... else /* '^' */
-...`,從沒檢查 `op` 究竟是不是 `'~'` 或 `'^'`。這在只有兩種停止字元(`~`/`^`
-/`\0`)時是安全的——**一個由呼叫端保證、卻從未寫進程式碼的不變式**:base 掃描
-只在遇到這三種字元時停下,所以進到後綴迴圈的第一個字元必然是 `~` 或 `^`。
-`@{N}` 合法地讓 base 掃描多了第四種停止條件(`@{`),前提就被打破了:實測
-`sg tag t 'master@{0}x'` 回 0 並把標籤指到 `master@{0}` 的 parent(`x` 被當成
-「非 `~` 即 `^`」的 `^` 分支吃掉了,又因為後面沒有數字,`parse_suffix_number`
-對空字串回傳隱含的 1),真 git 對同一輸入直接報 `ambiguous argument`。
-`sg_rev_parse_commit` 是 `sg reset`(破壞性操作)與 `sg tag` 解析使用者
-revision 字串的唯一入口,打錯一個字元被靜默解到附近但錯誤的 commit,後果不
-是「拒絕」而是「解到別的地方」。修法是在迴圈本身加一個
-`if (op != '~' && op != '^') return -1;`,而不是在 `@{N}` 那段收尾處補丁——
-讓不變式變回迴圈自己的局部性質,不依賴呼叫端多年前的假設繼續成立。
-
-### 刻意的 divergence
-
-1. **三方合併寫 `merge <arg>: Merge made by the 'sg-3way' strategy.`**,真 git
-   是 `'ort'`(或歷史上的 `'recursive'`)。sg 沒有實作 ort 策略,照抄策略名
-   會讓在 sg repo 上跑 `git reflog` 的人被誤導成「這是用 ort 合併的」。保留
-   git 的文法外殼(它自己的策略名本來就會隨版本變,`'recursive'`→`'ort'`就
-   是先例),只把策略名換成誠實的自己的名字。
-2. ~~**detached HEAD 的 `switch` 不寫 reflog 行**~~——**Phase 18 已解決**,
-   底下這段診斷的兩個選項都選了第一個:改共用函式,並逐一盤過 21 個呼叫端。
-   原文保留,因為它對「為什麼當時不該單獨補這個角落」的判斷仍然成立。
-   真 git 在這個情境下寫
-   `checkout: moving from <40-hex> to <target>`(實測)。試過照做,行不通:
-   `sg_ref_resolve_head`(`include/sg/refs.h`)對 detached HEAD 直接回
-   -1——它只認 symbolic HEAD,所以 fallback 邏輯從未被觸發過。要做對,要嘛
-   改這支被到處依賴、用來判斷「是不是 detached」的共用函式(波及所有靠它的
-   指令),要嘛在 `cmd_switch.c` 自己解析 `.git/HEAD` 的原始內容繞過它。而
-   sg 在 detached HEAD 這個狀態下本來就整個站不住腳(`sg status` 印
-   `On branch ?`、`No commits yet`,沒有一致的使用者體驗),留給 Phase 18 一
-   併處理,不在這裡單獨補一個沒有配套的角落。
-3. **`sg clone` 不建立 `refs/remotes/<remote>/HEAD`,也不寫它的 log**。真 git
-   clone 之後兩者都有。實作過程中曾一度只寫 log(不建 ref 本身),已經移
-   除——`sg reflog origin/HEAD` 走 `sg_rev_parse_ref_path` 解析 ref 名,而
-   該函式要求 ref 本身存在;ref 不存在,那個 log 檔就永遠讀不到,寫了也是
-   死資料,而且等於宣稱一段這個 repo 從未真正擁有的歷史。
-4. **`sg clone` 不寫 `refs/remotes/<remote>/<branch>` 的 log**——這條反而
-   **與 git 一致**(git 也要等到第一次 `fetch` 才第一次寫那份 log),但因為
-   直覺上「clone 應該把一切都寫好」而顯得反直覺,特地記下來,免得日後有人
-   把它當 bug「修好」。
-5. ~~**rebase 的 reflog 形狀留給 Phase 18**~~——**Phase 18 已完成**,做法正是
-   底下這段所描述的:改成 detached 模型,而不是補一組形狀對不上的假訊息。
-   原文保留,它把「為什麼加訊息字串解決不了」講清楚了。
-   真 git 的 rebase 全程在 detached
-   HEAD 上重放每個 commit,只在最後一次性把分支搬過去,所以分支自己的 log
-   只有一行、`logs/HEAD` 有 `rebase (start)`/`(pick)`/`(finish)` 一串。sg 的
-   rebase 從不 detach,每 pick 一個 commit 就直接搬一次分支 ref——結構上就
-   無法逐字複製那組訊息序列。Phase 17 的做法是讓 `cmd_rebase.c` 的每個
-   `sg_ref_update_branch` 呼叫維持傳 `NULL`(等同 `sg_ref_update` 的
-   `reflog_msg == NULL` 分支),也就是完全不寫 reflog,而不是寫一組形狀對不
-   上真 git 的假訊息。
-6. **`sg fetch` 的訊息只嵌 remote 名稱**,真 git 嵌入完整的 argv(例如
-   `fetch -q origin: ...`)。sg 的旗標集合與 git 不同,逐字複製 argv 沒有意
-   義;只嵌 remote 名讓 `sg fetch origin` 與 `git fetch origin` 的訊息逐位元
-   組相同(已量測),這是能對齊的最大公約數。
-
-### 測試紀律這一輪學到的
-
-- **`git reflog` 是免費的 oracle**:把磁碟格式做對之後,可以用同一串操作分
-  別在 sg 與真 git 上跑一遍,逐位元組比對兩邊 `git reflog`/`sg reflog` 的
-  message 欄——不必自己猜測措辭,答案就在真 git 的輸出裡。
-- **假覆蓋,實跑才現形**:把 `@{N}` 的「純數字」白名單暫時放寬成「非空即
-  可」,`@{u}`/`@{now}`/`@{-1}` 這幾條看起來在驗「必須是語法正確的索引」的
-  測試**仍然變紅,但理由不對**——非數字字元參與了 char 算術,產生一個巨大
-  的數值,是被無關的越界檢查擋下來的,不是被「必須是數字」這條規則擋下。補
-  了一個刻意構造的 `wideranger@{A}`(先寫 20 筆 log,讓 `'A'-'0'==17` 落在
-  合法索引範圍內)才是真正有鑑別力的案例——它必須能命中「這是合法的
-  reflog 深度」卻因為「不是數字」被拒絕,而不是被別的守衛頂替。
-- **假紅燈**:`master@{1}5` 這條測試在 2-commit 的 fixture 下確實變紅,但原
-  因是 root commit 沒有 parent,`@{1}5` 被誤解析成 `@{1}^5` 之後找 5 層
-  parent 本來就會失敗——與「後綴不合法該被拒絕」這條規則毫無關係,是巧合地
-  紅在同一個退出碼上。把 fixture 延長到 3 個 commit,讓「合法解析但層數不
-  夠」與「非法字元」兩種失敗理由分得開,才確認是後者在生效。**先證明測試會
-  紅還不夠,還要確認紅得有道理。**
-- **冗餘的防禦性檢查會把真正的驗證點藏起來**:`revparse.c` 裡有兩段與既有程
-  式碼邏輯完全重複的檢查,單獨刪掉任何一段都是**零測試變紅**。它們不是多一
-  層安全網,底下的防線(`parse_suffix_number`、`sg_reflog_at`)本來就已經擋
-  住同樣的輸入;真正該打 mutation 的地方是下一層,打在這兩段冗餘檢查上永遠
-  測不出東西。兩段都已經刪除,不留著製造「這裡好像有守衛」的錯覺。
-- **否定式斷言各自需要自己的定向 mutation**:讓 `sg clone` 也對
-  `origin/<branch>` 傳訊息(即偷偷開始寫這個 log)→ 精確 1 條檢查變紅;拿掉
-  `sg_ref_delete_under` 對 log 檔 `unlink` 的 `ENOENT` 容忍 → 3 條變紅(其中
-  一條是既有的 prefix 碰撞測試順帶抓到的)。`sg clone` 那條 mutation 刻意只
-  對 remote-tracking ref 傳訊息、不對 tag 傳——如果無差別地對所有 ref 都傳
-  訊息,tag 會觸發政策閘門(政策外的 ref_path 傳非 NULL 訊息直接 -1),讓整
-  個 clone 失敗,那種紅燈不是「否定式斷言生效」,是「clone 整個掛了」,不算
-  證據。
-- **`logs/HEAD` 的行數斷言**:最初用 `tail -1` 比對最後一行內容,但構造一個
-  「錯誤地寫了兩行相同內容」的 mutation 時,`tail -1` 照樣通過——兩行的最後
-  一行內容確實相同。只有額外斷言**行數**(`wc -l`)才分得出「該有一行」與
-  「多寫了一行」。
-
-### 第三輪冷讀:模型改動把 `--abort` 的一個不變式弄壞了
-
-段二交出去冷讀,抓到一個**高嚴重度、而且它自己重現過**的問題,是這次改動直接
-造成的。
-
-`finish_rebase` 是**兩次寫入**:先推進分支,再把 HEAD 接回去。我把 `--abort`
-的分支還原拿掉了,理由是「分支從頭到尾沒被動過」——那個理由只在整場 rebase
-是原子的時候成立。若在那兩次寫入之間被中斷(crash、SIGKILL、`sg_ref_set_head`
-的暫時性 I/O 失敗),分支已經停在 rebase 後的 tip,而 `.git/sg-rebase/` 還在。
-此時 `sg rebase --abort` 會:
-
-- 把工作目錄還原成 **rebase 前**的樹,
-- 把 HEAD 接回分支(而分支**已經**在 rebase 後的 tip),
-- 刪掉序列器狀態、**退出 0**,並印「'topic' is back at <orig>」。
-
-三者互相矛盾,而且是**假成功**。沒有 commit 永久遺失(新 tip 仍由分支可達),
-但工具說了謊。舊版的 `--abort` 無條件把分支重設回 `orig_head`,對任何中間狀態
-都是穩健的;新版依賴一個這條路徑自己就能打破的不變式。
-
-修法剛好不必取捨:`--abort` 恢復成無條件還原分支,而且**不影響 reflog 形狀**
-——`sg_ref_update_branch` 傳 NULL 訊息,永遠不寫 log 行;正常情況下值也沒變。
-寫入順序是「先分支(HEAD 仍 detached,不會鏡射)、再接回 HEAD」。
-
-這個情境**不能靠還原某一行來做 mutation 驗證**(它是缺少的防禦,不是壞掉的既
-有邏輯),但可以**製造那個中斷狀態**來測,interop 就是這樣寫的。把修法拿掉會
-讓那兩條精準變紅。
-
-同一輪還有兩件事:
-
-- **`<oid>` 正規化把 `onto` 的正確性蓋掉了**。分支的 finish 行是唯一嵌入完整
-  40-hex 的 rebase 訊息,而雙軌比對前會把任何 40-hex 換成 `<oid>`——所以把
-  `state->onto` 換成新 tip 或 `orig_head`,**整組 phase18f 都不會紅**。冷讀特別
-  要求主對話實跑這條 mutation 驗證它的預測,實跑確認它說對了。已補一條不經正
-  規化的直接斷言(外加一條前提檢查,確保 onto 與結果 tip 真的不同,否則那條斷
-  言自己就沒有鑑別力)。
-- **fast-forward 路徑的中斷窗口沒有任何標記**。冷讀說它「重跑就自癒」,實測
-  **是錯的**:重跑 `sg rebase <upstream>` 會因為 HEAD 是 detached 而被拒絕、
-  `--abort` 說「沒有進行中的 rebase」,只剩一個要確認的 `sg switch` 能脫身。
-  一般路徑在動任何東西之前就寫序列器狀態,ff 沒有;現在也寫了(純粹為了讓那個
-  窗口可救),收尾再刪掉。
-
-### oracle 的環境本身要被宣告
-
-phase18f 的 `(continue)` 那組本機全綠、**每一台 CI runner 都紅**(Linux 與 macOS
-皆然)。為此加的診斷輸出直接給出答案,而且推翻了原本的假設(「git 在 2.54 與
-2.55 之間改了訊息」):git 那一軌**一行 rebase 紀錄都沒寫**——不是訊息不同,是
-rebase 根本沒完成。`git rebase --continue` 要開編輯器,沒有編輯器就失敗。
-
-本機會過,是因為這台機器的 shell 匯出了 `GIT_EDITOR=true`。
-
-這件事的教訓不是「要設 GIT_EDITOR」,而是:**「拿真 git 當 oracle」這句話,只有
-在 oracle 的執行環境也被測試套件自己決定時才成立**。那次測量是真的,但它是透過
-一個測試從未宣告、剛好存在於開發者 shell 裡的設定取得的。interop.sh 現在自己
-`export GIT_EDITOR=true`,並在註解裡寫明理由。
-
-順帶一提,驗證這個修法時第一次的「乾淨環境」模擬做過頭了——連 git config 一起
-關掉,於是 git 找不到 committer 身分,整個套件在第一步就結束,輸出是空的。**空
-輸出讀起來跟通過一模一樣**,只有實際看行數才會發現。
-
-### 收尾補驗:自己寫的 reset 斷言也是假覆蓋
-
-merge 之後回頭補跑「否定式斷言」的定向 mutation(記憶裡的規則:「沒有做 X」這
-類斷言不能靠全面還原來驗),連帶發現 **Phase 18 自己新加的 reset 斷言是綠得沒有
-鑑別力的**。
-
-把 `move_head_to` 的 detached 分支關掉(讓它在 detached 時照樣去寫
-`refs/heads/%s`,而 `current_branch` 是 NULL,於是產生一個叫
-`refs/heads/(null)` 的分支、完全不碰 HEAD),原本只有 **phase14 的四條**變紅——
-phase12 與 18d 那幾條我為了這個修法新寫的斷言,一條都沒紅。
-
-原因是 fixture 退化:`p12r_base` 在 c1 上打 tag `v1`,而案例在 `HEAD~1`(= c1
-= 就是 v1)detach 之後 `reset --mixed v1` ——**那是個 no-op**。「HEAD 移到目標
-了」在 HEAD 根本沒動的建置上照樣成立。這是本次里程碑第三次踩到同一個形態(前兩
-次是標籤與情境錯開一格、以及「tag 移走」案靠無關理由退回 id)。
-
-改成在 c2 detach、reset 到 v1(真的移動),並補兩件事:一條**前提斷言**確認目標
-與起點不同(否則那條斷言自己就沒有鑑別力),以及一條比對**整份分支清單**而不只
-是 master——寫錯地方不一定會打到既有分支,`refs/heads/(null)` 就不會。同一個
-mutation 現在讓 7 條紅,其中那條新守衛直接把 `refs/heads/(null)` 印出來。
-
-順帶把踩過的 `tests/mutate.sh` 用法陷阱寫進腳本註解:perl 分隔符撞 C 語法
-(`s{}{}` 撞大括號、`s!!!` 撞 `!=`),以及**字面量出現不只一次時一定要加 `/g`**。
-
-### 無法驗證(如實記錄)
-
-- 兩處 malloc 失敗分支(`cmd_commit.c`、`cmd_switch.c` 建構 reflog 訊息字串
-  時的 OOM 路徑)——本專案沒有 malloc 失敗注入機制,只能靠讀碼確認對應的
-  `free` 都在正確的路徑上執行。
-- Phase 14/16 的 switch 閘門在 **reflog 這個維度**不可觀測:那些測試寫在
-  reflog 存在之前,只讀退出碼與工作目錄/index 狀態,「被拒絕的 switch 沒有
-  寫下任何 reflog 行」目前只靠「閘門在任何副作用之前」這個呼叫順序保證,沒
-  有專屬斷言。
-- `sg_ref_delete_under` 刪 log 檔那段路徑的長度截斷分支——需要一個長度剛好
-  卡在 `SG_PATH_MAX` 邊界、讓 `.../logs/...` 比 ref 路徑本身多出的 5 個位元
-  組正好溢出的分支名,構造成本高,沒有補。
-- `sg push` 在「本地 remote-tracking ref 已經等於新值」這個情境下,規則 1
-  (`old == new` 不追加)的抑制分支——沒有專屬案例區分「因為抑制而沒寫」與
-  「單純沒被呼叫到」。
-- `sg fetch` 的快進判斷在「new 的祖先鏈中間有物件缺失」這個邊角情況下的行
-  為:目前的實作會保守地把它標成 forced-update(訊息說謊的方向是安全的,不
-  會把非快進的更新誤標成快進),但沒有構造出這個情境的案例。
-
-### 另外記一句
-
-`sg_ref_update` 有一個已知限制,寫在自己的標頭註解裡:`sg_ref_read_path` 把
-「ref 不存在」與「ref 檔損壞」壓成同一個 -1,所以一個損壞的既有 ref 被更新
-時,它的 reflog 條目會把 `old_id` 記成全零,看起來像是這個 ref 剛被建立,而
-不是「曾經存在但讀不出來」。不為這個情境引入第三態,維持與專案既有的
-「-1 統一表示失敗」慣例一致。
-
-最終 `tests/interop.sh` 998 項檢查(Phase 16 結束時是 909;熱身踏勘先補到
-914,批 A 919、批 B 944、批 C 978、批 D 收尾到 998),`make test` 34 支二進
-位全過(新增 `tests/test_ref_update.c` 與 `tests/test_reflog_messages.c`;
-`tests/test_reflog.c` 是 Phase 15 就有的檔案層測試),
-`make sanitize` 乾淨,子指令從 23 個增加到 24 個(新增 `sg reflog`)。
-
-## Phase 18:detached HEAD,與 rebase 的 reflog 形狀
-
-Phase 17 把兩件事留在這裡(見上面「刻意的 divergence」第 2、5 條)。它們看起
-來是兩個題目,實際上是同一個:真 git 的 rebase 全程在 detached HEAD 上重放,
-所以不先把 detached HEAD 變成 sg 真正理解的狀態,rebase 的 reflog 形狀在結構
-上就對不齊。
-
-### 根因:一個 -1 同時表示兩件事
-
-`sg_ref_resolve_head` 在 `sg_ref_current_branch` 回 NULL 時直接回 -1,把
-「HEAD 是 detached」與「HEAD 是 unborn(repo 剛建、還沒有 commit)」壓成同一
-個失敗。**21 個呼叫端全部把它讀成後者**——標頭註解也是這樣寫的。
-
-這不是一個「等 Phase 18 才會發生」的問題。真 git 隨時可以把任何 sg repo 變成
-detached(`git checkout --detach`),而在那個狀態下 sg 不是拒絕,是**安靜地答
-錯**:
-
-- `sg log` 印「fatal: your current branch does not have any commits yet」,
-  下面壓著一整段完好的歷史。
-- `sg status` 把 HEAD 的樹算成空的,於是乾淨的工作目錄被報成「每個追蹤中的
-  檔案都是新增」。
-- `sg_safe_apply_tree` 共用同一段計算,所以 `sg switch` 在覆寫工作目錄前,是
-  拿空樹去判斷它即將蓋掉什麼。
-- `sg branch <name>` 回「目前的分支還沒有任何 commit」而拒絕建分支。
-- `sg stash push`/`pop` 直接失敗;而 `sg_snapshot_create` 會把快照記成 **root
-  commit**——安全網自己把 parent 連結弄丟了。
-
-修法是讓 detached 的 HEAD 真的解出它的裸 sha,-1 只剩「unborn」。21 個呼叫端
-逐一盤過,**沒有任何一處把這個失敗當成 detached 守衛在用**,所以沒有人因此失
-去守衛;三個真的要拒絕 detached 的指令(reset、rebase、push)判斷的是
-`sg_ref_current_branch`,不受影響。
-
-`sg_ref_head_is_detached` 刻意是三態(1/0/-1):**「損壞的 HEAD」不是
-「detached」**。這個區分有實際後果——detached 這個答案正是呼叫端用來決定「我
-可以把裸 sha 寫進 HEAD」的依據,把損壞當成 detached,等於把損壞洗成一個看起來
-正常的狀態。
-
-### 為什麼 detach 不能借用 `sg_ref_update(git_dir, "HEAD", ...)`
-
-Phase 17 收斂 ref 寫入時,`sg_ref_update` 順帶就具備了寫裸 sha 到 HEAD 的能力
-(`ref_path_reflog_allowed` 早就放行 `"HEAD"`,`write_ref_path_raw` 對 ref_path
-一視同仁)。踏勘因此建議直接用它,**那是錯的,而且錯得很安靜**:它取 old_id 走
-`sg_ref_read_path`,而 HEAD 還是 `ref: refs/heads/<b>` 的時候那個 hex 解析必然
-失敗,fallback 是全零——於是「從 commit A 分離到 B」被記成「憑空建出 B」。真
-git 在那一格寫的是離開的那個 commit(實測)。
-
-所以有了 `sg_ref_set_head_detached`,它的 old_id 走**修好之後的**
-`sg_ref_resolve_head`,symbolic 與裸 sha 兩種形狀都解得出來。定向 mutation 把
-它換回 `sg_ref_read_path`,只有「從分支 detach」那條斷言變紅,「從 detached 再
-detach」照樣綠——因為後者 HEAD 已經是裸 sha 了。兩條測試分屬不同來源形狀,缺
-一條就會留下這個死角。
-
-### `at` 還是 `from`:標籤不在 HEAD 裡,在 reflog 裡
-
-`HEAD detached at <x>` / `from <x>` 的 `<x>` **不是**現在的 HEAD,是當初的分離
-點,而分離點要回頭掃 `logs/HEAD` 最後一筆 `checkout: moving from ... to <y>`
-才知道。實測(git 2.55.0)出來的完整規則:
-
-- `<y>` 這個 token 現在**仍然解析到同一個 commit** 時就用它,否則退回縮寫 id。
-  所以移走的 tag、或 `HEAD~1` 這種本來就不是 ref 的運算式,都會退成 id。
-- 剝掉 `refs/tags/` 與 `refs/remotes/` 前綴,**但不剝 `refs/heads/`**——git 真
-  的會印 `HEAD detached at refs/heads/other`。
-- 字面 token `"HEAD"` 不算(`sg switch --detach HEAD` 印的是 id)。用 HEAD 來
-  說明 HEAD 在哪,本來也沒有資訊。
-- `at` 與 `from` 的分界是**值的比較**,不是「有沒有發生過什麼」:`reset --hard`
-  回到分離點會變回 `at`。
-- `logs/HEAD` 裡完全沒有 checkout 條目時,git 放棄這套措辭,改印
-  `Not currently on any branch.` / `* (no branch)`。
-
-### finish 的順序,讓兩條既有規則自己產出 git 的形狀
-
-rebase 改成 detached 模型之後,收尾的兩步順序是有意義的,而且**不需要任何特例**:
-
-1. **先**更新分支。此刻 HEAD 還是 detached,`sg_ref_update` 的 rule 2
-   (`is_current_branch`)因此是 0,那一行**不會**被鏡射進 `logs/HEAD`——分支
-   於是只拿到它該有的那一行 `rebase (finish): <ref> onto <onto>`。
-2. **再**把 HEAD 接回分支。old == new(兩邊都是最終 tip),而 `logs/HEAD` 從不
-   做 no-op 抑制(rule 1 的不對稱性),所以 `returning to` 那行照樣寫得出來。
-
-兩條在 Phase 17 就量好的規則,擺對順序就剛好是 git 的輸出。把兩步對調會讓五條
-檢查變紅,其中包含「finish 那行 old == new」。
-
-`--abort` 因此也變簡單了:分支全程沒被動過,只要把 HEAD 接回去。真 git 的分支
-log 在 abort 後同樣一行未增,理由一模一樣——值沒變,rule 1 抑制掉了。
-
-### 範圍是被逼著改的:`sg reset` 必須支援 detached HEAD
-
-開工時談定的範圍是「merge / reset / 從 detached 起手的 rebase 維持拒絕」。那個
-決定的前提是「detached 只可能由使用者或真 git 造成」。段二把 rebase 改成
-detached 模型之後,前提消失了:**暫停中的 rebase 現在自己就是 detached**,而
-`reset` 拒絕 detached 會直接拿掉「rebase 暫停中可以 reset」——那是 Phase 14 建
-立並對真 git 量過的能力,7 條 interop 因此變紅。真 git 允許它,原因完全相同:
-它自己的 rebase 也是 detached。
-
-所以 `reset` 開了,`merge` 與「從 detached 起手的 rebase」維持拒絕。兩條原本釘
-著「reset 在 detached 下必須拒絕」的既有測試**反過來改寫**——它們現在是錯的。
-順手把 reset 三種 mode 裡逐字重複三次的 ref 寫入收斂成 `move_head_to`。
-
-這件事本身是個教訓:**範圍決定會被後續的實作推翻**,而推翻它的是既有測試變紅,
-不是有人想起來。
-
-### 冷讀抓到的:三個「沒有斷言」而不是「斷言寫錯」
-
-段一交出去冷讀時,18a–18d 已經驗了 HEAD 檔案、兩份 reflog、ref、`status` 與
-`branch` 的措辭——**卻沒有任何一條讀 `switch` 自己的 stdout**。三個與真 git 的
-分歧就活在那個縫裡:
-
-1. `Previous HEAD position was ...` 綁在「切到分支」上,所以 detach→detach 完全
-   不印。它其實屬於「**離開** detached HEAD」。修的時候我又把規則弄錯了一次
-   ——真 git 只在 **commit 真的改變**時才印,同 commit 的三種組合都不印——新測
-   試在一分鐘內抓到。
-2. `sg switch --detach HEAD` 印出 `HEAD detached at HEAD`。
-3. 描述用的緩衝區只有 512 bytes,更長的 ref 名讓整個函式失敗,而 `status` 把那
-   個失敗渲染成 `Not currently on any branch.`——對一個明明 detached 的 HEAD 說
-   「不在任何分支上」,那不是資訊變少,是資訊變錯。
-
-三個都是**缺少斷言**,不是斷言寫錯。這是本專案第一次明確遇到這一類:測試覆蓋
-的維度(檔案內容、退出碼、reflog)全都對,只是少了一整個維度(stdout)。
-
-### 假覆蓋:這一輪抓到四個
-
-1. **標籤與情境錯開一格**:顯示那組案例用 `sg commit` 移動 HEAD,但當時
-   `sg commit` 在 detached 下還被拒絕,commit 根本沒發生,於是後面每個案例都往
-   前挪了一格,「at 應該變 from」被斷言成反的,**而且全部通過**。之所以看得出
-   來,是因為那個 helper 把比較到的字串印進 check 標籤裡。此後改用 git 移動
-   HEAD:這一節測的是措辭,不該因為 sg 的寫入能力退步而靜靜變成 no-op。
-2. **靠無關的理由通過**:「tag 被移走所以退回 id」那個案例,前一案剛好把 HEAD
-   留在目標 commit 上,而 git 對「沒有移動的 checkout」不寫 reflog——於是分離點
-   仍是更早那筆的 `HEAD~1`,退回 id 是因為 `HEAD~1` 本來就不是 ref。答案對,理
-   由完全無關,把被測的守衛刪掉照樣通過。
-3. **`cmp` 兩個空檔會成功**:雙軌比對前先斷言行數,否則一個什麼都沒做的
-   fixture 會報告「完全相符」。
-4. **走不到被測的那行**:`push` 的 detached/corrupt 訊息分流排在遠端 ref 廣播
-   之後,沒有活的 remote 就永遠走不到。第一版斷言在「remote 未設定」就先失敗
-   而通過。已拿掉並記進下面的無法驗證清單。
-
-另外,**重複的字串會讓 mutation 說謊**:`"rebase (start): checkout %s"` 有兩
-份,一次沒加 `/g` 的 mutation 只改到第一份,於是「plain/continue/skip 都沒紅、
-只有 fast-forward 紅」看起來像是覆蓋不足,實際上是驗證工具只改了一半。收斂成
-一個常數。
-
-### 工具:`tests/mutate.sh` 的名字會進 mktemp 樣板
-
-mutation 名字裡有 `/` 會讓 `mkdtemp` 失敗(「No such file or directory」)。腳
-本是大聲失敗的(退出 1),但錯誤訊息看起來像環境問題而不像「你的名字取壞
-了」,實測浪費了兩輪才看懂。名字現在會先過濾成安全字元。
-
-### 刻意維持的 divergence
-
-- ~~**`sg merge` 與「從 detached HEAD 起手的 `sg rebase`」仍然拒絕**~~——
-  **Phase 19 已放行**,見下一節。當時的理由仍然成立:那是範圍決定而不是做不到,
-  所以用 interop 釘住而不是任其漂移。釘住的代價與收益都在 Phase 19 兌現了:移
-  動這個邊界就是刪掉那兩條被釘住的檢查,而那個刪除動作本身連帶弄壞了第三條,
-  正好證明它們原本擋住的漂移是真的。
-- **`sg status` 沒有 git 那句 `interactive rebase in progress`**。實測發現真
-  git 即使沒加 `-i` 也印 interactive(2.26 起 merge backend 沿用 interactive
-  機制),sg 沒有 `-i`,照抄會是誤導。
-
-### 無法驗證(如實記錄)
-
-- `sg_ref_detach_description` 緩衝區放不下時退回縮寫 id 的那個分支:label 長度
-  上限來自 `ref_path[SG_PATH_MAX]`(4096,而 `sg_rev_parse_ref_path` 對放不下
-  的名字本來就回 -1),加上 `"HEAD detached from "` 共 4116 bytes,兩個呼叫端的
-  緩衝區都是 4160 → **就現有呼叫端而言永遠走不到**。兩輪冷讀各自獨立算過同一
-  條式子。不是結構性死碼(未來若有第三個呼叫端傳入較小的緩衝區就會觸發),所
-  以守衛保留,但如實記成沒有覆蓋。
-- `cmd_push.c` 的 detached / corrupt HEAD 訊息分流:它的 HEAD 檢查排在遠端 ref
-  廣播之後,要一個活的 remote 才走得到。改了但沒有斷言。
-- **「`--abort` 不動分支的 reflog」這條檢查是被規則保證的,不是被程式碼選擇保
-  證的**:abort 把分支還原成它本來就有的值,rule 1 的 no-op 抑制會擋掉任何寫
-  入,所以改 abort 自己的程式碼**沒有任何 mutation 能讓它變紅**(試過一個)。留
-  著當形狀的迴歸守衛,但它不能當成「abort 選擇不寫」的證據。
-- `finish_rebase` 兩次寫入之間、以及 fast-forward 路徑 detach 之後的**中斷
-  窗口本身**無法在測試裡真的觸發(沒有故障注入機制)。做法是**製造**中斷後的
-  磁碟狀態再驗 `--abort` 救得回來,那覆蓋的是復原邏輯,不是窗口的存在。
-- phase18e 的 branch→detach 案例對「commit 有沒有改變」這條新規則是無效覆蓋:
-  HEAD 從分支出發時 `have_prev_commit` 恆為 0,那個 `memcmp` 根本走不到。它是
-  重構的迴歸防護,不是新邏輯的覆蓋——標籤已經照實寫。
-
-最終 `tests/interop.sh` 1098 項檢查(Phase 17 結束時是 998),`make test` 35 支
-二進位全過(新增 `tests/test_head_detach.c`),`make sanitize` 乾淨,子指令維持
-24 個(`sg switch` 新增 `--detach`)。
+`<ref>@{N}` names that reflog entry's **`new_id`**, not `old_id` -- an easy direction to get
+backwards: @{0} means "the value the most recent update moved the ref **to**", not "the value
+before it moved"; the oldest entry's `old_id` is all-zero, and picking the wrong direction would
+silently return all-zero at the boundary instead of the first commit. `HEAD@{N}` and
+`<branch>@{N}` each read a different file, `logs/HEAD` and `logs/refs/heads/<branch>`
+respectively.
+
+The line between an index and a date selector isn't syntactic, it's a **numeric magnitude** --
+real git has no hardcoded syntax rule for this, it's a heuristic: measurement shows `@{10000000}`
+(1e7) is treated as an index, while `@{100000000}` (1e8) real git treats directly as a Unix
+timestamp and goes through the `@{<date>}` path, printing a warning that "log only goes back to
+<date>". sg doesn't support a date selector, so it deliberately uses a **digits-only whitelist**
+to define "this is an index"; anything else (including `@{u}`, `@{now}`, `@{-1}`) is cleanly
+rejected, rather than imitating a heuristic bounded at 1e8 that even real git's own documentation
+doesn't spell out. The result is that above 1e8, sg rejects while git accepts it (parsing it as a
+date) -- a deliberately recorded divergence, not a defect.
+
+Bare `@{N}` (with no ref name in front) is always rejected. Real git's bare `@{N}` refers to
+**the current branch**, not HEAD -- measurement shows the two have different values after
+operations like `reset` cause HEAD's log and the branch's own log to diverge. Guessing it means
+HEAD would be an implementation that **looks like it runs but gives a wrong answer**, more
+dangerous than an outright rejection, so rejection was chosen over guessing.
+
+### A real bug caught by a cold read: the `~`/`^` suffix loop never validated `op`
+
+`sg_rev_parse_commit`'s suffix loop had, for years, only checked `if (op == '~') ... else
+/* '^' */ ...`, never actually checking whether `op` was `'~'` or `'^'` at all. This was safe as
+long as there were only two stop characters (`~`/`^`/`\0`) -- **an invariant guaranteed by the
+caller, but never written into the code**: the base scan only stopped upon hitting these three
+characters, so the first character entering the suffix loop was necessarily `~` or `^`. `@{N}`
+legitimately gave the base scan a fourth stop condition (`@{`), which broke this premise:
+measured, `sg tag t 'master@{0}x'` returns 0 and points the tag at `master@{0}`'s parent (`x` gets
+swallowed into the "if not `~` then `^`" branch, and since there's no digit after it,
+`parse_suffix_number` returns the implicit 1 for an empty string), while real git reports
+`ambiguous argument` outright for the same input. `sg_rev_parse_commit` is the sole entry point
+for parsing a user's revision string for `sg reset` (a destructive operation) and `sg tag`; a
+mistyped character being silently resolved to a nearby but wrong commit isn't "rejected", it's
+"resolved somewhere else." The fix adds `if (op != '~' && op != '^') return -1;` inside the loop
+itself, rather than patching the tail end of the `@{N}` section -- restoring the invariant as a
+local property of the loop itself, no longer depending on an assumption the caller made years ago
+still holding.
+
+### Deliberate divergences
+
+1. **A three-way merge writes `merge <arg>: Merge made by the 'sg-3way' strategy.`**, while real
+   git writes `'ort'` (or historically `'recursive'`). sg hasn't implemented the ort strategy;
+   copying the strategy name verbatim would mislead anyone running `git reflog` on an sg repo into
+   thinking "this was merged with ort." The grammatical shell from git is kept (its own strategy
+   name has already changed across versions before -- `'recursive'` -> `'ort'` is precedent), just
+   swapping in an honest name of its own.
+2. ~~**`switch` doesn't write a reflog line for detached HEAD**~~ -- **resolved in Phase 18**, and
+   the diagnosis below chose the first of its two options: changing the shared function and
+   auditing all 21 call sites one by one. The original text is kept because the reasoning for "why
+   this corner shouldn't be patched separately at the time" still holds. Real git, in this
+   situation, writes `checkout: moving from <40-hex> to <target>` (measured). Trying to replicate
+   this didn't work: `sg_ref_resolve_head` (`include/sg/refs.h`) returns -1 outright for a
+   detached HEAD -- it only recognizes a symbolic HEAD, so the fallback logic was never triggered.
+   Doing it correctly means either changing this widely depended-on shared function used to
+   determine "is it detached" (affecting every command relying on it), or having `cmd_switch.c`
+   parse `.git/HEAD`'s raw content itself, bypassing it. And sg's overall footing in the detached
+   HEAD state is already shaky to begin with (`sg status` prints `On branch ?`, `No commits yet`,
+   with no coherent user experience), so this was left for Phase 18 to handle together, rather
+   than patching one unaccompanied corner here.
+3. **`sg clone` doesn't create `refs/remotes/<remote>/HEAD`, nor write its log.** Real git has both
+   after a clone. During implementation there was briefly a version that wrote only the log
+   (without creating the ref itself), which was removed -- `sg reflog origin/HEAD` goes through
+   `sg_rev_parse_ref_path` to resolve the ref name, and that function requires the ref itself to
+   exist; if the ref doesn't exist, that log file would never be readable, so writing it would be
+   dead data, and would amount to claiming a slice of history this repo never actually owned.
+4. **`sg clone` doesn't write a log for `refs/remotes/<remote>/<branch>`** -- this one actually
+   **matches git** (git also has to wait for the first `fetch` before it writes that log for the
+   first time), but it's specifically recorded here because it feels counter-intuitive given the
+   instinct that "clone should set everything up", so nobody later mistakes it for a bug and
+   "fixes" it.
+5. ~~**Rebase's reflog shape was left for Phase 18**~~ -- **completed in Phase 18**, and the
+   approach was exactly what's described in the section below: switching to the detached model
+   instead of patching in a set of fake messages that don't match the shape. The original text is
+   kept because it clearly explains "why adding message strings wouldn't solve it." Real git's
+   rebase replays every commit on a detached HEAD throughout, moving the branch over only once at
+   the very end, so the branch's own log gets only one line while `logs/HEAD` gets a series of
+   `rebase (start)`/`(pick)`/`(finish)` entries. sg's rebase never detaches, moving the branch ref
+   once for each commit picked -- structurally unable to reproduce that message sequence
+   verbatim. Phase 17's approach was to have every `sg_ref_update_branch` call in `cmd_rebase.c`
+   keep passing `NULL` (equivalent to `sg_ref_update`'s `reflog_msg == NULL` branch), i.e. writing
+   no reflog at all, rather than writing a set of fake messages whose shape doesn't match real
+   git's.
+6. **`sg fetch`'s message only embeds the remote name**, while real git embeds the full argv
+   (e.g. `fetch -q origin: ...`). sg's flag set differs from git's, so copying argv verbatim would
+   be meaningless; embedding only the remote name makes `sg fetch origin` and `git fetch origin`'s
+   messages byte-for-byte identical (measured) -- the largest common denominator that can be
+   aligned.
+
+### What was learned about test discipline this round
+
+- **`git reflog` is a free oracle**: once the on-disk format is correct, the same sequence of
+  operations can be run once on sg and once on real git, comparing `git reflog`/`sg reflog`'s
+  message field byte-for-byte -- no need to guess the wording yourself, the answer is right there
+  in real git's output.
+- **False coverage, only revealed by actually running it**: temporarily relaxing `@{N}`'s
+  "digits only" whitelist to "just non-empty", the tests for `@{u}`/`@{now}`/`@{-1}` that
+  appeared to be verifying "must be a syntactically valid index" **still went red, but for the
+  wrong reason** -- the non-digit characters participated in char arithmetic, producing a huge
+  value that was caught by an unrelated bounds check, not by the "must be digits" rule. A
+  deliberately constructed `wideranger@{A}` (writing 20 log entries first so that `'A'-'0'==17`
+  falls within the valid index range) was needed to get a genuinely discriminating case -- it had
+  to hit "this is a legitimate reflog depth" and still get rejected for "isn't a digit", rather
+  than being caught by a different guard instead.
+- **A false red**: the `master@{1}5` test did go red under the 2-commit fixture, but the reason
+  was that the root commit has no parent -- `@{1}5` got misparsed as `@{1}^5`, and looking for 5
+  levels of parent would naturally fail -- entirely unrelated to the rule "an invalid suffix must
+  be rejected"; it was coincidentally red on the same exit code. Only after extending the fixture
+  to 3 commits, separating "parses legitimately but not enough levels" from "invalid character" as
+  two distinct failure reasons, was it confirmed the latter was actually in effect. **Proving a
+  test can go red isn't enough -- it also has to be confirmed it goes red for the right reason.**
+- **Redundant defensive checks hide the real verification point**: `revparse.c` had two blocks of
+  checks that entirely duplicated existing code logic; deleting either one alone produced **zero
+  red tests**. They weren't an extra layer of safety net -- the defense underneath
+  (`parse_suffix_number`, `sg_reflog_at`) was already blocking the same input; the place that
+  actually deserves a mutation is the layer below, and mutating these two redundant checks would
+  never reveal anything. Both were deleted, rather than left in place creating the illusion that
+  "there's a guard here."
+- **Negative assertions each need their own directed mutation**: making `sg clone` also pass a
+  message for `origin/<branch>` (i.e. secretly starting to write that log) -> exactly 1 check went
+  red; removing `sg_ref_delete_under`'s tolerance of `ENOENT` on the log file's `unlink` -> 3 went
+  red (one of which was caught incidentally by an existing prefix-collision test). The `sg clone`
+  mutation deliberately only passed a message for the remote-tracking ref, not for the tag -- if
+  it indiscriminately passed a message for every ref, the tag would trigger the policy gate
+  (a policy-excluded ref_path given a non-NULL message returns -1 outright), failing the whole
+  clone -- that kind of red isn't "the negative assertion working", it's "clone crashed entirely",
+  which doesn't count as evidence.
+- **`logs/HEAD`'s line-count assertion**: initially compared the last line's content using
+  `tail -1`, but constructing a mutation that "mistakenly writes two identical lines" still passed
+  under `tail -1` -- the last line's content really is the same in both cases. Only additionally
+  asserting the **line count** (`wc -l`) can tell "should be one line" apart from "an extra line
+  got written."
+
+### Third cold read: the model change broke an invariant of `--abort`
+
+Segment two was handed off for a cold read, which caught a **high-severity issue that reproduced
+on its own**, directly caused by this change.
+
+`finish_rebase` is **two writes**: first advance the branch, then reattach HEAD. The branch
+restoration in `--abort` was removed, on the reasoning that "the branch was never touched
+throughout" -- that reasoning only holds if the whole rebase is atomic. If interrupted between
+those two writes (crash, SIGKILL, a transient I/O failure in `sg_ref_set_head`), the branch has
+already stopped at the post-rebase tip while `.git/sg-rebase/` is still present. At that point
+`sg rebase --abort` would:
+
+- restore the working directory to the tree **before the rebase**,
+- reattach HEAD to the branch (while the branch is **already** at the post-rebase tip),
+- delete the sequencer state, **exit 0**, and print "'topic' is back at <orig>".
+
+The three contradict each other, and it's a **false success**. No commit is permanently lost (the
+new tip is still reachable from the branch), but the tool lied. The old version of `--abort`
+unconditionally reset the branch back to `orig_head`, robust against any intermediate state; the
+new version depends on an invariant that this very path can itself break.
+
+The fix happened to need no trade-off: `--abort` was restored to unconditionally reset the branch,
+and **this doesn't affect the reflog shape** -- `sg_ref_update_branch` passes a NULL message, so it
+never writes a log line either way; the value doesn't change in the normal case either. The write
+order is "branch first (HEAD is still detached, so it doesn't mirror), then reattach HEAD."
+
+This scenario **can't be mutation-verified by reverting a line** (it's missing defense, not
+broken existing logic), but the interrupted state can be **constructed** for testing, and that's
+how interop was written. Removing the fix turns those two exactly red.
+
+Two more things came out of the same round:
+
+- **`<oid>` normalization was masking `onto`'s correctness.** The branch's finish line is the only
+  rebase message that embeds a full 40-hex, and before dual-track comparison, any 40-hex gets
+  replaced with `<oid>` -- so swapping `state->onto` for the new tip or `orig_head`, **the entire
+  phase18f group stays green.** The cold read specifically asked the primary conversation to
+  actually run this mutation to verify its prediction, and running it confirmed the prediction was
+  correct. A direct assertion bypassing normalization was added (plus a precondition check
+  confirming onto and the resulting tip actually differ, or that assertion itself would have no
+  discriminating power).
+- **The fast-forward path's interruption window had no marker at all.** The cold read claimed it
+  "self-heals on rerun", and measurement showed **this was wrong**: rerunning
+  `sg rebase <upstream>` gets rejected because HEAD is detached, and `--abort` says "no rebase in
+  progress" -- leaving only a confirmed `sg switch` as the way out. The normal path writes
+  sequencer state before touching anything; ff didn't. It now does too (purely to make that window
+  recoverable), deleted again at the finish.
+
+### The oracle's environment itself must be declared
+
+phase18f's `(continue)` group was entirely green locally, and **red on every CI runner** (both
+Linux and macOS). The diagnostic output added for this gave the answer directly, and it overturned
+the original assumption ("git changed the message between 2.54 and 2.55"): git's own track **wrote
+zero rebase log entries at all** -- not a different message, the rebase never completed at all.
+`git rebase --continue` needs to open an editor, and it fails without one.
+
+It passed locally because this machine's shell exports `GIT_EDITOR=true`.
+
+The lesson here isn't "you need to set GIT_EDITOR" -- it's that **the phrase "use real git as
+oracle" only holds when the oracle's execution environment is itself something the test suite
+decides.** That measurement was real, but it was obtained through a setting the test never
+declared, one that just happened to exist in the developer's shell. `interop.sh` now
+`export`s `GIT_EDITOR=true` itself, with the reason spelled out in a comment.
+
+Incidentally, the first attempt to simulate a "clean environment" while verifying this fix
+overcorrected -- it turned off the git config too, so git couldn't find a committer identity, and
+the entire suite ended at the first step, with empty output. **Empty output reads exactly like a
+pass**, and only actually looking at the line count reveals it.
+
+### Follow-up verification at wrap-up: the self-written reset assertion was also false coverage
+
+After merging, running back through the directed mutations for "negative assertions" (the
+remembered rule: assertions like "X was not done" can't be verified by a full revert) also found
+that **Phase 18's own newly added reset assertion was green with no discriminating power.**
+
+Disabling `move_head_to`'s detached branch (so that it still writes to `refs/heads/%s` even when
+detached, with `current_branch` being NULL, producing a branch literally named
+`refs/heads/(null)` and never touching HEAD at all), originally only **the four phase14 checks**
+went red -- none of the assertions newly written for this fix in phase12 and 18d went red at all.
+
+The reason was fixture degeneration: `p12r_base` tags `v1` on c1, and the case detaches at
+`HEAD~1` (= c1 = exactly v1) and then does `reset --mixed v1` -- **that's a no-op.** "HEAD moved
+to the target" still holds true on a setup where HEAD never actually moved at all. This is the
+third time this milestone has hit the same shape (the previous two were the tag and the scenario
+being offset by one, and the "tag moved away" case reverting the id for an unrelated reason).
+
+Changed to detach at c2 and reset to v1 (an actual move), plus two additions: a **precondition
+assertion** confirming the target differs from the starting point (or that assertion itself would
+have no discriminating power), and a check comparing **the full branch list** rather than just
+master -- writing to the wrong place doesn't necessarily hit an existing branch,
+`refs/heads/(null)` wouldn't. The same mutation now turns 7 red, with the new guard directly
+printing `refs/heads/(null)`.
+
+Also wrote the `tests/mutate.sh` usage pitfalls hit along the way into the script's comments: perl
+delimiters colliding with C syntax (`s{}{}` colliding with braces, `s!!!` colliding with `!=`),
+and **always adding `/g` when a literal occurs more than once.**
+
+### Not verifiable (recorded honestly)
+
+- Two malloc-failure branches (the OOM paths when `cmd_commit.c` and `cmd_switch.c` build reflog
+  message strings) -- this project has no malloc-failure injection mechanism, so confidence is
+  only from reading the code to confirm the corresponding `free` runs on the correct path.
+- Phase 14/16's switch gates are unobservable **along the reflog dimension**: those tests were
+  written before the reflog existed, only reading the exit code and the working directory/index
+  state; "a rejected switch wrote no reflog line at all" is currently guaranteed only by the call
+  ordering ("the gate runs before any side effect"), with no dedicated assertion.
+- The length-truncation branch of the path in `sg_ref_delete_under`'s log-file deletion path --
+  needs a branch name whose length lands exactly at the `SG_PATH_MAX` boundary, causing
+  `.../logs/...`'s extra 5 bytes over the ref path itself to overflow exactly; expensive to
+  construct, not added.
+- `sg push`'s suppression branch of rule 1 (no append when `old == new`) in the scenario where
+  "the local remote-tracking ref already equals the new value" -- no dedicated case distinguishes
+  "not written because it was suppressed" from "simply never called."
+- `sg fetch`'s fast-forward check's behavior in the edge case where "an object is missing partway
+  through new's ancestor chain": the current implementation conservatively labels it as a
+  forced-update (the direction the message lies in is safe -- it never mislabels a non-fast-forward
+  update as fast-forward), but no case constructing this scenario has been built.
+
+### One more thing worth noting
+
+`sg_ref_update` has a known limitation, documented in its own header comment: `sg_ref_read_path`
+collapses "ref doesn't exist" and "ref file is corrupt" into the same -1, so when an existing but
+corrupt ref is updated, its reflog entry records `old_id` as all-zero, making it look like this ref
+was just created, rather than "existed but couldn't be read." No third state was introduced for
+this scenario, keeping consistent with the project's existing convention of "-1 uniformly means
+failure."
+
+The final `tests/interop.sh` has 998 checks (909 at the end of Phase 16; the warm-up survey first
+added checks bringing it to 914, then batch A to 919, batch B to 944, batch C to 978, batch D
+wrapped up to 998); all 34 `make test` binaries pass (`tests/test_ref_update.c` and
+`tests/test_reflog_messages.c` were added; `tests/test_reflog.c` was already a file-layer test
+from Phase 15), `make sanitize` is clean, and the subcommand count grew from 23 to 24 (`sg reflog`
+added).
+
+## Phase 18: detached HEAD, and rebase's reflog shape
+
+Phase 17 left two items here (see items 2 and 5 under "Deliberate divergences" above). They look
+like two topics, but are actually one: real git's rebase replays entirely on a detached HEAD, so
+unless detached HEAD first becomes a state sg genuinely understands, rebase's reflog shape can
+never structurally line up.
+
+### Root cause: one -1 meaning two different things
+
+`sg_ref_resolve_head` returns -1 outright whenever `sg_ref_current_branch` returns NULL,
+collapsing "HEAD is detached" and "HEAD is unborn (repo just created, no commits yet)" into the
+same failure. **All 21 call sites read it as the latter** -- the header comment said so too.
+
+This isn't a problem that "would only happen once Phase 18 arrives." Real git can turn any sg repo
+into a detached one at any time (`git checkout --detach`), and in that state sg doesn't reject --
+it **silently answers wrong**:
+
+- `sg log` prints "fatal: your current branch does not have any commits yet", with a full intact
+  history sitting right underneath.
+- `sg status` treats HEAD's tree as empty, so a clean working directory gets reported as "every
+  tracked file is new."
+- `sg_safe_apply_tree` shares this same computation, so before `sg switch` overwrites the working
+  directory, it uses an empty tree to decide what it's about to overwrite.
+- `sg branch <name>` returns "the current branch has no commits yet" and refuses to create the
+  branch.
+- `sg stash push`/`pop` fail outright; and `sg_snapshot_create` would record the snapshot as a
+  **root commit** -- the safety net itself losing the parent link.
+
+The fix makes a detached HEAD actually resolve to its raw sha, leaving -1 to mean only "unborn."
+All 21 call sites were audited one by one; **none of them was using this failure as a detached
+guard**, so nobody lost a guard as a result; the three commands that genuinely need to reject
+detached (reset, rebase, push) check `sg_ref_current_branch`, unaffected.
+
+`sg_ref_head_is_detached` is deliberately three-state (1/0/-1): **"a broken HEAD" is not
+"detached."** This distinction has real consequences -- the "detached" answer is exactly what a
+caller uses to decide "I'm allowed to write a raw sha into HEAD"; treating broken as detached
+would launder a broken state into something that looks normal.
+
+### Why detach couldn't borrow `sg_ref_update(git_dir, "HEAD", ...)`
+
+When Phase 17 converged ref writing, `sg_ref_update` incidentally gained the ability to write a
+raw sha into HEAD (`ref_path_reflog_allowed` already permitted `"HEAD"`, and
+`write_ref_path_raw` treats ref_path uniformly). The survey therefore suggested using it directly,
+**which was wrong, and quietly wrong**: it reads old_id via `sg_ref_read_path`, and while HEAD is
+still `ref: refs/heads/<b>`, that hex parse necessarily fails, falling back to all-zero -- so
+"detaching from commit A to B" gets recorded as "B was created out of nowhere." Real git writes
+the commit being left, in that field (measured).
+
+So `sg_ref_set_head_detached` was added, with its old_id going through the **now-fixed**
+`sg_ref_resolve_head`, resolving both symbolic and raw-sha shapes. A directed mutation switched it
+back to `sg_ref_read_path`; only the "detach from a branch" assertion went red, while "detach from
+already-detached" stayed green -- because in the latter case HEAD is already a raw sha. The two
+tests each belong to a different source shape; missing either would leave this exact blind spot.
+
+### `at` or `from`: the label doesn't live in HEAD, it lives in the reflog
+
+`HEAD detached at <x>` / `from <x>`'s `<x>` is **not** the current HEAD, it's the original point of
+detachment, which can only be known by scanning `logs/HEAD`'s last `checkout: moving from ... to
+<y>` entry backward. The full rule as measured (git 2.55.0):
+
+- If the token `<y>` **still resolves to the same commit** now, use it; otherwise fall back to an
+  abbreviated id. So a tag that was moved, or an expression like `HEAD~1` that was never a ref to
+  begin with, both fall back to an id.
+- Strips the `refs/tags/` and `refs/remotes/` prefixes, **but not `refs/heads/`** -- git really
+  does print `HEAD detached at refs/heads/other`.
+- The literal token `"HEAD"` doesn't count (`sg switch --detach HEAD` prints the id). Using HEAD
+  to explain where HEAD is would carry no information anyway.
+- The line between `at` and `from` is a **value comparison**, not "did something happen":
+  `reset --hard` back to the detachment point turns it back into `at`.
+- When `logs/HEAD` has no checkout entry at all, git abandons this wording entirely and prints
+  `Not currently on any branch.` / `* (no branch)`.
+
+### The order of the finish steps lets two existing rules produce git's shape on their own
+
+Once rebase was switched to the detached model, the order of the two finishing steps became
+meaningful, and **required no special case at all**:
+
+1. **First**, update the branch. HEAD is still detached at this point, so `sg_ref_update`'s rule 2
+   (`is_current_branch`) is 0, and that line **does not** get mirrored into `logs/HEAD` -- the
+   branch ends up with exactly the one line it should have, `rebase (finish): <ref> onto <onto>`.
+2. **Then**, reattach HEAD to the branch. old == new (both are the final tip), and `logs/HEAD`
+   never applies no-op suppression (rule 1's asymmetry), so the `returning to` line still gets
+   written.
+
+Two rules already measured in Phase 17 produce exactly git's output once put in the right order.
+Swapping the two steps turns five checks red, including "the finish line has old == new."
+
+`--abort` therefore also became simpler: the branch was never touched throughout, so all that's
+needed is reattaching HEAD. Real git's branch log also gains zero lines after an abort, for
+exactly the same reason -- the value didn't change, and rule 1 suppresses it.
+
+### Scope was forced to change: `sg reset` had to support detached HEAD
+
+The scope agreed at the start of work was "merge / reset / a rebase started from detached all
+keep rejecting." That decision's premise was "detached can only ever be caused by the user or real
+git." Once segment two switched rebase to the detached model, that premise disappeared: **a
+paused rebase is now itself detached**, and rejecting detached in `reset` would directly remove
+"reset is allowed while a rebase is paused" -- a capability Phase 14 established and measured
+against real git, so 7 interop checks went red. Real git allows it for exactly the same reason:
+its own rebase is detached too.
+
+So `reset` was opened up, while `merge` and "a rebase started from detached" kept rejecting. Two
+existing tests that had pinned "reset must reject under detached" were **rewritten the other
+way** -- they were now wrong. Along the way, the ref write duplicated verbatim across reset's
+three modes was converged into `move_head_to`.
+
+This itself is a lesson: **a scope decision can get overturned by later implementation**, and what
+overturned it was an existing test going red, not someone remembering.
+
+### Caught by a cold read: three cases of "no assertion" rather than "wrong assertion"
+
+When segment one was handed off for a cold read, 18a-18d had already verified the HEAD file, both
+reflogs, refs, and the wording of `status` and `branch` -- **yet not a single one read `switch`'s
+own stdout.** Three divergences from real git lived exactly in that gap:
+
+1. `Previous HEAD position was ...` was tied to "switching to a branch," so detach->detach never
+   printed it at all. It actually belongs to "**leaving** detached HEAD." The rule got gotten
+   wrong again while fixing it -- real git only prints it when **the commit actually changes**;
+   all three same-commit combinations print nothing -- the new test caught it within a minute.
+2. `sg switch --detach HEAD` printed `HEAD detached at HEAD`.
+3. The description buffer was only 512 bytes; a longer ref name made the entire function fail, and
+   `status` rendered that failure as `Not currently on any branch.` -- telling a HEAD that is
+   clearly detached that it's "not on any branch" isn't less information, it's wrong information.
+
+All three are **missing assertions**, not wrong ones. This is the first time this project has
+clearly hit this category: every dimension the tests covered (file content, exit code, reflog) was
+correct, just missing an entire dimension (stdout).
+
+### False coverage: four caught this round
+
+1. **The label and the scenario offset by one**: the display test group used `sg commit` to move
+   HEAD, but at the time `sg commit` was still rejected under detached, so the commit never
+   happened, and every subsequent case shifted forward by one -- "at should become from" got
+   asserted backwards, **and all of it passed.** It was only noticeable because the helper printed
+   the compared string into the check's label. Switched to using git to move HEAD from then on:
+   this section tests wording, and shouldn't silently become a no-op just because sg's write
+   capability regressed.
+2. **Passing for an unrelated reason**: the "tag was moved away, so it falls back to an id" case --
+   the previous case happened to leave HEAD at the target commit, and git doesn't write to the
+   reflog for a "checkout that didn't move" -- so the detachment point was still the earlier
+   `HEAD~1` entry, and it fell back to an id because `HEAD~1` was never a ref to begin with. The
+   answer was correct, the reason was entirely unrelated, and deleting the guard under test still
+   passed.
+3. **`cmp` of two empty files succeeds**: the line count is now asserted before the dual-track
+   comparison, or a fixture that did nothing at all would report "a perfect match."
+4. **Never reaching the line under test**: push's detached/corrupt-message branch sits after the
+   remote ref advertisement; without a live remote it's never reached. The first version of the
+   assertion passed simply by failing earlier at "remote not configured." Removed and recorded in
+   the not-verifiable list below.
+
+Also, **a duplicated string can make a mutation lie**: `"rebase (start): checkout %s"` existed in
+two copies; a mutation without `/g` changed only the first copy, so "plain/continue/skip all stay
+green, only fast-forward goes red" looked like insufficient coverage, when actually the
+verification tool only changed half of it. Converged into one constant.
+
+### Tooling: `tests/mutate.sh`'s name goes into an mktemp template
+
+A mutation name containing `/` makes `mkdtemp` fail ("No such file or directory"). The script
+fails loudly (exit 1), but the error message looks like an environment problem rather than "your
+name is malformed" -- measured, this wasted two rounds before it was understood. Names are now
+filtered to safe characters first.
+
+### Deliberately maintained divergences
+
+- ~~**`sg merge` and "an `sg rebase` started from detached HEAD" still reject**~~ --
+  **allowed in Phase 19**, see the next section. The reasoning at the time still held: it was a
+  scope decision, not something impossible, so it was pinned with interop rather than left to
+  drift. Both the cost and the benefit of pinning it paid off in Phase 19: moving this boundary
+  meant deleting those two pinned checks, and that deletion itself broke a third one along the
+  way, precisely proving the drift they were originally guarding against was real.
+- **`sg status` doesn't have git's `interactive rebase in progress` line.** Measurement found
+  that real git prints "interactive" even without `-i` (from 2.26 onward, the merge backend reuses
+  the interactive machinery); sg has no `-i`, so copying it verbatim would be misleading.
+
+### Not verifiable (recorded honestly)
+
+- The branch of `sg_ref_detach_description` that falls back to an abbreviated id when the buffer
+  can't fit: the label length cap comes from `ref_path[SG_PATH_MAX]` (4096, and
+  `sg_rev_parse_ref_path` already returns -1 for a name that doesn't fit), plus
+  `"HEAD detached from "`, totaling 4116 bytes; both call sites' buffers are 4160 ->
+  **unreachable given the existing call sites.** Two independent rounds of cold reading each did
+  this same arithmetic separately. Not structurally dead code (it would trigger if a future third
+  call site ever passed a smaller buffer), so the guard is kept, but recorded honestly as
+  uncovered.
+- `cmd_push.c`'s detached/corrupt HEAD message branch: its HEAD check sits after the remote ref
+  advertisement, requiring a live remote to reach it. Changed, but no assertion.
+- **The check for "`--abort` doesn't touch the branch's reflog" is guaranteed by the rule, not by
+  a code choice guaranteeing it**: abort resets the branch back to the value it already had, and
+  rule 1's no-op suppression blocks any write, so changing abort's own code **has no mutation that
+  can turn it red** (one was tried). Kept as a regression guard for the shape, but it cannot be
+  taken as evidence that "abort chose not to write."
+- The interruption window itself, between `finish_rebase`'s two writes, and after detaching on the
+  fast-forward path, can't actually be triggered in a test (no fault-injection mechanism). The
+  approach was to **construct** the post-interruption disk state and then verify `--abort` can
+  recover it -- that covers the recovery logic, not the existence of the window.
+- phase18e's branch->detach case is ineffective coverage of the new "did the commit change" rule:
+  when HEAD starts from a branch, `have_prev_commit` is always 0, so that `memcmp` is never
+  reached at all. It's a regression guard for the refactor, not coverage of new logic -- the label
+  is written honestly.
+
+The final `tests/interop.sh` has 1098 checks (998 at the end of Phase 17), all 35 `make test`
+binaries pass (`tests/test_head_detach.c` added), `make sanitize` is clean, and the subcommand
+count stays at 24 (`sg switch` gained `--detach`).
 
 ---
 
-## Phase 19:merge 與 rebase 也接受 detached HEAD
+## Phase 19: merge and rebase now also accept detached HEAD
 
-Phase 18 把 detached HEAD 變成一等狀態,但刻意在三個指令前停住:merge、reset、
-rebase。reset 在 Phase 18 進行中就被自己的測試逼著放行了(暫停中的 rebase 變成
-detached,7 條既有 interop 因此紅)。剩下兩個是這一節。
+Phase 18 turned detached HEAD into a first-class state, but deliberately stopped short of three
+commands: merge, reset, rebase. reset was forced open by its own tests while Phase 18 was still in
+progress (a paused rebase became detached, turning 7 existing interop checks red). The remaining
+two are covered here.
 
-真 git 兩者都支援,所以這裡沒有設計自由度——目標行為完全由實測決定。
+Real git supports both, so there's no design freedom here at all -- the target behavior is
+entirely dictated by measurement.
 
-### 拿真 git 當 oracle:先量,再寫
+### Real git as oracle: measure first, then write
 
-開工第一件事是把兩個指令在 detached 下的全部行為量一遍(git 2.55.0),存成一張
-對照表:HEAD 檔案內容、`logs/HEAD` 追加了什麼、分支 reflog 追加了什麼、stdout
-逐字、以及 commit 物件的形狀。merge 四個場景(true merge / fast-forward /
-up-to-date / 衝突後 commit),rebase 五個(plain / 衝突後 continue / abort /
-up-to-date / fast-forward),每個都再跑一次**分支起手**的版本當對照組。
+The first thing done was measuring the entire behavior of both commands under detached (git
+2.55.0), storing it as a comparison table: HEAD file content, what got appended to `logs/HEAD`,
+what got appended to the branch's reflog, stdout verbatim, and the shape of the commit object.
+Four merge scenarios (true merge / fast-forward / up-to-date / commit after a conflict), five for
+rebase (plain / continue after a conflict / abort / up-to-date / fast-forward), each also run once
+more as a **branch-started** version to serve as the control.
 
-有對照組這件事是關鍵。單看 detached 的輸出無從判斷「這一行是本來就有的、還是
-detached 才有的」;並排之後,差異塌縮成很小的一張表:
+Having a control group is the key part. Looking at detached's output alone gives no way to tell
+"this line was there anyway" from "this line only appears under detached"; laid side by side, the
+differences collapse to a small table:
 
-| 面向 | 分支起手 | detached 起手 |
+| Aspect | Branch-started | Detached-started |
 |---|---|---|
-| rebase 成功訊息 | `...updated refs/heads/topic.` | `...updated detached HEAD.` |
+| rebase success message | `...updated refs/heads/topic.` | `...updated detached HEAD.` |
 | rebase up-to-date | `Current branch topic is up to date.` | `HEAD is up to date.` |
-| `logs/HEAD` 收尾行 | `rebase (finish): returning to refs/heads/topic` | **沒有** |
-| 分支 reflog 收尾行 | `rebase (finish): refs/heads/topic onto <onto>` | **沒有** |
-| `--abort` 的 log | `returning to refs/heads/topic` | `returning to <orig-head 40-hex>` |
-| 狀態檔 `head-name` | `refs/heads/topic` | 字面 `detached HEAD` |
-| `rebase (start)` / `(pick)` / `(continue)` | 逐字相同 | 逐字相同 |
+| `logs/HEAD` finishing line | `rebase (finish): returning to refs/heads/topic` | **none** |
+| branch reflog finishing line | `rebase (finish): refs/heads/topic onto <onto>` | **none** |
+| `--abort`'s log | `returning to refs/heads/topic` | `returning to <orig-head 40-hex>` |
+| state file `head-name` | `refs/heads/topic` | the literal `detached HEAD` |
+| `rebase (start)` / `(pick)` / `(continue)` | byte-identical | byte-identical |
 
-**踩到的第一個坑與程式無關**:git 預設用系統 locale 輸出,量到的是
-「更新 d42fa44..466da28」而不是 `Updating ...`。訊息字串一定要先鎖 `LC_ALL=C`
-再量,否則抄進測試的期望值在 CI 上必紅。這是 Phase 18 那條「oracle 的環境要自
-己宣告」的同一個教訓換一個面貌出現。
+**The first pitfall hit had nothing to do with the program**: git prints in the system locale by
+default, and what got measured was a translated line, not `Updating ...`. Message strings must
+always be measured with `LC_ALL=C` pinned first, or the expected values copied into the tests
+will be red on CI without fail. This is the same lesson from Phase 18's "the oracle's environment
+must be declared" showing up in a different guise.
 
-### 結構性的觀察:這不是特例,是退化
+### A structural observation: this isn't a special case, it's a degeneration
 
-把上表讀成「detached 要多寫七個特例」是錯的讀法。正確的讀法是:
+Reading the table above as "detached needs seven more special cases written" is the wrong
+reading. The correct reading is:
 
-Phase 18 的 `finish_rebase` 是兩步——先更新分支(HEAD 仍 detached,rule 2 不鏡
-射)、再接回 HEAD(old==new,但 `logs/HEAD` 不做 no-op 抑制)。**沒有分支的時候,
-這兩步各自沒有對象**:沒有分支要搬,也沒有 HEAD 要接回去(HEAD 從頭到尾就是
-detached,而且已經停在正確的 commit 上)。所以 `finish_rebase` 在
-`branch == NULL` 時整支 `return 0`,一個位元組都不寫——而真 git 量到的正是「什麼
-都沒寫」。
+Phase 18's `finish_rebase` is two steps -- first update the branch (HEAD is still detached, rule 2
+doesn't mirror it), then reattach HEAD (old==new, but `logs/HEAD` never applies no-op
+suppression). **When there's no branch, each of these two steps has no target**: there's no branch
+to move, and no HEAD to reattach (HEAD was detached the whole time, and has already stopped at
+the correct commit). So `finish_rebase` just `return 0`s entirely when `branch == NULL`, writing
+not a single byte -- and what real git measured out was exactly "wrote nothing at all."
 
-merge 同理:分支路徑是「更新分支 ref,rule 2 順便鏡射一行進 `logs/HEAD`」;
-detached 路徑是「直接寫 HEAD,它自己就記一行」。兩條路徑都只有一行 log,位置也
-都對,沒有任何一行是為了對齊 git 而特別寫的。
+merge works the same way: the branch path is "update the branch ref, and rule 2 incidentally
+mirrors a line into `logs/HEAD`"; the detached path is "write HEAD directly, which records a line
+by itself." Both paths end up with exactly one log line, in the right place, with not a single
+line written specifically to match git.
 
-這是 Phase 17 那兩條不對稱規則第二次當成**工具**而不是限制來用(第一次是 Phase
-18 的 `finish_rebase` 順序)。規則選得好的時候,新狀態不需要新規則。
+This is the second time the two asymmetric rules from Phase 17 were used as a **tool** rather than
+a constraint (the first was `finish_rebase`'s ordering in Phase 18). When a rule is well chosen, a
+new state doesn't need a new rule.
 
-### sentinel:磁碟上要說「這裡沒有分支」
+### A sentinel: the disk needs to say "there's no branch here"
 
-序列器狀態的 `orig_branch` 原本一定是分支名,`sg_rebase_state_read` 讀不到就判
-損壞。detached 起手需要表達「沒有分支」,而這個表達必須與「損壞」分得開。
+The sequencer state's `orig_branch` used to always be a branch name; `sg_rebase_state_read` judged
+it corrupt if it couldn't read one. Starting detached needs a way to express "no branch," and this
+expression must be kept separate from "corrupt."
 
-做法:記憶體用 `NULL`,磁碟寫字面字串 `detached HEAD`——與真 git 的
-`.git/rebase-merge/head-name` 同一個 sentinel。它撞不到真的分支名,因為
-`sg_ref_name_valid_for_create` 與真 git 的 check-ref-format 都拒絕含空白的 ref
-名,所以叫這個名字的分支根本建不出來。
+Approach: memory uses `NULL`; disk writes the literal string `detached HEAD` -- the same sentinel
+real git uses in `.git/rebase-merge/head-name`. It can't collide with a real branch name, because
+both `sg_ref_name_valid_for_create` and real git's check-ref-format reject a ref name containing
+whitespace, so a branch with this exact name can never be created at all.
 
-**刻意不採用的做法是「檔案不存在 = detached」。** 走到可以被 resume 的狀態時,
-rebase 一定寫過那個檔案,所以檔案不見了代表有東西把它弄掉了。把缺席讀成一個合
-法狀態,等於把資料遺失洗成正常運作——與 `sg_ref_head_is_detached` 堅持把損壞和
-detached 分開是同一條原則。缺席仍然回 -1,而且有一條專門的單元測試釘住。
+**Deliberately not adopted: "the file doesn't exist = detached."** By the time a rebase has
+reached a resumable state, it must have written that file, so a missing file means something
+removed it. Reading absence as a valid state would launder data loss into normal operation -- the
+same principle behind `sg_ref_head_is_detached` insisting on separating corrupt from detached.
+Absence still returns -1, and there's a dedicated unit test pinning this.
 
-### 兩個 bug,都是測試抓的,都不是移植錯誤
+### Two bugs, both caught by tests, neither a porting mistake
 
-**衝突合併在 detached 上 segfault。** `current_branch` 被原封不動傳進
-`sg_merge_trees` 當 `ours_label`,而那個 label 會被格式化進 `<<<<<<< %s` 衝突標
-記。NULL 進去就是崩潰,而且崩在使用者最容易走到的路徑上。修法是把「NULL → 
-`HEAD`」算成一個 `ours_label` 區域變數,衝突標記、merge 訊息本文、摘要行三處共
-用。副作用是 detached 時標記變成 `<<<<<<< HEAD`——正好就是真 git 一律用的字
-(sg 在分支上用分支名,那是既有分歧,phase4b 釘著,沒動)。
+**A conflicted merge segfaults under detached.** `current_branch` was passed unchanged into
+`sg_merge_trees` as `ours_label`, and that label gets formatted into the `<<<<<<< %s` conflict
+marker. NULL going in means a crash, and a crash on the path a user is most likely to hit. The
+fix computes "NULL -> `HEAD`" as an `ours_label` local variable, shared by the conflict marker, the
+merge message body, and the summary line. A side effect is the marker becomes `<<<<<<< HEAD` under
+detached -- exactly what real git always uses (sg uses the branch name on a branch, an existing
+divergence pinned by phase4b, untouched).
 
-**損壞 HEAD 被怪到工作目錄頭上。** merge 的「工作目錄要乾淨」閘門排在 HEAD 閘門
-之前,而比對工作目錄與 HEAD 本來就得先讀 HEAD;HEAD 壞掉時比對結果變成「每個檔
-案都是新增」,於是使用者被告知工作目錄髒——唯一沒問題的那部分被指控了。把 HEAD
-診斷移到最前面。**這是先前就存在的**,不是這次改出來的:在 Phase 19 之前 merge
-對損壞 HEAD 同樣印工作目錄髒,只是每個 detached HEAD 都在更早被拒絕,沒有測試
-走得到這個組合。
+**A corrupt HEAD gets blamed on the working directory.** merge's "the working directory must be
+clean" gate runs before the HEAD gate, and comparing the working directory to HEAD naturally
+requires reading HEAD first; with a broken HEAD, the comparison result becomes "every file is
+new," so the user is told the working directory is dirty -- the one part that's actually fine gets
+accused. The HEAD diagnostic was moved to the very front. **This is a pre-existing issue**, not
+introduced this time: before Phase 19, merge printed the same "working directory dirty" for a
+corrupt HEAD too; it's just that every detached HEAD was rejected earlier, so no test ever reached
+this combination.
 
-### 第三個 bug:整套綠燈之下的 `(null)`
+### The third bug: `(null)` hiding under an entirely green test suite
 
-冷讀在 `cmd_rebase.c` 的 fast-forward 捷徑找到最後一個沒守衛的 `current_branch`:
+The cold read found one last unguarded `current_branch` in `cmd_rebase.c`'s fast-forward
+shortcut:
 
 ```
 Fast-forwarded (null) to master.
 ```
 
-那條路徑**有**測試走到(phase19g 的 fast-forward 案例精確打中它),而且退出碼是
-0、ref 與 reflog 全部正確——因為測試把 stdout 丟進了 `/dev/null`。這個平台的
-`printf("%s", NULL)` 只印 `(null)` 不崩潰,所以三格 CI 都會靜默通過。
+That path **did** have a test reaching it (phase19g's fast-forward case hit it precisely), and the
+exit code was 0 with ref and reflog both correct -- because the test discarded stdout to
+`/dev/null`. On this platform, `printf("%s", NULL)` just prints `(null)` without crashing, so all
+three CI cells pass silently.
 
-缺的不是一條檢查,是**一整個維度**。18a–18d 曾經因為沒有任何一條讀 `switch` 的
-stdout 而漏掉三個分歧;這次一模一樣的形狀又出現一次,只是換到 rebase。現在這一
-批新增的每一句 detached 專屬訊息都有 stdout 斷言:merge 摘要行、rebase 成功
-行、fast-forward 行、abort 行。
+What's missing isn't one check, it's **an entire dimension.** 18a-18d once missed three
+divergences purely because not a single check read `switch`'s stdout; this exact same shape
+appeared again this time, just in rebase instead. Every newly added detached-specific message this
+round now has a stdout assertion: the merge summary line, rebase's success line, the
+fast-forward line, and the abort line.
 
-一個推論值得記下來:**「覆蓋率高」與「維度齊全」是兩回事**。Phase 19 對 HEAD 檔
-案、reflog、ref、commit 形狀、退出碼的斷言都很密,密到看起來不可能有洞——洞就
-在唯一沒人看的那一欄。
+One inference worth recording: **"high coverage" and "every dimension covered" are two different
+things.** Phase 19's assertions on the HEAD file, reflog, ref, commit shape, and exit code were all
+dense -- dense enough to look like there couldn't possibly be a hole -- and the hole was exactly in
+the one column nobody was looking at.
 
-### mutation 驗證:紅了還要紅得有道理
+### Mutation verification: going red isn't enough, it has to be red for the right reason
 
-七條定向 mutation,六條一次命中預測。第七條(`finish_rebase` 的 `if (0)`)**被
-抓到了,但理由是錯的**:NULL 分支往下走會在 `snprintf("refs/heads/%s")` 直接
-segfault,rebase 根本沒機會寫出多餘的 finish 行。那條專門驗「不寫 finish 行」的
-檢查因此**始終是綠的**——mutation 表面上成功,實際上什麼都沒驗到。
+Seven directed mutations, six matched the prediction on the first try. The seventh
+(`finish_rebase`'s `if (0)`) **was caught, but for the wrong reason**: taking the NULL branch
+segfaults directly at `snprintf("refs/heads/%s")`, so rebase never got the chance to write an
+extraneous finish line at all. The check specifically meant to verify "no finish line is written"
+was therefore **always green** -- the mutation looked successful on the surface but verified
+nothing at all.
 
-換成一條不會崩的 mutation(讓 `finish_rebase` 對 NULL 分支改寫一行假的
-`rebase (finish)` 進 `logs/HEAD`)之後,才真的紅在該紅的地方,失敗訊息是
-`no 'rebase (finish)' line is written when there is no branch (found 1)`。
+Switching to a mutation that doesn't crash (having `finish_rebase` write a fake
+`rebase (finish)` line into `logs/HEAD` for the NULL branch) actually turned it red for the right
+reason, with the failure message `no 'rebase (finish)' line is written when there is no branch
+(found 1)`.
 
-同樣的紀律也用在剛修好的 `(null)` bug 上:把 bug 種回去,恰好一條檢查變紅,而
-且失敗訊息逐字印出 `Fast-forwarded (null) to master.`。
+The same discipline was applied to the just-fixed `(null)` bug: replanting the bug turns exactly
+one check red, with the failure message printing `Fast-forwarded (null) to master.` verbatim.
 
-另外 sentinel 那條 mutation 值得單獨記:sentinel 收斂成單一常數之後,改掉它會讓
-**讀和寫同時改變**,round-trip 測試照樣綠——只有直接讀磁碟內容的那條斷言抓得到。
-這是 Phase 18「重複的字串會讓 mutation 說謊」的反面:常數只有一份的時候,能抓到
-它的必須是一條驗格式而不是驗自洽的斷言,那條斷言就是為此加的。
+One more mutation worth recording separately is the sentinel one: after the sentinel converged to
+a single constant, changing it makes **both the read and the write change together**, so the
+round-trip test stayed green -- only the assertion that directly reads the raw disk content
+catches it. This is the flip side of Phase 18's "a duplicated string can make a mutation lie":
+when there's only one copy of a constant, catching it requires an assertion that verifies the
+format rather than self-consistency, which is exactly why that assertion was added.
 
-### 順手收斂
+### Convergence done in passing
 
-`cmd_reset.c` 的 `move_head_to` 與 `cmd_commit.c` 的 inline 版本是同一段邏輯的
-兩份複本,merge 需要第三份。抽成 `sg_ref_move_head`(`include/sg/refs.h`)。
-分支與 detached 的二選一容易用同一種方式錯兩次,值得只有一個地方。
+`cmd_reset.c`'s `move_head_to` and `cmd_commit.c`'s inline version were two copies of the same
+logic, and merge needed a third. Extracted into `sg_ref_move_head` (`include/sg/refs.h`). The
+branch-vs-detached choice is easy to get wrong the same way twice, worth having in only one place.
 
-### 刻意維持的 divergence
+### Deliberately maintained divergences
 
-- **conflict marker 的 ours 標籤在分支上仍是分支名**,真 git 一律用 `HEAD`。
-  既有分歧,phase4b 釘著,Phase 19 沒有動它——只有 detached 時因為沒有分支可
-  用,才落到與 git 相同的 `HEAD`。
-- **`Fast-forwarded HEAD to <upstream>.` 等訊息是 sg 自己的措辭**,不是 git 的。
-  sg 在分支上本來就用自己的句子,detached 只是沿用同一套措辭,沒有理由只在這裡
-  改抄 git。
+- **The conflict marker's ours label is still the branch name on a branch**; real git always uses
+  `HEAD`. An existing divergence pinned by phase4b, untouched by Phase 19 -- only under detached,
+  where there's no branch to use, does it land on the same `HEAD` as git.
+- **Messages like `Fast-forwarded HEAD to <upstream>.` are sg's own wording**, not git's. sg
+  already used its own sentences on a branch; detached just reuses the same wording, with no
+  reason to copy git verbatim only here.
 
-  冷讀時被問過一次:五句 detached 訊息裡,為什麼只有
-  `Successfully rebased and updated detached HEAD onto '%s'.` 講了 "detached",
-  其餘四句都只說 `HEAD`?看起來像不一致,實際上規則是**逐句對照 git**:
-  `HEAD is up to date.` 與 `...updated detached HEAD` 都是 git 的原句照抄(git
-  自己就是一句說 detached、一句不說);另外三句 git 根本沒有對應輸出,是 sg 自
-  己的句子,那裡用 `HEAD` 就夠——沒有分支名這件事本身已經傳達了 detached。
-  統一成同一個詞會讓前兩句離開 oracle,那個代價比表面的一致性大。
+  This was asked about once during a cold read: of the five detached messages, why does only
+  `Successfully rebased and updated detached HEAD onto '%s'.` say "detached," while the other four
+  only say `HEAD`? It looks inconsistent, but the actual rule is **matched sentence-by-sentence
+  against git**: `HEAD is up to date.` and `...updated detached HEAD` are both copied verbatim from
+  git's own sentences (git itself says "detached" in one and not the other); the other three have
+  no corresponding output from git at all -- they're sg's own sentences, where `HEAD` alone is
+  enough, since the absence of a branch name already conveys "detached." Unifying them into the
+  same wording would take the first two out of alignment with the oracle -- a cost bigger than
+  surface-level consistency.
 
-### 無法驗證(如實記錄)
+### Not verifiable (recorded honestly)
 
-- **detached 起手的 rebase 在「寫完 state、還沒 detach HEAD」之間被中斷**時的可
-  恢復性沒有測試覆蓋。shell 沒辦法精準砍在那個點,而 Phase 18 用的替代手法(製
-  造中斷後的磁碟狀態再驗 `--abort`)在這裡沒有對應物,因為 detached 路徑的
-  `finish_rebase` 什麼都不寫、根本沒有「兩次寫入之間」那個窗口可以製造。邏輯上
-  自洽(冷讀逐行追過),但只有人工推理背書。
-- **`sg_ref_branch_name_is_safe` 不拒絕空白字元**,所以手動把
-  `.git/sg-rebase/orig-branch` 改成 `Detached HEAD`(大小寫不同)會被當成合法分
-  支名,而不是判成損壞。只有直接竄改磁碟才碰得到,不經任何 `sg` 指令可達;那支
-  函式的用途本來就是路徑安全而非完整驗證。不是 Phase 19 的迴歸,但 sentinel 機
-  制新增了一個依賴它不誤判的地方,記著。
-- **`sg merge --abort` 在 detached 下**現在有 interop 覆蓋(phase19c),但它從來
-  就沒有 detached 閘門——先前它在理論上可達、實際上沒有任何測試走過。
+- **Recoverability if a detached-started rebase is interrupted between "state finished writing"
+  and "HEAD not yet detached"** has no test coverage. A shell can't precisely kill it at that
+  exact point, and Phase 18's substitute technique (constructing the post-interruption disk state
+  and verifying `--abort` recovers it) has no counterpart here, because the detached path's
+  `finish_rebase` writes nothing at all -- there's no "between two writes" window to construct in
+  the first place. Logically self-consistent (traced line by line during a cold read), but backed
+  only by manual reasoning.
+- **`sg_ref_branch_name_is_safe` doesn't reject whitespace**, so manually editing
+  `.git/sg-rebase/orig-branch` to `Detached HEAD` (different capitalization) would be treated as a
+  legitimate branch name rather than judged corrupt. Only reachable by directly tampering with the
+  disk, unreachable through any `sg` command; that function's purpose was always path safety, not
+  full validation. Not a regression from Phase 19, but the sentinel mechanism added a new place
+  that depends on it not misjudging -- noted.
+- **`sg merge --abort` under detached** now has interop coverage (phase19c), but it never had a
+  detached gate to begin with -- previously it was theoretically reachable but no test ever
+  exercised it.
 
-最終 `tests/interop.sh` 1165 項檢查(Phase 18 結束時是 1098),`make test` 35 支
-二進位全過,`make sanitize` 乾淨,子指令維持 24 個。
+The final `tests/interop.sh` has 1165 checks (1098 at the end of Phase 18), all 35 `make test`
+binaries pass, `make sanitize` is clean, and the subcommand count stays at 24.
 
 ---
 
-## Phase 20:`sg stash` 的 `-u`/`-a`/`--keep-index`/`--index`,以及放寬 apply/pop 的乾淨閘門
+## Phase 20: `sg stash`'s `-u`/`-a`/`--keep-index`/`--index`, and relaxing apply/pop's clean gate
 
-Phase 15 把 `sg stash` 縮到核心子集,README 當時列出的未實作清單裡有四樣:
-`-u`(未追蹤檔案)、`--index`、`--keep-index`、pathspec。這一階段做了前三個,
-`sg_stash_push` 也從一串位置參數改成吃 `sg_stash_push_opts`
-(`include/sg/stash.h`)。**刻意不做**:`stash show`、pathspec、任何 `sg diff`
-改動——`show` 需要 tree-vs-tree diff 與 `--stat`,那是下一批的範圍,這裡不碰。
+Phase 15 shrank `sg stash` down to a core subset; the README at the time listed four unimplemented
+items: `-u` (untracked files), `--index`, `--keep-index`, and pathspec. This phase does the first
+three; `sg_stash_push` also switched from a run of positional arguments to accepting
+`sg_stash_push_opts` (`include/sg/stash.h`). **Deliberately not done**: `stash show`, pathspec, or
+any `sg diff` changes -- `show` needs tree-vs-tree diff and `--stat`, which is scope for the next
+batch and untouched here.
 
-### `--keep-index`:换掉 reset 的目標 tree,不是換一條新路徑
+### `--keep-index`: swap the target tree of the reset, not a whole new code path
 
-真 git 的 `--keep-index` 把工作目錄重設到**目前的 index**而不是 HEAD,index 本
-身原封不動。量法是五狀態 fixture(unstaged-modify / staged-modify / staged-new
-/ staged-delete / worktree-delete),`staged-delete` 那一格是唯一與其他四格反方
-向移動的,所以兩個方向都各釘一條斷言。
+Real git's `--keep-index` resets the working directory to **the current index** rather than HEAD,
+leaving the index itself untouched. This was measured with a five-state fixture
+(unstaged-modify / staged-modify / staged-new / staged-delete / worktree-delete); `staged-delete`
+is the one cell that moves in the opposite direction from the other four, so both directions each
+got their own assertion.
 
-實作是**串接兩次 `sg_apply_tree_to_workdir`**(先重設到 HEAD,再套用 index 的
-tree),不是直接把它指向 index tree 的單次呼叫。單次呼叫看起來等價、描述的也是
-同一個終態,但 `sg_apply_tree_to_workdir` 判斷「要不要刪掉工作目錄上的某個檔
-案」是看**呼叫當下讀到的 index**列不列它,而一個被 staged 為刪除的路徑,兩邊的
-index(呼叫當下的、以及目標 index tree)都不會列它,單次呼叫因此讓它在磁碟上原
-封不動地留著。串接讓第二次呼叫的基準是 HEAD 的 tree(它會列出這個路徑),第一
-次就把它刪乾淨。這也是真 git 自己實作這個旗標的方式。
+The implementation is **two chained calls to `sg_apply_tree_to_workdir`** (first reset to HEAD,
+then apply the index's tree), not a single call pointed directly at the index tree. A single call
+looks equivalent and describes the same final state, but `sg_apply_tree_to_workdir` decides
+"should this file on the working directory be deleted" by whether **the index read at the moment
+of the call** lists it, and a path staged as a deletion isn't listed by either index (the one at
+call time, or the target index tree), so a single call would leave it sitting on disk untouched.
+Chaining makes the second call's baseline HEAD's tree (which does list this path), so the first
+call cleans it out. This is also how real git itself implements this flag.
 
-### `-u`/`-a`:第三個 parent,而且是無條件寫的
+### `-u`/`-a`: a third parent, and it's written unconditionally
 
-未追蹤檔案的列舉從 `cmd_status.c` 的 `collect_untracked` 搬進
-`workdir/status.c`,改名 `sg_status_list_untracked`,加一個 `include_ignored`
-開關(status 與 `-u` 傳 0,`-a` 傳 1),回傳值改成排序過的——`sg_tree_build` 的
-扁平清單合約要求排序輸入,第一版直接餵 `readdir` 順序進去,錯了。建對應 tree 的
-`sg_tree_build_from_untracked` 加進 `tree_build.h`,與另兩支建 tree 的函式並列。
+The enumeration of untracked files was moved from `cmd_status.c`'s `collect_untracked` into
+`workdir/status.c`, renamed `sg_status_list_untracked`, with an `include_ignored` switch added
+(status and `-u` pass 0, `-a` passes 1), and its return value changed to be sorted --
+`sg_tree_build`'s flat-list contract requires sorted input, and the first version fed it
+`readdir`'s order directly, which was wrong. `sg_tree_build_from_untracked`, which builds the
+corresponding tree, was added to `tree_build.h` alongside the other two tree-building functions.
 
-拿真 git 2.55.0 量出來的規則:
+Rules measured against real git 2.55.0:
 
-- stash commit 長出第三個 parent:一個**沒有自己 parent 的 root commit**,tree
-  只放未追蹤檔案(`-a` 連 ignored 的也放)。**stash 自己的 tree(第一個
-  parent)與不帶 `-u` 時逐位元組相同**——這件事單看 `-u` 的輸出看不出來,是並排
-  跑一次不帶旗標的對照組,兩邊的 tree id 相減出來塌縮成的結論。
-- 只要有東西要 stash,第三個 parent 就**無條件建立**,即使未追蹤清單是空的
-  (寫一個空 tree)。「清單空就退回兩個 parent」的最佳化會讓寫出來的物件與真
-  git 不一致——真 git 就是寫了那個空 tree。
-- `-m` 不影響第二、三個 parent 的 subject,只動第一個。
-- `-u`/`-a` 下,「沒東西可存」的判斷也要看未追蹤清單(用第三個 parent 會用的同
-  一套過濾規則過濾過):工作目錄除了一個未追蹤檔案以外全乾淨,在純 `push` 下算
-  nothing-to-save,在 `-u`/`-a` 下**不算**。
-- 拿掉已收進第三個 parent 的檔案之後,`-u` 刪掉留下的空目錄,但**跳過被
-  ignore 的空目錄**;`-a` 兩者都刪(因為 `-a` 本來就把 ignored 檔案一起收
-  走,留下的空目錄不會再有 ignore 規則想保護的東西)。這個修剪步驟
-  **開 ignore engine 的時間點在拿檔案之前,不是之後**:`.gitignore` 自己通
-  常是未追蹤的,`-u` 會把它一起掃走,若修剪階段晚一步才開 ignore engine,
-  看到的就是空規則、於是連本該保留的 ignored 空目錄都刪了。單元 fixture 讓
-  `.gitignore` 保持未追蹤,才蓋得到這條;interop fixture 先 commit 了它,只
-  蓋得到守衛本身存在,蓋不到這個時序死角。
+- The stash commit grows a third parent: a **root commit with no parent of its own**, whose tree
+  holds only untracked files (`-a` includes ignored ones too). **The stash's own tree (the first
+  parent) is byte-for-byte identical to when `-u` isn't given** -- this can't be seen from `-u`'s
+  output alone; it's a conclusion that only collapses out from diffing the tree id against a
+  control run without the flag, side by side.
+- As long as there's anything to stash, the third parent is **created unconditionally**, even if
+  the untracked list is empty (an empty tree gets written). An optimization of "fall back to two
+  parents when the list is empty" would produce objects that don't match real git -- real git
+  really does write that empty tree.
+- `-m` doesn't affect the second and third parents' subjects, only the first.
+- Under `-u`/`-a`, the "nothing to save" determination must also look at the untracked list
+  (filtered through the same filtering rules the third parent uses): if the working directory is
+  clean except for one untracked file, that counts as nothing-to-save under plain `push`, but
+  **doesn't** under `-u`/`-a`.
+- After removing the files already gathered into the third parent, `-u` deletes the empty
+  directories left behind, but **skips empty directories that are themselves ignored**; `-a`
+  deletes both (since `-a` already gathered up ignored files together, there's nothing left in the
+  emptied directory that any ignore rule would want to protect). This pruning step's ignore
+  engine is opened **before fetching the files, not after**: `.gitignore` itself is usually
+  untracked, and `-u` would sweep it up too; if the pruning stage opened the ignore engine one step
+  too late, it would see an empty rule set and end up deleting even the ignored empty directories
+  that should have been kept. Only a unit fixture that keeps `.gitignore` untracked covers this;
+  the interop fixture had already committed it, covering only the guard's existence, not this
+  timing blind spot.
 
-### apply/pop:從「工作目錄必須全乾淨」收窄成「被動到的路徑不能髒」
+### apply/pop: narrowed from "the entire working directory must be clean" to "paths actually
+touched can't be dirty"
 
-舊的乾淨閘門是整個工作目錄與 index 都得跟 HEAD 一致。新規則
-(`sg_stash_apply_check_dirty`)只看這次 merge(base = stash 第一個 parent的
-tree、ours = HEAD tree、theirs = stash 的 tree)**實際會動到的路徑**:
+The old clean gate required the entire working directory and index to match HEAD. The new rule
+(`sg_stash_apply_check_dirty`) only looks at **the paths this merge will actually touch** (base =
+the stash's first parent's tree, ours = HEAD's tree, theirs = the stash's tree):
 
-- 該路徑在工作目錄裡的內容與 HEAD 不同 → 擋(含「內容碰巧與 stash 要寫的完全
-  相同」這格——判斷式看的是「是否偏離 HEAD」,不是「是否偏離 stash」);
-- 該路徑在 index 裡已經偏離 HEAD → 擋;
-- 該路徑在工作目錄裡**被刪掉了** → **不擋**(沒有東西會被覆寫);
-- 沒被這次 merge 碰到的路徑,不論多髒都不看。
+- the path's content in the working directory differs from HEAD -> blocked (including the case
+  where "the content happens to be identical to what the stash would write" -- the check is
+  "does it deviate from HEAD," not "does it deviate from the stash");
+- the path in the index already deviates from HEAD -> blocked;
+- the path **was deleted** from the working directory -> **not blocked** (nothing would be
+  overwritten);
+- paths this merge never touches aren't looked at at all, no matter how dirty.
 
-這條規則本身依賴 `sg_merge_result_apply` 的一項改動(見下一節)才能兌現「沒碰到
-的路徑維持原樣」的承諾。
+This rule by itself depends on a change to `sg_merge_result_apply` (see the next section) to honor
+its promise that "untouched paths stay exactly as they are."
 
-### 兩處刻意與真 git 分歧
+### Two deliberate divergences from real git
 
-1. **`-u` 的 pop 碰撞**:真 git 遇到未追蹤半邊撞车時,已追蹤半邊照樣套用,未
-   追蹤半邊逐檔失敗,把 entry 留在堆疊上——留下一個「entry 還在,但它要還原
-   的檔案已經在磁碟上跟自己打架」的無出口狀態(再 pop 一次照樣撞)。sg 把未
-   追蹤半邊的碰撞併進既有的事前檢查(已經同時涵蓋已追蹤與 `-u`/`-a` 未追蹤兩
-   邊),整個 apply 全有全無地拒絕——安全,代價是不比照真 git 的部分套用。
-2. **dirty apply 撞到 staged 改動**:真 git 的 `ours` 是 index,所以能把
-   stash 三方合併進一個已經 staged 的改動(可能合出衝突);sg 的 `ours` 是
-   HEAD,若在這裡放行,會直接把已 staged 的內容輾掉,所以 sg 拒絕——嚴格安全
-   的一側,代價是不比照真 git 這一格的寬鬆行為。
+1. **`-u`'s pop collision**: when real git hits a collision on the untracked half, the tracked
+   half still gets applied while the untracked half fails file by file, leaving the entry on the
+   stack -- leaving behind a state with no way out, "the entry is still there, but the file it
+   would restore is already fighting with itself on disk" (popping again hits the same collision
+   again). sg folds the untracked half's collision check into the existing pre-check (which already
+   covers both the tracked half and the `-u`/`-a` untracked half), rejecting the whole apply
+   all-or-nothing -- safe, at the cost of not matching real git's partial application.
+2. **A dirty apply colliding with staged changes**: real git's `ours` is the index, so it can
+   three-way merge the stash into an already-staged change (potentially producing a conflict); sg's
+   `ours` is HEAD, and allowing this here would directly overwrite already-staged content, so sg
+   rejects it -- the strictly safe side, at the cost of not matching real git's leniency in this
+   cell.
 
-### `sg_merge_result_apply` 的改動:本階段影響面最大的一處
+### The change to `sg_merge_result_apply`: this phase's single widest-reaching change
 
-它原本對 `sg_merge_trees` 的每個 clean 條目無條件寫回工作目錄。只要「工作目錄
-必須乾淨」還是硬性前提,這個無條件寫回是不可見的——寫回去的內容與磁碟上原本的
-逐位元組相同。放行髒工作目錄的那一刻,它就從無害變成破壞性:會把使用者留在磁
-碟上、跟這次 merge 無關的髒內容原地輾掉。
+It used to unconditionally write every clean entry from `sg_merge_trees` back to the working
+directory. As long as "the working directory must be clean" remained a hard precondition, this
+unconditional write-back was invisible -- the content written back was byte-for-byte identical to
+what was already on disk. The moment a dirty working directory is allowed through, it turns from
+harmless into destructive: it would overwrite, in place, dirty content on disk that has nothing
+to do with this merge.
 
-現在的規則是:跳過「結果與 ours(HEAD)相同」的條目,不重讀物件、不重寫磁碟。
-「是否碰到 ours」導出成獨立函式 `sg_merge_entry_touches_ours`
-(`include/sg/merge.h`),讓 stash 的 index 收尾規則(下段)與 merge/rebase 的
-工作目錄規則吃同一份定義——兩份獨立實作的漂移方向正好是「閘門放行了某條路
-徑,收尾邏輯卻把它輾掉」,只有一份定義才不會分岔。
+The rule now is: skip entries whose result equals ours (HEAD), without re-reading the object or
+rewriting the disk. "Whether it touches ours" was factored out into a standalone function,
+`sg_merge_entry_touches_ours` (`include/sg/merge.h`), so stash's index-finishing rule (next
+paragraph) and merge/rebase's working-directory rule share the same definition -- the direction
+two independent implementations would drift is exactly "the gate let a path through, but the
+finishing logic overwrites it anyway," and only one shared definition prevents that divergence.
 
-**`add_resolved_entry` 仍然無條件執行**,不受這條跳過規則影響:`cmd_merge.c`
-與 `cmd_rebase.c` 都是拿這支函式建出來的 in-memory index 去建 commit 的
-tree,少一個路徑就等於 commit 少一個檔案——這是 index 半邊,`sg_merge_entry_touches_ours`
-管的是工作目錄半邊要不要動筆,兩者不是同一件事。
+**`add_resolved_entry` still runs unconditionally**, unaffected by this skip rule: both
+`cmd_merge.c` and `cmd_rebase.c` build the commit's tree from the in-memory index this function
+constructs, so a missing path means a missing file in the commit -- this is the index half;
+`sg_merge_entry_touches_ours` governs whether the working-directory half gets written to; the two
+aren't the same thing.
 
-順帶兩個效果:`sg merge`/`sg rebase` 不再每次重寫整棵工作樹(含重組 chunk 過的
-大檔案),變成只碰真的有變動的路徑;而且「兩側都刪除同一路徑」的情況不再無聲
-`unlink` 掉一個剛好同名的未追蹤檔案(舊版是無條件對每個「刪除」結果呼叫刪
-除,不管磁碟上那個路徑到底是什麼)。
+Two side effects worth noting: `sg merge`/`sg rebase` no longer rewrite the entire working tree
+every time (including reassembling chunked large files), only touching paths that actually
+changed; and the case "both sides delete the same path" no longer silently `unlink`s an unrelated
+untracked file that happens to share the name (the old version unconditionally called delete for
+every "deleted" result, regardless of what that path on disk actually was).
 
-Index 半邊需要**另外陳述同一條規則**:一個 stage-0 條目,如果它的路徑 HEAD 從
-來沒有、這次 merge 也沒碰到,merge 結果裡沒有對應的 entry 可以把它接住,舊版
-會讓它悄悄從 index 掉出去(變成 unstaged)。stash 的 apply/pop 走的是自己一段
-專門對「沒被碰到的路徑」做第二輪掃描(對 pre-apply 的 index)來補回這個保證,
-而不是指望 `sg_merge_result_apply` 自己處理——它輸入是 `sg_merge_trees` 的結
-果,壓根不知道呼叫端之前的 index 長什麼樣。
+The index half needs **the same rule stated separately**: for a stage-0 entry whose path HEAD
+never had and this merge never touched, if the merge result has no corresponding entry to catch
+it, the old version would let it silently fall out of the index (becoming unstaged). stash's
+apply/pop route around this with their own dedicated second scan (over the pre-apply index) for
+"paths that weren't touched," restoring this guarantee, rather than relying on
+`sg_merge_result_apply` to handle it itself -- its input is `sg_merge_trees`'s result, and it has
+no idea what the caller's prior index looked like at all.
 
-### 這一輪的教訓
+### Lessons from this round
 
-- **oracle 只給終態,不給機制**。`--keep-index` 量到的五種檔案狀態完美對應
-  「把工作目錄重設到 index tree」,規格因此寫成「只要換一個參數」。實作時去
-  查 `sg_apply_tree_to_workdir` 的刪除迴圈才發現它是拿**呼叫當下讀到的
-  index**減去目標 tree——staged-delete 的路徑兩邊都不在,迴圈根本不會考慮
-  它,檔案會原地留著,正好跟量到的那一格反過來。正解是前面寫的串接兩次呼叫,
-  也是真 git 自己的實作方式。
-- **一個測試可以「被 mutation 抓到卻什麼都沒驗到」**。把
-  `remove_untracked_files` 改成無條件失敗,有兩個測試變紅——但紅的原因是
-  `-u push failed`,也就是**setup 本身壞了**,不是在驗 `-2` 這個回傳值的語
-  意。新測試因此改成斷言「回傳值恰好是 `-2`」,而不是「非 0」。
-- **一個死角需要「守衛唯一存在的理由」那種 fixture 才照得出來**。
-  `prune_empty_untracked_dirs` 的 ignore 守衛拿掉之後,`make test` 與 interop
-  全過——因為兩邊 fixture 裡都沒有一個「本身被 ignore、而且是空的」目錄。補上
-  之後,那個 fixture 還順帶照出一個真 bug:`.gitignore` 本身常常是未追蹤的,
-  `-u` 會連它一起掃走,而修剪階段的 ignore engine 若在那之後才開,就看不到任
-  何 ignore 規則了(細節見上面 `-u`/`-a` 那節)。
-- **`make test` 在第一個失敗的二進位就停**,看 mutation 結果要注意某支測試可
-  能根本沒跑到——本階段實際踩到:`test_merge_result_apply` 失敗導致
-  `test_stash` 沒有執行,乍看之下像是 stash 沒有回歸,其實是它從沒被問過。
-- **改動 merge/rebase/stash 共用的落地路徑時,`make test` 綠不算數**。實測:
-  把 `add_resolved_entry` 也跟著跳過(誤把 index 半邊的規則等同工作目錄半邊)
-  之後,`make test` 一條都沒紅,但 10 條 interop 檢查變紅(多數是 rebase 的
-  phase4c / 17 / 18f / 19a)——本專案這條「interop 才抓得到 merge/rebase 回
-  歸」的紀律,這次踩實了。
+- **The oracle gives an end state, not a mechanism.** The five file states measured for
+  `--keep-index` mapped perfectly onto "reset the working directory to the index's tree," so the
+  spec was written as "just swap one parameter." Only during implementation, checking
+  `sg_apply_tree_to_workdir`'s deletion loop, was it found that it computes **the index read at
+  call time** minus the target tree -- staged-delete's path isn't in either index, so the loop
+  never considers it at all, and the file stays put -- exactly the opposite of what was measured
+  for that cell. The correct fix is the two chained calls described above, also how real git
+  itself implements it.
+- **A test can be "caught by a mutation while verifying nothing at all."** Making
+  `remove_untracked_files` fail unconditionally turned two tests red -- but the reason was
+  `-u push failed`, i.e. **the setup itself broke**, not that the semantics of the `-2` return
+  value were being verified. The new test was therefore changed to assert "the return value is
+  exactly `-2`," not "non-zero."
+- **A blind spot needs a fixture that is the guard's sole reason for existing to reveal it.**
+  Removing `prune_empty_untracked_dirs`'s ignore guard, both `make test` and interop stayed all
+  green -- because neither fixture had a directory that was both **ignored and empty**. Adding one
+  also incidentally revealed a real bug: `.gitignore` itself is often untracked, `-u` would sweep
+  it up too, and if the pruning stage's ignore engine opened after that, it would see no ignore
+  rules at all (details in the `-u`/`-a` section above).
+- **`make test` stops at the first failing binary**, so a mutation result can hide a test that
+  never even ran -- actually hit this phase: `test_merge_result_apply` failing prevented
+  `test_stash` from running at all, which at a glance looked like stash had no regression, when
+  really it was never even asked.
+- **When changing the landing path shared by merge/rebase/stash, `make test` green doesn't
+  count.** Measured: after making `add_resolved_entry` skip along too (mistakenly treating the
+  index-half rule as the same as the working-directory-half rule), not a single `make test` check
+  went red, but 10 interop checks did (mostly rebase's phase4c / 17 / 18f / 19a) -- this
+  project's rule that "only interop catches merge/rebase regressions" held up firmly again.
 
-### 本階段刻意不修、留給後續的兩件事
+### Two things deliberately not fixed this phase, left for later
 
-1. **`sg_tree_build_from_workdir` 無法表示工作目錄裡的刪除**。對「已追蹤但工
-   作目錄裡已經不見了」的檔案,它會退回用 index 裡的 blob
-   (`include/sg/tree_build.h` 的標頭註解寫明這是刻意的,為了讓「每個條目都
-   解析得出來」這個合約成立)。後果:`sg stash push` 在只有一個已追蹤檔案被
-   刪除、其餘乾淨時會印「No local changes to save」、不建 stash;真 git 會
-   把刪除本身記進 stash 的 tree,pop 之後檔案維持刪除狀態(已實測驗證這個
-   分歧)。它有兩個呼叫端——`stash push` 與 `snapshot`——而對 snapshot 來
-   說那個 fallback 正是對的(安全網要能還原一切,包括「回到刪除之前」)。修
-   法必須讓兩個呼叫端拿到不同行為,這是設計決定,不是補丁,留給下一批。
-2. **`restore_untracked_flat` 用裸 `snprintf` 組路徑,不檢查截斷**。它的路徑
-   來自 stash 的第三個 parent 的 tree,那棵 tree 可能是真 git 寫的,不受
-   `sg_status_list_untracked` 內部 `path_join` 的截斷保護。但既有的
-   `sg_apply_tree_to_workdir` 對已追蹤那半邊用的**是完全相同的裸
-   `snprintf`**,所以這是專案既有的一致做法(雖然不安全),只補這一支會變成
-   「一類缺口只補了一半」。要修就整批一起修,不要在這裡先開一個特例。
+1. **`sg_tree_build_from_workdir` can't represent a deletion in the working directory.** For a
+   tracked file that's now missing from the working directory, it falls back to the blob in the
+   index (`include/sg/tree_build.h`'s header comment states this is deliberate, to uphold the
+   contract that "every entry resolves successfully"). Consequence: `sg stash push` with only one
+   tracked file deleted and everything else clean prints "No local changes to save" and creates no
+   stash; real git records the deletion itself into the stash's tree, and the file stays deleted
+   after popping (this divergence has been measured and confirmed). It has two call sites --
+   `stash push` and `snapshot` -- and for snapshot, that fallback is actually correct (a safety net
+   needs to be able to restore everything, including "back to before the deletion"). A fix must
+   give the two call sites different behavior, which is a design decision, not a patch, left for
+   the next batch.
+2. **`restore_untracked_flat` builds paths with a raw `snprintf`, with no truncation check.** Its
+   paths come from the stash's third parent's tree, which may have been written by real git and
+   isn't protected by `sg_status_list_untracked`'s internal `path_join` truncation guard. But the
+   existing `sg_apply_tree_to_workdir` uses **the exact same raw `snprintf`** for the tracked half,
+   so this is an existing project-wide practice (though unsafe); patching only this one function
+   would become "a class of gap only half-fixed." If it's going to be fixed, fix the whole class at
+   once, don't open a special case here first.
 
-最終 `tests/interop.sh` 1247 項檢查(Phase 19 結束時是 1165),`make test` 37
-支二進位全過(新增 `tests/test_status_untracked.c`、
-`tests/test_merge_result_apply.c`),`make sanitize` 乾淨,子指令維持 24 個。
+The final `tests/interop.sh` has 1247 checks (1165 at the end of Phase 19), all 37 `make test`
+binaries pass (`tests/test_status_untracked.c` and `tests/test_merge_result_apply.c` added),
+`make sanitize` is clean, and the subcommand count stays at 24.
 
-## Phase 21:工作目錄的刪除可以被表示,以及路徑截斷的整批修補
+## Phase 21: representing deletions in the working directory, and a batch fix for path truncation
 
-接續 Phase 20 結尾「刻意不修、留給後續的兩件事」。那一段是當時決策的紀錄,
-不改動;這裡記兩件事各自被怎麼處理了,以及修的過程中才發現的第三件。
+Continuing from Phase 20's closing "two things deliberately not fixed, left for later." That
+section is a record of the decision made at the time, unchanged; here records how each of the
+two was handled, plus a third thing only discovered while fixing them.
 
-### 症狀比當初記的嚴重一級
+### The symptom was one level more severe than what was recorded at the time
 
-Phase 20 記的是「只刪一個已追蹤檔案時印 `No local changes to save`、不建
-stash」。實測後發現那只是兩個症狀裡較輕的一個:
+Phase 20 recorded "when only a single tracked file is deleted, it prints `No local changes to
+save` and creates no stash." Measurement found that was only the lighter of two symptoms:
 
-| 情境 | 真 git | Phase 21 之前的 sg |
+| Scenario | Real git | sg before Phase 21 |
 |---|---|---|
-| 只刪一個已追蹤檔案 | 建 stash,tree 裡沒有該檔 | 印 `No local changes to save`,不建 stash |
-| 刪除 + 另一檔案被修改 | 建 stash,tree 裡沒有該檔 | 建了 stash,但 tree 裡**還有該檔**;`pop` 之後檔案**回來了** |
+| Only one tracked file deleted | Creates a stash, the tree omits that file | Prints `No local changes to save`, creates no stash |
+| Deletion + another file modified | Creates a stash, the tree omits that file | Creates a stash, but the tree **still has that file**; the file **comes back** after `pop` |
 
-第二列才是真正的資料遺漏:它不是「少存了東西」,而是 stash 一輪之後**使用者的
-刪除被靜默還原**,退出碼 0、沒有任何警告。當初只記了第一列,是因為那是從
-`stash push` 單獨觀察得到的;第二列要 push+pop 走完整輪才看得見。
+The second row is the real data loss: it's not "something wasn't saved," it's that after one
+round of stashing, **the user's deletion gets silently undone**, exit code 0, no warning at all.
+Only the first row was recorded at the time because that's what was observable from `stash push`
+alone; the second row only becomes visible after running push+pop through a full round.
 
-### 兩個呼叫端的分岔:必填 enum,沒有預設值
+### The fork between two call sites: a mandatory enum, no default value
 
-`sg_tree_build_from_workdir` 現在吃一個 `sg_workdir_missing`:
-`SG_WORKDIR_MISSING_KEEP_INDEX_BLOB`(給 `sg_snapshot_create`)與
-`SG_WORKDIR_MISSING_RECORD_DELETION`(給 `sg_stash_push` 建 `worktree_tree`)。
-**注意同一次 `sg stash push` 裡兩種語意都會用到**——它自己也是
-`sg_snapshot_create` 的呼叫端,那個安全網要的是前者。
+`sg_tree_build_from_workdir` now takes an `sg_workdir_missing`:
+`SG_WORKDIR_MISSING_KEEP_INDEX_BLOB` (for `sg_snapshot_create`) and
+`SG_WORKDIR_MISSING_RECORD_DELETION` (for `sg_stash_push` building `worktree_tree`). **Note that
+both semantics are used within a single `sg stash push`** -- it's also a caller of
+`sg_snapshot_create` itself, and that safety net needs the former.
 
-形狀上考慮過 options struct(Phase 20 的 `sg_stash_push_opts` 是前例),但那必然
-帶一套「NULL 表示預設」的慣例——**用一個把預設值制度化的形狀,去修一個預設值
-造成的 bug,方向是反的**。這裡只有一個軸、兩個呼叫端,必填 enum 讓呼叫端自己
-說明自己要哪一種。`= 0` 給保守那個值,讓任何意外的零初始化落在「不刪東西」那側。
+An options struct was considered (Phase 20's `sg_stash_push_opts` is the precedent), but that
+would necessarily carry a "NULL means default" convention -- **using a shape that institutionalizes
+a default value to fix a bug caused by a default value is backwards.** There's only one axis and
+two call sites here, so a mandatory enum has each caller state which one it wants. `= 0` maps to
+the conservative value, so any accidental zero-initialization lands on the "don't delete anything"
+side.
 
-### 「存在但讀不到」改成硬失敗:`sg_snapshot_create` 的合約跟著變
+### "Exists but can't be read" becomes a hard failure: `sg_snapshot_create`'s contract changes with it
 
-原本 `sg_read_file` 失敗就退回 index blob,不分「檔案被刪掉」與「權限被拒 /
-變成目錄 / I/O 錯誤」。新語意下這兩者必須分開:對真的刪除,省略該路徑是對的;
-對 I/O 錯誤,省略等於把檔案從 stash 裡弄丟。
+Previously, a failed `sg_read_file` just fell back to the index blob, not distinguishing "the file
+was deleted" from "permission denied / became a directory / I/O error." Under the new semantics
+these must be separated: for a genuine deletion, omitting the path is correct; for an I/O error,
+omitting it means losing the file from the stash.
 
-兩個 policy 現在都硬失敗。對 `KEEP_INDEX_BLOB` 也一樣,因為舊行為是**靜默寫入
-過期 blob 再讓破壞性操作繼續**——一個聲稱能救回、內容卻是舊的快照,比沒有快照
-更糟。所以 `sg_snapshot_create` 的合約從「每個條目都解析得出來」改成
-「解析得出來,否則拒絕快照」,9 個上游呼叫端會把它轉成「操作被拒絕」。
+Both policies now hard-fail. This applies to `KEEP_INDEX_BLOB` too, because the old behavior was
+**silently writing a stale blob and letting the destructive operation proceed anyway** -- a
+snapshot that claims to be recoverable but whose content is actually stale is worse than no
+snapshot at all. So `sg_snapshot_create`'s contract changed from "every entry resolves
+successfully" to "resolves successfully, or the snapshot is rejected"; its 9 upstream call sites
+translate this into "the operation is rejected."
 
-分類器的順序是關鍵,**`lstat` 一定在 `sg_read_file` 失敗之後,不可以前置探測**:
+The classifier's ordering is the key part: **`lstat` must always come after `sg_read_file` fails,
+never a pre-probe**:
 
-- 常見的競態是「探測後、讀之前被刪掉」。前置探測會把它判成「存在但讀不到」→
-  良性競態下整個 stash/snapshot 爆掉。後置分類把它判成「不在」,那在分類當下
-  是真的;只有罕見的反方向(讀失敗後檔案才出現)才硬失敗。兩者都消不掉競態,
-  但要讓罕見的那個方向去承擔硬失敗。
-- 零額外 syscall,成功路徑完全不動。
-- **`sg_read_file` 自己的 errno 不可用**(`workdir.c`:失敗前會經過 `free()`/
-  `fclose()`,而且 malloc 失敗與 EIO 走同一條 `return -1`)。後置 `lstat` 用的是
-  它自己的 errno,所以不必動 `sg_read_file` 的簽名。
-- 用 `lstat` 不用 `stat`,與 `stash.c` 髒閘門的存在性判定用同一個測法——push 端
-  與 gate 端對「這個檔案不在了」若定義不同,會出現 push 記了刪除、gate 卻認為
-  它還在。
+- The common race is "deleted after probing, before reading." A pre-probe would classify this as
+  "exists but can't be read" -> a harmless race would blow up the entire stash/snapshot. The
+  post-hoc classification treats it as "not there," which is true at the moment of
+  classification; only the rare opposite direction (the file appears after the read failed) hard-
+  fails. Neither eliminates the race, but this ensures the rare direction is the one bearing the
+  hard failure.
+- Zero extra syscalls, and the success path is entirely untouched.
+- **`sg_read_file`'s own errno isn't usable** (`workdir.c`: `free()`/`fclose()` run before it
+  fails, and a malloc failure and an EIO share the same `return -1`). The post-hoc `lstat` uses
+  its own errno, so `sg_read_file`'s signature doesn't need to change.
+- Using `lstat`, not `stat`, matching the exact test `stash.c`'s dirty gate uses for existence --
+  if the push side and the gate side define "this file is gone" differently, push could record a
+  deletion while the gate still believes it's there.
 
-`tests/test_snapshot.c` 那支驗 fallback 的測試**一個字都沒改就維持全綠**,因為
-它的 `b.txt` 是從未建立(ENOENT)→ 分類為「不在」→ 退回 index blob。這條性質
-本身就是驗證:需要改動那支測試才能過,就代表分類寫錯了。
+The `tests/test_snapshot.c` test that verifies the fallback **stayed all green with zero words
+changed**, because its `b.txt` was never created (ENOENT) -> classified as "not there" -> falls
+back to the index blob. This property is itself a form of verification: if that test needed
+changes to pass, the classification would have been written wrong.
 
-### 修的過程才發現的第三件:空父目錄從來沒被清過
+### A third thing found only while fixing this: empty parent directories were never cleaned up
 
-`apply.c` 與 `merge.c` 是「sg 刪掉一個已追蹤檔案」的**唯二**執行點,兩處都只
-`remove()` 檔案,`src/` 裡完全沒有 `rmdir` 服務這條路徑。
+`apply.c` and `merge.c` are the **only two** places sg ever deletes a tracked file, and both just
+`remove()` the file -- there is no `rmdir` serving this path anywhere in `src/`.
 
-**這個缺口是本階段才第一次可達的**:修法前 `worktree_tree` 必定包含 index 的
-每個路徑,所以 stash apply 的 `deleted` 條目只可能來自「base 有、ours 和 theirs
-都沒有」→ `sg_merge_entry_touches_ours` 回 `ours_present == 0` → `merge.c` 直接
-跳過 `remove()`。也就是說**Phase 21 之前的 `sg stash pop` 從來不會刪掉任何檔案**,
-新語意一上線它第一次會刪,於是第一次撞到這個缺口。這是「放寬前提會讓舊規則
-靜默失效」的又一個實例——舊規則不報錯,只是不再涵蓋新出現的情況。
+**This gap only became reachable for the first time this phase**: before the fix, `worktree_tree`
+necessarily included every path in the index, so a stash apply's `deleted` entry could only ever
+come from "base has it, both ours and theirs don't" -> `sg_merge_entry_touches_ours` returns
+`ours_present == 0` -> `merge.c` skips `remove()` outright. In other words, **`sg stash pop`
+before Phase 21 never actually deleted a single file**; the new semantics were the first time it
+ever would, and that was also the first time this gap was ever hit. Another instance of
+"relaxing a precondition silently invalidates an old rule" -- the old rule didn't error, it just
+no longer covered the newly reachable case.
 
-新增 `sg_prune_empty_parents`(`include/sg/workdir.h`),純 `rmdir` best-effort,
-往上走祖先迴圈清到 repo_root 為止(root 不清)。實測(真 git 2.55.0)三個邊界:
+`sg_prune_empty_parents` (`include/sg/workdir.h`) was added, a purely best-effort `rmdir` walking
+up the ancestor chain up to (not including) repo_root. Three boundaries measured (real git
+2.55.0):
 
-- 目錄**被 ignore 規則涵蓋**、因刪除而變空 → **清掉**。
-- 目錄裡還留著任何東西(含 ignored 檔案)→ 留著。
-- 巢狀 `a/b/c/t.txt` 被刪 → `a`、`b`、`c` 一路清掉。
+- A directory that's **covered by an ignore rule**, made empty by the deletion -> **cleaned up**.
+- A directory still holding anything at all (including ignored files) -> left alone.
+- A nested `a/b/c/t.txt` deleted -> `a`, `b`, `c` all cleaned up in sequence.
 
-⚠ **第一條與 `prune_empty_untracked_dirs` 的規則相反**:那一支是 ignore-aware 的,
-會**放過**「空但被 ignore」的目錄(interop 的 `build/` 檢查在守它)。兩支 prune
-對 ignore 的行為刻意相反,標頭註解有寫明,**不要「統一」它們**。
+Warning: **the first bullet is the opposite of `prune_empty_untracked_dirs`'s rule**: that function
+is ignore-aware, and **spares** a directory that's both empty and ignored (the interop `build/`
+check guards this). The two prune functions deliberately behave oppositely with respect to
+ignore, as stated in the header comment -- **don't "unify" them.**
 
-### 第二件事:整批修,不是只補一支
+### The second item: a batch fix, not just patching one function
 
-Phase 20 記的是 `restore_untracked_flat` 與 `sg_apply_tree_to_workdir` 兩處,並
-下了「要修就整批一起修」的指令。實際踏勘後是 **16 個站點**,分佈到 `merge.c`
-(merge/rebase/stash 共用的落地函式)、`stash.c`、`tree_build.c`、`cmd_add.c`、
-`cmd_restore.c`、`status.c`、`cmd_diff.c`。
+Phase 20 recorded two places, `restore_untracked_flat` and `sg_apply_tree_to_workdir`, with the
+instruction "if it's going to be fixed, fix the whole class at once." The actual survey found
+**16 sites**, spread across `merge.c` (the landing function shared by merge/rebase/stash),
+`stash.c`, `tree_build.c`, `cmd_add.c`, `cmd_restore.c`, `status.c`, `cmd_diff.c`.
 
-修法是抽一支 `sg_path_join` 放進 `include/sg/workdir.h`,而不是手寫 16 次檢查
-——後者等於在修重複的過程中製造第 17、18 份重複。它同時吃掉 `status.c` 與
-`cmd_add.c` 兩份逐字複本的 `path_join`;`SG_PATH_MAX` 從 14 個 `.c` 各自
-`#define` 收進標頭,連同 `SG_TREE_BUILD_PATH_MAX` 與 `SG_REVPARSE_PATH_MAX`
-這兩個同值的獨立常數名,以及 36 處裸字面量 `4096`。
+The fix extracted a `sg_path_join` into `include/sg/workdir.h` rather than hand-writing 16
+separate checks -- the latter would just create a 17th and 18th copy while fixing duplication.
+It also absorbed two verbatim copies of `path_join` in `status.c` and `cmd_add.c`; `SG_PATH_MAX`
+was consolidated into the header from 14 separate `.c` files' own `#define`s, along with two
+independently named constants of the same value, `SG_TREE_BUILD_PATH_MAX` and
+`SG_REVPARSE_PATH_MAX`, and 36 bare `4096` literals.
 
-**截斷的意義是逐類決定的,不是統一的**:
+**The meaning of truncation is decided per category, not uniformly**:
 
-| 類別 | 處理 |
+| Category | Handling |
 |---|---|
-| 寫入/刪除 | 絕不跳過(`rc = -1` 續跑 / 報錯讓該條目失敗 / `return -1`) |
-| 閘門 | 往保守倒:髒檢查標 dirty、碰撞預檢標 collision。**閘門的失敗方向不可以是「放行」** |
-| 回報 | 回 -1 讓 CLI 印,不可以靜默從 `sg status`/`sg diff` 掉一個檔案 |
-| 清理(best-effort) | 維持靜默跳過 |
+| Write/delete | Never skip (`rc = -1` and continue / report an error and fail that entry / `return -1`) |
+| Gate | Fall the conservative way: dirty checks flag dirty, collision pre-checks flag collision. **A gate's failure direction can never be "allow it through"** |
+| Report | Return -1 for the CLI to print; must never silently drop a file from `sg status`/`sg diff` |
+| Cleanup (best-effort) | Keep silently skipping |
 
-`tree_build.c` 是唯一必須**在 `sg_read_file` 之前**失敗的站點:它的迴圈把讀不到
-當成「檔案不在」,截斷後的路徑若剛好不存在,一個存在的檔案就會被記成刪除。
-這一站把兩件事綁在一起,所以截斷必須排在語意分岔之前落地。
+`tree_build.c` is the only site that must fail **before `sg_read_file`**: its loop treats an
+unreadable file as "the file isn't there," and if a truncated path just happens not to exist, an
+existing file would get recorded as deleted. This site couples two things together, so
+truncation has to be handled before the semantic fork.
 
-`would_lose_content`(`cmd_restore.c`)因此長出第三態:原本只回 yes/no,而截斷
-之下**兩個答案都是謊**——回 0 會讓 `sg restore` 在沒有警告的情況下覆寫內容。
+`would_lose_content` (`cmd_restore.c`) therefore grew a third state: it used to just return
+yes/no, and under truncation **both answers are lies** -- returning 0 would let `sg restore`
+overwrite content with no warning at all.
 
-刻意不改的:那些用 `git_dir` + 定長 hex 組路徑的 buffer(`loose.c`、`rebase.c`、
-`cmd_clone.c` 等)只換掉 `#define`,沒有改成走 helper——風險輪廓不同,溢出需要
-`git_dir` 本身極長。`prune_empty_untracked_dirs` 保留自己的 inline 檢查,因為它
-的慣例是靜默跳過而 helper 的呼叫端會回報;它原本的註解宣稱與 `status.c` 的
-`path_join` 一致,那是**錯的**(`collect_untracked` 跳過時會印 warning),已改成
-講真正的理由:沒清掉的空目錄對 git 與 sg 都不可見。
+Deliberately not changed: the buffers that build paths from `git_dir` + a fixed-length hex
+(`loose.c`, `rebase.c`, `cmd_clone.c`, etc.) only had their `#define` swapped, not routed through
+the helper -- their risk profile is different, since an overflow would require `git_dir` itself to
+be extremely long. `prune_empty_untracked_dirs` kept its own inline check, since its convention
+is to silently skip while the helper's callers report; its original comment claimed consistency
+with `status.c`'s `path_join`, which was **wrong** (`collect_untracked` prints a warning when it
+skips), and has been changed to state the real reason: an uncleaned empty directory is invisible
+to both git and sg.
 
-### 驗證:六條定向 mutation,都紅得有道理
+### Verification: six directed mutations, all red for the right reason
 
-`sg_tree_build_from_workdir` 原本零測試覆蓋,`sg_path_join` 也沒有直接測試。
-新增 `tests/test_path_join.c` 與 `tests/test_tree_build_workdir.c`,每一條斷言
-都先證明會紅:
+`sg_tree_build_from_workdir` had zero test coverage before, and `sg_path_join` had no direct
+test either. `tests/test_path_join.c` and `tests/test_tree_build_workdir.c` were added, with
+every assertion first proven to go red:
 
-| mutation | 變紅的具名檢查 |
+| Mutation | Named checks turned red |
 |---|---|
-| RECORD_DELETION 塌陷成 KEEP | 「兩個 policy 產生相同 tree」「刪除沒有被表示」「空 tree」「空子樹殘留」 |
-| 反向塌陷 | **`test_snapshot` 既有護欄**:`b.txt` 從快照樹消失 |
-| 拿掉「讀不到」硬失敗 | 兩個 policy 各自的硬失敗斷言 |
-| prune 只清一層 | 「`a/b` 該被剪掉」「`a` 該被剪掉」,而 `a/b/c` 沒紅 |
-| 拿掉截斷檢查 | 四條截斷斷言 + `out_size 0` |
-| 截斷檢查 off-by-one | **只有邊界那一條** |
+| RECORD_DELETION collapsed into KEEP | "the two policies produce the same tree", "the deletion isn't represented", "the empty tree", "the leftover empty subtree" |
+| The reverse collapse | **`test_snapshot`'s existing guardrail**: `b.txt` disappears from the snapshot tree |
+| Removing the "can't read" hard failure | Each policy's own hard-failure assertion |
+| prune only cleaning one level | "`a/b` should be pruned", "`a` should be pruned", with `a/b/c` staying green |
+| Removing the truncation check | Four truncation assertions + `out_size 0` |
+| An off-by-one in the truncation check | **Only the boundary one** |
 
-最後一條最有價值:它只打紅一條斷言,證明邊界測試不是粗測試的冗餘複本。反向
-塌陷那條則證明 `test_snapshot` 的護欄真的在守舊語意。
+The last row is the most valuable: it turns exactly one assertion red, proving the boundary test
+isn't a redundant copy of a coarser one. The reverse-collapse row proves `test_snapshot`'s
+guardrail really was guarding the old semantics.
 
-`sg_path_join` 的測試用**小 `out_size`** 而不是真實深目錄,這不是偷懶:macOS 的
-kernel PATH_MAX 是 1024,遠低於 `SG_PATH_MAX`,真實路徑長到能截斷 4096 緩衝區
-之前就會被 kernel 擋下,那個分支根本不會執行。用真實目錄寫的測試在本機會綠,
-但綠的理由與待測程式碼無關。
+`sg_path_join`'s test uses a **small `out_size`** rather than a real deep directory, and this isn't
+laziness: macOS's kernel PATH_MAX is 1024, far below `SG_PATH_MAX`, so a real path long enough to
+truncate the 4096 buffer would be blocked by the kernel before it ever got there, and that branch
+would never run at all. A test written with real directories would pass locally, but pass for a
+reason unrelated to the code under test.
 
-mutation 樣式要帶右括號:`(size_t)n >= out_size` 也會前綴命中同檔案裡的
-`out_size - pos`,而只改一半的 mutation 讀起來就像「已驗過」。
+The mutation pattern needs a closing parenthesis: `(size_t)n >= out_size` would also
+prefix-match `out_size - pos` elsewhere in the same file, and a mutation that only changed half of
+it would read like "already verified."
 
-### interop:把當初被迫繞開的檢查放回去
+### interop: putting back the checks that had to be worked around at the time
 
-Phase 20 為了避開這個 bug,額外維護了一份窄的 `p20_index_fixture`(不含
-`wt_del.txt`/`staged_del.txt`)。修好之後兩份 fixture 合併,`--index` 那組檢查
-現在跑在**當初必須躲開的案例**上——這是最強的回歸證據形式。
+To avoid this bug, Phase 20 maintained an extra, narrower `p20_index_fixture` (excluding
+`wt_del.txt`/`staged_del.txt`). After the fix, the two fixtures were merged, and the `--index`
+check group now runs against **the exact case that had to be avoided at the time** -- the
+strongest possible form of regression evidence.
 
-合併之後兩條 `--index` 檢查變紅,而且**紅得是真的**:sg 會把 `staged_del.txt`
-從磁碟上刪掉,真 git 留著它當未追蹤檔案。用 **`1afef8b`(本階段之前的 commit)
-建出的 binary 當對照組**實測,行為完全一樣——所以這是**既有分歧,不是本階段
-造成的**,只是先前被窄 fixture 遮住。成因是 Phase 20 已記錄且刻意保留的
-「sg 的 ours 是 HEAD 而不是 index」:`git rm --cached` 後檔案仍在磁碟上,而 sg 的
-apply 只看 HEAD,於是認定 ours 有、theirs 沒有 → 刪掉。
+After merging, two `--index` checks went red, and **genuinely so**: sg deletes `staged_del.txt`
+from disk, while real git keeps it as an untracked file. Measured against a control **binary
+built from `1afef8b` (the commit before this phase)**, the behavior was identical -- so this is
+**a pre-existing divergence, not caused by this phase**, just previously hidden by the narrower
+fixture. The cause is the "sg's ours is HEAD, not the index" divergence already recorded and
+deliberately kept in Phase 20: after `git rm --cached`, the file is still on disk, and sg's apply
+only looks at HEAD, concluding ours has it and theirs doesn't -> delete it.
 
-處理方式是把該路徑排除在逐位元組比對之外,並**用兩條檢查把分歧本身釘住**
-(真 git 留著 / sg 刪掉),不是靜默過濾——行為哪天變了仍然會有檢查變紅。
-**沒有調整預期值到變綠**,那是這個專案最糟的失敗模式。
+The handling was to exclude that path from the byte-for-byte comparison and **pin the divergence
+itself with two checks** (real git keeps it / sg deletes it), rather than silently filtering it
+out -- if the behavior ever changes, a check would still go red. **The expected value was not
+adjusted to make it green** -- that's the worst failure mode for this project.
 
-新增的 phase21 檢查有一條特別要記:**斷言 stdout 不是 `No local changes to save`**。
-這個 bug 在「只有刪除」那個情境下的全部症狀就是一行 stdout——檔案、ref、reflog
-都沒有差異。Phase 19 已經為「只驗檔案與 reflog 會漏掉整個輸出維度」付過一次
-代價。
+One of the newly added phase21 checks deserves specific mention: **it asserts stdout is not
+`No local changes to save`.** In the "deletion only" scenario, this bug's entire symptom was a
+single line of stdout -- files, refs, and reflog showed no difference at all. Phase 19 already
+paid the price once for "verifying only files and reflog misses an entire dimension of output."
 
-### 新可達的分歧,主動記下來
+### A newly reachable divergence, proactively recorded
 
-stash 了一個未 staged 的刪除 → 之後把同一路徑的刪除 staged → 再 pop:
-`sg_stash_apply_check_dirty` 的 index 那一列會拒絕(`idxpos < 0 && hf != NULL`),
-真 git 不會。這是同一條「ours 是 HEAD 不是 index」分歧的新組合,先前因為
-stash 根本記不了刪除而不可達。interop 有一條檢查釘住 sg 自己的拒絕行為,
-刻意不與真 git 比對——寫下來,而不是留給它以「interop 突然變紅」的形式被發現。
+Stashing an unstaged deletion -> then staging a deletion of the same path -> popping again:
+`sg_stash_apply_check_dirty`'s index check rejects it (`idxpos < 0 && hf != NULL`), while real git
+doesn't. This is a new combination of the same "ours is HEAD, not the index" divergence, previously
+unreachable because stash could never record a deletion at all. An interop check pins sg's own
+rejection behavior, deliberately not comparing against real git -- writing this down instead of
+leaving it to be discovered as "interop suddenly went red."
 
-最終 `tests/interop.sh` 1276 項檢查(Phase 20 結束時是 1247),`make test` 39 支
-二進位全過(新增 `tests/test_path_join.c`、`tests/test_tree_build_workdir.c`),
-`make sanitize` 乾淨,子指令維持 24 個。
+The final `tests/interop.sh` has 1276 checks (1247 at the end of Phase 20), all 39 `make test`
+binaries pass (`tests/test_path_join.c` and `tests/test_tree_build_workdir.c` added), `make
+sanitize` is clean, and the subcommand count stays at 24.
 
-### 收尾冷讀抓到的:prune 會走到 repo_root 之外
+### Caught by the wrap-up cold read: prune could walk outside repo_root
 
-尾段那批(語意分岔、prune、測試、interop)在第一輪 reviewer 交差之後才產生,
-沒有任何人冷讀過,所以又交了一次**只給尾段**的審查。它抓到一個實質問題:
-`sg_prune_empty_parents` 對 `relpath` 沒有任何約束,而它的標頭註解卻承諾
-「up to but never including repo_root」。
+The tail batch (the semantic fork, prune, tests, interop) was produced only after the first
+review round handed off, so no one had ever cold-read it -- it was handed off for a **tail-only**
+review a second time. It caught a substantive problem: `sg_prune_empty_parents` placed no
+constraint on `relpath` at all, while its header comment promises "up to but never including
+repo_root."
 
-**實測(不是推論)**:
+**Measured (not reasoned about)**:
 
-- `relpath = "../sibling/f.txt"` → 第一輪就把 `cur` 剝成 `"../sibling"`,
-  `sg_path_join` 產生 `repo_root/../sibling`,OS 解析成 repo 的**手足目錄**,
-  `rmdir` 真的把它刪掉了。
-- `relpath = "/f.txt"` → 剝完 `cur` 變成空字串,`sg_path_join` 對空 `rel` 的語意
-  是「直接回傳 base」,於是 `absdir` 就是 `repo_root`,**`rmdir(repo_root)` 被呼叫**。
-  真實 repo 裡 `.git` 讓它非空所以會失敗,但探針用空目錄實測時 repo_root 真的
-  被刪掉了——擋住它的是 `.git` 碰巧存在,不是程式碼。
+- `relpath = "../sibling/f.txt"` -> the very first round strips `cur` down to `"../sibling"`,
+  `sg_path_join` produces `repo_root/../sibling`, which the OS resolves to the repo's **sibling
+  directory**, and `rmdir` really did delete it.
+- `relpath = "/f.txt"` -> after stripping, `cur` becomes an empty string, and `sg_path_join`'s
+  semantics for an empty `rel` are "just return base," so `absdir` becomes `repo_root`, and
+  **`rmdir(repo_root)` gets called.** In a real repo, `.git` makes it non-empty so this would fail,
+  but a probe using an empty directory found repo_root really did get deleted when measured --
+  what stopped it was `.git` happening to exist, not the code.
 
-修法是加一支 `relpath_is_confined`:拒絕絕對路徑與含 `..` 元件的路徑。
-**為什麼不能假設呼叫端給的是乾淨路徑**:這些 `relpath` 來自 index 條目或 merge
-結果,最終來自 tree 物件,而 `src/object/tree.c` 解析 entry 名稱時**不做任何驗證**。
-所以「不會跑到 repo_root 之上」必須在這裡強制,不能靠上游。
+The fix added a `relpath_is_confined` function: rejecting absolute paths and paths with a `..`
+component. **Why the caller's path can't be assumed clean**: these `relpath`s come from index
+entries or a merge result, ultimately from a tree object, and `src/object/tree.c` does **no
+validation at all** when parsing entry names. So "will never walk above repo_root" must be
+enforced here, and can't rely on upstream.
 
-守衛刻意只擋這兩類:`...dots` 這種以點開頭的**普通目錄名**必須照樣被剪掉,
-測試裡有一條專門釘住這件事——mutation 把守衛改成無差別拒絕時,那條會連同其他
-四條正常 prune 檢查一起變紅,這是「守衛沒有過度嚴格」的證據。
+The guard deliberately only blocks these two classes: a **normal directory name** that happens to
+start with a dot, like `...dots`, must still be pruned as usual, and there's a test specifically
+pinning this -- when a mutation changed the guard to reject indiscriminately, that test went red
+alongside the other four normal-prune checks, which is the evidence that "the guard isn't
+over-strict."
 
-**一個更大、本階段不修的缺口**:同樣未經驗證的路徑也被緊鄰的 `remove(abspath)`
-使用(`apply.c`、`merge.c`),那在 Phase 21 之前就存在。也就是說「tree 物件裡的
-entry 名稱可以是任意字串」這件事,影響的不只 prune。整批的路徑封閉性(拒絕
-`..`、絕對路徑、`.git` 前綴)應該在**解析 tree / 寫 index 的那一層**做,而不是
-在每個消費端各補一次。記在這裡,不在本階段處理。
+**A larger gap, not fixed this phase**: the same unvalidated path is also used by the adjacent
+`remove(abspath)` (`apply.c`, `merge.c`), which predates Phase 21. In other words, the fact that
+"a tree object's entry name can be an arbitrary string" affects more than just prune. Path
+confinement as a batch (rejecting `..`, absolute paths, a `.git` prefix) should be done at the
+layer that **parses trees / writes the index**, not patched separately at every consumer. Recorded
+here, not addressed this phase.
 
-長度邊界另有一條測試,用**剛好 `SG_PATH_MAX`** 長的 relpath(短一個位元組就塞得下,
-所以那才是邊界)。把 `>=` 改成 `>` 的 mutation 會被抓到,但要注意**抓到它的不是
-具名斷言,是二進位直接 trap(退出碼 133)**——`strcpy` 溢出一個位元組被平台的
-stack 保護攔下。`mutate.sh` 的「退出碼非 0 就算被抓到」正好涵蓋這種情況,
-但它證明的是「溢出真的發生」,不是「那句斷言在守」。
+The length boundary has a separate test using a relpath of **exactly `SG_PATH_MAX`** in length
+(one byte shorter would still fit, so that's the actual boundary). A mutation changing `>=` to `>`
+was caught, but note **what caught it wasn't the named assertion, it was the binary trapping
+directly (exit code 133)** -- `strcpy` overflowing by one byte was caught by the platform's stack
+protection. `mutate.sh`'s "a non-zero exit code counts as caught" happens to cover this case, but
+what it proves is "the overflow really happened," not "that assertion is guarding it."
 
-## Phase 22:tree entry 名稱的路徑封閉性
+## Phase 22: path confinement for tree entry names
 
-Phase 21 收尾時記下「路徑封閉性該在解析 tree/寫 index 那一層做」,這一階段做了,
-但開工時的前提有一半是錯的,而且實際的洞比預期多兩個。
+Phase 21's wrap-up noted "path confinement should be done at the tree-parsing/index-writing
+layer," and this phase did it -- but half the premise going into it was wrong, and the actual
+holes numbered two more than expected.
 
-### 前提修正:驗證不是零
+### Correcting the premise: validation isn't zero
 
-`src/object/tree.c` 與 `src/index/index.c` 確實對名稱零驗證,但真正的守衛一直在
-`src/workdir/tree_build.c` 的 `entry_name_is_safe`(Phase 2 就存在),它擋空字串、
-`.`、`..`、任何含 `/` 的名稱,而且是**逐層**檢查。所以**路徑穿越一直是擋著的**。
+`src/object/tree.c` and `src/index/index.c` really do have zero validation on names, but the
+actual guard has always lived in `src/workdir/tree_build.c`'s `entry_name_is_safe` (present since
+Phase 2), which blocks empty strings, `.`, `..`, and any name containing `/`, checked at
+**every level**. So **path traversal has always been blocked.**
 
-洞在 `.git`:沒有斜線、不是 `.` 也不是 `..`,剛好從三條規則之間穿過去。
+The hole was `.git`: no slash, not `.`, not `..` -- it just happened to slip through the gap
+between the three rules.
 
-### 四個實測證實的洞
+### Four holes confirmed by measurement
 
-| # | 情境 | 修法前 |
+| # | Scenario | Before the fix |
 |---|---|---|
-| 1 | tree entry 名為 `.git`,`sg reset --hard`/`switch` | **退出碼 0,寫出 `.git/hacked.txt`** |
-| 2 | `sg add d/.git/evil` | **真的 stage 進 index**(真 git 靜默忽略) |
-| 3 | index 裡有 `.git/hooks/evil`,`sg restore` 它 | **把 PWNED 寫進真正的 gitdir,退出碼 0** |
-| 4 | `.g<U+200C>it`(HFS+ 會折掉的碼位) | 接受(真 git 拒絕) |
+| 1 | A tree entry named `.git`, `sg reset --hard`/`switch` | **Exit code 0, writes out `.git/hacked.txt`** |
+| 2 | `sg add d/.git/evil` | **Actually gets staged into the index** (real git silently ignores it) |
+| 3 | Index has `.git/hooks/evil`, `sg restore` it | **Writes PWNED into the real gitdir, exit code 0** |
+| 4 | `.g<U+200C>it` (a code point HFS+ folds away) | Accepted (real git rejects it) |
 
-第 2 項讓第 1 項的修法**變成必要而非可選**:sg 自己造得出惡意 tree,只補讀端會讓
-曾經 `sg add .git/x` 的使用者得到一個 sg 自己再也 switch 不回去的 repo。
+Item 2 makes item 1's fix **mandatory rather than optional**: sg can construct a malicious tree by
+itself, and only patching the read side would leave a user who once ran `sg add .git/x` with a
+repo that sg itself can never switch back into again.
 
-第 3 項比第 1 項嚴重:第 1 項只是寫進 `.git/`,第 3 項是**寫入攻擊者選定的內容**,
-而且入口是使用者自己打的一行 `sg restore`。
+Item 3 is worse than item 1: item 1 only writes into `.git/`, while item 3 **writes
+attacker-chosen content**, and the entry point is a single `sg restore` command the user typed
+themselves.
 
-### 守衛的位置:一個來源一道,不是同一條規則撒三遍
+### Where the guard lives: one guard per source, not the same rule scattered three times
 
-**不放解析層**。真 git 的物件庫照收畸形 tree、`cat-file -p` 讀得出來,防線在
-`read-tree`。放解析層會讓 `sg cat-file -p <壞 tree>` 失敗,而那正是診斷時最需要的
-能力;而且 `storage/chunk.c` 與 `cli/cmd_push.c` **只取 sha1、完全不看 name**,
-在那裡擋等於讓沒有攻擊面的路徑失敗。
+**Not in the parsing layer.** Real git's object store accepts a malformed tree as-is, and
+`cat-file -p` can read it; the defense lives in `read-tree`. Putting it in the parsing layer would
+make `sg cat-file -p <bad tree>` fail, which is exactly the capability most needed during
+diagnosis; and `storage/chunk.c` and `cli/cmd_push.c` **only take the sha1, never look at the
+name at all**, so blocking there would fail paths that have no attack surface whatsoever.
 
-**不放檔案系統關口**。這不只是冗餘,是**錯的**:`src/storage/refs.c` 就是拿
-`sg_write_file_mkdirs` 把 ref 檔寫進 `.git/refs/...`。一個會拒絕 `.git` 分量的
-守衛裝在那裡會直接打死 ref 寫入。規則的對錯取決於呼叫端在哪個 namespace,
-而那個資訊在 `sg_path_join` 那一層已經遺失。
+**Not at the filesystem chokepoint.** This isn't just redundant, it's **wrong**:
+`src/storage/refs.c` uses `sg_write_file_mkdirs` exactly to write ref files into
+`.git/refs/...`. A guard that rejects a `.git` component installed there would kill ref writing
+outright. Whether the rule is correct depends on which namespace the caller is in, and that
+information is already lost by the time it reaches `sg_path_join`.
 
-所以是**三個來源、三道守衛**:tree 位元組(`sg_tree_flatten`)、index 條目
-(`apply.c` 的 `remove()`、`cmd_restore.c` 的寫入)、argv(`cmd_add.c`)。
-判別是否冗餘的方法可執行:**刪掉任一道,都有一組只有它擋得住的輸入**。
-Phase 21 的 `relpath_is_confined` 是新判準的嚴格子集,所以被**收斂**掉而不是留著並存。
+So it's **three sources, three guards**: tree bytes (`sg_tree_flatten`), index entries
+(`apply.c`'s `remove()`, `cmd_restore.c`'s writes), and argv (`cmd_add.c`). The test for
+redundancy is executable: **deleting any one guard leaves a set of inputs only it could have
+blocked.** Phase 21's `relpath_is_confined` is a strict subset of the new predicate, so it was
+**converged** away rather than kept in parallel.
 
-### 走訪的跳過**不可以**用同一個判準(規格裡的這條指令是錯的)
+### Traversal's skip logic **cannot** use the same predicate (this instruction in the spec was
+wrong)
 
-規格原本要求「順手把 `cmd_add.c`/`status.c` 的 `.git` 跳過也改用新判準」。
-實測真 git 之後推翻:**git 會把 `.git.` 列為未追蹤目錄**(`?? .git./`),
-只在 `add` 時拒絕。改成統一判準會讓 `sg status` **漏報**一個 git 會報的路徑
-——狀態列表少一個檔案是最難察覺的一類錯。
+The spec originally asked for "while we're at it, also switch `cmd_add.c`/`status.c`'s `.git`
+skip to use the new predicate." Measuring real git overturned this: **git lists `.git.` as an
+untracked directory** (`?? .git./`), only rejecting it at `add` time. Unifying the predicate would
+make `sg status` **fail to report** a path git does report -- and a status listing silently
+dropping a file is one of the hardest classes of bug to notice.
 
-已改回 `strcmp(ent->d_name, ".git") == 0`。sg 建的 gitdir 永遠字面上叫 `.git`,
-精確比對不會漏;其他同名目錄是普通目錄,要列出來,並在它們**真的要進 index 時**
-才拒絕。標頭註解明講這支判準不適用於走訪。
+Reverted to `strcmp(ent->d_name, ".git") == 0`. The gitdir sg creates is always literally named
+`.git`, so an exact comparison never misses it; other directories with the same name are ordinary
+directories, listed as normal, and only rejected when they're **actually about to enter the
+index**. The header comment states plainly that this predicate doesn't apply to traversal.
 
-### 規則集(全部實測,不是憑記憶)
+### The rule set (all measured, not recalled)
 
-**拒絕**:`""`、`.`、`..`、含 `/`、`.git` 的任何大小寫變體、尾綴 `.`/空白的形式、
-以及折掉 HFS+ 忽略碼位後等於 `.git` 的名稱。
-**接受**:`.gitignore`、`.gitmodules`、`..a`、`a..`、`git~1`、含控制字元的名稱。
+**Rejected**: `""`, `.`, `..`, anything containing `/`, any case variant of `.git`, forms with a
+trailing `.`/whitespace, and names that equal `.git` once HFS+ ignorable code points are folded
+away.
+**Accepted**: `.gitignore`, `.gitmodules`, `..a`, `a..`, `git~1`, names containing control
+characters.
 
-大小寫折疊**自己寫 ASCII 版,不用 `strcasecmp`**:它依賴 locale,土耳其語 locale
-下 `'I'` 不折成 `'i'`,那正好會讓 `.GIT` 在**這條規則唯一存在理由的那個檔案系統上**
-漏掉。
+Case folding **is hand-written as ASCII-only, not `strcasecmp`**: it's locale-dependent, and
+under a Turkish locale `'I'` doesn't fold to `'i'`, which would let `.GIT` slip through **on
+exactly the filesystem this rule exists for.**
 
-**忽略碼位是逐個實測出來的 16 個**(U+200C..U+200F、U+202A..U+202E、
-U+206A..U+206F、U+FEFF)。**對照組是重點**:U+200B、U+2060、U+00A0、U+3000
-一樣是隱形字元,真 git **接受**它們。憑直覺寫成「所有零寬字元」會往**誤殺合法檔名**
-的方向錯,而那個方向沒有任何徵兆。
+**The ignorable code points are 16, confirmed one by one through measurement** (U+200C..U+200F,
+U+202A..U+202E, U+206A..U+206F, U+FEFF). **The control group matters here**: U+200B, U+2060,
+U+00A0, U+3000 are equally invisible characters, and real git **accepts** them. Writing "all
+zero-width characters" from intuition would err in the direction of **rejecting legitimate
+filenames**, and that direction has no symptoms at all.
 
-### 三處刻意分歧
+### Three deliberate divergences
 
-1. **entry 名稱裡的 `/`**:真 git 接受(會展開成巢狀路徑),sg 拒絕。理由**不是安全
-   而是正確性**:`sg_tree_flatten` 的輸出被 `flat_find` 當成依路徑排序的陣列做
-   **二分搜尋**(`include/sg/status.h` 明文記著這個不變量),一個名稱裡含 `/` 的
-   entry 會用自己的位元組參與排序,展開後路徑不再有序,`flat_find` 會**靜默漏找**。
-   放寬等於要同時重新證明排序不變量,換來的是接受一種 `git write-tree` 自己也
-   產不出來的 tree。
-2. **`git~1`(NTFS 8.3 短檔名)不擋**:sg 只支援 macOS/Linux,那裡不存在 8.3 短檔名,
-   而 `git~1` 是合法普通檔名,擋它是純誤殺。
-3. **`sg add` 回退出碼 1**,真 git 靜默退出 0。磁碟終態相同。`sg add` 本來就是
-   全有全無語意,跟著它走比為此開特例好。
+1. **`/` inside an entry name**: real git accepts it (expanding it into nested paths), sg rejects
+   it. The reason **isn't security, it's correctness**: `sg_tree_flatten`'s output gets treated by
+   `flat_find` as an array sorted by path for **binary search** (`include/sg/status.h` explicitly
+   documents this invariant), and an entry whose name contains `/` would participate in the
+   sorting using its own bytes; once expanded, the path is no longer sorted, and `flat_find` would
+   **silently miss lookups.** Relaxing this would require re-proving the sort invariant, in
+   exchange for accepting a kind of tree that even `git write-tree` itself can never produce.
+2. **`git~1` (an NTFS 8.3 short filename) is not blocked**: sg only supports macOS/Linux, where
+   8.3 short filenames don't exist, and `git~1` is a perfectly legitimate ordinary filename;
+   blocking it would be a pure false positive.
+3. **`sg add` returns exit code 1**; real git silently exits 0. The end state on disk is the
+   same. `sg add` already has all-or-nothing semantics, and following that convention is better
+   than carving out a special case for this.
 
-### 控制字元不在此階段(Phase 23)
+### Control characters aren't in scope this phase (Phase 23)
 
-真 git **接受**控制字元進 tree,防線在**顯示端**(C-style 轉義),而且實測
-`core.quotePath=false` **關不掉**——`quotePath` 只管 ≥0x80 的位元組,控制字元是
-無條件引用的。所以在名稱驗證裡拒絕它們會讓 sg 簽不出一個真 git 認為完全合法的
-repo,是新的相容性破口而不是修補。正確的形狀是一支共用的引用函式,
-**不能**重用 `sg_print_remote_text`(它把控制字元換成 `'?'`,有損且與 git 輸出不同)。
+Real git **accepts** control characters into a tree, with the defense living at the **display
+side** (C-style escaping), and measurement showed `core.quotePath=false` **can't turn it off** --
+`quotePath` only governs bytes >= 0x80, control characters are quoted unconditionally. So
+rejecting them in name validation would make sg unable to sign a repo real git considers fully
+legitimate -- a new compatibility hole, not a fix. The correct shape is a shared quoting function,
+which **cannot** reuse `sg_print_remote_text` (it replaces control characters with `'?'`, lossy
+and different from git's output).
 
-順帶記一個縮小威脅面的事實,以免日後有人以為漏了 git 的 `has_dirs_only_path`:
-**sg 從不建立 symlink**(`cmd_add.c` 對 `S_ISLNK` 是警告並跳過,`apply.c` 對 mode
-120000 是寫成一般檔案),所以 git 那套「路徑不得穿過 symlink」的檢查在 sg 沒有
-對應的攻擊面。
+Also worth noting, to shrink the threat surface and preempt anyone later thinking git's
+`has_dirs_only_path` check was missed: **sg never creates symlinks** (`cmd_add.c` warns and skips
+on `S_ISLNK`, `apply.c` writes mode 120000 as a plain file), so git's "a path must not walk
+through a symlink" check has no corresponding attack surface in sg.
 
-### 引擎的驗證是對真 git,不是對自己的測試
+### The engine's verification is against real git, not against its own tests
 
-把 42 個 hostile 名稱同時餵給 `sg_quote_path` 與
-`git -c core.quotepath=false ls-files`,**逐位元組 `cmp` 完全相同**。涵蓋
-0x01–0x1F 全部控制位元組、DEL、反斜線、雙引號、空格、全部 shell metachar、
-單引號、`ü`、中文、emoji,以及 `0x01` 後接 `'7'` 那個八進位重新解析陷阱。
+Feeding 42 hostile names into both `sg_quote_path` and
+`git -c core.quotepath=false ls-files` produced a **byte-for-byte `cmp` match, exactly**. Covering
+all control bytes 0x01-0x1F, DEL, backslash, double quote, space, every shell metacharacter,
+single quote, a u-diaeresis (U+00FC), CJK text, emoji, and the `0x01` followed by
+`'7'` octal-reinterpretation trap.
 
-方法可以重用,但有一個坑:**名稱清單要用 NUL 分隔,不能用換行**。第一次用換行寫
-清單時,含 LF 的那個名稱被切成兩筆,比對出現「假差異」——差點被讀成 sg 的 bug,
-實際上是我的比對工具壞了。作法:python 產生 `name\0name\0...`,
-一支小程式讀 stdin 逐筆呼叫引用函式,再與 `git ls-files` 的輸出 `sort | cmp`。
+The method can be reused, but there's one pitfall: **the name list must be NUL-separated, not
+newline-separated.** The first time the list was written with newlines, a name containing an LF
+got split into two entries, producing a "false divergence" in the comparison -- almost misread as
+an sg bug when it was actually the comparison tool that was broken. Approach: python generates
+`name\0name\0...`; a small program reads stdin, calling the quoting function entry by entry, then
+compares against `git ls-files`'s output with `sort | cmp`.
 
-這比跑引擎自己的單元測試強得多:單元測試驗的是「我認為 git 會這樣做」,
-這個比對驗的是「git 真的這樣做」。
+This is far stronger than running the engine's own unit tests: unit tests verify "I believe git
+does this," while this comparison verifies "git actually does this."
 
-### 驗證:十五條 mutation,四條是反向的
+### Verification: fifteen mutations, four of them reversed
 
-反向那四條才是這一階段最難得的部分——它們驗的是「規則**沒有**過寬」,
-而過寬平常不會有任何徵兆(所有測試照樣綠,只是誤殺合法檔名):
+The four reversed ones are the hardest-won part of this phase -- they verify the rule is **not**
+too broad, and over-broad rules normally show no symptoms at all (every test stays green, only
+legitimate filenames get rejected):
 
-| 反向 mutation | 結果 |
+| Reverse mutation | Result |
 |---|---|
-| 判準改成前綴比對 | **14 條**變紅,含大量既有 phase20 ignore 檢查 |
-| 忽略碼位多收一個 U+200B | **正好是對照組那條** |
-| flatten 的 `-2` 改成 `-1` | **只有訊息斷言紅,FS 斷言全綠** |
-| 走訪跳過改回過寬判準 | **只有那條漏報檢查** |
+| The predicate changed to a prefix match | **14** checks turned red, including a large number of existing phase20 ignore checks |
+| The ignorable code points list gained one more, U+200B | **exactly the control-group case** |
+| flatten's `-2` changed to `-1` | **only the message assertion goes red, filesystem assertions stay entirely green** |
+| Traversal's skip reverted to the overly broad predicate | **only that one false-negative check** |
 
-第三條特別值得記:它證明訊息斷言在做**獨立**的工作,而檔案系統的防護**不依賴**
-`-2`/`-1` 的區分。沒有這一對,「拒絕了」與「點名了路徑」會是同一件事的兩種說法。
+The third row is especially worth recording: it proves the message assertion does **independent**
+work, and the filesystem protection **doesn't depend** on the `-2`/`-1` distinction. Without this
+pair, "rejected" and "named the path" would be two ways of saying the same thing.
 
-### 三件誠實記下的限制
+### Three limitations recorded honestly
 
-1. **`sg_relpath_is_safe` 的長度邊界是靠平台的堆疊保護抓到的,不是靠斷言**:
-   把 `>=` 改成 `>` 之後 `memcpy` 溢出一個位元組直接 abort(退出碼 134),
-   那條 CHECK 根本來不及執行。`mutate.sh` 把非零退出碼算成「被抓到」是對的,
-   但它證明的是「溢出真的發生」,不是「那句斷言在守」。
-2. **Unicode 那一批只有主對話冷讀過**:reviewer 讀 diff 時它還不存在,
-   而它交差之後的修復同樣未經第二人冷讀。依規矩上限一輪,照實記下不遞迴。
-3. **`.GIT` 在 macOS 上測不出來**:檔案系統不分大小寫,`mkdir .GIT` 直接變成既有的
-   `.git`。那一格要看 CI 的 Linux 才算數。
+1. **`sg_relpath_is_safe`'s length boundary was caught by the platform's stack protection, not by
+   an assertion**: changing `>=` to `>`, `memcpy` overflows one byte and aborts outright (exit
+   code 134), never even reaching the CHECK statement. `mutate.sh` treating a non-zero exit as
+   "caught" is correct, but what it proves is "the overflow really happened," not "that assertion
+   is guarding it."
+2. **The Unicode batch was only cold-read by the primary conversation**: it didn't exist yet when
+   the reviewer read the diff, and the fix produced after that handoff was likewise never
+   cold-read by a second party. Following the rule of capping this at one round, recorded
+   honestly, not recursed.
+3. **`.GIT` can't be tested on macOS**: the filesystem is case-insensitive, so `mkdir .GIT`
+   directly becomes the existing `.git`. That cell only counts on CI's Linux.
 
-### 過程中兩次「驗證工具自己說謊」
+### Two more instances of "the verification tool itself lied" along the way
 
-- 一條 mutation 的 perl 運算式沒匹配到任何東西,`mutate.sh` 直接判「未套用」
-  (退出碼 3)。如果它靜靜跑完並回報「沒有檢查變紅」,結論會是「這裡是死角」
-  ——與事實完全相反。
-- 一條新加的 interop 檢查把多行的 `sg status` 輸出塞進 shell 字串再 grep,
-  結果連最穩的那條都紅了。**守衛是好的,說謊的是檢查**。沒去實跑就會回頭改
-  本來正確的程式碼。腳本裡已留註解記這件事。
+- A mutation's perl expression matched nothing at all, and `mutate.sh` correctly judged it "not
+  applied" (exit code 3). If it had run silently to completion and reported "no checks turned
+  red," the conclusion would have been "this is a blind spot" -- the exact opposite of the truth.
+- A newly added interop check stuffed `sg status`'s multi-line output into a shell string and
+  grepped it, and even the most stable of those checks went red. **The guard was fine, the check
+  was lying.** Without actually running it, the correct code would have been "fixed" backwards.
+  The script now carries a comment recording this.
 
-最終 `tests/interop.sh` 1299 項檢查(Phase 21 結束時是 1276),`make test` 40 支
-二進位全過(新增 `tests/test_path_safe.c`),`make sanitize` 乾淨,子指令維持 24 個。
+The final `tests/interop.sh` has 1299 checks (1276 at the end of Phase 21), all 40 `make test`
+binaries pass (`tests/test_path_safe.c` added), `make sanitize` is clean, and the subcommand
+count stays at 24.
 
-### 待查:`phase6a` 那條 smart-HTTP 檢查的間歇性失敗
+### To investigate: `phase6a`'s smart-HTTP check's intermittent failure
 
-2026-08-21 在 Phase 21/22 期間出現**兩次**,今天累計約 15 次以上的完整 interop
-只有這兩次。事後連跑 5 次全綠,**無法按需重現**。
+Occurred **twice** during Phase 21/22 on 2026-08-21, out of roughly 15+ complete interop runs
+total by that day. Five consecutive reruns afterward were all green, **not reproducible on
+demand.**
 
-紅的是這一條:
+The check that went red:
 
 > `phase6a: that push advances the remote's refs/sg/chunks to the local keep-alive commit`
 
-它的註解自己寫明「退出碼分不出『送出去了』和『決定不用送』」,所以失敗的形狀是:
-`sg add` 有移動本機 keep-alive ref(前一條檢查綠)、`sg push` **退出碼 0**、
-push **沒有**印 "Everything up-to-date"(前一條檢查綠),但**遠端的 `refs/sg/chunks`
-沒有跟上**。
+Its own comment states plainly "exit code alone can't distinguish 'sent it' from 'decided not to
+send it,'" so the shape of the failure is: `sg add` moved the local keep-alive ref (the previous
+check was green), `sg push` **exited 0**, push **did not** print "Everything up-to-date" (the
+previous check was green), but **the remote's `refs/sg/chunks` never advanced.**
 
-也就是說**推送端回報成功、遠端狀態卻沒變**。這比較像 sg 的 smart-HTTP push
-真有間歇性 bug,不像測試腳本的雜訊——腳本這幾條是純字串比對,沒有計時或
-競態成分。fixture 用 `/dev/urandom` 產生內容,所以 chunk 邊界每輪都不同,
-若 bug 與特定的 chunk 數量/大小有關,那正好解釋為何低頻且難重現。
+In other words, **the push side reported success while the remote state never changed.** This
+looks more like a genuine intermittent bug in sg's smart-HTTP push than test-script noise -- these
+checks are pure string comparisons, with no timing or race component. The fixture generates
+content with `/dev/urandom`, so chunk boundaries differ each round; if the bug relates to a
+specific chunk count/size, that would exactly explain the low frequency and difficulty
+reproducing it.
 
-**下次再出現時的起點**:保留 `$WORKDIR/phase6a_http_server.log` 與
-`$WORKDIR/p6a_chunks_only_push_out.txt`,兩者都已經在腳本裡寫出來了;
-比對 push 實際送出的 pkt-line 與伺服器端收到的 ref 更新。
-**不要當成雜訊直接重跑**。
+**Starting point for next time it occurs**: keep `$WORKDIR/phase6a_http_server.log` and
+`$WORKDIR/p6a_chunks_only_push_out.txt` -- both are already written out by the script; compare the
+pkt-lines push actually sent against the ref update the server side received. **Do not treat it
+as noise and just rerun.**
 
-## Phase 23:路徑的顯示端引用
+## Phase 23: display-side quoting for paths
 
-Phase 22 把控制字元刻意留在名稱驗證之外,理由記在該段:真 git **接受**它們進 tree,
-防線在顯示端。這一階段把那道防線補上。
+Phase 22 deliberately kept control characters out of name validation, with the reasoning recorded
+there: real git **accepts** them into a tree, and the defense lives at the display side. This
+phase adds that defense.
 
-### 已證實的問題,以及量測本身的陷阱
+### A confirmed problem, and a pitfall in the measurement itself
 
-檔名 `evil<ESC>[31m.txt` 經 `sg add`/`commit` 之後:
+A file named `evil<ESC>[31m.txt`, after `sg add`/`commit`:
 
-| | 原始位元組(od -c) | 終端機 |
+| | Raw bytes (od -c) | Terminal |
 |---|---|---|
-| sg | `e v i l 033 [ 3 1 m` — `033` 是**真正的 ESC** | 執行控制序列 |
-| 真 git | `" e v i l \ 0 3 3 [ 3` — 反斜線與 `0`、`3`、`3` 是**四個獨立字元** | 無害文字 |
+| sg | `e v i l 033 [ 3 1 m` -- `033` is a **real ESC** | Executes the control sequence |
+| Real git | `" e v i l \ 0 3 3 [ 3` -- the backslash and `0`, `3`, `3` are **four separate characters** | Harmless text |
 
-⚠ **`sed -n 'l'` 會把真正的 ESC 渲染成 `\033`,與 git 的字面轉義看起來完全相同。**
-我第一次就是這樣讀的,差點得出「兩邊都有轉義」的結論。驗證一律用 `od -c` 或
-`grep $'\x1b'`。計數佐證:sg 輸出含真正 ESC 的行數 = 1,git = 0 而含字面 `\033` = 1。
+Warning: **`sed -n 'l'` renders a real ESC as `\033`, making it look identical to git's literal
+escape.** The first pass read it this way and nearly concluded "both sides escape it." Verify
+exclusively with `od -c` or `grep $'\x1b'`. Corroborating counts: sg's output has 1 line
+containing a real ESC and 0 containing the literal `\033`; git has 0 lines with a real ESC and 1
+with the literal `\033`.
 
-### 規則(逐位元組實測)
+### The rule (measured byte by byte)
 
-具名:`\\` `\"` `\a` `\b` `\t` `\n` `\v` `\f` `\r`;其餘 <0x20 與 DEL 走
-**零填充三位八進位**(`\001`、ESC → `\033`、DEL → `\177`);**空格不轉義、
-也不觸發引號**;只有真的需要時才加引號。
+Named escapes: `\\` `\"` `\a` `\b` `\t` `\n` `\v` `\f` `\r`; everything else below 0x20 and DEL
+goes through **zero-padded three-digit octal** (`\001`, ESC -> `\033`, DEL -> `\177`); **spaces
+are neither escaped nor trigger quoting**; quotes are only added when actually needed.
 
-⚠ **ESC 是 `\033` 不是 `\e`**——C 沒有標準的 `\e`。
-⚠ **shell metachar 不是 git 的判準**:`~ ! $ * ? # ; | & ( ) < > [ ]` 與單引號
-全部原樣。這是最容易「順手加固」寫錯的地方,而寫寬**沒有徵兆**。
+Warning: **ESC is `\033`, not `\e`** -- C has no standard `\e`.
+Warning: **shell metacharacters are not git's criterion**: `~ ! $ * ? # ; | & ( ) < > [ ]` and
+single quotes all pass through as-is. This is the easiest place to get wrong through "helpful
+hardening," and writing it too broad **has no symptoms.**
 
-### API 形狀:借用指標的靜態 ring,不是 malloc
+### API shape: a static ring of borrowed pointers, not malloc
 
-近 70 個呼叫端、多數在錯誤路徑上。malloc 版每處都要 OOM 分支,而最自然的寫法
-`q ? q : path` 是 **fail-open**——正好在記憶體吃緊時把原始位元組印出去。
-專案已為**單一個**呼叫端仔細想過這件事(`net/http.c` 的 `shown_url` 退回
-`"(remote)"`,註解寫著 Fail closed)。要求 70 個站點每次都選對方向不會成功。
-靜態 ring 讓 OOM 決策**只存在於一個地方**,呼叫端無法寫錯。
+Nearly 70 call sites, most on error paths. A malloc'd version would need an OOM branch at every
+site, and the most natural way to write it, `q ? q : path`, is **fail-open** -- printing the raw
+bytes exactly when memory is tight. The project had already carefully thought this through for
+**a single** call site (`net/http.c`'s `shown_url` falls back to `"(remote)"`, with a comment
+stating "fail closed"). Requiring 70 sites to each pick the right direction every time was never
+going to succeed. A static ring keeps the OOM decision **existing in exactly one place**, where
+callers can't get it wrong.
 
-三支而不是一支,因為要讓「錯誤的形狀無法被表達」:`a/`、`b/` 前綴**折進**引用函式
-(引號必須包住前綴,分兩處決定就永遠有人寫得出 `a/"x\ty"`);`_delimited` 無條件
-加引號,讓句子裡的路徑看得出前後空白。
+Three functions rather than one, so that "the wrong shape can't even be expressed": the `a/`,
+`b/` prefixes are **folded into** the quoting function (the quotes must wrap the prefix, and
+splitting this into two decisions guarantees someone eventually writes `a/"x\ty"`); `_delimited`
+unconditionally adds quotes, so leading/trailing whitespace in a path is visible mid-sentence.
 
-**放 `util/` 而不是 `workdir/`**:純位元組轉換、零依賴;`cat-file` 印的是 tree entry
-名稱而非工作目錄路徑,讓它依賴 workdir 會把分層倒過來。
+**Placed in `util/`, not `workdir/`**: pure byte conversion, zero dependencies; `cat-file` prints
+tree entry names, not working-directory paths, and making it depend on workdir would invert the
+layering.
 
-### ≥0x80 原樣輸出:刻意且永久的分歧
+### Bytes >= 0x80 printed as-is: a deliberate, permanent divergence
 
-等同 `core.quotepath=false`。理由:sg 沒有設定系統,使用者無法像 git 那樣關掉;
-而 sg 自己的訊息就是 UTF-8 中文,把檔名印成 `\344\270\255` 與周圍輸出不一致。
-**interop 的每一組比對都加 `-c core.quotepath=false`**,只有控制字元組不加
-(兩邊都會引用),外加一組**反向檢查**——非 ASCII 對照**預設** git 必須**不同**。
-那是唯一釘住這個分歧本身的東西:沒有它,把 sg 悄悄改成 git 預設不會弄壞任何檢查。
+Equivalent to `core.quotepath=false`. Reasoning: sg has no configuration system, so the user
+can't turn this off the way git allows; and sg's own messages are UTF-8 Chinese to begin with, so
+printing filenames as `\344\270\255` would look inconsistent with the surrounding output. **Every
+interop comparison group adds `-c core.quotepath=false`**, except the control-character group
+(both sides quote those), plus one **reverse check** -- comparing non-ASCII with git's **default**,
+which **must differ.** That's the only thing pinning this divergence itself: without it, silently
+switching sg to git's default wouldn't break any check at all.
 
-### 建 fixture 時照出來的三個既有缺口(與引用無關)
+### Three pre-existing gaps found while building the fixture (unrelated to quoting)
 
-1. **二進位檔漏印 `diff --git`**,只印 `Binary files ... differ`。那不是任何工具
-   讀得回去的 patch——`git apply` 要靠 `diff --git` 才知道 hunk 屬於哪個檔案。
-2. **`---`/`+++` 少了尾隨 TAB**。真 git 在路徑**含空格**時加一個(`diff --git` 與
-   `Binary files` 都不加),用來把檔名與選用的時間戳分開。觸發條件是實測出來的
-   (八個案例交叉比對),不是憑「大概是含空白就加」。
-3. **`strbuf_append_path` 的 `char[4200]`**:引用後可達 16 KB,會**靜默截短**
-   ——而被截掉的正是最值得看的那些(全是控制字元的路徑)。改成直接 `strbuf_append`,
-   截斷點消失且程式碼更短。
+1. **Binary files were missing the `diff --git` line**, printing only `Binary files ... differ`.
+   That's not a patch any tool can read back -- `git apply` relies on `diff --git` to know which
+   file a hunk belongs to.
+2. **`---`/`+++` were missing a trailing TAB.** Real git adds one when a path **contains a
+   space** (neither `diff --git` nor `Binary files` add it), used to separate the filename from
+   an optional timestamp. The trigger condition was determined by measurement (cross-checked
+   across eight cases), not guessed from "probably added whenever there's whitespace."
+3. **`strbuf_append_path`'s `char[4200]`**: with quoting applied, this could reach 16 KB, and
+   would **silently truncate** -- and exactly the ones getting truncated were the most worth
+   looking at (paths that are entirely control characters). Switched to a plain `strbuf_append`,
+   eliminating the truncation point and shortening the code.
 
-### 四個真死角,全部是 fixture 缺一整個維度
+### Four real blind spots, all from the fixture missing an entire dimension
 
-逐站點 mutation(architect 指定的那條)抓到:
+Site-by-site mutation (the specific instruction from the architect) caught:
 
-| 死角 | 缺的維度 |
+| Blind spot | Missing dimension |
 |---|---|
-| status 的 staged/unstaged 清單 | fixture 只有未追蹤檔案 |
-| status 的 both modified | 沒有衝突情境 |
-| `Binary files` 那一行 | fixture 全是文字檔 |
-| **錯誤訊息那 56 處整批** | interop 從不比對 stderr 措辭 |
+| status's staged/unstaged listing | The fixture only had untracked files |
+| status's both-modified case | No conflict scenario |
+| The `Binary files` line | The fixture was all text files |
+| **The whole batch of 56 error-message sites** | interop never compares stderr wording |
 
-**若按整批驗證,`status` 與 `diff` 都會顯示「有覆蓋」**,而那三個 printer 從來沒被
-任何檢查碰過。最後一項的前後對照最乾淨:同一條 `_delimited` 降級 mutation,
-補檢查前 **1317/1317 全綠(真死角)**,補後 **1319/1320,只紅那一條**。
+**Verified as a whole batch, both `status` and `diff` would appear to "have coverage,"** while
+those three printers had never once been touched by any check. The before/after for the last item
+is the cleanest: the same `_delimited` degradation mutation, **1317/1317 entirely green
+(a real blind spot)** before adding the check, **1319/1320, only that one going red** after.
 
-⚠ 那條檢查的設計關鍵:**必須用「不需要轉義的名稱」**。含 ESC 的名稱在降級後仍然
-會被引用,對這個決定**零鑑別力**。只用 hostile 名稱寫的話,檢查會是綠的、
-看起來有覆蓋,實際上什麼都沒驗到。
+Warning: that check's design hinges on **using a name that needs no escaping.** A name containing
+ESC would still get quoted even after the degradation, giving **zero discriminating power** for
+this decision. Written with only hostile names, the check would be green, look like it has
+coverage, and actually verify nothing.
 
-### 三次假紅燈,都是驗證工具說謊而程式碼是對的
+### Three false reds, all cases of the verification tool lying while the code was correct
 
-1. `sed -n 'l'` 把真正的 ESC 與 git 的字面轉義渲染成同一個樣子(見上)。
-2. **我拿 `git status --porcelain` 當長格式的 oracle**。實測:porcelain 會引用
-   含空格的名稱(它的 `?? ` 前綴讓空格變成欄位分隔符),長格式與 `ls-files` 不會。
-   sg status 是長格式,印裸的是**對的**。已加一條檢查把「兩種格式規則不同」本身釘住,
-   讓下一個人不能悄悄換回錯的 oracle。
-3. 一條新 interop 檢查把多行的 `sg status` 輸出塞進 shell 字串再 grep,連最穩的
-   那條都紅了。守衛是好的,說謊的是檢查。腳本裡已留註解。
+1. `sed -n 'l'` renders a real ESC and git's literal escape identically (see above).
+2. **`git status --porcelain` was used as the oracle for the long format.** Measurement:
+   porcelain quotes names containing a space (its `?? ` prefix turns a space into a field
+   delimiter), while the long format and `ls-files` don't. `sg status` is the long format, and
+   printing it bare is **correct.** A check pinning "the two formats have different rules" was
+   added, so the next person can't silently swap back in the wrong oracle.
+3. A new interop check stuffed `sg status`'s multi-line output into a shell string and grepped
+   it, and even the most stable of those checks went red. The guard was fine, the check was
+   lying. The script now carries a comment recording this.
 
-三次都會誘導人去改本來正確的程式碼。
+All three would have tempted someone into "fixing" code that was actually correct.
 
-### 「make 0 warning」不是零警告的完整證據
+### "make: 0 warnings" isn't complete evidence of zero warnings
 
-`sprintf` 在 macOS 已棄用。**普通 build 報 0 warning,sanitize build 報 1 個**
-——同一份原始碼,兩組旗標的 warning 集合不同。已改成逐位元寫入(輸出永遠是
-反斜線加三位八進位,本來就不需要格式化函式)。讀閘門摘要時要記得這件事。
+`sprintf` is deprecated on macOS. **The normal build reports 0 warnings, the sanitize build
+reports 1** -- the exact same source, with two different flag sets giving two different warning
+sets. Switched to byte-by-byte writing (the output is always a backslash plus three octal digits,
+which never actually needed a formatting function). Worth remembering when reading gate
+summaries.
 
-### 刻意不做的
+### Deliberately not done
 
-- **`Cloning into '%s'...`、`Initialized empty Git repository in %s` 這類 stdout
-  資訊訊息不引用**——實測**真 git 在那裡也不引用**(raw ESC 直接進終端機),
-  而且那些路徑來自使用者自己打的 argv。
-- **ref/branch/tag 名稱不引用**:真 git 的 `git branch` 也不引用,**沒有 oracle**,
-  而在沒有 oracle 的地方自創行為是這個專案一再付代價的事。
-  (`sg_ref_branch_name_is_safe` 只擋路徑穿越,不擋控制字元,所以手工造出的
-  `refs/heads/a<TAB>b` 印出來仍是原始位元組。記下來比默默留著好。)
-- **commit/tag 訊息與 author 字串明文禁止引用**:那會破壞 `cat-file -p` 的位元組
-  保真,而 interop 有在盯。已實測確認未被誤改。
-- **兩份 `strbuf` 不收斂**:這一階段的 diff 是「機械、可 grep、可逐條核對」的性質,
-  加一個公開的 strbuf 型別會把風險換成結構性的,兩種混在同一次 review 裡,
-  reviewer 對哪一種都給不出有意義的判斷。而且那兩份今天並不逐字相同。
+- **stdout informational messages like `Cloning into '%s'...` and
+  `Initialized empty Git repository in %s` are not quoted** -- measurement confirmed **real git
+  doesn't quote them there either** (a raw ESC goes straight to the terminal), and those paths
+  come from argv the user typed themselves.
+- **ref/branch/tag names are not quoted**: real git's `git branch` doesn't quote them either, and
+  **there's no oracle**, and inventing behavior where there's no oracle is something this project
+  has repeatedly paid for.
+  (`sg_ref_branch_name_is_safe` only blocks path traversal, not control characters, so a
+  hand-crafted `refs/heads/a<TAB>b` still prints as raw bytes. Recording this is better than
+  silently leaving it be.)
+- **Commit/tag messages and author strings are explicitly forbidden from being quoted**: that
+  would break `cat-file -p`'s byte-for-byte fidelity, which interop is watching for. Confirmed by
+  measurement to have not been mistakenly changed.
+- **The two `strbuf`s are not converged**: this phase's diff has the property of being
+  "mechanical, greppable, checkable line by line"; adding a public strbuf type would trade that
+  for structural risk, and mixing both kinds into a single review would leave the reviewer unable
+  to give a meaningful judgment on either. The two also aren't verbatim identical today.
 
-### 收益
+### Payoff
 
-含控制字元的路徑今天產出的 patch **`git apply` 讀不進去**,加引用之後可以。
-腳本那邊也是嚴格變好:路徑含換行時 `sg status | awk` 原本會把一個檔案讀成兩行
-(靜默錯誤),現在是一行且明確可解析。
+A path with control characters currently produces a patch **`git apply` can't read back in**;
+adding quoting fixes this. The scripting side also got strictly better: when a path contains a
+newline, `sg status | awk` used to read one file as two lines (a silent bug); it's now a single,
+unambiguously parseable line.
 
-最終 `tests/interop.sh` 1320 項檢查(Phase 22 結束時是 1299),`make test` 41 支
-二進位全過(新增 `tests/test_quote_path.c`),`make sanitize` 乾淨,子指令維持 24 個。
+The final `tests/interop.sh` has 1320 checks (1299 at the end of Phase 22), all 41 `make test`
+binaries pass (`tests/test_quote_path.c` added), `make sanitize` is clean, and the subcommand
+count stays at 24.
 
-## Phase 24:`phase6a` 間歇性失敗的根因
+## Phase 24: root cause of `phase6a`'s intermittent failure
 
-Phase 22 末段記著一條「待查」:`phase6a` 的
+Phase 22's closing section noted a "to investigate": `phase6a`'s
 `that push advances the remote's refs/sg/chunks to the local keep-alive commit`
-偶爾變紅,無法按需重現,形狀是「push 回報成功、遠端 ref 沒動」。查到了,是真的 bug。
+occasionally went red, not reproducible on demand, in the shape of "push reports success, remote
+ref doesn't move." It's been tracked down, and it's a real bug.
 
-### 根因
+### Root cause
 
-`keep_alive_add`(`src/storage/chunk.c`)的提前返回**只檢查 `new_count == 0`**。
-當傳進來的 chunk id **全部都已存在**時,它照樣重建一個**內容完全相同的 tree**,
-再用 `time(NULL)` 建一個新 commit。
+`keep_alive_add`'s (`src/storage/chunk.c`) early return **only checks `new_count == 0`.** When
+every chunk id passed in **already exists**, it still rebuilds a tree with **identical content**,
+then builds a new commit with `time(NULL)`.
 
-`sg push` 在遠端與本機的 keep-alive ref 不同時**一定**會走合併路徑
-(`sg_chunk_keepalive_merge_commit`),而遠端的集合通常是本機的子集
-——於是「什麼都沒加,卻建了新 commit」。
+`sg push` **always** goes through the merge path (`sg_chunk_keepalive_merge_commit`) whenever the
+remote and local keep-alive refs differ, and the remote's set is usually a subset of the local
+one -- so it ends up "building a new commit despite adding nothing at all."
 
-**間歇的來源**:新舊 commit **只差時間戳**。同一秒內 id 相同(完全看不出來),
-跨秒才不同。跨秒時本機 ref 前進、推出去的是新 id,而 interop 是在 push **之前**
-記下本機值的,於是比對失敗。
+**Source of the intermittency**: the old and new commits **only differ in timestamp.** Within the
+same second, the ids are identical (completely undetectable); across a second boundary, they
+differ. When it crosses a second, the local ref advances and a new id gets pushed, while interop
+recorded the local value **before** the push, so the comparison fails.
 
-逐位元組證據(同一次失敗的兩個 commit):
+Byte-for-byte evidence (two commits from the same failure):
 ```
 tree bcccb1b01bf96b7b764344472a5b9347877e5f2d
 author small_git <sg@localhost> 1787294421 +0000
@@ -2360,768 +2793,933 @@ tree bcccb1b01bf96b7b764344472a5b9347877e5f2d
 author small_git <sg@localhost> 1787294422 +0000
 ```
 
-前後對照(同一個腳本、同一個條件):
+Before/after comparison (same script, same conditions):
 
-| 條件 | 失敗率 |
+| Condition | Failure rate |
 |---|---|
-| 正常速度 | 6/60(10%) |
-| `sg add` 與 `push` 之間插 1.2 秒 | **8/8** |
-| **修法後 + 同樣的 1.2 秒** | **0/8** |
+| Normal speed | 6/60 (10%) |
+| A 1.2-second delay inserted between `sg add` and `push` | **8/8** |
+| **After the fix + the same 1.2-second delay** | **0/8** |
 
-### 修法
+### The fix
 
-`entries` 先複製全部既有條目、再只加不重複的新條目,所以
-`entry_count == existing_count` 精確等價於「沒有任何新東西」。那種情況直接返回。
+`entries` now first copies all existing entries, then only adds new, non-duplicate ones, so
+`entry_count == existing_count` is exactly equivalent to "nothing new at all." That case returns
+directly.
 
-**這不只是測試不穩**:每次 push 都會在物件庫留下一個內容重複的 commit,
-並讓一個實際上沒有變化的 ref 無謂地移動。
+**This wasn't just test flakiness**: every push would leave behind a content-duplicate commit in
+the object store, and needlessly move a ref that had actually not changed at all.
 
-### 新測試為什麼刻意 `sleep(1)`
+### Why the new test deliberately does `sleep(1)`
 
-`test_keep_alive_merge_of_subset_does_not_move_the_ref` 裡那一秒不是浪費:
-沒有它的話,重建的 commit 會落在同一秒、拿到相同 id,**測試在修法前後都會通過**
-——一條看起來有覆蓋、實際上零鑑別力的斷言。理由已寫進測試註解。
+The one-second delay in `test_keep_alive_merge_of_subset_does_not_move_the_ref` isn't wasted:
+without it, the rebuilt commit would land in the same second and get the same id, and **the test
+would pass both before and after the fix** -- an assertion that looks like coverage but has zero
+discriminating power. The reasoning is written into the test's comment.
 
-### 這次調查最該記的:重現器連續兩次沒在重現,而且都偽裝成好消息
+### The single most important thing to record about this investigation: the reproducer failed to
+reproduce twice in a row, both times disguised as good news
 
-| | 症狀 | 抓到的方式 |
+| | Symptom | How it was caught |
 |---|---|---|
-| 第一次 | chunking 沒啟用 → push 短路成 "Everything up-to-date",3 次「ok」全是空跑 | 重現器自帶的**情境自檢** |
-| 第二次 | **`git clone` 預設不抓 `refs/sg/*`** → 遠端從來沒有那個 ref → 40 輪全走「建立」分支而不是要測的「合併」分支 | 把自檢加嚴:斷言遠端**已有**該 ref |
+| First time | Chunking wasn't enabled -> push short-circuited to "Everything up-to-date", all 3 "ok" runs were no-ops | The reproducer's own built-in **scenario self-check** |
+| Second time | **`git clone` doesn't fetch `refs/sg/*` by default** -> the remote never had that ref -> all 40 rounds went through the "create" branch, not the "merge" branch being tested | Tightened the self-check: asserting the remote **already has** the ref |
 
-第二次特別危險:**40 輪全綠看起來就是「查不到問題」**。若在那裡下結論說
-「判定為環境雜訊」,那會是一個完全錯誤、而且很有說服力的結論。
+The second time was especially dangerous: **40 rounds all green looks exactly like "no problem
+found."** Concluding "chalk it up to environment noise" at that point would have been an entirely
+wrong, and quite persuasive, conclusion.
 
-**還有一個自我證偽的陷阱**:我先前用 `sleep 1.2` 測時間戳假設,得到 0 次失敗,
-於是判定假設不成立。但那次跑在**還沒修好的**重現器上,根本沒進合併分支
-——**實驗本身無效**。修好後同一個實驗是 8/8 失敗。
-教訓:**一個實驗給出否定結果時,要先確認它有沒有真的執行到待測的那條路徑。**
+**There was also a self-falsifying trap**: an earlier test of the timestamp hypothesis using
+`sleep 1.2` got 0 failures, leading to the conclusion the hypothesis didn't hold. But that run was
+on the reproducer **before it was fixed**, which never entered the merge branch at all -- **the
+experiment itself was invalid.** After fixing the reproducer, the same experiment gave 8/8
+failures. Lesson: **when an experiment gives a negative result, first confirm it actually
+exercised the path under test.**
 
-### Mutation 驗證:四條,兩條是冷讀補的
+### Mutation verification: four mutations, two added following a cold read
 
-| mutation | 變紅的 |
+| Mutation | What turned red |
 |---|---|
-| 還原早退區塊 | `keep-alive subset merge` |
-| 條件寫成恆假 | 同上 |
-| **條件方向反轉**(`==` 改 `!=`) | **8 條**——「真的有新增」被誤判成早退,chunk 從此不被保護,`read_blob`/`missing chunk`/`keepalive-ref-deleted` 一整批跟著倒 |
-| **早退分支回 `-1` 而非 `0`** | **兩條,分屬兩個呼叫端**:`keep-alive incremental`(走 `sg_chunk_store_blob`)與 `keep-alive subset merge`(走 `sg_chunk_keepalive_merge_commit`) |
+| Reverting the early-return block | `keep-alive subset merge` |
+| Making the condition always false | Same as above |
+| **The condition's direction reversed** (`==` changed to `!=`) | **8 checks** -- "genuinely has additions" got misjudged as an early return, chunks stopped being protected from then on, and a whole batch of `read_blob`/`missing chunk`/`keepalive-ref-deleted` checks fell with it |
+| **The early-return branch returns `-1` instead of `0`** | **Two checks, belonging to two different call sites**: `keep-alive incremental` (via `sg_chunk_store_blob`) and `keep-alive subset merge` (via `sg_chunk_keepalive_merge_commit`) |
 
-後兩條是冷讀建議的方向,不是我原本設計的。**第四條的價值在於它證明這個早退同時被
-兩個獨立呼叫端的測試守著**——我自己跑的前兩條只驗到其中一個。
-記在這裡,免得下一個人為了知道「這行有沒有人守」而重跑一遍。
+The last two came from the cold read's suggested direction, not the original design. **The value
+of the fourth mutation is that it proves this early return is guarded by tests from two
+independent call sites** -- the first two mutations only verified one of them. Recorded here so
+the next person doesn't have to rerun this just to find out "is anyone guarding this line."
 
-### 重現方法(重現器本身刻意不進 repo)
+### Reproduction method (the reproducer itself is deliberately kept out of the repo)
 
-需要起 HTTP 伺服器、不在任何閘門裡,加進 `tests/` 只會靜默腐爛;
-持久的守衛是上面那支單元測試。要重建的話:
+It needs to spin up an HTTP server, isn't in any gate, and would silently rot if dropped into
+`tests/`; the persistent guard is the unit test above. To rebuild it:
 
-1. 來源 repo 開 `sg.chunking true` + `sg.chunkthreshold 1048576`,加一個 5 MiB 隨機檔。
-2. `git clone --bare` 成伺服器 repo,起 `interop.sh` 內嵌的 `http_server.py`。
-3. `sg clone` 出 dest,**dest 也要開 chunking**。
-4. **先從 dest push 一次**(建立遠端的 `refs/sg/chunks`)——這一步是第二個陷阱,
-   `git clone` 不會帶 `refs/sg/*`。
-5. 再 `sg add` 第二個 5 MiB 隨機檔,`sleep 1.2`,然後 push。
-6. 比對遠端 ref 與本機 ref;**並斷言 `remote_before` 是合法 sha**,
-   否則走的是建立分支而非合併分支。
+1. Enable `sg.chunking true` + `sg.chunkthreshold 1048576` on a source repo, add a 5 MiB random
+   file.
+2. `git clone --bare` it into a server repo, start `interop.sh`'s embedded `http_server.py`.
+3. `sg clone` a dest, **the dest must also have chunking enabled.**
+4. **Push once from dest first** (creating the remote's `refs/sg/chunks`) -- this step is the
+   second trap; `git clone` doesn't bring along `refs/sg/*`.
+5. `sg add` a second 5 MiB random file, `sleep 1.2`, then push.
+6. Compare the remote ref against the local ref; **and assert `remote_before` is a valid sha**,
+   or it's going through the create branch instead of the merge branch.
 
-## Phase 25:diff 的地基,與 `sg status` 的短格式
+## Phase 25: the diff foundation, and `sg status`'s short format
 
-`sg diff` 與 `sg status` 先前**一個參數都不收**(`(void)argv` + `argc != 1` 就印 usage)。
-這一輪把兩支的旗標補上,並且在補之前先把 `sg diff` 拆開——因為它收不了參數的原因是結構性的。
+`sg diff` and `sg status` previously **accepted no arguments at all** (`(void)argv` plus
+`argc != 1` printed usage). This round adds flags to both, and before doing so, first splits
+apart `sg diff` -- because the reason it couldn't accept arguments was structural.
 
-### 為什麼是「地基」而不只是「加旗標」
+### Why this is a "foundation" rather than just "adding flags"
 
-改寫前,「哪些路徑變了」與「怎麼把它印出來」是**同一個 `for` 迴圈**
-(舊 `cmd_diff.c` 的 `for (i = 0; i < idx.count; i++)`)。那個迴圈直接走 index 條目、
-直接讀工作目錄檔案,所以 `sg diff` **只可能**比較 index 與工作目錄——要支援
-`--cached`、`<rev>`、`<rev> <rev>`,不是加分支,是要有另一個答案來源。
+Before the rewrite, "which paths changed" and "how to print it" were **the same `for` loop**
+(the old `cmd_diff.c`'s `for (i = 0; i < idx.count; i++)`). That loop walked index entries
+directly and read working-directory files directly, so `sg diff` **could only ever** compare the
+index against the working directory -- supporting `--cached`, `<rev>`, `<rev> <rev>` isn't adding
+a branch, it requires another source of answers entirely.
 
-拆成兩層:
+Split into two layers:
 
-- `include/sg/diff.h` / `src/workdir/diff.c` —— **只回答「哪些路徑變了、兩側各是什麼」**。
-  四個建構器對應四種來源配對(tree↔tree、tree↔index、index↔工作目錄、tree↔工作目錄),
-  輸出一份依 path 排序的 `sg_diff_list`。不印任何東西。
-- `include/sg/diff_out.h` / `src/cli/diff_out.c` —— **只回答「怎麼印」**,六種格式。
-  `sg diff` 與 `sg stash show` 共用同一份。
+- `include/sg/diff.h` / `src/workdir/diff.c` -- **only answers "which paths changed, and what's on
+  each side."** Four builders correspond to four source pairings (tree<->tree, tree<->index,
+  index<->working directory, tree<->working directory), producing a path-sorted `sg_diff_list`.
+  Prints nothing.
+- `include/sg/diff_out.h` / `src/cli/diff_out.c` -- **only answers "how to print it,"** six
+  formats. Shared between `sg diff` and `sg stash show`.
 
-`old_tree` 傳 `NULL` 表示空 tree,unborn HEAD 因此不必為了 diff 而寫一個空 tree 物件。
+`old_tree` passed as `NULL` means an empty tree, so an unborn HEAD doesn't need an empty tree
+object written just for diffing.
 
-### 實測到的 oracle(真 git 2.55.0,全程 `LC_ALL=C`)
+### Oracle facts confirmed by measurement (real git 2.55.0, `LC_ALL=C` throughout)
 
-**衝突路徑在三種比較下是三個不同答案**,這是最容易寫錯的一組:
+**Conflict paths give three different answers under three different comparisons** -- the
+easiest set to get wrong:
 
-| 比較 | 真 git | 為什麼 |
+| Comparison | Real git | Why |
 |---|---|---|
-| `diff --cached` | `U` / `\| Unmerged` | 沒有單一 staged blob 可比 |
-| `diff <rev>` | 一般的 `M` | index 只決定成員資格,內容仍取自工作目錄 |
-| `diff`(index vs 工作目錄) | `U` 一列 **+** stage 2 vs 工作目錄一列 | 同一路徑兩列 |
+| `diff --cached` | `U` / `\| Unmerged` | There's no single staged blob to compare |
+| `diff <rev>` | Ordinary `M` | The index only decides membership; content still comes from the working directory |
+| `diff` (index vs working directory) | One `U` row **plus** one row of stage 2 vs working directory | Two rows for the same path |
 
-第三格的「第二列拿哪個 stage」是這樣認出來的:把工作目錄內容寫成與 stage 2
-**逐位元組相同**,第二列整個消失;換成 stage 1 或 stage 3 的內容則第二列還在。
+The third cell's "which stage does the second row use" was identified this way: making the
+working-directory content **byte-for-byte identical** to stage 2 makes the second row disappear
+entirely; using stage 1 or stage 3's content instead keeps the second row present.
 
-**`N files changed` 不計 unmerged 列**。只有 unmerged 列時印 ` 0 files changed`,
-而且**兩個子句都不印**——這與「兩者皆 0 時兩句都印」的規則並存,差別只在 `files_changed`:
+**`N files changed` doesn't count unmerged rows.** With only unmerged rows, it prints
+` 0 files changed`, and **neither clause is printed** -- coexisting with the rule that "when both
+are 0, both clauses print," with the difference hinging purely on `files_changed`:
 
-| 情境 | 輸出 |
+| Scenario | Output |
 |---|---|
-| binary,`files_changed == 1`,ins/del 皆 0 | ` 1 file changed, 0 insertions(+), 0 deletions(-)` |
-| 全是 unmerged,`files_changed == 0` | ` 0 files changed` |
+| Binary, `files_changed == 1`, ins/del both 0 | ` 1 file changed, 0 insertions(+), 0 deletions(-)` |
+| Entirely unmerged, `files_changed == 0` | ` 0 files changed` |
 
-**`diff <rev>` 的路徑集合由 index 決定,不是工作目錄**:`git rm --cached f` 之後檔案
-還在磁碟上,`git diff HEAD` 仍報 `D f`;未追蹤檔案完全不出現。
+**`diff <rev>`'s path set is decided by the index, not the working directory**: after
+`git rm --cached f`, the file is still on disk, and `git diff HEAD` still reports `D f`;
+untracked files never appear at all.
 
-**未追蹤目錄的摺疊是遞迴且逐目錄的**:底下任意深度有已追蹤路徑就進去;否則有非
-ignored 檔案就印一次 `dir/`;否則(全部 ignored)預設不列、`--ignored` 時印一次 `dir/`;
-空目錄什麼都不印。⚠ 判準是「**遞迴看來內容是否全部 ignored**」,不是「目錄名有沒有被
-pattern 命中」——`*.tmp` 從來不會命中 `d/subignored/` 這個名字,git 照樣把它摺疊。
-扁平 fixture 分不出這兩種實作。
+**Folding of untracked directories is recursive and per-directory**: if there's a tracked path
+anywhere underneath at any depth, descend into it; otherwise, if there's a non-ignored file
+underneath, print `dir/` once; otherwise (everything ignored), don't list it by default, and
+print `dir/` once with `--ignored`; an empty directory prints nothing. Warning: the criterion is
+"**recursively, is everything underneath ignored**," not "does the directory name itself match a
+pattern" -- `*.tmp` never matches the name `d/subignored/`, and git still folds it. A flat fixture
+can't tell these two implementations apart.
 
-**七種 unmerged 組合**(依 index 裡存在哪些 stage):`{1}`=`DD`/`both deleted:`、
-`{1,2}`=`UD`/`deleted by them:`、`{1,2,3}`=`UU`/`both modified:`、`{1,3}`=`DU`/`deleted by us:`、
-`{2}`=`AU`/`added by us:`、`{2,3}`=`AA`/`both added:`、`{3}`=`UA`/`added by them:`。
-長格式標籤欄寬 **17**(staged/unstaged 區段是 12)。改動前 `print_unmerged` 對七種全印
-`both modified:`,七分之六是錯的。
+**Seven unmerged combinations** (based on which stages are present in the index): `{1}` = `DD` /
+`both deleted:`, `{1,2}` = `UD` / `deleted by them:`, `{1,2,3}` = `UU` / `both modified:`,
+`{1,3}` = `DU` / `deleted by us:`, `{2}` = `AU` / `added by us:`, `{2,3}` = `AA` / `both added:`,
+`{3}` = `UA` / `added by them:`. The long format's label column width is **17** (the
+staged/unstaged sections use 12). Before this change, `print_unmerged` printed `both modified:`
+for all seven, six of which were wrong.
 
-**兩種引用規則**:porcelain **只要含空格就引用**(`?? ` 前綴讓空格變成欄位分隔符),
-長格式與四種機器格式(`--stat`/`--numstat`/`--name-only`/`--name-status`)**不引空格**,
-但兩邊都引控制字元。Phase 23 就是拿錯 oracle 而產生假紅燈,這次把兩者**正面對撞**寫進
-interop:同一個 `has space.txt`,porcelain 必須引、長格式必須不引。
+**Two quoting rules**: porcelain **quotes as soon as a name contains a space** (its `?? ` prefix
+turns a space into a field delimiter); the long format and the four machine formats
+(`--stat`/`--numstat`/`--name-only`/`--name-status`) **don't quote spaces**, but both quote
+control characters. Phase 23 produced a false red exactly by picking the wrong oracle; this time
+the two were pinned into interop **head to head**: the same `has space.txt` must be quoted under
+porcelain and must not be quoted under the long format.
 
-### `--stat` 的版面演算法
+### `--stat`'s layout algorithm
 
-這是本輪唯一有真演算法的部分,用實測反推,通過 24 組邊界案例 + 240 組隨機交叉驗證。
-要點:版面預算是 `name + number + 6 + graph ≤ width`(飽和時行長 `width - 1`);
-`COLUMNS` 即使非 tty 也生效;bar 縮放**整數截斷無四捨五入**,先縮較小的一邊、
-較大的一邊吃餘數;欄寬算的是**引用後**的字串且是 **display width 不是 byte length**。
+The only part of this round with a genuine algorithm, reverse-engineered by measurement, verified
+against 24 boundary cases plus 240 random cross-validation cases. Key points: the layout budget is
+`name + number + 6 + graph <= width` (line length is `width - 1` when saturated); `COLUMNS`
+applies even without a tty; bar scaling is **truncating integer division, no rounding**, with the
+smaller side scaled first and the larger side absorbing the remainder; column width is computed
+against the **quoted** string and is **display width, not byte length**.
 
-反推過程本身有一條值得記:第一版斷定「binary 列不參與欄寬競爭」,那是從一個
-`max_change` 壓倒性大的案例得來的**假陰性**;補做 binary-only 的 `COLUMNS` 掃描後才解出
-`max_graph = max(max_change, bin_width - 4)`。
+The reverse-engineering process itself has one lesson worth recording: the first version
+concluded "binary rows don't compete for column width," which was a **false negative** derived
+from a case where `max_change` overwhelmingly dominated; only after doing a binary-only `COLUMNS`
+sweep did `max_graph = max(max_change, bin_width - 4)` get worked out.
 
-### 這次最該記的三件事
+### The three most important things to record from this round
 
-**(1) 契約寫在正確的地方,但只寫在一個地方,而責任橫跨兩層。**
+**(1) The contract is written in the right place, but only in one place, while the
+responsibility spans two layers.**
 
-`diff_out.h` 的註解寫著「一顆讀不到的 blob 不可以讓整份 diff 消音」,渲染層也確實遵守。
-但**建構器自己也讀 chunk 資料**(為了回答「有沒有變」),而它在那裡 `return -1`
-——整份清單陣亡,而且 actionable 訊息也消失了,因為失敗發生在渲染層被呼叫**之前**,
-沒有任何下游還知道是哪個檔案壞了。
+`diff_out.h`'s comment states "an unreadable blob must not silence the entire diff," and the
+rendering layer does honor this. But **the builder itself also reads chunk data** (to answer
+"has this changed?"), and it `return -1`s there -- the entire list dies, and the actionable
+message disappears too, because the failure happens **before** the rendering layer is even
+called, so nothing downstream still knows which file was broken.
 
-修法:建構器把該路徑**當成有變**放進清單,讓渲染層帶著路徑再撞一次同樣的失敗。
+Fix: the builder puts that path into the list **as if it changed**, letting the rendering layer
+carry the path and hit the same failure a second time.
 
-**這個缺口在任何單一工作樹裡都不可能被發現**:建構器那邊 `cmd_diff.c` 還是舊版,
-interop 1325/1325 全綠;渲染器那邊沒有修正可測。兩邊各自都誠實地報告「全綠」,
-缺口只存在於兩者之間。
+**This gap could never have been found in any single working tree**: on the builder's side,
+`cmd_diff.c` was still the old version, so interop was 1325/1325 all green; on the renderer's
+side, there was no fix to test. Each side honestly reported "all green" on its own; the gap only
+existed between the two.
 
-**(2) 逐站點打 mutation,與 `mutate.sh` 自己的建議相衝突。**
+**(2) Site-by-site mutation testing conflicts with `mutate.sh`'s own advice.**
 
-腳本註解說「字面量出現不只一次一定要加 `/g`」——那是為了回答「這條規則有沒有被強制」。
-要回答「**每個站點是不是各自有覆蓋**」時,`/g` 恰恰是錯的:它把兩站的結果糊成一團,
-只要任一站有覆蓋整體就變紅。
+The script's comment says "always add `/g` when a literal occurs more than once" -- that answers
+"is this rule enforced." Answering "**does each site individually have coverage**" requires
+exactly the opposite of `/g`: it blends the results of two sites together, so if either site has
+coverage, the overall result goes red.
 
-實例:`sg_chunk_effective_id` 有兩個呼叫站點。逐站點打之後,站點 A 紅、
-站點 B **退出碼 0 零 FAIL**——測試只走過 index-vs-workdir,從沒走過 tree-vs-workdir,
-而後者在真實使用中一定會走到(commit 過的 chunked 檔案,tree 裡存的就是 pointer id)。
-沒有正規化的話**每個未修改的大檔案都會被誤報成有變更**。
+Example: `sg_chunk_effective_id` has two call sites. Mutated site by site, site A went red while
+site B produced **exit code 0, zero FAILs** -- the test only ever exercised index-vs-workdir,
+never tree-vs-workdir, and the latter is definitely exercised in real usage (a committed chunked
+file has its pointer id stored in the tree). Without normalization, **every unmodified large
+file would be misreported as changed.**
 
-分辨同字面量的站點不必靠 `/g`:把周邊文脈(縮排深度、前一行的呼叫)納入樣式就夠了。
+Distinguishing sites sharing the same literal doesn't require `/g` -- including the surrounding
+context (indentation depth, the preceding line's call) in the pattern is enough.
 
-**(3) 沒紅的 mutation 有三種,不要混為一談。**
+**(3) There are three reasons a mutation can fail to go red -- don't conflate them.**
 
-| 沒紅的原因 | 實例 | 該做什麼 |
+| Why it stayed green | Example | What to do about it |
 |---|---|---|
-| **真死角**:那個維度沒有測試 | `--stat` 的 `W*3/8` 夾擠常數改成 `1/2`,全部單元測試照過 | 補測試,而且要錨在外部 oracle |
-| **冗餘守衛**:真正的防線在下一層 | `name_width <= 3` 的提前返回——一般路徑本來就產生 `"..."` | **刪掉守衛**,讓 mutation 打在真正決定行為的地方 |
-| **數學上不可觀測** | `graph_width` 的下限值 6——後面的 reclaim 分支會無條件蓋掉它 | 記下證明,換一條驗得到的性質 |
+| **A real blind spot**: no test covers that dimension | `--stat`'s `W*3/8` squeeze constant changed to `1/2`, every unit test still passed | Add a test, anchored to an external oracle |
+| **A redundant guard**: the real defense is a layer below | The `name_width <= 3` early return -- the normal path already produces `"..."` | **Delete the guard**, letting the mutation land on whatever actually decides the behavior |
+| **Mathematically unobservable** | `graph_width`'s lower bound of 6 -- a later reclaim branch overwrites it unconditionally | Record the proof, switch to a property that can actually be verified |
 
-第三種是實作者用代數 + 20 萬次隨機探測**證明**給我看的,而不是硬做出一個假覆蓋的測試。
+The third kind was **proven** to me by the implementer with algebra plus 200,000 random probes,
+rather than forcing a falsely-covering test into existence.
 
-### 驗證
+### Verification
 
-`tests/interop.sh` 新增 **78 條**,其中 **22 條是 `oracle: precondition`**——它們不驗 sg,
-只驗 fixture 真的包含那個情境。這批立刻付了代價:第一次跑就紅了三條,全部是**我的**
-fixture 寫錯——`bin.dat` 與控制字元檔名在第一個 commit 就進去、之後沒再修改,
-所以既不出現在 `--cached` 的 diff 裡也不出現在 porcelain 裡。也就是說那組宣稱
-「涵蓋二進位列與引用名稱」的 `cmp` 檢查,**兩者都沒涵蓋**,而它會顯示為通過。
+**78** checks were added to `tests/interop.sh`, of which **22 are `oracle: precondition`** checks
+-- they don't verify sg, only that the fixture actually contains that scenario. This batch paid
+off immediately: three went red on the very first run, all due to fixture mistakes -- `bin.dat`
+and the control-character filename were added in the first commit and never modified again, so
+they never appeared in the `--cached` diff or in porcelain either. In other words, the check group
+claiming "covers the binary row and quoted names" **covered neither one**, and would have shown
+as passing.
 
-`--stat` 的夾擠常數刻意驗在 interop 而不是單元測試:單元測試的預期字串有一部分是從
-**被測程式自己的輸出**抄進去的,那種斷言對「實作與真 git 不符」零鑑別力,
-只證明程式沒有隨機變動。真正的 oracle 只有並排比對真 git 這一個。
+`--stat`'s squeeze constant was deliberately verified via interop rather than unit tests: a unit
+test's expected string is partly copied from **the tested program's own output**, an assertion
+type that has zero discriminating power against "the implementation doesn't match real git," only
+proving the program doesn't randomly vary. Comparing side by side against real git is the only
+real oracle here.
 
-`tests/mutate.sh` 也在這一輪長出第三條規則:一條 mutation 讓 `list_diff_sorted` 的
-歸併游標不再前進,測試**跑了三十分鐘還在跑**,而「永遠不退出」既不是 0 也不是非 0。
-現在有 `SG_MUTATE_TIMEOUT`(預設 300s),並且把「逾時」與「崩潰」**分開標示**
-——兩者都只證明「改壞了會出事」,不證明那條具名斷言有鑑別力。
+`tests/mutate.sh` also grew a third rule this round: a mutation left `list_diff_sorted`'s merge
+cursor never advancing, and the test was **still running after thirty minutes**, and "never
+exits" is neither 0 nor non-zero. There's now `SG_MUTATE_TIMEOUT` (default 300s), with "timeout"
+and "crash" **flagged separately** -- both only prove "breaking it causes trouble," neither proves
+that named assertion has discriminating power.
 
 ### `sg stash show`
 
-一個 stash entry 需要的四棵樹早就算好了:`load_stash_trees` 從 Phase 15 起就在把
-`stash@{N}` 解成 base / index / worktree / 可選的 untracked,只是它是 `static`,
-`cmd_stash.c` 看不到。這一輪把它提升為公開 API,而不是讓 `cmd_stash_show` 再解一次
-parent——本專案已經有八份 `env_or()` 逐字複本的教訓。
+The four trees a stash entry needs were already being computed: `load_stash_trees` has been
+resolving `stash@{N}` into base / index / worktree / an optional untracked tree since Phase 15,
+just that it was `static`, invisible to `cmd_stash.c`. This round promoted it to a public API
+rather than having `cmd_stash_show` re-parse the parents itself -- this project has already
+learned the lesson from eight verbatim copies of `env_or()`.
 
-實測而非假設的三條:預設格式是 **diffstat 不是 patch**;`-u` 與 `--only-untracked`
-**不是兩個獨立布林,而是同一個模式選擇器、後寫的贏**(兩種順序各跑一次才分得出來);
-沒有 untracked parent 時 `--only-untracked` 印空、`-u` 退回一般 diff,兩者都退出 0。
+Three facts confirmed by measurement, not assumed: the default format is **diffstat, not
+patch**; `-u` and `--only-untracked` **aren't two independent booleans, but a single mode
+selector, where whichever is written later wins** (only distinguishable by running both orders);
+without an untracked parent, `--only-untracked` prints nothing and `-u` falls back to a plain
+diff, both exiting 0.
 
-**`-u` 的聯集有一個 bug,是那條「排序」測試抓到的**:未追蹤那半原本拿
-`base_tree` vs `untracked_tree` 比,而每個只存在於已追蹤側的路徑在 `untracked_tree`
-裡都不存在,於是各被多報一筆**幽靈刪除**——同一路徑印兩次。正確做法是拿**空 tree**
-vs `untracked_tree`(`--only-untracked` 本來就是這樣做的)。
+**There was a bug in `-u`'s union, caught by the "ordering" test**: the untracked half used to
+compare `base_tree` against `untracked_tree`, and every path that exists only on the tracked side
+didn't exist in `untracked_tree` at all, so each got over-reported as a **phantom deletion** --
+the same path printed twice. The correct approach is comparing an **empty tree** against
+`untracked_tree` (which `--only-untracked` already did correctly).
 
-讓它現形的是 fixture 的一個刻意選擇:未追蹤檔名取 `b.txt`,**排在兩個已追蹤檔名
-`a.txt` 與 `c.txt` 中間**。若它排最後,「兩份清單串接」與「合併排序」的輸出完全相同,
-那條測試就會零鑑別力。
+What revealed it was a deliberate choice in the fixture: the untracked filename `b.txt` was
+chosen **to sort between the two tracked filenames `a.txt` and `c.txt`.** If it sorted last,
+"concatenating two lists" and "merge-sorting them" would produce identical output, and this test
+would have had zero discriminating power.
 
-### Mutation 驗證:34 條,由主對話執行
+### Mutation verification: 34 mutations, run by the primary conversation
 
-寫下來是為了讓下一個人不必重跑就知道哪些行被守著(慣例見 Phase 24)。
-清單由各輪 reviewer 設計、主對話執行——實作者不驗證自己的修法。
+Recorded so the next person doesn't have to rerun this to know which lines are guarded (the
+convention is set out in Phase 24). The list was designed by each round's reviewer and executed
+by the primary conversation -- the implementer doesn't verify their own fixes.
 
-| 範圍 | 條數 | 守住的性質(舉其要者) |
+| Scope | Count | Properties guarded (notable ones) |
 |---|---|---|
-| `workdir/diff.c` 第一輪 | 5 | blob id 比較、mode 比較、`NULL` tree = 空 tree、merge-join 的比較方向 |
-| `workdir/diff.c` 尾段 | 13 | `index_group_end` 的群組推進、三支建構器**各自**的衝突行為、第二列取 stage 2(改成 stage 1 會紅)、`-2` 不可壓成 `-1`、內容比對的正反兩個方向 |
-| `cmd_status.c` / `status.c` / `quote.c` | 9 | 七種 unmerged 標籤與兩碼、摺疊的三條規則、porcelain 的空格引用、二分搜尋的 `/` 邊界、`--ignored` 的否定式斷言 |
-| `cli/diff_out.c` | 11 | graph 的 `total<2` 保底與平手方向、截斷推到 `/`、CJK 欄寬、binary 計入而 unmerged 不計入 `files changed`、`files_changed > 0` 閘門 |
-| `cli/cmd_stash.c` | 4+ | 幽靈刪除的修法(`NULL` vs `base_tree`)、合併方向、`--only-untracked` 的三元、「後寫的贏」 |
+| `workdir/diff.c` first round | 5 | blob id comparison, mode comparison, `NULL` tree = empty tree, merge-join's comparison direction |
+| `workdir/diff.c` tail | 13 | `index_group_end`'s group advancement, each of the three builders' **own** conflict behavior, the second row taking stage 2 (goes red if switched to stage 1), `-2` must not be collapsed into `-1`, both directions of the content comparison |
+| `cmd_status.c` / `status.c` / `quote.c` | 9 | the seven unmerged labels and codes, the three folding rules, porcelain's space-quoting, binary search's `/` boundary, `--ignored`'s negative assertion |
+| `cli/diff_out.c` | 11 | graph's `total<2` floor and tie-breaking direction, truncation pushed to `/`, CJK column width, binary counting toward but unmerged not counting toward `files changed`, the `files_changed > 0` gate |
+| `cli/cmd_stash.c` | 4+ | the phantom-deletion fix (`NULL` vs `base_tree`), the merge direction, `--only-untracked`'s ternary, "whichever is written later wins" |
 
-**三條特別值得記的結果:**
+**Three results especially worth recording:**
 
-1. **逐站點才看得見的死角**:`sg_chunk_effective_id` 有兩個呼叫站點,站點 A 有覆蓋、
-   站點 B **退出碼 0 零 FAIL**。若用 `/g` 一次打兩站,整體會變紅、結論會是「已驗過」。
-   站點 B 在真實使用中一定會走到(commit 過的 chunked 檔案,tree 裡存的是 pointer id),
-   沒有正規化的話**每個未修改的大檔案都會被誤報成有變更**。已補測試。
-2. **被大書特書的規則反而沒測試**:`-u` 與 `--only-untracked`「後寫的贏」有二十行註解、
-   commit 訊息專段、兩種順序都實測過——而沒有任何測試同時給兩個旗標。
-   廢掉整條規則,9 個測試全過。已補測試。
-3. **「拿掉守衛」多半會崩,改成「讓守衛回傳錯誤碼」才驗得到**:驗
-   `tree_id == NULL` 的語意時,整段拿掉會 segfault(rc 139、零 FAIL 行),
-   具名檢查根本沒跑到;保留守衛但讓它 `return -1`,
-   `test_null_tree_is_empty_tree` 立刻紅在該紅的地方。
+1. **A blind spot only visible site by site**: `sg_chunk_effective_id` has two call sites, site A
+   had coverage, site B produced **exit code 0, zero FAILs.** Using `/g` to hit both sites at once
+   would have turned the overall result red, with the conclusion "already verified." Site B is
+   definitely exercised in real usage (a committed chunked file has its pointer id stored in the
+   tree), and without normalization **every unmodified large file would be misreported as
+   changed.** A test has been added.
+2. **A rule given extensive documentation had no test at all**: `-u` and `--only-untracked`'s
+   "whichever is written later wins" had twenty lines of comments, a dedicated commit-message
+   section, both orders individually measured -- and no test ever passed both flags at once.
+   Gutting the entire rule left all 9 tests passing. A test has been added.
+3. **"Removing the guard" usually crashes; only "making the guard return an error code" is
+   testable**: verifying `tree_id == NULL`'s semantics, removing the whole section causes a
+   segfault (rc 139, zero FAIL lines), never even reaching the named check; keeping the guard but
+   making it `return -1` instantly turns `test_null_tree_is_empty_tree` red for the right reason.
 
-`--stat` 的 `W*3/8` 夾擠常數**刻意驗在 interop 而不是單元測試**:單元測試的預期字串
-有一部分是從被測程式自己的輸出抄進去的,那種斷言對「實作與真 git 不符」零鑑別力。
-以 COLUMNS 40/60/80/120 與真 git 並排之後,同一條 mutation 讓其中三條變紅
-(120 那條不觸發夾擠,綠得有道理)。
+`--stat`'s `W*3/8` squeeze constant was **deliberately verified via interop rather than unit
+tests**: a unit test's expected string is partly copied from the tested program's own output, an
+assertion type with zero discriminating power against "the implementation doesn't match real
+git." Compared side by side with real git at COLUMNS 40/60/80/120, the same mutation turned three
+of them red (the 120 one doesn't trigger the squeeze, staying green for the right reason).
 
-### 冷讀審查找到的:一個真死角(規則是對的,但沒有人守著)
+### Caught by a cold-read review: a real blind spot (the rule was correct, but nothing guarded it)
 
-併入 master 之後補了一輪第三方冷讀。**沒有找到記憶體正確性問題**——`pos` 陣列在
-六條早期 return 與 `goto done` 上的釋放、`sg_pathspec_add` 的兩條 realloc 失敗路徑、
-`sg_diff_list_filter` 就地壓縮的 free 順序、`sg_quote_path_delimited` 的 4 槽借用規則、
-`spec_matches` 的 `spec[slen-1]`/`path[slen]` 索引,逐條核過都成立。
+After merging into master, a round of third-party cold reading was added. **No memory-correctness
+issues found** -- the `pos` array's release across six early returns and a `goto done`,
+`sg_pathspec_add`'s two realloc failure paths, `sg_diff_list_filter`'s free ordering during
+in-place compaction, `sg_quote_path_delimited`'s 4-slot borrowing rule, and `spec_matches`'s
+`spec[slen-1]`/`path[slen]` indexing all held up when checked one by one.
 
-但它指出一件我沒想到的事:`spec_matches` 的規則 1/2(字面量比對)是**無條件**跑的,
-並沒有以 `!has_wildcard(spec)` 為前提。於是一個**真的叫 `o[tx]her` 的目錄**會被
-spec `o[tx]her` 用目錄前綴規則遞迴進去——這看起來與「含萬用字元的 spec 沒有目錄前綴
-規則」矛盾。
+But it pointed out something not anticipated: `spec_matches`'s rules 1/2 (literal comparison) run
+**unconditionally**, not conditioned on `!has_wildcard(spec)`. So a directory **literally named**
+`o[tx]her` would get recursed into by the spec `o[tx]her` via the directory-prefix rule -- which
+looked like it contradicted "a spec containing a wildcard has no directory-prefix rule."
 
-先實測再說:真 git 2.55.0 對 `git diff -- 'o[tx]her'` 印出 `o[tx]her/f.txt`,
-對 `st*ar` 印出 `st*ar/g.txt`。**sg 的行為與 git 完全一致,程式碼是對的**——這正是
-git `match_pathspec_item` 的順序(`ps_strncmp` 先、`wildmatch` 後),而「規則 3 不加
-規則 2」講的是*萬用字元那一次比對*不吃目錄前綴,不是「含萬用字元的 spec 一律不吃」。
+Measurement first: real git 2.55.0 for `git diff -- 'o[tx]her'` prints `o[tx]her/f.txt`, and for
+`st*ar` prints `st*ar/g.txt`. **sg's behavior matches git exactly, the code was correct** -- this
+is exactly git's `match_pathspec_item`'s order (`ps_strncmp` first, `wildmatch` after), and "rule
+3 doesn't add rule 2" describes *that one wildcard comparison* not taking the directory prefix,
+not "a spec containing a wildcard never takes it at all."
 
-**真正的問題是沒有任何測試守著這件事。** 定向 mutation 證實:把規則 1/2 收窄成
-`!has_wildcard(spec) && ...`(那正是看到 `test_wildcards` 那幾條負面檢查之後最自然的
-「修法」),interop **1500/1500 全過、退出碼 0**——不是「打不到」,是**真死角**。
+**The real problem was that nothing tested this at all.** A directed mutation confirmed it:
+narrowing rules 1/2 to `!has_wildcard(spec) && ...` (exactly the most natural "fix" someone would
+make after seeing `test_wildcards`'s negative checks), interop stayed **1500/1500 all passing,
+exit code 0** -- not "can't reach it," a **real blind spot.**
 
-補了兩組(單元 4 條 + interop 3 條 cmp + 2 條對照),並重跑同一條 mutation 確認現在
-會紅:單元 4 條、interop 4 條。同時重跑反向 mutation,確認那三條「必須是空的」檢查
-**仍然**有鑑別力——新案例沒有反過來把過寬規則合法化。**兩個方向要同時釘住,
-只釘一邊的話另一邊會在下一次「順手統一」時無聲消失。**
+Two check groups were added (4 unit + 3 interop cmp + 2 controls), and the same mutation was
+rerun to confirm it now goes red: 4 unit checks, 4 interop checks. The reverse mutation was also
+rerun, confirming those three "must be empty" checks **still** have discriminating power -- the
+new cases didn't accidentally legitimize the over-broad rule in the other direction. **Both
+directions need to be pinned at the same time; pinning only one leaves the other to silently
+vanish the next time someone "helpfully unifies" it.**
 
-其餘發現與裁決:
+Other findings and rulings:
 
-| 發現 | 裁決 |
+| Finding | Ruling |
 |---|---|
-| 過長的 pathspec 會被誤報成「在版本庫之外」(`sg_resolve_repo_path_allow_root` 把 OOM 與越界都回 NULL) | 既有共用函式的既有行為,`pathspec.h` 已明文承認;Phase 28 是第一個把**任意使用者字串**餵給它的呼叫端,所以更容易被感知。**不改**,收在已知缺口 |
-| `--cached && rev2` 的 usage 檢查移到 repo 探索之後 | 良性:與其他所有 `sg_cmd_*` 一致(都先 `sg_require_git_dir`),而且真 git 在非 repo 目錄也是先報 not-a-repo |
-| `report_pathspec_error` 的 `default:` 會讓未來新增的錯誤碼靜默印成「在版本庫之外」 | **已修**:改成列舉每個值,`-Wswitch` 因此守得住 |
+| An overly long pathspec gets misreported as "outside the repository" (`sg_resolve_repo_path_allow_root` returns NULL for both OOM and out-of-bounds) | An existing behavior of an existing shared function, already explicitly acknowledged by `pathspec.h`; Phase 28 is the first call site to feed it **arbitrary user strings**, so it's more noticeable here. **Not changed**, recorded as a known gap |
+| The `--cached && rev2` usage check moved to after repo discovery | Benign: consistent with every other `sg_cmd_*` (all call `sg_require_git_dir` first), and real git also reports not-a-repo first outside a repo directory |
+| `report_pathspec_error`'s `default:` would silently print "outside the repository" for any future new error code | **Fixed**: switched to enumerating every value, so `-Wswitch` now guards it |
 
-⚠ 兩條 mutation 的結果要照實記,不可以當成「已驗過」:
+Warning: two mutations' results must be recorded honestly, not counted as "already verified":
 
-- **M10**(把 `free` 搬到 keep 分支製造 double-free)退出碼 133 被抓到,但抓到它的是
-  **崩潰**,不是任何具名斷言。它證明的是「記憶體被亂用會出事」,**不**證明有哪條檢查
-  在驗釋放順序。
-- **M9**(拿掉 `reserve()` 失敗分支裡的 `free(rel)`)**無法用現有測試驗證**:那條路徑
-  只有 realloc 失敗才走得到,本專案沒有故障注入。這條防線只有冷讀,不宣稱有覆蓋。
+- **M10** (moving a `free` into the keep branch to create a double-free) was caught by exit code
+  133, but what caught it was the **crash**, not any named assertion. It proves "misusing memory
+  causes trouble," it does **not** prove any check verifies the free ordering.
+- **M9** (removing the `free(rel)` in `reserve()`'s failure branch) **cannot be verified with
+  existing tests**: that path is only reachable if realloc fails, and this project has no fault
+  injection. This defense only has a cold read behind it, and no coverage is claimed.
 
-### 這一輪刻意沒做的
+### Deliberately not done this round
 
-- **patch body 不追真 git**:整檔仍是單一 hunk `@@ -1,N +1,M @@`,沒有 `index` 行、
-  沒有 `/dev/null`、沒有 3 行 context 的多 hunk 切分、沒有 `\ No newline at end of file`。
-  因此 unmerged 列在 patch 格式**直接跳過**(真 git 印 `diff --cc` 合併格式)。
-  機器可讀的四種格式才是這一輪拿來與 git 逐位元組比對的。
-- **沒有 pathspec 過濾**(Phase 28 已補)、**沒有 rename 偵測**(`sg_status_kind` 連資料結構都容不下)。
-- **符號連結**在三條走訪路徑都不列出——既有行為,與本專案「symlink 刻意延後」一致。
-- **index 同時有 stage 0 與 stage 1/2/3 時**,殘留的衝突條目被靜默略過。sg 自己的寫入
-  路徑產生不出那個狀態(`cmd_add.c` 寫 stage 0 前必先 `sg_index_remove_all_stages`),
-  失敗方向是「安全但不完整」,已在 `index_group_end` 上方註明。
+- **The patch body doesn't chase real git**: an entire file is still a single hunk
+  `@@ -1,N +1,M @@`, with no `index` line, no `/dev/null`, no 3-line-context multi-hunk splitting,
+  no `\ No newline at end of file`. As a result, unmerged rows are **skipped outright** in patch
+  format (real git prints a `diff --cc` combined format). The four machine-readable formats are
+  what this round used for byte-for-byte comparison against git.
+- **No pathspec filtering** (added in Phase 28), **no rename detection** (`sg_status_kind`'s data
+  structure can't even hold it).
+- **Symlinks** aren't listed by any of the three traversal paths -- a pre-existing behavior,
+  consistent with this project's deliberately deferred symlink support.
+- **When the index has both a stage 0 and stages 1/2/3 at the same time**, the leftover conflict
+  entry is silently skipped. sg's own write paths can never produce that state (`cmd_add.c` always
+  calls `sg_index_remove_all_stages` before writing stage 0), and the failure direction is "safe
+  but incomplete," noted above `index_group_end`.
 
-## Phase 26:patch 的位元組保真
+## Phase 26: byte-for-byte fidelity of the patch
 
-Phase 25 把 diff 拆成「找變更」與「印出來」兩層,但 patch body 刻意沒追真 git:
-整檔單一 hunk、沒有 `index` 行、沒有多 hunk 切分。代價是 `tests/interop.sh` 對 patch
-只能 grep header 行再比對——**六種輸出格式裡最主要的那一種,body 完全沒有 oracle**。
+Phase 25 split diff into two layers, "finding changes" and "printing them," but the patch body
+deliberately didn't chase real git: an entire file was a single hunk, no `index` line, no
+multi-hunk splitting. The cost was that `tests/interop.sh` could only grep header lines and
+compare for patch -- **the most significant of the six output formats had no oracle for its body
+at all.**
 
-這一輪把 patch 補到與真 git 逐位元組相同,並把 interop 升級成全輸出 `cmp`。
+This round brought the patch to byte-for-byte parity with real git, and upgraded interop to a
+full-output `cmp`.
 
-### 實測到的 oracle(真 git 2.55.0,`core.fileMode=true`)
+### Oracle facts confirmed by measurement (real git 2.55.0, `core.fileMode=true`)
 
-| 情況 | 輸出 |
+| Case | Output |
 |---|---|
-| 純內容修改 | `index <old7>..<new7> <mode>` |
-| 新增 | `new file mode 100644` + `index 0000000..<new7>` + `--- /dev/null` |
-| 刪除 | `deleted file mode 100644` + `index <old7>..0000000` + `+++ /dev/null` |
-| 純 chmod | 只有 `old mode`/`new mode` —— **沒有 index 行、沒有 `---`/`+++`、沒有 hunk** |
-| chmod + 內容 | `old mode`/`new mode` + `index <old7>..<new7>`(**無** mode 後綴) |
-| 二進位 | (mode 行,若有)+ `index <old7>..<new7>[ <mode>]` + `Binary files a/f and b/f differ` |
+| Pure content modification | `index <old7>..<new7> <mode>` |
+| Addition | `new file mode 100644` + `index 0000000..<new7>` + `--- /dev/null` |
+| Deletion | `deleted file mode 100644` + `index <old7>..0000000` + `+++ /dev/null` |
+| Pure chmod | Only `old mode`/`new mode` -- **no index line, no `---`/`+++`, no hunk** |
+| chmod + content | `old mode`/`new mode` + `index <old7>..<new7>` (**no** mode suffix) |
+| Binary | (mode line, if any) + `index <old7>..<new7>[ <mode>]` + `Binary files a/f and b/f differ` |
 
-- **index 行的 mode 後綴,只在這個 entry 沒印過任何 mode 行時才出現。** 這是單一規則,
-  不是四種情況各判一次;實作上由 `wrote_mode_line` 一個布林決定,不要在兩處各算一遍。
-- 縮寫固定 **7 hex**(實測 loose object 數 10/100/500/1000/2000/4000 都還是 7,
-  本專案不讀 `~/.gitconfig`,不做動態 abbrev)。
-- 不存在的一側是 `0000000`;**空檔是 `e69de29`**。「存在但空」與「不存在」是兩回事。
-- **純 chmod 在機器格式裡是會列出來的**:`--stat` 印 ` f | 0`、`--numstat` 印 `0\t0\tf`、
-  `--shortstat` 印 ` 1 file changed, 0 insertions(+), 0 deletions(-)`、`--name-status` 印 `M`。
+- **The index line's mode suffix only appears if no mode line has already been printed for this
+  entry.** This is a single rule, not something decided separately for each of the four cases;
+  implemented via a single boolean, `wrote_mode_line` -- don't compute it separately in two
+  places.
+- The abbreviation is a fixed **7 hex digits** (measured across loose object counts of
+  10/100/500/1000/2000/4000, always still 7; this project doesn't read `~/.gitconfig`, so there's
+  no dynamic abbrev).
+- The side that doesn't exist is `0000000`; **an empty file is `e69de29`.** "Exists but empty" and
+  "doesn't exist" are two different things.
+- **A pure chmod does still get listed in the machine formats**: `--stat` prints ` f | 0`,
+  `--numstat` prints `0\t0\tf`, `--shortstat` prints
+  ` 1 file changed, 0 insertions(+), 0 deletions(-)`, `--name-status` prints `M`.
 
-hunk 的部分:
+The hunk part:
 
-- `@@ -s,c +s,c @@`,**`c == 1` 省略 `,c`**,**`c == 0` 時 `s` 寫 0**(`@@ -1,16 +0,0 @@`)。
-- context = 3,兩處變更間隔 **≤6 合併、≥7 切開**(實測 5/6 合併、7/8/9 切開)。
-- 函式名後綴:往回找第一個開頭屬於 `[A-Za-z_$]` 的行,整行原樣接在 `@@ ` 之後。
-  **不算**的開頭實測有:數字、`#`、`/`、`}`、`.`、`@`、空白、tab。
-  找不到時**行尾沒有多餘空格**(用 `od -c` 確認的,不要憑看起來判斷)。
-- `\ No newline at end of file` 緊接在缺換行的那一行之後,**不計入 range**。
-  「文字相同但換行狀態不同」算**不同的行**,所以行相等判斷要看 `has_nl`——但
-  `sg_diff_lines_equal` 被 `workdir/merge.c` 共用,不能改它的語意,因此另開了一支嚴格版。
+- `@@ -s,c +s,c @@`, with **`c == 1` omitting `,c`**, and **`c == 0` writing `s` as 0**
+  (`@@ -1,16 +0,0 @@`).
+- context = 3, two changes are **merged if <=6 lines apart, split if >=7** (measured: 5/6 merge,
+  7/8/9 split).
+- The function-name suffix: scans backward for the first line whose first character is in
+  `[A-Za-z_$]`, appending that whole line verbatim right after `@@ `. Measured characters that
+  **don't count**: digits, `#`, `/`, `}`, `.`, `@`, whitespace, tab. When nothing is found, **there
+  is no trailing extra space at end of line** (confirmed with `od -c`, don't judge by appearance).
+- `\ No newline at end of file` immediately follows the line missing a newline, and **doesn't
+  count toward the range.** "Identical text but different newline state" counts as **a different
+  line**, so line-equality checks must look at `has_nl` -- but `sg_diff_lines_equal` is shared with
+  `workdir/merge.c`, whose semantics can't be changed, so a separate strict version was added.
 
-### 資料層先前根本印不出 `index` 行
+### The data layer previously couldn't print an `index` line at all
 
-這一輪最容易被低估的地方:`index` 行不是渲染層的問題。`sg_diff_side` 的 WORKDIR 側
-**`mode` 恆 0、`id` 從不填**,而 `sg diff` 不帶參數(最常用的那條)兩側都經過它。
-諷刺的是 `sg_hash_file_blob` 其實**已經算過**那個雜湊,比完就丟。
+The most easily underestimated part of this round: the `index` line wasn't a rendering-layer
+problem. `sg_diff_side`'s WORKDIR side had **`mode` always 0, `id` never filled in**, and `sg
+diff` with no arguments (the most commonly used invocation) has both sides going through it.
+Ironically, `sg_hash_file_blob` had **already computed** that hash, just to discard it after
+comparing.
 
-補上 id 與 mode 之後,`sg diff` 第一次看得到純 chmod。**但 `sg status` 仍然看不到**——
-它走 `src/workdir/status.c` 的 `sg_status_diff_unstaged`,是**另一份實作**,不經過
-`sg/diff.h` 的任何建構器、也完全不比較 `.mode`。這是本輪新發現的重複,分歧仍然開著。
+After adding id and mode, `sg diff` could see a pure chmod for the first time. **But `sg status`
+still can't** -- it goes through `src/workdir/status.c`'s `sg_status_diff_unstaged`, a
+**separate implementation** that goes through none of `sg/diff.h`'s builders and never compares
+`.mode` at all. This is a newly discovered duplication this round, and the divergence remains
+open.
 
-### 對齊:壓縮與縮排啟發式
+### Alignment: compaction and the indent heuristic
 
-`diff.indentHeuristic` **預設開啟**,而且真的會改變 hunk 位置(同一輸入,開/關差出
-`@@ -3,6 +3,10 @@` vs `@@ -4,5 +4,9 @@`)。這一層與真 git 的 `xdiff/xdiffi.c`
-**逐條核對過**,不是憑記憶:14 個評分常數、`measure_split`、`get_indent` 的空白處理、
-以及 `xdl_change_compact` 驅動迴圈的三件事——`else if` 鏈的優先權
-(`end_matching_other` **壓過**啟發式)、三個滑動下界(`earliest_end`、
-`g.end - groupsize - 1`、`g.end - MAX_SLIDING`)、以及 `<=0` 讓最下方的位置贏平手。
+`diff.indentHeuristic` is **enabled by default**, and genuinely changes hunk placement (the same
+input produces `@@ -3,6 +3,10 @@` with it off versus `@@ -4,5 +4,9 @@` with it on). This layer was
+**checked against real git's `xdiff/xdiffi.c` line by line**, not from memory: 14 scoring
+constants, `measure_split`, `get_indent`'s whitespace handling, and three things governing
+`xdl_change_compact`'s driving loop -- the `else if` chain's priority (`end_matching_other`
+**overrides** the heuristic), three sliding lower bounds (`earliest_end`,
+`g.end - groupsize - 1`, `g.end - MAX_SLIDING`), and `<=0` letting the bottommost position win
+ties.
 
-git 不把刪除側與新增側綁在一起:兩者分別住在各自檔案的 `changed` bitmap 裡、
-**各自獨立滑動**,再由 `end_matching_other` 決定要不要保持對齊。sg 原本綁成一對,
-於是同時含刪除與新增的群組**完全不能滑動**——那是殘留歧異的主要來源。
+git doesn't tie the deletion side and the addition side together: they each live in their own
+file's `changed` bitmap, **sliding independently**, with `end_matching_other` deciding whether to
+keep them aligned. sg used to bind them into a pair, so a group containing both a deletion and an
+addition **couldn't slide at all** -- the main source of the residual divergence.
 
-### 殘留的 2–3%,以及它**不是**什麼
+### The residual 2-3%, and what it is **not**
 
-fuzzer 實測(見下)剩約 2–3% 的位置歧異。**成因不在壓縮層**,那一層已經逐條對過原始碼。
-它在**底層對齊演算法**:sg 用 LCS 動態規劃回溯,git 預設用 Myers,兩者都最小但配對不同,
-而壓縮只正規化位置、不正規化配對。
+Fuzzer measurement (below) leaves about 2-3% of positional divergence. **The cause is not in the
+compaction layer**, which has already been checked line by line against the source. It's in the
+**underlying alignment algorithm**: sg uses LCS dynamic-programming backtracking, git defaults to
+Myers, both are minimal but pair up differently, and compaction only normalizes position, not
+pairing.
 
-證據:把 11 個殘留案例拿去跟 git 的其他演算法比,**6 個與 `git diff --histogram`
-逐位元組相同**(其中 3 個也等於 `--patience`),5 個不對應任何一種。
+Evidence: comparing the 11 residual cases against git's other algorithms, **6 were byte-for-byte
+identical to `git diff --histogram`** (3 of those also matched `--patience`), 5 corresponded to
+none of them.
 
-⚠ **下一個人不要去找一個不存在的評分 bug。** 要吃掉這 2–3% 得實作 Myers 特有的切分選擇,
-那是換演算法,不是調參。
+Warning: **the next person should not go looking for a scoring bug that doesn't exist.** Eating
+this 2-3% requires implementing Myers-specific split selection -- a different algorithm, not a
+tuning parameter.
 
-### 驗證儀器:`tests/fuzz_diff.py`
+### Verification instrumentation: `tests/fuzz_diff.py`
 
-其他五種 diff 格式都由「哪些路徑變了」完全決定,手寫 fixture 就釘得死。**patch body 不是**:
-當同一個最小編輯腳本可以寫在好幾個位置時,git 會挑一個,而「挑哪一個」出自壓縮與啟發式。
-fixture 只能釘住有人想得到的對齊,而**想不到的那些正是實作會漂走的地方**。
+The other five diff formats are fully determined by "which paths changed," so hand-written
+fixtures pin them down completely. **The patch body is not**: when the same minimal edit script
+can be written at several positions, git picks one, and "which one" comes from compaction and the
+heuristic. A fixture can only pin down alignments someone thought of, and **the ones nobody
+thought of are exactly where the implementation drifts.**
 
-所以生成器刻意偏向歧異:重複區塊、不同縮排、複製既有文字的插入。它拿真 git 當 oracle
-做逐位元組比對。收斂曲線(seeds 0-199):
+So the generator was deliberately biased toward ambiguity: repeated blocks, varying indentation,
+insertions that duplicate existing text. It compares byte-for-byte against real git as the
+oracle. Convergence curve (seeds 0-199):
 
-| 階段 | mismatch |
+| Stage | Mismatches |
 |---|---|
-| 只做壓縮 | 40 |
-| 加縮排啟發式 | 33 |
-| 修 `score_cmp` 結構(effective_indent 主導) | 27 |
-| 改成先合併再評分 | 16 |
-| 兩側各自獨立滑動 | 4 |
+| Compaction only | 40 |
+| Added the indent heuristic | 33 |
+| Fixed `score_cmp`'s structure (effective_indent dominates) | 27 |
+| Switched to merge-then-score | 16 |
+| Each side slides independently | 4 |
 
-三個不相交的 seed 區間比率一致(2.0% / 3.0% / 2.3%),不是對 seed 0-199 過擬合。
+Three disjoint seed ranges had consistent rates (2.0% / 3.0% / 2.3%), not an overfit to seeds
+0-199.
 
-⚠ **`--max-failures 0` 是刻意加的**:預設停在前 3 個 mismatch(那是除錯模式),
-而收斂需要的是**比率**——「停在 3」不是比率,每次跑都回報同一個數字,看起來像進度停滯。
+Warning: **`--max-failures 0` was deliberately added**: the default stops at the first 3
+mismatches (that's the debug mode), while convergence needs a **rate** -- "stops at 3" isn't a
+rate, and would report the same number on every run, looking like stalled progress.
 
-### 兩個踩過的坑
+### Two pitfalls hit along the way
 
-**一個為了讓測試變綠而調的參數,即使測試真的變綠了,也可能什麼都沒修好。**
-`RELATIVE_INDENT_PENALTY` 曾被從 `-4` 翻成 `+4`,理由是「這樣 A2 錨點就過了」。
-真 git 的原始碼裡它是 `-4`(是**獎勵**不是懲罰)。那個 `+4` 是在補償另一個 bug
-(群組不能各自滑動);等真正的 bug 修好,常數改回 `-4`,錨點照樣過。
+**A parameter tuned to make a test go green can turn out to have fixed nothing at all, even
+though the test really did go green.** `RELATIVE_INDENT_PENALTY` was once flipped from `-4` to
+`+4`, on the grounds that "this makes anchor A2 pass." In real git's source it's `-4` (a
+**bonus**, not a penalty). That `+4` was compensating for a different bug (groups couldn't slide
+independently); once the real bug was fixed, the constant was changed back to `-4`, and the
+anchor still passed.
 
-**拿 diff 去比對兩份 diff,會把「整體位移」呈現成「內容不同」。**
-一度據此判斷 sg 與 git 配出了不同的編輯腳本、需要改寫演算法。實際去比對兩邊
-`+`/`-` 行的**多重集合**之後:當時 33 個殘留**全部**是位移,不同腳本 **0 個**。
-要分辨這兩者就比多重集合,不要看 diff-of-diffs——渲染層本身就會製造那個假象。
+**Diffing two diffs against each other renders an "overall shift" as "different content."** At
+one point this was used to conclude sg and git had computed different edit scripts, requiring an
+algorithm rewrite. After actually comparing the two sides' `+`/`-` lines as **multisets**: at the
+time, **all 33** residual cases were shifts, with **0** genuinely different scripts. To
+distinguish the two, compare multisets, don't look at a diff-of-diffs -- the rendering layer
+itself manufactures that illusion.
 
-### 已知限制
+### Known limitations
 
-- 衝突路徑的 `diff --cc` 合併格式仍然直接跳過(`print_patch` 開頭 `continue`),未實作。
-- `sg diff` 仍不支援 pathspec(`sg diff -- <path>` 直接印 usage)。**Phase 28 已補。**
-- rename 偵測沒做,`sg_diff_side` 的三態也還容不下。
-- 讀不到工作目錄檔案時,sg 不像真 git 那樣中止整個指令(`fatal: cannot hash`,退出碼 128),
-  而是把該列留在清單裡、讓渲染層印出指名該檔的警告。**修改/刪除**那兩條路徑會把它
-  當成刪除(與 `sg_status_diff_unstaged` 一致),**不印警告**——這是既有行為,仍開著。
-  **新增**那條路徑會印警告,代價是 header 帶一個 `0000000` 的新 id。
-- 測試用「把追蹤路徑做成目錄」製造讀取失敗(避開 `chmod 000`,root 執行會失效)。
-  macOS 實測 `fopen` 成功、`fread` 設 `ferror`/EISDIR;**Linux 只由 CI 覆蓋**。
+- Conflicted paths' `diff --cc` combined format is still skipped outright
+  (`print_patch` starts with a `continue`), unimplemented.
+- `sg diff` still doesn't support pathspec (`sg diff -- <path>` just prints usage). **Added in
+  Phase 28.**
+- Rename detection isn't done, and `sg_diff_side`'s three states still can't hold it.
+- When a working-directory file can't be read, sg doesn't abort the entire command the way real
+  git does (`fatal: cannot hash`, exit code 128) -- it keeps the row in the list and has the
+  rendering layer print a warning naming the file. The **modified/deleted** paths treat it as a
+  deletion (consistent with `sg_status_diff_unstaged`), **printing no warning** -- a pre-existing
+  behavior, still open. The **addition** path prints a warning, at the cost of the header carrying
+  a new id of `0000000`.
+- Tests induce a read failure by "turning a tracked path into a directory" (avoiding
+  `chmod 000`, which doesn't work when run as root). Measured on macOS: `fopen` succeeds and
+  `fread` sets `ferror`/EISDIR; **Linux is only covered by CI.**
 
-## Phase 27:`sg status` 與 `sg diff` 對同一個問題只留一個答案
+## Phase 27: `sg status` and `sg diff` keep only one answer for the same question
 
-Phase 26 補完 patch 保真時,順手發現 `sg diff` 看得到純 chmod 而 `sg status` 看不到。
-成因不是漏改一行,而是**兩份獨立實作**在回答同一個問題:
-`sg_status_diff_unstaged`(`src/workdir/status.c`)與 `sg_diff_index_workdir`
-(`src/workdir/diff.c`)都在算「index 與工作目錄之間有哪些路徑變了」。
+While finishing up patch fidelity in Phase 26, it was noticed in passing that `sg diff` could see
+a pure chmod while `sg status` couldn't. The cause wasn't a missed line -- it's **two independent
+implementations** answering the same question: both `sg_status_diff_unstaged`
+(`src/workdir/status.c`) and `sg_diff_index_workdir` (`src/workdir/diff.c`) compute "which paths
+changed between the index and the working directory."
 
-### 先列舉,再收斂
+### Enumerate first, then converge
 
-沒有直接改。先寫 `tests/test_status_diff_parity.c`(具名案例 + 隨機情境,體例照
-`tests/test_fuzz_pack.c`),把兩支的輸出正規化後並排比對,**列舉出所有分歧**。
+Not changed directly at first. `tests/test_status_diff_parity.c` was written first (named cases
+plus random scenarios, in the style of `tests/test_fuzz_pack.c`), normalizing both functions'
+output and comparing them side by side, **enumerating every divergence.**
 
-理由:mode 那一個是**偶然撞見**的——沒有任何測試會抓到它。既然如此,沒有理由相信它是
-唯一的一個。盲目收斂的風險是把一個沒人知道存在的行為差異當成 bug 修掉、或當成 feature 留著,
-而三個呼叫端裡有兩個是安全閘門。
+Reasoning: the mode one was found **by accident** -- no test would have caught it. Given that,
+there's no reason to believe it's the only one. Converging blindly risks either "fixing" an
+unknown-until-now behavioral difference that was actually a feature, or leaving an actual bug in
+place -- and two of the three call sites are safety gates.
 
-結果:**恰好三類**,5000 輪隨機沒有再多。
+Result: **exactly three categories**, with 5000 random rounds finding no more.
 
-| # | 分歧 | 裁決 |
+| # | Divergence | Ruling |
 |---|---|---|
-| mode | diff 比較、status 完全不看 | status 側的 bug(真 git 對純 chmod 印 ` M`) |
-| chunk pointer 解不開 | diff 優雅降級、status 回 `-1` 放棄整個掃描 | status 側的 bug |
-| unmerged | status 跳過所有非 stage-0、diff 產生 unmerged 列 + stage-2 對照列 | **刻意分歧,保留** |
+| Mode | diff compares it, status doesn't look at it at all | A bug on status's side (real git prints ` M` for a pure chmod) |
+| Chunk pointer can't be resolved | diff degrades gracefully, status returns `-1`, abandoning the entire scan | A bug on status's side |
+| Unmerged | status skips every non-stage-0 entry; diff produces an unmerged row plus a stage-2 comparison row | **A deliberate divergence, kept** |
 
-第三類保留的理由:`cmd_status.c` 有自己的 Unmerged paths 區段。兩支的標頭註解都已寫明。
+Reason the third category was kept: `cmd_status.c` has its own Unmerged paths section. Both
+functions' header comments already state this.
 
-### 收斂之後的行為改變
+### Behavioral changes after converging
 
-`sg_status_diff_unstaged` 成為 `sg_diff_index_workdir` 的薄轉接層。三個呼叫端:
-`cmd_status.c` 與 `apply.c` 的**兩道髒工作目錄閘門**。所以這不只是重構:
+`sg_status_diff_unstaged` became a thin adapter over `sg_diff_index_workdir`. Three call sites:
+`cmd_status.c`, and **the two dirty-working-directory gates** in `apply.c`. So this wasn't just a
+refactor:
 
-- `sg status` 開始回報純 chmod。
-- **`sg switch` / `sg reset --hard` / `sg merge` / `sg rebase` 開始把純 chmod 算成髒。**
-  實測真 git 同樣會擋(`error: Your local changes to the following files would be
-  overwritten by checkout`),對照組(工作目錄乾淨、其他條件相同)則正常切換。
+- `sg status` started reporting pure chmods.
+- **`sg switch` / `sg reset --hard` / `sg merge` / `sg rebase` started treating a pure chmod as
+  dirty.** Measurement confirms real git blocks it the same way
+  (`error: Your local changes to the following files would be overwritten by checkout`), while a
+  control run (clean working directory, otherwise identical) switches normally.
 
-⚠ **閘門的失敗方向要親自確認,不能假設。** 收斂前 chunk pointer 解不開會讓函式回 `-1`,
-而 `apply.c` 寫的是 `dirty = !unstaged_ok || ...`——判斷不出來就當成髒,fail closed。
-收斂後那條路徑不再回 `-1`,改成把該路徑列成有變更。結果仍是髒,但**機制從失敗保護變成正常回報**。
-逐條查證過沒有引入 fail-open:路徑截斷仍回 `-1`(`diff.c:363`),chunk 失敗列在清單裡,
-hash 失敗變 ABSENT 也列在清單裡——沒有「回 0 又把路徑省略」的路徑。
+Warning: **the direction of a gate's failure has to be confirmed personally, never assumed.**
+Before converging, an unresolvable chunk pointer made the function return `-1`, and `apply.c` had
+`dirty = !unstaged_ok || ...` -- an inconclusive result was treated as dirty, fail-closed. After
+converging, that path no longer returns `-1`, and instead lists that path as changed. The result
+is still dirty, but **the mechanism shifted from failure protection to normal reporting.**
+Verified item by item that no fail-open was introduced: a truncated path still returns `-1`
+(`diff.c:363`), a chunk failure gets listed, and a hash failure becomes ABSENT and gets listed too
+-- there's no path that returns 0 while omitting the path silently.
 
-### 收斂帶來的一個新風險,以及它為什麼差點沒人發現
+### A new risk introduced by converging, and why it almost went unnoticed
 
-轉接層要濾掉 unmerged 路徑的 stage-2 對照列。第一版判準是**「與前一列同路徑就跳過」**。
+The adapter layer needs to filter out unmerged paths' stage-2 comparison rows. The first
+version's criterion was **"skip if the same path as the previous row."**
 
-這在正常 index 下正確,但 **`sg_index_read` 載入時不驗證排序也不去重**
-(`src/index/index.c`,它信任磁碟上的檔案)。手改或損毀的 index 可以讓同一路徑落在
-兩個不連續的群組;`index_group_end` 只合併連續的一段,於是兩個群組各產生一列,
-若中間的路徑恰好都沒有差異,兩列就會**相鄰**——第二列被當成 stage-2 對照列**靜默丟棄**。
+This is correct under a normal index, but **`sg_index_read` doesn't validate ordering or
+deduplicate on load** (`src/index/index.c`, which trusts the file on disk). A hand-edited or
+corrupted index can put the same path into two non-contiguous groups; `index_group_end` only
+merges a contiguous run, so the two groups each produce one row, and if the paths in between
+happen to have no differences, the two rows end up **adjacent** -- the second row gets silently
+dropped as if it were the stage-2 comparison row.
 
-方向很重要:舊實作在同樣情境最多是重複計算(無害),新實作是**漏報**,而它餵的正是
-`switch`/`reset --hard` 的髒判斷。判準改嚴成「**前一列是 unmerged 列且路徑相同**」即可。
+The direction matters: the old implementation, in the same scenario, would at worst double-count
+(harmless); the new implementation **under-reports**, and this feeds exactly the dirty checks for
+`switch`/`reset --hard`. Tightening the criterion to "**the previous row is an unmerged row and
+the same path**" fixes it.
 
-⚠ 改嚴之後跑 mutation:把判準改回寬鬆的,**零測試變紅**——真死角。
-情境建得出來(測試可以直接操作 `sg_index` 的陣列繞過排序插入),只是沒人建。
-`test_corrupt_index_duplicate_path_is_not_dropped` 就是補這個。
-**一個修法如果沒有任何測試能區分它與被修掉的那個 bug,那個修法等於沒有落地。**
+Warning: after tightening it, a mutation was run reverting the criterion to the loose version --
+**zero tests turned red** -- a real blind spot. The scenario is constructible (a test can
+directly manipulate `sg_index`'s array to insert past ordering), just nobody had built it.
+`test_corrupt_index_duplicate_path_is_not_dropped` fills exactly this gap. **A fix has effectively
+not landed at all if no test can distinguish it from the bug it fixed.**
 
-「非 unmerged 路徑絕不產生第二列」這個不變量已寫進 `include/sg/diff.h` 的公開合約——
-先前它只活在轉接層自己的註解裡,而未來若 `sg_diff_index_workdir` 因為新功能
-(例如 rename 偵測)讓一般路徑多出第二列,那個 bug 會是靜默的。
+The invariant "a non-unmerged path never produces a second row" has now been written into
+`include/sg/diff.h`'s public contract -- previously it only lived in the adapter layer's own
+comment, and if `sg_diff_index_workdir` ever gains a second row for an ordinary path due to a
+future feature (e.g. rename detection), that bug would otherwise be silent.
 
-### 已知的診斷降級
+### A known diagnostic downgrade
 
-收斂前 chunk pointer 解不開會讓閘門印出「無法完整判斷工作目錄狀態」;收斂後該路徑被當成
-一般 `SG_STATUS_MODIFIED` 列出,那則警告不再出現,使用者看到的和普通編輯過的檔案一樣。
-**安全性沒有退化**(仍然算髒),但在最需要準確資訊的時刻(即將覆蓋工作目錄)少了一個信號。
-已記在 `include/sg/status.h` 的合約裡。
+Before converging, an unresolvable chunk pointer made the gate print "cannot fully determine
+working directory status"; after converging, that path gets listed as an ordinary
+`SG_STATUS_MODIFIED`, and that warning no longer appears -- the user sees it just like a normal
+edited file. **No safety regression** (still counted as dirty), but at the exact moment the user
+needs accurate information most (about to overwrite the working directory), one signal is
+missing. This is recorded in `include/sg/status.h`'s contract.
 
-### harness 自己的盲點
+### A blind spot in the harness itself
 
-parity fuzzer 一開始只數「路徑有沒有被回報」,**不看 `kind`**。實測:把轉接層的
-`SG_STATUS_MODIFIED` 改成 `SG_STATUS_DELETED`,5000 輪 fuzzer 一輪都不紅,只有兩條具名測試紅。
-補上 kind 斷言後同一個 mutation 產生 619 條 FAIL。
+The parity fuzzer initially only counted "was the path reported at all," **not the `kind`.**
+Measured: changing the adapter layer's `SG_STATUS_MODIFIED` to `SG_STATUS_DELETED`, not a single
+one of 5000 fuzzer rounds went red, only two named tests did. After adding a kind assertion, the
+same mutation produced 619 FAIL lines.
 
-⚠ 補的時候期望值要**明確寫死**,不可以拿 diff 側算出來的當期望——那是自我循環,
-兩邊一起錯就驗不到,而「兩邊會不會一起錯」正是這支 harness 存在的理由。
+Warning: when adding this, the expected value must be **explicitly hardcoded**, not taken from
+what the diff side computes -- that would be self-referential, unable to catch both sides being
+wrong together, and "would both sides go wrong together" is exactly the reason this harness
+exists.
 
-## Phase 28:`sg diff` 的 pathspec
+## Phase 28: `sg diff`'s pathspec
 
-`sg diff -- <path>` 先前直接印 usage。這一輪把它補上,順帶把 `sg diff` 的引數解析
-換成真 git 那套「版本還是路徑」的消歧規則。
+`sg diff -- <path>` previously just printed usage. This round added it, and along the way
+switched `sg diff`'s argument parsing to real git's "revision or path" disambiguation rules.
 
-### 規則全部是實測來的,而且沒有一條符合直覺
+### Every rule was measured, and not one of them matches intuition
 
-開工前先拿 git 2.55.0 量了一張表(`git diff --name-only -- <spec>`,worktree 裡有
-`a.txt`、`sub/b.txt`、`sub/deep/c.txt`、`other/d.c`、`e.c`,全部都有改動):
+Before starting, a table was measured against git 2.55.0 (`git diff --name-only -- <spec>`, with
+a worktree containing `a.txt`, `sub/b.txt`, `sub/deep/c.txt`, `other/d.c`, `e.c`, all modified):
 
-| spec | git 的答案 | 為什麼會猜錯 |
+| spec | git's answer | Why it's easy to guess wrong |
 |---|---|---|
-| `sub` | `sub/b.txt`, `sub/deep/c.txt` | 目錄前綴,符合直覺 |
-| `*.c` | `e.c`, `other/d.c` | **`*` 會跨 `/`**——pathspec 用的是 WM_PATHNAME 關掉的 wildmatch |
-| `sub*` | `sub/b.txt`, `sub/deep/c.txt` | 中的原因是上面那條,**不是**遞迴進目錄 |
-| `o[tx]her` | (空) | 含萬用字元就**沒有**目錄前綴規則 |
-| `su?` / `s*b` / `sub/dee?` | (空) | 同上,三個都是空的 |
-| `sub/` | `sub/b.txt`, `sub/deep/c.txt` | 尾綴 `/` = 「這個名字底下的東西」 |
-| `a.txt/` | (空) | 同一條規則的另一半:一般檔案底下沒有東西 |
-| `lit*st`(檔名真的含 `*`) | `lit*st` | 字面量比對先跑,萬用字元字元被當成自己 |
-| `nosuch` | (空,退出 0) | `git diff` 對匹配不到的 pathspec **不報錯** |
-| `""` | fatal | 空字串不是有效的 pathspec |
+| `sub` | `sub/b.txt`, `sub/deep/c.txt` | A directory prefix, matches intuition |
+| `*.c` | `e.c`, `other/d.c` | **`*` crosses `/`** -- pathspec uses wildmatch with WM_PATHNAME off |
+| `sub*` | `sub/b.txt`, `sub/deep/c.txt` | Matches for the reason above, **not** because it recurses into the directory |
+| `o[tx]her` | (empty) | A spec containing a wildcard has **no** directory-prefix rule |
+| `su?` / `s*b` / `sub/dee?` | (empty) | Same as above, all three are empty |
+| `sub/` | `sub/b.txt`, `sub/deep/c.txt` | A trailing `/` means "what's underneath this name" |
+| `a.txt/` | (empty) | The other half of the same rule: there's nothing underneath an ordinary file |
+| `lit*st` (a filename that literally contains `*`) | `lit*st` | The literal match runs first; the wildcard characters are treated as literal |
+| `nosuch` | (empty, exit 0) | `git diff` doesn't error on a pathspec matching nothing |
+| `""` | fatal | An empty string isn't a valid pathspec |
 
-於是比對是**三條有順序的規則**(`spec_matches`,`src/workdir/pathspec.c`):字面量精確 →
-字面量目錄前綴 → 含萬用字元才走 `sg_wildmatch`。⚠ **前兩條與第三條不相加**。
-這正好是 git `match_pathspec_item` 的形狀:`ps_strncmp` 的字面量比對之後,
-才輪到 `wildmatch`,而字面量那一支要求整個 spec 是 path 的前綴,`o[tx]her` 過不了。
+So the comparison is **three ordered rules** (`spec_matches`, `src/workdir/pathspec.c`): exact
+literal match -> literal directory prefix -> only a wildcard-containing spec goes through
+`sg_wildmatch`. Warning: **the first two rules don't add to the third.** This is exactly the
+shape of git's `match_pathspec_item`: `ps_strncmp`'s literal comparison runs first, then
+`wildmatch` gets its turn, and the literal branch requires the entire spec to be a prefix of the
+path, which `o[tx]her` fails.
 
-### 共用 wildmatch,而不是寫第二個 glob
+### Sharing wildmatch, rather than writing a second glob
 
-`src/workdir/ignore.c` 裡的 `seg_match` 早就是一支純位元組的 wildmatch(`*` `?` `[]`
-`\` 全有,而且**不認識 `/`**)——那正是 pathspec 要的東西。gitignore 之所以看起來不同,
-是因為它在上面疊了一層 segment 邏輯讓 `*` 停在 `/`、讓 `**` 跨目錄。在真 git 裡這兩者
-也只差一個 `WM_PATHNAME` 旗標。
+`src/workdir/ignore.c`'s `seg_match` was already a pure-byte wildmatch (`*` `?` `[]` `\` all
+present, and it **doesn't understand `/`**) -- exactly what pathspec needs. gitignore looks
+different only because it layers segment logic on top so `*` stops at `/` and `**` crosses
+directories. In real git the two only differ by a single `WM_PATHNAME` flag.
 
-所以 `seg_match` + `class_match` 原封不動搬進 `src/util/wildmatch.c` 成為 `sg_wildmatch`,
-ignore.c 保留 segment 層並改呼叫它。搬完先跑 `python3 tests/fuzz_ignore.py`(拿真 git
-當 oracle)200 輪 0 mismatch,確認搬移沒有改變 gitignore 的行為——這種重構最危險的
-失敗方式是「行為變了但沒有人發現」,而 ignore 這塊剛好有現成的差分 oracle。
+So `seg_match` + `class_match` were moved verbatim into `src/util/wildmatch.c` as `sg_wildmatch`,
+with ignore.c keeping the segment layer and calling it instead. After the move,
+`python3 tests/fuzz_ignore.py` (using real git as oracle) was run for 200 rounds with 0
+mismatches, confirming the move didn't change gitignore's behavior -- the most dangerous failure
+mode of this kind of refactor is "behavior changed and nobody noticed," and ignore happens to
+have a ready-made differential oracle.
 
-### 過濾放在清單建好之後
+### Filtering happens after the list is already built
 
-`sg_diff_list_filter`(`src/workdir/diff.c`)吃一份已完成的 `sg_diff_list`。**不**下放到
-四個建構器裡面:四份各自的 pathspec 判斷,每一份對「哪些路徑參與比較」都有自己的
-理解,正是 Phase 27 花一個里程碑消滅的形狀。代價是被濾掉的檔案仍然被雜湊過一次
-——那是速度帳單,不是錯答案,已寫進標頭。
+`sg_diff_list_filter` (`src/workdir/diff.c`) takes an already-completed `sg_diff_list`. It's
+**not** pushed down into the four builders: four independent pathspec checks, each with its own
+understanding of "which paths participate in the comparison," is exactly the shape Phase 27 spent
+a milestone eliminating. The cost is that filtered-out files still get hashed once -- that's a
+speed bill, not a wrong answer, and it's noted in the header.
 
-unmerged 路徑在 index-vs-工作目錄下佔**相鄰兩列**(Phase 25),兩列同路徑,所以一起留或
-一起走,不可能被拆散。
+Unmerged paths occupy **two adjacent rows** under index-vs-working directory (Phase 25); the two
+rows share a path, so they're always kept together or dropped together, never split apart.
 
-### 裸引數的消歧
+### Disambiguating bare arguments
 
-`--` 之後不做任何檢查(那就是打 `--` 的意義)。沒有 `--` 時每個引數逐一判斷,規則同樣
-是實測的:
+Nothing is checked after `--` (that's exactly the point of typing `--`). Without `--`, each
+argument is judged individually, again by rules confirmed through measurement:
 
-- 既是有效版本、又是既有檔案 → **直接拒絕**,不猜。
-- 第一個「是路徑」的引數結束版本清單,**其後每個引數都必須存在**——`git diff a.txt HEAD`
-  會指名 `HEAD` 失敗,即使它是完美的版本。
-- 兩者皆非 → 「有歧義的參數」。
-- ⚠ **含萬用字元的引數不做存在性檢查**:`git diff '*.zzz'` 匹配不到任何東西仍然退出 0,
-  而 `git diff nosuch` 是硬錯誤。這條由 `sg_pathspec_looks_like_spec` 回答,字元集只有
-  那一份,和給那些字元意義的比對器放在同一個檔案。
+- Both a valid revision and an existing file -> **rejected outright**, never guessed.
+- The first "path-like" argument ends the revision list, and **every argument after it must
+  exist** -- `git diff a.txt HEAD` fails naming `HEAD`, even though it's a perfectly valid
+  revision.
+- Neither one -> "ambiguous argument."
+- Warning: **an argument containing a wildcard skips the existence check**: `git diff '*.zzz'`
+  still exits 0 even matching nothing, while `git diff nosuch` is a hard error. This is answered
+  by `sg_pathspec_looks_like_spec`, whose character set lives in the exact same file as the
+  matcher that gives those characters meaning.
 
-magic(`:(icase)`、`:!`、`:/`)**拒絕而不是當成字面路徑**。當成字面路徑的話,使用者得到的
-是一個匹配不到東西的空 diff,或者更糟——匹配到一個真的叫 `:!sub` 的檔案。兩者都是在回答
-使用者沒問的問題,而 diff 靜默少印檔案是這裡最糟的失敗方式。
+Magic (`:(icase)`, `:!`, `:/`) **is rejected rather than treated as a literal path.** Treating it
+as literal would give the user either an empty diff matching nothing, or worse -- matching a file
+literally named `:!sub`. Both answer a question the user never asked, and a diff silently
+printing too few files is the worst failure mode here.
 
-### 驗證:正向與反向 mutation
+### Verification: forward and reverse mutations
 
-interop 新增 68 條檢查(1432 → 1500),**幾乎每一條都是同一組引數在 sg 與真 git 之間的
-全輸出 `cmp`**;斷言 sg 自己的輸出等於把「sg 當下的行為」凍結起來,只有 git 說得出哪一種才對。
-錯誤案例不能比對退出碼(git 用 128,本專案只有 0/1),所以拆成兩半:sg 拒絕、
-而且訊息指名理由;旁邊再放一條「真 git 也拒絕」的 oracle 檢查。
+68 checks were added to interop (1432 -> 1500), **almost every one a full-output `cmp` of the
+same set of arguments between sg and real git**; asserting against sg's own output would just
+freeze "sg's current behavior," and only git can say which one is actually correct. Error cases
+can't be compared by exit code (git uses 128, this project only has 0/1), so they were split in
+two: sg rejects it and the message names the reason; paired with an oracle check confirming "real
+git rejects it too."
 
-定向 mutation 八條,全部被抓到:
+Eight directed mutations, all caught:
 
-| mutation | 變紅 |
+| Mutation | Went red |
 |---|---|
-| 拿掉目錄前綴規則 | interop 15 條 + 單元測試 6 條 |
-| 讓 `sg_diff_list_filter` 什麼都不濾 | interop 約 30 條(含正面對照組) |
-| 拿掉萬用字元分支(`if (has_wildcard(spec))` → `if (0)`) | interop 4 條 |
-| 不把尾綴 `/` 接回去 | interop 1 條(`a.txt/`) |
-| `arg_exists_in_worktree` 恆真 | interop 6 條 |
-| 拿掉「既是版本又是檔案」的拒絕 | interop 2 條 |
-| `looks_like_spec` 不認 `:` | interop **1 條,而且只有訊息那條** |
-| **反向**:讓含萬用字元的 spec 也吃目錄前綴規則 | interop 3 條(`su?`、`s*b`、`sub/dee?`) |
+| Removing the directory-prefix rule | 15 interop checks + 6 unit tests |
+| Making `sg_diff_list_filter` filter nothing | About 30 interop checks (including the positive control) |
+| Removing the wildcard branch (`if (has_wildcard(spec))` -> `if (0)`) | 4 interop checks |
+| Not reattaching a trailing `/` | 1 interop check (`a.txt/`) |
+| `arg_exists_in_worktree` always true | 6 interop checks |
+| Removing the "both a revision and a file" rejection | 2 interop checks |
+| `looks_like_spec` doesn't recognize `:` | interop **1 check, and only the message one** |
+| **Reverse**: letting a wildcard-containing spec also take the directory-prefix rule | 3 interop checks (`su?`, `s*b`, `sub/dee?`) |
 
-最後一條是**反向 mutation**,也是這一輪真正的驗證重點:規則寫得**過寬**完全沒有徵兆,
-所有正向檢查照樣全綠。`su?`/`s*b`/`sub/dee?` 那三條「必須是空的」檢查,唯一的存在理由
-就是讓這條變紅。⚠ 誠實記下:`o[tx]her` 那條**沒有**紅——不是它沒鑑別力,而是這個特定的
-過寬規則(拿 spec 去比對 path 的前 `slen` 個位元組)剛好打不到它;換一種過寬寫法會打到。
-**一條 mutation 沒紅只證明這條 mutation 打不到那裡,不證明那個維度沒有覆蓋。**
+The last one is a **reverse mutation**, and the true focus of this round's verification: a rule
+written **too broadly** has no symptoms at all, and every forward check stays entirely green. The
+three "must be empty" checks for `su?`/`s*b`/`sub/dee?` exist for no other reason than to turn
+this specific mutation red. Warning, recorded honestly: `o[tx]her`'s check did **not** go red --
+not because it lacks discriminating power, but because this particular over-broad rule (comparing
+spec against the path's first `slen` bytes) just happens not to hit it; a different over-broad
+formulation would. **One mutation staying green only proves that mutation didn't reach that spot,
+it doesn't prove that dimension lacks coverage.**
 
-倒數第二條同樣值得記:把 `sg_pathspec_looks_like_spec` 裡的 `:` 拿掉之後,
-`sg diff :(icase)a.txt` 仍然退出非 0(改走「有歧義的參數」那條路),於是「拒絕 magic」
-那條檢查照樣綠——只有「訊息說得出理由」那條紅了。**把「拒絕」和「說出為什麼拒絕」拆成
-兩條斷言,是這條 mutation 唯一的可觀測性來源。**
+The second-to-last row is equally worth recording: with `:` removed from
+`sg_pathspec_looks_like_spec`, `sg diff :(icase)a.txt` still exits non-zero (falling through to
+"ambiguous argument" instead), so the "magic is rejected" check stayed green -- only the "the
+message states the reason" check went red. **Splitting "rejected" and "states why it was
+rejected" into two separate assertions is the only source of observability for this mutation.**
 
-還有一條正面對照組(`phase28 control`):未過濾的清單裡確實有 `a.txt`,過濾後必須沒有、
-而且必須還留著被指名的那個路徑。理由是所有 `cmp` 檢查在「兩邊都印出全部」時**照樣全綠**
-——過濾器整支變成 no-op 的話,只有這條抓得到。
+There's also one positive control group (`phase28 control`): the unfiltered list really does
+contain `a.txt`; after filtering it must be gone, while the path that was actually named must
+still be present. Reason: all the `cmp` checks stay entirely green when "both sides print
+everything" -- if the filter became a complete no-op, only this check would catch it.
 
-衝突路徑另有一組:unmerged 在 index-vs-工作目錄下佔相鄰兩列,是唯一可能被過濾器
-「拆散」的結構。三種比較各配一個選中衝突、一個排除衝突的 pathspec 與 git 對比,
-再加一條直接數列數的檢查(必須是 2,其中一條是 `U`)。
+Conflicted paths get a separate group: unmerged occupies two adjacent rows under
+index-vs-working-directory, the only structure that could be "split apart" by the filter. Each of
+the three comparison types is paired with one pathspec that selects the conflict and one that
+excludes it, compared against git, plus a check that directly counts the rows (must be 2, one of
+them a `U`).
 
-### 這一輪刻意沒做的
+### Deliberately not done this round
 
-- **magic pathspec** 全部拒絕,沒有實作。
-- **`core.ignorecase`**:比對一律逐位元組,即使在 macOS 的大小寫不敏感檔案系統上
-  (實測真 git 在同樣環境也是逐位元組:`git diff -- A.TXT` 對 `a.txt` 印不出東西)。
-- **`sg stash show`、`sg status` 的 pathspec**:兩者都吃得到同一份 `sg_pathspec`,
-  但這一輪只接 `sg diff`。
-- **三個以上的 rev**:真 git 的 `git diff HEAD HEAD HEAD` 退出 0(合併 diff 的路徑),
-  sg 判成 usage 錯誤。已知分歧。
-- 效能:被濾掉的路徑仍然會被雜湊。見上。
+- **Magic pathspecs** are all rejected, not implemented.
+- **`core.ignorecase`**: comparisons are always byte-for-byte, even on macOS's case-insensitive
+  filesystem (measurement confirms real git is byte-for-byte in the same environment too:
+  `git diff -- A.TXT` prints nothing for `a.txt`).
+- **Pathspec for `sg stash show` and `sg status`**: both could accept the same `sg_pathspec`, but
+  this round only wired it into `sg diff`.
+- **Three or more revisions**: real git's `git diff HEAD HEAD HEAD` exits 0 (a combined-diff
+  path); sg treats it as a usage error. A known divergence.
+- Performance: filtered-out paths still get hashed. See above.
 
-## Phase 29:rename 偵測(exact)
+## Phase 29: rename detection (exact)
 
-改名先前一律印成 delete + add。這一輪讓 `sg diff` 認得改名,六種格式全部與真 git
-逐位元組相同。**只做 exact(內容完全相同)**;git 另外會用相似度分數找 inexact
-改名,那一半還沒做,見末尾。
+Renames used to always be printed as delete + add. This round made `sg diff` recognize renames,
+with all six formats byte-for-byte identical to real git. **Only exact matches (identical
+content) are handled**; git additionally uses a similarity score to find inexact renames, which
+isn't done yet -- see the end of this section.
 
-### 實測推翻的兩件事
+### Two things measurement overturned
 
-1. **配對是全域的內容比對,不是 `git mv` 的歷史。** 把 `low.txt` 的內容整個換掉之後,
-   git 把它配到了 `sub/deep_new.txt`(內容相同的那個),原本的 `sub/deep.txt` 變成 `D`、
-   `low_new.txt` 變成 `A`。改名在 git 的模型裡是「刪除集合與新增集合之間的一場配對」,
-   與檔案怎麼移動無關。
-2. **工作目錄側等於沒有改名。** 未 stage 的改名,新檔是未追蹤的,根本不參與 diff——
-   `git diff` / `git diff HEAD` 只看得到 `D`,`git status` 是 `D` + `??`。
-   所以 index↔工作目錄那個建構器結構上產生不出改名列,`sg_diff_index_workdir`
-   不必特別處理。
+1. **Pairing is a global content comparison, not `git mv`'s history.** After completely
+   replacing `low.txt`'s content, git paired it with `sub/deep_new.txt` (the one with matching
+   content), leaving the original `sub/deep.txt` as `D` and `low_new.txt` as `A`. A rename in
+   git's model is "a pairing between the deletion set and the addition set," unrelated to how a
+   file actually moved.
+2. **The working-directory side has no renames at all.** For an unstaged rename, the new file is
+   untracked and doesn't participate in the diff at all -- `git diff` / `git diff HEAD` only see
+   `D`, and `git status` shows `D` + `??`. So the index<->working-directory builder can
+   structurally never produce a rename row; `sg_diff_index_workdir` needs no special handling.
 
-### 規格表(全部實測 git 2.55.0)
+### The spec table (all measured against git 2.55.0)
 
-| 格式 | 改名列長什麼樣 |
+| Format | What the rename row looks like |
 |---|---|
-| `--name-status` | `R100\told\tnew`,分數**三位數補零** |
-| `--name-only` | 只印**新**路徑 |
-| `--numstat` | `0\t0\t<壓縮後的配對>` ——兩個路徑擠在**同一欄**,不是兩欄 |
-| `--stat` | 名稱欄放壓縮後的配對 |
-| `--shortstat` | 不受影響 |
-| patch | `diff --git a/old b/new`、`[old/new mode]`、`similarity index N%`、`rename from/to`;100% 時**沒有 `index` 行也沒有 hunk** |
+| `--name-status` | `R100\told\tnew`, the score **zero-padded to three digits** |
+| `--name-only` | Prints only the **new** path |
+| `--numstat` | `0\t0\t<compacted pairing>` -- the two paths crammed into **one column**, not two |
+| `--stat` | The name column holds the compacted pairing |
+| `--shortstat` | Unaffected |
+| Patch | `diff --git a/old b/new`, `[old/new mode]`, `similarity index N%`, `rename from/to`; at 100%, **no `index` line and no hunk** |
 
-排序依**新路徑**(刪除列用自己的路徑),正好是 sg 的 `sg_diff_list` 既有的排序鍵,
-所以配對之後不需要重排——只有來源列被移除,目的地列保留原本的 path。
+Sorting is by **the new path** (a deletion row uses its own path), exactly the existing sort key
+of sg's `sg_diff_list`, so no re-sort is needed after pairing -- only the source row is removed,
+while the destination row keeps its original path.
 
-`{a => b}` 壓縮的前後綴都在 **`/` 邊界**上計算:
+`{a => b}` compaction computes both the prefix and suffix at **`/` boundaries**:
 
 ```
-a/b/c.txt  -> a/z/c.txt     =>  a/{b => z}/c.txt      前後綴都有
-h/i/j.txt  -> h2/i/j.txt    =>  {h => h2}/i/j.txt     只有後綴
-x/y.txt    -> x/y2.txt      =>  x/{y.txt => y2.txt}   只有前綴
-pre.txt    -> pre.txt.bak   =>  pre.txt => pre.txt.bak   位元組有共同、但沒有共同「元件」
+a/b/c.txt  -> a/z/c.txt     =>  a/{b => z}/c.txt      both prefix and suffix
+h/i/j.txt  -> h2/i/j.txt    =>  {h => h2}/i/j.txt     suffix only
+x/y.txt    -> x/y2.txt      =>  x/{y.txt => y2.txt}   prefix only
+pre.txt    -> pre.txt.bak   =>  pre.txt => pre.txt.bak   bytes in common, but no shared "component"
 ```
 
-⚠ 後綴迴圈要**掃到底、在每個 `/` 更新**(取最長的元件對齊後綴),不是遇到第一個 `/`
-就停——後者會把 `{h => h2}/i/j.txt` 印成 `{h/i => h2/i}/j.txt`。實作時就是這樣寫錯的,
-interop 的 cmp 抓到。
-⚠ **需要 C-quoting 的路徑會讓壓縮整個關掉**:git 印 `d/plain.txt => "d/tab\there.txt"`,
-不是 `d/{plain.txt => ...}`。把括號形式的片段各自加引號會在路徑中間生出引號,沒有
-消費端能解析。
+Warning: the suffix loop must **scan to the very end, updating at every `/`** (taking the longest
+component-aligned suffix), not stop at the first `/` -- the latter would print
+`{h => h2}/i/j.txt` as `{h/i => h2/i}/j.txt`. That was exactly how the first implementation got
+it wrong, caught by interop's `cmp`.
+Warning: **a path needing C-quoting shuts off compaction entirely**: git prints
+`d/plain.txt => "d/tab\there.txt"`, not `d/{plain.txt => ...}`. Quoting each fragment of the
+bracketed form separately would generate quotes in the middle of a path, unparseable by any
+consumer.
 
-### 順序:pathspec 先,rename 偵測後
+### Ordering: pathspec first, then rename detection
 
-實測:`git diff --cached --name-status -- b1.txt`(只指名改名的新那半)印出 **`A b1.txt`**,
-不是改名;只指名舊那半印出 `D`;兩半都給才是 `R100`。所以 git 是**先用 pathspec 過濾、
-再做偵測**,被濾掉的那半就沒有配對對象了。
+Measured: `git diff --cached --name-status -- b1.txt` (naming only the new half of the rename)
+prints **`A b1.txt`**, not a rename; naming only the old half prints `D`; only when both halves
+are given does it become `R100`. So git **filters by pathspec first, then detects renames**;
+whichever half gets filtered out has no partner left to pair with.
 
-`cmd_diff.c` 因此是 `sg_diff_list_filter` → `sg_diff_detect_renames`。把順序寫反不會有
-任何編譯或執行期徵兆,只會在「pathspec 只指名一半」時給出 `R100` 而 git 給 `A`。
-定向 mutation(把偵測移到過濾之前)紅了 4 條檢查。
+`cmd_diff.c` is therefore `sg_diff_list_filter` -> `sg_diff_detect_renames`. Getting the order
+backwards produces no compile-time or runtime symptom at all -- it would only give `R100` while
+git gives `A` when a pathspec names only half of a rename. A directed mutation (moving detection
+before filtering) turned 4 checks red.
 
-### 配對規則
+### Pairing rule
 
-目的地依路徑順序,各自認領**第一個尚未被認領**、內容相同的來源。實測支撐:
-兩個相同來源配兩個相同目的地會依序配(`a1→b1`、`a2→b2`,不交叉);
-一個來源配兩個相同目的地時,第一個目的地拿走它,第二個退回普通的 `A`
-(git 預設不做 copy 偵測,實測連 `-C` 都沒偵測到)。
+Destinations, in path order, each claim **the first not-yet-claimed** source with matching
+content. Measurement support: two identical sources paired with two identical destinations pair
+up in order (`a1->b1`, `a2->b2`, no crossing); when one source matches two identical
+destinations, the first destination claims it and the second falls back to a plain `A` (git
+doesn't do copy detection by default, and measurement confirms even adding `-C` didn't detect it).
 
-⚠ **比對用的是 effective id**。`sg_diff_side_effective_id` 原本是 `diff_out.c` 裡的
-static,這一輪提升成公開函式讓兩個消費端共用——它帶著一句要緊的合約:
-**兩個「未驗證」的 id 就算位元組相同,也不是內容相同的證據**。第一版的 rename.c
-自己寫了一份 helper 並在解析失敗時退回原始 id,那正是這句話警告的錯,會生出假改名。
-現在失敗方向是「不配對」。
+Warning: **the comparison uses the effective id.** `sg_diff_side_effective_id` used to be a
+`static` inside `diff_out.c`; this round promoted it to a public function shared by both
+consumers -- carrying an important contract: **two "unverified" ids being byte-identical is not
+evidence of identical content.** The first version of rename.c wrote its own helper that fell
+back to the raw id on parse failure, exactly the mistake that sentence warns against, which would
+produce false renames. The failure direction now is "don't pair."
 
-### 驗證
+### Verification
 
-interop 新增 31 條(1505 → 1536),定向 mutation 九條、八條被抓到。第九條值得記:
+31 checks were added to interop (1505 -> 1536), with nine directed mutations, eight caught. The
+ninth is worth recording:
 
-**把 `R%03d` 改成 `R%d`,整套測試零變紅**——但這不是覆蓋缺口,是**數學上不可觀測**:
-目前每個改名都是 exact、分數恆為 100,兩種格式印出來完全一樣。處理方式不是記下來
-就算了,而是**把它變成可觀測的**:`tests/test_rename.c` 新增一條直接把 93 分餵進
-`sg_diff_print --name-status` 的渲染測試(該格式不讀內容,所以捏造的清單就夠)。
-重跑同一條 mutation 後變紅,訊息顯示 `R93`。
+**Changing `R%03d` to `R%d` turned zero tests red** -- but this isn't a coverage gap, it's
+**mathematically unobservable**: at present every rename is exact, with the score always 100, so
+both formats print identically. Rather than just noting it, this was **made observable**:
+`tests/test_rename.c` gained a new test that directly feeds a score of 93 into
+`sg_diff_print --name-status`'s rendering test (that format doesn't read content, so a fabricated
+list is sufficient). Rerunning the same mutation now turns it red, with the message showing
+`R93`.
 
-### 加一個結構欄位的代價,是 ASan 抓到的
+### The cost of adding a structural field, caught by ASan
 
-`sg_diff_entry` 多了 `old_path` 與 `score` 之後踩到兩件事,兩件都不是邏輯錯:
+Adding `old_path` and `score` to `sg_diff_entry` hit two things, neither a logic error:
 
-1. **Makefile 沒有標頭相依追蹤**(無 `-MMD`/`.d`/`-include`)。改了標頭之後 `make` 只重編
-   動過的 `.c`,其他 TU continue 用舊佈局的 `.o`,於是 `make test` 在 `cmd_stash.c` 的
-   `strcmp` 崩掉——看起來完全像新寫的邏輯有 bug。`make clean && make` 之後 50/50 全過,
-   程式碼一行沒改。已寫進 CLAUDE.md 的建置章節。
-2. **手工建構 entry 的地方會漏掉新欄位。** `tests/test_diff_out.c` 有兩處是
-   `malloc` 之後逐一指派欄位(沒有先 memset),新欄位因此是 malloc 垃圾,而
-   `print_patch` 會解參考 `old_path`。**普通建置跑過去沒事,只有 `make sanitize` 紅**
-   ——ASan 報 `SEGV ... in sg_quote_path_prefixed`,位址是 `0xbebebebe`(未初始化樣式)。
+1. **The Makefile has no header dependency tracking** (no `-MMD`/`.d`/`-include`). After changing
+   a header, `make` only recompiles the `.c` files that were touched, leaving other TUs using
+   `.o`s with the old layout, so `make test` crashed on a `strcmp` in `cmd_stash.c` -- looking
+   exactly like a bug in newly written logic. `make clean && make` had all 50/50 passing, with
+   not a single line of code changed. This has been written into CLAUDE.md's build section.
+2. **Places that manually construct an entry can miss the new field.** `tests/test_diff_out.c`
+   has two places that assign fields one by one after `malloc` (with no prior memset), so the new
+   field was leftover malloc garbage, and `print_patch` dereferences `old_path`. **The normal
+   build runs through fine; only `make sanitize` goes red** -- ASan reports
+   `SEGV ... in sg_quote_path_prefixed`, at address `0xbebebebe` (the uninitialized-memory
+   pattern).
 
-第 2 點正是 CLAUDE.md 那條「動到記憶體管理時加跑 `make sanitize`」的價值:`make test`
-與 interop **雙雙全綠**,只有 sanitize 抓得到。往共用結構加欄位應該算進「動到記憶體管理」。
+Point 2 is exactly the value of CLAUDE.md's rule to "run `make sanitize` when touching memory
+management": `make test` and interop were **both entirely green**, and only sanitize caught it.
+Adding a field to a shared struct should count as "touching memory management."
 
-### 冷讀審查:一個真 bug、兩個零覆蓋的性質
+### Cold-read review: one real bug, two properties with zero coverage
 
-併入之後補了一輪第三方冷讀。記憶體安全那一面是乾淨的(`ids` 索引、`stolen` 指標移交、
-壓縮迴圈、`sg_quote_path` 的 4 槽輪替、選項解析、`sg_diff_side_effective_id` 的提升
-逐位元組相同),但它找到三件事:
+After merging, a round of third-party cold reading was added. The memory-safety side was clean
+(the `ids` array indexing, `stolen` pointer transfer, the compaction loop, `sg_quote_path`'s
+4-slot rotation, option parsing, and `sg_diff_side_effective_id`'s promotion were all
+byte-for-byte identical), but it found three things:
 
-**1. `rename_pair_display` 的溢位 fallback 會靜默印錯(真 bug)。** 原本寫成寫進呼叫端給的
-`char[SG_PATH_MAX * 2]`(8192),而兩個各 4095 位元組的路徑加上 `" => "` 是 8195——
-`snprintf` 截斷、走 fallback,而那個 fallback **回傳的是光禿禿的新路徑**,輸出與一個
-普通的新增檔案**無法區分**,改名整個消失。而且我自己的註解還寫著 fallback 是
-「plain `old => new` form」,是假的。審查者用 ASan 探針實際餵 4095 位元組路徑證實了。
-⚠ 這不是假設性輸入:`src/object/tree.c` 解析 entry 名稱時**不驗證長度**,所以一棵
-`git mktree` 造出來的 tree 就能提供這種路徑,純 tree↔tree 的 `sg diff` 就走得到。
-修法是**把固定緩衝區整個拿掉**,依輸入長度配置(回傳 owned 字串)。加引號會讓長度再
-膨脹到四倍,任何固定大小都保證不了。
+**1. `rename_pair_display`'s overflow fallback silently prints wrong output (a real bug).** It
+was written to write into a caller-provided `char[SG_PATH_MAX * 2]` (8192), while two paths of
+4095 bytes each plus `" => "` total 8195 -- `snprintf` truncates, falling back, and that fallback
+**returns the bare new path**, output that is **indistinguishable** from a plain added file --
+the rename disappears entirely. And the comment even claimed the fallback was a "plain
+`old => new` form", which was false. The reviewer confirmed this with an ASan probe actually
+feeding in a 4095-byte path. Warning: this isn't a hypothetical input -- `src/object/tree.c`
+doesn't validate length when parsing entry names, so a tree built with `git mktree` can supply
+such a path, reachable by a pure tree<->tree `sg diff`. The fix was to **remove the fixed buffer
+entirely**, allocating based on input length (returning an owned string). Adding quotes can
+inflate the length by up to fourfold, and no fixed size could ever guarantee enough room.
 
-**2. 「未驗證的 id 絕不配對」這條安全性質零覆蓋。** 那道閘門存在的理由是「兩個未驗證
-的 id 就算相同也不是內容相同的證據」,但要走到它需要一個解不開的 chunk pointer,
-而 chunk 的門檻是 64 KiB——Phase 29 的 fixture 每個檔案只有二十行,interop 裡也沒有
-任何一條把 chunk 與改名放在一起。審查者預測「把驗證拿掉會全綠」。實跑確認。
-補的測試不需要 fixture:把 `git_dir` 指向不存在的目錄,BLOB 側的 id 就驗不過,
-再配一個**同樣 id 但走 WORKDIR 側**的對照組(那側的 id 就是內容雜湊,驗得過)證明
-「count == 2」不是因為偵測根本沒在配對。重跑該 mutation 後變紅。
+**2. The safety property "an unverified id never pairs" had zero coverage.** That gate exists
+for the reason that "two unverified ids being equal is not evidence of identical content," but
+reaching it requires an unresolvable chunk pointer, and the chunking threshold is 64 KiB -- Phase
+29's fixture files are only twenty lines each, and not a single interop check combines chunking
+with renaming. The reviewer predicted "removing the verification would leave everything green."
+Confirmed by running it. The added test needs no fixture: pointing `git_dir` at a nonexistent
+directory makes the BLOB side's id fail verification, paired with a control group with **the
+same id but going through the WORKDIR side** (whose id is a content hash and does verify),
+proving "count == 2" isn't because detection just wasn't pairing at all. Rerunning the mutation
+now turns it red.
 
-**3. 改名列的 OLD 側是用**目的地**路徑去讀的(潛在,目前不可達)。** `print_patch` 與
-`build_entry_stat` 都把 `e->path` 餵給 `sg_diff_side_read`。今天無害,因為那個參數只有
-WORKDIR 側會用到,而四個建構器沒有一個會產生 WORKDIR 的 `old_side`。已改成
-`old_side_path(e)`。⚠ 改完打 mutation **仍然全綠**——沒有任何建構器產得出能分辨的
-輸入。按「先問這個值能不能從更低的接縫餵進去」的判準,那是覆蓋缺口而不是不可觀測:
-測試直接捏造一個 WORKDIR `old_side` 的 entry、在磁碟上放兩個內容不同的檔案,渲染 patch
-之後斷言移除行來自**舊**檔。重跑 mutation 後變紅。
+**3. A rename row's OLD side is read using the** destination **path (latent, currently
+unreachable).** Both `print_patch` and `build_entry_stat` feed `e->path` into
+`sg_diff_side_read`. Harmless today because that parameter is only used by the WORKDIR side, and
+none of the four builders can ever produce a WORKDIR `old_side`. Changed to `old_side_path(e)`.
+Warning: after the change, a mutation **still stayed entirely green** -- no builder can produce
+input that would distinguish the two. Per the criterion of "first ask whether this value could be
+fed in from a lower seam," this is a coverage gap, not something unobservable: the test directly
+fabricates an entry with a WORKDIR `old_side`, places two files with different content on disk,
+renders the patch, and asserts the removal line comes from the **old** file. Rerunning the
+mutation now turns it red.
 
-其餘:`記憶體不足` 的半形逗號改成全形(全檔慣例);壓縮迴圈裡那個 `free(old_path)`
-經審查確認**恆為 NULL**(被認領的一定是來源,而 `old_path` 只會設在目的地上),
-mutation 實跑也是綠的——**這是「已證明惰性」的一行,不是死角**,保留並註明理由,
-與 `sg_diff_list_filter` 同一個模式。
+Everything else: a half-width comma in "out of memory" changed to full-width (the file-wide
+convention); the `free(old_path)` inside the compaction loop was confirmed by the reviewer to be
+**always NULL** (whatever gets claimed is always the source, and `old_path` is only ever set on
+the destination), and running the mutation confirmed it stayed green -- **this is a line of
+"proven-inert" code, not a blind spot**, kept in place with the reasoning noted, the same pattern
+as `sg_diff_list_filter`.
 
-**`-M` 的拼法是實測後刻意保留的分歧**:真 git 接受 `-M0`、`-M101`、`-M0.5`、`-M50%`
-(全部 rc=0),sg 一律回 usage。理由是 sg 目前沒有 inexact 偵測,接受一個語意兌現不了的
-選項比拒絕更糟;失敗方向是「大聲拒絕」而不是「默默給錯答案」。等 inexact 做出來時
-要把整個文法補齊。
+**`-M`'s syntax is a deliberately kept divergence after measurement**: real git accepts `-M0`,
+`-M101`, `-M0.5`, `-M50%` (all rc=0), while sg always returns usage. The reasoning is that sg
+currently has no inexact detection, and accepting an option whose semantics it can't deliver
+would be worse than rejecting it; the failure direction is "loudly reject" rather than "silently
+give a wrong answer." When inexact detection is done, the full grammar needs to be filled in.
 
-### 這一輪刻意沒做的
+### Deliberately not done this round
 
-- **inexact 改名**(相似度分數)。這是最大的缺口,而且風險已經看得到:要讓 `R093`
-  與 `similarity index 93%` 與 git 逐位元組相同,必須複製 git `diffcore-delta.c` 的
-  spanhash 計數演算法,差一分整條 cmp 就紅。interop 有兩條檢查**明確斷言這個分歧**
-  (git 給 `R0..`、sg 給 `D`+`A`),外加一條 `--no-renames` 對照組證明分歧確實只出在
-  偵測而不是別處——等 inexact 做出來,那兩條會紅,必須更新,而不是靜靜地繼續錯。
-- **copy 偵測**(`-C`)。git 預設關閉,實測連加 `-C` 都沒偵測到,不做。
-- **`sg status` 的改名列**(`R  old -> new`)。`sg_status_diff_staged` 是 tree↔index 的
-  **第二份實作**(Phase 27 只收斂了 unstaged 那半),而且同時餵著 `apply.c` 的兩道
-  安全閘門——把改名塞進去會改變它們看到的列數。要做得對需要先像 Phase 27 那樣
-  列舉分歧,不是順手加。
-- `-M<n>` 只接受 1-100 的整數,不接受 git 的小數(`-M0.5`)與尾綴 `%`。
+- **Inexact renames** (similarity scoring). This is the biggest gap, and the risk is already
+  visible: to make `R093` and `similarity index 93%` byte-for-byte identical to git, git's
+  `diffcore-delta.c` spanhash-counting algorithm would need to be replicated -- off by one point
+  and the whole `cmp` goes red. Interop has two checks that **explicitly assert this
+  divergence** (git gives `R0..`, sg gives `D`+`A`), plus a `--no-renames` control confirming the
+  divergence is genuinely confined to detection and nowhere else -- once inexact detection is
+  built, those two checks will go red and must be updated, not silently left wrong.
+- **Copy detection** (`-C`). git has it off by default, and measurement confirms it doesn't
+  detect it even with `-C` added; not done.
+- **`sg status`'s rename row** (`R  old -> new`). `sg_status_diff_staged` is a **second
+  implementation** of tree<->index (Phase 27 only converged the unstaged half), and it also
+  feeds `apply.c`'s two safety gates -- stuffing renames into it would change the row count they
+  see. Doing this correctly requires first enumerating divergences the way Phase 27 did, not
+  adding it in passing.
+- `-M<n>` only accepts an integer from 1-100, not git's decimals (`-M0.5`) or trailing `%`.

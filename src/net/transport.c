@@ -218,7 +218,7 @@ static int parse_ref_advertisement_for_service(const unsigned char *data, size_t
         }
 
         if (!sg_ref_name_is_safe(name)) {
-            fprintf(stderr, "sg: warning: 忽略遠端不合法的 ref 名稱 '%s'\n", name);
+            fprintf(stderr, "sg: warning: ignoring invalid ref name '%s' from remote\n", name);
             free(name);
             continue;
         }
@@ -239,7 +239,7 @@ static int parse_ref_advertisement_for_service(const unsigned char *data, size_t
     return 0;
 
 malformed:
-    fprintf(stderr, "sg: 遠端回應不是有效的 git smart HTTP ref advertisement\n");
+    fprintf(stderr, "sg: remote response is not a valid git smart HTTP ref advertisement\n");
 fail:
     {
         size_t i;
@@ -342,19 +342,19 @@ int sg_demux_sideband_response(const unsigned char *data, size_t len, sg_buf *ou
        pre-multiplex NAK/ACK line(s) (upload-pack only; receive-pack has none)
        and into genuine side-band-64k framing -- from that point on, every
        packet's first byte must be a band number, and anything else is a
-       protocol error per spec section 2 ("其他值 = 協定錯誤"), not something
-       to silently skip. */
+       protocol error per spec section 2 ("any other value = protocol error"),
+       not something to silently skip. */
     int in_multiplex = 0;
 
     for (;;) {
         if (sg_pkt_read(data, len, &pos, &type, &payload, &payload_len) != 0) {
-            fprintf(stderr, "sg: 遠端回應格式錯誤\n");
+            fprintf(stderr, "sg: malformed remote response\n");
             return -1;
         }
         if (type == SG_PKT_FLUSH)
             return 0;
         if (type == SG_PKT_DELIM) {
-            fprintf(stderr, "sg: 遠端回應包含非預期的 protocol v2 delim-pkt\n");
+            fprintf(stderr, "sg: remote response contains an unexpected protocol v2 delim-pkt\n");
             return -1;
         }
         if (payload_len == 0)
@@ -382,7 +382,8 @@ int sg_demux_sideband_response(const unsigned char *data, size_t len, sg_buf *ou
             default:
                 if (in_multiplex) {
                     fprintf(stderr,
-                           "sg: 遠端回應的 side-band 封包帶有未知的 band 編號 %d（協定錯誤）\n",
+                           "sg: remote response's side-band packet has unknown band number %d "
+                           "(protocol error)\n",
                            band);
                     return -1;
                 }
@@ -642,7 +643,7 @@ int sg_parse_push_report_status(const unsigned char *data, size_t len, sg_push_r
     return 0;
 
 malformed:
-    fprintf(stderr, "sg: 遠端 git-receive-pack 的 report-status 回應格式錯誤\n");
+    fprintf(stderr, "sg: malformed report-status response from remote git-receive-pack\n");
 fail:
     {
         size_t i;
@@ -670,7 +671,7 @@ int sg_transport_push(const char *base_url, const sg_push_ref_update *updates, s
     size_t i;
 
     if (update_count == 0) {
-        fprintf(stderr, "sg: push 命令列表是空的（沒有任何 ref 要更新）\n");
+        fprintf(stderr, "sg: push command list is empty (no refs to update)\n");
         return -1;
     }
 

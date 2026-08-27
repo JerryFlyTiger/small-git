@@ -791,8 +791,8 @@ static int read_whole_file(const char *path, unsigned char **out, size_t *out_le
 /* In-place mutation of a whole file's bytes (pack or idx), then -- if
    enough bytes remain -- refreshes the trailing 20-byte self-checksum so
    the mutated file still "looks like" something that was legitimately
-   produced and then bit-rotted, per the task's "各自重算 trailer"
-   instruction. Neither sg_pack_read's pack decoding (no whole-pack trailer
+   produced and then bit-rotted, per the task's "recompute each file's own
+   trailer" instruction. Neither sg_pack_read's pack decoding (no whole-pack trailer
    check on that path) nor idx_parse (never reads its own trailing
    checksum) actually gate on this, but keeping it internally consistent
    makes for a more realistic mutant and costs nothing. */

@@ -86,18 +86,18 @@ static void print_conflict_message(const unsigned char commit_id[SG_SHA1_RAW_LEN
     size_t i;
 
     short_hex(commit_id, short_sha);
-    fprintf(stderr, "無法自動套用 %s %s\n", short_sha, summary != NULL ? summary : "");
+    fprintf(stderr, "cannot automatically apply %s %s\n", short_sha, summary != NULL ? summary : "");
     free(summary);
-    fprintf(stderr, "以下檔案有衝突:\n");
+    fprintf(stderr, "The following files have conflicts:\n");
     for (i = 0; i < conflict_count; i++)
         fprintf(stderr, "    %s\n", sg_quote_path(conflict_paths[i]));
     fprintf(stderr,
-           "請解決衝突後:\n"
-           "  sg add <file>...      標記為已解決\n"
-           "  sg rebase --continue  繼續 rebase\n"
-           "或:\n"
-           "  sg rebase --skip      跳過這個 commit\n"
-           "  sg rebase --abort     放棄並回到原本狀態\n");
+           "After resolving conflicts:\n"
+           "  sg add <file>...      mark as resolved\n"
+           "  sg rebase --continue  continue the rebase\n"
+           "Or:\n"
+           "  sg rebase --skip      skip this commit\n"
+           "  sg rebase --abort     give up and return to the original state\n");
 }
 
 /* ==================== single-commit cherry-pick ==================== */
@@ -219,7 +219,7 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
         if (memcmp(merged_tree, ours_tree, SG_SHA1_RAW_LEN) == 0) {
             char *summary = first_line_dup(commit.message);
 
-            printf("已跳過 %s %s（變更已存在於 upstream）\n", short_sha, summary != NULL ? summary : "");
+            printf("Skipped %s %s (change already present in upstream)\n", short_sha, summary != NULL ? summary : "");
             free(summary);
             rc = PICK_EMPTY;
             goto done;
@@ -355,11 +355,11 @@ static int finish_rebase(const char *git_dir, const char *branch, const sg_rebas
         return 0;
 
     if (sg_ref_resolve_head(git_dir, tip) != 0) {
-        fprintf(stderr, "sg: 無法讀取重放後的 HEAD\n");
+        fprintf(stderr, "sg: cannot read HEAD after replay\n");
         return -1;
     }
     if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch) >= (int)sizeof(ref_path)) {
-        fprintf(stderr, "sg: 分支名稱太長\n");
+        fprintf(stderr, "sg: branch name too long\n");
         return -1;
     }
     sg_sha1_to_hex(state->onto, onto_hex);
@@ -371,7 +371,7 @@ static int finish_rebase(const char *git_dir, const char *branch, const sg_rebas
         return -1;
     }
     if (sg_ref_set_head(git_dir, branch, head_msg) != 0) {
-        fprintf(stderr, "sg: 分支已更新，但無法讓 HEAD 重新指回 '%s'\n", branch);
+        fprintf(stderr, "sg: branch was updated, but cannot point HEAD back at '%s'\n", branch);
         return -1;
     }
     return 0;
@@ -396,7 +396,7 @@ static int run_rebase_todo(const char *git_dir, const char *repo_root, const cha
         rc = rebase_pick_one(git_dir, repo_root, commit_id);
 
         if (rc == PICK_ERROR) {
-            fprintf(stderr, "sg: rebase 過程中發生錯誤\n");
+            fprintf(stderr, "sg: an error occurred while rebasing\n");
             return -1;
         }
 
@@ -406,7 +406,7 @@ static int run_rebase_todo(const char *git_dir, const char *repo_root, const cha
             memmove(state->todo, state->todo + 1, (state->todo_count - 1) * sizeof(*state->todo));
             state->todo_count--;
             if (sg_rebase_state_write(git_dir, state) != 0)
-                fprintf(stderr, "sg: warning: 無法寫入 rebase 狀態\n");
+                fprintf(stderr, "sg: warning: cannot write rebase state\n");
             return 1;
         }
 
@@ -415,7 +415,7 @@ static int run_rebase_todo(const char *git_dir, const char *repo_root, const cha
         state->todo_count--;
         state->has_current = 0;
         if (sg_rebase_state_write(git_dir, state) != 0)
-            fprintf(stderr, "sg: warning: 無法寫入 rebase 狀態\n");
+            fprintf(stderr, "sg: warning: cannot write rebase state\n");
     }
 
     /* Re-attach before clearing the sequencer state: if this fails the
@@ -431,8 +431,8 @@ static int run_rebase_todo(const char *git_dir, const char *repo_root, const cha
        can't clean it up either. Don't call that success. */
     if (sg_rebase_state_remove(git_dir) != 0) {
         fprintf(stderr,
-               "sg: commit 都已重放完成，但未能清除 .git/sg-rebase/\n"
-               "sg: 在手動刪除該目錄之前，rebase 會被視為仍在進行中\n");
+               "sg: all commits were replayed, but failed to remove .git/sg-rebase/\n"
+               "sg: until that directory is removed by hand, the rebase is considered still in progress\n");
         return 1;
     }
     if (current_branch != NULL)
@@ -458,8 +458,8 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
 
     if (sg_rebase_state_exists(git_dir)) {
         fprintf(stderr,
-               "sg: 已有一個進行中的 rebase\n"
-               "請先執行 sg rebase --continue 完成它，或 sg rebase --abort 放棄\n");
+               "sg: a rebase is already in progress\n"
+               "Finish it first with sg rebase --continue, or give up with sg rebase --abort\n");
         return 1;
     }
     /* Existence, not parseability -- see sg_merge_head_exists. This
@@ -470,8 +470,8 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
        too, or the two states disagree about whether a merge is in flight. */
     if (sg_merge_head_exists(git_dir)) {
         fprintf(stderr,
-               "sg: 目前有一個尚未完成的合併\n"
-               "請先完成它，或執行 sg merge --abort 放棄\n");
+               "sg: an unfinished merge is in progress\n"
+               "Finish it first, or run sg merge --abort to give up\n");
         return 1;
     }
 
@@ -482,12 +482,12 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
        means exactly that, not a refusal. */
     current_branch = sg_ref_current_branch(git_dir);
     if (current_branch == NULL && sg_ref_head_is_detached(git_dir) != 1) {
-        fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
+        fprintf(stderr, "sg: cannot read HEAD (.git/HEAD is neither a branch nor a commit id)\n");
         return 1;
     }
 
     if (sg_ref_resolve_head(git_dir, head_commit) != 0) {
-        fprintf(stderr, "sg: 目前分支沒有任何 commit，無法 rebase\n");
+        fprintf(stderr, "sg: the current branch has no commits, cannot rebase\n");
         free(current_branch);
         return 1;
     }
@@ -510,12 +510,12 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
 
     mb_rc = sg_merge_base(git_dir, head_commit, upstream_commit, base_commit);
     if (mb_rc == -2) {
-        fprintf(stderr, "sg: 找到多個彼此獨立的共同祖先（criss-cross 歷史），無法 rebase\n");
+        fprintf(stderr, "sg: found multiple unrelated common ancestors (criss-cross history), cannot rebase\n");
         free(current_branch);
         return 1;
     }
     if (mb_rc == -1) {
-        fprintf(stderr, "sg: '%s' 與目前分支沒有共同的歷史，無法 rebase\n", upstream_arg);
+        fprintf(stderr, "sg: '%s' has no common history with the current branch, cannot rebase\n", upstream_arg);
         free(current_branch);
         return 1;
     }
@@ -550,7 +550,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         }
         snprintf(label, sizeof(label), "rebase onto %s", upstream_arg);
         if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: 自動快照失敗，為了安全起見中止這次 rebase（沒有做任何變更）\n");
+            fprintf(stderr, "sg: automatic snapshot failed, aborting this rebase for safety (no changes made)\n");
             sg_index_free(&idx);
             free(current_branch);
             return 1;
@@ -558,7 +558,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         sg_index_free(&idx);
 
         if (sg_apply_tree_to_workdir(git_dir, repo_root, upstream_tree) != 0) {
-            fprintf(stderr, "sg: 還原工作目錄失敗\n");
+            fprintf(stderr, "sg: failed to restore the working directory\n");
             free(current_branch);
             return 1;
         }
@@ -579,7 +579,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
 
             if (snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg) >=
                    (int)sizeof(start_msg)) {
-                fprintf(stderr, "sg: upstream 名稱太長\n");
+                fprintf(stderr, "sg: upstream name too long\n");
                 free(current_branch);
                 return 1;
             }
@@ -595,12 +595,12 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
                The ordinary replay path has always written its state before
                touching anything for the same reason. */
             if (sg_rebase_state_write(git_dir, &ff_state) != 0) {
-                fprintf(stderr, "sg: 無法寫入 rebase 狀態\n");
+                fprintf(stderr, "sg: cannot write rebase state\n");
                 free(current_branch);
                 return 1;
             }
             if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
-                fprintf(stderr, "sg: 無法讓 HEAD 指向 '%s'\n", upstream_arg);
+                fprintf(stderr, "sg: cannot point HEAD at '%s'\n", upstream_arg);
                 sg_rebase_state_remove(git_dir);
                 free(current_branch);
                 return 1;
@@ -612,8 +612,8 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             }
             if (sg_rebase_state_remove(git_dir) != 0) {
                 fprintf(stderr,
-                       "sg: 分支已快進，但未能清除 .git/sg-rebase/\n"
-                       "sg: 在手動刪除該目錄之前，rebase 會被視為仍在進行中\n");
+                       "sg: the branch was fast-forwarded, but failed to remove .git/sg-rebase/\n"
+                       "sg: until that directory is removed by hand, the rebase is considered still in progress\n");
                 free(current_branch);
                 return 1;
             }
@@ -630,7 +630,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
     rc = sg_rebase_compute_todo(git_dir, head_commit, base_commit, &state.todo, &state.todo_count,
                                 merge_commit, &found_merge);
     if (rc != 0) {
-        fprintf(stderr, "sg: 計算要重放的 commit 清單時發生錯誤\n");
+        fprintf(stderr, "sg: an error occurred while computing the list of commits to replay\n");
         free(current_branch);
         return 1;
     }
@@ -639,8 +639,8 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
 
         short_hex(merge_commit, short_sha);
         fprintf(stderr,
-               "sg: 尚不支援含 merge commit 的 rebase（%s 是一個 merge commit）\n"
-               "請改用 sg merge\n",
+               "sg: rebasing merge commits is not yet supported (%s is a merge commit)\n"
+               "Use sg merge instead\n",
                short_sha);
         free(state.todo);
         free(current_branch);
@@ -671,7 +671,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         }
         snprintf(label, sizeof(label), "rebase onto %s", upstream_arg);
         if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: 自動快照失敗，為了安全起見中止這次 rebase（沒有做任何變更）\n");
+            fprintf(stderr, "sg: automatic snapshot failed, aborting this rebase for safety (no changes made)\n");
             sg_index_free(&idx);
             free(state.todo);
             free(current_branch);
@@ -686,7 +686,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
     state.has_current = 0;
 
     if (sg_rebase_state_write(git_dir, &state) != 0) {
-        fprintf(stderr, "sg: 無法寫入 rebase 狀態\n");
+        fprintf(stderr, "sg: cannot write rebase state\n");
         sg_rebase_state_free(&state);
         return 1;
     }
@@ -696,7 +696,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
 
         if (sg_commit_tree_of(git_dir, upstream_commit, upstream_tree) != 0 ||
            sg_apply_tree_to_workdir(git_dir, repo_root, upstream_tree) != 0) {
-            fprintf(stderr, "sg: 還原工作目錄失敗\n");
+            fprintf(stderr, "sg: failed to restore the working directory\n");
             sg_rebase_state_free(&state);
             return 1;
         }
@@ -714,12 +714,12 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
            reflog_msg_with_subject allocates instead of using a fixed buffer. */
         if (snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg) >=
                (int)sizeof(start_msg)) {
-            fprintf(stderr, "sg: upstream 名稱太長\n");
+            fprintf(stderr, "sg: upstream name too long\n");
             sg_rebase_state_free(&state);
             return 1;
         }
         if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
-            fprintf(stderr, "sg: 無法讓 HEAD 指向 '%s'\n", upstream_arg);
+            fprintf(stderr, "sg: cannot point HEAD at '%s'\n", upstream_arg);
             sg_rebase_state_free(&state);
             return 1;
         }
@@ -736,7 +736,7 @@ static void print_unmerged_paths(const sg_index *idx)
 {
     size_t i;
 
-    fprintf(stderr, "sg: 尚有未解決的衝突，無法繼續 rebase：\n");
+    fprintf(stderr, "sg: unresolved conflicts remain, cannot continue the rebase:\n");
     for (i = 0; i < idx->count; i++) {
         if (idx->entries[i].stage == 0)
             continue;
@@ -744,7 +744,7 @@ static void print_unmerged_paths(const sg_index *idx)
             continue;
         fprintf(stderr, "\t%s\n", sg_quote_path(idx->entries[i].path));
     }
-    fprintf(stderr, "請先解決衝突並執行 `sg add <file>...` 標記為已解決，再重新 sg rebase --continue。\n");
+    fprintf(stderr, "Please resolve conflicts and run `sg add <file>...` to mark them resolved, then run sg rebase --continue again.\n");
 }
 
 static int do_rebase_continue(const char *git_dir, const char *repo_root)
@@ -760,15 +760,15 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
     int rc;
 
     if (!sg_rebase_state_exists(git_dir)) {
-        fprintf(stderr, "sg: 沒有進行中的 rebase\n");
+        fprintf(stderr, "sg: no rebase is in progress\n");
         return 1;
     }
     if (sg_rebase_state_read(git_dir, &state) != 0) {
-        fprintf(stderr, "sg: rebase 狀態損毀，請執行 sg rebase --abort 清理\n");
+        fprintf(stderr, "sg: rebase state is corrupt, run sg rebase --abort to clean up\n");
         return 1;
     }
     if (!state.has_current) {
-        fprintf(stderr, "sg: rebase 狀態損毀（沒有正在處理中的 commit），請執行 sg rebase --abort 清理\n");
+        fprintf(stderr, "sg: rebase state is corrupt (no commit is currently being processed), run sg rebase --abort to clean up\n");
         sg_rebase_state_free(&state);
         return 1;
     }
@@ -788,7 +788,7 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
     if (sg_object_read(git_dir, state.current, &type, &content, &content_len) != 0 ||
        type != SG_OBJ_COMMIT || sg_commit_parse(content, content_len, &orig_commit) != 0) {
         free(content);
-        fprintf(stderr, "sg: 無法讀取原始 commit\n");
+        fprintf(stderr, "sg: cannot read the original commit\n");
         sg_index_free(&idx);
         sg_rebase_state_free(&state);
         return 1;
@@ -796,7 +796,7 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
     free(content);
 
     if (sg_ref_resolve_head(git_dir, new_head) != 0) {
-        fprintf(stderr, "sg: 無法讀取目前分支\n");
+        fprintf(stderr, "sg: cannot read the current branch\n");
         sg_commit_free(&orig_commit);
         sg_index_free(&idx);
         sg_rebase_state_free(&state);
@@ -823,7 +823,7 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
             char *summary = first_line_dup(orig_commit.message);
 
             short_hex(state.current, short_sha);
-            printf("已跳過 %s %s（變更已存在於 upstream）\n", short_sha,
+            printf("Skipped %s %s (change already present in upstream)\n", short_sha,
                   summary != NULL ? summary : "");
             free(summary);
             sg_commit_free(&orig_commit);
@@ -930,22 +930,22 @@ static int do_rebase_skip(const char *git_dir, const char *repo_root)
     int rc;
 
     if (!sg_rebase_state_exists(git_dir)) {
-        fprintf(stderr, "sg: 沒有進行中的 rebase\n");
+        fprintf(stderr, "sg: no rebase is in progress\n");
         return 1;
     }
     if (sg_rebase_state_read(git_dir, &state) != 0) {
-        fprintf(stderr, "sg: rebase 狀態損毀，請執行 sg rebase --abort 清理\n");
+        fprintf(stderr, "sg: rebase state is corrupt, run sg rebase --abort to clean up\n");
         return 1;
     }
     if (!state.has_current) {
-        fprintf(stderr, "sg: 沒有正在處理中的 commit 可以跳過\n");
+        fprintf(stderr, "sg: there is no commit currently being processed to skip\n");
         sg_rebase_state_free(&state);
         return 1;
     }
 
     if (sg_ref_resolve_head(git_dir, head_commit) != 0 ||
        sg_commit_tree_of(git_dir, head_commit, head_tree) != 0) {
-        fprintf(stderr, "sg: 無法讀取目前分支\n");
+        fprintf(stderr, "sg: cannot read the current branch\n");
         sg_rebase_state_free(&state);
         return 1;
     }
@@ -963,7 +963,7 @@ static int do_rebase_skip(const char *git_dir, const char *repo_root)
             return 1;
         }
         if (sg_snapshot_create(git_dir, repo_root, &idx, "rebase --skip", NULL) != 0) {
-            fprintf(stderr, "sg: 自動快照失敗，為了安全起見中止 skip（沒有做任何變更）\n");
+            fprintf(stderr, "sg: automatic snapshot failed, aborting the skip for safety (no changes made)\n");
             sg_index_free(&idx);
             sg_rebase_state_free(&state);
             return 1;
@@ -972,7 +972,7 @@ static int do_rebase_skip(const char *git_dir, const char *repo_root)
     }
 
     if (sg_apply_tree_to_workdir(git_dir, repo_root, head_tree) != 0) {
-        fprintf(stderr, "sg: 還原工作目錄失敗\n");
+        fprintf(stderr, "sg: failed to restore the working directory\n");
         sg_rebase_state_free(&state);
         return 1;
     }
@@ -996,11 +996,11 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
     char short_sha[8];
 
     if (!sg_rebase_state_exists(git_dir)) {
-        fprintf(stderr, "sg: 沒有進行中的 rebase\n");
+        fprintf(stderr, "sg: no rebase is in progress\n");
         return 1;
     }
     if (sg_rebase_state_read(git_dir, &state) != 0) {
-        fprintf(stderr, "sg: rebase 狀態損毀，無法安全 abort；請手動檢查 .git/sg-rebase/\n");
+        fprintf(stderr, "sg: rebase state is corrupt, cannot abort safely; please check .git/sg-rebase/ by hand\n");
         return 1;
     }
 
@@ -1013,7 +1013,7 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
        that work the same way merge --abort and switch/undo do, and refuse
        to abort at all if the snapshot itself can't be taken. */
     if (sg_snapshot_create(git_dir, repo_root, &idx, "rebase --abort", NULL) != 0) {
-        fprintf(stderr, "sg: 自動快照失敗，為了安全起見中止 abort（沒有做任何變更）\n");
+        fprintf(stderr, "sg: automatic snapshot failed, aborting the abort for safety (no changes made)\n");
         sg_index_free(&idx);
         sg_rebase_state_free(&state);
         return 1;
@@ -1021,12 +1021,12 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
     sg_index_free(&idx);
 
     if (sg_commit_tree_of(git_dir, state.orig_head, orig_head_tree) != 0) {
-        fprintf(stderr, "sg: 無法讀取 rebase 前的 commit\n");
+        fprintf(stderr, "sg: cannot read the pre-rebase commit\n");
         sg_rebase_state_free(&state);
         return 1;
     }
     if (sg_apply_tree_to_workdir(git_dir, repo_root, orig_head_tree) != 0) {
-        fprintf(stderr, "sg: 還原工作目錄失敗\n");
+        fprintf(stderr, "sg: failed to restore the working directory\n");
         sg_rebase_state_free(&state);
         return 1;
     }
@@ -1042,7 +1042,7 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
         sg_sha1_to_hex(state.orig_head, orig_head_hex);
         snprintf(abort_msg, sizeof(abort_msg), "rebase (abort): returning to %s", orig_head_hex);
         if (sg_ref_set_head_detached(git_dir, state.orig_head, abort_msg) != 0) {
-            fprintf(stderr, "sg: 無法讓 HEAD 重新指回 %s\n", orig_head_hex);
+            fprintf(stderr, "sg: cannot point HEAD back at %s\n", orig_head_hex);
             sg_rebase_state_free(&state);
             return 1;
         }
@@ -1073,22 +1073,22 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
         char abort_msg[SG_PATH_MAX + 64];
 
         if (sg_ref_update_branch(git_dir, state.orig_branch, state.orig_head) != 0) {
-            fprintf(stderr, "sg: 無法把分支 '%s' 還原到 rebase 前的位置\n", state.orig_branch);
+            fprintf(stderr, "sg: cannot restore branch '%s' to its pre-rebase position\n", state.orig_branch);
             sg_rebase_state_free(&state);
             return 1;
         }
         snprintf(abort_msg, sizeof(abort_msg), "rebase (abort): returning to refs/heads/%s",
                 state.orig_branch);
         if (sg_ref_set_head(git_dir, state.orig_branch, abort_msg) != 0) {
-            fprintf(stderr, "sg: 無法讓 HEAD 重新指回 '%s'\n", state.orig_branch);
+            fprintf(stderr, "sg: cannot point HEAD back at '%s'\n", state.orig_branch);
             sg_rebase_state_free(&state);
             return 1;
         }
     }
     if (sg_rebase_state_remove(git_dir) != 0) {
         fprintf(stderr,
-               "sg: 分支與工作目錄都已還原，但未能清除 .git/sg-rebase/\n"
-               "sg: 在手動刪除該目錄之前，rebase 會被視為仍在進行中\n");
+               "sg: the branch and working directory were both restored, but failed to remove .git/sg-rebase/\n"
+               "sg: until that directory is removed by hand, the rebase is considered still in progress\n");
         sg_rebase_state_free(&state);
         return 1;
     }

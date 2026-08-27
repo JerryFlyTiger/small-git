@@ -90,8 +90,8 @@ int sg_cmd_reset(int argc, char **argv)
 
     if (pathspec_given) {
         fprintf(stderr,
-               "sg: reset 不支援指定路徑 (pathspec)；如果只是想取消暫存某個檔案，"
-               "請改用 `sg restore --staged <path>`\n");
+               "sg: reset does not support a pathspec; if you only want to unstage a file, "
+               "use `sg restore --staged <path>` instead\n");
         return 1;
     }
     if (rev_arg == NULL)
@@ -115,7 +115,7 @@ int sg_cmd_reset(int argc, char **argv)
        precisely because its own rebase is detached too. */
     current_branch = sg_ref_current_branch(git_dir);
     if (current_branch == NULL && sg_ref_head_is_detached(git_dir) != 1) {
-        fprintf(stderr, "sg: 無法讀取 HEAD（.git/HEAD 的內容既不是分支也不是 commit id）\n");
+        fprintf(stderr, "sg: cannot read HEAD (.git/HEAD is neither a branch nor a commit id)\n");
         free(git_dir);
         free(repo_root);
         return 1;
@@ -138,7 +138,7 @@ int sg_cmd_reset(int argc, char **argv)
            against git: both an unresolved merge conflict and a paused
            rebase produce this same rejection, exit 128. */
         if (sg_merge_head_exists(git_dir) || sg_rebase_state_exists(git_dir)) {
-            fprintf(stderr, "sg: 合併或 rebase 進行中，無法執行 soft reset\n");
+            fprintf(stderr, "sg: a merge or rebase is in progress, cannot do a soft reset\n");
             free(current_branch);
             free(git_dir);
             free(repo_root);
@@ -153,7 +153,7 @@ int sg_cmd_reset(int argc, char **argv)
 
             snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
             if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: 無法更新 %s\n",
+                fprintf(stderr, "sg: cannot update %s\n",
                        current_branch != NULL ? current_branch : "HEAD");
                 free(current_branch);
                 free(git_dir);
@@ -189,7 +189,7 @@ int sg_cmd_reset(int argc, char **argv)
            automatically, without an interactive confirmation. */
         snprintf(label, sizeof(label), "reset --mixed to '%s'", rev_arg);
         if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: 自動快照失敗，為了安全起見中止這次操作（沒有做任何變更）\n");
+            fprintf(stderr, "sg: automatic snapshot failed, aborting this operation for safety (no changes made)\n");
             sg_index_free(&idx);
             free(current_branch);
             free(git_dir);
@@ -212,7 +212,7 @@ int sg_cmd_reset(int argc, char **argv)
 
             snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
             if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: 無法更新 %s\n",
+                fprintf(stderr, "sg: cannot update %s\n",
                        current_branch != NULL ? current_branch : "HEAD");
                 free(current_branch);
                 free(git_dir);
@@ -231,7 +231,7 @@ int sg_cmd_reset(int argc, char **argv)
            rebase-merge/ untouched, only a soft-reset-style rejection or
            `rebase --abort` ends it. */
         if (merge_in_progress && sg_merge_head_remove(git_dir) != 0)
-            fprintf(stderr, "sg: warning: 未能清除 MERGE_HEAD\n");
+            fprintf(stderr, "sg: warning: failed to remove MERGE_HEAD\n");
     } else {
         char label[256];
         int apply_rc;
@@ -265,7 +265,7 @@ int sg_cmd_reset(int argc, char **argv)
 
             snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
             if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: 無法更新 %s\n",
+                fprintf(stderr, "sg: cannot update %s\n",
                        current_branch != NULL ? current_branch : "HEAD");
                 free(current_branch);
                 free(git_dir);

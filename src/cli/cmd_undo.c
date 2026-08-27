@@ -17,11 +17,11 @@ static void print_list(const sg_snapshot_list *list)
     size_t i;
 
     if (list->count == 0) {
-        printf("目前沒有任何自動快照\n");
+        printf("No automatic snapshots yet\n");
         return;
     }
 
-    printf("自動快照（最新在前）：\n");
+    printf("Automatic snapshots (newest first):\n");
     for (i = 0; i < list->count; i++) {
         time_t t = (time_t)list->entries[i].timestamp;
         struct tm tmv;
@@ -31,7 +31,7 @@ static void print_list(const sg_snapshot_list *list)
         strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", &tmv);
         printf("  %zu) %s  %s\n", i + 1, timebuf, list->entries[i].message);
     }
-    printf("使用 `sg undo <編號>` 還原\n");
+    printf("Use `sg undo <number>` to restore\n");
 }
 
 int sg_cmd_undo(int argc, char **argv)
@@ -126,8 +126,8 @@ int sg_cmd_undo(int argc, char **argv)
            sense. */
         rebase_in_progress = sg_rebase_state_exists(git_dir);
         if (rebase_in_progress)
-            fprintf(stderr, "sg: 注意：undo 會放棄目前進行中的 rebase"
-                           "（工作目錄將還原到快照，不必再執行 sg rebase --abort）\n");
+            fprintf(stderr, "sg: note: undo will give up the current in-progress rebase"
+                           " (the working directory will be restored to the snapshot, no need to also run sg rebase --abort)\n");
 
         snprintf(label, sizeof(label), "undo (restore snapshot #%ld)", n);
         apply_rc = sg_safe_apply_tree(git_dir, repo_root, tree_id, label, force);
@@ -140,9 +140,9 @@ int sg_cmd_undo(int argc, char **argv)
             printf("Restored snapshot #%ld\n", n);
             if (rebase_in_progress) {
                 if (sg_rebase_state_remove(git_dir) != 0)
-                    fprintf(stderr, "sg: warning: 未能清除進行中的 rebase 狀態\n");
+                    fprintf(stderr, "sg: warning: failed to clear the in-progress rebase state\n");
                 else
-                    fprintf(stderr, "sg: 進行中的 rebase 已放棄（工作目錄已還原到快照）\n");
+                    fprintf(stderr, "sg: the in-progress rebase has been given up (working directory restored to the snapshot)\n");
             }
         }
 
