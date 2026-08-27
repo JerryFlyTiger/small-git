@@ -62,6 +62,32 @@ proviso from the first bullet ("not measured != measured as zero") applies to
 `make test` too: when it recompiles no test binaries, it says so explicitly
 rather than handing you an empty 0.
 
+There is a fifth, opt-in gate that is **not** part of the completion
+criteria: `bash tests/gates.sh --leaks` re-runs every unit test binary under
+macOS's `/usr/bin/leaks`. It exists because this machine cannot run the real
+thing -- Apple's ASan does not implement LeakSanitizer and aborts outright on
+`detect_leaks=1` (measured), so a green `make sanitize` here is zero evidence
+about leaks; the only precise leak detection the project has is CI's ubuntu
+ASan job. Two things about reading its row, both measured:
+
+- **`leaks` is a conservative scanner, so `0 leaks` means "nothing it could
+  prove leaked"**, not "no leaks". A single 4 KB `malloc` made in a helper
+  that returns goes unreported, because the dead frame still holds the
+  pointer and the stack is scanned as a root; 200 x 100 KB with the stack
+  scrubbed afterwards is caught. It is a net for accumulating leaks, never a
+  substitute for CI.
+- **A crashed binary yields exit code 0 and no summary line at all**, so
+  reading the exit code alone would score a segfault as green. The gate
+  therefore demands the `N leaks for M total leaked bytes` line from every
+  binary and reports `analyzed N/50`, the same "not measured != measured as
+  zero" shape as the `make` and `make test` rows. Non-macOS is a `skip` row,
+  never a silent pass.
+
+`SG_LEAKS_TIMEOUT` (default 120s) bounds each binary, turning a hang into a
+named failure. All three of the gate's FAIL branches were proven by planting
+a leak, an unanalyzable binary, and a crashing one -- the leak case is the
+one that matters, because `make test` and interop both stayed green for it.
+
 `tests/test_fuzz_pack.c` and `tests/test_fuzz_index.c` are fuzzers for the
 binary parsers, already included in `make test` (default round count only
 takes a few seconds). `SG_FUZZ_ITERS` adjusts the round count,

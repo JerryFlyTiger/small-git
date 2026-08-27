@@ -1,6 +1,9 @@
 #!/bin/bash
 # The four gates that make up the completion standard, run as one script,
-# printing a compact summary + the paths of the raw logs.
+# printing a compact summary + the paths of the raw logs. There is also an
+# optional fifth, macOS-only gate (--leaks); it is not part of the completion
+# standard, it is a coarse local stand-in for the leak detection that only
+# CI's ubuntu ASan job can actually do.
 #
 # CLAUDE.md's "Build & verify" section requires make + make test + interop.sh
 # all green as the completion standard, plus make sanitize when memory
@@ -13,6 +16,7 @@
 #   bash tests/gates.sh              # make + make test + interop.sh
 #   bash tests/gates.sh --sanitize   # also run make sanitize (cleans twice, slow)
 #   bash tests/gates.sh --rebuild    # make clean first, so the warning count means something
+#   bash tests/gates.sh --leaks      # also run /usr/bin/leaks over the unit test binaries (macOS)
 #
 # Exit code: 0 only if every gate that ran is green, otherwise 1 (bad
 # arguments give 2).
@@ -63,6 +67,29 @@
 #      which flag set they were built with, so skipping the clean and running
 #      a plain make afterward links the sanitizer's .o files into the normal
 #      build (Makefile:76-80).
+#
+#   7. `leaks`'s exit code alone is not enough, and reading it alone would
+#      turn a crash into a green row. Measured on this machine, all four
+#      quadrants:
+#        - exits 1, leaks nothing        -> rc 0, "0 leaks for 0 total ..."
+#        - exits 0, leaks 200 blocks     -> rc 1, "200 leaks for 22937600 ..."
+#        - exits 1, leaks 200 blocks     -> rc 1, same line
+#        - SIGSEGV                       -> rc 0, and NO summary line at all
+#      So rc reflects the leak verdict and never the binary's own exit status
+#      (pass/fail is gate 2's job, not this one's), but a binary that dies
+#      before exit produces rc 0 with nothing measured. That is why this gate
+#      requires the "N leaks for M total leaked bytes" line from every binary
+#      and reports "analyzed N of TOTAL" -- the same shape as gate 2's
+#      "ran N of TOTAL", and for the same reason.
+#
+#   8. `leaks` is a CONSERVATIVE scanner, so a green row means "nothing it
+#      could prove leaked", not "no leaks". Measured: a single 4 KB malloc
+#      made in a helper that returns is NOT reported (the dead frame still
+#      holds the pointer value, and the scan treats the stack as a root),
+#      while 200 x 100 KB with the stack scrubbed afterwards is. Treat this
+#      gate as a net for accumulating leaks, never as a substitute for CI's
+#      LeakSanitizer, which is precise and is the only automated leak
+#      detection this project actually has (see .github/workflows/ci.yml).
 
 set -u
 
@@ -72,11 +99,13 @@ cd "$PROJECT_ROOT" || exit 1
 
 WANT_SANITIZE=0
 WANT_REBUILD=0
+WANT_LEAKS=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --sanitize) WANT_SANITIZE=1 ;;
         --rebuild)  WANT_REBUILD=1 ;;
+        --leaks)    WANT_LEAKS=1 ;;
         -h|--help)
             # Print the whole header comment block (up to the first
             # non-comment, non-blank line). Three details: do not switch this
@@ -93,7 +122,7 @@ while [ "$#" -gt 0 ]; do
             exit 0
             ;;
         *)
-            echo "usage: bash tests/gates.sh [--sanitize] [--rebuild]" >&2
+            echo "usage: bash tests/gates.sh [--sanitize] [--rebuild] [--leaks]" >&2
             exit 2
             ;;
     esac
@@ -164,6 +193,35 @@ count_tus() { grep -c -- ' -c src/' "$1"; }
 count_fails() { grep -c '^FAIL' "$1"; }
 
 TOTAL_BINS=$(find tests -name '*.c' | wc -l | tr -d ' ')
+
+# Gate 5 re-runs every test binary under `leaks`, so it inherits their
+# runtimes -- and a binary that hangs there would hold the terminal forever
+# with a status that is neither 0 nor non-zero. That is the exact shape
+# tests/mutate.sh grew SG_MUTATE_TIMEOUT for, so this gate gets the same
+# treatment. macOS ships no timeout(1); this returns 124 on expiry the way
+# GNU timeout does. Polled at 200 ms rather than 1 s because a 1 s poll adds
+# most of a second to each of 50 fast binaries -- nearly a minute of pure
+# waiting.
+LEAKS_TIMEOUT=${SG_LEAKS_TIMEOUT:-120}
+
+run_with_timeout() {
+    local secs=$1
+    shift
+    "$@" &
+    local pid=$!
+    local ticks=0
+    local limit=$((secs * 5))
+    while kill -0 "$pid" 2> /dev/null; do
+        if [ "$ticks" -ge "$limit" ]; then
+            kill -9 "$pid" 2> /dev/null
+            wait "$pid" 2> /dev/null
+            return 124
+        fi
+        sleep 0.2
+        ticks=$((ticks + 1))
+    done
+    wait "$pid"
+}
 
 # ---------------------------------------------------------------- gate 1: make
 
@@ -277,6 +335,86 @@ else
     fi
 fi
 
+# ------------------------------------------ gate 5: leaks (macOS, opt-in)
+#
+# Placed BEFORE gate 4 on purpose, and it has to be: `make sanitize` opens
+# with its own clean and closes with another one (WHY 6), so once gate 4 has
+# run there are no ordinary test binaries left to examine. Pointing `leaks`
+# at ASan-instrumented binaries would be wrong anyway -- ASan replaces the
+# allocator, which is the very thing `leaks` walks. The summary prints rows
+# in the order they ran, so this one appears above sanitize.
+
+if [ "$WANT_LEAKS" = 1 ]; then
+    if [ "$(uname -s)" != "Darwin" ]; then
+        # Not FAIL: on Linux the real LeakSanitizer runs in CI and is strictly
+        # better. But not silence either -- the row has to say it did not run.
+        ROWS+=("$(printf '%-4s %-9s %5s   %-12s  %s' "skip" "leaks" "-" "-" \
+            "not macOS -- CI's ubuntu ASan job runs the real LeakSanitizer instead")")
+    elif ! command -v leaks > /dev/null 2>&1; then
+        # Asked for explicitly and unavailable is a failure, not a skip.
+        row "FAIL" "leaks" "--leaks was requested but no leaks(1) was found on PATH" "0" "-"
+    else
+        echo "-> leaks (re-runs every unit test binary under /usr/bin/leaks)"
+        t0=$SECONDS
+        : > "$LOGDIR/leaks.log"
+        analyzed=0
+        leaking=0
+        leaked_bytes=0
+        problems=""
+        unreported=""
+        leakers=""
+        # -not -path '*.dSYM/*' so the debug bundles never get executed.
+        # MallocStackLogging is deliberately NOT set: measured, detection is
+        # identical without it and it costs time, and when something does leak
+        # the note at the end says how to get the stacks back.
+        bins=$(find build/tests -type f -perm -u+x -not -path '*.dSYM/*' | sort)
+        while IFS= read -r b; do
+            [ -z "$b" ] && continue
+            name=$(basename "$b")
+            echo "===== $name =====" >> "$LOGDIR/leaks.log"
+            run_with_timeout "$LEAKS_TIMEOUT" leaks -quiet --atExit -- "$b" \
+                > "$LOGDIR/one.log" 2>&1
+            lrc=$?
+            cat "$LOGDIR/one.log" >> "$LOGDIR/leaks.log"
+            sum=$(grep -oE '[0-9]+ leaks for [0-9]+ total leaked bytes' "$LOGDIR/one.log" | tail -1)
+            if [ "$lrc" -eq 124 ]; then
+                # See WHY 7: a hang measures nothing, and must never read green.
+                unreported="$unreported $name(timeout after ${LEAKS_TIMEOUT}s)"
+            elif [ -z "$sum" ]; then
+                # See WHY 7: this is what a crashed binary looks like -- rc 0
+                # and no summary line. Counting it as analyzed would be a lie.
+                unreported="$unreported $name(no summary line, exit $lrc)"
+            else
+                analyzed=$((analyzed + 1))
+                n=${sum%% leaks*}
+                if [ "$n" -gt 0 ]; then
+                    leaking=$((leaking + 1))
+                    leakers="$leakers $name($sum)"
+                    bytes=$(printf '%s' "$sum" | sed -n 's/.* for \([0-9]*\) total.*/\1/p')
+                    leaked_bytes=$((leaked_bytes + bytes))
+                fi
+            fi
+        done <<EOF
+$bins
+EOF
+        rm -f "$LOGDIR/one.log"
+        dt=$((SECONDS - t0))
+
+        [ -n "$unreported" ] && problems="$problems; no leak report from:$unreported"
+        [ "$leaking" -gt 0 ] && problems="$problems; leaking:$leakers ($leaked_bytes byte(s) total)"
+
+        if [ "$analyzed" -eq "$TOTAL_BINS" ] && [ -z "$problems" ]; then
+            # "conservative scan" is in the row on purpose (WHY 8): this line
+            # must not be read as "this build has no leaks".
+            row "ok" "leaks" "$analyzed/$TOTAL_BINS analyzed, 0 leaks (conservative scan, see WHY 8)" "$dt" "leaks.log"
+        else
+            row "FAIL" "leaks" "$analyzed/$TOTAL_BINS analyzed$problems" "$dt" "leaks.log"
+        fi
+    fi
+else
+    ROWS+=("$(printf '%-4s %-9s %5s   %-12s  %s' "skip" "leaks" "-" "-" "not run (add --leaks to run it)")")
+fi
+
 # ------------------------------------------------------ gate 4: make sanitize
 
 if [ "$WANT_SANITIZE" = 1 ]; then
@@ -331,6 +469,13 @@ echo "raw logs: $LOGDIR"
 if [ "$WANT_SANITIZE" = 1 ] && [ "$(uname -s)" = "Darwin" ]; then
     # See WHY 5.
     echo "note: macOS's ASan does not do leak detection, so the sanitize row above is zero evidence against memory leaks."
+    if [ "$WANT_LEAKS" != 1 ]; then
+        echo "note: --leaks is the local stand-in for that, though a coarse one (see WHY 8)."
+    fi
+fi
+if [ "$WANT_LEAKS" = 1 ] && [ "$(uname -s)" = "Darwin" ]; then
+    echo "note: the leaks row is a conservative scan (WHY 8) and proves less than CI's LeakSanitizer."
+    echo "note: for allocation stacks on a leaking binary, re-run it alone: MallocStackLogging=1 leaks --atExit -- build/tests/<name>"
 fi
 if [ "$CLEANED" = 1 ]; then
     echo "note: build/ has been cleaned, the next make will be a full rebuild."
