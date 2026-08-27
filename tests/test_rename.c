@@ -99,7 +99,7 @@ static void test_exact_rename_becomes_one_row(void)
     add_deletion(&l, "old.txt", 0xAA);
     add_addition(&l, "zew.txt", 0xAA);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection succeeds");
     CHECK(l.count == 1, "two rows collapse into one");
     e = find(&l, "zew.txt");
     CHECK(e != NULL, "the surviving row is the destination");
@@ -121,7 +121,7 @@ static void test_different_content_is_not_a_rename(void)
     add_deletion(&l, "old.txt", 0xAA);
     add_addition(&l, "zew.txt", 0xBB);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection succeeds");
     CHECK(l.count == 2, "unequal content stays a delete plus an add");
     CHECK(find(&l, "old.txt") != NULL && find(&l, "old.txt")->old_path == NULL,
           "the deletion is untouched");
@@ -142,7 +142,7 @@ static void test_pairs_in_path_order(void)
     add_addition(&l, "b1.txt", 0xAA);
     add_addition(&l, "b2.txt", 0xAA);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection succeeds");
     CHECK(l.count == 2, "both pairs collapse");
     CHECK(find(&l, "b1.txt") != NULL && find(&l, "b1.txt")->old_path != NULL &&
           strcmp(find(&l, "b1.txt")->old_path, "a1.txt") == 0, "b1 comes from a1");
@@ -163,7 +163,7 @@ static void test_a_source_is_used_once(void)
     add_addition(&l, "d1.txt", 0xAA);
     add_addition(&l, "d2.txt", 0xAA);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection succeeds");
     CHECK(l.count == 2, "one rename plus one addition");
     CHECK(find(&l, "d1.txt") != NULL && find(&l, "d1.txt")->old_path != NULL,
           "the first destination in path order claims the source");
@@ -185,7 +185,7 @@ static void test_modifications_and_unmerged_never_pair(void)
     memset(&l.entries[0].new_side, 0, sizeof(l.entries[0].new_side));
     l.entries[0].new_side.kind = SG_DIFF_SIDE_BLOB;
 
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection succeeds");
     CHECK(l.count == 2, "a modification is not a rename source");
     sg_diff_list_free(&l);
 
@@ -193,7 +193,7 @@ static void test_modifications_and_unmerged_never_pair(void)
     add_deletion(&l, "a.txt", 0xAA);
     add_addition(&l, "b.txt", 0xAA);
     l.entries[0].unmerged = 1;
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection succeeds");
     CHECK(l.count == 2, "an unmerged row is never a rename source");
     sg_diff_list_free(&l);
 }
@@ -208,7 +208,7 @@ static void test_zero_score_disables(void)
     add_deletion(&l, "old.txt", 0xAA);
     add_addition(&l, "zew.txt", 0xAA);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 0) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 0, 0) == 0, "detection succeeds");
     CHECK(l.count == 2, "--no-renames leaves both rows");
     CHECK(l.entries[0].old_path == NULL && l.entries[1].old_path == NULL,
           "and marks neither as a rename");
@@ -230,7 +230,7 @@ static void test_list_stays_sorted(void)
     add_addition(&l, "d.txt", 0xCC);
     add_addition(&l, "e.txt", 0xAA);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection succeeds");
     CHECK(l.count == 3, "two pairs collapse, one addition stands alone");
     for (i = 1; i < l.count; i++)
         CHECK(strcmp(l.entries[i - 1].path, l.entries[i].path) < 0,
@@ -243,12 +243,12 @@ static void test_empty_and_single_lists(void)
     sg_diff_list l;
 
     memset(&l, 0, sizeof(l));
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "an empty list is fine");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "an empty list is fine");
     CHECK(l.count == 0, "and stays empty");
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", NULL, 50) == 0, "so is no list at all");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", NULL, 50, 0) == 0, "so is no list at all");
 
     add_deletion(&l, "only.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "one row is fine");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "one row is fine");
     CHECK(l.count == 1 && l.entries[0].old_path == NULL, "a lone deletion is not a rename");
     sg_diff_list_free(&l);
 }
@@ -278,7 +278,7 @@ static void test_unverified_ids_are_never_paired(void)
     l.entries[0].old_side.kind = SG_DIFF_SIDE_BLOB;
     l.entries[1].new_side.kind = SG_DIFF_SIDE_BLOB;
 
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection still succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection still succeeds");
     CHECK(l.count == 2, "identical but unverified ids are not a rename");
     CHECK(l.entries[0].old_path == NULL && l.entries[1].old_path == NULL,
           "and neither row claims to be one");
@@ -291,7 +291,7 @@ static void test_unverified_ids_are_never_paired(void)
     memset(&l, 0, sizeof(l));
     add_deletion(&l, "old.txt", 0xAA);
     add_addition(&l, "zew.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50) == 0, "detection succeeds");
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0, "detection succeeds");
     CHECK(l.count == 1, "the same ids on verified sides DO pair");
     sg_diff_list_free(&l);
 }
@@ -588,7 +588,7 @@ static void test_inexact_rename_carries_gits_score(void)
     add_addition(&l, "new.txt", 0xBB);
     add_deletion(&l, "old.txt", 0xAA);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 1, "the two rows become one, got %zu", l.count);
     e = find(&l, "new.txt");
@@ -621,7 +621,7 @@ static void test_the_threshold_is_a_real_comparison(void)
     memset(&l, 0, sizeof(l));
     add_addition(&l, "new.txt", 0xBB);
     add_deletion(&l, "old.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds at the default threshold");
     CHECK(l.count == 1, "a pair exactly at the threshold is a rename");
     CHECK(l.count == 1 && l.entries[0].score == 50, "and it scores 50, got %d",
@@ -631,7 +631,7 @@ static void test_the_threshold_is_a_real_comparison(void)
     memset(&l, 0, sizeof(l));
     add_addition(&l, "new.txt", 0xBB);
     add_deletion(&l, "old.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT + 1) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT + 1, 0) == 0,
           "detection succeeds one point higher");
     CHECK(l.count == 2, "one point above it, the same pair is an add and a delete");
     sg_diff_list_free(&l);
@@ -643,7 +643,7 @@ static void test_the_threshold_is_a_real_comparison(void)
     memset(&l, 0, sizeof(l));
     add_addition(&l, "new.txt", 0xBB);
     add_deletion(&l, "old.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 2, "one line further and the size guard rules it out");
     sg_diff_list_free(&l);
@@ -668,7 +668,7 @@ static void test_exact_only_threshold_still_finds_exact_renames(void)
     memset(&l, 0, sizeof(l));
     add_addition(&l, "new.txt", 0xBB);
     add_deletion(&l, "old.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_MAX) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_MAX, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 2, "a 79%% pair is not a rename under -M100%%");
     sg_diff_list_free(&l);
@@ -676,7 +676,7 @@ static void test_exact_only_threshold_still_finds_exact_renames(void)
     memset(&l, 0, sizeof(l));
     add_addition(&l, "new.txt", 0xAA);
     add_deletion(&l, "old.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_MAX) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_MAX, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 1, "but identical content still is one under -M100%%");
     CHECK(l.count == 1 && l.entries[0].score == 100, "and still scores 100");
@@ -713,7 +713,7 @@ static void test_the_file_name_beats_a_better_score(void)
     add_addition(&l, "dir2/foo.txt", 0xBB);
     add_addition(&l, "other.txt", 0xCC);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 2, "one of the two additions becomes the rename, got %zu rows",
           l.count);
@@ -764,7 +764,7 @@ static void test_a_name_match_below_the_raised_threshold_loses(void)
     add_addition(&l, "d2/x.txt", 0xBB);
     add_addition(&l, "zz.txt", 0xCC);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 2, "one rename and one addition, got %zu rows", l.count);
     e = find(&l, "zz.txt");
@@ -802,7 +802,7 @@ static void test_the_exact_pass_prefers_a_matching_file_name(void)
     add_addition(&l, "c/f.txt", 0xAA);
 
     CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l,
-                                 SG_SIMILARITY_DEFAULT) == 0,
+                                 SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 2, "one rename plus the unused source, got %zu rows", l.count);
     e = find(&l, "c/f.txt");
@@ -847,7 +847,7 @@ static void test_only_the_best_four_sources_per_destination_survive(void)
     add_deletion(&l, "s4.txt", 0xA4);
     add_deletion(&l, "s5.txt", 0xA5);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 5, "one rename and four leftover deletions, got %zu rows", l.count);
     e = find(&l, "p.txt");
@@ -896,7 +896,7 @@ static void test_the_matrix_breaks_a_tie_on_the_file_name(void)
     add_deletion(&l, "b/x.txt", 0xA2);
     add_addition(&l, "c/x.txt", 0xB0);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 2, "one rename and one leftover deletion, got %zu rows", l.count);
     e = find(&l, "c/x.txt");
@@ -943,7 +943,7 @@ static void test_only_a_hundred_identical_sources_are_considered(void)
     add_addition(&l, "z/target.txt", 0xAA);
 
     CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l,
-                                 SG_SIMILARITY_DEFAULT) == 0,
+                                 SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 101, "one rename and a hundred leftover deletions, got %zu",
           l.count);
@@ -986,7 +986,7 @@ static void test_an_exact_tie_keeps_the_source_it_already_had(void)
         add_deletion(&l, rel, (unsigned char)(0xA0 + i));
     }
 
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 6, "one rename and five leftover deletions, got %zu rows", l.count);
     e = find(&l, "p.txt");
@@ -1031,7 +1031,7 @@ static void test_a_repeated_file_name_declines_the_shortcut(void)
     add_deletion(&l, "b/x.txt", 0xA2);
     add_addition(&l, "c/x.txt", 0xB0);
 
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 2, "one rename and one leftover deletion, got %zu rows", l.count);
     e = find(&l, "c/x.txt");
@@ -1051,6 +1051,120 @@ static void test_a_repeated_file_name_declines_the_shortcut(void)
     rmdir(root);
 }
 
+/* ---- copy detection (Phase 33) ----------------------------------------- */
+
+/* Measured against git 2.55.0 (see the fixture table in the milestone spec):
+   one deleted source with two full-content destinations gives ONE copy and
+   ONE rename, not two copies and not two renames. git spends the source's
+   uses in PATH ORDER, and a destination is a copy exactly while uses remain
+   after its own -- so c1.txt (first in path order) is the copy and c2.txt
+   (last) is the rename, however identical the two destinations are to each
+   other. The source row itself disappears, exactly as an ordinary rename's
+   source does: only the LAST consuming destination clears it. */
+static void test_one_source_two_copies_gives_a_copy_then_a_rename(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    add_deletion(&l, "src.txt", 0xAA);
+    add_addition(&l, "c1.txt", 0xAA);
+    add_addition(&l, "c2.txt", 0xAA);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 1) == 0,
+          "detection succeeds");
+    CHECK(l.count == 2, "the source is consumed, leaving the two destinations, got %zu",
+          l.count);
+    e = find(&l, "c1.txt");
+    CHECK(e != NULL && e->old_path != NULL && strcmp(e->old_path, "src.txt") == 0,
+          "c1.txt is paired to the source");
+    CHECK(e != NULL && e->is_copy == 1, "and it is a COPY, since a use remains after it");
+    e = find(&l, "c2.txt");
+    CHECK(e != NULL && e->old_path != NULL && strcmp(e->old_path, "src.txt") == 0,
+          "c2.txt is paired to the source too");
+    CHECK(e != NULL && e->is_copy == 0, "but it is a RENAME, the last use of the source");
+    CHECK(find(&l, "src.txt") == NULL, "the source row is gone, same as an ordinary rename");
+    sg_diff_list_free(&l);
+}
+
+/* The control for the test above: with copy detection OFF, the exact same
+   fixture must fall back to plain rename behaviour -- one rename, one
+   ordinary addition left untouched -- exactly like
+   test_a_source_is_used_once. Without this control, "l.count == 2" in the
+   test above could equally be satisfied by detection that always treats a
+   repeated source as two renames. */
+static void test_without_copy_detection_the_same_fixture_is_one_rename(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    add_deletion(&l, "src.txt", 0xAA);
+    add_addition(&l, "c1.txt", 0xAA);
+    add_addition(&l, "c2.txt", 0xAA);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0,
+          "detection succeeds");
+    CHECK(l.count == 2, "one rename plus one addition, got %zu", l.count);
+    e = find(&l, "c1.txt");
+    CHECK(e != NULL && e->old_path != NULL && e->is_copy == 0,
+          "the first destination claims the source as a RENAME, not a copy");
+    e = find(&l, "c2.txt");
+    CHECK(e != NULL && e->old_path == NULL, "the second stays a plain addition");
+    sg_diff_list_free(&l);
+}
+
+/* A modified path (both sides present) is registered with one use already
+   spent on itself, so ANY destination paired off it always finds a use
+   remaining afterwards -- it is always a COPY, never a rename, and the
+   modified row is never removed from the list: the source is still there.
+   Measured against git 2.55.0. */
+static void test_a_modified_row_as_copy_source_is_always_a_copy(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    /* Sorted by path: "cp.txt" before "mod.txt". */
+    add_addition(&l, "cp.txt", 0xAA);
+    add(&l, "mod.txt", 1, 0xAA, 1, 0xCC); /* modification: old=AA, new=CC */
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 1) == 0,
+          "detection succeeds");
+    CHECK(l.count == 2, "the modified source row stays, plus the paired destination, got %zu",
+          l.count);
+    e = find(&l, "cp.txt");
+    CHECK(e != NULL && e->old_path != NULL && strcmp(e->old_path, "mod.txt") == 0,
+          "cp.txt is paired to the modified row's OLD content");
+    CHECK(e != NULL && e->is_copy == 1, "and it is a copy, since the source is still there");
+    e = find(&l, "mod.txt");
+    CHECK(e != NULL && e->old_path == NULL,
+          "the modified row itself is not a rename target, it is untouched");
+    sg_diff_list_free(&l);
+}
+
+/* The control for the test above: with copy detection OFF, a modification is
+   never even considered as a source (is_modification is only consulted
+   `detect_copies && ...`), so the same fixture must fall back to an ordinary
+   addition plus an ordinary modification, unpaired. */
+static void test_without_copy_detection_a_modification_is_never_a_source(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    add_addition(&l, "cp.txt", 0xAA);
+    add(&l, "mod.txt", 1, 0xAA, 1, 0xCC);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0,
+          "detection succeeds");
+    CHECK(l.count == 2, "nothing pairs, got %zu", l.count);
+    e = find(&l, "cp.txt");
+    CHECK(e != NULL && e->old_path == NULL,
+          "the addition stays a plain addition without copy detection");
+    sg_diff_list_free(&l);
+}
+
 static void test_a_side_that_cannot_be_read_is_never_paired(void)
 {
     char tmpl[] = "/tmp/sg_rename_unreadable_XXXXXX";
@@ -1065,7 +1179,7 @@ static void test_a_side_that_cannot_be_read_is_never_paired(void)
     memset(&l, 0, sizeof(l));
     add_addition(&l, "new.txt", 0xBB);
     add_deletion(&l, "old.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection succeeds");
     CHECK(l.count == 1, "control: with both files readable this is a rename");
     sg_diff_list_free(&l);
@@ -1074,7 +1188,7 @@ static void test_a_side_that_cannot_be_read_is_never_paired(void)
     memset(&l, 0, sizeof(l));
     add_addition(&l, "new.txt", 0xBB);
     add_deletion(&l, "old.txt", 0xAA);
-    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT) == 0,
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 0) == 0,
           "detection still succeeds with the source gone");
     CHECK(l.count == 2, "an unreadable side is never paired");
     sg_diff_list_free(&l);
@@ -1108,6 +1222,10 @@ int main(void)
     test_an_exact_tie_keeps_the_source_it_already_had();
     test_a_repeated_file_name_declines_the_shortcut();
     test_a_side_that_cannot_be_read_is_never_paired();
+    test_one_source_two_copies_gives_a_copy_then_a_rename();
+    test_without_copy_detection_the_same_fixture_is_one_rename();
+    test_a_modified_row_as_copy_source_is_always_a_copy();
+    test_without_copy_detection_a_modification_is_never_a_source();
 
     if (failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);

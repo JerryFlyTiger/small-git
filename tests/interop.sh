@@ -9970,6 +9970,223 @@ check "phase32: the clean-workdir gate still names the path it came from" \
 check "phase32: and the path it went to" \
     grep -q '^	staged:              b.txt$' "$WORKDIR/p32_gate.txt"
 
+# --- Phase 33: `-C` copy detection ----------------------------------------
+#
+# Same discipline as Phase 29/30: every positive case gets a whole-output cmp
+# against real git, PLUS a grep-based oracle assertion proving real git
+# actually answers what this block assumes it does -- Phase 32 lost a whole
+# fixture to a flag sg did not support, and the byte-for-byte compares stayed
+# green for the wrong reason because nothing checked the oracle side
+# independently.
+P33="$WORKDIR/p33_copy"
+(cd "$WORKDIR" && "$SG" init p33_copy) > /dev/null 2>&1
+(cd "$P33" && git config user.email "a@b.c" && git config user.name "git user")
+
+p33_mk() {
+    mkdir -p "$(dirname "$2")"
+    python3 -c "
+import sys
+open(sys.argv[1], 'w').write(''.join('%s-%d\n' % (sys.argv[2], i) for i in range(1, int(sys.argv[3]) + 1)))
+" "$2" "$3" "${4:-20}"
+}
+
+p33_cmp() {
+    p33_dir="$1"
+    p33_label="$2"
+    shift 2
+    (cd "$p33_dir" && "$SG" diff "$@") > "$WORKDIR/p33_sg.txt" 2>/dev/null
+    (cd "$p33_dir" && git -c core.quotepath=false diff "$@") > "$WORKDIR/p33_git.txt" 2>/dev/null
+    check "phase33: sg diff $p33_label matches real git byte-for-byte" \
+        cmp -s "$WORKDIR/p33_sg.txt" "$WORKDIR/p33_git.txt"
+}
+
+# --- A: an untouched source plus a full copy -- plain -C finds nothing, only
+# -C -C (find-copies-harder) would, and sg does not implement that. ----------
+P33_A="$WORKDIR/p33_untouched_source"
+(cd "$WORKDIR" && "$SG" init p33_untouched_source) > /dev/null 2>&1
+(cd "$P33_A" && git config user.email "a@b.c" && git config user.name "git user")
+p33_mk "$P33_A" "$P33_A/src.txt" A
+(cd "$P33_A" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+cp "$P33_A/src.txt" "$P33_A/copy.txt"
+(cd "$P33_A" && "$SG" add .) > /dev/null 2>&1
+check "phase33 oracle: real git's plain -C does NOT find a copy from an untouched source" \
+    sh -c "(cd '$P33_A' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^A[[:space:]]copy.txt\$'"
+check "phase33 oracle: and it prints no C-line at all" \
+    sh -c "! (cd '$P33_A' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^C'"
+for p33_fmt in --name-status --stat --numstat --shortstat --name-only; do
+    p33_cmp "$P33_A" "--cached -C $p33_fmt (untouched source)" --cached -C "$p33_fmt"
+done
+p33_cmp "$P33_A" "--cached -C (patch, untouched source)" --cached -C
+
+# --- B: a modified source plus an inexact copy of its ORIGINAL content -----
+P33_B="$WORKDIR/p33_modified_source"
+(cd "$WORKDIR" && "$SG" init p33_modified_source) > /dev/null 2>&1
+(cd "$P33_B" && git config user.email "a@b.c" && git config user.name "git user")
+p33_mk "$P33_B" "$P33_B/src.txt" B 100
+(cd "$P33_B" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+# The copy is taken from the ORIGINAL 100-line content (first 80 lines of it,
+# byte for byte -- the same shape as the Phase 30/test_rename.c 100-down-to-80
+# fixture, which scores 79). src.txt is then edited in place, which is what
+# makes it stay in the list as a plain modification instead of a deletion.
+p33_mk "$P33_B" "$P33_B/copy.txt" B 80
+python3 -c "
+import sys
+lines = open(sys.argv[1]).readlines()[:79]
+open(sys.argv[1], 'w').writelines(lines + ['EDITED\n'])
+" "$P33_B/src.txt"
+(cd "$P33_B" && "$SG" add .) > /dev/null 2>&1
+check "phase33 oracle: real git pairs the edited source with -C" \
+    sh -c "(cd '$P33_B' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^C079[[:space:]]src.txt[[:space:]]copy.txt\$'"
+check "phase33 oracle: and the source row is STILL a plain modification" \
+    sh -c "(cd '$P33_B' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^M[[:space:]]src.txt\$'"
+for p33_fmt in --name-status --stat --numstat --shortstat --name-only; do
+    p33_cmp "$P33_B" "--cached -C $p33_fmt (modified source stays, plus a copy)" --cached -C "$p33_fmt"
+done
+p33_cmp "$P33_B" "--cached -C (patch, modified source stays, plus a copy)" --cached -C
+check "phase33: sg's patch prints copy from/copy to, not rename from/to" \
+    sh -c "(cd '$P33_B' && '$SG' diff --cached -C) | grep -q '^copy from src.txt\$'"
+
+# --- C: a deleted source with two full copies -- one COPY, one RENAME ------
+P33_C="$WORKDIR/p33_one_source_two_copies"
+(cd "$WORKDIR" && "$SG" init p33_one_source_two_copies) > /dev/null 2>&1
+(cd "$P33_C" && git config user.email "a@b.c" && git config user.name "git user")
+p33_mk "$P33_C" "$P33_C/src.txt" C
+(cd "$P33_C" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P33_C/src.txt"
+p33_mk "$P33_C" "$P33_C/c1.txt" C
+p33_mk "$P33_C" "$P33_C/c2.txt" C
+(cd "$P33_C" && "$SG" add .) > /dev/null 2>&1
+check "phase33 oracle: real git calls the first destination in path order a COPY" \
+    sh -c "(cd '$P33_C' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^C100[[:space:]]src.txt[[:space:]]c1.txt\$'"
+check "phase33 oracle: and the second a RENAME" \
+    sh -c "(cd '$P33_C' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^R100[[:space:]]src.txt[[:space:]]c2.txt\$'"
+for p33_fmt in --name-status --stat --numstat --shortstat --name-only; do
+    p33_cmp "$P33_C" "--cached -C $p33_fmt (one source, one copy, one rename)" --cached -C "$p33_fmt"
+done
+p33_cmp "$P33_C" "--cached -C (patch, one source, one copy, one rename)" --cached -C
+
+# --- D: the same-file-name shortcut, which -C is documented to SKIP --------
+# Same fixture shape Phase 30 used to prove the shortcut exists: without -C,
+# the shared file name pairs dir2/foo.txt first even though other.txt is a
+# much closer match. With -C the shortcut is off entirely, so the pairing
+# reverses: dir1/foo.txt goes to whichever destination the full comparison
+# ranks best (other.txt, at 98%), and dir2/foo.txt is left as its own rename
+# off... no other source, so it stays a copy from dir1/foo.txt too, at 79%.
+P33_D="$WORKDIR/p33_shortcut_skipped"
+(cd "$WORKDIR" && "$SG" init p33_shortcut_skipped) > /dev/null 2>&1
+(cd "$P33_D" && git config user.email "a@b.c" && git config user.name "git user")
+p33_mk "$P33_D" "$P33_D/dir1/foo.txt" D 100
+(cd "$P33_D" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P33_D/dir1/foo.txt"
+p33_mk "$P33_D" "$P33_D/dir2/foo.txt" D 80
+p33_mk "$P33_D" "$P33_D/other.txt" D 99
+(cd "$P33_D" && "$SG" add .) > /dev/null 2>&1
+check "phase33 oracle: WITHOUT -C, the shared file name wins, at 79%" \
+    sh -c "(cd '$P33_D' && LC_ALL=C git diff --cached --name-status) | grep -q '^R079[[:space:]]dir1/foo.txt[[:space:]]dir2/foo.txt\$'"
+check "phase33 oracle: and other.txt is left an ordinary addition" \
+    sh -c "(cd '$P33_D' && LC_ALL=C git diff --cached --name-status) | grep -q '^A[[:space:]]other.txt\$'"
+check "phase33 oracle: WITH -C, the shortcut is skipped -- other.txt (98%) wins the RENAME" \
+    sh -c "(cd '$P33_D' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^R098[[:space:]]dir1/foo.txt[[:space:]]other.txt\$'"
+check "phase33 oracle: and dir2/foo.txt (79%) is left a COPY from the same source" \
+    sh -c "(cd '$P33_D' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^C079[[:space:]]dir1/foo.txt[[:space:]]dir2/foo.txt\$'"
+p33_cmp "$P33_D" "--cached --name-status (no -C: shortcut wins)" --cached --name-status
+for p33_fmt in --name-status --stat --numstat --shortstat --name-only; do
+    p33_cmp "$P33_D" "--cached -C $p33_fmt (shortcut skipped under -C)" --cached -C "$p33_fmt"
+done
+p33_cmp "$P33_D" "--cached -C (patch, shortcut skipped under -C)" --cached -C
+
+# --- grammar: -C/-C<n>/-C<n>%/--find-copies[=<n>] share -M's parser --------
+for p33_opt in -C -C5 "-C90%" --find-copies "--find-copies=90%"; do
+    p33_cmp "$P33_C" "--name-status $p33_opt (grammar)" --cached --name-status "$p33_opt"
+done
+check "phase33 oracle: real git rejects an unparsable -C value" \
+    sh -c "! (cd '$P33_C' && LC_ALL=C git diff --cached -Cabc) > /dev/null 2>&1"
+check "phase33: sg rejects it too" \
+    sh -c "! (cd '$P33_C' && '$SG' diff --cached -Cabc) > /dev/null 2>&1"
+
+# --- -C -C / --find-copies-harder: a deliberate divergence from real git ---
+# sg does not implement find-copies-harder (it would need every UNCHANGED
+# path as a candidate source, which sg_diff_list never holds). Pin the
+# divergence explicitly rather than let it look like an accident: real git
+# accepts the flag, sg refuses it outright.
+check "phase33 oracle: real git DOES accept -C -C" \
+    sh -c "(cd '$P33_C' && LC_ALL=C git diff --cached -C -C --name-status) > /dev/null 2>&1"
+check "phase33: sg deliberately rejects -C -C" \
+    sh -c "! (cd '$P33_C' && '$SG' diff --cached -C -C) > /dev/null 2>$WORKDIR/p33_harder.txt"
+check "phase33: and names find-copies-harder in the error" \
+    grep -q "find-copies-harder" "$WORKDIR/p33_harder.txt"
+check "phase33 oracle: real git also accepts the long form --find-copies-harder" \
+    sh -c "(cd '$P33_C' && LC_ALL=C git diff --cached --find-copies-harder --name-status) > /dev/null 2>&1"
+check "phase33: sg rejects the long form too" \
+    sh -c "! (cd '$P33_C' && '$SG' diff --cached --find-copies-harder) > /dev/null 2>$WORKDIR/p33_harder2.txt"
+check "phase33: and names find-copies-harder in that error too" \
+    grep -q "find-copies-harder" "$WORKDIR/p33_harder2.txt"
+
+# Two properties of copy mode that the fixtures above cannot see, because
+# something else in the pipeline happens to reach the same answer. Both were
+# found by mutating the product code and watching nothing turn red.
+#
+# 1. Copy mode skips the same-file-name shortcut. With ONE source that is
+#    invisible: copy mode lets a source be reused, so claiming it early via
+#    the shortcut costs nothing. It takes TWO sources -- one that shares the
+#    destination's name at 79%, one that does not at 98% -- for the shortcut
+#    to change the answer. Measured against git 2.55.0: without -C the name
+#    wins, with -C the score does.
+P33_E="$WORKDIR/p33_shortcut_two_sources"
+(cd "$WORKDIR" && "$SG" init p33_shortcut_two_sources) > /dev/null 2>&1
+(cd "$P33_E" && git config user.email "a@b.c" && git config user.name "git user")
+p33_mk "$P33_E" "$P33_E/a/x.txt" L 80
+p33_mk "$P33_E" "$P33_E/b/y.txt" L 99
+(cd "$P33_E" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+rm "$P33_E/a/x.txt" "$P33_E/b/y.txt"
+p33_mk "$P33_E" "$P33_E/d/x.txt" L 100
+(cd "$P33_E" && "$SG" add .) > /dev/null 2>&1
+check "phase33 oracle: without -C the shared file name wins" \
+    sh -c "(cd '$P33_E' && LC_ALL=C git diff --cached --name-status) | grep -q '^R079'"
+check "phase33 oracle: with -C the better score wins instead" \
+    sh -c "(cd '$P33_E' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^R098'"
+p33_cmp "$P33_E" "--cached --name-status (two sources, shortcut on)" \
+    --cached --name-status
+p33_cmp "$P33_E" "--cached -C --name-status (two sources, shortcut skipped)" \
+    --cached -C --name-status
+#
+# 2. The exact pass lets a source be claimed again under -C. Normally the
+#    matrix's second walk would find the same pair anyway, so breaking the
+#    exact pass changes nothing -- except at -C100%, where the matrix is
+#    skipped entirely and the exact pass is the only thing left.
+P33_F="$WORKDIR/p33_exact_reuse"
+(cd "$WORKDIR" && "$SG" init p33_exact_reuse) > /dev/null 2>&1
+(cd "$P33_F" && git config user.email "a@b.c" && git config user.name "git user")
+p33_mk "$P33_F" "$P33_F/src.txt" S 100
+(cd "$P33_F" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+cp "$P33_F/src.txt" "$P33_F/c1.txt"
+cp "$P33_F/src.txt" "$P33_F/c2.txt"
+rm "$P33_F/src.txt"
+(cd "$P33_F" && "$SG" add .) > /dev/null 2>&1
+check "phase33 oracle: -C100% still splits one source into a copy and a rename" \
+    sh -c "(cd '$P33_F' && LC_ALL=C git diff --cached -C100% --name-status) | grep -q '^C100'"
+check "phase33 oracle: and the second one is the rename" \
+    sh -c "(cd '$P33_F' && LC_ALL=C git diff --cached -C100% --name-status) | grep -q '^R100'"
+p33_cmp "$P33_F" "--cached -C100% --name-status (exact pass alone)" \
+    --cached -C100% --name-status
+
+# -M and -C write the same mode in git, so the LAST one wins. Measured:
+# `git diff -C -M` finds renames only while `-M -C` finds copies. sg had -C
+# sticky in the first order, and nothing noticed because no check combined
+# the two flags -- a coverage gap sitting exactly where the defect was.
+check "phase33 oracle: git's -C then -M reverts to renames only" \
+    sh -c "(cd '$P33_F' && LC_ALL=C git diff --cached -C -M --name-status) | grep -qv '^C' "
+check "phase33 oracle: and the reverse order keeps copies" \
+    sh -c "(cd '$P33_F' && LC_ALL=C git diff --cached -M -C --name-status) | grep -q '^C100'"
+p33_cmp "$P33_F" "--cached -C -M --name-status (the later flag wins)" \
+    --cached -C -M --name-status
+p33_cmp "$P33_F" "--cached -M -C --name-status (the later flag wins)" \
+    --cached -M -C --name-status
+p33_cmp "$P33_F" "--cached -C -M50% --name-status (a valued -M also clears -C)" \
+    --cached -C -M50% --name-status
+p33_cmp "$P33_F" "--cached -C --no-renames --name-status" --cached -C --no-renames --name-status
+p33_cmp "$P33_F" "--cached --no-renames -C --name-status" --cached --no-renames -C --name-status
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

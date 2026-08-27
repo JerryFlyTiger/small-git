@@ -19,7 +19,7 @@
 
 static const char USAGE[] =
     "usage: sg diff [--cached|--staged] [--stat[=<w>[,<n>]]|--numstat|--shortstat|--name-only|"
-    "--name-status] [-M[<n>]|--no-renames] [<rev> [<rev>]] [--] [<path>...]\n";
+    "--name-status] [-M[<n>]|-C[<n>]|--no-renames] [<rev> [<rev>]] [--] [<path>...]\n";
 
 /* Resolves rev to a tree id via sg_rev_parse_commit + sg_commit_tree_of --
    the one path every rev argument in this command goes through, per
@@ -175,6 +175,7 @@ int sg_cmd_diff(int argc, char **argv)
        as a percentage -- see sg/similarity.h for why a percentage cannot hold
        every threshold the -M grammar can ask for. 0 means --no-renames. */
     int rename_score = SG_SIMILARITY_DEFAULT;
+    int detect_copies = 0; /* git's -C */
     int rev_count;
     char bad_path[SG_PATH_MAX];
     int rc;
@@ -224,8 +225,41 @@ int sg_cmd_diff(int argc, char **argv)
             opts.format = SG_DIFF_FORMAT_NAME_STATUS;
         } else if (strcmp(a, "--no-renames") == 0) {
             rename_score = 0;
+            detect_copies = 0;
+        } else if (strcmp(a, "--find-copies-harder") == 0 ||
+                  ((strncmp(a, "-C", 2) == 0 ||
+                    strncmp(a, "--find-copies", 13) == 0) && detect_copies)) {
+            /* git's -C -C. It additionally offers every UNCHANGED path as a
+               copy source, and sg_diff_list only ever holds paths that
+               changed -- so this is refused rather than quietly answered as
+               plain -C would answer it. Measured: git accepts it and finds
+               copies sg would miss, so approximating it would be a silently
+               wrong answer, which is the one failure direction this codebase
+               does not allow. */
+            fprintf(stderr, "sg: --find-copies-harder (-C -C) is not implemented; "
+                            "plain -C only finds copies whose source also changed\n");
+            free(pos);
+            return 1;
+        } else if (strcmp(a, "-C") == 0 || strcmp(a, "--find-copies") == 0) {
+            detect_copies = 1;
+            rename_score = SG_SIMILARITY_DEFAULT;
+        } else if (strncmp(a, "-C", 2) == 0 || strncmp(a, "--find-copies=", 14) == 0) {
+            const char *v = a[1] == 'C' ? a + 2 : a + strlen("--find-copies=");
+
+            if (sg_similarity_parse_score_arg(v, &rename_score) != 0) {
+                fputs(USAGE, stderr);
+                free(pos);
+                return 1;
+            }
+            detect_copies = 1;
         } else if (strcmp(a, "-M") == 0 || strcmp(a, "--find-renames") == 0) {
             rename_score = SG_SIMILARITY_DEFAULT;
+            /* -M turns copy detection back OFF. git keeps one mode field that
+               each flag overwrites, so the last one written wins: measured,
+               `git diff -C -M` finds renames only, while `-M -C` finds
+               copies. Leaving this out made -C sticky, which nothing caught
+               because no test combined the two. */
+            detect_copies = 0;
         } else if (strncmp(a, "-M", 2) == 0 || strncmp(a, "--find-renames=", 15) == 0) {
             const char *v = a[1] == 'M' ? a + 2 : a + 15;
 
@@ -234,6 +268,7 @@ int sg_cmd_diff(int argc, char **argv)
                 free(pos);
                 return 1;
             }
+            detect_copies = 0;
         } else if (a[0] == '-' && a[1] != '\0') {
             fputs(USAGE, stderr);
             free(pos);
@@ -365,7 +400,7 @@ int sg_cmd_diff(int argc, char **argv)
        against git 2.55.0, `git diff --cached --name-status -- b1.txt` on a
        renamed pair prints "A b1.txt", because git filters by pathspec first
        and a spec naming half a rename leaves nothing to pair with. */
-    if (sg_diff_detect_renames(git_dir, repo_root, &list, rename_score) != 0) {
+    if (sg_diff_detect_renames(git_dir, repo_root, &list, rename_score, detect_copies) != 0) {
         fprintf(stderr, "sg: out of memory, cannot detect renames\n");
         goto done;
     }
