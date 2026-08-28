@@ -286,7 +286,7 @@ int sg_tree_build_from_index(const char *git_dir, const sg_index *idx,
 }
 
 int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
-                               sg_workdir_missing missing,
+                               sg_workdir_missing missing, const sg_pathspec *ps,
                                unsigned char tree_id_out[SG_SHA1_RAW_LEN], char *bad_path)
 {
     sg_flat_entry *entries = NULL;
@@ -343,6 +343,21 @@ int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const
             if (bad_path != NULL)
                 snprintf(bad_path, SG_PATH_MAX, "%s", idx->entries[i].path);
             goto out_free_entries;
+        }
+
+        /* Phase 37: a path the pathspec does not match is handled exactly
+           like SG_WORKDIR_MISSING_KEEP_INDEX_BLOB, regardless of `missing`
+           and regardless of what is actually on disk -- the working tree is
+           never even looked at for this path this call. This must run
+           AFTER the path-safety guard above (every index path still gets
+           validated, matched or not) and BEFORE any lstat/read below (the
+           whole point is to skip touching the working tree at all). */
+        if (ps != NULL && !sg_pathspec_matches(ps, idx->entries[i].path)) {
+            entries[entry_count].path = idx->entries[i].path;
+            entries[entry_count].mode = idx->entries[i].mode;
+            memcpy(entries[entry_count].sha1, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
+            entry_count++;
+            continue;
         }
 
         /* A truncated path must hard-fail here, before sg_read_file ever
@@ -424,7 +439,7 @@ out_free_entries:
 }
 
 int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
-                                 int include_ignored,
+                                 const sg_pathspec *ps, int include_ignored,
                                  unsigned char tree_id_out[SG_SHA1_RAW_LEN],
                                  size_t *file_count_out)
 {
@@ -436,7 +451,7 @@ int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, con
     int chunk_enabled = 0;
     size_t chunk_threshold = SG_CHUNK_DEFAULT_THRESHOLD;
 
-    if (sg_status_list_untracked(git_dir, repo_root, idx, include_ignored,
+    if (sg_status_list_untracked(git_dir, repo_root, idx, ps, include_ignored,
                                  SG_STATUS_UNTRACKED_LIST_FILES, &paths, &count) != 0)
         return -1;
 

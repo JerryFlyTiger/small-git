@@ -10,6 +10,7 @@
 #include "sg/objstore.h"
 #include "sg/quote.h"
 #include "sg/rebase.h"
+#include "sg/pathspec.h"
 #include "sg/repo.h"
 #include "sg/stash.h"
 #include "sg/workdir.h"
@@ -40,9 +41,31 @@ static void print_dropped(const char *spec, size_t index, const char *hex)
         printf("Dropped refs/stash@{%zu} (%s)\n", index, hex);
 }
 
+/* Phase 37: `sg stash push -- <pathspec>...` -- a third, deliberate copy of
+   this function (cmd_diff.c, cmd_status.c already each have one). CLAUDE.md
+   names the precedent (report_bad_tree_path/report_bad_stash_tree_path,
+   Phase 25): converge once interop covers all three, not before. */
+static void report_pathspec_error(sg_pathspec_error err, const char *arg, const char *repo_root)
+{
+    switch (err) {
+    case SG_PATHSPEC_ERR_EMPTY:
+        fprintf(stderr, "sg: an empty string is not a valid path; use . to match all paths\n");
+        break;
+    case SG_PATHSPEC_ERR_MAGIC:
+        fprintf(stderr, "sg: unsupported pathspec magic: %s\n", sg_quote_path_delimited(arg));
+        break;
+    case SG_PATHSPEC_ERR_NONE:
+    case SG_PATHSPEC_ERR_OUTSIDE:
+        fprintf(stderr, "sg: %s is outside the repository %s\n",
+               sg_quote_path_delimited(arg), sg_quote_path_delimited(repo_root));
+        break;
+    }
+}
+
 static int cmd_stash_push(int argc, char **argv, const char *usage)
 {
     sg_stash_push_opts opts;
+    sg_pathspec pathspec;
     int i0 = 1;
     int i;
     char *git_dir;
@@ -50,17 +73,36 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
     unsigned char commit_id[SG_SHA1_RAW_LEN];
     char bad_path[SG_PATH_MAX];
     int rc;
+    char **pos;
+    int n_pos = 0;
+    int dashdash = -1; /* index into pos[] where "--" split the line */
 
     memset(&opts, 0, sizeof(opts));
+    memset(&pathspec, 0, sizeof(pathspec));
     bad_path[0] = '\0';
 
     if (argc >= 2 && strcmp(argv[1], "push") == 0)
         i0 = 2;
 
+    pos = malloc((size_t)(argc > 0 ? argc : 1) * sizeof(*pos));
+    if (pos == NULL) {
+        fprintf(stderr, "sg: out of memory\n");
+        return 1;
+    }
+
     for (i = i0; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0) {
+        /* Past "--" nothing is an option any more, same convention as
+           cmd_diff.c/cmd_status.c. */
+        if (dashdash >= 0) {
+            pos[n_pos++] = argv[i];
+            continue;
+        }
+        if (strcmp(argv[i], "--") == 0) {
+            dashdash = n_pos;
+        } else if (strcmp(argv[i], "-m") == 0) {
             if (i + 1 >= argc) {
                 fputs(usage, stderr);
+                free(pos);
                 return 1;
             }
             opts.message = argv[++i];
@@ -70,21 +112,42 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
             opts.include_ignored = 1;
         } else if (strcmp(argv[i], "--keep-index") == 0) {
             opts.keep_index = 1;
-        } else {
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
             fputs(usage, stderr);
+            free(pos);
             return 1;
+        } else {
+            pos[n_pos++] = argv[i];
         }
     }
 
     git_dir = sg_require_git_dir();
-    if (git_dir == NULL)
+    if (git_dir == NULL) {
+        free(pos);
         return 1;
+    }
     repo_root = sg_repo_root(git_dir);
     if (repo_root == NULL) {
         fprintf(stderr, "sg: failed to determine repository root\n");
+        free(pos);
         free(git_dir);
         return 1;
     }
+
+    for (i = 0; i < n_pos; i++) {
+        sg_pathspec_error perr;
+
+        if (sg_pathspec_add(&pathspec, repo_root, pos[i], &perr) != 0) {
+            report_pathspec_error(perr, pos[i], repo_root);
+            sg_pathspec_free(&pathspec);
+            free(pos);
+            free(repo_root);
+            free(git_dir);
+            return 1;
+        }
+    }
+    free(pos);
+    opts.pathspec = &pathspec;
 
     /* sg_stash_push refuses an unmerged index, but it is a library function
        and reports that as a bare -1 alongside every other failure. Ask the
@@ -100,6 +163,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
             sg_index_free(&idx);
             if (unmerged) {
                 fprintf(stderr, "sg: unresolved conflicts remain, cannot stash push\n");
+                sg_pathspec_free(&pathspec);
                 free(git_dir);
                 free(repo_root);
                 return 1;
@@ -122,9 +186,23 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
     rc = sg_stash_push(git_dir, repo_root, &opts, commit_id, bad_path);
     if (rc == 1) {
         printf("No local changes to save\n");
+        sg_pathspec_free(&pathspec);
         free(git_dir);
         free(repo_root);
         return 0;
+    }
+    if (rc == 2) {
+        /* Phase 37: opts.pathspec matched nothing at all -- nothing durable
+           was written, unlike -2 below. Real git's wording is "pathspec ...
+           did not match any file(s) known to git"; sg's own wording is
+           enough since this is a brand-new rejection with no oracle
+           byte-format to match (only the exit code + "nothing created"
+           behavior is pinned against real git, per PHASE37_SPEC.md B1). */
+        fprintf(stderr, "sg: pathspec did not match any files; no stash created\n");
+        sg_pathspec_free(&pathspec);
+        free(git_dir);
+        free(repo_root);
+        return 1;
     }
     if (rc == -2) {
         /* The stash commit + refs/stash were already written durably (it IS
@@ -140,6 +218,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
             fprintf(stderr, "sg: that stash is stash@{0}: %s\n", list.entries[0].message);
             sg_stash_list_free(&list);
         }
+        sg_pathspec_free(&pathspec);
         free(git_dir);
         free(repo_root);
         return 1;
@@ -157,6 +236,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         else
             fprintf(stderr,
                    "sg: cannot create stash (unborn HEAD, or the index has unresolved conflicts?)\n");
+        sg_pathspec_free(&pathspec);
         free(git_dir);
         free(repo_root);
         return 1;
@@ -187,6 +267,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         }
     }
 
+    sg_pathspec_free(&pathspec);
     free(git_dir);
     free(repo_root);
     return 0;
@@ -805,7 +886,7 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
 int sg_cmd_stash(int argc, char **argv)
 {
     static const char usage[] = "usage: sg stash [push] [-m <msg>] [-u|--include-untracked] [-a|--all] "
-                                "[--keep-index]\n"
+                                "[--keep-index] [--] [<pathspec>...]\n"
                                 "   or: sg stash list\n"
                                 "   or: sg stash show [-p|--patch] [--stat[=<w>[,<n>]]] [--numstat] "
                                 "[--shortstat] [--name-only]\n"

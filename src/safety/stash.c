@@ -322,12 +322,203 @@ int sg_stash_parse_spec(const char *spec, size_t *index_out)
 
 /* ---- push ------------------------------------------------------------------ */
 
+/* True if ps matches at least one path idx covers (any stage -- this is a
+   pure existence check, not a "did it change" check, so an unmerged path
+   still counts). Used only by sg_stash_push's Phase 37 "pathspec matched
+   nothing at all" gate below. */
+static int idx_has_matching_path(const sg_index *idx, const sg_pathspec *ps)
+{
+    size_t i;
+
+    for (i = 0; i < idx->count; i++) {
+        if (sg_pathspec_matches(ps, idx->entries[i].path))
+            return 1;
+    }
+    return 0;
+}
+
+static const sg_flat_entry *stash_flat_find(const sg_flat_list *list, const char *path)
+{
+    size_t i;
+
+    for (i = 0; i < list->count; i++) {
+        if (strcmp(list->entries[i].path, path) == 0)
+            return &list->entries[i];
+    }
+    return NULL;
+}
+
+/* PHASE37_SPEC.md B3: the per-path restore a partial `sg stash push --
+   <pathspec>` uses instead of sg_apply_tree_to_workdir's whole-tree reset.
+   sg_apply_tree_to_workdir deliberately gains NO pathspec parameter -- it is
+   the one shared entry point switch/reset --hard/merge/undo/stash all call,
+   and giving it a filter would put every one of those five call sites on
+   the hook for this feature's risk (CLAUDE.md's standing rule on this
+   function). This is instead a private, narrower reimplementation of the
+   same "reset working tree + index to a target tree" operation, confined to
+   paths ps matches:
+
+     - a path ps matches, present in target_tree: workdir content + index
+       entry are (re)written from target_tree, exactly like
+       sg_apply_tree_to_workdir would.
+     - a path ps matches, tracked now but ABSENT from target_tree: removed
+       from the working tree (and pruned upward) and from the index --
+       target_tree names the deletion, so this path's matched status must
+       still let the deletion through.
+     - every other path -- ps does not match it, matched or not by
+       target_tree -- is left COMPLETELY alone: working-tree content and
+       index entry both untouched, staged or not.
+
+   Called twice by sg_stash_push under partial push: once with head_tree
+   (the base reset every partial push does), and again with index_tree only
+   under --keep-index (re-layering the staged diff back on top, same
+   two-call shape sg_apply_tree_to_workdir's own caller uses and for the
+   same reason -- see the comment at that call site).
+
+   Returns 0, -1 on failure (some paths may already have been rewritten;
+   same no-rollback convention as sg_apply_tree_to_workdir -- there is
+   nothing to roll back TO here besides the snapshot the caller already
+   took). */
+static int restore_matched_paths(const char *git_dir, const char *repo_root,
+                                 const unsigned char target_tree[SG_SHA1_RAW_LEN],
+                                 const sg_pathspec *ps)
+{
+    sg_flat_list target_flat;
+    sg_index idx;
+    char bad_path[SG_PATH_MAX];
+    size_t i;
+    int rc = 0;
+
+    if (sg_tree_flatten(git_dir, target_tree, &target_flat, bad_path) != 0)
+        return -1;
+
+    if (sg_index_read(git_dir, &idx) != 0) {
+        sg_flat_list_free(&target_flat);
+        return -1;
+    }
+
+    /* Matched paths tracked now but absent from target_tree: delete. idx may
+       hold several stage 1/2/3 entries for the same path (an unresolved
+       conflict) -- skip duplicates so each path is only handled once, same
+       convention as sg_apply_tree_to_workdir's own loop. */
+    for (i = 0; i < idx.count; i++) {
+        if (i > 0 && strcmp(idx.entries[i].path, idx.entries[i - 1].path) == 0)
+            continue;
+        if (!sg_pathspec_matches(ps, idx.entries[i].path))
+            continue;
+        if (stash_flat_find(&target_flat, idx.entries[i].path) == NULL) {
+            char abspath[SG_PATH_MAX];
+
+            if (!sg_relpath_is_safe(idx.entries[i].path)) {
+                fprintf(stderr, "sg: path %s in index is invalid, refusing to delete\n",
+                       sg_quote_path_delimited(idx.entries[i].path));
+                rc = -1;
+                continue;
+            }
+            if (sg_path_join(abspath, sizeof(abspath), repo_root, idx.entries[i].path) != 0) {
+                fprintf(stderr, "sg: path too long, cannot delete %s\n",
+                       sg_quote_path_delimited(idx.entries[i].path));
+                rc = -1;
+                continue;
+            }
+            if (remove(abspath) == 0)
+                sg_prune_empty_parents(repo_root, idx.entries[i].path);
+            if (sg_index_remove_all_stages(&idx, idx.entries[i].path) != 0)
+                rc = -1;
+        }
+    }
+
+    /* Matched paths present in target_tree: (re)write content, then the
+       index entry. Every path here is unconditionally overwritten -- unlike
+       sg_apply_tree_to_workdir there is no need to compare against a prior
+       state first, an unmatched path was already skipped above/below and
+       nothing here ever touches it. */
+    for (i = 0; i < target_flat.count; i++) {
+        char abspath[SG_PATH_MAX];
+        unsigned char *blob_content;
+        size_t blob_len;
+        struct stat st;
+        sg_index_entry entry;
+        sg_chunk_missing_info missing;
+        int read_rc;
+
+        if (!sg_pathspec_matches(ps, target_flat.entries[i].path))
+            continue;
+
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, target_flat.entries[i].path) != 0) {
+            fprintf(stderr, "sg: path too long, cannot write %s\n",
+                   sg_quote_path_delimited(target_flat.entries[i].path));
+            rc = -1;
+            continue;
+        }
+        read_rc = sg_chunk_read_blob(git_dir, target_flat.entries[i].sha1, &blob_content, &blob_len,
+                                     &missing);
+        if (read_rc == -2) {
+            sg_chunk_print_missing_error(target_flat.entries[i].path, &missing);
+            rc = -1;
+            continue;
+        }
+        if (read_rc != 0) {
+            fprintf(stderr, "sg: missing blob for %s\n",
+                   sg_quote_path_delimited(target_flat.entries[i].path));
+            rc = -1;
+            continue;
+        }
+        if (sg_write_file_mkdirs(abspath, blob_content, blob_len,
+                                 (int)(target_flat.entries[i].mode & 0777)) != 0) {
+            fprintf(stderr, "sg: failed to write %s\n",
+                   sg_quote_path_delimited(target_flat.entries[i].path));
+            free(blob_content);
+            rc = -1;
+            continue;
+        }
+        free(blob_content);
+
+        if (stat(abspath, &st) != 0) {
+            rc = -1;
+            continue;
+        }
+
+        memset(&entry, 0, sizeof(entry));
+        entry.ctime_sec = (unsigned int)st.st_ctime;
+        entry.mtime_sec = (unsigned int)st.st_mtime;
+#if defined(__APPLE__)
+        entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
+        entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
+#else
+        entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
+        entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
+#endif
+        entry.dev = (unsigned int)st.st_dev;
+        entry.ino = (unsigned int)st.st_ino;
+        entry.mode = target_flat.entries[i].mode;
+        entry.uid = (unsigned int)st.st_uid;
+        entry.gid = (unsigned int)st.st_gid;
+        entry.file_size = (unsigned int)st.st_size;
+        memcpy(entry.sha1, target_flat.entries[i].sha1, SG_SHA1_RAW_LEN);
+        entry.path = target_flat.entries[i].path;
+
+        if (sg_index_upsert(&idx, &entry) != 0) {
+            fprintf(stderr, "sg: failed to stage %s\n", sg_quote_path_delimited(target_flat.entries[i].path));
+            rc = -1;
+        }
+    }
+
+    if (rc == 0 && sg_index_write(git_dir, &idx) != 0)
+        rc = -1;
+
+    sg_index_free(&idx);
+    sg_flat_list_free(&target_flat);
+    return rc;
+}
+
 int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_push_opts *opts,
                   unsigned char commit_id_out[SG_SHA1_RAW_LEN], char *bad_path)
 {
-    static const sg_stash_push_opts default_opts = {NULL, 0, 0, 0};
+    static const sg_stash_push_opts default_opts = {NULL, 0, 0, 0, NULL};
     const char *message;
     int untracked_flag;
+    int partial; /* Phase 37: opts->pathspec set and non-empty */
     unsigned char head_commit[SG_SHA1_RAW_LEN];
     unsigned char head_tree[SG_SHA1_RAW_LEN];
     sg_index idx;
@@ -361,6 +552,7 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         opts = &default_opts;
     message = opts->message;
     untracked_flag = opts->include_untracked || opts->include_ignored;
+    partial = (opts->pathspec != NULL && opts->pathspec->count > 0);
 
     if (sg_ref_resolve_head(git_dir, head_commit) != 0)
         return -1; /* unborn HEAD */
@@ -376,23 +568,55 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         return -1;
     }
 
-    if (sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_RECORD_DELETION,
-                                   worktree_tree, bad_path) != 0) {
-        sg_index_free(&idx);
-        return -1;
-    }
-    if (sg_tree_build_from_index(git_dir, &idx, index_tree) != 0) {
-        sg_index_free(&idx);
-        return -1;
-    }
-
+    /* Phase 37, PHASE37_SPEC.md B1: fetched here, before anything is built
+       or written, and filtered by opts->pathspec directly (NULL when not
+       partial, which matches everything -- identical to the pre-Phase-37
+       call). Doing this before the "did the pathspec match anything at all"
+       gate below lets that gate reuse this same list instead of listing
+       untracked files twice; doing it before any tree-building call also
+       means the "matched nothing" case below writes nothing at all, not
+       even a blob object. */
     if (untracked_flag) {
-        if (sg_status_list_untracked(git_dir, repo_root, &idx, opts->include_ignored,
+        if (sg_status_list_untracked(git_dir, repo_root, &idx, opts->pathspec, opts->include_ignored,
                                      SG_STATUS_UNTRACKED_LIST_FILES, &untracked_paths,
                                      &untracked_path_count) != 0) {
             sg_index_free(&idx);
             return -1;
         }
+    }
+
+    /* Phase 37, PHASE37_SPEC.md B1: "did the pathspec match anything real at
+       all" is a wholly new question this codebase never had to answer
+       before -- not even `sg diff`/`sg status` ask it, both of which are
+       silently exit-0 on a pathspec matching nothing (see cmd_status.c's own
+       comment on the deliberate divergence). A partial stash push refuses
+       instead, exactly like real git's "pathspec ... did not match any
+       file(s)", and refuses even when the worktree has OTHER, unrelated
+       dirty paths the pathspec simply does not name -- this check runs
+       BEFORE the "nothing to save" check below, and is unrelated to it. */
+    if (partial && !idx_has_matching_path(&idx, opts->pathspec) &&
+       (!untracked_flag || untracked_path_count == 0)) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
+        sg_index_free(&idx);
+        return 2; /* pathspec matched nothing; nothing written */
+    }
+
+    if (sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_RECORD_DELETION,
+                                   opts->pathspec, worktree_tree, bad_path) != 0) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
+        sg_index_free(&idx);
+        return -1;
+    }
+    if (sg_tree_build_from_index(git_dir, &idx, index_tree) != 0) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
+        sg_index_free(&idx);
+        return -1;
     }
 
     if (memcmp(worktree_tree, head_tree, SG_SHA1_RAW_LEN) == 0 &&
@@ -457,8 +681,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     if (untracked_flag) {
         unsigned char untracked_tree[SG_SHA1_RAW_LEN];
 
-        if (sg_tree_build_from_untracked(git_dir, repo_root, &idx, opts->include_ignored, untracked_tree,
-                                         NULL) != 0) {
+        if (sg_tree_build_from_untracked(git_dir, repo_root, &idx, opts->pathspec, opts->include_ignored,
+                                         untracked_tree, NULL) != 0) {
             free(head_subject);
             for (i = 0; i < untracked_path_count; i++)
                 free(untracked_paths[i]);
@@ -574,7 +798,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     }
     sg_index_free(&idx);
 
-    if (sg_apply_tree_to_workdir(git_dir, repo_root, head_tree) != 0) {
+    if ((partial ? restore_matched_paths(git_dir, repo_root, head_tree, opts->pathspec)
+                : sg_apply_tree_to_workdir(git_dir, repo_root, head_tree)) != 0) {
         for (i = 0; i < untracked_path_count; i++)
             free(untracked_paths[i]);
         free(untracked_paths);
@@ -600,7 +825,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
        the staged-delete row of the measured --keep-index table (Phase 20
        spec). */
     if (opts->keep_index) {
-        if (sg_apply_tree_to_workdir(git_dir, repo_root, index_tree) != 0) {
+        if ((partial ? restore_matched_paths(git_dir, repo_root, index_tree, opts->pathspec)
+                    : sg_apply_tree_to_workdir(git_dir, repo_root, index_tree)) != 0) {
             for (i = 0; i < untracked_path_count; i++)
                 free(untracked_paths[i]);
             free(untracked_paths);

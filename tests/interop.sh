@@ -10594,6 +10594,151 @@ check "phase36 oracle: git's exact answer when the outside file has been DELETED
     grep -qx 'AD \.\./secret\.txt' "$WORKDIR/p36_git_deleted_status.txt"
 
 
+
+# --- Phase 37: pathspec on `sg status` and `sg stash push` -------------
+#
+# Part A's fold table is a byte-for-byte cmp against real git, same
+# technique as p28_cmp: the "does this fold or list individually" decision
+# is exactly the kind of rule that looks obvious and is not (CLAUDE.md's
+# Phase 37 entry: a wildcard spec still folds despite matching individual
+# files below the fold point). Part B's three-tree comparison reuses the
+# Phase 21 D1-D4 technique (twin git-run/sg-run repos, full `ls-tree -r`
+# comparison, not --name-only, so mode+sha1+path all have to agree) rather
+# than a name-only comparison, since content-addressed blob ids are
+# byte-identical across repos whenever the content itself is.
+
+P37_STATUS="$WORKDIR/p37_status"
+(cd "$WORKDIR" && "$SG" init p37_status) > /dev/null 2>&1
+(cd "$P37_STATUS" && git config user.email "a@b.c" && git config user.name "git user")
+mkdir -p "$P37_STATUS/wholly/deep"
+printf 'u1\n' > "$P37_STATUS/wholly/u1.txt"
+printf 'u2\n' > "$P37_STATUS/wholly/deep/u2.txt"
+
+# Runs `status --porcelain -- <args>` through both implementations and
+# compares the whole output. core.quotepath=false for the same reason
+# p28_cmp needs it (CLAUDE.md's byte>=0x80 divergence) -- harmless here,
+# every name in this fixture is plain ASCII.
+p37_status_cmp() {
+    p37_label="$1"
+    shift
+    (cd "$P37_STATUS" && "$SG" status --porcelain "$@") > "$WORKDIR/p37_sg.txt" 2>/dev/null
+    (cd "$P37_STATUS" && git -c core.quotepath=false status --porcelain "$@") > "$WORKDIR/p37_git.txt" 2>/dev/null
+    check "phase37: sg status $p37_label matches real git byte-for-byte" \
+        cmp -s "$WORKDIR/p37_sg.txt" "$WORKDIR/p37_git.txt"
+}
+
+p37_status_cmp "(no pathspec)"
+p37_status_cmp "-- wholly" -- wholly
+p37_status_cmp "-- wholly/" -- wholly/
+p37_status_cmp "-- wholly/u1.txt" -- wholly/u1.txt
+p37_status_cmp "-- wholly/deep" -- wholly/deep
+p37_status_cmp "-- wholly/deep/u2.txt" -- wholly/deep/u2.txt
+p37_status_cmp "-- 'wholly/*'" -- 'wholly/*'
+p37_status_cmp "-- nosuch" -- nosuch
+
+# Positive collision: naming a real branch is STILL a pathspec for `sg
+# status` (no rev/path disambiguation at all, unlike `sg diff`) -- measured
+# against git 2.55.0, `git status master` prints nothing and exits 0.
+(cd "$P37_STATUS" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+P37_STATUS_MASTER_SG=$(cd "$P37_STATUS" && "$SG" status --porcelain master 2>/dev/null)
+check "phase37: sg status <real-branch-name> prints nothing (it's a pathspec, not a rev)" \
+    test -z "$P37_STATUS_MASTER_SG"
+check "phase37: sg status <real-branch-name> exits 0" \
+    sh -c "cd '$P37_STATUS' && '$SG' status master > /dev/null 2>&1"
+
+# --- Part B: the three-tree partial-push comparison, and the head-on
+# collision between `sg status -- nosuch` (silent, exit 0) and
+# `sg stash push -- nosuch` (refused, exit 1) that guards against unifying
+# the two "did the pathspec match anything" rules. ---
+p37_b2_fixture() {
+    _dir="$1"
+    _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = "git" ]; then
+        (cd "$_dir" && git init -q .) > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && "$_impl" init "$(basename "$_dir")") > /dev/null 2>&1
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user") > /dev/null 2>&1
+    mkdir -p "$_dir/sub"
+    printf 'base\n' > "$_dir/a.txt"
+    printf 'base\n' > "$_dir/b.txt"
+    printf 'base\n' > "$_dir/sub/c.txt"
+    printf 'base\n' > "$_dir/sub/d.txt"
+    if [ "$_impl" = "git" ]; then
+        (cd "$_dir" && "$_impl" add . && "$_impl" commit -q -m base) > /dev/null 2>&1
+    else
+        (cd "$_dir" && "$_impl" add . && "$_impl" commit -m base) > /dev/null 2>&1
+    fi
+    printf 'STAGED-a\n' > "$_dir/a.txt"
+    (cd "$_dir" && "$_impl" add a.txt) > /dev/null 2>&1
+    printf 'WORKTREE-a\n' > "$_dir/a.txt"
+    printf 'WORKTREE-b\n' > "$_dir/b.txt"
+    printf 'STAGED-c\n' > "$_dir/sub/c.txt"
+    (cd "$_dir" && "$_impl" add sub/c.txt) > /dev/null 2>&1
+    printf 'WORKTREE-c\n' > "$_dir/sub/c.txt"
+    printf 'WORKTREE-d\n' > "$_dir/sub/d.txt"
+    printf 'untracked2\n' > "$_dir/sub/untracked2.txt"
+    printf 'other\n' > "$_dir/other_untracked.txt"
+}
+
+P37_B2_GIT="$WORKDIR/p37_b2_git"
+p37_b2_fixture "$P37_B2_GIT" git
+(cd "$P37_B2_GIT" && git stash push -q -u -m p37 -- sub) > /dev/null 2>&1
+check "phase37 oracle: git stash push -u -- sub exits 0" test $? = 0
+P37_B2_GIT_TREE=$(cd "$P37_B2_GIT" && git ls-tree -r refs/stash | sort)
+P37_B2_GIT_IDXTREE=$(cd "$P37_B2_GIT" && git ls-tree -r refs/stash^2 | sort)
+P37_B2_GIT_UNTRACKED=$(cd "$P37_B2_GIT" && git ls-tree -r refs/stash^3 | sort)
+
+P37_B2_SG="$WORKDIR/p37_b2_sg"
+p37_b2_fixture "$P37_B2_SG" "$SG"
+(cd "$P37_B2_SG" && "$SG" stash push -u -m p37 -- sub) > /dev/null 2>&1
+check "phase37: sg stash push -u -- sub exits 0" test $? = 0
+P37_B2_SG_TREE=$(cd "$P37_B2_SG" && git ls-tree -r refs/stash | sort)
+P37_B2_SG_IDXTREE=$(cd "$P37_B2_SG" && git ls-tree -r refs/stash^2 | sort)
+P37_B2_SG_UNTRACKED=$(cd "$P37_B2_SG" && git ls-tree -r refs/stash^3 | sort)
+
+check "phase37: sg's partial-push stash tree matches real git's byte-for-byte (mode+sha1+path)" \
+    test "$P37_B2_SG_TREE" = "$P37_B2_GIT_TREE"
+check "phase37: sg's partial-push index tree (stash^2, unfiltered) matches real git's" \
+    test "$P37_B2_SG_IDXTREE" = "$P37_B2_GIT_IDXTREE"
+check "phase37: sg's partial-push untracked tree (stash^3, matched-only) matches real git's" \
+    test "$P37_B2_SG_UNTRACKED" = "$P37_B2_GIT_UNTRACKED"
+
+# B1 + the head-on collision, on the SAME underlying dirty fixture: `status`
+# silently exits 0 on a pathspec matching nothing, `stash push` refuses.
+P37_B1="$WORKDIR/p37_b1"
+(cd "$WORKDIR" && "$SG" init p37_b1) > /dev/null 2>&1
+(cd "$P37_B1" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'base\n' > "$P37_B1/a.txt"
+(cd "$P37_B1" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+printf 'dirty\n' > "$P37_B1/a.txt"
+
+check "phase37: sg status -- nosuch exits 0 on the SAME dirty fixture" \
+    sh -c "cd '$P37_B1' && '$SG' status -- nosuch > /dev/null 2>&1"
+P37_B1_STATUS_OUT=$(cd "$P37_B1" && "$SG" status --porcelain -- nosuch 2>/dev/null)
+check "phase37: sg status -- nosuch prints nothing" test -z "$P37_B1_STATUS_OUT"
+
+check "phase37: sg stash push -- nosuch (SAME fixture) exits 1, not 0" \
+    sh -c "! (cd '$P37_B1' && '$SG' stash push -- nosuch) > /dev/null 2>&1"
+check "phase37: sg stash push -- nosuch did not create a stash entry" \
+    sh -c "[ \"\$(cd '$P37_B1' && '$SG' stash list | wc -l | tr -d ' ')\" = 0 ]"
+P37_B1_A_AFTER=$(cat "$P37_B1/a.txt")
+check "phase37: sg stash push -- nosuch left a.txt untouched" \
+    test "$P37_B1_A_AFTER" = "dirty"
+
+# Oracle confirmation: real git's own exit code for the identical case.
+P37_B1_GIT="$WORKDIR/p37_b1_git"
+mkdir -p "$P37_B1_GIT"
+(cd "$P37_B1_GIT" && git init -q .) > /dev/null 2>&1
+(cd "$P37_B1_GIT" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'base\n' > "$P37_B1_GIT/a.txt"
+(cd "$P37_B1_GIT" && git add . && git commit -q -m base) > /dev/null 2>&1
+printf 'dirty\n' > "$P37_B1_GIT/a.txt"
+check "phase37 oracle: real git stash push -- nosuch also exits non-zero" \
+    sh -c "! (cd '$P37_B1_GIT' && git stash push -q -m p37 -- nosuch) > /dev/null 2>&1"
+
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

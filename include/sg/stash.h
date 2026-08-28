@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "sg/hash.h"
+#include "sg/pathspec.h"
 
 typedef struct {
     unsigned char commit_id[SG_SHA1_RAW_LEN];
@@ -59,6 +60,10 @@ typedef struct {
                                staged changes staged (measured against real
                                git: this is not a separate code path, just a
                                different tree passed to the same reset). */
+    /* Phase 37: NULL (or an empty pathspec) matches every path, reproducing
+       every pre-Phase-37 behaviour exactly -- see sg_stash_push's own header
+       comment below for what a restricting pathspec changes. */
+    const sg_pathspec *pathspec;
 } sg_stash_push_opts;
 
 /* Creates a new stash from the current index and working tree and resets
@@ -99,6 +104,40 @@ typedef struct {
    and the working tree may not have been reset. Deliberately does NOT touch
    a paused rebase's sequencer state, and does NOT remove MERGE_HEAD -- both
    are the CLI layer's job (see cmd_stash.c).
+
+   Returns 2 (Phase 37) when opts->pathspec is set and matches NOTHING at
+   all -- not one index path (any stage), not one untracked file even when
+   -u/-a is set -- exactly like real git's "pathspec ... did not match any
+   file(s)" rejection: nothing durable is written, not even when the
+   worktree has OTHER, unrelated dirty paths outside the pathspec (measured,
+   PHASE37_SPEC.md B1). This check runs before anything is written, and is
+   otherwise unrelated to the plain "nothing to save" case above -- a
+   worktree that is clean everywhere the pathspec touches still returns 1,
+   not 2, when the pathspec itself is real (matches an existing path) but
+   that path happens to be unchanged.
+
+   PARTIAL PUSH (opts->pathspec set, non-empty, PHASE37_SPEC.md B2/B3): the
+   three trees are built asymmetrically, not just filtered uniformly --
+     - index_tree (parent 2, `stash^2`) is UNCHANGED: the complete,
+       unfiltered index tree, exactly as a plain push would build it.
+     - the stash commit's OWN tree (the "tracked" half) starts from the
+       index tree and, ONLY on a path the pathspec matches, is replaced with
+       freshly-hashed working-tree content (or omitted entirely, recording a
+       deletion, if that path is gone from the working tree). A path the
+       pathspec does NOT match keeps its index content here regardless of
+       what the working tree looks like there -- its on-disk state, deleted
+       or not, is simply never consulted.
+     - the untracked parent's tree (only built at all under -u/-a) contains
+       ONLY the untracked files the pathspec matches.
+   After the stash + snapshot are written, the working-tree/index reset step
+   also becomes per-path: only a pathspec-matched path is set back to HEAD's
+   content (or, under --keep-index, the index tree's content) in both the
+   working tree and the index; every other path -- matched by nothing, or
+   simply untouched by the pathspec -- keeps its exact pre-push state,
+   staged or not. sg_apply_tree_to_workdir deliberately gains no pathspec
+   parameter for this (it is the shared whole-tree entry point for switch/
+   reset/merge/undo/stash too); the per-path restore is private to this
+   function's own implementation.
 
    bad_path may be NULL; when non-NULL and the return is -1 because the
    working tree's own sg_tree_build_from_workdir call refused a hostile

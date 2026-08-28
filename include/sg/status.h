@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "sg/index.h"
+#include "sg/pathspec.h"
 #include "sg/similarity.h"
 #include "sg/tree_build.h"
 
@@ -72,6 +73,15 @@ typedef enum {
    list they have always had. Silently picking a side here would be exactly
    the bug this parameter exists to prevent.
 
+   `ps` (Phase 37) filters the finished list, applied AFTER
+   sg_diff_tree_index but BEFORE sg_diff_detect_renames -- CLAUDE.md's rule
+   for sg_diff_list_filter (Phase 29: filtering after rename detection can
+   turn a real rename into a plain "A" because only half the pair survives)
+   applies here for exactly the same reason. NULL matches everything, same
+   as sg_diff_list_filter's own NULL convention. apply.c's two safety gates
+   always pass NULL: they need the unfiltered list to tell the user
+   everything that is uncommitted.
+
    Returns 0, -1 on failure (including a HEAD tree that cannot be read), or
    -2 if head_tree names a hostile entry (sg_tree_flatten's own -2 -- e.g. a
    crafted commit with a ".." or ".git" path component), same convention as
@@ -82,7 +92,17 @@ typedef enum {
    bytes) so the caller can print an actionable message instead of a guess. */
 int sg_status_diff_staged(const char *git_dir, const char *repo_root,
                           const unsigned char *head_tree, const sg_index *idx,
-                          int rename_score, sg_status_list *out, char *bad_path);
+                          int rename_score, const sg_pathspec *ps, sg_status_list *out,
+                          char *bad_path);
+
+/* Removes every entry (old_path checked too, for a rename row) that does not
+   match ps from an already-built sg_status_list. NULL ps leaves the list
+   untouched -- same "NULL matches everything" convention as
+   sg_diff_list_filter/sg_pathspec_matches. Used by callers (e.g. `sg
+   status`'s unstaged list) where filtering has no rename-detection ordering
+   concern to worry about, unlike sg_status_diff_staged's `ps` parameter
+   above. */
+void sg_status_list_filter(sg_status_list *list, const sg_pathspec *ps);
 
 /* Changes not yet staged: a thin adapter over sg_diff_index_workdir
    (include/sg/diff.h), which does the actual index-vs-workdir walk. A path
@@ -151,6 +171,19 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
    individually when include_ignored is set (the fold only ever collapses
    the non-ignored side of that directory).
 
+   `ps` (Phase 37) is the one deliberate, named exception to CLAUDE.md's
+   "filter after the builder, never inside it" rule: how deep a wholly-
+   untracked directory folds is itself a function of the pathspec (measured
+   against git 2.55.0 -- `-- wholly/u1.txt` lists that one file instead of
+   folding to "wholly/", while `-- 'wholly/star'` still folds to "wholly/"
+   despite matching individual files below it), so filtering the flat result
+   of an already-folded walk cannot recover the right answer: a folded entry
+   "wholly/" cannot be matched against a spec naming a file below it, and the
+   file would silently vanish instead of being unfolded. NULL matches
+   everything and reproduces the pre-Phase-37 walk exactly; every existing
+   caller (safety/stash.c, workdir/tree_build.c) passes NULL, since they need
+   real per-file names regardless of any pathspec.
+
    *out is a malloc'd array of malloc'd strings, sorted by path (the walk
    itself is readdir order, which is unspecified; callers such as
    sg_tree_build_from_untracked rely on this being sorted rather than each
@@ -163,7 +196,7 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
    uncommitted work gets lost. Returns 0 on success, -1 on allocation
    failure. */
 int sg_status_list_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
-                             int include_ignored, sg_status_untracked_fold fold, char ***out,
-                             size_t *count);
+                             const sg_pathspec *ps, int include_ignored,
+                             sg_status_untracked_fold fold, char ***out, size_t *count);
 
 #endif

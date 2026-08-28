@@ -69,7 +69,8 @@ void sg_status_list_free(sg_status_list *list)
    the two agreed on all three unmerged shapes before it did. */
 int sg_status_diff_staged(const char *git_dir, const char *repo_root,
                           const unsigned char *head_tree, const sg_index *idx,
-                          int rename_score, sg_status_list *out, char *bad_path)
+                          int rename_score, const sg_pathspec *ps, sg_status_list *out,
+                          char *bad_path)
 {
     sg_diff_list dl;
     size_t i;
@@ -95,6 +96,14 @@ int sg_status_diff_staged(const char *git_dir, const char *repo_root,
     trc = sg_diff_tree_index(git_dir, head_tree, idx, &dl, bad_path);
     if (trc != 0)
         return trc;
+
+    /* Phase 37: filtering happens HERE, between the builder and rename
+       detection, never after -- CLAUDE.md's Phase 29 rule (filtering after
+       rename detection can turn a real rename into a plain "A" because only
+       half the pair survives) applies to this adapter exactly the way it
+       applies to sg_diff_trees/sg_diff_tree_index's own callers. A NULL ps
+       is a no-op, same convention as sg_pathspec_matches. */
+    sg_diff_list_filter(&dl, ps);
 
     /* Detection runs here, on the finished list, so that the caller's single
        rename_score decision covers it -- see sg/status.h for why that
@@ -212,6 +221,40 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
     return 0;
 }
 
+/* No rename detection runs on this list (sg_status_diff_unstaged never
+   pairs a delete with an add), so unlike sg_status_diff_staged's `ps`
+   parameter, filtering after the fact is safe -- there is no rename row
+   whose old half could be silently orphaned by filtering too late. A rename
+   row's old_path is checked too, on the theory that a caller matching on
+   either half of a pair still wants to see the row (sg_status_diff_staged
+   itself never produces a row reaching this function, but this keeps the
+   rule the same shape as sg_diff_list_filter for any future caller that
+   does pass renamed rows through it). */
+void sg_status_list_filter(sg_status_list *list, const sg_pathspec *ps)
+{
+    size_t i;
+    size_t out = 0;
+
+    if (ps == NULL || ps->count == 0)
+        return;
+
+    for (i = 0; i < list->count; i++) {
+        sg_status_entry *e = &list->entries[i];
+        int keep = sg_pathspec_matches(ps, e->path) ||
+                  (e->old_path != NULL && sg_pathspec_matches(ps, e->old_path));
+
+        if (keep) {
+            if (out != i)
+                list->entries[out] = list->entries[i];
+            out++;
+        } else {
+            free(e->path);
+            free(e->old_path);
+        }
+    }
+    list->count = out;
+}
+
 /* True if idx has an entry for path at any stage (0, or an unresolved
    conflict's 1/2/3) -- a path with only 1/2/3 entries would otherwise be
    wrongly reported as untracked, and a staged-delete (no entry at any stage,
@@ -227,6 +270,47 @@ static int path_tracked_any_stage(const sg_index *idx, const char *path)
     return 0;
 }
 
+/* True if resolving ps at reldir requires descending strictly below reldir
+   to know the answer -- i.e. some LITERAL (wildcard-free) spec in ps names a
+   path that is a proper descendant of reldir. Only literal specs can force
+   this: a wildcard spec has no leading-directory rule of its own (see
+   sg_pathspec_matches's header comment), so whether it matches anything
+   under reldir is decided by the real per-file sg_pathspec_matches check the
+   callers below already make -- forcing recursion for a wildcard spec would
+   also have to un-fold "wholly/" for `-- 'wholly/star'`, which measured against
+   git 2.55.0 stays folded despite matching individual files below it.
+   reldir must not have a trailing '/' (same convention as
+   dir_has_tracked_descendant). Used only to decide whether a wholly-
+   untracked directory may take the fold-or-omit shortcut below, or must be
+   walked entry by entry instead. */
+static int spec_forces_recursion(const sg_pathspec *ps, const char *reldir)
+{
+    size_t reldir_len;
+    size_t i;
+
+    if (ps == NULL)
+        return 0;
+    reldir_len = strlen(reldir);
+    for (i = 0; i < ps->count; i++) {
+        const char *spec = ps->specs[i];
+        size_t slen = strlen(spec);
+
+        if (strpbrk(spec, "*?[\\") != NULL)
+            continue; /* wildcard: never forces */
+        if (slen > 0 && spec[slen - 1] == '/')
+            slen--; /* compare without a trailing slash, same as reldir */
+        if (slen == 0)
+            continue; /* "." at the root: matches everything, never forces */
+        if (reldir_len == 0) {
+            return 1; /* any non-empty literal spec is deeper than root */
+        }
+        if (slen > reldir_len && memcmp(spec, reldir, reldir_len) == 0 &&
+           spec[reldir_len] == '/')
+            return 1;
+    }
+    return 0;
+}
+
 /* Walks the worktree collecting untracked files, filtered through the
    .gitignore engine (ig) unless include_ignored makes every path pass:
    ignored directories are pruned outright -- nothing under an ignored
@@ -237,8 +321,8 @@ static int path_tracked_any_stage(const sg_index *idx, const char *path)
    failure here would let a caller claim a clean tree it never actually
    examined). */
 static int collect_untracked(const char *repo_root, const char *reldir, const sg_index *idx,
-                             sg_ignore *ig, int include_ignored, char ***out, size_t *count,
-                             size_t *cap)
+                             sg_ignore *ig, const sg_pathspec *ps, int include_ignored,
+                             char ***out, size_t *count, size_t *cap)
 {
     char absdir[SG_PATH_MAX];
     DIR *d;
@@ -327,7 +411,7 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
                 closedir(d);
                 return -1;
             }
-            if (collect_untracked(repo_root, relpath, idx, ig, include_ignored, out, count,
+            if (collect_untracked(repo_root, relpath, idx, ig, ps, include_ignored, out, count,
                                   cap) != 0) {
                 sg_ignore_pop_dir(ig);
                 closedir(d);
@@ -338,6 +422,8 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
             if (path_tracked_any_stage(idx, relpath))
                 continue;
             if (!include_ignored && sg_ignore_is_ignored(ig, relpath, 0))
+                continue;
+            if (ps != NULL && !sg_pathspec_matches(ps, relpath))
                 continue;
             if (*count == *cap) {
                 size_t new_cap = *cap == 0 ? 16 : *cap * 2;
@@ -496,7 +582,7 @@ static int dir_has_tracked_descendant(const sg_index *idx, const char *reldir)
    under-reporting collect_untracked's own warnings exist to prevent, so the
    same stderr convention applies here too. */
 static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *ig,
-                          int *has_nonignored, int *has_any)
+                          const sg_pathspec *ps, int *has_nonignored, int *has_any)
 {
     char absdir[SG_PATH_MAX];
     DIR *d;
@@ -556,13 +642,19 @@ static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *
                 closedir(d);
                 return -1;
             }
-            rc = dir_scan_flags(repo_root, relpath, ig, has_nonignored, has_any);
+            rc = dir_scan_flags(repo_root, relpath, ig, ps, has_nonignored, has_any);
             sg_ignore_pop_dir(ig);
             if (rc != 0) {
                 closedir(d);
                 return -1;
             }
         } else if (S_ISREG(st.st_mode)) {
+            /* Phase 37: a file that a pathspec excludes does not count
+               towards either flag -- it must not be able to justify folding
+               (or even listing) a directory none of whose actual matches lie
+               here. NULL ps matches everything, same as everywhere else. */
+            if (ps != NULL && !sg_pathspec_matches(ps, relpath))
+                continue;
             *has_any = 1;
             if (!sg_ignore_is_ignored(ig, relpath, 0))
                 *has_nonignored = 1;
@@ -595,7 +687,7 @@ static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *
    path here silently is exactly the under-reporting this file's warnings
    exist to prevent. Returns 0 on success, -1 on allocation failure. */
 static int collect_ignored_within(const char *repo_root, const char *reldir, sg_ignore *ig,
-                                  char ***out, size_t *count, size_t *cap)
+                                  const sg_pathspec *ps, char ***out, size_t *count, size_t *cap)
 {
     char absdir[SG_PATH_MAX];
     DIR *d;
@@ -658,10 +750,10 @@ static int collect_ignored_within(const char *repo_root, const char *reldir, sg_
                 closedir(d);
                 return -1;
             }
-            rc = dir_scan_flags(repo_root, relpath, ig, &has_nonignored, &has_any);
+            rc = dir_scan_flags(repo_root, relpath, ig, ps, &has_nonignored, &has_any);
             if (rc == 0) {
                 if (has_nonignored)
-                    rc = collect_ignored_within(repo_root, relpath, ig, out, count, cap);
+                    rc = collect_ignored_within(repo_root, relpath, ig, ps, out, count, cap);
                 else if (has_any)
                     rc = untracked_append_folded(out, count, cap, relpath);
                 /* neither: relpath is empty (recursively) -- nothing to
@@ -673,6 +765,8 @@ static int collect_ignored_within(const char *repo_root, const char *reldir, sg_
                 return -1;
             }
         } else if (S_ISREG(st.st_mode)) {
+            if (ps != NULL && !sg_pathspec_matches(ps, relpath))
+                continue;
             if (sg_ignore_is_ignored(ig, relpath, 0)) {
                 if (untracked_append(out, count, cap, relpath) != 0) {
                     closedir(d);
@@ -696,23 +790,34 @@ static int collect_ignored_within(const char *repo_root, const char *reldir, sg_
    individually via collect_ignored_within); no non-ignored file but at
    least one file (all ignored) -> fold to "dir/" only if include_ignored,
    otherwise omit entirely; no file at all -> omit entirely regardless.
+
+   `ps` (Phase 37) additionally gates the fold-vs-recurse choice, per
+   sg_status_list_untracked's header comment: a reldir that a literal spec
+   names something strictly below (spec_forces_recursion) is never eligible
+   for the shortcut below, even when it would otherwise wholly fold, so this
+   function falls through to the entry-by-entry walk instead -- that walk
+   then makes its own, deeper fold decision by recursing back into this same
+   function per subdirectory. When the shortcut IS taken, dir_scan_flags has
+   already filtered has_nonignored/has_any by ps, so "fold to dir/" here only
+   ever fires when something under reldir actually matches.
    Returns 0 on success, -1 on allocation failure. */
 static int collect_untracked_folded(const char *repo_root, const char *reldir, const sg_index *idx,
-                                    sg_ignore *ig, int include_ignored, int is_root,
-                                    char ***out, size_t *count, size_t *cap)
+                                    sg_ignore *ig, const sg_pathspec *ps, int include_ignored,
+                                    int is_root, char ***out, size_t *count, size_t *cap)
 {
-    if (!is_root && !dir_has_tracked_descendant(idx, reldir)) {
+    if (!is_root && !dir_has_tracked_descendant(idx, reldir) &&
+       !spec_forces_recursion(ps, reldir)) {
         int has_nonignored = 0;
         int has_any = 0;
 
-        if (dir_scan_flags(repo_root, reldir, ig, &has_nonignored, &has_any) != 0)
+        if (dir_scan_flags(repo_root, reldir, ig, ps, &has_nonignored, &has_any) != 0)
             return -1;
 
         if (has_nonignored) {
             if (untracked_append_folded(out, count, cap, reldir) != 0)
                 return -1;
             if (include_ignored)
-                return collect_ignored_within(repo_root, reldir, ig, out, count, cap);
+                return collect_ignored_within(repo_root, reldir, ig, ps, out, count, cap);
             return 0;
         }
         if (has_any && include_ignored)
@@ -783,8 +888,8 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
                     closedir(d);
                     return -1;
                 }
-                if (collect_untracked_folded(repo_root, relpath, idx, ig, include_ignored, 0, out,
-                                             count, cap) != 0) {
+                if (collect_untracked_folded(repo_root, relpath, idx, ig, ps, include_ignored, 0,
+                                             out, count, cap) != 0) {
                     sg_ignore_pop_dir(ig);
                     closedir(d);
                     return -1;
@@ -794,6 +899,8 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
                 if (path_tracked_any_stage(idx, relpath))
                     continue;
                 if (!include_ignored && sg_ignore_is_ignored(ig, relpath, 0))
+                    continue;
+                if (ps != NULL && !sg_pathspec_matches(ps, relpath))
                     continue;
                 if (untracked_append(out, count, cap, relpath) != 0) {
                     closedir(d);
@@ -807,12 +914,15 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
 }
 
 int sg_status_list_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
-                             int include_ignored, sg_status_untracked_fold fold, char ***out,
-                             size_t *count)
+                             const sg_pathspec *ps, int include_ignored,
+                             sg_status_untracked_fold fold, char ***out, size_t *count)
 {
     sg_ignore *ig = NULL;
     size_t cap = 0;
     int rc;
+
+    if (ps != NULL && ps->count == 0)
+        ps = NULL; /* an empty pathspec matches everything, same as NULL */
 
     *out = NULL;
     *count = 0;
@@ -821,9 +931,10 @@ int sg_status_list_untracked(const char *git_dir, const char *repo_root, const s
         return -1;
 
     if (fold == SG_STATUS_UNTRACKED_FOLD_DIRS)
-        rc = collect_untracked_folded(repo_root, "", idx, ig, include_ignored, 1, out, count, &cap);
+        rc = collect_untracked_folded(repo_root, "", idx, ig, ps, include_ignored, 1, out, count,
+                                      &cap);
     else
-        rc = collect_untracked(repo_root, "", idx, ig, include_ignored, out, count, &cap);
+        rc = collect_untracked(repo_root, "", idx, ig, ps, include_ignored, out, count, &cap);
     sg_ignore_free(ig);
     if (rc != 0) {
         /* Whatever collect_untracked managed to accumulate before failing is

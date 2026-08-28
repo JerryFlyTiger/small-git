@@ -98,7 +98,7 @@ static void test_include_ignored_flag(void)
 
     memset(&idx, 0, sizeof(idx));
 
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked (include_ignored=0) failed");
     CHECK(list_contains(untracked, count, "fresh.txt"), "fresh.txt missing under include_ignored=0");
     CHECK(list_contains(untracked, count, ".gitignore"),
@@ -109,7 +109,7 @@ static void test_include_ignored_flag(void)
 
     untracked = NULL;
     count = 0;
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 1, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked (include_ignored=1) failed");
     CHECK(list_contains(untracked, count, "fresh.txt"), "fresh.txt missing under include_ignored=1");
     CHECK(list_contains(untracked, count, "keep.log"),
@@ -135,7 +135,7 @@ static void test_nested_dirs_use_full_path(void)
     write_workdir_file(repo_root, "sub/dir/file.txt", "nested\n");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed");
     CHECK(list_contains(untracked, count, "sub/dir/file.txt"),
          "nested untracked file must use full relative path, not basename");
@@ -174,7 +174,7 @@ static void test_staged_delete_counts_as_untracked(void)
     free(entry.path);
 
     /* First: while it IS in the index, it must NOT show up as untracked. */
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed (tracked case)");
     CHECK(!list_contains(untracked, count, "tracked_then_uncached.txt"),
          "a file present in the index must not be reported as untracked");
@@ -186,7 +186,7 @@ static void test_staged_delete_counts_as_untracked(void)
 
     untracked = NULL;
     count = 0;
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed (staged-delete case)");
     CHECK(list_contains(untracked, count, "tracked_then_uncached.txt"),
          "a file dropped from the index but still on disk must count as untracked");
@@ -210,7 +210,7 @@ static void test_empty_dir_produces_no_entries(void)
     mkdir_p(repo_root, "emptydir");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed");
     CHECK(count == 0, "an empty untracked directory must not produce any entries, got %zu", count);
     free_list(untracked, count);
@@ -230,7 +230,7 @@ static void test_git_dir_never_appears(void)
     size_t i;
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 1, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed");
     for (i = 0; i < count; i++)
         CHECK(strncmp(untracked[i], ".git/", 5) != 0 && strcmp(untracked[i], ".git") != 0,
@@ -254,7 +254,7 @@ static void test_tree_build_from_untracked_empty(void)
     size_t file_count = 999;
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_tree_build_from_untracked(git_dir, repo_root, &idx, 0, tree_id, &file_count) == 0,
+    CHECK(sg_tree_build_from_untracked(git_dir, repo_root, &idx, NULL, 0, tree_id, &file_count) == 0,
          "tree build from untracked (empty) failed");
     CHECK(file_count == 0, "expected file_count 0 for no untracked files, got %zu", file_count);
     sg_sha1_to_hex(tree_id, hex);
@@ -282,7 +282,7 @@ static void test_tree_build_from_untracked_nonempty(void)
     write_workdir_file(repo_root, "sub/inner.txt", "inner\n");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_tree_build_from_untracked(git_dir, repo_root, &idx, 0, tree_id, &file_count) == 0,
+    CHECK(sg_tree_build_from_untracked(git_dir, repo_root, &idx, NULL, 0, tree_id, &file_count) == 0,
          "tree build from untracked (nonempty) failed");
     CHECK(file_count == 2, "expected file_count 2, got %zu", file_count);
 
@@ -326,7 +326,7 @@ static void test_list_untracked_is_sorted(void)
     write_workdir_file(repo_root, "a.txt", "a\n");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_LIST_FILES, &untracked, &count) == 0,
          "list_untracked failed");
     CHECK(count == 5, "expected 5 untracked files, got %zu", count);
     for (i = 0; i + 1 < count; i++) {
@@ -374,7 +374,7 @@ static void test_tree_build_from_untracked_matches_sorted_reference(void)
     write_workdir_file(repo_root, "a.txt", "a\n");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_tree_build_from_untracked(git_dir, repo_root, &idx, 0, tree_id, &file_count) == 0,
+    CHECK(sg_tree_build_from_untracked(git_dir, repo_root, &idx, NULL, 0, tree_id, &file_count) == 0,
          "tree build from untracked failed");
     CHECK(file_count == 5, "expected file_count 5, got %zu", file_count);
 
@@ -413,7 +413,7 @@ static void test_fold_wholly_untracked_dir(void)
     write_workdir_file(repo_root, "un/b.txt", "b\n");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
                                    &untracked, &count) == 0,
          "list_untracked (fold) failed");
     CHECK(count == 1, "expected exactly one folded entry, got %zu", count);
@@ -455,7 +455,7 @@ static void test_fold_is_per_directory_not_global(void)
     CHECK(sg_index_upsert(&idx, &entry) == 0, "upsert failed");
     free(entry.path);
 
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
                                    &untracked, &count) == 0,
          "list_untracked (fold) failed");
     CHECK(count == 1, "expected exactly one entry (the folded sub/), got %zu", count);
@@ -507,7 +507,7 @@ static void test_fold_prefix_boundary_is_not_a_lexical_near_miss(void)
     CHECK(sg_index_upsert(&idx, &entry) == 0, "upsert failed");
     free(entry.path);
 
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
                                    &untracked, &count) == 0,
          "list_untracked (fold) failed");
     CHECK(list_contains(untracked, count, "un/"),
@@ -540,7 +540,7 @@ static void test_fold_mixed_dir_lists_ignored_individually(void)
 
     memset(&idx, 0, sizeof(idx));
 
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
                                    &untracked, &count) == 0,
          "list_untracked (fold, include_ignored=0) failed");
     CHECK(count == 2, "expected 'mixed/' and '.gitignore', got %zu", count);
@@ -551,7 +551,7 @@ static void test_fold_mixed_dir_lists_ignored_individually(void)
 
     untracked = NULL;
     count = 0;
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
                                    &untracked, &count) == 0,
          "list_untracked (fold, include_ignored=1) failed");
     CHECK(list_contains(untracked, count, "mixed/"),
@@ -582,7 +582,7 @@ static void test_fold_all_ignored_dir(void)
 
     memset(&idx, 0, sizeof(idx));
 
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 0, SG_STATUS_UNTRACKED_FOLD_DIRS,
                                    &untracked, &count) == 0,
          "list_untracked (fold, include_ignored=0) failed");
     CHECK(!list_contains(untracked, count, "allignored/"),
@@ -593,7 +593,7 @@ static void test_fold_all_ignored_dir(void)
 
     untracked = NULL;
     count = 0;
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
                                    &untracked, &count) == 0,
          "list_untracked (fold, include_ignored=1) failed");
     CHECK(list_contains(untracked, count, "allignored/"),
@@ -620,7 +620,7 @@ static void test_fold_empty_dir_produces_no_entries(void)
     mkdir_p(repo_root, "emptydir");
 
     memset(&idx, 0, sizeof(idx));
-    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
+    CHECK(sg_status_list_untracked(git_dir, repo_root, &idx, NULL, 1, SG_STATUS_UNTRACKED_FOLD_DIRS,
                                    &untracked, &count) == 0,
          "list_untracked (fold) failed");
     CHECK(count == 0, "an empty untracked directory must not produce any entries, got %zu", count);

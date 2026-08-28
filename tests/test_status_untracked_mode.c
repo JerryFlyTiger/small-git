@@ -257,6 +257,11 @@ static void test_bare_u_equals_uall(void)
 /* A SEPARATE argv token "no" after a bare "-u" must NOT be reinterpreted as
    "-uno" -- sg has no pathspec support, so this must fall through to the
    usage error, not silently become an untracked-files mode. */
+/* Phase 37: since `sg status` gained pathspec support, a separate argv token
+   "no" after a bare "-u" is no longer a usage error -- it is a pathspec,
+   exactly the way git 2.55.0 treats it (measured). A pathspec that matches
+   nothing is silent and exits 0 (per CLAUDE.md/PHASE37_SPEC.md's A1: "no
+   match at all -> silent, exit 0", unlike `sg stash push`'s exit 1). */
 static void test_separate_u_no_is_not_uno(void)
 {
     char out_split[8192];
@@ -271,7 +276,13 @@ static void test_separate_u_no_is_not_uno(void)
     argv_split[1] = "-u";
     argv_split[2] = "no";
     rc_split = run_status_capture(3, argv_split, out_split, sizeof(out_split));
-    CHECK(rc_split == 1, "separate '-u' 'no' must be rejected (usage error), got rc=%d", rc_split);
+    CHECK(rc_split == 0, "separate '-u' 'no' is now a (non-matching) pathspec, got rc=%d",
+         rc_split);
+    /* The header ("On branch"/"No commits yet") is unconditional -- pathspec
+       only filters the change lists -- so only "nothing to commit" is
+       checked, not that the whole output is empty. */
+    CHECK(strstr(out_split, "nothing to commit, working tree clean") != NULL,
+         "separate '-u' 'no' matching nothing must report a clean tree, got %s", out_split);
 
     argv_joined[0] = "status";
     argv_joined[1] = "-uno";
