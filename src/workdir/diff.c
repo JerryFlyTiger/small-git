@@ -438,6 +438,23 @@ static int append_index_entry_vs_workdir(const char *git_dir, const char *repo_r
     unsigned int wd_mode;
     sg_diff_side os = side_blob(entry->mode, entry->sha1);
 
+    /* Phase 36: entry->path comes straight off a parsed .git/index entry,
+       validated by nobody (sg_index_read validates nothing about index
+       paths, by design -- see CLAUDE.md). Without this check a path like
+       "../secret.txt" would be stat()/read through sg_path_join + the calls
+       below, reading a file outside the repository into a diff/status row.
+       The failure direction here is the SAME as "existing but unreadable"
+       just below, not a hard failure of the whole call: `sg status` must
+       still be able to list this path (git does too, as the staged half of
+       the same diff, which never reaches this function at all), it just
+       must never read ITS CONTENT. Treating it as ABSENT, exactly like a
+       permission-denied read, achieves both at once without a new case. */
+    if (!sg_relpath_is_safe(entry->path)) {
+        sg_diff_side ns = side_absent();
+
+        return list_append(out, entry->path, &os, &ns);
+    }
+
     /* A truncated path must not be silently skipped: sg/diff.h and
        CLAUDE.md both require a hard failure here rather than quietly
        dropping a path from `sg diff`. */
@@ -536,6 +553,11 @@ static sg_diff_side build_result_side(const char *repo_root, const char *path)
     unsigned char wd_sha1[SG_SHA1_RAW_LEN];
     unsigned int wd_mode;
 
+    /* Phase 36: path is an unmerged index entry's path, same untrusted
+       source and same reasoning as append_index_entry_vs_workdir above --
+       collapse into ABSENT rather than reading outside the repository. */
+    if (!sg_relpath_is_safe(path))
+        return side_absent();
     if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0)
         return side_absent();
     if (stat(abspath, &st) != 0)
@@ -746,6 +768,16 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
             struct stat st;
             sg_diff_side os = side_absent();
 
+            /* Phase 36: idx_path is untrusted (a raw .git/index path), same
+               reasoning as append_index_entry_vs_workdir in
+               sg_diff_index_workdir above. Treat it exactly like the "stat
+               fails" case right below -- both sides absent, nothing
+               reported -- rather than reading a file the index merely
+               points at, possibly outside the repository entirely. */
+            if (!sg_relpath_is_safe(idx_path)) {
+                ii = group_end;
+                continue;
+            }
             if (sg_path_join(abspath, sizeof(abspath), repo_root, idx_path) != 0) {
                 rc = -1;
                 goto done;

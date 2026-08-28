@@ -300,8 +300,9 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
     sg_status_list staged;
     sg_status_list unstaged;
     int has_head;
-    int staged_ok, unstaged_ok;
+    int staged_rc, staged_ok, unstaged_ok;
     int dirty;
+    char staged_bad_path[SG_PATH_MAX];
     size_t i;
 
     has_head = (sg_ref_resolve_head(git_dir, head_id) == 0);
@@ -317,7 +318,10 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
        user what is uncommitted, and a rename row carries two paths where
        this loop prints one. See sg/status.h -- the parameter is mandatory
        precisely so this choice is made here rather than inherited. */
-    staged_ok = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, &staged) == 0;
+    staged_bad_path[0] = '\0';
+    staged_rc = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, &staged,
+                                      staged_bad_path);
+    staged_ok = staged_rc == 0;
     unstaged_ok = sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) == 0;
 
     /* A failed diff (e.g. out of memory) must NOT be read as "clean" -- that
@@ -341,10 +345,16 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
             strbuf_append_path(&msg, "modified (unstaged): ", unstaged.entries[i].path);
         for (i = 0; i < staged.count; i++)
             strbuf_append_path(&msg, "staged: ", staged.entries[i].path);
-        if (!staged_ok || !unstaged_ok)
+        if (staged_rc == -2 && staged_bad_path[0] != '\0') {
+            strbuf_append(&msg, "sg: warning: HEAD's tree names an invalid path (");
+            strbuf_append(&msg, sg_quote_path_delimited(staged_bad_path));
+            strbuf_append(&msg, "), could not fully determine the working directory state; "
+                          "requiring confirmation to be safe\n");
+        } else if (!staged_ok || !unstaged_ok) {
             strbuf_append(&msg, "sg: warning: could not fully determine the working directory "
                           "state (possibly out of memory, or path too long); requiring "
                           "confirmation to be safe\n");
+        }
         if (sg_index_has_unmerged(&idx))
             strbuf_append(&msg,
                           "sg: an unfinished merge is currently in progress; continuing will "
@@ -366,13 +376,30 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
 
         /* --force only skips the interactive prompt above; it must never
            skip taking the safety snapshot */
-        if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: automatic snapshot failed; aborting this operation to be safe "
-                            "(no changes were made)\n");
-            sg_status_list_free(&staged);
-            sg_status_list_free(&unstaged);
-            sg_index_free(&idx);
-            return -1;
+        {
+            char snap_bad_path[SG_PATH_MAX];
+
+            snap_bad_path[0] = '\0';
+            if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL, snap_bad_path) != 0) {
+                /* Phase 36 round 2: this is the first and only place in this
+                   call that ever reaches sg_tree_build_from_workdir, unlike
+                   sg_stash_push's own two calls where the earlier one always
+                   fires first -- so a hostile index path can genuinely
+                   surface HERE, and the generic message below used to be
+                   the only thing printed for it. */
+                if (snap_bad_path[0] != '\0')
+                    fprintf(stderr, "sg: automatic snapshot failed: the index names an invalid "
+                                    "path (%s); aborting this operation to be safe (no changes "
+                                    "were made)\n",
+                           sg_quote_path_delimited(snap_bad_path));
+                else
+                    fprintf(stderr, "sg: automatic snapshot failed; aborting this operation to be "
+                                    "safe (no changes were made)\n");
+                sg_status_list_free(&staged);
+                sg_status_list_free(&unstaged);
+                sg_index_free(&idx);
+                return -1;
+            }
         }
     }
 
@@ -424,7 +451,8 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
     sg_index idx;
     sg_status_list staged = {0};
     sg_status_list unstaged = {0};
-    int staged_ok, unstaged_ok, dirty;
+    int staged_rc, staged_ok, unstaged_ok, dirty;
+    char staged_bad_path[SG_PATH_MAX];
     size_t i;
 
     if (sg_index_read(git_dir, &idx) != 0) {
@@ -438,7 +466,10 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
 
     /* Renames deliberately OFF, same reason as the gate above: the rejection
        message below enumerates these rows one path at a time. */
-    staged_ok = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, &staged) == 0;
+    staged_bad_path[0] = '\0';
+    staged_rc = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, &staged,
+                                      staged_bad_path);
+    staged_ok = staged_rc == 0;
     unstaged_ok = sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) == 0;
 
     /* A failed diff must never read as "clean" -- same rule as the rest of
@@ -452,7 +483,11 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
             fprintf(stderr, "\tstaged:              %s\n", sg_quote_path(staged.entries[i].path));
         for (i = 0; i < unstaged.count; i++)
             fprintf(stderr, "\tmodified (unstaged): %s\n", sg_quote_path(unstaged.entries[i].path));
-        if (!staged_ok || !unstaged_ok)
+        if (staged_rc == -2 && staged_bad_path[0] != '\0')
+            fprintf(stderr, "sg: warning: HEAD's tree names an invalid path (%s), could not "
+                            "fully determine the working directory state\n",
+                   sg_quote_path_delimited(staged_bad_path));
+        else if (!staged_ok || !unstaged_ok)
             fprintf(stderr, "sg: warning: could not fully determine the working directory "
                             "state (possibly out of memory, or path too long)\n");
         fprintf(stderr,

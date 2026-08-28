@@ -764,6 +764,33 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   it while real git does not (the same "ours is HEAD, not the index" rule).
   Details in Phase 21 of `docs/DESIGN.md`.
 
+## Deliberate divergences from real git
+
+Four places where sg's answer differs from real git **on purpose**, not by
+oversight -- each was measured against git 2.55.0, each is pinned on both
+sides by an interop check (so accidentally "fixing" one back into silent
+agreement with git would itself go undetected without the pin), and none of
+them should be "fixed" without first re-reading the WARNING that explains
+why the divergence exists.
+
+1. **`-C -C` / `--find-copies-harder` is rejected outright** (Phase 33,
+   `cmd_diff.c`), not approximated -- see the module notes' `-C -C` WARNING.
+2. **`-c`/`--cc` combined with an explicit `<rev>` argument is rejected
+   outright** (Phase 34), not approximated -- real git switches to a
+   completely different parent pairing there. See the module notes'
+   `-c`/`--cc` WARNING.
+3. **`* Unmerged path` stays unquoted regardless of `core.quotePath`**
+   (Phase 34) -- real git leaves this one line unquoted even when every
+   other path is quoted; see PHASE34_ORACLE.md #1.
+4. **`sg status --porcelain` prints a fixed `AD` for a path that escapes the
+   repository via a crafted index, in all three possible real-world states**
+   (Phase 36) -- real git actually reads the file outside the repository to
+   decide between `A `/`AM`/`AD`; sg refuses to read it at all (the fix Phase
+   36 exists to enforce), so it cannot compute which of the three is true and
+   always reports the one that draws the user's attention rather than the one
+   that could silently claim "clean". See the Phase 36 section of
+   `docs/DESIGN.md` for the full three-row measurement.
+
 ## Core types cheat sheet
 
 Line numbers are anchors as of the time of writing and may drift -- go by

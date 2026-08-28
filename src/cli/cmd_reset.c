@@ -6,6 +6,7 @@
 #include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
@@ -188,13 +189,25 @@ int sg_cmd_reset(int argc, char **argv)
            doesn't prompt for it either. Split the difference: snapshot
            automatically, without an interactive confirmation. */
         snprintf(label, sizeof(label), "reset --mixed to '%s'", rev_arg);
-        if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: automatic snapshot failed, aborting this operation for safety (no changes made)\n");
-            sg_index_free(&idx);
-            free(current_branch);
-            free(git_dir);
-            free(repo_root);
-            return 1;
+        {
+            char snap_bad_path[SG_PATH_MAX];
+
+            snap_bad_path[0] = '\0';
+            if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL, snap_bad_path) != 0) {
+                if (snap_bad_path[0] != '\0')
+                    fprintf(stderr, "sg: automatic snapshot failed: the index names an invalid "
+                                    "path (%s), aborting this operation for safety (no changes "
+                                    "made)\n",
+                           sg_quote_path_delimited(snap_bad_path));
+                else
+                    fprintf(stderr, "sg: automatic snapshot failed, aborting this operation for "
+                                    "safety (no changes made)\n");
+                sg_index_free(&idx);
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
         }
         sg_index_free(&idx);
 

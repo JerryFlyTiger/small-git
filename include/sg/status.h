@@ -72,12 +72,17 @@ typedef enum {
    list they have always had. Silently picking a side here would be exactly
    the bug this parameter exists to prevent.
 
-   Returns 0, or -1 on failure -- including a HEAD tree that cannot be read.
-   A failure must never be read as "no changes": every caller here treats it
-   as dirty, which is the safe direction. */
+   Returns 0, -1 on failure (including a HEAD tree that cannot be read), or
+   -2 if head_tree names a hostile entry (sg_tree_flatten's own -2 -- e.g. a
+   crafted commit with a ".." or ".git" path component), same convention as
+   sg_diff_tree_index/sg_tree_flatten. A failure must never be read as "no
+   changes": every caller here treats both -1 and -2 as dirty, which is the
+   safe direction. bad_path may be NULL; when non-NULL and the return is -2,
+   the offending repo-relative path is copied into it (needs SG_PATH_MAX
+   bytes) so the caller can print an actionable message instead of a guess. */
 int sg_status_diff_staged(const char *git_dir, const char *repo_root,
                           const unsigned char *head_tree, const sg_index *idx,
-                          int rename_score, sg_status_list *out);
+                          int rename_score, sg_status_list *out, char *bad_path);
 
 /* Changes not yet staged: a thin adapter over sg_diff_index_workdir
    (include/sg/diff.h), which does the actual index-vs-workdir walk. A path

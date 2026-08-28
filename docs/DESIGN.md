@@ -4653,3 +4653,186 @@ at 11.5 MB RSS. At 5000 lines / 500 edits the gap was already 0.19s/257 MB
 vs <5ms/10.6 MB. This is expected from the complexity classes, not a
 surprise, but it is a real user-facing improvement for `sg diff` on large
 files, which the old implementation had no protection against at all.
+
+## Phase 36: closing the read-side path-containment hole
+
+Every previous path-containment phase (21-23, 28) guarded a *write*: `remove`,
+`sg_write_file_mkdirs`, `sg add`'s argv. Measured directly against a crafted
+`.git/index` (index v2, entry paths are validated by nobody -- see
+`sg_index_read`'s header comment and the module-layout note in CLAUDE.md):
+every write-side consumer was already closed (apply.c's `remove` guard,
+merge.c's structural dependency on `sg_tree_flatten`, `reset --hard`'s
+`--force` ordering). The hole was on the **read** side, and it was worse than
+any write-side gap on record: `sg_tree_build_from_workdir` would `stat`/read
+a path like `"../secret.txt"`, hash it, and **write the content as a
+permanent loose object** -- reachable afterwards via `sg cat-file -p` --
+before the separately-guarded delete/apply step downstream ever got a chance
+to fail. `sg stash push` against such an index exited non-zero (looking, from
+the outside, like the attack had been rejected) while having already
+exfiltrated the file into the object store.
+
+Real git's oracle for the exact same crafted index (real git's own
+`update-index --add --cacheinfo ...,../secret.txt` refuses this path outright
+with "Invalid path", measured -- the fixture can only be built with raw index
+bytes): `git status --porcelain` lists the path (`A  ../secret.txt`), `git
+stash push` fails (`invalid object 100644 <id> for '../secret.txt'`), and no
+blob for the outside content is ever written. Three separate, independently
+checkable facts -- not "git also refuses this index", which would have been
+too coarse to say anything about *which* half (read vs. write) is guarded.
+
+### The fix: two guards, not one, and neither hard-fails the whole call
+
+**`sg_tree_build_from_workdir`** (`src/workdir/tree_build.c`) gained an
+`sg_relpath_is_safe` check on every index path, run *before* `sg_path_join`
+even runs (same position and reasoning as the pre-existing truncation check
+right below it). Unlike every other guard in the project, the failure
+direction here has to be a **hard failure of the whole build** -- this
+function is the one index consumer that both reads outside the repository
+and turns what it reads into a permanent write, so a caller (`sg stash push`,
+`sg_snapshot_create`) must never be handed a tree that silently omits the
+bad path (that would be the exact silent-data-loss shape the neighboring
+truncation check already guards against) or, worse, a tree that silently
+contains content read from outside the repository.
+
+**`sg_diff_index_workdir`** (`src/workdir/diff.c`, three call sites:
+`append_index_entry_vs_workdir`, `build_result_side`, and the "in index, not
+in tree" branch of `sg_diff_tree_workdir`) needed the **opposite** failure
+direction. `sg status` must still be able to list a hostile path -- real git
+does too, from the staged half of the same status (`sg_diff_tree_index`,
+which never touches the working directory at all and so needed no new
+guard). Hard-failing the whole diff/status call here would have made the
+fix itself the regression CLAUDE.md's Phase 25 rule was written to prevent:
+"one unreadable path must not blind the user to every other path". Instead,
+an unsafe path is folded into the **same case the file already has** for
+"exists but unreadable" -- `SG_DIFF_SIDE_ABSENT`, never a `WORKDIR` side
+carrying real content. This is a pre-existing convention (permission denied,
+a race with a delete), not a new case invented for Phase 36; the guard just
+adds one more reason to take a branch that was already there.
+
+### `AD` vs real git's answer: the fourth deliberate divergence, not a bug
+
+`sg status --porcelain` prints a fixed `AD ../secret.txt` for this exact
+fixture, no matter what is actually sitting at the escaping path. Real git
+does not print a fixed answer -- it genuinely reads the outside file to
+decide, and gives three different answers depending on what it finds there
+(all three measured against git 2.55.0, same crafted index, only the
+outside file's on-disk state changed between runs):
+
+| state of the file outside the repo | real git | sg |
+|---|---|---|
+| content is identical to the blob the index records | `A ` | `AD` |
+| content has changed | `AM` | `AD` |
+| file has been deleted | `AD` | `AD` |
+
+The earlier draft of this note claimed the divergence was just "git read it,
+found no difference, printed nothing extra" -- that explains only the first
+row. All three rows share one cause: **byte-for-byte compatibility and
+"refuse to read outside the repository" are in direct conflict here, and
+this phase chose the second.** sg cannot know which of the three real states
+holds without doing the very read Phase 36 exists to prevent, so it cannot
+compute git's answer at all -- not "computes it wrong", genuinely does not
+have the information.
+
+Given that, printing a fixed code is the only option, and `AD` was chosen
+over `A ` deliberately: `AD` is wrong in exactly the same way in all three
+rows (it always claims a deletion happened), so it always makes the path
+LOOK suspicious and draws the user's attention to it. `A ` would be a
+strictly worse wrong answer in two of the three rows -- it claims the
+tracked-vs-working-tree state is perfectly clean, which is true in exactly
+one of the three rows and false (silently) in the other two. A guard whose
+failure mode is "declare everything is fine" defeats the purpose of having
+a guard at all. Both sides still name the escaping PATH in every row (the
+only property interop pins, and now also the only property that survives
+across all three of git's possible answers), sg is simply never able to
+say more than that about it.
+
+This is the project's **fourth** recorded deliberate divergence from git,
+alongside `-C -C`/`--find-copies-harder` (Phase 33, rejected outright),
+`-c`/`--cc` combined with an explicit rev (Phase 34, rejected outright), and
+`* Unmerged path` staying unquoted regardless of `core.quotePath` (Phase 34).
+Recorded in CLAUDE.md's divergence list alongside the other three.
+
+### What stayed exactly as it was on purpose
+
+`sg_merge_result_apply`'s `remove(abspath)` (`src/workdir/merge.c`) got a
+comment, not a guard. Its path safety is a **structural fact**, not an
+enforced invariant: every `sg_merge_result` in this codebase is built by
+`sg_merge_trees` out of three trees that already went through
+`sg_tree_flatten` (which aborts the merge outright, `-2`, on any entry
+failing `sg_path_component_is_safe`), so nothing unsafe can reach this loop
+today. Adding a guard here anyway would be the same mistake
+`add_resolved_entry`'s neighboring comment already documents avoiding: a
+redundant defense hides the layer that is actually doing the work, so a
+mutation aimed at *this* line would never turn red -- the real guard, one
+call away in `sg_tree_flatten`, would silently absorb it, and the next
+person reading a green mutation report would misread "no signal" as "no
+guard needed" instead of "wrong layer checked". The comment exists so that
+the day `sg_merge_result` grows a second producer, its author has to
+consciously decide who validates the paths, rather than inheriting safety
+that happened to be true only because of who used to be the only caller.
+
+`sg_index_read` gained no validation, again on purpose (this is the fourth
+phase to make this exact call): every index consumer downstream needs to
+answer "is this hostile" differently -- `sg status` lists it, `sg
+stash`/`sg_tree_build_from_workdir` refuse it, the safety gates in apply.c
+fold it into "dirty". Centralizing the check in the parser would force one
+of those answers on all of them.
+
+### Error messages that discarded `sg_tree_flatten`'s `bad_path`
+
+Two messages predated `sg_tree_flatten`'s `-2`/`bad_path` contract (Phase 25)
+and had never been updated to use it, both folding a *named* failure into a
+generic guess:
+
+- `cmd_status.c`'s staged-changes warning ("out of memory, or an unreadable
+  HEAD tree") -- fixed by giving `sg_status_diff_staged` an optional
+  `bad_path` out-parameter that forwards `sg_diff_tree_index`'s own `-2`/
+  `bad_path` straight through (same shape `sg_diff_tree_index` and
+  `sg_tree_flatten` already use), and printing the path when it's available.
+- `sg_require_clean_workdir`'s and `sg_safe_apply_tree`'s "could not fully
+  determine the working directory state" (`src/workdir/apply.c`, the message
+  `sg merge`/`sg rebase`/`sg switch`/`reset --hard` all share via these two
+  functions) -- same fix, threaded through the same new `bad_path` parameter
+  on `sg_status_diff_staged`.
+
+`sg_status_diff_unstaged` did **not** get an equivalent parameter: its only
+source of `-2` would have been the new Phase 36 guards above, and those were
+deliberately built to never produce one (see "opposite failure direction"
+above) -- there is nothing for a `bad_path` parameter there to carry.
+
+### Verification
+
+- `make` + `make sanitize`: clean, no new warnings.
+- `make test`: 54/54 binaries (three new checks added to the existing
+  `tests/test_path_safe.c`, no new binary).
+- `bash tests/interop.sh`: 1750/1750 passed, 0 skipped (baseline 1744 + 6
+  new Phase 36 checks: status lists the path / stash fails / no blob
+  written, on each of sg and real git).
+- `python3 tests/fuzz_ignore.py`: 200 iterations, 0 mismatches
+  (traversal-adjacent, run per CLAUDE.md's rule for touching `workdir/` path
+  handling).
+- `make clean && make sanitize`: 54/54 under ASan/UBSan, no new warnings, no
+  sanitizer aborts.
+- `python3 tests/fuzz_diff.py 500 --max-failures 0`: 0 mismatches (one
+  isolated run during measurement reported 1, not reproduced across four
+  further runs at the same seed range including a `--max-failures 3` run
+  that would have printed the offending seed -- treated as environment
+  noise from a concurrent build, not attributed to this phase).
+  `python3 tests/fuzz_combined.py 200 --max-failures 0`: 0 mismatches (141
+  rounds produced a conflict).
+- Directed mutation (`tests/mutate.sh`), one per guard, each turning red on
+  exactly its own named assertion and nothing else in the pre-existing 54
+  checks (proving all three are net-new coverage, not duplicates of
+  something already guarded elsewhere):
+  - `sg_tree_build_from_workdir`'s check ->
+    `test_tree_build_from_workdir_refuses_escaping_index_entry` (both its
+    assertions: refusal, and "blob never written").
+  - `append_index_entry_vs_workdir`'s check (used by
+    `sg_diff_index_workdir`, what `sg status`/plain `sg diff` use) ->
+    `test_diff_index_workdir_refuses_escaping_index_entry`.
+  - `sg_diff_tree_workdir`'s own, separate check on the "in index, not in
+    tree" branch (what `sg diff <rev>` uses; NOT reached by either guard
+    above) -> `test_diff_tree_workdir_refuses_escaping_index_entry`. This
+    one is the reason there are three tests, not two: the first attempt at
+    this phase's mutation pass found this exact branch was a genuine blind
+    spot (exit code 0, no FAIL) until the dedicated third test was added.

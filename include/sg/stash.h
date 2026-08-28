@@ -98,9 +98,17 @@ typedef struct {
    not claim nothing was created, and should tell the user the entry exists
    and the working tree may not have been reset. Deliberately does NOT touch
    a paused rebase's sequencer state, and does NOT remove MERGE_HEAD -- both
-   are the CLI layer's job (see cmd_stash.c). */
+   are the CLI layer's job (see cmd_stash.c).
+
+   bad_path may be NULL; when non-NULL and the return is -1 because the
+   working tree's own sg_tree_build_from_workdir call refused a hostile
+   index path (Phase 36 -- e.g. "../secret.txt"), the offending
+   repo-relative path is copied into it (needs SG_PATH_MAX bytes), same
+   convention as sg_status_diff_staged's bad_path. Left untouched for every
+   other -1 cause, so the caller must not assume it was written just
+   because the call failed. */
 int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_push_opts *opts,
-                  unsigned char commit_id_out[SG_SHA1_RAW_LEN]);
+                  unsigned char commit_id_out[SG_SHA1_RAW_LEN], char *bad_path);
 
 /* Checks whether apply/pop of stash entry `index` would be forced to
    overwrite an uncommitted change -- the replacement for the old blanket

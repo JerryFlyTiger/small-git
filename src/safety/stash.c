@@ -323,7 +323,7 @@ int sg_stash_parse_spec(const char *spec, size_t *index_out)
 /* ---- push ------------------------------------------------------------------ */
 
 int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_push_opts *opts,
-                  unsigned char commit_id_out[SG_SHA1_RAW_LEN])
+                  unsigned char commit_id_out[SG_SHA1_RAW_LEN], char *bad_path)
 {
     static const sg_stash_push_opts default_opts = {NULL, 0, 0, 0};
     const char *message;
@@ -377,7 +377,7 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     }
 
     if (sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_RECORD_DELETION,
-                                   worktree_tree) != 0) {
+                                   worktree_tree, bad_path) != 0) {
         sg_index_free(&idx);
         return -1;
     }
@@ -557,7 +557,14 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
        exactly why these two return -2 instead of -1: the caller must not
        claim "nothing was created" once the stash entry is already listed in
        `sg stash list`. */
-    if (sg_snapshot_create(git_dir, repo_root, &idx, "stash push", NULL) != 0) {
+    /* bad_path is NULL here on purpose, not an oversight: this call and the
+       earlier sg_tree_build_from_workdir call above (building worktree_tree)
+       share the same idx and neither is mutated between them, so if a
+       hostile index path exists, the earlier call always hits it first and
+       this function has already returned -1 long before reaching here. See
+       sg_stash_push's own bad_path parameter for the one that actually
+       fires for this path. */
+    if (sg_snapshot_create(git_dir, repo_root, &idx, "stash push", NULL, NULL) != 0) {
         for (i = 0; i < untracked_path_count; i++)
             free(untracked_paths[i]);
         free(untracked_paths);

@@ -135,7 +135,7 @@ static int stash_push_plain(const char *git_dir, const char *repo_root, const ch
 
     memset(&opts, 0, sizeof(opts));
     opts.message = message;
-    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out, NULL);
 }
 
 static int stash_push_untracked(const char *git_dir, const char *repo_root, const char *message,
@@ -146,7 +146,7 @@ static int stash_push_untracked(const char *git_dir, const char *repo_root, cons
     memset(&opts, 0, sizeof(opts));
     opts.message = message;
     opts.include_untracked = 1;
-    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out, NULL);
 }
 
 /* Runs sg_cmd_stash with the given argv from inside repo_root, capturing

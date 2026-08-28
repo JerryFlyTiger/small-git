@@ -111,7 +111,7 @@ static void test_create_uses_workdir_or_falls_back_to_index(void)
     CHECK(sg_index_upsert(&idx, &e) == 0, "upsert b.txt");
     /* deliberately never written to repo_root/b.txt */
 
-    CHECK(sg_snapshot_create(git_dir, repo_root, &idx, "test snapshot", commit_id) == 0,
+    CHECK(sg_snapshot_create(git_dir, repo_root, &idx, "test snapshot", commit_id, NULL) == 0,
          "sg_snapshot_create failed");
 
     CHECK(sg_loose_read(git_dir, commit_id, &type, &content, &content_len) == 0,
@@ -174,7 +174,7 @@ static void test_same_second_snapshots_do_not_collide(void)
     for (i = 0; i < n; i++) {
         unsigned char commit_id[SG_SHA1_RAW_LEN];
 
-        CHECK(sg_snapshot_create(git_dir, repo_root, &idx, "same label", commit_id) == 0,
+        CHECK(sg_snapshot_create(git_dir, repo_root, &idx, "same label", commit_id, NULL) == 0,
              "snapshot #%d create failed", i);
     }
 

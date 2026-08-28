@@ -48,9 +48,11 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
     char *git_dir;
     char *repo_root;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
+    char bad_path[SG_PATH_MAX];
     int rc;
 
     memset(&opts, 0, sizeof(opts));
+    bad_path[0] = '\0';
 
     if (argc >= 2 && strcmp(argv[1], "push") == 0)
         i0 = 2;
@@ -117,7 +119,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
                         "index back to HEAD, after which `sg rebase --continue` may skip the current commit as a result\n");
     }
 
-    rc = sg_stash_push(git_dir, repo_root, &opts, commit_id);
+    rc = sg_stash_push(git_dir, repo_root, &opts, commit_id, bad_path);
     if (rc == 1) {
         printf("No local changes to save\n");
         free(git_dir);
@@ -143,7 +145,18 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         return 1;
     }
     if (rc != 0) {
-        fprintf(stderr, "sg: cannot create stash (unborn HEAD, or the index has unresolved conflicts?)\n");
+        /* Phase 36 follow-up: bad_path is set specifically when the working
+           tree's own sg_tree_build_from_workdir call refused a hostile index
+           path (e.g. "../secret.txt") -- the generic "unborn HEAD, or ...
+           unresolved conflicts" guess below was previously printed for this
+           case too, discarding the actual reason (measured: HEAD was not
+           unborn and the index had no real conflict). */
+        if (bad_path[0] != '\0')
+            fprintf(stderr, "sg: cannot create stash: the index names an invalid path (%s)\n",
+                   sg_quote_path_delimited(bad_path));
+        else
+            fprintf(stderr,
+                   "sg: cannot create stash (unborn HEAD, or the index has unresolved conflicts?)\n");
         free(git_dir);
         free(repo_root);
         return 1;

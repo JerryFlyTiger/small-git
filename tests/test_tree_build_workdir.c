@@ -132,10 +132,10 @@ static void test_policies_differ_only_on_the_missing_path(void)
     stage_entry(git_dir, &idx, "gone.txt", "staged gone\n", gone_blob);
 
     CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB,
-                                     keep_tree) == 0,
+                                     keep_tree, NULL) == 0,
          "KEEP_INDEX_BLOB build failed");
     CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_RECORD_DELETION,
-                                     del_tree) == 0,
+                                     del_tree, NULL) == 0,
          "RECORD_DELETION build failed");
 
     CHECK(memcmp(keep_tree, del_tree, SG_SHA1_RAW_LEN) != 0,
@@ -190,7 +190,7 @@ static void test_record_deletion_can_build_the_empty_tree(void)
     /* never written to disk */
 
     CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_RECORD_DELETION,
-                                     tree_id) == 0,
+                                     tree_id, NULL) == 0,
          "building a tree where every path was deleted must succeed, not fail");
 
     CHECK(sg_hex_to_sha1(EMPTY_TREE_HEX, expected) == 0, "bad empty-tree vector");
@@ -233,7 +233,7 @@ static void test_record_deletion_leaves_no_empty_subtree(void)
     /* dir/a.txt and dir/b.txt deliberately absent from the working tree */
 
     CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_RECORD_DELETION,
-                                     tree_id) == 0,
+                                     tree_id, NULL) == 0,
          "RECORD_DELETION build failed");
 
     CHECK(sg_loose_read(git_dir, tree_id, &type, &content, &content_len) == 0,
@@ -283,10 +283,10 @@ static void test_exists_but_unreadable_is_a_hard_failure(void)
     }
 
     CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_RECORD_DELETION,
-                                     tree_id) == -1,
+                                     tree_id, NULL) == -1,
          "RECORD_DELETION must fail on an unreadable path, not record it as deleted");
     CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB,
-                                     tree_id) == -1,
+                                     tree_id, NULL) == -1,
          "KEEP_INDEX_BLOB must fail on an unreadable path, not fall back to the stale blob");
 
     sg_index_free(&idx);
