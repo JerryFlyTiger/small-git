@@ -4456,3 +4456,200 @@ code path the fuzzer's existing 2-way generator does not exercise, so this
 number was not expected to move). `python3 tests/fuzz_combined.py 150`: 104
 conflicts, 2 mismatches, both attributed to the pre-existing LCS-vs-Myers
 residual (see above), not the combined layer. `make sanitize`: clean.
+
+## Phase 35: alignment algorithm swap, LCS backtracking -> git's Myers
+
+Replaces the O(na*nb) LCS-table alignment `sg_diff_build_script` used
+(`src/util/diff_lcs.c`) with a direct port of git's actual algorithm:
+`xdiff/xdiffi.c`'s Myers divide-and-conquer (`xdl_split`/`xdl_recs_cmp`) plus
+`xdiff/xprepare.c`'s two pre-passes (`xdl_trim_ends`, `xdl_cleanup_records` /
+`xdl_clean_mmatch`), both from git v2.55.0. This closes the last known
+divergence in the patch body: the Phase 26 residual (2-3% of hunks disagree
+on *positioning*, not content) tracked back to sg using an unreduced LCS
+while git defaults to Myers, and the fuzzers below confirm the residual is
+gone, not just reduced.
+
+### Why the divergence existed in the first place
+
+Phase 26 measured that of 11 residual cases, 6 were byte-for-byte identical
+to `git diff --histogram` and reasoned "sg is accidentally closer to
+histogram than to Myers". That was directionally right but incomplete: the
+old LCS backtrack, given no size-reduction pass, finds *a* longest common
+subsequence, and which one it picks when several tie is an artifact of the
+backtrack's own tie-breaking rule -- it has no reason to agree with either
+algorithm in general. Myers with git's exact heuristics is the only thing
+guaranteed to agree with `git diff`, because it's the same code.
+
+### Scope decisions (made in advance, not revisited mid-implementation)
+
+1. **`xdl_cleanup_records`/`xdl_clean_mmatch` and `xdl_split`'s two
+   heuristics were ported despite having no measured witness on this
+   project's fixtures for a chunk of their internal logic.** The
+   hypothesis going in was that histogram/patience skip the size-reduction
+   pass while default Myers always runs it, and that this explained sg's
+   histogram-like bias. That hypothesis was **refuted** before writing any
+   code: on the 4 saved failing fixtures, `git diff` and `git diff
+   --minimal` (which disables both the reduction pass and the split
+   heuristics) produce byte-identical output; across 420 additional
+   measured cases (360 random files at three sizes, 60 deliberately
+   pathological ones built to trigger `xdl_clean_mmatch`'s specific
+   discard condition) `git diff` and `git diff --minimal` never disagreed
+   once. This part of git's own pipeline was never observed to change its
+   own output, so sg cannot be observed disagreeing with it either. The
+   code was ported anyway, because the project's completion bar is
+   byte-for-byte agreement, not "agrees on everything we happened to
+   measure" -- see "No witness, by design" below for the full scope of
+   what this covers and the mutation evidence for each piece.
+2. **`src/workdir/merge.c`'s three-way merge is untouched.** It calls
+   `sg_diff_lcs_table`/`sg_diff_lcs_table_exact` directly and rolls its own
+   backtrack (`merge.c:283-313`, `:364-365`), never going through
+   `sg_diff_build_script`. Both public LCS-table functions are kept exactly
+   as they were. Reason: every measured residual was in the diff path, none
+   in merge (`tests/fuzz_diff.py` cannot reach merge's alignment at all),
+   so changing merge's line-pairing behaviour would be an unforced change
+   with no fuzzer watching it.
+3. **`src/cli/diff_out.c`'s `coalesce_lines` (Phase 34's combined-diff LCS,
+   a from-scratch port of `combine-diff.c`) is untouched too**, but for a
+   different reason than merge: it already has its own separate LCS table
+   and never called into `diff_lcs.c`. `fuzz_combined.py`'s pre-existing
+   residual (tracked in Phase 34 as "attributed to the LCS-vs-Myers gap")
+   is fixed as a side effect, because `combine_process_parent`
+   (`diff_out.c:852`) calls `sg_diff_build_script` for the two parent-vs-
+   result comparisons that feed `coalesce_lines`, not because
+   `coalesce_lines` itself changed.
+
+### The coordinate mapping (the part most likely to be wrong)
+
+`xdl_cleanup_records` builds a `reference_index[]` per file: only lines
+classified `KEEP` (or `INVESTIGATE` demoted to `KEEP`) get an entry, so the
+Myers core (`myers_recs_cmp`/`myers_split_box` in `diff_lcs.c`, mirroring
+git's `xdl_recs_cmp`/`xdl_split`) runs entirely in a *compacted* coordinate
+space `[0, nreff)` that skips every line already resolved as
+obviously-unmatched. `changed[]`, however, is indexed by the *original*
+line number, because that is what `compact_one_side` (Phase 26, untouched)
+and the final `sg_diff_group` output need. The two array-of-longs
+`aref`/`bref` are exactly this mapping (compacted index -> original index),
+and every site that writes into `achanged`/`bchanged` from inside the Myers
+core goes through them (`mc->achanged[mc->aref[off1]]`, not
+`mc->achanged[off1]`). This is a SEPARATE path from `cleanup_side`'s own
+direct write `changed[i + off] = 1` for a line it classified `DISCARD`
+before Myers ever runs -- the two write into the same bitmap but from
+different call sites, and a mutation review round confirmed they need
+separate tests: `tests/test_diff_myers.c` has
+`test_myers_aref_mapping_second_dup_deleted`/
+`test_myers_bref_mapping_second_dup_inserted` for the Myers/aref path
+(a duplicated common line forces the Myers core to decide *which*
+occurrence is the edit, expected values checked against `git diff
+--no-index` on the same 3/4-line fixtures), and a separate
+`test_discard_path_coordinate_mapping` for `cleanup_side`'s own `+ off`
+write (two unique-content lines wrapped in a common prefix long enough to
+give `dstart != 0`, so a lost `+ off` is observable). All three were
+independently confirmed via `tests/mutate.sh` to catch exactly their own
+path and not the other: mutating `mc->aref[off1]`/`mc->bref[off2]` down to
+bare `off1`/`off2` turns only the two Myers/aref tests red, and mutating
+`changed[i + off]` down to `changed[i]` turns only
+`test_discard_path_coordinate_mapping` red (plus, incidentally,
+`test_trim_only_end_differs`, whose own fixture happens to also have
+`dstart != 0` -- see that test's comment for why `test_trim_only_start_differs`
+cannot see the same bug).
+
+### No witness, by design: the size-reduction pass and the two split heuristics
+
+Three pieces of the port have no test in this project that fails when they
+are individually broken, and this is a deliberate, disclosed gap rather
+than an oversight -- see scope decision 1 above for why the code stayed
+anyway. All three were checked with `tests/mutate.sh` and, for the two
+confirmed blind spots, an independent re-check with `tests/fuzz_diff.py`
+directly (copying the mutated working tree to a scratch directory and
+running the fuzzer's own `PROJECT_ROOT`-relative binary, the same
+mechanism `mutate.sh` uses for `make test`):
+
+- **`cleanup_side`'s `other_is_b ? count_b : count_a` (which file's match
+  count decides KEEP/DISCARD/INVESTIGATE) is a blind spot for
+  `tests/test_diff_myers.c`** (swapping the two branches: exit 0, no FAIL
+  lines) **but IS caught by the differential fuzzer**: 8/500 mismatches at
+  `--seed 0`, 7/500 at `--seed 20000`. This one is not actually
+  witness-less overall -- it just has no *unit-level* witness, only a
+  statistical one. Recorded here so the next person does not "fix" the
+  blind spot by deleting fuzzer coverage that is already doing the job.
+- **`xdl_split`'s heuristic A forward/backward asymmetry
+  (`k == snake_cnt` forward at `:597`, `k == snake_cnt - 1` backward at
+  `:620`) is a genuine blind spot for both**: forcing the backward branch
+  to match the forward one produces 0/500 mismatches at `--seed 0` and
+  0/300 at `--seed 111111`, on top of the pre-existing 0/500 at `--seed
+  20000/40000/60000` this phase's baseline already established. Nothing in
+  this project's test suite would catch this asymmetry regressing to a
+  copy-paste "fix" that makes the two match.
+- **`bogosqrt`'s shift amount (`n >>= 2`, used identically for both
+  `cleanup_side`'s `mlim` and the Myers core's `mxcost`) is the same kind
+  of blind spot**: changing it to `n >>= 1` (a real behavioral change --
+  it moves the size-reduction/heuristic trigger thresholds, not a no-op)
+  produces 0/500 mismatches at `--seed 0` and 0/300 at `--seed 111111`.
+
+The common thread, and the reason none of this is surprising: **`git diff`
+and `git diff --minimal` were never observed to disagree** across the 420
+cases scope decision 1 describes. `--minimal` is exactly "skip the
+size-reduction pass and both split heuristics" -- so on every input this
+project's fuzzers or manual construction have produced, git's own pipeline
+never took a path where any of this code changed its answer. sg inherits
+that same blind spot by construction, not by a gap in its own test
+harness. **The fuzzers here prove "does not misfire on common inputs", not
+"is internally correct"** -- CLAUDE.md's third kind of "mutation stayed
+green" (mathematically unobservable on this project's fixture
+distribution), and this is the disclosure for it, matching the standard
+Phase 30 set for `-M`/`-C`'s two-pass ordering and Phase 34 set for
+`combine-diff.c`'s NUL-sentinel bound: recorded as a decision, not left for
+the next person to rediscover as a mystery.
+
+### No floating point
+
+`xdl_bogosqrt` (git's size-limit heuristic, used both for
+`xdl_cleanup_records`'s `mlim` and for the Myers core's `mxcost`) is **not**
+an actual square root -- it is `for (i = 1; n > 0; n >>= 2) i <<= 1; return
+i;`, a shift-based approximation, ported verbatim as `bogosqrt()` in
+`diff_lcs.c`. The whole path (classification, trim, cleanup, Myers) is
+integer-only, same as it was before this phase.
+
+### Verification
+
+- `make` + `make sanitize`: clean, no new warnings (checked both compiling
+  `src/util/diff_lcs.c` in isolation and the full link).
+- `make test`: 54/54 binaries (one new: `tests/test_diff_myers.c`, eleven
+  checks covering divide-and-conquer/snake basic shapes, `xdl_trim_ends`'s
+  four boundary cases, the three coordinate-mapping tests above (two
+  Myers/aref, one cleanup_side/DISCARD), and the `sg_diff_group` contract
+  -- ascending, non-overlapping, never both-zero -- on a multi-hunk
+  fixture). All 28 pre-existing `tests/test_diff_out.c` checks stayed
+  green unmodified, as expected: they anchor real git's output, not the
+  old LCS's.
+- `bash tests/interop.sh`: 1744/1744 passed, 0 skipped (unchanged from the
+  Phase 34 baseline -- interop's full-output `cmp` checks were already
+  passing before this phase on every fixture they happened to cover; this
+  phase's whole point was the fixtures they *didn't* cover).
+- `python3 tests/fuzz_diff.py 500 --seed <s> --max-failures 0` for
+  `s in {0, 20000, 40000, 60000}` (the last one previously unused, run as
+  an out-of-sample check): **0 mismatches** in all four, down from a
+  measured baseline of 14/14/16 (no prior measurement at 60000).
+- `python3 tests/fuzz_combined.py 200 --seed <s> --max-failures 0` for
+  `s in {0, 20000, 60000}`: **0 mismatches** in all three (141/147/141
+  conflicts produced respectively), down from a baseline of 2/0/(unmeasured)
+  -- confirming the Phase 34 residual note above (a diff_lcs.c bug, not a
+  combine-diff.c bug) was correct.
+- The 4 fixtures saved from the baseline measurement
+  (`p35_baseline/r48,r85,r114,r192`) were each re-diffed directly (`git
+  diff` / `git diff --cached` vs `build/sg diff` / `build/sg diff
+  --cached`) and confirmed byte-identical.
+
+### Performance (a second-order benefit, not the goal)
+
+The old LCS table was O(na*nb) time **and space**, with no size cap
+(`lcs_table_ex` mallocs `na+1` separate rows of `nb+1` `size_t` each).
+Myers is O((N+M)D) where D is the edit distance, using O(N+M) working
+memory (the two `kvdf`/`kvdb` vectors). Measured on a synthetic 8000-line
+file with 800 scattered single-line edits (10% churn, same content on both
+builds, only `src/util/diff_lcs.c` swapped): the old build took 0.51s real
+and peaked at 537 MB RSS; the new build finished in under 10ms and peaked
+at 11.5 MB RSS. At 5000 lines / 500 edits the gap was already 0.19s/257 MB
+vs <5ms/10.6 MB. This is expected from the complexity classes, not a
+surprise, but it is a real user-facing improvement for `sg diff` on large
+files, which the old implementation had no protection against at all.

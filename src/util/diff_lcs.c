@@ -1,5 +1,7 @@
 #include "sg/diff_lcs.h"
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -110,7 +112,7 @@ void sg_diff_lcs_free_table(size_t **dp, size_t na)
     free(dp);
 }
 
-/* ---- minimal edit script: backtrack + group compaction + indent heuristic */
+/* ---- minimal edit script: Myers alignment + group compaction + indent heuristic */
 
 typedef struct {
     sg_diff_group *groups;
@@ -137,44 +139,640 @@ static int gb_push(group_builder *gb, size_t a_off, size_t a_len, size_t b_off, 
     return 0;
 }
 
-/* Walks the LCS table exactly like the single-step classifier every caller
-   of this module used to hand-roll (count_lines in diff_out.c, the old
-   print_text_diff_body), but folds consecutive non-equal steps into one
-   sg_diff_group instead of acting on each line immediately. Returns -1 only
-   on allocation failure. */
-static int backtrack_into_groups(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
-                                 size_t **dp, group_builder *gb)
-{
-    size_t i = 0, j = 0;
-    int in_group = 0;
-    size_t gstart_a = 0, gstart_b = 0;
+/* ---- Myers diff (a direct port of git's xdiff/xdiffi.c + xprepare.c,
+   v2.55.0), replacing the old LCS-backtrack alignment. See Phase 35 of
+   docs/DESIGN.md for the full rationale and the measurements that pinned
+   down each of git's constants. sg_diff_lcs_table/_exact and
+   backtrack_into_groups (the old alignment this replaces) are gone from
+   this call path -- src/workdir/merge.c's three-way merge still calls
+   sg_diff_lcs_table/_exact directly and rolls its own backtrack, and that
+   is DELIBERATELY left untouched (Phase 35 scope decision 1b: merge's
+   alignment has no differential coverage, so changing its behaviour with
+   no net under it is not worth it). */
 
-    while (i < na || j < nb) {
-        if (i < na && j < nb && sg_diff_lines_equal_exact(a[i], b[j])) {
-            if (in_group) {
-                if (gb_push(gb, gstart_a, i - gstart_a, gstart_b, j - gstart_b) != 0)
-                    return -1;
-                in_group = 0;
-            }
-            i++;
-            j++;
-            continue;
-        }
-        if (!in_group) {
-            gstart_a = i;
-            gstart_b = j;
-            in_group = 1;
-        }
-        if (i < na && (j >= nb || dp[i + 1][j] >= dp[i][j + 1]))
-            i++;
-        else
-            j++;
-    }
-    if (in_group) {
-        if (gb_push(gb, gstart_a, i - gstart_a, gstart_b, j - gstart_b) != 0)
-            return -1;
-    }
+/* Each unique line (by sg_diff_lines_equal_exact) gets one class id,
+   mirroring git's xdlclass_t / xdl_classify_record: the point is turning
+   "are these two lines the same" into an O(1) integer comparison instead
+   of a memcmp, which is what makes the O((N+M)D) time bound on the Myers
+   core actually O((N+M)D) instead of O((N+M)D * line length). Any hash
+   works here (unlike git's xdl_hash_record_verbatim, ours is not required
+   to match git's byte-for-byte) as long as collisions are always resolved
+   by an exact content compare before two lines share a class -- that is
+   the only property the rest of the algorithm depends on. */
+typedef struct {
+    sg_diff_line line;
+    size_t count_a; /* occurrences of this class in file a (git: len1) */
+    size_t count_b; /* occurrences of this class in file b (git: len2) */
+    long next;      /* next class chained in the same hash bucket, -1 terminated */
+} diff_class;
+
+typedef struct {
+    diff_class *classes;
+    size_t count, cap;
+    long *buckets;
+    size_t hsize;
+} classifier;
+
+static size_t line_hash(sg_diff_line ln)
+{
+    size_t h = 5381;
+    size_t i;
+
+    for (i = 0; i < ln.len; i++)
+        h = h * 33 + (unsigned char)ln.ptr[i];
+    h = h * 33 + (size_t)(ln.has_nl ? 1 : 0);
+    return h;
+}
+
+static int classifier_init(classifier *cf, size_t total_hint)
+{
+    size_t hbits = 1;
+
+    while (((size_t)1 << hbits) < total_hint && hbits < 24)
+        hbits++;
+    cf->hsize = (size_t)1 << hbits;
+    cf->buckets = malloc(cf->hsize * sizeof(*cf->buckets));
+    if (cf->buckets == NULL)
+        return -1;
+    /* Every byte 0xff -> every long reads back as -1 on a two's complement
+       platform (the only kind sg supports, per CLAUDE.md's platform note),
+       used here as the bucket-chain terminator. */
+    memset(cf->buckets, 0xff, cf->hsize * sizeof(*cf->buckets));
+    cf->classes = NULL;
+    cf->count = 0;
+    cf->cap = 0;
     return 0;
+}
+
+static void classifier_free(classifier *cf)
+{
+    free(cf->buckets);
+    free(cf->classes);
+}
+
+/* Finds or creates the class for ln, returns its id, or -1 on allocation
+   failure. */
+static long classify_get(classifier *cf, sg_diff_line ln)
+{
+    size_t h = line_hash(ln);
+    size_t bucket = h & (cf->hsize - 1);
+    long idx = cf->buckets[bucket];
+
+    while (idx != -1) {
+        if (sg_diff_lines_equal_exact(cf->classes[idx].line, ln))
+            return idx;
+        idx = cf->classes[idx].next;
+    }
+
+    if (cf->count == cf->cap) {
+        size_t new_cap = cf->cap == 0 ? 16 : cf->cap * 2;
+        diff_class *grown = realloc(cf->classes, new_cap * sizeof(*grown));
+
+        if (grown == NULL)
+            return -1;
+        cf->classes = grown;
+        cf->cap = new_cap;
+    }
+    idx = (long)cf->count++;
+    cf->classes[idx].line = ln;
+    cf->classes[idx].count_a = 0;
+    cf->classes[idx].count_b = 0;
+    cf->classes[idx].next = cf->buckets[bucket];
+    cf->buckets[bucket] = idx;
+    return idx;
+}
+
+/* Classifies every line of both files, filling *acls_out[0..na) /
+   *bcls_out[0..nb) with class ids and cf's per-class count_a/count_b.
+   Returns -1 on allocation failure (cf is left in a freeable state either
+   way, caller always calls classifier_free). */
+static int classify_all(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb, classifier *cf,
+                        long **acls_out, long **bcls_out)
+{
+    long *acls, *bcls;
+    size_t i;
+
+    if (classifier_init(cf, na + nb + 1) != 0)
+        return -1;
+
+    acls = malloc((na > 0 ? na : 1) * sizeof(*acls));
+    bcls = malloc((nb > 0 ? nb : 1) * sizeof(*bcls));
+    if (acls == NULL || bcls == NULL) {
+        free(acls);
+        free(bcls);
+        return -1;
+    }
+
+    for (i = 0; i < na; i++) {
+        long idx = classify_get(cf, a[i]);
+
+        if (idx < 0) {
+            free(acls);
+            free(bcls);
+            return -1;
+        }
+        acls[i] = idx;
+        cf->classes[idx].count_a++;
+    }
+    for (i = 0; i < nb; i++) {
+        long idx = classify_get(cf, b[i]);
+
+        if (idx < 0) {
+            free(acls);
+            free(bcls);
+            return -1;
+        }
+        bcls[i] = idx;
+        cf->classes[idx].count_b++;
+    }
+
+    *acls_out = acls;
+    *bcls_out = bcls;
+    return 0;
+}
+
+/* Port of git's xdl_trim_ends (xprepare.c): strips the common leading and
+   trailing run (by class id, i.e. exact content match) shared by both
+   files, so the expensive part of the algorithm only ever looks at the
+   middle. dend1/dend2 mirror git's xdf1->dend/xdf2->dend: the LAST index
+   (inclusive) still inside the middle region for each file, which can be
+   less than dstart (an empty middle, e.g. when one file is wholly a
+   prefix/suffix of the other). */
+static void trim_ends(const long *acls, size_t na, const long *bcls, size_t nb, long *dstart, long *dend1,
+                      long *dend2)
+{
+    long i, lim;
+
+    lim = (long)(na < nb ? na : nb);
+    for (i = 0; i < lim; i++)
+        if (acls[i] != bcls[i])
+            break;
+    *dstart = i;
+
+    lim -= i;
+    for (i = 0; i < lim; i++)
+        if (acls[(long)na - 1 - i] != bcls[(long)nb - 1 - i])
+            break;
+    *dend1 = (long)na - i - 1;
+    *dend2 = (long)nb - i - 1;
+}
+
+#define SG_XDL_KPDIS_RUN 4
+#define SG_XDL_MAX_EQLIMIT 1024
+#define SG_XDL_SIMSCAN_WINDOW 100
+#define SG_XDL_MAX_COST_MIN 256
+#define SG_XDL_HEUR_MIN_COST 256
+#define SG_XDL_SNAKE_CNT 20
+#define SG_XDL_K_HEUR 4
+/* git's XDL_LINE_MAX is (1UL << (CHAR_BIT*sizeof(long)-1)) - 1, i.e. exactly
+   LONG_MAX on any two's complement platform -- which is the only kind sg
+   supports (CLAUDE.md's platform note). */
+#define SG_XDL_LINE_MAX LONG_MAX
+
+#define SG_MYERS_DISCARD 0
+#define SG_MYERS_KEEP 1
+#define SG_MYERS_INVESTIGATE 2
+
+/* Not a real square root -- a shift-based approximation, matching git's
+   xdl_bogosqrt (xutils.c) exactly, including its use as a NON-monotonic-
+   feeling but deterministic size limit rather than an actual sqrt(). Using
+   a real sqrt() here would introduce floating point into a path that
+   currently has none (CLAUDE.md's "no floating point" note for this
+   phase). */
+static uint64_t bogosqrt(uint64_t n)
+{
+    uint64_t i;
+
+    for (i = 1; n > 0; n >>= 2)
+        i <<= 1;
+    return i;
+}
+
+/* Port of git's xdl_clean_mmatch (xprepare.c): decides whether an
+   INVESTIGATE line at position i (within a length-len action[] window)
+   should be demoted to DISCARD because it sits inside a run of otherwise-
+   discardable lines. */
+static int clean_mmatch(const unsigned char *action, long i, long len)
+{
+    long r, rdis0, rpdis0, rdis1, rpdis1;
+    long s = 0, e = len - 1;
+
+    if (i - s > SG_XDL_SIMSCAN_WINDOW)
+        s = i - SG_XDL_SIMSCAN_WINDOW;
+    if (e - i > SG_XDL_SIMSCAN_WINDOW)
+        e = i + SG_XDL_SIMSCAN_WINDOW;
+
+    for (r = 1, rdis0 = 0, rpdis0 = 1; (i - r) >= s; r++) {
+        if (action[i - r] == SG_MYERS_DISCARD)
+            rdis0++;
+        else if (action[i - r] == SG_MYERS_INVESTIGATE)
+            rpdis0++;
+        else
+            break;
+    }
+    if (rdis0 == 0)
+        return 0;
+    for (r = 1, rdis1 = 0, rpdis1 = 1; (i + r) <= e; r++) {
+        if (action[i + r] == SG_MYERS_DISCARD)
+            rdis1++;
+        else if (action[i + r] == SG_MYERS_INVESTIGATE)
+            rpdis1++;
+        else
+            break;
+    }
+    if (rdis1 == 0)
+        return 0;
+    rdis1 += rdis0;
+    rpdis1 += rpdis0;
+
+    return rpdis1 * SG_XDL_KPDIS_RUN < (rpdis1 + rdis1);
+}
+
+/* Port of git's xdl_cleanup_records for ONE side (called once for a
+   against b's counts, once for b against a's counts -- git does the same
+   pair of loops inline in one function, split here because sg's "which
+   count field" differs per side, not because the algorithm differs).
+   `cls` is the full per-original-index class array for THIS file (size n);
+   `other_count_of(class)` reads the OTHER file's occurrence count for that
+   class (count_b when processing file a, count_a when processing file b).
+   [dstart, dend] is the middle region trim_ends left; anything outside it
+   is common prefix/suffix and never touched (changed[] stays 0, as
+   calloc'd by the caller). A line judged DISCARD gets changed[i]=1
+   immediately (git: "obviously changed, no candidate for alignment"); a
+   line judged KEEP gets appended (by ORIGINAL index) to *ref_out, which is
+   the coordinate space the Myers core actually runs in. Returns -1 only on
+   allocation failure. */
+static int cleanup_side(const long *cls, size_t n, const diff_class *classes, int other_is_b, long dstart,
+                        long dend, unsigned char *changed, long **ref_out, size_t *nreff_out)
+{
+    long off = dstart;
+    long len = dend - off + 1;
+    unsigned char *action;
+    long *refidx;
+    long i;
+    long mlim;
+    size_t nreff = 0;
+
+    if (len <= 0) {
+        *ref_out = NULL;
+        *nreff_out = 0;
+        return 0;
+    }
+
+    action = calloc((size_t)len, 1);
+    refidx = malloc((size_t)len * sizeof(*refidx));
+    if (action == NULL || refidx == NULL) {
+        free(action);
+        free(refidx);
+        return -1;
+    }
+
+    mlim = (long)bogosqrt((uint64_t)n);
+    if (mlim > SG_XDL_MAX_EQLIMIT)
+        mlim = SG_XDL_MAX_EQLIMIT;
+
+    for (i = 0; i < len; i++) {
+        long cls_idx = cls[i + off];
+        size_t nm = other_is_b ? classes[cls_idx].count_b : classes[cls_idx].count_a;
+
+        if (nm == 0)
+            action[i] = SG_MYERS_DISCARD;
+        else if ((long)nm < mlim)
+            action[i] = SG_MYERS_KEEP;
+        else
+            action[i] = SG_MYERS_INVESTIGATE;
+    }
+
+    for (i = 0; i < len; i++) {
+        unsigned char act = action[i];
+
+        if (act == SG_MYERS_INVESTIGATE)
+            act = clean_mmatch(action, i, len) ? SG_MYERS_DISCARD : SG_MYERS_KEEP;
+
+        if (act == SG_MYERS_KEEP)
+            refidx[nreff++] = i + off;
+        else
+            changed[i + off] = 1;
+    }
+
+    free(action);
+    *ref_out = refidx;
+    *nreff_out = nreff;
+    return 0;
+}
+
+/* The Myers core (xdl_recs_cmp/xdl_split in git) runs entirely in
+   "compacted" coordinates: index k into file a means aref[k] in the
+   original array, and get_hash_* looks up that original line's class id.
+   changed[] is written back at the ORIGINAL index -- this is exactly the
+   coordinate mapping flagged in the spec as the easiest place to get
+   wrong, and it is why aref/bref exist as a separate array instead of
+   folding cleanup_side's KEEP/DISCARD decision directly into a boolean. */
+typedef struct {
+    const long *acls, *bcls;
+    const long *aref, *bref;
+    unsigned char *achanged, *bchanged;
+} myers_ctx;
+
+static long get_hash_a(const myers_ctx *mc, long idx)
+{
+    return mc->acls[mc->aref[idx]];
+}
+
+static long get_hash_b(const myers_ctx *mc, long idx)
+{
+    return mc->bcls[mc->bref[idx]];
+}
+
+typedef struct {
+    long i1, i2;
+    int min_lo, min_hi;
+} myers_split;
+
+typedef struct {
+    long mxcost;
+    long snake_cnt;
+    long heur_min;
+} myers_env;
+
+/* Direct port of git's xdl_split (xdiffi.c): Myers's O(ND) forward/backward
+   search for the box (off1,lim1)x(off2,lim2), including both heuristics
+   (opportunistic snake sampling and forced convergence past mxcost). See
+   Phase 35 of docs/DESIGN.md for why both are kept despite having no
+   measured witness on this project's fixtures: omitting them is a
+   real, if rare, divergence from git, and the project's standard is
+   byte-for-byte compatibility, not "matches on everything we happened to
+   test". */
+static long myers_split_box(const myers_ctx *mc, long off1, long lim1, long off2, long lim2, long *kvdf,
+                            long *kvdb, int need_min, myers_split *spl, const myers_env *env)
+{
+    long dmin = off1 - lim2, dmax = lim1 - off2;
+    long fmid = off1 - off2, bmid = lim1 - lim2;
+    long odd = (fmid - bmid) & 1;
+    long fmin = fmid, fmax = fmid;
+    long bmin = bmid, bmax = bmid;
+    long ec, d, i1, i2, prev1, best, dd, v, k;
+
+    kvdf[fmid] = off1;
+    kvdb[bmid] = lim1;
+
+    for (ec = 1;; ec++) {
+        int got_snake = 0;
+
+        if (fmin > dmin)
+            kvdf[--fmin - 1] = -1;
+        else
+            ++fmin;
+        if (fmax < dmax)
+            kvdf[++fmax + 1] = -1;
+        else
+            --fmax;
+
+        for (d = fmax; d >= fmin; d -= 2) {
+            if (kvdf[d - 1] >= kvdf[d + 1])
+                i1 = kvdf[d - 1] + 1;
+            else
+                i1 = kvdf[d + 1];
+            prev1 = i1;
+            i2 = i1 - d;
+            while (i1 < lim1 && i2 < lim2 && get_hash_a(mc, i1) == get_hash_b(mc, i2)) {
+                i1++;
+                i2++;
+            }
+            if (i1 - prev1 > env->snake_cnt)
+                got_snake = 1;
+            kvdf[d] = i1;
+            if (odd && bmin <= d && d <= bmax && kvdb[d] <= i1) {
+                spl->i1 = i1;
+                spl->i2 = i2;
+                spl->min_lo = spl->min_hi = 1;
+                return ec;
+            }
+        }
+
+        if (bmin > dmin)
+            kvdb[--bmin - 1] = SG_XDL_LINE_MAX;
+        else
+            ++bmin;
+        if (bmax < dmax)
+            kvdb[++bmax + 1] = SG_XDL_LINE_MAX;
+        else
+            --bmax;
+
+        for (d = bmax; d >= bmin; d -= 2) {
+            if (kvdb[d - 1] < kvdb[d + 1])
+                i1 = kvdb[d - 1];
+            else
+                i1 = kvdb[d + 1] - 1;
+            prev1 = i1;
+            i2 = i1 - d;
+            while (i1 > off1 && i2 > off2 && get_hash_a(mc, i1 - 1) == get_hash_b(mc, i2 - 1)) {
+                i1--;
+                i2--;
+            }
+            if (prev1 - i1 > env->snake_cnt)
+                got_snake = 1;
+            kvdb[d] = i1;
+            if (!odd && fmin <= d && d <= fmax && i1 <= kvdf[d]) {
+                spl->i1 = i1;
+                spl->i2 = i2;
+                spl->min_lo = spl->min_hi = 1;
+                return ec;
+            }
+        }
+
+        if (need_min)
+            continue;
+
+        if (got_snake && ec > env->heur_min) {
+            for (best = 0, d = fmax; d >= fmin; d -= 2) {
+                dd = d > fmid ? d - fmid : fmid - d;
+                i1 = kvdf[d];
+                i2 = i1 - d;
+                v = (i1 - off1) + (i2 - off2) - dd;
+
+                if (v > SG_XDL_K_HEUR * ec && v > best && off1 + env->snake_cnt <= i1 && i1 < lim1 &&
+                    off2 + env->snake_cnt <= i2 && i2 < lim2) {
+                    for (k = 1; get_hash_a(mc, i1 - k) == get_hash_b(mc, i2 - k); k++)
+                        if (k == env->snake_cnt) {
+                            best = v;
+                            spl->i1 = i1;
+                            spl->i2 = i2;
+                            break;
+                        }
+                }
+            }
+            if (best > 0) {
+                spl->min_lo = 1;
+                spl->min_hi = 0;
+                return ec;
+            }
+
+            for (best = 0, d = bmax; d >= bmin; d -= 2) {
+                dd = d > bmid ? d - bmid : bmid - d;
+                i1 = kvdb[d];
+                i2 = i1 - d;
+                v = (lim1 - i1) + (lim2 - i2) - dd;
+
+                if (v > SG_XDL_K_HEUR * ec && v > best && off1 < i1 && i1 <= lim1 - env->snake_cnt &&
+                    off2 < i2 && i2 <= lim2 - env->snake_cnt) {
+                    for (k = 0; get_hash_a(mc, i1 + k) == get_hash_b(mc, i2 + k); k++)
+                        if (k == env->snake_cnt - 1) {
+                            best = v;
+                            spl->i1 = i1;
+                            spl->i2 = i2;
+                            break;
+                        }
+                }
+            }
+            if (best > 0) {
+                spl->min_lo = 0;
+                spl->min_hi = 1;
+                return ec;
+            }
+        }
+
+        if (ec >= env->mxcost) {
+            long fbest, fbest1, bbest, bbest1;
+
+            fbest = fbest1 = -1;
+            for (d = fmax; d >= fmin; d -= 2) {
+                i1 = kvdf[d] < lim1 ? kvdf[d] : lim1;
+                i2 = i1 - d;
+                if (lim2 < i2) {
+                    i1 = lim2 + d;
+                    i2 = lim2;
+                }
+                if (fbest < i1 + i2) {
+                    fbest = i1 + i2;
+                    fbest1 = i1;
+                }
+            }
+
+            bbest = bbest1 = SG_XDL_LINE_MAX;
+            for (d = bmax; d >= bmin; d -= 2) {
+                i1 = off1 > kvdb[d] ? off1 : kvdb[d];
+                i2 = i1 - d;
+                if (i2 < off2) {
+                    i1 = off2 + d;
+                    i2 = off2;
+                }
+                if (i1 + i2 < bbest) {
+                    bbest = i1 + i2;
+                    bbest1 = i1;
+                }
+            }
+
+            if ((lim1 + lim2) - bbest < fbest - (off1 + off2)) {
+                spl->i1 = fbest1;
+                spl->i2 = fbest - fbest1;
+                spl->min_lo = 1;
+                spl->min_hi = 0;
+            } else {
+                spl->i1 = bbest1;
+                spl->i2 = bbest - bbest1;
+                spl->min_lo = 0;
+                spl->min_hi = 1;
+            }
+            return ec;
+        }
+    }
+}
+
+/* Direct port of git's xdl_recs_cmp (xdiffi.c): shrink the box by eating
+   matching snakes off both ends, then either mark one whole side changed
+   (the other side is empty) or split-and-recurse. */
+static void myers_recs_cmp(const myers_ctx *mc, long off1, long lim1, long off2, long lim2, long *kvdf,
+                           long *kvdb, int need_min, const myers_env *env)
+{
+    for (; off1 < lim1 && off2 < lim2 && get_hash_a(mc, off1) == get_hash_b(mc, off2); off1++, off2++)
+        ;
+    for (; off1 < lim1 && off2 < lim2 && get_hash_a(mc, lim1 - 1) == get_hash_b(mc, lim2 - 1); lim1--, lim2--)
+        ;
+
+    if (off1 == lim1) {
+        for (; off2 < lim2; off2++)
+            mc->bchanged[mc->bref[off2]] = 1;
+    } else if (off2 == lim2) {
+        for (; off1 < lim1; off1++)
+            mc->achanged[mc->aref[off1]] = 1;
+    } else {
+        myers_split spl;
+
+        myers_split_box(mc, off1, lim1, off2, lim2, kvdf, kvdb, need_min, &spl, env);
+        myers_recs_cmp(mc, off1, spl.i1, off2, spl.i2, kvdf, kvdb, spl.min_lo, env);
+        myers_recs_cmp(mc, spl.i1, lim1, spl.i2, lim2, kvdf, kvdb, spl.min_hi, env);
+    }
+}
+
+/* Top-level driver: fills achanged[0..na) / bchanged[0..nb) (both the
+   offset-by-1 buffers sg_diff_build_script owns, so index -1 and index n
+   are both valid and read as 0) exactly like the old backtrack_into_groups
+   used to, but via classify -> trim -> cleanup -> Myers instead of an
+   O(na*nb) LCS table. need_min is always 0 at the top level: sg has no
+   --minimal equivalent, matching git's own default (xpp->flags &
+   XDF_NEED_MINIMAL) being unset for a plain `git diff`. Returns -1 only on
+   allocation failure. */
+static int myers_diff(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb, unsigned char *achanged,
+                      unsigned char *bchanged)
+{
+    classifier cf;
+    long *acls = NULL, *bcls = NULL;
+    long dstart, dend1, dend2;
+    long *aref = NULL, *bref = NULL;
+    size_t nreffa = 0, nreffb = 0;
+    long ndiags;
+    long *kvd = NULL, *kvdf, *kvdb;
+    myers_ctx mc;
+    myers_env env;
+    int rc = -1;
+
+    memset(&cf, 0, sizeof(cf));
+    if (classify_all(a, na, b, nb, &cf, &acls, &bcls) != 0) {
+        classifier_free(&cf);
+        return -1;
+    }
+
+    trim_ends(acls, na, bcls, nb, &dstart, &dend1, &dend2);
+
+    if (cleanup_side(acls, na, cf.classes, 1, dstart, dend1, achanged, &aref, &nreffa) != 0)
+        goto out;
+    if (cleanup_side(bcls, nb, cf.classes, 0, dstart, dend2, bchanged, &bref, &nreffb) != 0)
+        goto out;
+
+    ndiags = (long)nreffa + (long)nreffb + 3;
+    kvd = malloc((size_t)(2 * ndiags + 2) * sizeof(*kvd));
+    if (kvd == NULL)
+        goto out;
+    kvdf = kvd;
+    kvdb = kvdf + ndiags;
+    kvdf += (long)nreffb + 1;
+    kvdb += (long)nreffb + 1;
+
+    env.mxcost = (long)bogosqrt((uint64_t)ndiags);
+    if (env.mxcost < SG_XDL_MAX_COST_MIN)
+        env.mxcost = SG_XDL_MAX_COST_MIN;
+    env.snake_cnt = SG_XDL_SNAKE_CNT;
+    env.heur_min = SG_XDL_HEUR_MIN_COST;
+
+    mc.acls = acls;
+    mc.bcls = bcls;
+    mc.aref = aref;
+    mc.bref = bref;
+    mc.achanged = achanged;
+    mc.bchanged = bchanged;
+
+    myers_recs_cmp(&mc, 0, (long)nreffa, 0, (long)nreffb, kvdf, kvdb, 0, &env);
+    rc = 0;
+
+out:
+    free(kvd);
+    free(aref);
+    free(bref);
+    free(acls);
+    free(bcls);
+    classifier_free(&cf);
+    return rc;
 }
 
 /* ---- indentation heuristic (git's diff.indentHeuristic, reconstructed) --
@@ -359,7 +957,7 @@ static split_score score_position(const sg_diff_line *rec, size_t n, size_t pos,
 
 /* ---- per-file group sliding (mirrors git's struct xdlgroup / group_*) --
 
-   Unlike the paired sg_diff_group the backtrack produces, sliding operates
+   Unlike the paired sg_diff_group the alignment step produces, sliding operates
    on ONE file's own "changed" bitmap at a time: changed[i] is true iff
    line i of THIS file was touched by some edit (deleted, for the a-side;
    inserted, for the b-side -- a "replace" simply means both sides have a
@@ -565,56 +1163,34 @@ static int build_groups_from_changed(const unsigned char *achanged, size_t na, c
 sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
                                     int indent_heuristic)
 {
-    size_t **dp;
-    group_builder gb, final_gb;
+    group_builder final_gb;
     sg_diff_script *script;
     unsigned char *achanged_buf, *bchanged_buf, *achanged, *bchanged;
-    size_t k;
-
-    dp = sg_diff_lcs_table_exact(a, na, b, nb);
-    if (dp == NULL)
-        return NULL;
-
-    gb.groups = NULL;
-    gb.count = 0;
-    gb.cap = 0;
-    if (backtrack_into_groups(a, na, b, nb, dp, &gb) != 0) {
-        sg_diff_lcs_free_table(dp, na);
-        free(gb.groups);
-        return NULL;
-    }
-    sg_diff_lcs_free_table(dp, na);
 
     /* Two independent per-file "changed" bitmaps, offset by 1 so index -1
        and index n both read as 0 (see compact_one_side/group_*'s own
-       comments for why that sentinel matters). Seeded from the backtrack's
-       paired groups -- a "replace" group simply marks both bitmaps over
-       its own range, with no other special-casing needed from here on. */
+       comments for why that sentinel matters). Filled directly by
+       myers_diff -- see that function's own comment for the coordinate
+       mapping (compacted Myers space back to these original indices). */
     achanged_buf = calloc(na + 2, 1);
     bchanged_buf = calloc(nb + 2, 1);
     if (achanged_buf == NULL || bchanged_buf == NULL) {
         free(achanged_buf);
         free(bchanged_buf);
-        free(gb.groups);
         return NULL;
     }
     achanged = achanged_buf + 1;
     bchanged = bchanged_buf + 1;
 
-    for (k = 0; k < gb.count; k++) {
-        sg_diff_group *grp = &gb.groups[k];
-        size_t t;
-
-        for (t = 0; t < grp->a_len; t++)
-            achanged[grp->a_off + t] = 1;
-        for (t = 0; t < grp->b_len; t++)
-            bchanged[grp->b_off + t] = 1;
+    if (myers_diff(a, na, b, nb, achanged, bchanged) != 0) {
+        free(achanged_buf);
+        free(bchanged_buf);
+        return NULL;
     }
-    free(gb.groups);
 
     /* Mirrors git's xdl_build_script call order: xdf1 (a's deletions) is
-       compacted first, consulting b's bitmap as it was right after the
-       backtrack; THEN xdf2 (b's insertions) is compacted consulting a's
+       compacted first, consulting b's bitmap as myers_diff just left it;
+       THEN xdf2 (b's insertions) is compacted consulting a's
        bitmap as compact_one_side above just left it. Swapping this order
        changes output on any hunk where both sides have room to slide --
        matching git means matching the order, not just the algorithm. */

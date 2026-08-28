@@ -6,10 +6,13 @@
 /* A line viewed into an existing buffer -- ptr/len are borrowed, never
    owned. len excludes the trailing '\n'; has_nl records whether one
    actually followed in the source (false only for a final line that isn't
-   newline-terminated). Shared by `sg diff`'s unified-diff printer and the
-   three-way merge's line alignment, so the O(n*m) LCS table is built once
-   and consumed differently by each caller instead of being reimplemented
-   twice. */
+   newline-terminated). Historically shared by `sg diff`'s unified-diff
+   printer and the three-way merge's line alignment; since Phase 35,
+   sg_diff_build_script no longer uses this LCS table at all (it runs git's
+   Myers algorithm instead -- see that function's own comment), so the ONLY
+   remaining caller of sg_diff_lcs_table/_exact below is
+   src/workdir/merge.c's three-way merge, which rolls its own backtrack
+   over the table directly. */
 typedef struct {
     const char *ptr;
     size_t len;
@@ -41,9 +44,13 @@ size_t **sg_diff_lcs_table(const sg_diff_line *a, size_t na, const sg_diff_line 
 void sg_diff_lcs_free_table(size_t **dp, size_t na);
 
 /* Same table, but classifying lines with sg_diff_lines_equal_exact instead
-   of sg_diff_lines_equal -- used by sg_diff_build_script so the has_nl
-   distinction actually drives the alignment, not just the final printed
-   marker. */
+   of sg_diff_lines_equal. Before Phase 35 this fed sg_diff_build_script, so
+   the has_nl distinction would actually drive the patch-body alignment, not
+   just the final printed marker -- that caller is gone now (Myers
+   classifies lines itself, has_nl-aware, without building this table at
+   all). Nothing in-tree calls this one any more; kept as public API in
+   case a future has_nl-aware caller of sg_diff_lcs_table needs it (today
+   src/workdir/merge.c uses the plain, non-exact table instead). */
 size_t **sg_diff_lcs_table_exact(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb);
 
 /* ---- minimal edit script (patch-body intermediate representation) ---- */
@@ -53,7 +60,7 @@ size_t **sg_diff_lcs_table_exact(const sg_diff_line *a, size_t na, const sg_diff
    b_len (but not both) may be 0 for a pure insertion/deletion; both
    non-zero is a "replace", meaning the two files each independently have a
    changed run at this same gap index -- NOT a distinguished case the
-   backtrack pins in place. Internally (src/util/diff_lcs.c) each side is
+   alignment step pins in place. Internally (src/util/diff_lcs.c) each side is
    tracked as its own per-file "changed" bitmap and slid independently
    (mirroring git's xdiff/xdiffi.c: two xdfile_t structures, each compacted
    on its own, synchronized only by an end_matching_other tie-break so an
