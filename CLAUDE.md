@@ -251,9 +251,76 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   need it (both sides quote them).
   WARNING: **quoting is explicitly forbidden for**: commit/tag messages and
   author strings (would break the byte-fidelity of `cat-file -p`), ref/branch/
-  tag names (real git does not quote them either, **there is no oracle**), and
+  tag names (real git does not quote them either, **there is no oracle**),
   stdout informational messages like `Cloning into` (real git does not quote
-  those either, measured).
+  those either, measured), and **since Phase 34, `* Unmerged path <p>`**
+  (measured with `od -c`: real git lets a raw ESC byte in the filename go
+  straight to stdout, `core.quotepath` has no effect on this line either).
+- **`sg diff` renders a combined diff for an unresolved conflict since Phase
+  34** (`-c` / `--cc`, `src/cli/diff_out.c`'s `render_combined_patch` and
+  friends -- a from-scratch port of git's `combine-diff.c`, fixed at exactly
+  2 parents: ours = index stage 2, theirs = index stage 3, result = the
+  working-tree file). Only `sg_diff_index_workdir` (plain `sg diff`, no rev,
+  no `--cached`) can produce a "combinable" row -- `sg_diff_entry` carries
+  three extra sides (`ours`/`theirs`/`result`) for exactly this, ABSENT
+  unless `unmerged` is set; a row is combinable iff both `ours` and `theirs`
+  are non-ABSENT. `sg_diff_tree_index` (`--cached`) never fills them, which
+  is why `--cached` always prints `* Unmerged path <p>` regardless of
+  `-c`/`--cc` -- there is no special-case branch for that, it falls out of
+  the data layer.
+  WARNING: **PATCH's default IS dense combined, even with no flag at all**
+  (measured: `git diff` on a conflict prints `diff --cc` unprompted) --
+  `--cc` only makes that explicit, and only `-c` turns density off. The
+  other five formats (`--stat`/`--numstat`/`--shortstat`/`--name-only`/
+  `--name-status`) do the OPPOSITE: a combinable row renders exactly as it
+  did before Phase 34 **unless `-c`/`--cc` is explicit** -- an unflagged
+  `sg diff --name-status` on a conflict must keep printing `U`, not silently
+  start printing `MM`. `sg_diff_out_opts.combined` (0/1/2) carries both
+  "which flag" and "was one given at all" for exactly this asymmetry; see
+  its header comment before touching either half.
+  WARNING: **`-c`/`--cc` last one wins**, same convention as `-M`/`-C`
+  (Phase 33's lesson: untested together, one flag stays silently stuck) --
+  `-c --cc` prints `diff --cc`, `--cc -c` prints `diff --combined`.
+  WARNING: **`-c`/`--cc` combined with a `<rev>` argument is rejected
+  outright**, not approximated: real git switches to a completely different
+  parent pairing there (stage 1 vs the named tree blob), so answering it as
+  the stage-2/stage-3 pairing this renderer implements would be a silently
+  wrong answer -- same treatment as Phase 33's `-C -C`.
+  WARNING: **the funcname suffix's off-by-one is git's own bug, ported
+  faithfully, not fixed**: `comment_end` records the index of the last
+  non-blank byte scanned (cap 40 bytes), and the print loop stops BEFORE
+  that index, so a trailing `{` silently disappears while the space before
+  it survives. `combine-diff.c`'s own minimal heuristic (first byte
+  alnum/`_`/`$`) is a SEPARATE implementation from the 2-way patch body's
+  `find_function_name` -- do not merge the two.
+  WARNING: git's 40-byte funcname scan walks the raw buffer relying on a
+  NUL sentinel to stop (`if (!ch) break`); sg's buffers are plain
+  `malloc`'d and carry no such sentinel, so the scan is clamped to the
+  bytes actually left in the result buffer instead -- a memory-safety fix
+  (`make sanitize` catches the heap-overread otherwise), **not a claimed
+  output divergence**: git's own stop condition and sg's clamp land on the
+  same byte (binary detection already rules out an embedded NUL, and a
+  funcname candidate is by construction a line outside every hunk, which
+  can never be the file's actual last line), and 216 targeted comparisons
+  against real git (9 funcname lengths x 4 leading-context depths x
+  with/without a trailing no-newline delete x 3 flag combinations) found 0
+  mismatches. **Do not add this to Phase 34's deliberate-divergence list**
+  (rev-argument rejection, `* Unmerged path` unquoted -- see the diff
+  module notes below, both pinned on both sides by interop): this one has
+  no oracle-side pin, because there is nothing measured to diverge on.
+  WARNING: **when touching the combined-diff block of `diff_out.c`
+  (`render_combined_patch` and everything it calls), a green `make test`
+  does not count, same as the funcname/LCS notes above** -- run
+  `python3 tests/fuzz_combined.py 150` (real git is the oracle, nothing is
+  borrowed from sg) and report the actual mismatch count. Baseline (Phase
+  34, measured): 150 rounds, 104 produced a real conflict, 2 mismatched,
+  both attributed to the project's pre-existing LCS-vs-Myers 2-way
+  alignment residual (the funcname WARNING three above this one has the
+  same underlying diff engine), not to the combined layer -- see
+  `tests/fuzz_combined.py`'s own docstring and Phase 34 of
+  `docs/DESIGN.md` for the attribution method. A number higher than 2 is a
+  regression; a number that stays 2 for a DIFFERENT reason is not
+  automatically fine either, re-run the attribution.
 - **"Which paths changed" always goes through `sg_diff_*`**
   (`include/sg/diff.h`, Phase 25): four builders correspond to
   tree<->tree, tree<->index, index<->working-directory, tree<->working-

@@ -90,6 +90,22 @@ typedef struct {
        unmerged paths outright, which is why the flag exists rather than a
        `continue`. */
     int unmerged;
+    /* Only meaningful when unmerged != 0; otherwise all three are ABSENT.
+       old_side / new_side stay ABSENT for an unmerged row regardless (that
+       contract is unchanged) -- these three are what the combined-diff
+       renderer (Phase 34) needs and old_side/new_side cannot express:
+         ours   = index stage 2 (the "-1" side in git's parlance),
+         theirs = index stage 3,
+         result = the working-tree file (ABSENT when it has been deleted).
+       ours and theirs both non-ABSENT is exactly "combinable" -- the path
+       has content on both sides of the conflict and a combined diff can be
+       rendered instead of the bare "* Unmerged path" line. Only
+       sg_diff_index_workdir ever fills these; the other three builders leave
+       them ABSENT, which is what routes sg_diff_tree_index (--cached)
+       through the "* Unmerged path" rendering unconditionally. */
+    sg_diff_side ours;
+    sg_diff_side theirs;
+    sg_diff_side result;
 } sg_diff_entry;
 
 typedef struct {

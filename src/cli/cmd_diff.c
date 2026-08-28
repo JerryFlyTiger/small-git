@@ -19,7 +19,7 @@
 
 static const char USAGE[] =
     "usage: sg diff [--cached|--staged] [--stat[=<w>[,<n>]]|--numstat|--shortstat|--name-only|"
-    "--name-status] [-M[<n>]|-C[<n>]|--no-renames] [<rev> [<rev>]] [--] [<path>...]\n";
+    "--name-status] [-M[<n>]|-C[<n>]|--no-renames] [-c|--cc] [<rev> [<rev>]] [--] [<path>...]\n";
 
 /* Resolves rev to a tree id via sg_rev_parse_commit + sg_commit_tree_of --
    the one path every rev argument in this command goes through, per
@@ -252,6 +252,19 @@ int sg_cmd_diff(int argc, char **argv)
                 return 1;
             }
             detect_copies = 1;
+        } else if (strcmp(a, "--cc") == 0) {
+            /* Dense combined diff -- also what a bare `sg diff` uses for an
+               unmerged path even without this flag (Phase 34 oracle 2: the
+               PATCH format's default IS dense combined). Spelled out as its
+               own opts value rather than folding into a bool so the CLI can
+               tell "the user asked for this" apart from "PATCH's implicit
+               default", which the other five formats need (oracle: they stay
+               unchanged unless -c/--cc is explicit). Last one of -c/--cc
+               wins, same convention as -M/-C (Phase 33's lesson: untested
+               together, one flag silently stuck). */
+            opts.combined = 1;
+        } else if (strcmp(a, "-c") == 0) {
+            opts.combined = 2; /* non-dense: "diff --combined" */
         } else if (strcmp(a, "-M") == 0 || strcmp(a, "--find-renames") == 0) {
             rename_score = SG_SIMILARITY_DEFAULT;
             /* -M turns copy detection back OFF. git keeps one mode field that
@@ -325,6 +338,16 @@ int sg_cmd_diff(int argc, char **argv)
        project's exit codes are only 0/1 (not git's 129), per CLAUDE.md. */
     if (cached && rev2 != NULL) {
         fputs(USAGE, stderr);
+        goto done;
+    }
+
+    /* Phase 34, decision 0.1: real git switches to a completely different
+       parent pairing (stage 1 vs the named tree blob) once a <rev> is
+       given, instead of the stage-2/stage-3 pairing this renderer
+       implements -- approximating it would silently answer a different
+       question. Rejected outright, same treatment as -C -C above. */
+    if (opts.combined != 0 && rev1 != NULL) {
+        fprintf(stderr, "sg: -c/--cc cannot be combined with a revision argument\n");
         goto done;
     }
 

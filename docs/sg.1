@@ -356,7 +356,8 @@ being dropped silently.
 .B sg diff
 .RB [ --cached | --staged ]
 .RB [ --stat [= <width> [, <name-width> ]]| --numstat | --shortstat | --name-only | --name-status ]
-.RB [ -M [ <n> ]| --no-renames ]
+.RB [ -M [ <n> ]| -C [ <n> ]| --no-renames ]
+.RB [ -c | --cc ]
 .RI [ rev " [" rev ]]
 .RB [ -- ]
 .RI [ path ...]
@@ -395,10 +396,12 @@ an ordinary
 against a
 .I rev
 (the index only decides membership there; the content still comes from the
-working directory), and both a
-.B U
-row and a second row comparing stage 2 against the file on disk for the
-plain index-vs-working-directory case.
+working directory), and, for the plain index-vs-working-directory case, a
+combined diff (see below) when both sides of the conflict (index stage 2
+and stage 3) are present, or
+.B "* Unmerged path"
+plus an ordinary row comparing stage 2 against the file on disk when only
+one of them is.
 .PP
 The default output is a patch.
 .BR --numstat ", " --shortstat ", " --name-only " and " --name-status
@@ -477,10 +480,41 @@ the function-name suffix and
 .BR "\e No newline at end of file" .
 Around two to three percent of hunks differ in position: sg aligns lines
 with an LCS backtrack where git defaults to Myers, and the two produce
-equally minimal but differently paired edit scripts. An unresolved conflict
-is skipped in patch output rather than being rendered as git's combined
+equally minimal but differently paired edit scripts.
+.PP
+A combinable unresolved conflict (both index stage 2 and stage 3 present,
+plain index-vs-working-directory comparison only) is rendered as git's
+combined diff, matching git byte for byte:
 .B "diff --cc"
-format.
+by default (dense, git's own PATCH default) or with
+.BR --cc ,
+.B "diff --combined"
+with
+.B -c
+(every difference from either side, unpruned). The last of
+.B -c
+and
+.B --cc
+on the command line wins. Combined with a
+.I rev
+argument, both are rejected \(em real git switches to a different parent
+pairing there (stage 1 vs the named tree blob) that sg does not implement,
+so refusing is preferred to a silently different answer.
+.B -c
+and
+.B --cc
+also change the machine-readable formats for a combinable row: it collapses
+to a single
+.B MM
+row in
+.BR --name-status ,
+the path once in
+.BR --name-only ,
+and disappears entirely from
+.B --stat
+/
+.BR --numstat / --shortstat .
+Without either flag, those five formats are unaffected by this change.
 .PP
 A path whose content is byte-identical to one that disappeared in the same
 diff is reported as a rename, as git does by default:
