@@ -544,6 +544,70 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   bug it exists to eliminate. `safety/stash.c` and `workdir/tree_build.c`
   always pass "do not fold" -- they need **real filenames**, folding would
   make `sg stash -u` store a directory path.
+- **`sg status`/`sg stash push` gained pathspec support in Phase 37.**
+  `sg_status_list_untracked` also gained a `const sg_pathspec *ps` parameter,
+  and this is the **one deliberate, named exception** to the "filter after
+  the builder, never inside it" rule the diff/status pipeline otherwise
+  follows everywhere else (see `sg_diff_list_filter`'s and
+  `sg_status_diff_staged`'s own entries above). Reason: how deep a
+  wholly-untracked directory folds is itself a function of the pathspec, not
+  a fixed shape you can filter after the fact -- measured against git
+  2.55.0: `-- wholly/u1.txt` lists that one file instead of folding to
+  `wholly/`, while `-- 'wholly/*'` still folds to `wholly/` despite matching
+  individual files below it. A folded entry `"wholly/"` cannot be matched
+  against a spec naming a file below it after the walk is already done; the
+  file would silently vanish instead of being unfolded. `NULL` matches
+  everything and reproduces the pre-Phase-37 walk exactly; `safety/stash.c`
+  and `workdir/tree_build.c` still pass `NULL` for their own unfiltered
+  calls (`sg_tree_build_from_untracked`'s own `-u`/`-a` listing, and
+  `sg_tree_build_from_workdir`'s snapshot use), only `sg_stash_push`'s
+  partial-pathspec path passes a real one.
+  **`sg_status_diff_staged` filters between `sg_diff_tree_index` and
+  `sg_diff_detect_renames`**, same ordering rule as `sg_diff_list_filter`
+  and for the identical Phase 29 reason (filtering after rename detection
+  can turn a real rename into a plain `A` because only half the pair
+  survives). The two `cmd_status.c` printers that scan `idx` directly
+  (`print_unmerged`, `print_porcelain_tracked`) bypass every `sg_status_list`
+  and so each needed its own `sg_pathspec_matches` call -- this is the
+  single easiest site to miss when threading a pathspec through `sg
+  status`, there is no list to filter, only a raw index scan.
+  **`sg status` has no rev/path disambiguation at all** (unlike `sg diff`):
+  measured, `git status master` (a real branch name) prints nothing and
+  exits 0 -- every positional argument is a pathspec, full stop.
+  **`sg stash push`'s partial pathspec push needed a THIRD, orthogonal
+  dimension**, not a second `sg_workdir_missing` value: `sg_workdir_missing`
+  already decides "how to record a path whose file is gone"
+  (`KEEP_INDEX_BLOB` vs `RECORD_DELETION`), but a partial push also needs
+  "does this path count this round at all" -- a property of the pathspec,
+  independent of that path's own on-disk state. `sg_tree_build_from_workdir`
+  therefore gained a separate `const sg_pathspec *ps` parameter: for a path
+  `ps` does not match, the working tree is never even looked at (no lstat,
+  no read, no hash) -- the index's own blob and mode are copied straight
+  through, regardless of which `missing` policy the call was given and
+  regardless of whether the file on disk was deleted, unreadable, or simply
+  unchanged. This is also why an unmatched path's working-tree **deletion**
+  must never leak into the stash's own tree: the working tree for that path
+  is never consulted at all, so there is nothing for a deletion to be
+  recorded from.
+  **`sg_apply_tree_to_workdir` deliberately gained NO pathspec parameter**
+  -- it is the shared whole-tree entry point for switch/reset --hard/merge/
+  undo/stash, and giving it a filter would put every one of those five call
+  sites on the hook for one feature's risk. `sg_stash_push`'s partial
+  restore step instead uses a private, narrower per-path reimplementation
+  (`restore_matched_paths` in `safety/stash.c`) confined to `sg stash
+  push`'s own two call sites (the HEAD reset, and the `--keep-index`
+  re-layering on top of it).
+  **"Did the pathspec match anything real at all" is a brand-new question
+  this codebase never had to answer before Phase 37** -- not even `sg diff`/
+  `sg status` ask it (both are silently exit-0 on a pathspec matching
+  nothing). `sg stash push -- <pathspec>` answers it and refuses (a new
+  return code, 2) when nothing matches, even when the working tree has
+  OTHER, unrelated dirty paths the pathspec simply does not name; nothing
+  is written when this fires, checked and returned before any tree is even
+  built. **Do not "unify" this with `sg status`/`sg diff`'s silent-exit-0
+  rule** -- `tests/interop.sh` has a head-on colliding pair
+  (`sg status -- nosuch` exit 0 no output vs. `sg stash push -- nosuch` exit
+  1) guarding exactly this divergence.
 - **There is exactly one lookup table for the seven unmerged stage
   combinations** (`unmerged_label` in `cmd_status.c`), shared by the long
   format and porcelain. The long format's label column width is **17**, the
@@ -571,8 +635,14 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   real git lists `.git.` as an untracked directory, and using the predicate
   to skip it would make `sg status` **under-report** (measured in Phase 22).
 - **After deleting a tracked file, `sg_prune_empty_parents` must be called**
-  (`include/sg/workdir.h`, Phase 21). There are exactly two call sites: right
-  after a successful `remove()` in `workdir/apply.c` and `workdir/merge.c`.
+  (`include/sg/workdir.h`, Phase 21). There are **three** call sites: right
+  after a successful `remove()` in `workdir/apply.c` and `workdir/merge.c`,
+  and (Phase 37) `safety/stash.c`'s `restore_matched_paths`, which does the
+  same "delete a matched, target-absent path" step for `sg stash push`'s
+  partial-pathspec restore -- the same reasoning applies there as at the
+  other two, it is just a third call site rather than a reason to route
+  through `sg_apply_tree_to_workdir` (which this codebase deliberately does
+  not give a pathspec parameter, see Phase 37 in `docs/DESIGN.md`).
   WARNING: it is **deliberately not ignore-aware**, which is **the opposite
   rule** from `prune_empty_untracked_dirs` in `safety/stash.c`: the former
   cleans up a directory that is "empty but ignored" (measured against real

@@ -535,7 +535,7 @@ static void test_tree_build_from_workdir_refuses_escaping_index_entry(void)
 
     bad_path[0] = '\0';
     rc = sg_tree_build_from_workdir(git_dir, repo_path, &idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB,
-                                    tree_id, bad_path);
+                                    NULL, tree_id, bad_path);
     CHECK(rc != 0, "expected sg_tree_build_from_workdir to refuse an escaping index path, got %d",
          rc);
     /* Phase 36 follow-up: bad_path must name the actual offending path, not

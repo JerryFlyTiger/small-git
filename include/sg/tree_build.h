@@ -5,6 +5,7 @@
 
 #include "sg/hash.h"
 #include "sg/index.h"
+#include "sg/pathspec.h"
 
 typedef struct {
     char *path; /* malloc'd, owned; repo-root-relative, '/'-separated */
@@ -89,6 +90,28 @@ typedef enum {
    into a permanent loose object; every other consumer either only reads
    inside the repository already, or never persists what it read.
 
+   `ps` (Phase 37) adds a third, ORTHOGONAL dimension on top of `missing`,
+   used by sg_stash_push's partial pathspec push: for an index path `ps`
+   does NOT match, the working tree is never even consulted (no lstat, no
+   read, no hash) -- the index's own blob and mode are copied straight into
+   the result, exactly as SG_WORKDIR_MISSING_KEEP_INDEX_BLOB would handle a
+   missing file, REGARDLESS of which `missing` policy this call was given
+   and regardless of whether the file on disk was deleted, unreadable, or
+   simply unchanged. This is deliberately a separate parameter, not folded
+   into sg_workdir_missing: "does this path count this round" (a property of
+   the CALL, i.e. the pathspec) and "how to record a path whose file is
+   gone" (a property of that specific path's own state) are independent --
+   sg_stash_push's partial push needs BOTH RECORD_DELETION (for a matched,
+   deleted path) and "ignore the working tree entirely" (for every
+   unmatched path) within the same call, which a single enlarged enum could
+   not express. NULL (or an empty pathspec) matches every path and
+   reproduces this function's pre-Phase-37 behaviour exactly; every existing
+   caller (safety/snapshot.c, and sg_stash_push's own unfiltered index-tree
+   build) passes NULL. The Phase 36 path-safety guard below still runs for
+   EVERY index path unconditionally, matched or not -- ps only ever narrows
+   which paths touch the working tree, it must never narrow which paths get
+   validated.
+
    Returns 0, -1 on failure. bad_path may be NULL; when non-NULL and the
    failure is specifically the Phase 36 path-safety guard above (never for
    any other -1 cause -- OOM, an unreadable file, a write failure), the
@@ -96,7 +119,7 @@ typedef enum {
    so the caller can print an actionable message instead of a guess, same
    convention as sg_tree_flatten's bad_path and sg_status_diff_staged's. */
 int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
-                               sg_workdir_missing missing,
+                               sg_workdir_missing missing, const sg_pathspec *ps,
                                unsigned char tree_id_out[SG_SHA1_RAW_LEN], char *bad_path);
 
 /* Builds a tree out of the working tree's untracked files (full relative
@@ -104,9 +127,15 @@ int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const
    counts as untracked and what include_ignored does. Every file's content is
    hashed and written as a blob. file_count_out, if non-NULL, reports how
    many files were included. No untracked files produces an empty tree and
-   reports 0, not an error. Returns 0 on success, -1 on failure. */
+   reports 0, not an error.
+
+   `ps` (Phase 37) is forwarded straight to sg_status_list_untracked, so this
+   builds the untracked parent of a partial `sg stash push -- <pathspec>`
+   (PHASE37_SPEC.md B2's untracked_tree, containing ONLY the matched
+   untracked files). NULL matches every path, same convention as everywhere
+   else. Returns 0 on success, -1 on failure. */
 int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, const sg_index *idx,
-                                 int include_ignored,
+                                 const sg_pathspec *ps, int include_ignored,
                                  unsigned char tree_id_out[SG_SHA1_RAW_LEN],
                                  size_t *file_count_out);
 

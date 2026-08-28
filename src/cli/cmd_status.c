@@ -5,6 +5,7 @@
 #include "sg/merge.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/pathspec.h"
 #include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/refs.h"
@@ -19,17 +20,44 @@
 
 static const char USAGE[] =
     "usage: sg status [-s|--short|--porcelain] [-b|--branch] [--ignored] "
-    "[-u<mode>|--untracked-files=<mode>]\n";
+    "[-u<mode>|--untracked-files=<mode>] [--] [<pathspec>...]\n";
+
+/* Unlike `sg diff`, `sg status` has NO revision/path disambiguation at all:
+   measured against git 2.55.0, `git status master` (a real branch name)
+   prints nothing and exits 0 -- every positional argument is a pathspec,
+   full stop. Do not port cmd_diff.c's split_revs_and_paths here, that logic
+   is specific to diff having revision arguments to disambiguate against. */
+
+static void report_pathspec_error(sg_pathspec_error err, const char *arg, const char *repo_root)
+{
+    switch (err) {
+    case SG_PATHSPEC_ERR_EMPTY:
+        fprintf(stderr, "sg: an empty string is not a valid path; use . to match all paths\n");
+        break;
+    case SG_PATHSPEC_ERR_MAGIC:
+        fprintf(stderr, "sg: unsupported pathspec magic: %s\n", sg_quote_path_delimited(arg));
+        break;
+    /* No `default:` on purpose, same reasoning as cmd_diff.c's copy of this
+       function (which this one is deliberately duplicated from, per
+       CLAUDE.md's Phase 25 precedent for report_bad_tree_path -- converge
+       once interop covers both). */
+    case SG_PATHSPEC_ERR_NONE:
+    case SG_PATHSPEC_ERR_OUTSIDE:
+        fprintf(stderr, "sg: %s is outside the repository %s\n",
+               sg_quote_path_delimited(arg), sg_quote_path_delimited(repo_root));
+        break;
+    }
+}
 
 /* -u<mode>/--untracked-files=<mode>. Measured against git 2.55.0: bare "-u"
    (no attached mode) behaves like "-uall", NOT like the flagless default --
    see parse_untracked_mode's caller for why that has to be handled before
    ever looking at an attached suffix. A *separate* argv token "no" after a
-   bare "-u" is NOT the same as "-uno" (git treats it as a pathspec instead);
-   sg has no pathspec support, so that shape simply falls through to the
-   usage error below, which is the correct way to avoid silently reinterpreting
-   it as a mode string. STATUS_U_NORMAL is 0 so status_opts's memset-to-zero
-   below already selects it as the default. */
+   bare "-u" is NOT the same as "-uno" (git treats it as a pathspec instead):
+   since Phase 37 that is exactly what happens here too -- a bare "-u"
+   followed by a positional token falls through to the pathspec collection
+   below rather than a usage error, matching git. STATUS_U_NORMAL is 0 so
+   status_opts's memset-to-zero below already selects it as the default. */
 typedef enum {
     STATUS_U_NORMAL, /* fold a wholly-untracked dir into "dir/" -- the default */
     STATUS_U_ALL,     /* never fold: one line per untracked file */
@@ -183,8 +211,15 @@ static void print_section(const char *title, const char **hints, size_t hint_cou
 /* Prints every distinct path carrying a stage 1/2/3 entry (idx is sorted by
    (path, stage), so duplicates for a path are contiguous), each with the
    long-format label unmerged_label derives from which stages are present.
-   Returns the number of distinct unmerged paths found. */
-static size_t print_unmerged(const sg_index *idx, int rebase_in_progress)
+   Returns the number of distinct unmerged paths found.
+
+   `ps` (Phase 37) is applied here directly, via sg_pathspec_matches, rather
+   than through any of the sg_status_list builders above -- this function
+   scans idx on its own, bypassing every one of them (see include/sg/status.h
+   and cmd_status.c's other call sites), so it is the one place that has to
+   filter for itself, or an unmerged path would leak through unfiltered
+   while every other section respects the pathspec. */
+static size_t print_unmerged(const sg_index *idx, const sg_pathspec *ps, int rebase_in_progress)
 {
     size_t i;
     size_t count = 0;
@@ -193,6 +228,8 @@ static size_t print_unmerged(const sg_index *idx, int rebase_in_progress)
         if (idx->entries[i].stage == 0)
             continue;
         if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
+            continue;
+        if (!sg_pathspec_matches(ps, idx->entries[i].path))
             continue;
         count++;
     }
@@ -212,6 +249,8 @@ static size_t print_unmerged(const sg_index *idx, int rebase_in_progress)
         if (idx->entries[i].stage == 0)
             continue;
         if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
+            continue;
+        if (!sg_pathspec_matches(ps, idx->entries[i].path))
             continue;
         unmerged_label(sg_index_find_stage(idx, idx->entries[i].path, 1) >= 0,
                       sg_index_find_stage(idx, idx->entries[i].path, 2) >= 0,
@@ -282,10 +321,15 @@ static int prow_append(prow **rows, size_t *count, size_t *cap, const char *path
    Untracked and ignored paths are printed separately by the caller, in
    their own path-sorted batches, never interleaved with this section (see
    status.h's fold documentation and the task's measured ordering).
+   `staged`/`unstaged` are already pathspec-filtered by the time they reach
+   here (sg_status_diff_staged/sg_status_list_filter at the call site), but
+   idx is scanned directly for the unmerged rows below -- same reasoning as
+   print_unmerged's own `ps` parameter.
+
    Returns 0 on success, -1 on allocation failure (nothing has been printed
    in that case beyond whatever fprintf itself managed). */
-static int print_porcelain_tracked(const sg_index *idx, const sg_status_list *staged,
-                                   const sg_status_list *unstaged)
+static int print_porcelain_tracked(const sg_index *idx, const sg_pathspec *ps,
+                                   const sg_status_list *staged, const sg_status_list *unstaged)
 {
     prow *rows = NULL;
     size_t count = 0;
@@ -300,6 +344,8 @@ static int print_porcelain_tracked(const sg_index *idx, const sg_status_list *st
         if (idx->entries[i].stage == 0)
             continue;
         if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
+            continue;
+        if (!sg_pathspec_matches(ps, idx->entries[i].path))
             continue;
         unmerged_label(sg_index_find_stage(idx, idx->entries[i].path, 1) >= 0,
                       sg_index_find_stage(idx, idx->entries[i].path, 2) >= 0,
@@ -487,6 +533,10 @@ int sg_cmd_status(int argc, char **argv)
     size_t unmerged_count;
     size_t i;
     int arg_i;
+    char **pos;
+    int n_pos = 0;
+    int dashdash = -1; /* index into pos[] where "--" split the line */
+    sg_pathspec pathspec;
     static const char *staged_hints[] = {
         "use \"sg restore --staged <file>...\" to unstage",
     };
@@ -496,9 +546,26 @@ int sg_cmd_status(int argc, char **argv)
     };
 
     memset(&opts, 0, sizeof(opts));
+    memset(&pathspec, 0, sizeof(pathspec));
     opts.rename_score = SG_SIMILARITY_DEFAULT; /* git detects renames here by default */
+
+    pos = malloc((size_t)(argc > 0 ? argc : 1) * sizeof(*pos));
+    if (pos == NULL) {
+        fprintf(stderr, "sg: out of memory\n");
+        return 1;
+    }
+
     for (arg_i = 1; arg_i < argc; arg_i++) {
-        if (strcmp(argv[arg_i], "-s") == 0 || strcmp(argv[arg_i], "--short") == 0 ||
+        /* Past "--" nothing is an option any more, same convention as
+           cmd_diff.c: `sg status -- --ignored` asks about a file literally
+           named "--ignored". */
+        if (dashdash >= 0) {
+            pos[n_pos++] = argv[arg_i];
+            continue;
+        }
+        if (strcmp(argv[arg_i], "--") == 0) {
+            dashdash = n_pos;
+        } else if (strcmp(argv[arg_i], "-s") == 0 || strcmp(argv[arg_i], "--short") == 0 ||
            strcmp(argv[arg_i], "--porcelain") == 0) {
             opts.porcelain = 1;
         } else if (strcmp(argv[arg_i], "-b") == 0 || strcmp(argv[arg_i], "--branch") == 0) {
@@ -528,31 +595,60 @@ int sg_cmd_status(int argc, char **argv)
         } else if (strncmp(argv[arg_i], "-u", 2) == 0 && argv[arg_i][2] != '\0') {
             if (parse_untracked_mode(argv[arg_i] + 2, &opts.u_mode) != 0) {
                 fputs(USAGE, stderr);
+                free(pos);
                 return 1;
             }
         } else if (strncmp(argv[arg_i], "--untracked-files=", strlen("--untracked-files=")) == 0) {
             if (parse_untracked_mode(argv[arg_i] + strlen("--untracked-files="), &opts.u_mode) !=
                0) {
                 fputs(USAGE, stderr);
+                free(pos);
                 return 1;
             }
-        } else {
+        } else if (argv[arg_i][0] == '-' && argv[arg_i][1] != '\0') {
             fputs(USAGE, stderr);
+            free(pos);
             return 1;
+        } else {
+            /* Every remaining bare argument is a pathspec -- `sg status` has
+               no revision/path disambiguation at all (see the comment above
+               report_pathspec_error), unlike `sg diff`. */
+            pos[n_pos++] = argv[arg_i];
         }
     }
 
     git_dir = sg_require_git_dir();
-    if (git_dir == NULL)
+    if (git_dir == NULL) {
+        free(pos);
         return 1;
+    }
     repo_root = sg_repo_root(git_dir);
     if (repo_root == NULL) {
         fprintf(stderr, "sg: failed to determine repository root\n");
+        free(pos);
         free(git_dir);
         return 1;
     }
+    /* Resolved against repo_root, exactly like cmd_diff.c -- the positional
+       arguments only became available above, but sg_pathspec_add needs
+       repo_root, so it cannot happen any earlier than this. */
+    for (arg_i = 0; arg_i < n_pos; arg_i++) {
+        sg_pathspec_error perr;
+
+        if (sg_pathspec_add(&pathspec, repo_root, pos[arg_i], &perr) != 0) {
+            report_pathspec_error(perr, pos[arg_i], repo_root);
+            sg_pathspec_free(&pathspec);
+            free(pos);
+            free(repo_root);
+            free(git_dir);
+            return 1;
+        }
+    }
+    free(pos);
+
     if (sg_index_read(git_dir, &idx) != 0) {
         fprintf(stderr, "sg: failed to read index (corrupt?)\n");
+        sg_pathspec_free(&pathspec);
         free(git_dir);
         free(repo_root);
         return 1;
@@ -647,7 +743,7 @@ int sg_cmd_status(int argc, char **argv)
 
         staged_bad_path[0] = '\0';
         staged_rc = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx,
-                                          opts.rename_score, &staged, staged_bad_path);
+                                          opts.rename_score, &pathspec, &staged, staged_bad_path);
         if (staged_rc == -2 && staged_bad_path[0] != '\0')
             /* Phase 36: previously this branch was folded into the generic
                "out of memory" message below, discarding the actual reason
@@ -666,17 +762,21 @@ int sg_cmd_status(int argc, char **argv)
         fprintf(stderr,
                "sg: warning: failed to compute unstaged changes (out of memory, or a path too "
                "long)\n");
+    /* No rename detection runs on the unstaged list, so filtering it after
+       the fact is safe -- see sg_status_list_filter's header comment. */
+    sg_status_list_filter(&unstaged, &pathspec);
 
     if (opts.u_mode != STATUS_U_NO) {
         sg_status_untracked_fold fold =
             opts.u_mode == STATUS_U_ALL ? SG_STATUS_UNTRACKED_LIST_FILES : SG_STATUS_UNTRACKED_FOLD_DIRS;
 
-        if (sg_status_list_untracked(git_dir, repo_root, &idx, 0, fold, &untracked,
+        if (sg_status_list_untracked(git_dir, repo_root, &idx, &pathspec, 0, fold, &untracked,
                                      &untracked_count) != 0) {
             fprintf(stderr, "sg: out of memory, cannot scan untracked files\n");
             sg_status_list_free(&staged);
             sg_status_list_free(&unstaged);
             sg_index_free(&idx);
+            sg_pathspec_free(&pathspec);
             free(repo_root);
             free(git_dir);
             return 1;
@@ -686,7 +786,7 @@ int sg_cmd_status(int argc, char **argv)
             char **untracked_and_ignored = NULL;
             size_t untracked_and_ignored_count = 0;
 
-            if (sg_status_list_untracked(git_dir, repo_root, &idx, 1, fold,
+            if (sg_status_list_untracked(git_dir, repo_root, &idx, &pathspec, 1, fold,
                                          &untracked_and_ignored, &untracked_and_ignored_count) !=
                    0 ||
                list_diff_sorted(untracked, untracked_count, untracked_and_ignored,
@@ -701,6 +801,7 @@ int sg_cmd_status(int argc, char **argv)
                     free(untracked[i]);
                 free(untracked);
                 sg_index_free(&idx);
+                sg_pathspec_free(&pathspec);
                 free(repo_root);
                 free(git_dir);
                 return 1;
@@ -718,13 +819,13 @@ int sg_cmd_status(int argc, char **argv)
        does. */
 
     if (opts.porcelain) {
-        if (print_porcelain_tracked(&idx, &staged, &unstaged) != 0)
+        if (print_porcelain_tracked(&idx, &pathspec, &staged, &unstaged) != 0)
             fprintf(stderr, "sg: warning: out of memory printing porcelain output\n");
         print_porcelain_paths("?? ", untracked, untracked_count);
         if (opts.ignored)
             print_porcelain_paths("!! ", ignored, ignored_count);
     } else {
-        unmerged_count = print_unmerged(&idx, sg_rebase_state_exists(git_dir));
+        unmerged_count = print_unmerged(&idx, &pathspec, sg_rebase_state_exists(git_dir));
 
         print_section("Changes to be committed:", staged_hints, 1, &staged);
         print_section("Changes not staged for commit:", unstaged_hints, 2, &unstaged);
@@ -766,9 +867,28 @@ int sg_cmd_status(int argc, char **argv)
                 else
                     printf("nothing to commit (use -u to show untracked files)\n");
             }
-        } else if (staged.count == 0 && unstaged.count == 0 && untracked_count == 0 &&
-                  unmerged_count == 0) {
-            printf("nothing to commit, working tree clean\n");
+        } else if (staged.count == 0) {
+            /* Measured against real git 2.55.0 (LC_ALL=C, three fixtures):
+               untracked-only prints a DIFFERENT closing line than the fully
+               clean case, and an unstaged/unmerged change wins over both
+               regardless of whether untracked files are also present --
+               same three-way shape the -uno branch above already uses, just
+               with "clean" as a real answer here (-uno can never learn
+               that). This is a pre-existing gap (predates Phase 37): sg
+               previously printed NO closing line at all whenever
+               untracked_count > 0 or (unstaged/unmerged) was true in this
+               branch, since the old condition required every count to be
+               zero. Phase 37 made it easier to hit (`sg status -- wholly`
+               with only untracked files left after filtering), but the gap
+               itself is not specific to pathspec. */
+            if (unstaged.count > 0 || unmerged_count > 0)
+                printf("no changes added to commit (use \"git add\" and/or \"git commit "
+                      "-a\")\n");
+            else if (untracked_count > 0)
+                printf("nothing added to commit but untracked files present (use \"git add\" "
+                      "to track)\n");
+            else
+                printf("nothing to commit, working tree clean\n");
         }
     }
 
@@ -781,6 +901,7 @@ int sg_cmd_status(int argc, char **argv)
     sg_status_list_free(&staged);
     sg_status_list_free(&unstaged);
     sg_index_free(&idx);
+    sg_pathspec_free(&pathspec);
     free(repo_root);
     free(git_dir);
     return 0;

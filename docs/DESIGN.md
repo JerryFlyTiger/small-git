@@ -4836,3 +4836,325 @@ above) -- there is nothing for a `bad_path` parameter there to carry.
     one is the reason there are three tests, not two: the first attempt at
     this phase's mutation pass found this exact branch was a genuine blind
     spot (exit code 0, no FAIL) until the dedicated third test was added.
+
+## Phase 37: pathspec on `sg status` and `sg stash push`
+
+Two commands gain `-- <pathspec>...`, but they needed genuinely different
+treatment, not a single shared "add a pathspec parameter" pass -- Part A
+(status) is a filtering problem, Part B (stash push) is a partial-write
+problem with no precedent anywhere else in the codebase.
+
+### Part A: `sg status -- <pathspec>...`
+
+**No rev/path disambiguation.** Measured against git 2.55.0:
+`git status master` (a real branch name) prints nothing and exits 0 -- every
+positional argument is a pathspec, full stop. `cmd_status.c` does not port
+`cmd_diff.c`'s `split_revs_and_paths`; that logic is specific to diff having
+revision arguments to disambiguate against, `status` has none.
+
+**Five filter points, not three.** staged/unstaged/untracked look like the
+obvious three, but two more exist and are easy to miss entirely:
+
+1. **staged** (`sg_status_diff_staged`): must filter **between**
+   `sg_diff_tree_index` and `sg_diff_detect_renames`, never after -- the
+   same Phase 29 rule `sg_diff_list_filter`'s own callers already follow
+   (filtering after rename detection can turn a real rename into a plain
+   `A` because only half the pair survives). The function's signature grew
+   a `const sg_pathspec *ps` parameter for this; `apply.c`'s two safety
+   gates (which enumerate the unfiltered list to tell the user what is
+   uncommitted) pass `NULL`.
+2. **unstaged** (`sg_status_diff_unstaged`): no rename detection runs on
+   this list, so post-hoc filtering is safe. A new `sg_status_list_filter`
+   (`workdir/status.c`) is applied by the caller after the fact, rather
+   than threading `ps` through the builder -- there is no ordering hazard
+   to protect against here, unlike the staged case.
+3. **untracked**: see the fold-table discussion below -- this one is the
+   real design problem of Part A.
+4. **ignored** (`--ignored`): built from two `sg_status_list_untracked`
+   calls (a set difference), both inherit pathspec-awareness for free once
+   the underlying function does.
+5. **unmerged**: `cmd_status.c`'s `print_unmerged` (long format) and
+   `print_porcelain_tracked` (porcelain) each scan `idx` **directly**,
+   bypassing every `sg_status_list` the other four points funnel through.
+   Each needed its own `sg_pathspec_matches` call. This is the single
+   easiest site to miss: there is no list to filter, only a raw index scan,
+   and it does not show up by grepping for "filter" the way the others do.
+   `print_unmerged` specifically has **two separate loops** (a counting
+   pass that decides whether the "Unmerged paths:" header even prints, and
+   a printing pass) -- a reverse mutation on this phase found that removing
+   either loop's filter alone leaves the *other* loop's filter fully
+   masking it in an all-matched or all-excluded fixture; catching each
+   loop's filter individually needed a spec that matches *some but not all*
+   of the fixture's unmerged paths (see Verification below).
+
+**The untracked fold table is the one deliberate exception to "filter after
+the builder"** (CLAUDE.md now documents this too). Measured against git
+2.55.0, a wholly-untracked `wholly/` directory containing `u1.txt` and
+`deep/u2.txt`:
+
+| pathspec | output |
+|---|---|
+| (none) | `?? wholly/` |
+| `-- wholly` | `?? wholly/` |
+| `-- wholly/` | `?? wholly/` |
+| `-- wholly/u1.txt` | `?? wholly/u1.txt` |
+| `-- wholly/deep` | `?? wholly/deep/` |
+| `-- wholly/deep/u2.txt` | `?? wholly/deep/u2.txt` |
+| `-- 'wholly/*'` | `?? wholly/` (wildcard still folds) |
+
+Git decides fold depth **while walking**, not by filtering an already-folded
+result: `sg_status_list_untracked` (`FOLD_DIRS` mode) only ever produces one
+line, `"wholly/"`, for the whole subtree, and
+`sg_pathspec_matches("wholly/u1.txt", "wholly/")` cannot succeed (the spec is
+longer than the path, none of the three matching rules apply) -- filtering
+post-hoc would make the file vanish entirely rather than un-fold it.
+
+The fix threads `const sg_pathspec *ps` through `sg_status_list_untracked`
+and its whole family of static helpers (`collect_untracked`,
+`dir_scan_flags`, `collect_ignored_within`, `collect_untracked_folded`), and
+adds one new decision, `spec_forces_recursion(ps, reldir)`: true only when a
+**literal** (wildcard-free) spec names something strictly deeper than
+`reldir` (a proper descendant, not merely a longer disjoint string). Only
+literal specs can force recursion -- a wildcard spec has no directory-prefix
+rule of its own (`sg_pathspec_matches`'s header comment already says this),
+so whether it matches anything below `reldir` is answered by the ordinary
+per-file `sg_pathspec_matches` check that already runs at every leaf,
+regardless of fold depth. This is exactly why `-- 'wholly/*'` still folds:
+its literal prefix (up to the first wildcard char) is `"wholly"`, which
+equals `reldir` at the point the fold decision is made, so nothing forces a
+deeper walk, and `dir_scan_flags` (also pathspec-filtered now) confirms at
+least one real file matches before emitting the folded line.
+
+When `spec_forces_recursion` is false, `dir_scan_flags` itself decides fold
+vs. omit: a `ps`-filtered `has_nonignored`/`has_any` pair (a file that does
+not match `ps` counts toward neither flag) is enough to reuse the exact
+pre-Phase-37 fold/omit logic unchanged -- "fold if something matches, omit
+if nothing does" falls out for free once the flags themselves are filtered.
+
+### Part B: `sg stash push -- <pathspec>...`
+
+**Not a mechanical filter -- a genuine partial write**, and the queue's
+original description was wrong on two points (corrected after measurement):
+`git stash show` does not accept a pathspec at all (`-- sub` is parsed as a
+stash ref and errors "sub is not a valid reference"), so `sg stash show`'s
+existing rejection was already correct and needed no change.
+
+**The three trees are asymmetric, not uniformly filtered** (measured, git
+2.55.0, fixture: `a.txt` staged+worktree changed but does NOT match `sub`;
+`b.txt` worktree-only, does not match; `sub/c.txt` staged+worktree, matches;
+`sub/d.txt` worktree-only, matches; `git stash push -u -- sub`):
+
+| tree | content |
+|---|---|
+| stash's own tree | `a.txt`->`STAGED-a` (**index** content), `b.txt`->base (index==HEAD), `sub/c.txt`->`WORKTREE-c`, `sub/d.txt`->`WORKTREE-d` |
+| `stash^2` (index parent) | complete, **unfiltered**: a=`STAGED-a`, b=base, c=`STAGED-c`, d=base |
+| `stash^3` (untracked parent) | only the matched untracked file(s) |
+
+Rule: `index_tree` is `sg_tree_build_from_index(idx)`, completely unchanged
+-- it was never filtered, there is nothing to touch. The stash's own tree
+starts from the **index** tree and, only on a matched path, is replaced
+with freshly-rehashed working-tree content (or omitted, recording a
+deletion, if that path is gone from disk). An unmatched path's on-disk
+state -- edited, deleted, whatever -- is never even consulted.
+
+**This needed a third dimension in `sg_tree_build_from_workdir`, not a
+bigger `sg_workdir_missing` enum.** `sg_workdir_missing` already answers
+"how to record a path whose file is gone" (`KEEP_INDEX_BLOB` vs.
+`RECORD_DELETION`); a partial push additionally needs "does this path count
+this round at all", a property of the pathspec, independent of that path's
+own on-disk state. Folding the two into one enlarged enum cannot express
+"RECORD_DELETION for a matched, deleted path, but ignore the working tree
+entirely for every unmatched path" within the same call. The fix is a
+**separate** `const sg_pathspec *ps` parameter: for a path `ps` does not
+match, the function copies the index's own blob/mode straight through
+(`lstat`/read never even run for that path), unconditionally, regardless of
+which `missing` policy the call was given. This is also the mechanism that
+makes an unmatched path's working-tree **deletion** invisible to the
+stash's own tree -- there is nothing to detect a deletion of, because the
+working tree for that path was never looked at.
+
+**`sg_apply_tree_to_workdir` gained no pathspec parameter, on purpose** --
+it is the one shared whole-tree entry point for switch/reset --hard/merge/
+undo/stash, and CLAUDE.md's standing rule is that a filter added there would
+put all five call sites on the hook for this one feature's risk. Instead
+`safety/stash.c` has a private `restore_matched_paths` (per-path
+reimplementation of the same "reset workdir+index to a target tree"
+operation, confined to `ps`-matched paths), used only by `sg_stash_push`'s
+own two restore calls: the HEAD reset every partial push does, and the
+`--keep-index` re-layering of the index tree on top of it. An unmatched
+path -- whether or not it appears in the target tree -- is left completely
+alone in both the working tree and the index.
+
+**"Did the pathspec match anything at all" is a brand-new question**: not
+even `sg diff`/`sg status` ask it (both are silently exit-0 on a pathspec
+matching nothing -- see Part A's own header comment on this divergence).
+`sg_stash_push` answers it and refuses -- a new return code, **2** --
+before any tree is built or any object written, even when the working tree
+has OTHER, unrelated dirty paths the pathspec does not name. The check is a
+plain existence scan (`idx_has_matching_path`, any stage) over the index,
+plus the already-`ps`-filtered untracked-file listing when `-u`/`-a` is
+set; it runs before the "nothing to save" (return 1) check and is otherwise
+unrelated to it -- a worktree that is clean everywhere the pathspec touches
+still returns 1, not 2, when the pathspec itself names a real (but
+unchanged) path.
+
+### Two open questions from review, both measured against real git and both "sg is already correct"
+
+- **A pathspec matching only untracked files, without `-u`/`-a`.** Measured:
+  `git stash push -- <spec-matching-only-an-untracked-file>` (no `-u`) also
+  refuses -- exit 1, no stash created -- exactly like sg's B1 gate. Nothing
+  to change; `idx_has_matching_path` correctly ignores untracked files
+  entirely when `untracked_flag` is 0, since only the index is a candidate
+  match source in that mode.
+- **A bare `-` as the pathspec argument.** Measured: git treats it as an
+  ordinary (non-matching, in a repo with no file literally named `-`)
+  pathspec on both commands -- `git status -- -` is silent and exits 0,
+  `git stash push -- -` refuses with "did not match any file(s)". sg
+  matches on both counts (`sg_pathspec_looks_like_spec`'s wildcard/magic
+  character set does not treat a bare `-` as special, so it is just a
+  literal one-character spec that happens not to exist).
+
+### A pre-existing gap this phase made easier to hit: the long format's closing summary line
+
+Independent of pathspec, `cmd_status.c`'s long-format closing-summary logic
+had a missing branch since it was first written (not introduced by Phase
+37): the non-`-uno` branch's condition required staged/unstaged/untracked/
+unmerged ALL to be zero before printing anything, so whenever exactly one of
+untracked or unstaged/unmerged was non-zero (with nothing staged), **no
+closing line printed at all** -- not the wrong line, no line whatsoever.
+Measured against real git 2.55.0 (`LC_ALL=C`, three isolated fixtures, since
+this machine's git is zh_TW-localized -- see CLAUDE.md's standing note on
+that):
+
+| staged | unstaged/unmerged | untracked | git's closing line |
+|---|---|---|---|
+| 0 | 0 | 0 | `nothing to commit, working tree clean` |
+| 0 | 0 | >0 | `nothing added to commit but untracked files present (use "git add" to track)` |
+| 0 | >0 | any | `no changes added to commit (use "git add" and/or "git commit -a")` |
+| >0 | any | any | (no closing line -- the sections above already say enough) |
+
+This is exactly the same three-way shape the `-uno` branch already
+implements (it already had the second and third lines' logic, just gated on
+a different first condition since `-uno` can never learn whether untracked
+files exist). The fix mirrors that shape into the default branch, reusing
+the identical message strings. Pathspec makes this trivial to reach by
+accident: `sg status -- wholly` on a fixture whose only match is an
+untracked directory lands exactly on the second row.
+
+**Fixed** (not just recorded) -- the change is confined to the single
+`else if (staged.count == 0) { ... }` block in `cmd_status.c`, mirroring
+already-established logic one branch up, so it stayed within a
+single-location, stop-loss-compatible fix. `tests/test_status_pathspec.c`
+gained `test_summary_untracked_only` and `test_summary_unstaged_only`
+(the second, sibling branch, not explicitly called out by the report but
+covered by the same fix and the same oracle measurement); both reverse-
+mutation-verified individually.
+
+### A structural interop blind spot: the long format has no byte-for-byte oracle coverage at all
+
+`tests/interop.sh`'s `cmp`-against-real-git technique (used everywhere else
+in this phase, and in Phases 25-36 before it) is fundamentally unusable for
+`sg status`'s **long format** hints and closing lines: every hint string is
+literally `sg <subcommand> ...` (`"use \"sg restore --staged <file>...\" to
+unstage"`, etc.), which can never byte-match `git`'s own `"use \"git
+restore...\""` wording. The porcelain/short format and the six machine
+formats of `sg diff` have no such problem (their bytes genuinely are
+tool-name-independent, or -- for the few that do print a message -- interop
+already treats them as sg-only assertions rather than `cmp`s). This is why
+1776/1776 passing on this phase's interop run was never going to catch the
+missing-branch bug above: **there was no check of that shape running at
+all**, not a check that ran and happened to stay green. A "normalize `git`'s
+tool name to `sg`'s before `cmp`-ing" scheme was considered and rejected:
+half the hint text differs in more than just the tool name (real git has a
+`commit -a` shorthand sg's own `commit` command does not implement at all,
+`git add -A`-style flags similarly have no sg equivalent, while `restore
+--staged` exists verbatim on both sides), so a normalizer would have to
+encode a second, hand-maintained copy of every wording difference -- at that
+point it is not testing anything a human reading both outputs side-by-side
+wasn't already doing, just adding a layer that can silently drift out of
+sync with the real divergences. The long format's closing lines and hints
+therefore remain provable only by a direct `sg`-only assertion (as
+`test_status_pathspec.c` and `test_status_untracked_mode.c` already do) or
+by manual side-by-side comparison -- there is no mechanical guard against a
+FUTURE missing branch of this same shape, and that is a standing, structural
+gap in this project's test coverage, not a one-off bug.
+
+### Verification
+
+- `make` + `make sanitize`: clean, no new warnings, `56/56` binaries under
+  ASan/UBSan.
+- `make test`: `56/56` binaries (two new test files:
+  `tests/test_status_pathspec.c`, `tests/test_stash_pathspec.c`).
+- `bash tests/interop.sh`: `1776/1776 passed, 0 skipped` (baseline 1755 + 21
+  new Phase 37 checks: Part A's fold-table `cmp`s plus the `master`-as-
+  pathspec collision, and Part B's three-tree `ls-tree -r` comparison plus
+  the exit-code/no-stash-created checks and the oracle confirmation). The
+  new group covers the Part A fold table (full-output `cmp` per row) and
+  Part B's three-tree `ls-tree -r` comparison plus the exit-code/
+  no-stash-created checks, and the head-on colliding pair (`sg status --
+  nosuch` exit 0 vs. `sg stash push -- nosuch` exit 1) guarding against
+  unifying the two "did the pathspec match anything" rules. One authoring
+  mistake surfaced here and nowhere else: the twin-fixture helper
+  (`p37_b2_fixture`) initially ran `sg commit -q -m base` for BOTH
+  implementations, but `sg commit` (unlike real git) has no `-q` flag at
+  all (`usage: sg commit -m <message>`) -- the sg-side fixture silently
+  failed to commit, and every downstream `sg stash push` in that fixture
+  failed with "cannot create stash (unborn HEAD...)". None of the unit
+  tests could have caught this, since they never shell out to the `sg`
+  binary's own CLI argument parser at all.
+- `python3 tests/fuzz_ignore.py`: 200 iterations, 0 mismatches (Part A
+  touches the untracked directory walk directly).
+- Directed mutation (`tests/mutate.sh`), one per filter/skip site, not
+  batched:
+  - Part A: staged-before-rename, unstaged, the untracked
+    `spec_forces_recursion` gate, `dir_scan_flags`'s per-file filter, the
+    folded-listing per-file filter, `-uall`'s own (separate) per-file
+    filter, and all three `idx`-scanning unmerged sites (porcelain, and
+    the long format's counting AND printing loops separately) were each
+    individually caught. Three were genuine first-pass blind spots, each
+    closed with a new, more targeted fixture rather than a broader one:
+    `-uall` + pathspec had zero test coverage at all; the long format's
+    counting-loop filter was masked by an all-excluded fixture where the
+    header never fires either way; the printing-loop filter was masked by
+    an all-matched fixture where the counting loop's own filter already
+    produced the right visible answer.
+  - Part B: the B1 "matched nothing" gate, the worktree-tree pathspec
+    parameter, the untracked-listing pathspec parameter (both the listing
+    used for the match check/sweep and the separate one threaded into
+    `sg_tree_build_from_untracked`), both `restore_matched_paths` call
+    sites (HEAD reset and the `--keep-index` reset), `restore_matched_paths`'s
+    own two internal filters (the deletion loop and the write loop), the
+    `sg_tree_build_from_workdir` skip-disk branch, and the `partial` flag
+    computation itself -- all individually caught. Two were first-pass
+    blind spots: the `--keep-index` restore call's pathspec-awareness was
+    invisible with a single-file fixture (the whole-tree fallback and the
+    per-path restore agree when there is nothing unmatched to disagree
+    about) until an unmatched dirty file was added to that fixture; the
+    deletion loop's own filter was invisible whenever every unmatched path
+    already existed in the target tree (the deletion branch that check
+    guards never even triggers) until a fixture added an unmatched,
+    newly-staged file absent from HEAD specifically to exercise it.
+  - Follow-up round (coordinator review): the two new closing-line branches
+    in `cmd_status.c` (untracked-only, unstaged-only) were each caught
+    individually by `test_summary_untracked_only`/`test_summary_unstaged_only`.
+    The automatic safety snapshot's "must not be pathspec-narrowed" property
+    (asserted in `test_b2_three_trees`, snapshot tree must hold a.txt's real
+    `WORKTREE-a` content, not the stash tree's `STAGED-a`) has **no**
+    mutation to hang a reverse-mutation round on -- `snapshot.c` passes
+    `NULL` structurally, there is no pathspec variable at that call site to
+    mutate into something else. The assertion exists purely so a FUTURE
+    change threading a pathspec into that `NULL` would turn it red; this is
+    the one Phase 37 property that is asserted but not mutation-verified,
+    recorded here rather than left implicit.
+  - Independent re-verification (coordinator, separate from the
+    author's own rounds above): Part B's three trees compared **identical**
+    byte-for-byte against real git across the full B2 fixture (stash's own
+    tree, `stash^2`, `stash^3`, and the post-push working-directory state
+    including that an unmatched path's staged status survives as `MM`);
+    B1's no-match case agreed on both exit code and refs/stash absence; all
+    five gates (`make test` 56/56, interop 1776/1776 0 skipped, `--leaks`
+    56/56, `--sanitize` 56/56) were independently green; and a separate
+    80-case `sg status` vs `git status` comparison found all 64
+    machine-readable cases in agreement (the remaining 16 are the
+    long-format hint/closing-line strings the structural gap above already
+    explains).

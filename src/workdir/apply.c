@@ -319,7 +319,7 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
        this loop prints one. See sg/status.h -- the parameter is mandatory
        precisely so this choice is made here rather than inherited. */
     staged_bad_path[0] = '\0';
-    staged_rc = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, &staged,
+    staged_rc = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, NULL, &staged,
                                       staged_bad_path);
     staged_ok = staged_rc == 0;
     unstaged_ok = sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) == 0;
@@ -467,7 +467,7 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
     /* Renames deliberately OFF, same reason as the gate above: the rejection
        message below enumerates these rows one path at a time. */
     staged_bad_path[0] = '\0';
-    staged_rc = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, &staged,
+    staged_rc = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, 0, NULL, &staged,
                                       staged_bad_path);
     staged_ok = staged_rc == 0;
     unstaged_ok = sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) == 0;
