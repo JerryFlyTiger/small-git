@@ -314,13 +314,14 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `python3 tests/fuzz_combined.py 150` (real git is the oracle, nothing is
   borrowed from sg) and report the actual mismatch count. Baseline (Phase
   34, measured): 150 rounds, 104 produced a real conflict, 2 mismatched,
-  both attributed to the project's pre-existing LCS-vs-Myers 2-way
+  both attributed to the project's then-pre-existing LCS-vs-Myers 2-way
   alignment residual (the funcname WARNING three above this one has the
   same underlying diff engine), not to the combined layer -- see
   `tests/fuzz_combined.py`'s own docstring and Phase 34 of
-  `docs/DESIGN.md` for the attribution method. A number higher than 2 is a
-  regression; a number that stays 2 for a DIFFERENT reason is not
-  automatically fine either, re-run the attribution.
+  `docs/DESIGN.md` for the attribution method. **That residual is gone as
+  of Phase 35** (`diff_lcs.c` now runs git's actual Myers algorithm, not an
+  unreduced LCS backtrack) -- re-measured at 200 rounds x 3 seed ranges,
+  0 mismatches in all three. A number higher than 0 is a regression.
 - **"Which paths changed" always goes through `sg_diff_*`**
   (`include/sg/diff.h`, Phase 25): four builders correspond to
   tree<->tree, tree<->index, index<->working-directory, tree<->working-
@@ -348,18 +349,30 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   26 (the `index` line, `new file mode`/`deleted file mode`/`/dev/null`,
   context-3 multi-hunk splitting, function-name suffixes, `\ No newline at end
   of file`), so interop does a full-output `cmp` for **all six formats**.
-  WARNING: about **2-3% of hunks still disagree on positioning**, caused by
-  **the underlying alignment algorithm** (sg uses LCS backtracking, git
-  defaults to Myers), **not** a compression or indentation heuristic -- that
-  layer has already been checked line-by-line against `xdiff/xdiffi.c` (14
-  constants, `measure_split`, the `else if` priority order and three sliding
-  lower bounds of `xdl_change_compact`). Of 11 measured residual cases, 6 are
-  byte-for-byte identical to `git diff --histogram`. **Do not go looking for a
-  scoring bug that does not exist**; details are in Phase 26 of
-  `docs/DESIGN.md`. When touching `diff_out.c` / `diff_lcs.c` /
-  `workdir/diff.c`, a green `make test` **does not count**, run
-  `python3 tests/fuzz_diff.py 200 --max-failures 0` and compare the residual
-  count.
+  **As of Phase 35, the alignment step (`sg_diff_build_script` in
+  `src/util/diff_lcs.c`) is a direct port of git's actual Myers algorithm**
+  (`xdiff/xdiffi.c`'s `xdl_split`/`xdl_recs_cmp` + `xdiff/xprepare.c`'s
+  `xdl_trim_ends`/`xdl_cleanup_records`), not the old unreduced LCS
+  backtrack -- the ~2-3% positioning residual Phase 26 measured (of 11
+  cases, 6 byte-identical to `git diff --histogram`, because the old
+  backtrack's tie-breaking happened to lean that way on ties, not because
+  it implemented histogram) is now **0 mismatches**, re-measured at 500
+  rounds x 4 seed ranges via `tests/fuzz_diff.py` and 200 rounds x 2 seed
+  ranges via `tests/fuzz_combined.py`. Details, including the coordinate-
+  mapping trap (Myers runs in a coordinate space `xdl_cleanup_records`
+  compacted, and writing `changed[]` back at the wrong index is the easiest
+  way to get this wrong) and the perf numbers, are in Phase 35 of
+  `docs/DESIGN.md`. **`src/workdir/merge.c`'s three-way merge still calls
+  `sg_diff_lcs_table`/`_exact` directly and rolls its own backtrack,
+  bypassing `sg_diff_build_script` entirely -- it was deliberately left on
+  the old LCS backtrack** (Phase 35 scope decision: no fuzzer covers
+  merge's alignment, so there was no net to change its behaviour under).
+  Both public LCS-table functions (`sg_diff_lcs_table`/`_exact`) stay in
+  `diff_lcs.c` unchanged, only for that caller now. When touching
+  `diff_out.c` / `diff_lcs.c` / `workdir/diff.c`, a green `make test`
+  **does not count**, run `python3 tests/fuzz_diff.py 500 --max-failures 0`
+  (across a few different `--seed` values, not just the default) and
+  report the actual mismatch count -- it should stay 0.
 - **pathspec always goes through `sg_pathspec_*`** (`include/sg/pathspec.h`,
   Phase 28); the matching rule is **three ordered clauses**: exact literal
   match, literal directory prefix, only fall through to `sg_wildmatch` if the
