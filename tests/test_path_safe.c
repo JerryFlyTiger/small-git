@@ -2,10 +2,13 @@
 
 #include "sg/apply.h"
 #include "sg/cli.h"
+#include "sg/diff.h"
+#include "sg/diff_out.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/object.h"
+#include "sg/objstore.h"
 #include "sg/repo.h"
 #include "sg/tree_build.h"
 
@@ -464,6 +467,379 @@ static void test_restore_refuses_a_dotgit_index_entry(void)
     free(path);
 }
 
+/* --- tree_build.c's sg_tree_build_from_workdir guard: the read-side guard
+   that permanently writes an object (Phase 36) ---
+
+   Built the same way as test_apply_remove_guard_skips_escaping_index_entry
+   above: sg_index_upsert/sg_index_write straight onto disk, modelling a
+   .git/index an attacker (or an sg predating this guard) left behind --
+   sg_index_read validates nothing about entry paths, by design.
+
+   The property under test is NOT the return code alone: before Phase 36,
+   sg_tree_build_from_workdir's caller (sg_stash_push) already failed with a
+   non-zero exit further down its own pipeline (the remove-side guard in
+   apply.c rejects the same path when the stash tries to reset the working
+   directory back to HEAD) while STILL having permanently written the
+   external file's content as a loose object first. A test that only checked
+   "did the call fail" would have stayed green through that entire bug --
+   the assertion has to be that the blob naming the external content's hash
+   never lands in the object store. */
+static void test_tree_build_from_workdir_refuses_escaping_index_entry(void)
+{
+    char outer_template[] = "/tmp/sg_treebuild_escape_test_XXXXXX";
+    char *outer;
+    char repo_path[4096];
+    char git_dir[SG_PATH_MAX];
+    char secret_path[4096];
+    static const char secret_content[] = "TOP-SECRET-API-KEY-abc123";
+    unsigned char secret_blob_id[SG_SHA1_RAW_LEN];
+    unsigned char fake_sha1[SG_SHA1_RAW_LEN];
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry entry;
+    unsigned char *readback = NULL;
+    size_t readback_len = 0;
+    sg_obj_type readback_type;
+    char bad_path[SG_PATH_MAX];
+    int rc;
+
+    outer = strdup(outer_template);
+    if (mkdtemp(outer) == NULL) {
+        fprintf(stderr, "mkdtemp failed\n");
+        exit(1);
+    }
+    snprintf(repo_path, sizeof(repo_path), "%s/repo", outer);
+    CHECK(mkdir(repo_path, 0755) == 0, "mkdir repo failed");
+    CHECK(sg_repo_init(repo_path) == 0, "sg_repo_init failed");
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", repo_path);
+
+    /* secret.txt sits OUTSIDE the repo, reachable only via "../secret.txt",
+       exactly the p36c reproducer's fixture. */
+    snprintf(secret_path, sizeof(secret_path), "%s/secret.txt", outer);
+    CHECK(sg_write_file_mkdirs(secret_path, (const unsigned char *)secret_content,
+                               strlen(secret_content), 0644) == 0,
+         "failed to write secret fixture");
+    /* What the guard must prevent from ever reaching the object store --
+       computed independently of sg_tree_build_from_workdir so the assertion
+       below is not just "the function's own idea of the hash". */
+    CHECK(sg_hash_file_blob(secret_path, secret_blob_id) == 0,
+         "failed to hash the secret fixture");
+
+    memset(fake_sha1, 0xCD, sizeof(fake_sha1));
+    memset(&idx, 0, sizeof(idx));
+    memset(&entry, 0, sizeof(entry));
+    entry.mode = 0100644;
+    memcpy(entry.sha1, fake_sha1, SG_SHA1_RAW_LEN);
+    entry.path = (char *)"../secret.txt";
+    CHECK(sg_index_upsert(&idx, &entry) == 0, "sg_index_upsert failed");
+
+    bad_path[0] = '\0';
+    rc = sg_tree_build_from_workdir(git_dir, repo_path, &idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB,
+                                    tree_id, bad_path);
+    CHECK(rc != 0, "expected sg_tree_build_from_workdir to refuse an escaping index path, got %d",
+         rc);
+    /* Phase 36 follow-up: bad_path must name the actual offending path, not
+       be left empty -- this is what lets sg_stash_push/cmd_stash.c print an
+       actionable message instead of a guess. */
+    CHECK(strcmp(bad_path, "../secret.txt") == 0,
+         "expected bad_path to be \"../secret.txt\", got \"%s\"", bad_path);
+
+    /* The load-bearing assertion: the secret's content must never have been
+       written as a loose object, escaping-path guard or not. */
+    rc = sg_object_read(git_dir, secret_blob_id, &readback_type, &readback, &readback_len);
+    CHECK(rc != 0, "the external file's content was written into the object store");
+    free(readback);
+
+    sg_index_free(&idx);
+    free(outer);
+}
+
+/* --- diff.c's index-vs-workdir guard: content must not be read, but the
+   path must still be reportable (Phase 36) ---
+
+   Unlike the tree_build guard above, this one must NOT hard-fail the whole
+   call: `sg status`/`sg diff` still need to be able to list a path like this
+   (real git does too, from the staged half of the same status, which never
+   reaches this code at all). The property under test is that the working
+   tree file's content is never read: sg_diff_index_workdir must report the
+   row (if any) with new_side ABSENT, the same convention already used for
+   "existing but unreadable", rather than a WORKDIR side carrying the
+   external file's real hash. */
+static void test_diff_index_workdir_refuses_escaping_index_entry(void)
+{
+    char outer_template[] = "/tmp/sg_diffworkdir_escape_test_XXXXXX";
+    char *outer;
+    char repo_path[4096];
+    char git_dir[SG_PATH_MAX];
+    char secret_path[4096];
+    static const char secret_content[] = "TOP-SECRET-API-KEY-abc123";
+    unsigned char secret_blob_id[SG_SHA1_RAW_LEN];
+    unsigned char fake_sha1[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry entry;
+    sg_diff_list dl;
+    int rc;
+    size_t i;
+
+    outer = strdup(outer_template);
+    if (mkdtemp(outer) == NULL) {
+        fprintf(stderr, "mkdtemp failed\n");
+        exit(1);
+    }
+    snprintf(repo_path, sizeof(repo_path), "%s/repo", outer);
+    CHECK(mkdir(repo_path, 0755) == 0, "mkdir repo failed");
+    CHECK(sg_repo_init(repo_path) == 0, "sg_repo_init failed");
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", repo_path);
+
+    snprintf(secret_path, sizeof(secret_path), "%s/secret.txt", outer);
+    CHECK(sg_write_file_mkdirs(secret_path, (const unsigned char *)secret_content,
+                               strlen(secret_content), 0644) == 0,
+         "failed to write secret fixture");
+    CHECK(sg_hash_file_blob(secret_path, secret_blob_id) == 0,
+         "failed to hash the secret fixture");
+
+    /* fake_sha1 deliberately does NOT equal secret_blob_id: if the guard
+       failed and the file were actually read+hashed, the row's new_side
+       would carry secret_blob_id, which the assertion below checks for
+       directly -- a stronger property than "some row got appended". */
+    memset(fake_sha1, 0xCD, sizeof(fake_sha1));
+    memset(&idx, 0, sizeof(idx));
+    memset(&entry, 0, sizeof(entry));
+    entry.mode = 0100644;
+    memcpy(entry.sha1, fake_sha1, SG_SHA1_RAW_LEN);
+    entry.path = (char *)"../secret.txt";
+    CHECK(sg_index_upsert(&idx, &entry) == 0, "sg_index_upsert failed");
+
+    rc = sg_diff_index_workdir(git_dir, repo_path, &idx, &dl);
+    CHECK(rc == 0, "expected sg_diff_index_workdir to succeed (never a hard failure), got %d", rc);
+
+    for (i = 0; i < dl.count; i++) {
+        const sg_diff_entry *e = &dl.entries[i];
+
+        if (strcmp(e->path, "../secret.txt") != 0)
+            continue;
+        CHECK(e->new_side.kind != SG_DIFF_SIDE_WORKDIR ||
+                 memcmp(e->new_side.id, secret_blob_id, SG_SHA1_RAW_LEN) != 0,
+             "the external file's real content hash leaked into the diff row");
+    }
+
+    sg_diff_list_free(&dl);
+    sg_index_free(&idx);
+    free(outer);
+}
+
+/* --- diff.c's tree-vs-workdir guard: the third, separately-guarded call
+   site (Phase 36) ---
+
+   sg_diff_tree_workdir's "in the index, not in the tree" branch is a THIRD
+   place that reads a working-tree file at an untrusted index path, distinct
+   from both guards above: sg_diff_index_workdir (index-vs-workdir, what `sg
+   status`/plain `sg diff` use) never runs this function at all, and
+   sg_tree_build_from_workdir never runs this comparison logic either. A
+   directed mutation that deletes ONLY this guard leaves the other two
+   fully intact and green -- proving this test is not redundant with either
+   of the tests above. old_tree is NULL (empty tree), so the malicious path
+   necessarily takes the "in index, not in tree" branch, never the
+   "present in both" branch the other two guards would also protect. */
+static void test_diff_tree_workdir_refuses_escaping_index_entry(void)
+{
+    char outer_template[] = "/tmp/sg_difftreewd_escape_test_XXXXXX";
+    char *outer;
+    char repo_path[4096];
+    char git_dir[SG_PATH_MAX];
+    char secret_path[4096];
+    static const char secret_content[] = "TOP-SECRET-API-KEY-abc123";
+    unsigned char secret_blob_id[SG_SHA1_RAW_LEN];
+    unsigned char fake_sha1[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry entry;
+    sg_diff_list dl;
+    int rc;
+    size_t i;
+
+    outer = strdup(outer_template);
+    if (mkdtemp(outer) == NULL) {
+        fprintf(stderr, "mkdtemp failed\n");
+        exit(1);
+    }
+    snprintf(repo_path, sizeof(repo_path), "%s/repo", outer);
+    CHECK(mkdir(repo_path, 0755) == 0, "mkdir repo failed");
+    CHECK(sg_repo_init(repo_path) == 0, "sg_repo_init failed");
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", repo_path);
+
+    snprintf(secret_path, sizeof(secret_path), "%s/secret.txt", outer);
+    CHECK(sg_write_file_mkdirs(secret_path, (const unsigned char *)secret_content,
+                               strlen(secret_content), 0644) == 0,
+         "failed to write secret fixture");
+    CHECK(sg_hash_file_blob(secret_path, secret_blob_id) == 0,
+         "failed to hash the secret fixture");
+
+    memset(fake_sha1, 0xCD, sizeof(fake_sha1));
+    memset(&idx, 0, sizeof(idx));
+    memset(&entry, 0, sizeof(entry));
+    entry.mode = 0100644;
+    memcpy(entry.sha1, fake_sha1, SG_SHA1_RAW_LEN);
+    entry.path = (char *)"../secret.txt";
+    CHECK(sg_index_upsert(&idx, &entry) == 0, "sg_index_upsert failed");
+
+    rc = sg_diff_tree_workdir(git_dir, repo_path, NULL, &idx, &dl, NULL);
+    CHECK(rc == 0, "expected sg_diff_tree_workdir to succeed (never a hard failure), got %d", rc);
+
+    for (i = 0; i < dl.count; i++) {
+        const sg_diff_entry *e = &dl.entries[i];
+
+        if (strcmp(e->path, "../secret.txt") != 0)
+            continue;
+        CHECK(e->new_side.kind != SG_DIFF_SIDE_WORKDIR ||
+                 memcmp(e->new_side.id, secret_blob_id, SG_SHA1_RAW_LEN) != 0,
+             "the external file's real content hash leaked into the diff row");
+    }
+
+    sg_diff_list_free(&dl);
+    sg_index_free(&idx);
+    free(outer);
+}
+
+/* --- diff.c's build_result_side guard: the FOURTH, separately-guarded
+   call site (reviewer-found blind spot, Phase 36 follow-up) ---
+
+   build_result_side is only reached through the UNMERGED branch of
+   sg_diff_index_workdir (idx->entries[i].stage != 0), building the
+   "result" side of a conflict row -- i.e. what a combined diff (`sg diff
+   -c`/`--cc`) shows as the resolved/working-tree content. None of the
+   other three Phase 36 tests exercise this: they all use a stage-0 entry,
+   which never reaches this function at all (confirmed by running this
+   exact mutation BEFORE this test existed: `tests/mutate.sh` reported exit
+   code 0, no FAIL lines -- a real blind spot, not a redundant guard).
+
+   The consequence of that blind spot is worse than the other three: this
+   is the one guard whose failure prints the external file's ACTUAL BYTES
+   into a diff hunk, not just a content hash. The assertion below has to
+   look at the rendered combined-diff TEXT, not a struct field, to catch
+   that. */
+static void test_build_result_side_refuses_escaping_index_entry(void)
+{
+    char outer_template[] = "/tmp/sg_buildresult_escape_test_XXXXXX";
+    char *outer;
+    char repo_path[4096];
+    char git_dir[SG_PATH_MAX];
+    char secret_path[4096];
+    static const char secret_content[] = "TOP-SECRET-COMBINED-CONTENT-xyz789";
+    unsigned char ours_blob[SG_SHA1_RAW_LEN], theirs_blob[SG_SHA1_RAW_LEN];
+    sg_index idx;
+    sg_index_entry e2, e3;
+    sg_diff_list dl;
+    sg_diff_out_opts opts;
+    char *rendered;
+    int rc;
+    int saved_stdout;
+    char capture_path[] = "/tmp/sg_buildresult_capture_XXXXXX";
+    int fd;
+    FILE *f;
+    long len;
+
+    outer = strdup(outer_template);
+    if (mkdtemp(outer) == NULL) {
+        fprintf(stderr, "mkdtemp failed\n");
+        exit(1);
+    }
+    snprintf(repo_path, sizeof(repo_path), "%s/repo", outer);
+    CHECK(mkdir(repo_path, 0755) == 0, "mkdir repo failed");
+    CHECK(sg_repo_init(repo_path) == 0, "sg_repo_init failed");
+    snprintf(git_dir, sizeof(git_dir), "%s/.git", repo_path);
+
+    /* The escaping path's actual on-disk content -- what a broken guard
+       would print verbatim into the combined-diff hunk. */
+    snprintf(secret_path, sizeof(secret_path), "%s/conflict.txt", outer);
+    CHECK(sg_write_file_mkdirs(secret_path, (const unsigned char *)secret_content,
+                               strlen(secret_content), 0644) == 0,
+         "failed to write secret fixture");
+
+    /* Real blobs for ours/theirs, so render_combined_patch's own
+       sg_diff_side_read calls for THOSE two sides succeed normally -- only
+       the result side (the guarded one) is untrusted here. */
+    write_blob(git_dir, "OURS\nline\n", ours_blob);
+    write_blob(git_dir, "THEIRS\nline\n", theirs_blob);
+
+    memset(&idx, 0, sizeof(idx));
+    memset(&e2, 0, sizeof(e2));
+    e2.mode = 0100644;
+    e2.stage = 2;
+    memcpy(e2.sha1, ours_blob, SG_SHA1_RAW_LEN);
+    e2.path = (char *)"../conflict.txt";
+    CHECK(sg_index_upsert(&idx, &e2) == 0, "sg_index_upsert(stage 2) failed");
+
+    memset(&e3, 0, sizeof(e3));
+    e3.mode = 0100644;
+    e3.stage = 3;
+    memcpy(e3.sha1, theirs_blob, SG_SHA1_RAW_LEN);
+    e3.path = (char *)"../conflict.txt";
+    CHECK(sg_index_upsert(&idx, &e3) == 0, "sg_index_upsert(stage 3) failed");
+
+    rc = sg_diff_index_workdir(git_dir, repo_path, &idx, &dl);
+    CHECK(rc == 0, "expected sg_diff_index_workdir to succeed (never a hard failure), got %d", rc);
+
+    /* Render the combined diff to a captured file the same way
+       tests/test_diff_out.c does -- the property under test lives in the
+       rendered TEXT (render_combined_patch re-reads e->result's path via
+       sg_diff_side_read), not in any in-memory struct field. */
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_PATCH; /* PATCH's implicit default is dense combined */
+
+    rendered = NULL;
+    fflush(stdout);
+    fd = mkstemp(capture_path);
+    CHECK(fd >= 0, "mkstemp for capture failed");
+    if (fd >= 0) {
+        saved_stdout = dup(STDOUT_FILENO);
+        CHECK(saved_stdout >= 0, "dup(STDOUT_FILENO) failed");
+        if (saved_stdout >= 0) {
+            dup2(fd, STDOUT_FILENO);
+            close(fd);
+
+            sg_diff_print(git_dir, repo_path, &dl, &opts);
+
+            fflush(stdout);
+            dup2(saved_stdout, STDOUT_FILENO);
+            close(saved_stdout);
+        } else {
+            /* stdout was never redirected, so there is nothing captured to
+               read back -- close fd here since the dup2/close pair above
+               that would normally own it never ran. */
+            close(fd);
+        }
+    }
+
+    f = (fd >= 0) ? fopen(capture_path, "rb") : NULL;
+    CHECK(f != NULL, "failed to reopen capture file");
+    if (f != NULL) {
+        fseek(f, 0, SEEK_END);
+        len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        rendered = malloc((size_t)len + 1);
+        if (rendered != NULL) {
+            if (len > 0 && fread(rendered, 1, (size_t)len, f) != (size_t)len) {
+                fprintf(stderr, "short read on capture file\n");
+                exit(1);
+            }
+            rendered[len] = '\0';
+        }
+        fclose(f);
+    }
+    unlink(capture_path);
+
+    CHECK(rendered != NULL, "no rendered output captured");
+    if (rendered != NULL) {
+        CHECK(strstr(rendered, secret_content) == NULL,
+             "the external file's real content was printed into the combined diff");
+        free(rendered);
+    }
+
+    sg_diff_list_free(&dl);
+    sg_index_free(&idx);
+    free(outer);
+}
+
 int main(void)
 {
     test_component_rejects();
@@ -477,6 +853,10 @@ int main(void)
     test_cmd_add_rejects_dotgit_arg();
     test_relpath_rejects_an_oversized_component();
     test_restore_refuses_a_dotgit_index_entry();
+    test_tree_build_from_workdir_refuses_escaping_index_entry();
+    test_diff_index_workdir_refuses_escaping_index_entry();
+    test_diff_tree_workdir_refuses_escaping_index_entry();
+    test_build_result_side_refuses_escaping_index_entry();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

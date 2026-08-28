@@ -120,9 +120,18 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     {
         char label[300];
 
+        char snap_bad_path[SG_PATH_MAX];
+
         snprintf(label, sizeof(label), "merge %s", branch_arg);
-        if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: automatic snapshot failed, aborting this merge for safety (no changes made)\n");
+        snap_bad_path[0] = '\0';
+        if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL, snap_bad_path) != 0) {
+            if (snap_bad_path[0] != '\0')
+                fprintf(stderr, "sg: automatic snapshot failed: the index names an invalid path "
+                                "(%s), aborting this merge for safety (no changes made)\n",
+                       sg_quote_path_delimited(snap_bad_path));
+            else
+                fprintf(stderr, "sg: automatic snapshot failed, aborting this merge for safety "
+                                "(no changes made)\n");
             sg_index_free(&idx);
             return 1;
         }
@@ -308,10 +317,22 @@ static int do_merge_abort(const char *git_dir, const char *repo_root)
     /* This overwrites the working tree just like a dangerous switch/restore
        does -- take a safety snapshot first, and abort outright if that
        fails instead of proceeding unprotected. */
-    if (sg_snapshot_create(git_dir, repo_root, &idx, "merge --abort", NULL) != 0) {
-        fprintf(stderr, "sg: automatic snapshot failed, aborting the abort for safety (no changes made)\n");
-        sg_index_free(&idx);
-        return 1;
+    {
+        char snap_bad_path[SG_PATH_MAX];
+
+        snap_bad_path[0] = '\0';
+        if (sg_snapshot_create(git_dir, repo_root, &idx, "merge --abort", NULL, snap_bad_path) !=
+           0) {
+            if (snap_bad_path[0] != '\0')
+                fprintf(stderr, "sg: automatic snapshot failed: the index names an invalid path "
+                                "(%s), aborting the abort for safety (no changes made)\n",
+                       sg_quote_path_delimited(snap_bad_path));
+            else
+                fprintf(stderr, "sg: automatic snapshot failed, aborting the abort for safety (no "
+                                "changes made)\n");
+            sg_index_free(&idx);
+            return 1;
+        }
     }
     sg_index_free(&idx);
 

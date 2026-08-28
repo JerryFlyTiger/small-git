@@ -641,14 +641,26 @@ int sg_cmd_status(int argc, char **argv)
 
     /* Renames ON here, unlike the safety gates in apply.c: this list is
        rendered for a human, and `git status` pairs them. See sg/status.h. */
-    if (sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx, opts.rename_score,
-                              &staged) != 0)
-        /* Not necessarily out of memory: sg_status_diff_staged folds an
-           unreadable HEAD tree into the same -1. `sg diff`/`sg stash show`
-           name the offending path here; this one cannot, because it does not
-           ask for it -- so it must not claim a cause it does not know. */
-        fprintf(stderr, "sg: warning: could not compute staged changes "
-                        "(out of memory, or an unreadable HEAD tree)\n");
+    {
+        char staged_bad_path[SG_PATH_MAX];
+        int staged_rc;
+
+        staged_bad_path[0] = '\0';
+        staged_rc = sg_status_diff_staged(git_dir, repo_root, head_tree_ptr, &idx,
+                                          opts.rename_score, &staged, staged_bad_path);
+        if (staged_rc == -2 && staged_bad_path[0] != '\0')
+            /* Phase 36: previously this branch was folded into the generic
+               "out of memory" message below, discarding the actual reason
+               (bad_path from sg_tree_flatten). `sg diff`/`sg stash show`
+               already name the offending path for the same underlying -2;
+               this call site can now do the same. */
+            fprintf(stderr, "sg: warning: could not compute staged changes: HEAD's tree names "
+                            "an invalid path (%s)\n",
+                   sg_quote_path_delimited(staged_bad_path));
+        else if (staged_rc != 0)
+            fprintf(stderr, "sg: warning: could not compute staged changes "
+                            "(out of memory, or an unreadable HEAD tree)\n");
+    }
 
     if (sg_status_diff_unstaged(git_dir, repo_root, &idx, &unstaged) != 0)
         fprintf(stderr,

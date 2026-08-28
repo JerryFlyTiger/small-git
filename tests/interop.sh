@@ -10389,6 +10389,210 @@ check "phase34: \"* Unmerged path\" carries the RAW tab byte, not a quoted name"
 check "phase34 oracle: real git's \"* Unmerged path\" is unquoted too, even with core.quotepath=false unset" \
     sh -c "(cd '$P34_Q' && git diff --cached) | grep -q \"^\* Unmerged path wei rd\$(printf '\\t')tab.txt\$\""
 
+# --- Phase 36: a hand-crafted .git/index naming a path that escapes the
+# repository ("../secret.txt"), whose blob does NOT exist in the object
+# store yet -- real git's own porcelain cannot even build this fixture
+# ("git update-index --add --cacheinfo ...,../secret.txt" itself refuses
+# with "Invalid path", measured), so the index is written directly as raw
+# v2 bytes, entries kept path-sorted (an unsorted index of the same two
+# entries made sg's own a.txt lookup fail during measurement -- real git
+# tolerated it, sg did not, so an unsorted fixture would have failed for
+# the wrong reason here).
+#
+# This is the read-side hole Phase 36 closes: sg_tree_build_from_workdir
+# used to hash the outside file and write it as a PERMANENT loose object
+# before the separately-guarded delete/apply step ever failed -- measured
+# before the fix, "sg cat-file -p <that id>" printed the secret back out.
+# The SAME crafted bytes are used on both sides below, pinning three things
+# at once:
+#   1. `status --porcelain` still lists the escaping path on BOTH sides --
+#      this is NOT the bug (real git lists it too, as the staged half of the
+#      diff, which never touches the working directory). A guard that also
+#      hid the path from status would be undetectable without this
+#      positive-collision check sitting right next to #3.
+#   2. `stash push` fails on BOTH sides.
+#   3. NEITHER side's object store ever gains the outside file's blob.
+# ---
+p36_write_index() {
+    # $1 = .git dir, $2 = repo-relative path of an existing tracked file,
+    # $3 = the escaping repo-relative path (e.g. "../secret.txt"). Prints
+    # the escaping path's blob sha1 (hex) to stdout, computed independently
+    # of anything sg or git does with it.
+    python3 - "$1" "$2" "$3" <<'PY'
+import hashlib
+import os
+import struct
+import sys
+
+git_dir, a_path, secret_relpath = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def blob_sha1_hex(content):
+    h = hashlib.sha1()
+    h.update(b"blob %d\0" % len(content))
+    h.update(content)
+    return h.hexdigest()
+
+
+def make_entry(path, mode, sha1_hex):
+    sha1 = bytes.fromhex(sha1_hex)
+    flags = len(path.encode()) & 0xFFF
+    header = struct.pack(">IIIIIIIIII", 0, 0, 0, 0, 0, 0, mode, 0, 0, 0)
+    entry = header + sha1 + struct.pack(">H", flags) + path.encode() + b"\0"
+    pad = (8 - (len(entry) % 8)) % 8
+    return entry + b"\0" * pad
+
+
+worktree = os.path.dirname(git_dir)
+with open(os.path.join(worktree, a_path), "rb") as f:
+    a_sha1 = blob_sha1_hex(f.read())
+with open(os.path.join(worktree, secret_relpath), "rb") as f:
+    secret_sha1 = blob_sha1_hex(f.read())
+
+entries = sorted(
+    [(a_path, 0o100644, a_sha1), (secret_relpath, 0o100644, secret_sha1)],
+    key=lambda e: e[0],
+)
+body = b"DIRC" + struct.pack(">II", 2, len(entries))
+for name, mode, sha1hex in entries:
+    body += make_entry(name, mode, sha1hex)
+checksum = hashlib.sha1(body).digest()
+with open(os.path.join(git_dir, "index"), "wb") as f:
+    f.write(body)
+    f.write(checksum)
+print(secret_sha1)
+PY
+}
+
+p36_secret_obj_missing() {
+    # $1 = .git dir, $2 = blob sha1 hex
+    sha_prefix=$(echo "$2" | cut -c1-2)
+    sha_rest=$(echo "$2" | cut -c3-)
+    test ! -f "$1/objects/$sha_prefix/$sha_rest"
+}
+
+# --- sg side ---
+P36_SG="$WORKDIR/p36_sg"
+mkdir -p "$P36_SG/outer"
+printf 'TOP-SECRET-API-KEY-abc123' > "$P36_SG/outer/secret.txt"
+(cd "$P36_SG/outer" && "$SG" init repo) > /dev/null 2>&1
+P36_SG_REPO="$P36_SG/outer/repo"
+printf 'hello\n' > "$P36_SG_REPO/a.txt"
+(cd "$P36_SG_REPO" && "$SG" add a.txt && "$SG" commit -m base) > /dev/null 2>&1
+P36_SG_SECRET_SHA=$(p36_write_index "$P36_SG_REPO/.git" "a.txt" "../secret.txt")
+printf 'dirty extra\n' >> "$P36_SG_REPO/a.txt"
+
+(cd "$P36_SG_REPO" && "$SG" status --porcelain) > "$WORKDIR/p36_sg_status.txt" 2>&1
+check "phase36: sg status --porcelain lists the escaping index path" \
+    grep -qF '../secret.txt' "$WORKDIR/p36_sg_status.txt"
+# Deliberate divergence #4 (CLAUDE.md): sg refuses to read the escaping
+# path's content, so it cannot compute git's three-way A /AM/AD answer and
+# always prints AD instead -- pin the fixed answer itself, or a change that
+# widened/narrowed this divergence would have nothing catching it. This
+# fixture's outside file is untouched (content == what the index records),
+# the same shape real git answers "A " for -- deliberately different sides,
+# not a copy-paste mistake.
+check "phase36: sg status --porcelain always prints a fixed AD for this path (deliberate divergence #4)" \
+    grep -qx 'AD \.\./secret\.txt' "$WORKDIR/p36_sg_status.txt"
+
+(cd "$P36_SG_REPO" && "$SG" stash push) > "$WORKDIR/p36_sg_stash.txt" 2>&1
+P36_SG_STASH_RC=$?
+check "phase36: sg stash push refuses a crafted index naming a path outside the repository" \
+    test "$P36_SG_STASH_RC" != 0
+check "phase36: sg never wrote the outside file's blob into its object store" \
+    p36_secret_obj_missing "$P36_SG_REPO/.git" "$P36_SG_SECRET_SHA"
+# Round-2 follow-up: cmd_stash.c's bad_path branch names the offending path
+# instead of the pre-existing generic "unborn HEAD, or ... unresolved
+# conflicts?" guess -- pin the actual message text, not just the exit code,
+# or the CLI-visible half of this fix has nothing catching a regression.
+check "phase36: sg stash push names the offending path in its error message" \
+    grep -qF '../secret.txt' "$WORKDIR/p36_sg_stash.txt"
+
+# --- git side (the control): built with plumbing (mktree/commit-tree),
+# never `git commit`/`git checkout`, so it needs no confirmation prompt and
+# touches no branch this script did not itself create. ---
+P36_GIT="$WORKDIR/p36_git"
+mkdir -p "$P36_GIT/outer"
+printf 'TOP-SECRET-API-KEY-abc123' > "$P36_GIT/outer/secret.txt"
+(cd "$P36_GIT/outer" && git init -q repo) > /dev/null 2>&1
+P36_GIT_REPO="$P36_GIT/outer/repo"
+(cd "$P36_GIT_REPO" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'hello\n' > "$P36_GIT_REPO/a.txt"
+P36_GIT_BLOB_A=$(cd "$P36_GIT_REPO" && git hash-object -w a.txt)
+P36_GIT_TREE=$(printf '100644 blob %s\ta.txt\n' "$P36_GIT_BLOB_A" | git -C "$P36_GIT_REPO" mktree)
+P36_GIT_COMMIT=$(git -C "$P36_GIT_REPO" commit-tree "$P36_GIT_TREE" -m base)
+git -C "$P36_GIT_REPO" update-ref refs/heads/master "$P36_GIT_COMMIT"
+git -C "$P36_GIT_REPO" symbolic-ref HEAD refs/heads/master
+
+P36_GIT_SECRET_SHA=$(p36_write_index "$P36_GIT_REPO/.git" "a.txt" "../secret.txt")
+printf 'dirty extra\n' >> "$P36_GIT_REPO/a.txt"
+
+(cd "$P36_GIT_REPO" && git status --porcelain) > "$WORKDIR/p36_git_status.txt" 2>&1
+check "phase36 oracle: git status --porcelain also lists the escaping index path" \
+    grep -qF '../secret.txt' "$WORKDIR/p36_git_status.txt"
+# This is row 1 of DESIGN.md's three-row table (docs/DESIGN.md, Phase 36's
+# "AD vs real git's answer" section): the outside file's content has not
+# been touched since the crafted index recorded its blob id, so real git's
+# own read finds no difference and reports a plain "A ".
+check "phase36 oracle: git's exact answer when the outside file is UNCHANGED is 'A ' (table row 1)" \
+    grep -qx 'A  \.\./secret\.txt' "$WORKDIR/p36_git_status.txt"
+
+(cd "$P36_GIT_REPO" && git stash push) > "$WORKDIR/p36_git_stash.txt" 2>&1
+P36_GIT_STASH_RC=$?
+check "phase36 oracle: git stash push also refuses the same crafted index" \
+    test "$P36_GIT_STASH_RC" != 0
+check "phase36 oracle: git never wrote the outside file's blob into its object store either" \
+    p36_secret_obj_missing "$P36_GIT_REPO/.git" "$P36_GIT_SECRET_SHA"
+
+# --- Rows 2 and 3 of the same table: real git actually reads the outside
+# file to decide, so its answer depends on what is sitting there. sg cannot
+# reproduce any of this (that read is exactly what Phase 36 refuses to do,
+# see the "AD" divergence check on the sg side above), so these two checks
+# exist purely to keep DESIGN.md's table from silently going stale -- if a
+# future git version changed how it answers here, these would be the first
+# thing to turn red. Independent fixtures, not reusing $P36_GIT_REPO, so
+# neither interferes with the stash-push checks already run against it. ---
+P36_GIT_CHANGED="$WORKDIR/p36_git_changed"
+mkdir -p "$P36_GIT_CHANGED/outer"
+printf 'TOP-SECRET-API-KEY-abc123' > "$P36_GIT_CHANGED/outer/secret.txt"
+(cd "$P36_GIT_CHANGED/outer" && git init -q repo) > /dev/null 2>&1
+P36_GIT_CHANGED_REPO="$P36_GIT_CHANGED/outer/repo"
+(cd "$P36_GIT_CHANGED_REPO" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'hello\n' > "$P36_GIT_CHANGED_REPO/a.txt"
+P36_GIT_CHANGED_BLOB_A=$(cd "$P36_GIT_CHANGED_REPO" && git hash-object -w a.txt)
+P36_GIT_CHANGED_TREE=$(printf '100644 blob %s\ta.txt\n' "$P36_GIT_CHANGED_BLOB_A" |
+    git -C "$P36_GIT_CHANGED_REPO" mktree)
+P36_GIT_CHANGED_COMMIT=$(git -C "$P36_GIT_CHANGED_REPO" commit-tree "$P36_GIT_CHANGED_TREE" -m base)
+git -C "$P36_GIT_CHANGED_REPO" update-ref refs/heads/master "$P36_GIT_CHANGED_COMMIT"
+git -C "$P36_GIT_CHANGED_REPO" symbolic-ref HEAD refs/heads/master
+p36_write_index "$P36_GIT_CHANGED_REPO/.git" "a.txt" "../secret.txt" > /dev/null
+# The index's blob id was computed from the ORIGINAL content above; changing
+# the outside file's bytes now, after the index was already crafted, is
+# what makes real git's read find a difference.
+printf 'TOP-SECRET-API-KEY-abc123-CHANGED' > "$P36_GIT_CHANGED/outer/secret.txt"
+(cd "$P36_GIT_CHANGED_REPO" && git status --porcelain) > "$WORKDIR/p36_git_changed_status.txt" 2>&1
+check "phase36 oracle: git's exact answer when the outside file has CHANGED is 'AM' (table row 2)" \
+    grep -qx 'AM \.\./secret\.txt' "$WORKDIR/p36_git_changed_status.txt"
+
+P36_GIT_DELETED="$WORKDIR/p36_git_deleted"
+mkdir -p "$P36_GIT_DELETED/outer"
+printf 'TOP-SECRET-API-KEY-abc123' > "$P36_GIT_DELETED/outer/secret.txt"
+(cd "$P36_GIT_DELETED/outer" && git init -q repo) > /dev/null 2>&1
+P36_GIT_DELETED_REPO="$P36_GIT_DELETED/outer/repo"
+(cd "$P36_GIT_DELETED_REPO" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'hello\n' > "$P36_GIT_DELETED_REPO/a.txt"
+P36_GIT_DELETED_BLOB_A=$(cd "$P36_GIT_DELETED_REPO" && git hash-object -w a.txt)
+P36_GIT_DELETED_TREE=$(printf '100644 blob %s\ta.txt\n' "$P36_GIT_DELETED_BLOB_A" |
+    git -C "$P36_GIT_DELETED_REPO" mktree)
+P36_GIT_DELETED_COMMIT=$(git -C "$P36_GIT_DELETED_REPO" commit-tree "$P36_GIT_DELETED_TREE" -m base)
+git -C "$P36_GIT_DELETED_REPO" update-ref refs/heads/master "$P36_GIT_DELETED_COMMIT"
+git -C "$P36_GIT_DELETED_REPO" symbolic-ref HEAD refs/heads/master
+p36_write_index "$P36_GIT_DELETED_REPO/.git" "a.txt" "../secret.txt" > /dev/null
+rm -f "$P36_GIT_DELETED/outer/secret.txt"
+(cd "$P36_GIT_DELETED_REPO" && git status --porcelain) > "$WORKDIR/p36_git_deleted_status.txt" 2>&1
+check "phase36 oracle: git's exact answer when the outside file has been DELETED is 'AD' (table row 3)" \
+    grep -qx 'AD \.\./secret\.txt' "$WORKDIR/p36_git_deleted_status.txt"
+
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

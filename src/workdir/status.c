@@ -69,11 +69,12 @@ void sg_status_list_free(sg_status_list *list)
    the two agreed on all three unmerged shapes before it did. */
 int sg_status_diff_staged(const char *git_dir, const char *repo_root,
                           const unsigned char *head_tree, const sg_index *idx,
-                          int rename_score, sg_status_list *out)
+                          int rename_score, sg_status_list *out, char *bad_path)
 {
     sg_diff_list dl;
     size_t i;
     int rc = 0;
+    int trc;
 
     memset(out, 0, sizeof(*out));
 
@@ -83,9 +84,17 @@ int sg_status_diff_staged(const char *git_dir, const char *repo_root,
        all three unmerged arrangements, a corrupt index, an unborn HEAD and
        the path-ordering boundaries -- and found them equivalent, so this
        replaced that walk without changing any answer. The harness stayed:
-       it now guards the normalisation below instead. */
-    if (sg_diff_tree_index(git_dir, head_tree, idx, &dl, NULL) != 0)
-        return -1;
+       it now guards the normalisation below instead.
+
+       bad_path (Phase 36) is forwarded straight through: sg_diff_tree_index
+       returns -2 with the offending path when HEAD's tree names a hostile
+       entry, and -1 for every other failure (out of memory, an unreadable
+       object). Collapsing the two here is exactly the bug Phase 36 fixed --
+       every caller that folded this into one message was printing a guess
+       instead of the actual reason. */
+    trc = sg_diff_tree_index(git_dir, head_tree, idx, &dl, bad_path);
+    if (trc != 0)
+        return trc;
 
     /* Detection runs here, on the finished list, so that the caller's single
        rename_score decision covers it -- see sg/status.h for why that

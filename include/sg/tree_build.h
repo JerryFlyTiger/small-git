@@ -80,10 +80,24 @@ typedef enum {
    instead would be worse than no snapshot at all. Under
    RECORD_DELETION the result can cover fewer paths than idx, down to an
    empty tree if every path was deleted -- that is success, not an error.
-   Returns 0, -1 on failure. */
+
+   Phase 36: also hard-fails (before ever touching the working tree for that
+   entry) if an index path fails sg_relpath_is_safe -- e.g. "../secret.txt"
+   or a path under ".git/". sg_index_read validates nothing about index
+   paths (by design, see CLAUDE.md), and this function is the one index
+   consumer that both reads outside the repository AND turns what it read
+   into a permanent loose object; every other consumer either only reads
+   inside the repository already, or never persists what it read.
+
+   Returns 0, -1 on failure. bad_path may be NULL; when non-NULL and the
+   failure is specifically the Phase 36 path-safety guard above (never for
+   any other -1 cause -- OOM, an unreadable file, a write failure), the
+   offending repo-relative path is copied into it (needs SG_PATH_MAX bytes)
+   so the caller can print an actionable message instead of a guess, same
+   convention as sg_tree_flatten's bad_path and sg_status_diff_staged's. */
 int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
                                sg_workdir_missing missing,
-                               unsigned char tree_id_out[SG_SHA1_RAW_LEN]);
+                               unsigned char tree_id_out[SG_SHA1_RAW_LEN], char *bad_path);
 
 /* Builds a tree out of the working tree's untracked files (full relative
    paths, not flattened basenames) -- see sg_status_list_untracked for what

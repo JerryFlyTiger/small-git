@@ -287,7 +287,7 @@ int sg_tree_build_from_index(const char *git_dir, const sg_index *idx,
 
 int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
                                sg_workdir_missing missing,
-                               unsigned char tree_id_out[SG_SHA1_RAW_LEN])
+                               unsigned char tree_id_out[SG_SHA1_RAW_LEN], char *bad_path)
 {
     sg_flat_entry *entries = NULL;
     size_t entry_count = 0;
@@ -321,6 +321,29 @@ int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const
            sharing a name. */
         if (i > 0 && strcmp(idx->entries[i].path, idx->entries[i - 1].path) == 0)
             continue;
+
+        /* Phase 36: idx->entries[i].path comes straight off a parsed .git/index
+           entry, and sg_index_read validates none of it (see index.c and
+           CLAUDE.md's rationale for keeping it that way -- an index consumer
+           other than this one, e.g. `sg status`, still has to be able to
+           list a hostile entry). This is the one consumer that turns the
+           path into a read PLUS a permanent write (a loose object below),
+           which is a strictly worse outcome than the write-side guards this
+           project already has: a path like "../secret.txt" would hash and
+           store a file outside the repository entirely, and it does so
+           whether or not anything downstream later fails to delete/apply it
+           (measured: a stash push against a crafted index wrote the outside
+           file's blob before its own later, unrelated apply step failed).
+           Must hard-fail the whole build, not silently skip the entry --
+           skipping would make sg_snapshot_create/sg_stash_push produce a
+           tree that quietly omits a legitimate index path too, the same
+           silent-data-loss shape the truncation check below already
+           guards against. */
+        if (!sg_relpath_is_safe(idx->entries[i].path)) {
+            if (bad_path != NULL)
+                snprintf(bad_path, SG_PATH_MAX, "%s", idx->entries[i].path);
+            goto out_free_entries;
+        }
 
         /* A truncated path must hard-fail here, before sg_read_file ever
            runs: a truncated buffer usually still names some real,

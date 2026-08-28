@@ -17,9 +17,18 @@
    with the new commit's id when non-NULL. Returns 0 on success, -1 on
    failure. Callers must treat a -1 here as "this dangerous operation cannot
    be performed safely" and abort rather than proceeding anyway -- a failed
-   snapshot must not be treated as protection having happened. */
+   snapshot must not be treated as protection having happened.
+
+   bad_path may be NULL; when non-NULL and the failure is specifically the
+   Phase 36 path-safety guard inside sg_tree_build_from_workdir (a hostile
+   index path, e.g. "../secret.txt"), the offending repo-relative path is
+   copied into it (needs SG_PATH_MAX bytes), same convention as
+   sg_status_diff_staged's and sg_stash_push's bad_path. Left untouched for
+   every other -1 cause (OOM, an unreadable object, a ref-write failure), so
+   the caller must not assume it was written just because the call failed. */
 int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_index *idx,
-                       const char *label, unsigned char commit_id_out[SG_SHA1_RAW_LEN]);
+                       const char *label, unsigned char commit_id_out[SG_SHA1_RAW_LEN],
+                       char *bad_path);
 
 typedef struct {
     char *ref_name;    /* last path segment only, e.g. "1721000000-switch-to-feature", malloc'd */

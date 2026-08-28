@@ -959,7 +959,27 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                unlink an unrelated, unversioned file that happens to share
                the name (Phase 20: base had the path, ours and theirs both
                deleted it, and some untracked file with the same name now
-               sits at abspath). */
+               sits at abspath).
+
+               Phase 36: unlike apply.c's equivalent remove(), e->path has no
+               guard of its own here -- same situation add_resolved_entry's
+               comment above already documents for its own sg_path_join, and
+               deliberately not fixed the same way (no guard added) for the
+               same reason: it would be a redundant defence that hides the
+               real one. This is safe today ONLY because e->path is a
+               structural fact, not an enforced invariant: sg_merge_result's
+               entries are built exclusively by sg_merge_trees out of three
+               trees that all went through sg_tree_flatten first (each
+               returns -2 and aborts the merge outright on a path that fails
+               sg_path_component_is_safe), so nothing reaches this loop that
+               flatten did not already clear. If sg_merge_result ever grows a
+               second producer -- e.g. building one by hand for a test
+               fixture, or a future caller assembling a result outside
+               sg_merge_trees -- that producer becomes responsible for the
+               same validation, or this remove() reopens exactly the
+               tree-build hole Phase 36 closed elsewhere (see
+               sg_tree_build_from_workdir in tree_build.c and
+               docs/DESIGN.md's Phase 36 section for the full writeup). */
             if (sg_merge_entry_touches_ours(e) && remove(abspath) == 0)
                 sg_prune_empty_parents(repo_root, e->path);
         } else {

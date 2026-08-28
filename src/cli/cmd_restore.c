@@ -310,16 +310,29 @@ int sg_cmd_restore(int argc, char **argv)
             char label[512];
 
             snprintf(label, sizeof(label), "restore %s", affected.buf != NULL ? affected.buf : "");
-            if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-                fprintf(stderr,
-                       "sg: automatic snapshot failed, aborting this restore for safety (no changes made)\n");
-                free(msg.buf);
-                free(affected.buf);
-                sg_flat_list_free(&head_flat);
-                sg_index_free(&idx);
-                free(repo_root);
-                free(git_dir);
-                return 1;
+            {
+                char snap_bad_path[SG_PATH_MAX];
+
+                snap_bad_path[0] = '\0';
+                if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL, snap_bad_path) !=
+                   0) {
+                    if (snap_bad_path[0] != '\0')
+                        fprintf(stderr,
+                               "sg: automatic snapshot failed: the index names an invalid path "
+                               "(%s), aborting this restore for safety (no changes made)\n",
+                               sg_quote_path_delimited(snap_bad_path));
+                    else
+                        fprintf(stderr,
+                               "sg: automatic snapshot failed, aborting this restore for safety "
+                               "(no changes made)\n");
+                    free(msg.buf);
+                    free(affected.buf);
+                    sg_flat_list_free(&head_flat);
+                    sg_index_free(&idx);
+                    free(repo_root);
+                    free(git_dir);
+                    return 1;
+                }
             }
         }
         free(msg.buf);

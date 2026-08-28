@@ -67,7 +67,7 @@ static int stash_push(const char *git_dir, const char *repo_root, const char *me
 
     memset(&opts, 0, sizeof(opts));
     opts.message = message;
-    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out, NULL);
 }
 
 /* Same, but for a call site that also needs opts.keep_index set. */
@@ -79,7 +79,7 @@ static int stash_push_keep_index(const char *git_dir, const char *repo_root, con
     memset(&opts, 0, sizeof(opts));
     opts.message = message;
     opts.keep_index = 1;
-    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out, NULL);
 }
 
 static char *read_workdir_file(const char *repo_root, const char *rel)
@@ -851,7 +851,7 @@ static int stash_push_u(const char *git_dir, const char *repo_root, const char *
     memset(&opts, 0, sizeof(opts));
     opts.message = message;
     opts.include_untracked = 1;
-    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out, NULL);
 }
 
 static int stash_push_a(const char *git_dir, const char *repo_root, const char *message,
@@ -862,7 +862,7 @@ static int stash_push_a(const char *git_dir, const char *repo_root, const char *
     memset(&opts, 0, sizeof(opts));
     opts.message = message;
     opts.include_ignored = 1;
-    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out, NULL);
 }
 
 static int stash_push_u_keep_index(const char *git_dir, const char *repo_root, const char *message,
@@ -874,7 +874,7 @@ static int stash_push_u_keep_index(const char *git_dir, const char *repo_root, c
     opts.message = message;
     opts.include_untracked = 1;
     opts.keep_index = 1;
-    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out);
+    return sg_stash_push(git_dir, repo_root, &opts, commit_id_out, NULL);
 }
 
 static void read_commit(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN], sg_commit *out)

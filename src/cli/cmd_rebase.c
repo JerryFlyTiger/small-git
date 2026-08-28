@@ -549,11 +549,23 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             return 1;
         }
         snprintf(label, sizeof(label), "rebase onto %s", upstream_arg);
-        if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: automatic snapshot failed, aborting this rebase for safety (no changes made)\n");
-            sg_index_free(&idx);
-            free(current_branch);
-            return 1;
+        {
+            char snap_bad_path[SG_PATH_MAX];
+
+            snap_bad_path[0] = '\0';
+            if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL, snap_bad_path) != 0) {
+                if (snap_bad_path[0] != '\0')
+                    fprintf(stderr, "sg: automatic snapshot failed: the index names an invalid "
+                                    "path (%s), aborting this rebase for safety (no changes "
+                                    "made)\n",
+                           sg_quote_path_delimited(snap_bad_path));
+                else
+                    fprintf(stderr, "sg: automatic snapshot failed, aborting this rebase for "
+                                    "safety (no changes made)\n");
+                sg_index_free(&idx);
+                free(current_branch);
+                return 1;
+            }
         }
         sg_index_free(&idx);
 
@@ -670,12 +682,24 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             return 1;
         }
         snprintf(label, sizeof(label), "rebase onto %s", upstream_arg);
-        if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL) != 0) {
-            fprintf(stderr, "sg: automatic snapshot failed, aborting this rebase for safety (no changes made)\n");
-            sg_index_free(&idx);
-            free(state.todo);
-            free(current_branch);
-            return 1;
+        {
+            char snap_bad_path[SG_PATH_MAX];
+
+            snap_bad_path[0] = '\0';
+            if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL, snap_bad_path) != 0) {
+                if (snap_bad_path[0] != '\0')
+                    fprintf(stderr, "sg: automatic snapshot failed: the index names an invalid "
+                                    "path (%s), aborting this rebase for safety (no changes "
+                                    "made)\n",
+                           sg_quote_path_delimited(snap_bad_path));
+                else
+                    fprintf(stderr, "sg: automatic snapshot failed, aborting this rebase for "
+                                    "safety (no changes made)\n");
+                sg_index_free(&idx);
+                free(state.todo);
+                free(current_branch);
+                return 1;
+            }
         }
         sg_index_free(&idx);
     }
@@ -962,11 +986,23 @@ static int do_rebase_skip(const char *git_dir, const char *repo_root)
             sg_rebase_state_free(&state);
             return 1;
         }
-        if (sg_snapshot_create(git_dir, repo_root, &idx, "rebase --skip", NULL) != 0) {
-            fprintf(stderr, "sg: automatic snapshot failed, aborting the skip for safety (no changes made)\n");
-            sg_index_free(&idx);
-            sg_rebase_state_free(&state);
-            return 1;
+        {
+            char snap_bad_path[SG_PATH_MAX];
+
+            snap_bad_path[0] = '\0';
+            if (sg_snapshot_create(git_dir, repo_root, &idx, "rebase --skip", NULL,
+                                   snap_bad_path) != 0) {
+                if (snap_bad_path[0] != '\0')
+                    fprintf(stderr, "sg: automatic snapshot failed: the index names an invalid "
+                                    "path (%s), aborting the skip for safety (no changes made)\n",
+                           sg_quote_path_delimited(snap_bad_path));
+                else
+                    fprintf(stderr, "sg: automatic snapshot failed, aborting the skip for safety "
+                                    "(no changes made)\n");
+                sg_index_free(&idx);
+                sg_rebase_state_free(&state);
+                return 1;
+            }
         }
         sg_index_free(&idx);
     }
@@ -1012,11 +1048,23 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
     /* The user may have edited files while resolving a conflict -- protect
        that work the same way merge --abort and switch/undo do, and refuse
        to abort at all if the snapshot itself can't be taken. */
-    if (sg_snapshot_create(git_dir, repo_root, &idx, "rebase --abort", NULL) != 0) {
-        fprintf(stderr, "sg: automatic snapshot failed, aborting the abort for safety (no changes made)\n");
-        sg_index_free(&idx);
-        sg_rebase_state_free(&state);
-        return 1;
+    {
+        char snap_bad_path[SG_PATH_MAX];
+
+        snap_bad_path[0] = '\0';
+        if (sg_snapshot_create(git_dir, repo_root, &idx, "rebase --abort", NULL, snap_bad_path) !=
+           0) {
+            if (snap_bad_path[0] != '\0')
+                fprintf(stderr, "sg: automatic snapshot failed: the index names an invalid path "
+                                "(%s), aborting the abort for safety (no changes made)\n",
+                       sg_quote_path_delimited(snap_bad_path));
+            else
+                fprintf(stderr, "sg: automatic snapshot failed, aborting the abort for safety (no "
+                                "changes made)\n");
+            sg_index_free(&idx);
+            sg_rebase_state_free(&state);
+            return 1;
+        }
     }
     sg_index_free(&idx);
 
