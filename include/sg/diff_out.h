@@ -23,6 +23,21 @@ typedef struct {
        honours COLUMNS even when stdout is not a tty. */
     int stat_width;
     int stat_name_width;
+    /* Combined-diff mode for an unmerged (both stage 2 and stage 3 present)
+       row, Phase 34: 0 = not given on the command line, 1 = dense (--cc),
+       2 = non-dense (-c). A single field carries both "which flag" and
+       "was one given at all" -- deliberately, because the PATCH format and
+       the other five formats read it differently (measured against git
+       2.55.0, see CLAUDE.md's combined-diff note for the oracle):
+         - PATCH treats 0 the same as 1 (dense IS the PATCH default even
+           with no flag at all -- `git diff` on a conflict prints
+           "diff --cc" unprompted); only 2 turns off dense.
+         - The other five formats leave a combinable row rendered exactly as
+           today UNLESS this is nonzero -- 0 must not be treated as "dense"
+           there, or an unflagged `sg diff --name-status` on a conflict would
+           silently start printing "MM" instead of "U".
+       Never set by a builder, only by the CLI layer parsing -c/--cc. */
+    int combined;
 } sg_diff_out_opts;
 
 /* Every format except PATCH quotes paths with sg_quote_path -- measured

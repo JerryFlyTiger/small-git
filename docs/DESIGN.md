@@ -4266,3 +4266,193 @@ git -- the discipline Phase 32 earned the hard way, when a fixture using a flag 
 compared two identical rename-free states and passed. Four unit tests assert `is_copy` directly
 rather than through rendering, each with a `detect_copies = 0` control so the tests cannot pass
 by the feature simply being off.
+
+## Phase 34: combined diff (`sg diff -c` / `--cc`)
+
+Real git's `combine-diff.c`, ported from scratch and fixed at exactly 2
+parents (ours = index stage 2, theirs = index stage 3, result = the
+working-tree file) -- `sg diff` never needs an N-way merge, only the one
+real git produces for an unresolved 2-way conflict.
+
+### Where the expected values came from
+
+A three-document handoff, same shape as Phase 33: an **oracle** (real git
+2.55.0 measured, `LC_ALL=C`, both config env vars pointed at `/dev/null`)
+covering when combined even applies (only plain `sg diff`, never `--cached`,
+never with a `<rev>`), the flag grammar (`--cc` = dense = PATCH's *implicit*
+default; `-c` = non-dense; last one wins), the header's exact byte layout,
+and eighteen concrete samples pinned as test fixtures; an **algorithm spec**
+derived from a cold read of `combine-diff.c` (`struct sline`'s flag bits,
+`consume_hunk`/`consume_line`, `coalesce_lines`'s LCS merge of two parents'
+deleted-line lists, `make_hunks`'s dense-mode pruning rule, and the funcname
+suffix's off-by-one); and an **implementation spec** deciding sg-specific
+placement (which struct grows, which file renders, three scope decisions
+below). All three were cross-checked against measurement before code was
+written, not the other way around.
+
+### Three decisions made in advance, not revisited mid-implementation
+
+1. **`-c`/`--cc` combined with a `<rev>` is rejected outright.** Real git
+   switches to a completely different parent pairing there (stage 1 vs the
+   named tree blob at that rev) -- approximating it with the stage-2/stage-3
+   pairing this renderer implements would be a silently wrong answer, not a
+   close one. Same treatment as Phase 33's `-C -C`: both sides of the
+   divergence (`git diff -c HEAD` succeeds, `sg diff -c HEAD` is refused)
+   are pinned by interop.
+2. **`* Unmerged path <p>`'s path is never quoted.** Measured with `od -c`:
+   real git lets a raw ESC byte in the filename go straight to stdout,
+   `core.quotepath=false` has no effect on this one line. This is the
+   fourth documented exception to "printing a path always goes through
+   `sg_quote_path`" (CLAUDE.md).
+3. **One milestone, not split into a data-layer half and a render-layer
+   half.** `sg_diff_entry` already carried the right shape for the
+   conflict row (Phase 20's `unmerged` flag, `list_append_unmerged` as the
+   sole constructor) -- the only gap was that `print_patch` threw away the
+   information needed to render combined instead of skipping the row, so
+   splitting would have meant landing an inert data change with no renderer
+   to prove it against.
+
+### The two surprises the algorithm spec's translation had to resolve
+
+- **git's `nb`/`nb-1` lost-bucket split (`consume_hunk`) collapses to one
+  rule.** Read literally, a pure-deletion hunk hangs its lost lines on
+  `sline[nb]` and a mixed add/delete hunk hangs them on `sline[nb-1]` --
+  looks like two cases. Working through git's own 1-based "insert after
+  line N" convention for hunk headers, both resolve to the SAME index:
+  `sg_diff_group`'s own `b_off` (0-based, already what
+  `sg_diff_build_script` hands back from the ordinary 2-way LCS engine).
+  `combine_process_parent` uses `b_off` unconditionally; no case split
+  survives in the port.
+- **The 40-byte funcname scan needed a bound `combine-diff.c` does not
+  spell out explicitly, but relies on.** Real git's scan loop stops on
+  `if (!ch) break` -- a NUL sentinel at the end of its mmap'd/xcalloc'd
+  buffer. sg's blob buffers are plain `malloc`'d with no such sentinel, so
+  the scan is clamped to the bytes actually left in the result buffer
+  instead; without the clamp this is a heap-buffer-overflow read, caught
+  immediately by `make sanitize` on the fixture built to exercise it. This
+  is **not a claimed output divergence** -- git's NUL-sentinel stop and
+  sg's byte-count clamp land on the identical byte: binary detection
+  already rules out an embedded NUL reachable by the scan, and a funcname
+  candidate is by construction a line outside every hunk (the "not yet
+  marked" scan in `combine_dump`), which structurally can never be the
+  file's actual last line. Measured, not just argued: 216 targeted
+  comparisons against real git (9 funcname lengths x 4 leading-context
+  depths x with/without a trailing no-newline delete x 3 flag
+  combinations) found 0 mismatches. Do NOT list this alongside the two
+  genuine deliberate divergences above (rev-argument rejection, `* Unmerged
+  path` unquoted) -- both of those are pinned on both sides by an interop
+  check that asserts real git's OTHER behaviour; this one has no oracle-side
+  pin because there is nothing to diverge on.
+
+### Not ported: `reuse_combine_diff`
+
+git skips re-running a parent's 2-way diff when two parents' blobs are
+byte-identical (`reuse_combine_diff`, `combine-diff.c`), copying the
+already-computed `p_lno`/`lost`/`flag` bits across instead. **Deliberately
+not ported here** -- it is a pure performance optimization (the output is
+provably identical either way: running the same 2-way diff against the same
+`(parent, result)` pair twice produces the same `sline` contribution twice),
+and sg's fixed 2-parent case pays for the redundant diff at most once per
+conflicted path. Recorded explicitly so a future reader does not mistake
+the omission for a missed step -- the ALGO spec this phase was built from
+flagged it as "suggested to keep", and it was a deliberate call to drop it,
+not an oversight.
+
+### Review round: mutation results and the one genuine blind spot found
+
+Seven mutations, run by the main conversation after a cold-read review of
+the diff (`bash tests/mutate.sh`, `tests/gates.sh --interop`/named unit
+binary as appropriate):
+
+| # | Mutation | Result |
+|---|---|---|
+| m1 | Swap the ours/theirs (parent 0/1) columns | 9 checks turned red |
+| m2 | Invert the dense-mode pruning condition | 3 checks turned red (including the hunk-count assertion, 2 vs 4 `@@@` markers) |
+| m3 | Print the funcname suffix in full (undo the off-by-one) | 2 checks turned red |
+| m4 | Remove the companion-row skip after a combinable unmerged row | 6 interop checks turned red |
+| m5 | Make `-c`/`--cc` sticky (later flag does not override) | 1 check turned red |
+| m6 | Quote `* Unmerged path`'s filename | **initially a blind spot** -- every existing interop check used an ASCII-only path, where quoting is a no-op; see the "head-on collision" fixture (control-byte filename `wei rd\ttab.txt`) added afterward, which turns this red on exactly the two checks that name quoting |
+| m7 | Reverse `coalesce_lines`'s LCS tie-break | 2 checks turned red |
+
+m7 was the one prediction that came out wrong: it was expected to stay
+green (the tie-break only matters when the LCS has more than one optimal
+alignment, which seemed unlikely to be pinned by any fixture), but sample
+(D)'s empty-result fixture -- both parents' entire content deleted, forcing
+`coalesce_lines` to interleave two full sequences -- happens to have exactly
+the kind of tie the mutation flips, and it caught it. A useful reminder that
+"probably not observable" needs the same measurement discipline as any
+other claim in this file.
+
+**`has_companion_row`'s five call sites are not equally covered by
+mutation.** Only the `print_patch` site was hit by m4 above; the other four
+(`print_name_only`, `print_name_status`, `print_numstat`,
+`build_stat_rows`) share the same indentation and structure, so a
+per-site mutation (per CLAUDE.md's "per-site vs batch" warning) cannot
+distinguish them from each other by context alone. Their correctness is
+verified by interop's per-format `p34_cmp` byte compares instead (each of
+the five non-patch formats gets its own `-c`/`--cc` comparison against real
+git in the Phase 34 A fixture) -- not by a dedicated mutation round. This is
+recorded so the next person does not read "5 call sites, 1 mutation" as an
+oversight.
+
+### Attributing a fuzz_combined mismatch: diff-of-diffs is the wrong tool
+
+`tests/fuzz_combined.py`'s 150-round baseline (measured 2026-08-28): 104
+rounds produced a real conflict, 2 mismatched. Both were run down with a
+throwaway attribution script (not checked in -- the method is what needs to
+survive, not the script) that answers one question: **is the combined layer
+introducing the divergence, or inheriting one that already exists one layer
+down?**
+
+The wrong way to answer that is to diff the two patches against each other
+(`diff <(git output) <(sg output)`) and read the result as "these lines
+changed". CLAUDE.md's `diff-of-diffs-misreads-shifted-groups` note applies
+here directly: when sg and git pick different-but-equally-minimal hunk
+splits for the SAME underlying content (the documented ~2-3% LCS-vs-Myers
+residual, Phase 26), a line-level diff of the two outputs reports a
+"content change" at every line whose position shifted, even though not one
+byte of actual file content differs. Reading that as "combined diff has a
+content bug" would be answering the wrong question.
+
+The right way, used here:
+
+1. **Multiset compare, not diff-of-diffs.** Strip both patches down to their
+   content lines (drop `diff --cc`/`index`/`---`/`+++`/`@@@` header lines,
+   strip the leading two-column `+`/`-`/` ` prefix from what remains) and
+   compare as `collections.Counter` multisets. If they are equal, every line
+   git printed and every line sg printed are the same SET of lines in a
+   different arrangement -- a positioning disagreement, not a content one.
+2. **Replay each parent-vs-result pair as an ordinary 2-way diff.** Take the
+   real ours/theirs blobs and the actual working-tree result bytes from the
+   failing round, commit each parent alone in a throwaway repo with that
+   same result content on disk, and run plain `sg diff` against plain
+   `git diff` on that 2-way comparison. If the 2-way diff ALREADY disagrees
+   with git there, the combined layer is exonerated: it is feeding a
+   correct algorithm (git's own, ported faithfully) a hunk split that
+   already diverged before combining ever ran.
+
+Both of the 150-round baseline's 2 mismatches satisfied both checks:
+identical content-line multisets, and one of the two parent-vs-result 2-way
+diffs already disagreeing with git on its own. 2/104 ~= 1.9%, inside the
+documented 2-3% band. **No mismatch was attributable to the combined layer
+itself.**
+
+### Verification
+
+Interop grew by 44 checks (1700 -> 1744): 39 from the original combined-diff
+matrix, plus 5 from the review round's "head-on collision" fixture (item 1
+above) -- all comparing sg's full byte output against
+`git -c core.quotepath=false diff` on conflicts `sg merge` itself produced
+(same "sg-made conflict, real-git oracle" idiom Phase 4b established for
+`sg status`). `tests/test_diff_combined.c` adds ten unit tests built
+directly on `sg_diff_entry` (bypassing `sg merge` for precise control over
+ours/theirs/result content), covering column order, dense's per-hunk
+pruning (not per-file), the LCS-coalesced empty-result sample, the
+deleted-result no-hunk-body case, binary, the funcname off-by-one at both
+the single-byte and 40-byte-cap edges, and the CLI's `-c`/`--cc`
+last-one-wins ordering. `python3 tests/fuzz_diff.py 200 --max-failures 0`:
+4 mismatches, unchanged from the Phase 27 baseline (combined diff is a new
+code path the fuzzer's existing 2-way generator does not exercise, so this
+number was not expected to move). `python3 tests/fuzz_combined.py 150`: 104
+conflicts, 2 mismatches, both attributed to the pre-existing LCS-vs-Myers
+residual (see above), not the combined layer. `make sanitize`: clean.

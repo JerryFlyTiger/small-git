@@ -10187,6 +10187,209 @@ p33_cmp "$P33_F" "--cached -C -M50% --name-status (a valued -M also clears -C)" 
 p33_cmp "$P33_F" "--cached -C --no-renames --name-status" --cached -C --no-renames --name-status
 p33_cmp "$P33_F" "--cached --no-renames -C --name-status" --cached --no-renames -C --name-status
 
+# Phase 34: combined diff (`sg diff -c` / `--cc`) for an unresolved conflict.
+# Every fixture is a conflict `sg merge` produces (same idiom as phase4b
+# case 2: real git recognizes an sg-made UU state as its own, so `git diff`
+# on the SAME repo is a legitimate oracle without needing `git merge` at
+# all). p34_cmp compares the FULL byte output of one format across sg and
+# real git, same discipline as p33_cmp.
+p34_cmp() {
+    p34_dir="$1"
+    p34_label="$2"
+    shift 2
+    (cd "$p34_dir" && "$SG" diff "$@") > "$WORKDIR/p34_sg.txt" 2>/dev/null
+    (cd "$p34_dir" && git -c core.quotepath=false diff "$@") > "$WORKDIR/p34_git.txt" 2>/dev/null
+    check "phase34: sg diff $p34_label matches real git byte-for-byte" \
+        cmp -s "$WORKDIR/p34_sg.txt" "$WORKDIR/p34_git.txt"
+}
+
+p34_mkconflict() {
+    p34_repo="$1"
+    p34_path="$2"
+    p34_base="$3"
+    p34_ours="$4"
+    p34_theirs="$5"
+
+    mkdir -p "$p34_repo"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$p34_repo")") > /dev/null 2>&1
+    printf '%s' "$p34_base" > "$p34_repo/$p34_path"
+    (cd "$p34_repo" && "$SG" add "$p34_path" && "$SG" commit -m base) > /dev/null 2>&1
+    (cd "$p34_repo" && "$SG" switch -c side) > /dev/null 2>&1
+    printf '%s' "$p34_theirs" > "$p34_repo/$p34_path"
+    (cd "$p34_repo" && "$SG" add "$p34_path" && "$SG" commit -m side_change) > /dev/null 2>&1
+    (cd "$p34_repo" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+    printf '%s' "$p34_ours" > "$p34_repo/$p34_path"
+    (cd "$p34_repo" && "$SG" add "$p34_path" && "$SG" commit -m ours_change) > /dev/null 2>&1
+    (cd "$p34_repo" && "$SG" merge side < /dev/null) > /dev/null 2>&1
+}
+
+# --- A: a typical unresolved conflict, still carrying markers -------------
+P34_A="$WORKDIR/p34_typical"
+p34_mkconflict "$P34_A" f.txt \
+    'a
+b
+BASE
+d
+e
+f
+g
+' \
+    'a
+b
+OURS
+d
+e
+f
+g
+' \
+    'a
+b
+SIDE
+d
+e
+f
+g
+'
+check "phase34 oracle: real git recognizes the sg-made conflict as UU" \
+    sh -c "(cd '$P34_A' && git status --porcelain) | grep -q '^UU f.txt\$'"
+for p34_fmt in --name-status --stat --numstat --shortstat --name-only; do
+    p34_cmp "$P34_A" "$p34_fmt (default: no combined)" "$p34_fmt"
+    p34_cmp "$P34_A" "-c $p34_fmt" -c "$p34_fmt"
+    p34_cmp "$P34_A" "--cc $p34_fmt" --cc "$p34_fmt"
+done
+p34_cmp "$P34_A" "(patch, default is dense)"
+p34_cmp "$P34_A" "-c (non-dense patch)" -c
+p34_cmp "$P34_A" "--cc (dense patch)" --cc
+p34_cmp "$P34_A" "-c --cc (last one wins: dense)" -c --cc
+p34_cmp "$P34_A" "--cc -c (last one wins: non-dense)" --cc -c
+check "phase34 oracle: -c --cc prints \"diff --cc\" (dense wins)" \
+    sh -c "(cd '$P34_A' && '$SG' diff -c --cc) | head -1 | grep -q '^diff --cc '"
+check "phase34 oracle: --cc -c prints \"diff --combined\" (non-dense wins)" \
+    sh -c "(cd '$P34_A' && '$SG' diff --cc -c) | head -1 | grep -q '^diff --combined '"
+
+# --- B: dense drops the hunk once the working copy matches ours exactly ---
+P34_B="$WORKDIR/p34_dense_omit"
+p34_mkconflict "$P34_B" f.txt \
+    'a
+b
+BASE
+d
+e
+f
+g
+' \
+    'a
+b
+OURS
+d
+e
+f
+g
+' \
+    'a
+b
+SIDE
+d
+e
+f
+g
+'
+printf 'a\nb\nOURS\nd\ne\nf\ng\n' > "$P34_B/f.txt"
+p34_cmp "$P34_B" "--cc (result equals ours: header only, no hunk)" --cc
+p34_cmp "$P34_B" "-c (must NOT prune the same hunk)" -c
+
+# --- C: the working copy is deleted entirely -------------------------------
+P34_C="$WORKDIR/p34_deleted"
+p34_mkconflict "$P34_C" f.txt \
+    'a
+b
+c
+' \
+    'a
+OURS
+c
+' \
+    'a
+THEIRS
+c
+'
+rm -f "$P34_C/f.txt"
+p34_cmp "$P34_C" "--cc (deleted result: header + mode line, no body)" --cc
+for p34_fmt in --stat --numstat --shortstat --name-only --name-status; do
+    p34_cmp "$P34_C" "$p34_fmt (deleted result)" --cc "$p34_fmt"
+done
+
+# --- D: --cached always "* Unmerged path", -c/--cc is a complete no-op ----
+P34_D="$WORKDIR/p34_cached"
+p34_mkconflict "$P34_D" f.txt \
+    'a
+' \
+    'b
+' \
+    'c
+'
+p34_cmp "$P34_D" "--cached (unaffected by no flag)" --cached
+p34_cmp "$P34_D" "--cached -c (must still be \"* Unmerged path\")" --cached -c
+p34_cmp "$P34_D" "--cached --cc (must still be \"* Unmerged path\")" --cached --cc
+check "phase34 oracle: real git's --cached -c is still \"* Unmerged path\"" \
+    sh -c "(cd '$P34_D' && git diff --cached -c) | grep -q '^\* Unmerged path f.txt\$'"
+
+# --- E: -c/--cc rejected together with a <rev> -- deliberate divergence ---
+# Real git switches to a completely different parent pairing (stage 1 vs the
+# named tree blob) once a <rev> is given; sg rejects outright rather than
+# approximate it (decision 0.1, same treatment as phase33's -C -C). Pin both
+# halves of the divergence, same idiom as the -C -C block above.
+check "phase34 oracle: real git DOES accept -c with a <rev>" \
+    sh -c "(cd '$P34_A' && git diff -c HEAD) > /dev/null 2>&1"
+check "phase34: sg deliberately rejects -c with a <rev>" \
+    sh -c "! (cd '$P34_A' && '$SG' diff -c HEAD) > $WORKDIR/p34_rev.txt 2>&1"
+check "phase34: and names the reason" \
+    grep -q "revision" "$WORKDIR/p34_rev.txt"
+check "phase34: --cc with a <rev> is rejected too" \
+    sh -c "! (cd '$P34_A' && '$SG' diff --cc HEAD~1) > /dev/null 2>&1"
+
+# --- F: head-on collision -- "* Unmerged path" must NOT be quoted, but the
+# SAME filename in a combined header (--- a/..., +++ b/..., diff --cc ...)
+# MUST be quoted. A single "quote everything"/"quote nothing" rule would
+# leave one of these two green for the wrong reason; mutate.sh proved this
+# by turning "* Unmerged path" quoted and finding interop stayed fully
+# green until this fixture existed (both prior checks used ASCII-only
+# names, where quoting is a no-op either way). Real git needs
+# core.quotepath=false for the combined header (>= 0x80 / control-byte
+# quoting policy, same as every other combined-diff comparison in this
+# file) but NOT for "* Unmerged path" itself -- PHASE34_ORACLE.md #1: real
+# git leaves that one line unquoted regardless of the config.
+P34Q_NAME=$(printf 'wei rd\ttab.txt')
+P34_Q="$WORKDIR/p34_quote_collision"
+p34_mkconflict "$P34_Q" "$P34Q_NAME" \
+    'a
+b
+BASE
+d
+' \
+    'a
+b
+OURS
+d
+' \
+    'a
+b
+SIDE
+d
+'
+p34_cmp "$P34_Q" "(patch, combinable: combined header must be quoted)"
+check "phase34: combined header quotes the control-byte name" \
+    sh -c "(cd '$P34_Q' && '$SG' diff) | grep -q '^diff --cc \"wei rd'"
+(cd "$P34_Q" && "$SG" diff --cached) > "$WORKDIR/p34q_sg_cached.txt" 2>/dev/null
+(cd "$P34_Q" && git -c core.quotepath=false diff --cached) > "$WORKDIR/p34q_git_cached.txt" 2>/dev/null
+check "phase34: sg diff --cached (\"* Unmerged path\", unquoted) matches real git byte-for-byte" \
+    cmp -s "$WORKDIR/p34q_sg_cached.txt" "$WORKDIR/p34q_git_cached.txt"
+check "phase34: \"* Unmerged path\" carries the RAW tab byte, not a quoted name" \
+    sh -c "grep -q \"^\* Unmerged path wei rd\$(printf '\\t')tab.txt\$\" '$WORKDIR/p34q_sg_cached.txt'"
+check "phase34 oracle: real git's \"* Unmerged path\" is unquoted too, even with core.quotepath=false unset" \
+    sh -c "(cd '$P34_Q' && git diff --cached) | grep -q \"^\* Unmerged path wei rd\$(printf '\\t')tab.txt\$\""
+
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

@@ -86,6 +86,8 @@ void sg_diff_list_filter(sg_diff_list *list, const sg_pathspec *ps)
     list->count = write;
 }
 
+static sg_diff_side side_absent(void);
+
 static int list_append(sg_diff_list *list, const char *path, const sg_diff_side *old_side,
                        const sg_diff_side *new_side)
 {
@@ -113,6 +115,12 @@ static int list_append(sg_diff_list *list, const char *path, const sg_diff_side 
     list->entries[list->count].old_side = *old_side;
     list->entries[list->count].new_side = *new_side;
     list->entries[list->count].unmerged = 0;
+    /* ABSENT for every builder except sg_diff_index_workdir, which
+       overwrites these on the unmerged row it just appended -- see
+       sg/diff.h's sg_diff_entry contract. */
+    list->entries[list->count].ours = side_absent();
+    list->entries[list->count].theirs = side_absent();
+    list->entries[list->count].result = side_absent();
     list->count++;
     return 0;
 }
@@ -499,6 +507,45 @@ static int append_index_entry_vs_workdir(const char *git_dir, const char *repo_r
     return 0;
 }
 
+/* Builds the `ours`/`theirs` side of an unmerged sg_diff_entry straight off
+   the matching stage entry -- ABSENT when that stage does not exist (e.g. an
+   add/add conflict has no stage 1, and a delete/modify conflict is missing
+   one of stage 2/3). Mirrors side_blob's convention: stores the entry's raw
+   id, chunk-pointer or not, resolved to the effective id only at render time
+   via sg_diff_side_effective_id -- same as every other BLOB side in this
+   file. */
+static sg_diff_side side_from_stage_entry(const sg_index *idx, const char *path, int stage)
+{
+    int pos = sg_index_find_stage(idx, path, stage);
+
+    if (pos < 0)
+        return side_absent();
+    return side_blob(idx->entries[pos].mode, idx->entries[pos].sha1);
+}
+
+/* Builds the `result` side of an unmerged sg_diff_entry: the working-tree
+   file at path, or ABSENT when it is missing or unreadable. Deliberately
+   simpler than append_index_entry_vs_workdir -- a working-tree file is never
+   itself a chunk pointer, so there is no effective-id resolution to do, only
+   stat + hash. "Exists but unreadable" collapses into ABSENT, same
+   convention as append_index_entry_vs_workdir uses for the same case. */
+static sg_diff_side build_result_side(const char *repo_root, const char *path)
+{
+    char abspath[SG_PATH_MAX];
+    struct stat st;
+    unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+    unsigned int wd_mode;
+
+    if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0)
+        return side_absent();
+    if (stat(abspath, &st) != 0)
+        return side_absent();
+    wd_mode = workdir_entry_mode(abspath);
+    if (sg_hash_file_blob(abspath, wd_sha1) != 0)
+        return side_absent();
+    return side_workdir(wd_sha1, wd_mode);
+}
+
 int sg_diff_index_workdir(const char *git_dir, const char *repo_root, const sg_index *idx,
                           sg_diff_list *out)
 {
@@ -521,6 +568,13 @@ int sg_diff_index_workdir(const char *git_dir, const char *repo_root, const sg_i
             if (list_append_unmerged(out, path) != 0) {
                 sg_diff_list_free(out);
                 return -1;
+            }
+            {
+                sg_diff_entry *ue = &out->entries[out->count - 1];
+
+                ue->ours = side_from_stage_entry(idx, path, 2);
+                ue->theirs = side_from_stage_entry(idx, path, 3);
+                ue->result = build_result_side(repo_root, path);
             }
 
             stage2_pos = sg_index_find_stage(idx, path, 2);

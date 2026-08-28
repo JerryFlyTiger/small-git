@@ -69,6 +69,31 @@ static int digits(long long v)
     return w;
 }
 
+/* An unmerged row is "combinable" -- git's word for "there is content on
+   both sides of the conflict to actually diff" -- iff both stage 2 (ours)
+   and stage 3 (theirs) are present. See sg/diff.h's sg_diff_entry contract:
+   only sg_diff_index_workdir ever fills ours/theirs, so this is
+   automatically false for every row sg_diff_tree_index (--cached) produces,
+   which is exactly why --cached always falls through to "* Unmerged path"
+   regardless of -c/--cc (Phase 34 oracle 1). */
+static int combinable(const sg_diff_entry *e)
+{
+    return e->unmerged && e->ours.kind != SG_DIFF_SIDE_ABSENT && e->theirs.kind != SG_DIFF_SIDE_ABSENT;
+}
+
+/* Whether the entry right after index i is the companion row a combinable
+   unmerged entry can carry -- shared by every format that needs to fold the
+   pair into one row (PHASE34_ORACLE.md #2). Deliberately checks !unmerged
+   too, not just the path: a corrupt index can put two genuinely unmerged
+   rows for the same path back to back (see CLAUDE.md's status.c/diff.c note
+   on index ordering not being validated), and those must NOT be treated as
+   an unmerged-row/companion-row pair. */
+static int has_companion_row(const sg_diff_list *list, size_t i)
+{
+    return i + 1 < list->count && !list->entries[i + 1].unmerged &&
+          strcmp(list->entries[i + 1].path, list->entries[i].path) == 0;
+}
+
 static char entry_status(const sg_diff_entry *e)
 {
     if (e->unmerged)
@@ -632,10 +657,692 @@ static int print_text_diff_body(const char *old_path, const char *new_path,
     return 0;
 }
 
-static int print_patch(const char *git_dir, const char *repo_root, const sg_diff_list *list)
+/* ---- combined diff (Phase 34: `sg diff -c` / `--cc`) ------------------ */
+
+/* This is a from-scratch port of git v2.55.0's combine-diff.c, fixed at
+   exactly 2 parents (ours = index stage 2, theirs = index stage 3) --
+   sg never needs an N-way merge here, only the one real git produces for an
+   unresolved 2-way conflict. See PHASE34_ALGO.md (written while porting)
+   for the line numbers this was derived from; the two surprises worth
+   flagging inline as they come up are noted below. */
+
+#define SG_COMBINE_MARK 0x4u          /* bit 2: this position is in a hunk */
+#define SG_COMBINE_NO_PRE_DELETE 0x8u /* bit 3: don't show its lost lines */
+#define SG_COMBINE_ALL_MASK 0x3u      /* bits 0,1: "new relative to parent n" */
+#define SG_COMBINE_CONTEXT 3
+
+/* One deleted line attached to a result position, tagged with which
+   parent(s) it was deleted from (bit n = parent n). `text` is borrowed from
+   that parent's own sg_diff_split_lines array. */
+typedef struct {
+    sg_diff_line text;
+    unsigned int parent_map;
+} combine_lost;
+
+typedef struct {
+    sg_diff_line line; /* the result line; meaningless past index cnt-1 */
+    unsigned int flag;
+    size_t p_lno[2];
+    combine_lost *lost;
+    size_t lost_count;
+    /* Per-parent holding pen, filled while combine_process_parent walks
+       that one parent's diff against the result, flushed into `lost` (via
+       coalesce_lines) before the next parent is processed. */
+    combine_lost *plost;
+    size_t plost_count, plost_cap;
+} combine_sline;
+
+static int combine_plost_append(combine_sline *sl, sg_diff_line text, unsigned int pbit)
+{
+    if (sl->plost_count == sl->plost_cap) {
+        size_t new_cap = sl->plost_cap == 0 ? 4 : sl->plost_cap * 2;
+        combine_lost *grown = realloc(sl->plost, new_cap * sizeof(*grown));
+
+        if (grown == NULL)
+            return -1;
+        sl->plost = grown;
+        sl->plost_cap = new_cap;
+    }
+    sl->plost[sl->plost_count].text = text;
+    sl->plost[sl->plost_count].parent_map = pbit;
+    sl->plost_count++;
+    return 0;
+}
+
+/* git's coalesce_lines: merges `newarr` (nnew items, all newly deleted by
+   parent `pbit`, already in that parent's own order) into the persistent
+   `*base`/`*base_count` list built up from earlier parents, via the LCS of
+   the two content sequences -- identical content collapses into one row
+   with the union of parent bits, differing content is interleaved in LCS
+   order. Always consumes (frees or reuses) `*base`'s old storage; `newarr`
+   is only read. Returns 0, or -1 on allocation failure (base unchanged). */
+static int coalesce_lines(combine_lost **base, size_t *base_count, const combine_lost *newarr,
+                          size_t nnew, unsigned int pbit)
+{
+    size_t m = *base_count;
+    size_t i, j;
+    size_t **lcs;
+    int **dir; /* 0 = BASE (keep base line), 1 = NEW, 2 = MATCH */
+    combine_lost *result;
+    size_t rc;
+
+    if (nnew == 0)
+        return 0;
+    if (m == 0) {
+        combine_lost *copy = malloc(nnew * sizeof(*copy));
+
+        if (copy == NULL)
+            return -1;
+        memcpy(copy, newarr, nnew * sizeof(*copy));
+        free(*base);
+        *base = copy;
+        *base_count = nnew;
+        return 0;
+    }
+
+    lcs = malloc((m + 1) * sizeof(*lcs));
+    dir = malloc((m + 1) * sizeof(*dir));
+    if (lcs == NULL || dir == NULL) {
+        free(lcs);
+        free(dir);
+        return -1;
+    }
+    for (i = 0; i <= m; i++) {
+        lcs[i] = calloc(nnew + 1, sizeof(size_t));
+        dir[i] = malloc((nnew + 1) * sizeof(int));
+        if (lcs[i] == NULL || dir[i] == NULL) {
+            size_t k;
+
+            for (k = 0; k <= i; k++) {
+                free(lcs[k]);
+                free(dir[k]);
+            }
+            free(lcs);
+            free(dir);
+            return -1;
+        }
+        dir[i][0] = 0;
+    }
+    for (j = 1; j <= nnew; j++)
+        dir[0][j] = 1;
+
+    for (i = 1; i <= m; i++) {
+        for (j = 1; j <= nnew; j++) {
+            if (sg_diff_lines_equal((*base)[i - 1].text, newarr[j - 1].text)) {
+                lcs[i][j] = lcs[i - 1][j - 1] + 1;
+                dir[i][j] = 2;
+            } else if (lcs[i][j - 1] >= lcs[i - 1][j]) {
+                lcs[i][j] = lcs[i][j - 1];
+                dir[i][j] = 1;
+            } else {
+                lcs[i][j] = lcs[i - 1][j];
+                dir[i][j] = 0;
+            }
+        }
+    }
+
+    result = malloc((m + nnew) * sizeof(*result));
+    if (result == NULL) {
+        for (i = 0; i <= m; i++) {
+            free(lcs[i]);
+            free(dir[i]);
+        }
+        free(lcs);
+        free(dir);
+        return -1;
+    }
+
+    rc = 0;
+    i = m;
+    j = nnew;
+    while (i != 0 || j != 0) {
+        if (dir[i][j] == 2) {
+            result[rc] = (*base)[i - 1];
+            result[rc].parent_map |= pbit;
+            rc++;
+            i--;
+            j--;
+        } else if (dir[i][j] == 1) {
+            result[rc++] = newarr[j - 1];
+            j--;
+        } else {
+            result[rc++] = (*base)[i - 1];
+            i--;
+        }
+    }
+    for (i = 0; i < rc / 2; i++) {
+        combine_lost tmp = result[i];
+
+        result[i] = result[rc - 1 - i];
+        result[rc - 1 - i] = tmp;
+    }
+
+    for (i = 0; i <= m; i++) {
+        free(lcs[i]);
+        free(dir[i]);
+    }
+    free(lcs);
+    free(dir);
+    free(*base);
+    *base = result;
+    *base_count = rc;
+    return 0;
+}
+
+/* Runs parent n's 2-way diff against the result and folds it into `sline`:
+   consume_hunk+consume_line's job (append deleted lines to the lost bucket,
+   flag added lines) followed by the "assign p_lno, coalesce plost into
+   lost" full-file pass, both from combine_diff() in combine-diff.c.
+
+   The lost-bucket index is the SAME for both a pure-deletion group and a
+   mixed add/delete group: git's nb/nb-1 split (comment_end note in
+   PHASE34_ALGO.md) resolves to sg_diff_group's own b_off either way once
+   you work through git's 1-based "insert after line N" convention -- see
+   the design note in DESIGN.md's Phase 34 section. */
+static int combine_process_parent(combine_sline *sline, size_t cnt, const sg_diff_line *parent_lines,
+                                  size_t parent_cnt, const sg_diff_line *result_lines, int n)
+{
+    sg_diff_script *script;
+    size_t k;
+    unsigned int pbit = 1u << n;
+    size_t lno;
+    size_t p_lno;
+
+    (void)result_lines;
+    script = sg_diff_build_script(parent_lines, parent_cnt, result_lines, cnt, 1);
+    if (script == NULL)
+        return -1;
+
+    for (k = 0; k < script->count; k++) {
+        const sg_diff_group *g = &script->groups[k];
+        size_t t;
+
+        for (t = 0; t < g->a_len; t++) {
+            if (combine_plost_append(&sline[g->b_off], parent_lines[g->a_off + t], pbit) != 0) {
+                sg_diff_script_free(script);
+                return -1;
+            }
+        }
+        for (t = 0; t < g->b_len; t++)
+            sline[g->b_off + t].flag |= pbit;
+    }
+    sg_diff_script_free(script);
+
+    p_lno = 1;
+    for (lno = 0; lno <= cnt; lno++) {
+        combine_sline *sl = &sline[lno];
+        size_t li;
+
+        sl->p_lno[n] = p_lno;
+        if (sl->plost_count > 0) {
+            if (coalesce_lines(&sl->lost, &sl->lost_count, sl->plost, sl->plost_count, pbit) != 0)
+                return -1;
+            free(sl->plost);
+            sl->plost = NULL;
+            sl->plost_count = 0;
+            sl->plost_cap = 0;
+        }
+        for (li = 0; li < sl->lost_count; li++)
+            if (sl->lost[li].parent_map & pbit)
+                p_lno++;
+        if (lno < cnt && !(sl->flag & pbit))
+            p_lno++;
+    }
+    sline[cnt + 1].p_lno[n] = p_lno;
+    return 0;
+}
+
+static int combine_interesting(const combine_sline *sl)
+{
+    return (sl->flag & SG_COMBINE_ALL_MASK) != 0 || sl->lost_count != 0;
+}
+
+static size_t combine_adjust_hunk_tail(const combine_sline *sline, size_t hunk_begin, size_t i)
+{
+    if (hunk_begin + 1 <= i && !(sline[i - 1].flag & SG_COMBINE_ALL_MASK))
+        i--;
+    return i;
+}
+
+static size_t combine_find_next(const combine_sline *sline, size_t i, size_t cnt, int look_for_uninteresting)
+{
+    while (i <= cnt) {
+        int marked = (sline[i].flag & SG_COMBINE_MARK) != 0;
+
+        if (look_for_uninteresting ? !marked : marked)
+            return i;
+        i++;
+    }
+    return i;
+}
+
+/* git's give_context(): grows each already-marked run by SG_COMBINE_CONTEXT
+   lines on either side, merging two runs whose gap is smaller than that.
+   Returns 1 if anything was marked, 0 if the whole file is uninteresting. */
+static int combine_give_context(combine_sline *sline, size_t cnt)
+{
+    size_t i;
+
+    i = combine_find_next(sline, 0, cnt, 0);
+    if (cnt < i)
+        return 0;
+
+    while (i <= cnt) {
+        size_t j = (SG_COMBINE_CONTEXT < i) ? (i - SG_COMBINE_CONTEXT) : 0;
+        size_t k;
+
+        while (j < i) {
+            if (!(sline[j].flag & SG_COMBINE_MARK))
+                sline[j].flag |= SG_COMBINE_NO_PRE_DELETE;
+            sline[j++].flag |= SG_COMBINE_MARK;
+        }
+
+    again:
+        j = combine_find_next(sline, i, cnt, 1);
+        if (cnt < j)
+            break;
+
+        k = combine_find_next(sline, j, cnt, 0);
+        j = combine_adjust_hunk_tail(sline, i, j);
+
+        if (k < j + SG_COMBINE_CONTEXT) {
+            while (j < k)
+                sline[j++].flag |= SG_COMBINE_MARK;
+            i = k;
+            goto again;
+        }
+
+        i = k;
+        k = (j + SG_COMBINE_CONTEXT < cnt + 1) ? j + SG_COMBINE_CONTEXT : cnt + 1;
+        while (j < k)
+            sline[j++].flag |= SG_COMBINE_MARK;
+    }
+    return 1;
+}
+
+/* git's make_hunks(): marks every "interesting" position, then, for dense
+   (--cc) mode only, prunes a whole candidate hunk when every one of its
+   differing lines points at exactly one parent -- i.e. the result equals
+   that other parent verbatim there. -c (dense == 0) skips the pruning
+   entirely and returns give_context's raw marking. */
+static int combine_make_hunks(combine_sline *sline, size_t cnt, int dense)
+{
+    size_t i;
+
+    for (i = 0; i <= cnt; i++) {
+        if (combine_interesting(&sline[i]))
+            sline[i].flag |= SG_COMBINE_MARK;
+        else
+            sline[i].flag &= ~SG_COMBINE_MARK;
+    }
+    if (!dense)
+        return combine_give_context(sline, cnt);
+
+    i = 0;
+    while (i <= cnt) {
+        size_t j, hunk_begin, hunk_end;
+        unsigned int same_diff;
+        int has_interesting;
+
+        while (i <= cnt && !(sline[i].flag & SG_COMBINE_MARK))
+            i++;
+        if (cnt < i)
+            break;
+        hunk_begin = i;
+        for (j = i + 1; j <= cnt; j++) {
+            if (!(sline[j].flag & SG_COMBINE_MARK)) {
+                size_t la;
+                int contin = 0;
+
+                la = combine_adjust_hunk_tail(sline, hunk_begin, j);
+                la = (la + SG_COMBINE_CONTEXT < cnt + 1) ? la + SG_COMBINE_CONTEXT : cnt + 1;
+                while (la > 0) {
+                    la--;
+                    if (la < j)
+                        break;
+                    if (sline[la].flag & SG_COMBINE_MARK) {
+                        contin = 1;
+                        break;
+                    }
+                }
+                if (!contin)
+                    break;
+                j = la;
+            }
+        }
+        hunk_end = j;
+
+        same_diff = 0;
+        has_interesting = 0;
+        for (j = i; j < hunk_end && !has_interesting; j++) {
+            unsigned int this_diff = sline[j].flag & SG_COMBINE_ALL_MASK;
+            size_t li;
+
+            if (this_diff) {
+                if (!same_diff)
+                    same_diff = this_diff;
+                else if (same_diff != this_diff) {
+                    has_interesting = 1;
+                    break;
+                }
+            }
+            for (li = 0; li < sline[j].lost_count && !has_interesting; li++) {
+                this_diff = sline[j].lost[li].parent_map;
+                if (!same_diff)
+                    same_diff = this_diff;
+                else if (same_diff != this_diff)
+                    has_interesting = 1;
+            }
+        }
+
+        if (!has_interesting && same_diff != SG_COMBINE_ALL_MASK) {
+            for (j = hunk_begin; j < hunk_end; j++)
+                sline[j].flag &= ~SG_COMBINE_MARK;
+        }
+        i = hunk_end;
+    }
+
+    return combine_give_context(sline, cnt);
+}
+
+static int combine_is_space(int ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\v' || ch == '\f';
+}
+
+/* Function-name candidate: combine-diff.c's OWN minimal heuristic
+   (hunk_comment_line), unrelated to find_function_name's xdiff-style rule
+   used by the 2-way patch body -- do not merge the two. */
+static int combine_comment_line(const sg_diff_line *line)
+{
+    int ch;
+
+    if (line->len == 0)
+        return 0;
+    ch = (unsigned char)line->ptr[0];
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' || ch == '$';
+}
+
+/* dump_sline's "@@@ -a,b -c,d +e,f @@@[ <funcname>]" header, including the
+   off-by-one funcname suffix (PHASE34_ORACLE.md #4: comment_end records the
+   INDEX of the last non-blank byte, and the print loop stops BEFORE it, so
+   a trailing "{" silently disappears -- this is git's own behaviour, not a
+   bug to fix here).
+
+   `comment_limit` bounds the 40-byte scan to the remaining bytes in the
+   result buffer: real git scans a NUL/newline-terminated mmap and can walk
+   past the funcname candidate's own line into whatever follows in memory.
+   sg's buffers are plain malloc'd and NOT padded, so scanning unconditionally
+   up to 40 bytes risks a heap-buffer-overflow read past the allocation on a
+   file whose last line is a short, newline-less funcname candidate --
+   clamping to what is actually left in the buffer is the deliberate,
+   memory-safe adaptation; it only differs from git's output in that exact
+   edge case (a funcname line that is simultaneously both the hunk's
+   trailing context AND the last, newline-less bytes of the file). */
+static void combine_print_hunk_header(const combine_sline *sline, size_t lno, size_t hunk_end, size_t cnt,
+                                      const sg_diff_line *hunk_comment, size_t comment_limit)
+{
+    size_t rlines = hunk_end - lno;
+    int n;
+
+    if (hunk_end > cnt)
+        rlines--;
+
+    printf("@@@");
+    for (n = 0; n < 2; n++) {
+        size_t l0 = sline[lno].p_lno[n];
+        size_t l1 = sline[hunk_end].p_lno[n];
+
+        printf(" -%zu,%zu", l0, l1 - l0);
+    }
+    printf(" +%zu,%zu ", lno + 1, rlines);
+    printf("@@@");
+
+    if (hunk_comment != NULL) {
+        size_t max_i = 40;
+        int comment_end = 0;
+        size_t i;
+
+        if (comment_limit < max_i)
+            max_i = comment_limit;
+        for (i = 0; i < max_i; i++) {
+            int ch = (unsigned char)hunk_comment->ptr[i];
+
+            if (ch == 0 || ch == '\n')
+                break;
+            if (!combine_is_space(ch))
+                comment_end = (int)i;
+        }
+        if (comment_end != 0)
+            putchar(' ');
+        for (i = 0; i < (size_t)comment_end; i++)
+            putchar(hunk_comment->ptr[i]);
+    }
+    putchar('\n');
+}
+
+/* dump_sline's body: walk hunks in order, and within each hunk, for every
+   result position print its attached (already-coalesced) lost lines first,
+   then its own line -- unless SG_COMBINE_NO_PRE_DELETE says this position's
+   lost lines were already shown as part of an earlier hunk's trailing
+   context (give_context's job). */
+static void combine_dump(const combine_sline *sline, size_t cnt, const unsigned char *result_data,
+                         size_t result_len)
+{
+    size_t lno = 0;
+    const unsigned char *result_end = result_data + result_len;
+
+    for (;;) {
+        size_t hunk_end;
+        const sg_diff_line *hunk_comment = NULL;
+
+        while (lno <= cnt && !(sline[lno].flag & SG_COMBINE_MARK)) {
+            if (combine_comment_line(&sline[lno].line))
+                hunk_comment = &sline[lno].line;
+            lno++;
+        }
+        if (cnt < lno)
+            break;
+        for (hunk_end = lno + 1; hunk_end <= cnt; hunk_end++)
+            if (!(sline[hunk_end].flag & SG_COMBINE_MARK))
+                break;
+
+        {
+            size_t comment_limit = 0;
+
+            if (hunk_comment != NULL)
+                comment_limit = (size_t)(result_end - (const unsigned char *)hunk_comment->ptr);
+            combine_print_hunk_header(sline, lno, hunk_end, cnt, hunk_comment, comment_limit);
+        }
+
+        while (lno < hunk_end) {
+            const combine_sline *sl = &sline[lno++];
+            const combine_lost *ll = (sl->flag & SG_COMBINE_NO_PRE_DELETE) ? NULL : sl->lost;
+            int j;
+
+            if (ll != NULL) {
+                size_t li;
+
+                for (li = 0; li < sl->lost_count; li++) {
+                    for (j = 0; j < 2; j++)
+                        putchar((sl->lost[li].parent_map & (1u << j)) ? '-' : ' ');
+                    printf("%.*s\n", (int)sl->lost[li].text.len, sl->lost[li].text.ptr);
+                }
+            }
+            if (cnt < lno)
+                break;
+            for (j = 0; j < 2; j++)
+                putchar((sl->flag & (1u << j)) ? '+' : ' ');
+            printf("%.*s\n", (int)sl->line.len, sl->line.ptr);
+        }
+    }
+}
+
+/* Header + hunk body for one combinable unmerged row. `dense` is
+   sg_diff_out_opts.combined != 2 -- see that header comment for the "0 means
+   PATCH's implicit dense default" rule. Reads ours/theirs/result itself
+   (print_patch never reads e->old_side/e->new_side for an unmerged row --
+   both stay ABSENT by contract, see sg/diff.h). Returns 0, or -1 after
+   printing a message (same convention as build_entry_stat/print_patch). */
+static int render_combined_patch(const char *git_dir, const char *repo_root, const sg_diff_entry *e, int dense)
+{
+    unsigned char *ours_data = NULL, *theirs_data = NULL, *result_data = NULL;
+    size_t ours_len = 0, theirs_len = 0, result_len = 0;
+    sg_chunk_missing_info missing;
+    int rc;
+    int deleted;
+    int is_binary;
+    int mode_differs;
+    unsigned char ours_eff[SG_SHA1_RAW_LEN], theirs_eff[SG_SHA1_RAW_LEN];
+    char ours_hex[SG_SHA1_HEX_LEN + 1], theirs_hex[SG_SHA1_HEX_LEN + 1];
+    unsigned int result_mode;
+
+    rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->ours, &ours_data, &ours_len, &missing);
+    if (rc == -2) {
+        sg_chunk_print_missing_error(e->path, &missing);
+        return -1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "sg: warning: cannot read %s\n", sg_quote_path_delimited(e->path));
+        return -1;
+    }
+    rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->theirs, &theirs_data, &theirs_len, &missing);
+    if (rc == -2) {
+        sg_chunk_print_missing_error(e->path, &missing);
+        free(ours_data);
+        return -1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "sg: warning: cannot read %s\n", sg_quote_path_delimited(e->path));
+        free(ours_data);
+        return -1;
+    }
+    rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->result, &result_data, &result_len, &missing);
+    if (rc == -2) {
+        sg_chunk_print_missing_error(e->path, &missing);
+        free(ours_data);
+        free(theirs_data);
+        return -1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "sg: warning: cannot read %s\n", sg_quote_path_delimited(e->path));
+        free(ours_data);
+        free(theirs_data);
+        return -1;
+    }
+
+    deleted = e->result.kind == SG_DIFF_SIDE_ABSENT;
+    result_mode = deleted ? 0 : e->result.mode;
+    /* git: mode_differs iff ANY parent's mode != the result's (0 for
+       deleted) -- NOT "the two parents differ from each other". */
+    mode_differs = (e->ours.mode != result_mode) || (e->theirs.mode != result_mode);
+
+    is_binary = is_binary_data(ours_data, ours_len) || is_binary_data(theirs_data, theirs_len) ||
+               is_binary_data(result_data, result_len);
+
+    sg_diff_side_effective_id(git_dir, &e->ours, ours_eff);
+    sg_diff_side_effective_id(git_dir, &e->theirs, theirs_eff);
+    sg_sha1_to_hex(ours_eff, ours_hex);
+    sg_sha1_to_hex(theirs_eff, theirs_hex);
+    ours_hex[7] = '\0';
+    theirs_hex[7] = '\0';
+
+    printf("diff %s %s\n", dense ? "--cc" : "--combined", sg_quote_path(e->path));
+    /* The destination side is never a real object -- the working tree copy
+       is not in the object store -- so it is always "0000000", never
+       computed (PHASE34_ORACLE.md #3). */
+    printf("index %s,%s..0000000\n", ours_hex, theirs_hex);
+    if (mode_differs) {
+        if (deleted)
+            printf("deleted file mode %06o,%06o\n", e->ours.mode, e->theirs.mode);
+        else
+            printf("mode %06o,%06o..%06o\n", e->ours.mode, e->theirs.mode, result_mode);
+    }
+
+    if (is_binary) {
+        printf("Binary files differ\n");
+        free(ours_data);
+        free(theirs_data);
+        free(result_data);
+        return 0;
+    }
+
+    printf("--- %s\n", sg_quote_path_prefixed("a/", e->path));
+    printf("+++ %s\n", deleted ? "/dev/null" : sg_quote_path_prefixed("b/", e->path));
+
+    if (deleted) {
+        /* No hunk body at all for a deleted result -- PHASE34_ORACLE.md
+           sample (E) / PHASE34_ALGO.md #7 (result_deleted skips
+           combine_diff and dump_sline both). */
+        free(ours_data);
+        free(theirs_data);
+        free(result_data);
+        return 0;
+    }
+
+    {
+        size_t na, nb, ncnt;
+        sg_diff_line *a_lines = sg_diff_split_lines(ours_data, ours_len, &na);
+        sg_diff_line *b_lines = sg_diff_split_lines(theirs_data, theirs_len, &nb);
+        sg_diff_line *r_lines = sg_diff_split_lines(result_data, result_len, &ncnt);
+        combine_sline *sline;
+        size_t i;
+        int had_error = 0;
+
+        sline = calloc(ncnt + 2, sizeof(*sline));
+        if (sline == NULL || (na != 0 && a_lines == NULL) || (nb != 0 && b_lines == NULL) ||
+           (ncnt != 0 && r_lines == NULL)) {
+            free(sline);
+            free(a_lines);
+            free(b_lines);
+            free(r_lines);
+            free(ours_data);
+            free(theirs_data);
+            free(result_data);
+            fprintf(stderr, "sg: warning: out of memory diffing %s\n", sg_quote_path_delimited(e->path));
+            return -1;
+        }
+        for (i = 0; i < ncnt; i++)
+            sline[i].line = r_lines[i];
+
+        if (combine_process_parent(sline, ncnt, a_lines, na, r_lines, 0) != 0 ||
+           combine_process_parent(sline, ncnt, b_lines, nb, r_lines, 1) != 0)
+            had_error = 1;
+
+        if (!had_error) {
+            combine_make_hunks(sline, ncnt, dense);
+            combine_dump(sline, ncnt, result_data, result_len);
+        }
+
+        for (i = 0; i < ncnt + 2; i++) {
+            free(sline[i].lost);
+            free(sline[i].plost);
+        }
+        free(sline);
+        free(a_lines);
+        free(b_lines);
+        free(r_lines);
+        free(ours_data);
+        free(theirs_data);
+        free(result_data);
+
+        if (had_error) {
+            fprintf(stderr, "sg: warning: out of memory diffing %s\n", sg_quote_path_delimited(e->path));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int print_patch(const char *git_dir, const char *repo_root, const sg_diff_list *list, int combined)
 {
     size_t i;
     int had_error = 0;
+    /* PATCH's default IS dense combined, even with no -c/--cc at all
+       (PHASE34_ORACLE.md #2) -- only an explicit -c (combined == 2) turns
+       off density. */
+    int dense = combined != 2;
+    int skip_next = 0;
 
     for (i = 0; i < list->count; i++) {
         const sg_diff_entry *e = &list->entries[i];
@@ -649,13 +1356,33 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
         int wrote_mode_line;
         int content_changed;
 
-        /* Deliberate divergence from real git, which prints a "diff --cc"
-           combined-diff format for an unresolved conflict -- not
-           implemented this round (see CLAUDE.md's PATCH format note). Both
-           sides of an unmerged sg_diff_entry are ABSENT (sg/diff.h), so
-           there is no single pair of blobs to diff anyway. */
-        if (e->unmerged)
+        if (skip_next) {
+            skip_next = 0;
             continue;
+        }
+
+        if (e->unmerged) {
+            /* The companion row (stage2-vs-workdir) that
+               sg_diff_index_workdir appends right after a combinable
+               unmerged row is a plain, non-unmerged entry sharing the same
+               path -- render the combined diff in its place and swallow it,
+               same as real git (PHASE34_ORACLE.md #1: "no longer prints the
+               companion's own 2-way patch"). */
+            if (combinable(e)) {
+                if (render_combined_patch(git_dir, repo_root, e, dense) != 0)
+                    had_error = 1;
+                if (has_companion_row(list, i))
+                    skip_next = 1;
+                continue;
+            }
+            /* Not combinable (only one of stage2/stage3 present) --
+               "* Unmerged path" plus, when it exists, the ordinary 2-way
+               companion row right after it (PHASE34_ORACLE.md #1). Path is
+               deliberately unquoted -- see the "printing a path" rule's
+               fourth exception in CLAUDE.md. */
+            printf("* Unmerged path %s\n", e->path);
+            continue;
+        }
 
         old_present = e->old_side.kind != SG_DIFF_SIDE_ABSENT;
         new_present = e->new_side.kind != SG_DIFF_SIDE_ABSENT;
@@ -790,21 +1517,37 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
 
 /* ---- NAME_ONLY / NAME_STATUS (no content reads needed) ---------------- */
 
-static int print_name_only(const sg_diff_list *list)
+static int print_name_only(const sg_diff_list *list, int combined)
 {
     size_t i;
-
-    for (i = 0; i < list->count; i++)
-        printf("%s\n", sg_quote_path(list->entries[i].path));
-    return 0;
-}
-
-static int print_name_status(const sg_diff_list *list)
-{
-    size_t i;
+    int skip_next = 0;
 
     for (i = 0; i < list->count; i++) {
         const sg_diff_entry *e = &list->entries[i];
+
+        if (skip_next) {
+            skip_next = 0;
+            continue;
+        }
+        printf("%s\n", sg_quote_path(e->path));
+        if (combined != 0 && combinable(e) && has_companion_row(list, i))
+            skip_next = 1;
+    }
+    return 0;
+}
+
+static int print_name_status(const sg_diff_list *list, int combined)
+{
+    size_t i;
+    int skip_next = 0;
+
+    for (i = 0; i < list->count; i++) {
+        const sg_diff_entry *e = &list->entries[i];
+
+        if (skip_next) {
+            skip_next = 0;
+            continue;
+        }
 
         /* A rename is the one row with two paths and a score. Measured
            against git 2.55.0: "R100\told\tnew", the score three digits and
@@ -815,6 +1558,15 @@ static int print_name_status(const sg_diff_list *list)
             printf("%c%03d\t%s\t%s\n", e->is_copy ? 'C' : 'R', e->score,
                   sg_quote_path(e->old_path),
                   sg_quote_path(e->path));
+            continue;
+        }
+        /* Combinable + -c/--cc: one row, two status letters (one per
+           parent) -- measured "MM" in every shape tested
+           (PHASE34_ORACLE.md #2), never any other two-letter combination. */
+        if (combined != 0 && combinable(e)) {
+            printf("MM\t%s\n", sg_quote_path(e->path));
+            if (has_companion_row(list, i))
+                skip_next = 1;
             continue;
         }
         printf("%c\t%s\n", entry_status(e), sg_quote_path(e->path));
@@ -932,14 +1684,27 @@ static char *entry_display_name(const sg_diff_entry *e)
     return strdup(sg_quote_path(e->path));
 }
 
-static int print_numstat(const char *git_dir, const char *repo_root, const sg_diff_list *list)
+static int print_numstat(const char *git_dir, const char *repo_root, const sg_diff_list *list, int combined)
 {
     size_t i;
     int had_error = 0;
+    int skip_next = 0;
 
     for (i = 0; i < list->count; i++) {
         const sg_diff_entry *e = &list->entries[i];
         entry_stat st;
+
+        if (skip_next) {
+            skip_next = 0;
+            continue;
+        }
+        /* Combinable + -c/--cc: the row disappears entirely, not even
+           "0\t0" -- and so does its companion (PHASE34_ORACLE.md #2). */
+        if (combined != 0 && combinable(e)) {
+            if (has_companion_row(list, i))
+                skip_next = 1;
+            continue;
+        }
 
         if (build_entry_stat(git_dir, repo_root, e, &st) != 0) {
             had_error = 1;
@@ -978,10 +1743,11 @@ typedef struct {
 } stat_row;
 
 static int build_stat_rows(const char *git_dir, const char *repo_root, const sg_diff_list *list,
-                           stat_row **rows_out, size_t *count_out, int *had_error)
+                           int combined, stat_row **rows_out, size_t *count_out, int *had_error)
 {
     stat_row *rows;
     size_t n = 0, i;
+    int skip_next = 0;
 
     *rows_out = NULL;
     *count_out = 0;
@@ -995,6 +1761,20 @@ static int build_stat_rows(const char *git_dir, const char *repo_root, const sg_
     for (i = 0; i < list->count; i++) {
         const sg_diff_entry *e = &list->entries[i];
         entry_stat st;
+
+        if (skip_next) {
+            skip_next = 0;
+            continue;
+        }
+        /* Combinable + -c/--cc: the row (and its companion) vanish entirely
+           -- not even " Unmerged" (PHASE34_ORACLE.md #2, --stat's own row
+           disappears too, unlike --numstat's still-present-but-zero shape
+           for other formats). */
+        if (combined != 0 && combinable(e)) {
+            if (has_companion_row(list, i))
+                skip_next = 1;
+            continue;
+        }
 
         if (build_entry_stat(git_dir, repo_root, e, &st) != 0) {
             *had_error = 1;
@@ -1137,7 +1917,7 @@ static int print_stat(const char *git_dir, const char *repo_root, const sg_diff_
     int files_changed = 0;
     long insertions = 0, deletions = 0;
 
-    if (build_stat_rows(git_dir, repo_root, list, &rows, &n, &had_error) != 0)
+    if (build_stat_rows(git_dir, repo_root, list, opts->combined, &rows, &n, &had_error) != 0)
         return -1;
 
     if (n == 0) {
@@ -1224,17 +2004,17 @@ int sg_diff_print(const char *git_dir, const char *repo_root, const sg_diff_list
 {
     switch (opts->format) {
     case SG_DIFF_FORMAT_PATCH:
-        return print_patch(git_dir, repo_root, list);
+        return print_patch(git_dir, repo_root, list, opts->combined);
     case SG_DIFF_FORMAT_STAT:
         return print_stat(git_dir, repo_root, list, opts, 0);
     case SG_DIFF_FORMAT_SHORTSTAT:
         return print_stat(git_dir, repo_root, list, opts, 1);
     case SG_DIFF_FORMAT_NUMSTAT:
-        return print_numstat(git_dir, repo_root, list);
+        return print_numstat(git_dir, repo_root, list, opts->combined);
     case SG_DIFF_FORMAT_NAME_ONLY:
-        return print_name_only(list);
+        return print_name_only(list, opts->combined);
     case SG_DIFF_FORMAT_NAME_STATUS:
-        return print_name_status(list);
+        return print_name_status(list, opts->combined);
     default:
         return -1;
     }
