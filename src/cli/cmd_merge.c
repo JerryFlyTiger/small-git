@@ -92,11 +92,22 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     int rc = 1;
     /* What "our" side is called: in conflict markers, in the generated merge
        message, and in the summary line. sg names the branch where real git
-       always writes HEAD -- a pre-existing divergence pinned by phase4b --
-       but with HEAD detached there is no branch to name and git's own answer
-       is the only one available. Computed once: passing current_branch
-       straight through is what made a conflicting detached merge write NULL
-       into the "<<<<<<< %s" marker and crash. */
+       always writes HEAD -- a deliberate divergence -- but with HEAD
+       detached there is no branch to name and git's own answer is the only
+       one available. Computed once: passing current_branch straight through
+       is what made a conflicting detached merge write NULL into the
+       "<<<<<<< %s" marker and crash.
+
+       This comment used to claim the divergence was "pinned by phase4b".
+       It was not: measured in Phase 41, interop's only three mentions of
+       "<<<<<<<" assert the marker is ABSENT after an abort (twice) and pin
+       the STASH labels (once, a different call site), and
+       tests/test_merge_content.c pins only that sg_merge_content writes
+       whatever label its caller hands it -- never which label this function
+       picks. The pin the comment promised now exists, in interop's phase41
+       group, on both sides as this project's convention for a deliberate
+       divergence requires. A comment asserting a guard that is not there is
+       worse than no comment: it stops the next reader adding one. */
     const char *ours_label = (current_branch != NULL) ? current_branch : "HEAD";
 
     if (sg_commit_tree_of(git_dir, ours_commit, ours_tree) != 0 ||

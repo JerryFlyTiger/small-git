@@ -22,6 +22,7 @@ bash tests/interop.sh             # interop test against real git (needs a prior
 make sanitize                     # clean + rebuild with ASan/UBSan + run unit tests
 python3 tests/fuzz_ignore.py      # .gitignore consistency fuzzer (200 rounds by default)
 python3 tests/fuzz_diff.py        # patch output consistency fuzzer (200 rounds by default)
+python3 tests/fuzz_merge.py       # three-way merge vs real git (200 rounds by default)
 ```
 
 **Run the first four gates in one shot: `bash tests/gates.sh`** (`--sanitize`
@@ -394,17 +395,76 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   mapping trap (Myers runs in a coordinate space `xdl_cleanup_records`
   compacted, and writing `changed[]` back at the wrong index is the easiest
   way to get this wrong) and the perf numbers, are in Phase 35 of
-  `docs/DESIGN.md`. **`src/workdir/merge.c`'s three-way merge still calls
-  `sg_diff_lcs_table`/`_exact` directly and rolls its own backtrack,
-  bypassing `sg_diff_build_script` entirely -- it was deliberately left on
-  the old LCS backtrack** (Phase 35 scope decision: no fuzzer covers
-  merge's alignment, so there was no net to change its behaviour under).
-  Both public LCS-table functions (`sg_diff_lcs_table`/`_exact`) stay in
-  `diff_lcs.c` unchanged, only for that caller now. When touching
+  `docs/DESIGN.md`. **Since Phase 41 `src/workdir/merge.c`'s three-way
+  merge uses this same aligner** -- Phase 35 deliberately left it on the old
+  LCS backtrack because no fuzzer covered merge's alignment, and Phase 41
+  built that net (`tests/fuzz_merge.py`) first, then moved it. That made
+  merge the LAST caller of `sg_diff_lcs_table`/`_exact`/`_free_table`, so
+  **those three are gone**; do not reintroduce an LCS table, and note the
+  reason is not output (holding has_nl constant, Myers and an exact LCS
+  backtrack produced identical output on all 200 rounds) but cost: 6000
+  lines a side was 602 MB / 0.37s with the table and 10.8 MB / <0.01s with
+  Myers, measured. `sg_diff_lines_equal` (has_nl-blind) survives only for
+  `diff_out.c`'s combined diff. When touching
   `diff_out.c` / `diff_lcs.c` / `workdir/diff.c`, a green `make test`
   **does not count**, run `python3 tests/fuzz_diff.py 500 --max-failures 0`
   (across a few different `--seed` values, not just the default) and
   report the actual mismatch count -- it should stay 0.
+- **The three-way merge (`sg_merge_content`, `src/workdir/merge.c`) builds a
+  region list and post-processes it, it does not append bytes as it
+  classifies** (Phase 41). Order is fixed and is git's: sync-point
+  classification -> `refine_conflicts` -> `simplify_conflicts` ->
+  `emit_regions`. When touching any of it, a green `make test` **does not
+  count**: run `python3 tests/fuzz_merge.py 200` AND
+  `python3 tests/fuzz_merge.py 200 --no-newline-edits` (real git is the
+  oracle) and report both counts -- baseline for both is **0**, re-measured
+  at 200 rounds x 4 seed ranges.
+  WARNING: **line comparison here is has_nl-AWARE**
+  (`sg_diff_lines_equal_exact`), on both the alignment and the span
+  comparison. It was has_nl-blind until Phase 41, and that one choice meant
+  "ours' only edit was removing the trailing newline" read as "ours changed
+  nothing": theirs was taken, the user's edit was discarded, and the merge
+  reported SUCCESS. 29.5% of fuzz rounds mismatched real git because of it.
+  WARNING: **a line with `has_nl == 0` is the last line of ITS file, but the
+  merged output interleaves three files**, so it can still be followed by
+  something. `bytebuf_ensure_nl` terminates it (git does the same in
+  `xdl_recs_copy`); without it the output contains a line that appears in
+  none of the three inputs, e.g. `base14=======`.
+  WARNING: **an EMPTY region must not even terminate the previous line.**
+  The sync-point pass pushes a zero-length region after the final anchor as
+  a matter of course, so calling `bytebuf_ensure_nl` before writing nothing
+  gives a file that legitimately ends without a newline one it never had --
+  including on a merge that resolved to "unchanged", i.e. rewriting a file
+  it did not merge. `tests/fuzz_merge.py` was blind to this for a whole
+  review round: an anchor is always a BASE line and only a file's own last
+  line can carry `has_nl == 0`, so while `gen_base` newline-terminated every
+  line the shape was unreachable and 0/200 meant nothing about it. The
+  generator now strips base's trailing newline 15% of the time; with the
+  guard reverted the old generator still reports 0/200 and the new one
+  reports 20/200.
+  WARNING: **the empty-region guard asks about the side being PRINTED**
+  (`from == to` after `take_theirs` is applied), not about the ours side.
+  For a one-sided pure insertion the two questions differ, and asking the
+  wrong one drops the inserted run entirely rather than misplacing a
+  newline. Both directions are pinned by their own fixture; before those
+  existed all 13 named tests stayed green under that mutation while
+  `fuzz_merge.py` caught it 54/200 -- probabilistic coverage, no witness.
+  WARNING: **two conflicts separated by at most 3 identical lines print as
+  ONE conflict** (`SG_MERGE_CONFLICT_GAP`, git's
+  `xdl_simplify_non_conflicts`; measured: 0-3 merge, 4 splits) -- **but a
+  one-sided change inside the gap blocks the merge however short it is**,
+  which is why regions carry a `REGION_RESOLVED` kind distinct from
+  `REGION_SAME`. A distance-only rule passes the gap-3 test and fails the
+  resolved-change one; both are in `tests/test_merge_content.c` as a pair.
+  WARNING: **a conflict's two sides are diffed against EACH OTHER and what
+  they agree on is hoisted out of the conflict** (git's
+  `xdl_refine_conflict`), and this runs BEFORE simplification, not after --
+  refinement splits conflicts, simplification then decides which pieces are
+  too close together to keep apart. Reversing them changes the answer.
+  WARNING: **do not write down that sg's three-way merge is a port of
+  `xdl_merge`.** The sync-point layer underneath these two passes is sg's
+  own design. It agrees with git on 800 fuzz rounds; that is a measurement,
+  not an equivalence.
 - **pathspec always goes through `sg_pathspec_*`** (`include/sg/pathspec.h`,
   Phase 28); the matching rule is **three ordered clauses**: exact literal
   match, literal directory prefix, only fall through to `sg_wildmatch` if the
@@ -991,7 +1051,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 
 ## Deliberate divergences from real git
 
-Four places where sg's answer differs from real git **on purpose**, not by
+Five places where sg's answer differs from real git **on purpose**, not by
 oversight -- each was measured against git 2.55.0, each is pinned on both
 sides by an interop check (so accidentally "fixing" one back into silent
 agreement with git would itself go undetected without the pin), and none of
@@ -1020,6 +1080,20 @@ why the divergence exists.
    NOT apply** to a `<src>` that resolves to nothing (`error: src refspec
    ... does not match any`) -- git's own exit code there is already 1, no
    divergence to pin.
+5. **`sg merge`'s conflict-marker "ours" label names the current branch
+   where real git always writes `HEAD`** (`cmd_merge.c`'s `ours_label`,
+   which also feeds the generated merge message and the summary line).
+   Measured in Phase 41 across five situations -- a differently named
+   branch, merging a tag, a detached HEAD, and rebase -- git's ours label is
+   invariant; only the theirs label varies. **This is the oldest entry on
+   this list and the last to get a witness**: it predates the list, and
+   `cmd_merge.c`'s own comment claimed it was "pinned by phase4b" when no
+   such check existed. Pinned on both sides since Phase 41 (interop's
+   `phase41` group), including the asymmetry that **a detached HEAD makes
+   the divergence disappear** -- `current_branch` is NULL there and sg falls
+   back to git's own answer. `sg rebase` and `sg stash` are NOT on this
+   list: rebase passes a literal `"HEAD"` and matches git, and stash's
+   `Updated upstream`/`Stashed changes` match git's too.
 
 ## Core types cheat sheet
 

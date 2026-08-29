@@ -6,13 +6,13 @@
 /* A line viewed into an existing buffer -- ptr/len are borrowed, never
    owned. len excludes the trailing '\n'; has_nl records whether one
    actually followed in the source (false only for a final line that isn't
-   newline-terminated). Historically shared by `sg diff`'s unified-diff
-   printer and the three-way merge's line alignment; since Phase 35,
-   sg_diff_build_script no longer uses this LCS table at all (it runs git's
-   Myers algorithm instead -- see that function's own comment), so the ONLY
-   remaining caller of sg_diff_lcs_table/_exact below is
-   src/workdir/merge.c's three-way merge, which rolls its own backtrack
-   over the table directly. */
+   newline-terminated). Shared by `sg diff`'s unified-diff printer and
+   by src/workdir/merge.c's three-way merge, which have used the SAME aligner
+   (sg_diff_build_script, git's Myers algorithm) since Phase 41. Merge was the
+   last caller of the O(na*nb) LCS table that used to be declared here, and
+   the table went with it -- not tidiness: at 6000 lines a side that table
+   allocated 602 MB and took 0.37s, where Myers takes 10.8 MB and under 0.01s
+   for the same merge result (measured). */
 typedef struct {
     const char *ptr;
     size_t len;
@@ -30,28 +30,16 @@ int sg_diff_lines_equal(sg_diff_line a, sg_diff_line b);
    treats "same text, different newline-termination" as a different line
    (Phase 26, measured: a final line missing its newline prints as its own
    -/+ row plus a following "\ No newline at end of file", never silently
-   merged with an identically-spelled earlier line). Only the PATCH body
-   needs this distinction -- sg_diff_lines_equal is left untouched because
-   src/workdir/merge.c's three-way merge shares it and must not change
-   behaviour here (see that file's own comment on why it ignores has_nl). */
+   merged with an identically-spelled earlier line).
+
+   The three-way merge needs it too, since Phase 41. It used to compare
+   has_nl-blind on purpose, and that one choice was the dominant source of
+   merge mismatch against real git: when ours' ONLY edit was removing a
+   trailing newline, the merge read it as "ours changed nothing", took
+   theirs, and reported success -- discarding a user's edit silently. The
+   has_nl-blind sg_diff_lines_equal survives because src/cli/diff_out.c's
+   combined diff still wants it. */
 int sg_diff_lines_equal_exact(sg_diff_line a, sg_diff_line b);
-
-/* Builds the (na+1) x (nb+1) LCS length table: dp[i][j] = length of the
-   longest common subsequence of a[i..na) and b[j..nb). Returns a malloc'd
-   array of na+1 malloc'd rows (each nb+1 size_t entries), or NULL on
-   allocation failure. Free with sg_diff_lcs_free_table. */
-size_t **sg_diff_lcs_table(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb);
-void sg_diff_lcs_free_table(size_t **dp, size_t na);
-
-/* Same table, but classifying lines with sg_diff_lines_equal_exact instead
-   of sg_diff_lines_equal. Before Phase 35 this fed sg_diff_build_script, so
-   the has_nl distinction would actually drive the patch-body alignment, not
-   just the final printed marker -- that caller is gone now (Myers
-   classifies lines itself, has_nl-aware, without building this table at
-   all). Nothing in-tree calls this one any more; kept as public API in
-   case a future has_nl-aware caller of sg_diff_lcs_table needs it (today
-   src/workdir/merge.c uses the plain, non-exact table instead). */
-size_t **sg_diff_lcs_table_exact(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb);
 
 /* ---- minimal edit script (patch-body intermediate representation) ---- */
 

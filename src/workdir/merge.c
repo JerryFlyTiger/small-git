@@ -248,6 +248,26 @@ static int bytebuf_append_line(bytebuf *b, sg_diff_line line)
     return 0;
 }
 
+/* Terminates whatever was written last, so the next thing appended starts on
+   a line of its own. A line with has_nl == 0 is by construction the LAST line
+   of its own file, but the merged output interleaves three files, so that
+   line can still be followed by another side's lines or by a conflict marker
+   -- and then it has to grow the newline it never had. Measured against real
+   git: with ours ending "base14" (no trailing newline) inside a conflict,
+   git writes "base14\n=======", sg used to write "base14=======", inventing a
+   line that appears in none of the three inputs. git does this in xdl_merge
+   the same way, by passing add_nl to xdl_recs_copy when it copies a side into
+   a conflict region.
+
+   Called before every append that follows content, never after the last one,
+   so a file that legitimately ends without a newline still ends without one. */
+static int bytebuf_ensure_nl(bytebuf *b)
+{
+    if (b->len > 0 && b->buf[b->len - 1] != '\n')
+        return bytebuf_append(b, "\n", 1);
+    return 0;
+}
+
 static int bytebuf_append_lines(bytebuf *b, const sg_diff_line *lines, size_t start, size_t end)
 {
     size_t k;
@@ -264,6 +284,16 @@ static int content_has_nul(const unsigned char *data, size_t len)
     return len > 0 && memchr(data, '\0', len) != NULL;
 }
 
+/* Compares two spans line for line, has_nl INCLUDED (Phase 41). Before the
+   Myers swap this used the has_nl-blind sg_diff_lines_equal, and that single
+   choice was the dominant source of merge mismatch against real git: with
+   base "x\ny\nz\n" and ours "x\ny\nz" (the only edit being the removal of
+   the trailing newline), ours_eq_base came out TRUE, so the span was resolved
+   as "ours changed nothing", theirs was taken, and the user's edit was
+   silently discarded while the merge reported success. Measured against git,
+   which conflicts there. The alignment above is has_nl-aware now, so leaving
+   this one blind would keep the same span misclassified even after the two
+   sides stopped being matched. */
 static int segment_equal(const sg_diff_line *a, size_t as, size_t ae, const sg_diff_line *b,
                          size_t bs, size_t be)
 {
@@ -274,42 +304,293 @@ static int segment_equal(const sg_diff_line *a, size_t as, size_t ae, const sg_d
     if (na != nb)
         return 0;
     for (k = 0; k < na; k++) {
-        if (!sg_diff_lines_equal(a[as + k], b[bs + k]))
+        if (!sg_diff_lines_equal_exact(a[as + k], b[bs + k]))
             return 0;
     }
     return 1;
 }
 
-/* Backtracks an LCS table (built over a as rows, b as columns) into a
-   match array of size na: match[i] = the b-index a[i] was aligned to, or -1
-   if a[i] wasn't part of the alignment. This is exactly the walk `sg diff`
-   uses to classify +/-/context lines, reused here to find base<->ours and
-   base<->theirs alignments. Returns NULL on allocation failure. */
-static long *lcs_matches(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
-                        size_t **dp)
-{
-    long *match = malloc((na > 0 ? na : 1) * sizeof(*match));
-    size_t i, j;
+/* Aligns a against b with sg_diff_build_script (git's Myers algorithm, the
+   same aligner `sg diff`'s patch bodies have used since Phase 35) and returns
+   a match array of size na: match[i] = the b-index a[i] was aligned to, or -1
+   if a[i] is inside a changed run. Returns NULL on allocation failure.
 
-    if (match == NULL)
+   This is the adapter Phase 41 exists to add: sg_diff_build_script speaks
+   sg_diff_group (a_off/a_len paired with b_off/b_len), while the sync-point
+   pass below needs the per-line match array the old LCS backtrack produced.
+   The conversion is a single walk because outside the groups the two sides
+   run in lockstep -- that is exactly what "between two consecutive groups,
+   a[..]==b[..] line for line" in sg_diff_build_script's contract means.
+
+   The lockstep walk is written to stop on EITHER side's bound rather than
+   just a's, so a group list that ever violated that contract would leave
+   lines unmatched (-1, "not aligned") instead of writing a b-index past nb
+   into match[] -- the failure direction has to be "no sync point here",
+   never an out-of-range index that the sync-point pass would then use to
+   subscript ours_lines/theirs_lines. */
+static long *script_matches(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb)
+{
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    long *match;
+    size_t i, ai = 0, bi = 0;
+
+    if (script == NULL)
         return NULL;
+    match = malloc((na > 0 ? na : 1) * sizeof(*match));
+    if (match == NULL) {
+        sg_diff_script_free(script);
+        return NULL;
+    }
     for (i = 0; i < na; i++)
         match[i] = -1;
 
-    i = 0;
-    j = 0;
-    while (i < na && j < nb) {
-        if (sg_diff_lines_equal(a[i], b[j])) {
-            match[i] = (long)j;
-            i++;
-            j++;
-        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-            i++;
-        } else {
-            j++;
+    for (i = 0; i < script->count; i++) {
+        const sg_diff_group *g = &script->groups[i];
+
+        while (ai < g->a_off && bi < g->b_off) {
+            match[ai] = (long)bi;
+            ai++;
+            bi++;
+        }
+        ai = g->a_off + g->a_len;
+        bi = g->b_off + g->b_len;
+    }
+    while (ai < na && bi < nb) {
+        match[ai] = (long)bi;
+        ai++;
+        bi++;
+    }
+
+    sg_diff_script_free(script);
+    return match;
+}
+
+/* ---- the merged output as a region list (Phase 41) ----
+
+   git's xdl_merge does not write bytes as it classifies. It builds a list of
+   regions and then post-processes that list TWICE -- xdl_refine_conflict,
+   then xdl_simplify_non_conflicts -- and both passes need to see a region's
+   neighbours. sg's sync-point pass used to append straight into the output
+   buffer, which made both passes inexpressible; this list is what makes them
+   expressible, and both are implemented below.
+
+   Every region carries BOTH sides' line ranges, not just the text that will
+   be printed: merging two conflicts across a gap has to reproduce the gap
+   inside each side of the combined conflict, in that side's own words, and
+   the gap is not necessarily the same text on the two sides. */
+typedef enum {
+    /* Identical on both sides. Does NOT block merging two conflicts across
+       it -- git keeps such lines out of its changes list entirely, so its
+       simplify pass never sees them as an obstacle, only as distance. */
+    REGION_SAME,
+    /* Exactly one side changed and its version won (git's mode != 0). This
+       DOES block merging two conflicts across it, however short it is --
+       measured against git 2.55.0, see the gap table in Phase 41 of
+       docs/DESIGN.md: with a one-line ours-only change inside a 3-line gap,
+       git leaves two conflicts where a purely distance-based rule would
+       have produced one. */
+    REGION_RESOLVED,
+    REGION_CONFLICT
+} region_kind;
+
+typedef struct {
+    size_t os, oe; /* ours lines [os, oe) */
+    size_t ts, te; /* theirs lines [ts, te) */
+    region_kind kind;
+    int take_theirs; /* SAME/RESOLVED: whose text gets printed */
+} merge_region;
+
+typedef struct {
+    merge_region *v;
+    size_t count, cap;
+} region_list;
+
+static void region_list_free(region_list *l)
+{
+    free(l->v);
+    l->v = NULL;
+    l->count = 0;
+    l->cap = 0;
+}
+
+static int region_push(region_list *l, size_t os, size_t oe, size_t ts, size_t te,
+                       region_kind kind, int take_theirs)
+{
+    merge_region *r;
+
+    if (l->count == l->cap) {
+        size_t cap = l->cap == 0 ? 16 : l->cap * 2;
+        merge_region *grown = realloc(l->v, cap * sizeof(*grown));
+
+        if (grown == NULL)
+            return -1;
+        l->v = grown;
+        l->cap = cap;
+    }
+    r = &l->v[l->count++];
+    r->os = os;
+    r->oe = oe;
+    r->ts = ts;
+    r->te = te;
+    r->kind = kind;
+    r->take_theirs = take_theirs;
+    return 0;
+}
+
+/* git's "zealous" conflict refinement (xdiff/xmerge.c's xdl_refine_conflict):
+   diff the two conflicting sides against EACH OTHER and hoist whatever they
+   agree on out of the conflict, leaving only the runs they actually disagree
+   about between the markers.
+
+   sg's three-way layer got by without this until Phase 41 because its
+   alignment was has_nl-blind, which happened to place many of these agreed
+   lines outside the conflict as sync points instead. Making the alignment
+   exact is what exposed the gap. Measured, base "A\nB" (no trailing newline)
+   against ours "A\nB\nC\n" and theirs "A\nB\nD\n": base's "B" no longer
+   matches either side's "B\n", so the whole tail becomes one conflict, yet
+   real git still prints "B" as ordinary context above the marker, because it
+   refines. Without this pass sg printed "B" twice, once inside each side --
+   which is what tests/test_merge_content.c's test_anchor_newline_not_glued
+   caught, and it is the reason that test was written to look at bytes.
+
+   Like git, a conflict with an empty side is not refined: there is nothing to
+   agree on. The hoisted runs are taken from ours, which is sound only because
+   the aligner matched them has_nl-aware, so the two sides are identical
+   bytes. */
+static int refine_conflicts(const region_list *in, region_list *out, const sg_diff_line *ours,
+                            const sg_diff_line *theirs)
+{
+    size_t i;
+
+    for (i = 0; i < in->count; i++) {
+        const merge_region *r = &in->v[i];
+        sg_diff_script *script;
+        size_t j, ai, bi;
+        int rc = -1;
+
+        if (r->kind != REGION_CONFLICT || r->os == r->oe || r->ts == r->te) {
+            if (region_push(out, r->os, r->oe, r->ts, r->te, r->kind, r->take_theirs) != 0)
+                return -1;
+            continue;
+        }
+
+        script = sg_diff_build_script(ours + r->os, r->oe - r->os, theirs + r->ts,
+                                     r->te - r->ts, 0);
+        if (script == NULL)
+            return -1;
+
+        ai = r->os;
+        bi = r->ts;
+        for (j = 0; j < script->count; j++) {
+            const sg_diff_group *g = &script->groups[j];
+            size_t ca = r->os + g->a_off, cb = r->ts + g->b_off;
+
+            if (ca > ai && region_push(out, ai, ca, bi, cb, REGION_SAME, 0) != 0)
+                goto group_done;
+            if (region_push(out, ca, ca + g->a_len, cb, cb + g->b_len, REGION_CONFLICT, 0) != 0)
+                goto group_done;
+            ai = ca + g->a_len;
+            bi = cb + g->b_len;
+        }
+        if (ai < r->oe && region_push(out, ai, r->oe, bi, r->te, REGION_SAME, 0) != 0)
+            goto group_done;
+        rc = 0;
+
+group_done:
+        sg_diff_script_free(script);
+        if (rc != 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Two conflicts separated by at most this many identical lines are printed as
+   one conflict. git's own constant (xdl_simplify_non_conflicts' `end - begin
+   > 3`), re-measured here rather than recalled: with a plain gap of 0-3 lines
+   real git prints one conflict block, at 4 it prints two. */
+#define SG_MERGE_CONFLICT_GAP 3
+
+/* git's xdl_simplify_non_conflicts. Runs AFTER refinement, on purpose and in
+   that order: refinement splits conflicts apart, and this pass then decides
+   which of the pieces are too close together to be worth separating. Doing it
+   the other way round would let a gap that refinement is about to create
+   escape the rule.
+
+   REGION_RESOLVED blocks a merge no matter how short the gap is, which is why
+   the distance is not the only thing tracked -- see region_kind's comment for
+   the measurement. */
+static void simplify_conflicts(region_list *l)
+{
+    size_t i;
+
+    for (i = 0; i < l->count; i++) {
+        size_t j, gap = 0, merge_to = i;
+
+        if (l->v[i].kind != REGION_CONFLICT)
+            continue;
+        for (j = i + 1; j < l->count; j++) {
+            if (l->v[j].kind == REGION_CONFLICT) {
+                merge_to = j;
+                gap = 0;
+                continue;
+            }
+            if (l->v[j].kind != REGION_SAME)
+                break;
+            gap += l->v[j].oe - l->v[j].os;
+            if (gap > SG_MERGE_CONFLICT_GAP)
+                break;
+        }
+        if (merge_to > i) {
+            l->v[i].oe = l->v[merge_to].oe;
+            l->v[i].te = l->v[merge_to].te;
+            memmove(&l->v[i + 1], &l->v[merge_to + 1],
+                   (l->count - merge_to - 1) * sizeof(*l->v));
+            l->count -= merge_to - i;
         }
     }
-    return match;
+}
+
+static int emit_regions(bytebuf *out, const region_list *l, const sg_diff_line *ours,
+                        const sg_diff_line *theirs, const char *ours_label,
+                        const char *theirs_label, int *conflict_out)
+{
+    size_t i;
+
+    for (i = 0; i < l->count; i++) {
+        const merge_region *r = &l->v[i];
+
+        if (r->kind != REGION_CONFLICT) {
+            const sg_diff_line *src = r->take_theirs ? theirs : ours;
+            size_t from = r->take_theirs ? r->ts : r->os;
+            size_t to = r->take_theirs ? r->te : r->oe;
+
+            /* An empty region must not even terminate the previous line.
+               Zero-length regions are ordinary here -- the sync-point pass
+               emits one for every empty span, including the one after the
+               final anchor -- and calling bytebuf_ensure_nl before writing
+               nothing would give a file that legitimately ends without a
+               newline one it never had. Measured: merging three identical
+               copies of "x\ny" returned "x\ny\n", 4 bytes for a 3-byte
+               input, on a merge that changed nothing at all. */
+            if (from == to)
+                continue;
+            if (bytebuf_ensure_nl(out) != 0 || bytebuf_append_lines(out, src, from, to) != 0)
+                return -1;
+            continue;
+        }
+        if (bytebuf_ensure_nl(out) != 0)
+            return -1;
+        *conflict_out = 1;
+        if (bytebuf_append_str(out, "<<<<<<< ") != 0 ||
+           bytebuf_append_str(out, ours_label) != 0 || bytebuf_append_str(out, "\n") != 0 ||
+           bytebuf_append_lines(out, ours, r->os, r->oe) != 0 || bytebuf_ensure_nl(out) != 0 ||
+           bytebuf_append_str(out, "=======\n") != 0 ||
+           bytebuf_append_lines(out, theirs, r->ts, r->te) != 0 || bytebuf_ensure_nl(out) != 0 ||
+           bytebuf_append_str(out, ">>>>>>> ") != 0 ||
+           bytebuf_append_str(out, theirs_label) != 0 || bytebuf_append_str(out, "\n") != 0)
+            return -1;
+    }
+    return 0;
 }
 
 typedef struct {
@@ -325,11 +606,11 @@ int sg_merge_content(const unsigned char *base, size_t base_len, const unsigned 
     sg_diff_line *base_lines = NULL;
     sg_diff_line *ours_lines = NULL;
     sg_diff_line *theirs_lines = NULL;
-    size_t **dp_bo = NULL;
-    size_t **dp_bt = NULL;
     long *bo_match = NULL;
     long *bt_match = NULL;
     sync_point *syncs = NULL;
+    region_list raw = {0};
+    region_list regions = {0};
     size_t sync_cap;
     size_t sync_count = 0;
     bytebuf outbuf = {0};
@@ -361,13 +642,8 @@ int sg_merge_content(const unsigned char *base, size_t base_len, const unsigned 
     if (base_lines == NULL || ours_lines == NULL || theirs_lines == NULL)
         goto done;
 
-    dp_bo = sg_diff_lcs_table(base_lines, nbase, ours_lines, nours);
-    dp_bt = sg_diff_lcs_table(base_lines, nbase, theirs_lines, ntheirs);
-    if (dp_bo == NULL || dp_bt == NULL)
-        goto done;
-
-    bo_match = lcs_matches(base_lines, nbase, ours_lines, nours, dp_bo);
-    bt_match = lcs_matches(base_lines, nbase, theirs_lines, ntheirs, dp_bt);
+    bo_match = script_matches(base_lines, nbase, ours_lines, nours);
+    bt_match = script_matches(base_lines, nbase, theirs_lines, ntheirs);
     if (bo_match == NULL || bt_match == NULL)
         goto done;
 
@@ -404,48 +680,55 @@ int sg_merge_content(const unsigned char *base, size_t base_len, const unsigned 
         int theirs_eq_base = segment_equal(base_lines, bs, be, theirs_lines, ts, te);
         int ours_eq_theirs = segment_equal(ours_lines, os, oe, theirs_lines, ts, te);
 
-        if (ours_eq_base) {
-            if (bytebuf_append_lines(&outbuf, theirs_lines, ts, te) != 0)
+        if (ours_eq_base && theirs_eq_base) {
+            /* Neither side touched this span, so it is distance, not a
+               change: SAME rather than RESOLVED, or it would block the
+               simplify pass for no reason. */
+            if (region_push(&raw, os, oe, ts, te, REGION_SAME, 0) != 0)
                 goto done;
-        } else if (theirs_eq_base) {
-            if (bytebuf_append_lines(&outbuf, ours_lines, os, oe) != 0)
+        } else if (ours_eq_base) {
+            if (region_push(&raw, os, oe, ts, te, REGION_RESOLVED, 1) != 0)
                 goto done;
-        } else if (ours_eq_theirs) {
-            if (bytebuf_append_lines(&outbuf, ours_lines, os, oe) != 0)
+        } else if (theirs_eq_base || ours_eq_theirs) {
+            if (region_push(&raw, os, oe, ts, te, REGION_RESOLVED, 0) != 0)
                 goto done;
-        } else {
-            conflict = 1;
-            if (bytebuf_append_str(&outbuf, "<<<<<<< ") != 0 ||
-               bytebuf_append_str(&outbuf, ours_label) != 0 ||
-               bytebuf_append_str(&outbuf, "\n") != 0 ||
-               bytebuf_append_lines(&outbuf, ours_lines, os, oe) != 0 ||
-               bytebuf_append_str(&outbuf, "=======\n") != 0 ||
-               bytebuf_append_lines(&outbuf, theirs_lines, ts, te) != 0 ||
-               bytebuf_append_str(&outbuf, ">>>>>>> ") != 0 ||
-               bytebuf_append_str(&outbuf, theirs_label) != 0 ||
-               bytebuf_append_str(&outbuf, "\n") != 0)
-                goto done;
+        } else if (region_push(&raw, os, oe, ts, te, REGION_CONFLICT, 0) != 0) {
+            goto done;
         }
 
         if (idx < sync_count - 1) {
-            /* sg_diff_lines_equal ignores has_nl, so a sync point's base line
-               may carry a has_nl that doesn't match the position it's being
-               emitted at (e.g. base's final, newline-less line matching
-               identical content earlier in ours/theirs). Only trust base's
-               own has_nl when this anchor is truly the last line of all
-               three inputs; otherwise more content follows, so force a
-               newline to avoid gluing lines together. */
-            sg_diff_line anchor = base_lines[cur.base_idx];
-            int is_final_line = cur.base_idx == (long)nbase - 1 &&
-                                cur.ours_idx == (long)nours - 1 &&
-                                cur.theirs_idx == (long)ntheirs - 1;
+            /* The anchor. Its has_nl can be trusted, and that is a property of
+               the alignment, not an assumption (Phase 41): a sync point is a
+               base line matched on BOTH sides, script_matches matches
+               has_nl-aware, so all three lines agree on it. A line with
+               has_nl == 0 is by construction the last line of its own file
+               (sg_diff_split_lines only clears the flag when no '\n' was found
+               before the end), so an anchor carrying has_nl == 0 is
+               simultaneously the last line of base, ours and theirs.
 
-            if (!is_final_line)
-                anchor.has_nl = 1;
-            if (bytebuf_append_line(&outbuf, anchor) != 0)
+               Until Phase 41 the alignment was has_nl-blind, so base's final
+               newline-less line could match an identically spelled line in the
+               MIDDLE of ours/theirs, and emitting base's has_nl verbatim then
+               glued that line onto the next one. The repair for that was an
+               explicit is_final_line test forcing has_nl to 1 everywhere else;
+               it is unreachable now -- the case it repaired can no longer be
+               produced -- so it is removed rather than kept as a comforting
+               no-op. bytebuf_ensure_nl in emit_regions is a different guard
+               with a different job: it terminates a line that legitimately
+               lacks a newline when more output follows it. */
+            if (region_push(&raw, (size_t)cur.ours_idx, (size_t)cur.ours_idx + 1,
+                           (size_t)cur.theirs_idx, (size_t)cur.theirs_idx + 1, REGION_SAME,
+                           0) != 0)
                 goto done;
         }
     }
+
+    if (refine_conflicts(&raw, &regions, ours_lines, theirs_lines) != 0)
+        goto done;
+    simplify_conflicts(&regions);
+    if (emit_regions(&outbuf, &regions, ours_lines, theirs_lines, ours_label, theirs_label,
+                    &conflict) != 0)
+        goto done;
 
     *out = outbuf.buf;
     *out_len = outbuf.len;
@@ -454,11 +737,11 @@ int sg_merge_content(const unsigned char *base, size_t base_len, const unsigned 
 done:
     if (rc < 0)
         free(outbuf.buf);
+    region_list_free(&raw);
+    region_list_free(&regions);
     free(syncs);
     free(bo_match);
     free(bt_match);
-    sg_diff_lcs_free_table(dp_bo, nbase);
-    sg_diff_lcs_free_table(dp_bt, nbase);
     free(base_lines);
     free(ours_lines);
     free(theirs_lines);

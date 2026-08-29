@@ -169,7 +169,14 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
     {
         char *summary = first_line_dup(commit.message);
 
-        snprintf(theirs_label, sizeof(theirs_label), "%s %s", short_sha,
+        /* git's rebase conflict marker parenthesizes the subject:
+           ">>>>>>> 11f17ed (theirs commit subject)". sg wrote it without the
+           parentheses until Phase 41 measured the two side by side. Unlike
+           cmd_merge.c's ours label, nothing recorded this one as
+           deliberate -- no comment, no test -- so it read as an oversight
+           against this project's byte-compatibility goal and is corrected
+           rather than pinned as-is. */
+        snprintf(theirs_label, sizeof(theirs_label), "%s (%s)", short_sha,
                 summary != NULL ? summary : "");
         free(summary);
     }
