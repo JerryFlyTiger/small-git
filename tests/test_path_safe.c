@@ -682,7 +682,7 @@ static void test_diff_tree_workdir_refuses_escaping_index_entry(void)
     entry.path = (char *)"../secret.txt";
     CHECK(sg_index_upsert(&idx, &entry) == 0, "sg_index_upsert failed");
 
-    rc = sg_diff_tree_workdir(git_dir, repo_path, NULL, &idx, &dl, NULL);
+    rc = sg_diff_tree_workdir(git_dir, repo_path, NULL, &idx, &dl, NULL, 0);
     CHECK(rc == 0, "expected sg_diff_tree_workdir to succeed (never a hard failure), got %d", rc);
 
     for (i = 0; i < dl.count; i++) {

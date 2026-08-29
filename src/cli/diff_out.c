@@ -69,16 +69,19 @@ static int digits(long long v)
     return w;
 }
 
-/* An unmerged row is "combinable" -- git's word for "there is content on
-   both sides of the conflict to actually diff" -- iff both stage 2 (ours)
-   and stage 3 (theirs) are present. See sg/diff.h's sg_diff_entry contract:
-   only sg_diff_index_workdir ever fills ours/theirs, so this is
-   automatically false for every row sg_diff_tree_index (--cached) produces,
-   which is exactly why --cached always falls through to "* Unmerged path"
-   regardless of -c/--cc (Phase 34 oracle 1). */
+/* "Combinable" -- git's word for "there is content on both sides to
+   actually diff, render this as a combined diff instead of a plain 2-way
+   one". Thin wrapper: sg_diff_entry_is_combined (sg/diff.h) is the shared
+   predicate for BOTH producers of ours/theirs/result (a real conflict via
+   sg_diff_index_workdir, and Phase 40's sg_diff_fill_combined_from_index
+   over a tree-vs-workdir list), and is false for every row
+   sg_diff_tree_index (--cached) or sg_diff_trees produces -- neither fills
+   ours/theirs -- which is exactly why --cached and a two-rev diff always
+   fall through to ordinary rendering regardless of -c/--cc (Phase 34
+   oracle 1, Phase 40 SPEC section 1). */
 static int combinable(const sg_diff_entry *e)
 {
-    return e->unmerged && e->ours.kind != SG_DIFF_SIDE_ABSENT && e->theirs.kind != SG_DIFF_SIDE_ABSENT;
+    return sg_diff_entry_is_combined(e);
 }
 
 /* Whether the entry right after index i is the companion row a combinable
@@ -1367,7 +1370,10 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
                unmerged row is a plain, non-unmerged entry sharing the same
                path -- render the combined diff in its place and swallow it,
                same as real git (PHASE34_ORACLE.md #1: "no longer prints the
-               companion's own 2-way patch"). */
+               companion's own 2-way patch"). Deliberately NOT gated on
+               `combined != 0` -- PATCH's default IS dense combined for a
+               real conflict, even with no -c/--cc at all (PHASE34_ORACLE.md
+               #2). */
             if (combinable(e)) {
                 if (render_combined_patch(git_dir, repo_root, e, dense) != 0)
                     had_error = 1;
@@ -1381,6 +1387,18 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
                deliberately unquoted -- see the "printing a path" rule's
                fourth exception in CLAUDE.md. */
             printf("* Unmerged path %s\n", e->path);
+            continue;
+        }
+
+        /* Phase 40: a combined row from sg_diff_fill_combined_from_index
+           (`sg diff -c/--cc <rev>`) is the OPPOSITE of the case above -- it
+           only renders combined when the flag was actually given (SPEC
+           section 1: "-c/--cc with no rev given has no effect" degenerates
+           because ordinary sg_diff_tree_workdir rows never set unmerged,
+           but a row THIS pass filled must still check the flag itself). */
+        if (combined != 0 && combinable(e)) {
+            if (render_combined_patch(git_dir, repo_root, e, dense) != 0)
+                had_error = 1;
             continue;
         }
 

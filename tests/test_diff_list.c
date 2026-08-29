@@ -635,7 +635,7 @@ static void test_tree_workdir_addition_side_has_id_and_mode(void)
     memset(&idx, 0, sizeof(idx));
     index_upsert_blob(&idx, "added.sh", 0100755, id);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir failed");
 
     e = find_entry(&list, "added.sh");
@@ -780,7 +780,7 @@ static void test_tree_workdir_rm_cached_is_deletion(void)
 
     memset(&idx, 0, sizeof(idx));
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir failed");
     CHECK(list.count == 1,
          "expected tracked.txt to be reported despite being unchanged on disk, got %zu entries",
@@ -834,7 +834,7 @@ static void test_tree_workdir_content_compare_and_addition(void)
     index_upsert_blob(&idx, "unchanged.txt", 0100644, id_unchanged);
     index_upsert_blob(&idx, "staged.txt", 0100644, id_unchanged);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir failed");
 
     e = find_entry(&list, "changed.txt");
@@ -902,7 +902,7 @@ static void test_tree_workdir_unmerged_not_special(void)
     index_upsert_stage(&idx, "resolved.txt", 2, 0100644, id2);
     index_upsert_stage(&idx, "resolved.txt", 3, 0100644, id3);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir failed");
     CHECK(list.count == 1, "expected exactly conflict.txt's row, got %zu", list.count);
 
@@ -1151,7 +1151,7 @@ static void test_chunk_pointer_normalization_tree_workdir(void)
     memset(&empty_idx, 0, sizeof(empty_idx));
     index_upsert_blob(&empty_idx, "big.bin", 0100644, pointer_id);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir failed");
     CHECK(list.count == 0,
          "unmodified chunked content in a TREE entry must normalize to the working tree's hash "
@@ -1166,7 +1166,7 @@ static void test_chunk_pointer_normalization_tree_workdir(void)
     data[0] ^= 0xFF;
     write_workdir_file_bytes(repo_root, "big.bin", data, len);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir failed on the modified fixture");
     CHECK(list.count == 1, "modified chunked content should be reported as changed, got %zu",
          list.count);
@@ -1295,7 +1295,7 @@ static void test_tree_workdir_unreadable_blob_does_not_silence_others(void)
     index_upsert_blob(&idx, "broken.txt", 0100644, id_broken);
     index_upsert_blob(&idx, "other.txt", 0100644, id_other);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir must return 0, not -1, when one path's tree blob is unreadable");
     CHECK(list.count == 2, "expected both paths to be reported, got %zu", list.count);
 
@@ -1444,7 +1444,7 @@ static void test_tree_workdir_unreadable_workdir_file_is_absent(void)
     memset(&idx, 0, sizeof(idx));
     index_upsert_blob(&idx, "was_file.txt", 0100644, id);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir failed");
     CHECK(list.count == 1, "expected exactly one row, got %zu", list.count);
 
@@ -1503,7 +1503,7 @@ static void test_tree_workdir_unreadable_addition_is_still_reported(void)
     index_upsert_blob(&idx, "added.txt", 0100644, id);
     index_upsert_blob(&idx, "unrelated.txt", 0100644, id);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
          "sg_diff_tree_workdir failed");
 
     e = find_entry(&list, "added.txt");

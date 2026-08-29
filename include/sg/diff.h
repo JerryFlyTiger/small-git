@@ -90,23 +90,53 @@ typedef struct {
        unmerged paths outright, which is why the flag exists rather than a
        `continue`. */
     int unmerged;
-    /* Only meaningful when unmerged != 0; otherwise all three are ABSENT.
-       old_side / new_side stay ABSENT for an unmerged row regardless (that
-       contract is unchanged) -- these three are what the combined-diff
-       renderer (Phase 34) needs and old_side/new_side cannot express:
-         ours   = index stage 2 (the "-1" side in git's parlance),
-         theirs = index stage 3,
-         result = the working-tree file (ABSENT when it has been deleted).
-       ours and theirs both non-ABSENT is exactly "combinable" -- the path
-       has content on both sides of the conflict and a combined diff can be
-       rendered instead of the bare "* Unmerged path" line. Only
-       sg_diff_index_workdir ever fills these; the other three builders leave
-       them ABSENT, which is what routes sg_diff_tree_index (--cached)
-       through the "* Unmerged path" rendering unconditionally. */
+    /* These three are what the combined-diff renderer (Phase 34, extended
+       Phase 40) needs and old_side/new_side cannot express. There are
+       exactly TWO producers, and they fill them with different meanings:
+
+       1. sg_diff_index_workdir, when unmerged != 0 (a real conflict):
+            ours   = index stage 2 (the "-1" side in git's parlance),
+            theirs = index stage 3,
+            result = the working-tree file (ABSENT when it has been
+                     deleted -- this does NOT disqualify the row, see
+                     sg_diff_entry_is_combined below).
+          old_side / new_side stay ABSENT for this row regardless.
+
+       2. sg_diff_fill_combined_from_index (Phase 40), a post-build pass over
+          sg_diff_tree_workdir's output (`sg diff -c/--cc <rev>`, no
+          `--cached`, no second rev), with unmerged left at 0:
+            ours   = the LOWEST-stage index entry for the path (stage 0 for
+                     an ordinary tracked file; measured against git 2.55.0,
+                     an add/add conflict with no stage 1 uses stage 2, not
+                     "stage 1 or nothing"),
+            theirs = a copy of old_side (the named tree's blob),
+            result = a copy of new_side (the working-tree file).
+          Here result absence (a working-tree deletion) DOES disqualify the
+          row -- see sg_diff_entry_is_combined.
+
+       Every other builder leaves all three ABSENT, which is what routes
+       sg_diff_tree_index (--cached) through the "* Unmerged path" rendering
+       unconditionally regardless of -c/--cc. */
     sg_diff_side ours;
     sg_diff_side theirs;
     sg_diff_side result;
 } sg_diff_entry;
+
+/* Whether a row should render as a combined diff instead of an ordinary
+   2-way one. This is the shared predicate for both producers above -- do
+   not add a third boolean field, it is derivable from what is already
+   there:
+
+     ours/theirs both non-ABSENT, AND (unmerged OR result non-ABSENT).
+
+   The asymmetry on `result` is deliberate and measured on both sides: a
+   real conflict (producer 1) still renders combined with a deleted working
+   tree file (interop pins the header-only "deleted result" shape), but the
+   Phase 40 rev-mode pass (producer 2) does NOT -- git falls back to an
+   ordinary "deleted file mode" row instead (SPEC section 3, fixture D).
+   Collapsing the two into one unconditional rule breaks whichever side you
+   didn't measure last. */
+int sg_diff_entry_is_combined(const sg_diff_entry *e);
 
 typedef struct {
     sg_diff_entry *entries; /* sorted by path, byte-wise */
@@ -189,10 +219,39 @@ int sg_diff_index_workdir(const char *git_dir, const char *repo_root,
    An unmerged path is NOT special here: the index only decides membership, and
    the content still comes from the working tree, so such a path takes part as
    an ordinary modification against the tree's blob. Measured: `git diff HEAD
-   --name-status` prints "M" for a conflicted path, not "U". */
+   --name-status` prints "M" for a conflicted path, not "U".
+
+   `combined` (Phase 40, pass nonzero only for `sg diff -c/--cc <rev>`)
+   widens the row-inclusion rule from "differs from the tree" to "differs
+   from the tree OR differs from the index's lowest-stage entry" -- needed
+   because a combined row's inclusion test is "differs from ANY parent", and
+   the index is a second parent this comparison otherwise never looks at.
+   Measured against git 2.55.0: a path staged with one edit and then
+   reverted back to the named tree's exact bytes in the working tree still
+   appears in `git diff -c <rev>` (SPEC section 6, fixture O's p3) even
+   though plain `git diff <rev>` on the same state prints nothing for it.
+   Passing 0 reproduces the exact pre-Phase-40 behaviour; the caller still
+   has to run sg_diff_fill_combined_from_index afterward to actually
+   populate ours/theirs/result on the rows this widening added. */
 int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                          const unsigned char *old_tree, const sg_index *idx,
-                         sg_diff_list *out, char *bad_path);
+                         sg_diff_list *out, char *bad_path, int combined);
+
+/* Phase 40: a post-build pass over an sg_diff_tree_workdir list (`sg diff
+   -c/--cc <rev>`, exactly one rev, no `--cached`) that fills in the three
+   combined-diff sides described on sg_diff_entry, so sg_diff_entry_is_combined
+   can recognize these rows the same way it recognizes an sg_diff_index_workdir
+   conflict row. Run AFTER sg_diff_list_filter (same ordering rule as
+   sg_diff_detect_renames, and for the identical reason: a pathspec should
+   decide membership before this pass ever looks at a row) and BEFORE
+   sg_diff_detect_renames (a combined row must never be offered to rename/copy
+   detection as a source or destination -- SPEC section 5).
+
+   Every entry in `list` is visited; a path with no index entry at all leaves
+   `ours` ABSENT, which is exactly what makes sg_diff_entry_is_combined false
+   and the row fall back to plain sg_diff_tree_workdir rendering. Cannot fail
+   -- it only reads already-loaded index data, no I/O. */
+void sg_diff_fill_combined_from_index(const sg_index *idx, sg_diff_list *list);
 
 /* The content id a side stands for, resolving a chunk pointer to what it
    points at. Returns 0 when that id is trustworthy, and -1 when it is the
@@ -277,6 +336,13 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
    sg_diff_index_workdir); both carry the same path, so both survive or both
    go, and the pair can never be split. */
 void sg_diff_list_filter(sg_diff_list *list, const sg_pathspec *ps);
+
+/* Phase 40: a stable partition, combined rows first (sg_diff_entry_is_combined),
+   then non-combined rows -- each half keeping its own existing path order.
+   Used only by `sg diff -c/--cc <rev>` (SPEC section 4); every other
+   diff-printing path leaves the list's builder/filter/rename order alone.
+   Returns 0, or -1 on allocation failure with the list left untouched. */
+int sg_diff_reorder_combined_first(sg_diff_list *list);
 
 /* Loads one side's bytes. An ABSENT side yields (NULL, 0), which is what the
    renderers want for an addition or a deletion. BLOB sides go through

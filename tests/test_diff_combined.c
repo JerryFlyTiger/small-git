@@ -693,13 +693,24 @@ static void test_cli_c_cc_last_one_wins(void)
     free(root);
 }
 
-/* ---- -c/--cc rejected together with a <rev> argument ------------------- */
+/* ---- Phase 40: -c/--cc + <rev> is no longer rejected ------------------- */
 
-static void test_cli_rejects_combined_with_rev(void)
+/* Phase 34 rejected this combination outright, on the mistaken belief that
+   it needed the stage-2/stage-3 pairing this file's other tests exercise
+   (see SPEC.md and docs/DESIGN.md's Phase 40 section for the three ways
+   that belief was wrong). It is accepted now, and renders an ordinary
+   `sg diff -c/--cc <rev>` combined diff -- see tests/test_diff_combined_rev.c
+   for coverage of the new [index, named tree] parent pairing itself; this
+   test only pins the CLI-level, no-longer-rejected shape on a fixture this
+   file already had lying around (a real conflict, so HEAD's tree, the
+   index's lowest-stage entry, and the conflicted working-tree file are all
+   guaranteed to differ from one another). */
+static void test_cli_accepts_combined_with_rev(void)
 {
-    char *root = make_tmp_repo_and_cd("cli_rev_reject");
+    char *root = make_tmp_repo_and_cd("cli_rev_accept");
     char *out;
     char *argv1[4] = {"diff", "-c", "HEAD", NULL};
+    char *argv2[4] = {"diff", "--cc", "HEAD", NULL};
     int rc;
 
     (void)root;
@@ -708,7 +719,17 @@ static void test_cli_rejects_combined_with_rev(void)
     capture_start();
     rc = sg_cmd_diff(3, argv1);
     out = capture_end();
-    CHECK(rc == 1, "-c with a <rev> must exit 1, got %d", rc);
+    CHECK(rc == 0, "-c with a <rev> must now exit 0, got %d", rc);
+    CHECK(strncmp(out, "diff --combined conflict.txt", 28) == 0,
+         "-c HEAD should render a non-dense combined diff for conflict.txt: %s", out);
+    free(out);
+
+    capture_start();
+    rc = sg_cmd_diff(3, argv2);
+    out = capture_end();
+    CHECK(rc == 0, "--cc with a <rev> must now exit 0, got %d", rc);
+    CHECK(strncmp(out, "diff --cc conflict.txt", 22) == 0,
+         "--cc HEAD should render a dense combined diff for conflict.txt: %s", out);
     free(out);
 
     free(root);
@@ -743,7 +764,7 @@ int main(void)
     test_combined_binary();
     test_combined_funcname_off_by_one();
     test_cli_c_cc_last_one_wins();
-    test_cli_rejects_combined_with_rev();
+    test_cli_accepts_combined_with_rev();
     test_cached_ignores_combined_flags();
 
     if (failures > 0) {

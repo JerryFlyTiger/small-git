@@ -281,11 +281,42 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   WARNING: **`-c`/`--cc` last one wins**, same convention as `-M`/`-C`
   (Phase 33's lesson: untested together, one flag stays silently stuck) --
   `-c --cc` prints `diff --cc`, `--cc -c` prints `diff --combined`.
-  WARNING: **`-c`/`--cc` combined with a `<rev>` argument is rejected
-  outright**, not approximated: real git switches to a completely different
-  parent pairing there (stage 1 vs the named tree blob), so answering it as
-  the stage-2/stage-3 pairing this renderer implements would be a silently
-  wrong answer -- same treatment as Phase 33's `-C -C`.
+  **`-c`/`--cc` with a `<rev>` is implemented as of Phase 40** (it was
+  rejected outright before that). It is a SECOND producer of
+  `ours`/`theirs`/`result`, and it pairs
+  **[the index's own entry for the path, the named tree's blob]** against
+  the working-tree file -- read Phase 40 of `docs/DESIGN.md` before touching
+  it, because Phase 34's recorded reason for the old rejection ("stage 1 vs
+  the named tree blob") was measurably wrong in three ways and each one is
+  still an inviting way to reimplement it incorrectly:
+  it has **nothing to do with conflicts** (a repo with no unmerged entry
+  anywhere still prints `diff --combined`); parent 1 is **the index**, not a
+  merge base and not HEAD; and parent 1 is the **lowest stage present**, not
+  stage 1 (an add/add conflict has no stage 1 and pairs against stage 2).
+  WARNING: **it only takes effect for exactly one rev with no `--cached`**.
+  `-c --cached <rev>` and `-c <rev1> <rev2>` are unaffected, and neither
+  needs a special-case branch -- `sg_diff_trees`/`sg_diff_tree_index` never
+  fill `ours`/`theirs`, so it falls out of the data layer, the same way
+  `--cached` already did in Phase 34.
+  WARNING: **it changes the OUTPUT ORDER of every format**: all combined
+  rows print first in path order, then all non-combined rows in path order
+  (`sg_diff_reorder_combined_first`, applied only in this mode). An
+  interleaved fixture is required to observe this at all.
+  WARNING: **rename/copy detection must never see a combined row**
+  (`rename.c`'s three predicates skip them). Only a `-C` fixture makes this
+  observable -- under plain `-M` a combined row is a modification and would
+  never have been paired anyway.
+  WARNING: **it also widens which rows EXIST**, not just how they render: a
+  row is included when the result differs from **any** parent, so a path
+  whose working tree matches the named tree but whose index does not still
+  appears (measured: plain `git diff <rev>` prints nothing for it). This is
+  why `sg_diff_tree_workdir` takes a `combined` parameter -- a pass running
+  after the builder cannot recover a row the builder never emitted.
+  WARNING: **`sg_diff_entry_is_combined`'s treatment of `result` is
+  deliberately asymmetric**: a real conflict still combines with the
+  working-tree file deleted, the Phase 40 rev-mode row does not (it falls
+  back to an ordinary `deleted file mode`). Both sides are pinned by
+  interop; "unifying" them breaks whichever one you did not measure last.
   WARNING: **the funcname suffix's off-by-one is git's own bug, ported
   faithfully, not fixed**: `comment_end` records the index of the last
   non-blank byte scanned (cap 40 bytes), and the print loop stops BEFORE
@@ -305,8 +336,9 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   against real git (9 funcname lengths x 4 leading-context depths x
   with/without a trailing no-newline delete x 3 flag combinations) found 0
   mismatches. **Do not add this to Phase 34's deliberate-divergence list**
-  (rev-argument rejection, `* Unmerged path` unquoted -- see the diff
-  module notes below, both pinned on both sides by interop): this one has
+  (`* Unmerged path` unquoted -- see the diff module notes below, pinned on
+  both sides by interop; the rev-argument rejection that used to sit
+  beside it is gone, implemented in Phase 40): this one has
   no oracle-side pin, because there is nothing measured to diverge on.
   WARNING: **when touching the combined-diff block of `diff_out.c`
   (`render_combined_patch` and everything it calls), a green `make test`
@@ -950,7 +982,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 
 ## Deliberate divergences from real git
 
-Five places where sg's answer differs from real git **on purpose**, not by
+Four places where sg's answer differs from real git **on purpose**, not by
 oversight -- each was measured against git 2.55.0, each is pinned on both
 sides by an interop check (so accidentally "fixing" one back into silent
 agreement with git would itself go undetected without the pin), and none of
@@ -959,14 +991,10 @@ why the divergence exists.
 
 1. **`-C -C` / `--find-copies-harder` is rejected outright** (Phase 33,
    `cmd_diff.c`), not approximated -- see the module notes' `-C -C` WARNING.
-2. **`-c`/`--cc` combined with an explicit `<rev>` argument is rejected
-   outright** (Phase 34), not approximated -- real git switches to a
-   completely different parent pairing there. See the module notes'
-   `-c`/`--cc` WARNING.
-3. **`* Unmerged path` stays unquoted regardless of `core.quotePath`**
+2. **`* Unmerged path` stays unquoted regardless of `core.quotePath`**
    (Phase 34) -- real git leaves this one line unquoted even when every
    other path is quoted; see PHASE34_ORACLE.md #1.
-4. **`sg status --porcelain` prints a fixed `AD` for a path that escapes the
+3. **`sg status --porcelain` prints a fixed `AD` for a path that escapes the
    repository via a crafted index, in all three possible real-world states**
    (Phase 36) -- real git actually reads the file outside the repository to
    decide between `A `/`AM`/`AD`; sg refuses to read it at all (the fix Phase
@@ -974,7 +1002,7 @@ why the divergence exists.
    always reports the one that draws the user's attention rather than the one
    that could silently claim "clean". See the Phase 36 section of
    `docs/DESIGN.md` for the full three-row measurement.
-5. **`sg push` uses exit code 1 where real git uses 128 for a client-side
+4. **`sg push` uses exit code 1 where real git uses 128 for a client-side
    refspec syntax error** (empty dst, `--delete` with a colon, an
    already-`refs/`-prefixed malformed dst -- Phase 39) -- this project's own
    convention is "exit codes are only ever 0 or 1" (see Code conventions

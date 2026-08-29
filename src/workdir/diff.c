@@ -86,6 +86,28 @@ void sg_diff_list_filter(sg_diff_list *list, const sg_pathspec *ps)
     list->count = write;
 }
 
+int sg_diff_reorder_combined_first(sg_diff_list *list)
+{
+    sg_diff_entry *reordered;
+    size_t i, w = 0;
+
+    if (list->count == 0)
+        return 0;
+    reordered = malloc(list->count * sizeof(*reordered));
+    if (reordered == NULL)
+        return -1;
+    for (i = 0; i < list->count; i++)
+        if (sg_diff_entry_is_combined(&list->entries[i]))
+            reordered[w++] = list->entries[i];
+    for (i = 0; i < list->count; i++)
+        if (!sg_diff_entry_is_combined(&list->entries[i]))
+            reordered[w++] = list->entries[i];
+    free(list->entries);
+    list->entries = reordered;
+    list->cap = list->count;
+    return 0;
+}
+
 static sg_diff_side side_absent(void);
 
 static int list_append(sg_diff_list *list, const char *path, const sg_diff_side *old_side,
@@ -160,6 +182,42 @@ static sg_diff_side side_workdir(const unsigned char id[SG_SHA1_RAW_LEN], unsign
     if (id != NULL)
         memcpy(s.id, id, SG_SHA1_RAW_LEN);
     return s;
+}
+
+int sg_diff_entry_is_combined(const sg_diff_entry *e)
+{
+    if (e->ours.kind == SG_DIFF_SIDE_ABSENT || e->theirs.kind == SG_DIFF_SIDE_ABSENT)
+        return 0;
+    if (e->unmerged)
+        return 1;
+    return e->result.kind != SG_DIFF_SIDE_ABSENT;
+}
+
+void sg_diff_fill_combined_from_index(const sg_index *idx, sg_diff_list *list)
+{
+    size_t i;
+
+    for (i = 0; i < list->count; i++) {
+        sg_diff_entry *e = &list->entries[i];
+        int stage;
+        sg_diff_side ours = side_absent();
+
+        /* Lowest stage present, not "stage 1" -- an add/add conflict has no
+           stage 1 at all and git falls back to stage 2 there (SPEC section
+           2, fixture C). Stage 0 is the ordinary, unconflicted case, which
+           is why it is checked first and covers almost every row. */
+        for (stage = 0; stage <= 3; stage++) {
+            int pos = sg_index_find_stage(idx, e->path, (unsigned int)stage);
+
+            if (pos >= 0) {
+                ours = side_blob(idx->entries[pos].mode, idx->entries[pos].sha1);
+                break;
+            }
+        }
+        e->ours = ours;
+        e->theirs = e->old_side;
+        e->result = e->new_side;
+    }
 }
 
 /* Normalizes path's on-disk permission bits to a tree/index-entry mode.
@@ -620,7 +678,7 @@ int sg_diff_index_workdir(const char *git_dir, const char *repo_root, const sg_i
 
 int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                          const unsigned char *old_tree, const sg_index *idx,
-                         sg_diff_list *out, char *bad_path)
+                         sg_diff_list *out, char *bad_path, int combined)
 {
     sg_flat_list old_flat;
     size_t oi = 0;
@@ -718,8 +776,40 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                     sg_diff_side os_effective =
                         side_blob(old_flat.entries[oi].mode, effective_sha1);
                     sg_diff_side ns = side_workdir(wd_sha1, wd_mode);
+                    int must_append = blob_sides_differ(&os_effective, &ns);
 
-                    if (blob_sides_differ(&os_effective, &ns)) {
+                    /* Phase 40 SPEC section 3/6, fixture O's p3: a combined
+                       row's inclusion rule is "differs from ANY parent",
+                       not just "differs from the named tree" -- the ordinary
+                       2-way criterion above only ever checks the tree
+                       against the working tree, so a path where the named
+                       tree happens to equal the working tree but the INDEX
+                       does not (a staged-then-reverted edit) would otherwise
+                       never even enter the list, and sg_diff_fill_combined_
+                       from_index only fills rows that are already there.
+                       ii still points at the group's first entry here
+                       (lowest stage -- sg/index.h's (path, stage) sort
+                       order, same invariant index_group_end's own comment
+                       relies on), so no separate stage scan is needed. A
+                       chunk-pointer resolution failure on the index side is
+                       treated as "differs" (force the row in), the same
+                       failure direction append_index_entry_vs_workdir uses
+                       right above for the identical reason: the renderer's
+                       own sg_diff_side_read is what actually reports it. */
+                    if (!must_append && combined && ii < idx->count) {
+                        unsigned char idx_eff[SG_SHA1_RAW_LEN];
+                        sg_diff_side is;
+
+                        if (sg_chunk_effective_id(git_dir, idx->entries[ii].sha1, idx_eff) != 0)
+                            must_append = 1;
+                        else {
+                            is = side_blob(idx->entries[ii].mode, idx_eff);
+                            if (blob_sides_differ(&is, &ns))
+                                must_append = 1;
+                        }
+                    }
+
+                    if (must_append) {
                         if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
                             rc = -1;
                             goto done;
