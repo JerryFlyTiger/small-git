@@ -5298,6 +5298,68 @@ for p41f in nl.txt gap3.txt gap4.txt; do
         cmp -s "$WORKDIR/p41_c_sg.txt" "$WORKDIR/p41_c_git.txt"
 done
 
+# --- Phase 43: `sg merge` accepts any revision, not just a bare branch name.
+# Before this it called sg_ref_branch_exists directly, so a tag, a
+# refs/heads/... path and a `~N` suffix were all rejected with "invalid
+# reference" while the equivalent `git merge` worked -- and that contradicted
+# this project's own rule that a user-supplied revision goes through
+# sg_rev_parse_commit. The generated merge message follows git's own naming
+# rules, all of which were measured rather than recalled (see Phase 43 of
+# docs/DESIGN.md for the table).
+p43_repo() {
+    rm -rf "$1"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$1")") > /dev/null 2>&1
+    printf 'l1\nl2\nl3\n' > "$1/f.txt"
+    (cd "$1" && "$SG" add f.txt && "$SG" commit -m base) > /dev/null 2>&1
+    (cd "$1" && "$SG" branch topic) > /dev/null 2>&1
+    printf 'ours\n' > "$1/g.txt"
+    (cd "$1" && "$SG" add g.txt && "$SG" commit -m ours) > /dev/null 2>&1
+    (cd "$1" && "$SG" switch topic) > /dev/null 2>&1
+    printf 'theirs\n' > "$1/h.txt"
+    (cd "$1" && "$SG" add h.txt && "$SG" commit -m theirs) > /dev/null 2>&1
+    (cd "$1" && LC_ALL=C git tag v1 && LC_ALL=C git tag -a av1 -m ann) > /dev/null 2>&1
+    (cd "$1" && "$SG" switch master) > /dev/null 2>&1
+}
+# One repo per (argument, tool) pair, because a merge is not undoable in
+# place; both tools always start from the SAME sg-built history.
+for p43arg in topic refs/heads/topic v1 av1 'topic~0'; do
+    P43S="$WORKDIR/p43_sg"
+    P43G="$WORKDIR/p43_git"
+    p43_repo "$P43S"
+    rm -rf "$P43G"; cp -R "$P43S" "$P43G"
+    (cd "$P43S" && "$SG" merge "$p43arg") > /dev/null 2>&1
+    p43rc=$?
+    (cd "$P43G" && LC_ALL=C git merge "$p43arg") > /dev/null 2>&1
+    check "phase43: sg merge accepts '$p43arg' (exit 0, like git)" test "$p43rc" = 0
+    check "phase43: the merge message for '$p43arg' matches git byte-for-byte" \
+        sh -c "(cd '$P43S' && LC_ALL=C git log -1 --format=%s) > $WORKDIR/p43_s.txt; (cd '$P43G' && LC_ALL=C git log -1 --format=%s) > $WORKDIR/p43_g.txt; cmp -s $WORKDIR/p43_s.txt $WORKDIR/p43_g.txt"
+done
+# The " into <branch>" suffix, which git omits on exactly master and main
+# (measured; it does NOT follow init.defaultBranch). Both halves are checked,
+# because a rule that always appends and a rule that never appends each pass
+# one of them.
+P43T="$WORKDIR/p43_trunk"
+p43_repo "$P43T"
+(cd "$P43T" && "$SG" branch trunk && "$SG" switch trunk) > /dev/null 2>&1
+rm -rf "$P43T.git-copy"; cp -R "$P43T" "$P43T.git-copy"
+(cd "$P43T" && "$SG" merge topic) > /dev/null 2>&1
+(cd "$P43T.git-copy" && LC_ALL=C git merge topic) > /dev/null 2>&1
+check "phase43 oracle: on a branch that is not master/main git appends ' into <branch>'" \
+    sh -c "(cd '$P43T.git-copy' && LC_ALL=C git log -1 --format=%s) | grep -qx \"Merge branch 'topic' into trunk\""
+check "phase43: sg appends it too" \
+    sh -c "(cd '$P43T' && LC_ALL=C git log -1 --format=%s) | grep -qx \"Merge branch 'topic' into trunk\""
+check "phase43 oracle: on master git omits the suffix" \
+    sh -c "(cd '$P43G' && LC_ALL=C git log -1 --format=%s) | grep -qv ' into '"
+# A revision that resolves to nothing: same wording as git, sg's own prefix
+# and this project's exit-code convention.
+(cd "$P43G" && "$SG" merge nosuchrev) > /dev/null 2> "$WORKDIR/p43_err.txt"
+check "phase43: an unresolvable revision exits 1" test $? = 1
+check "phase43: and says what git says (with sg's prefix)" \
+    grep -qx 'sg: nosuchrev - not something we can merge' "$WORKDIR/p43_err.txt"
+(cd "$P43G" && LC_ALL=C git merge nosuchrev) > /dev/null 2> "$WORKDIR/p43_gerr.txt"
+check "phase43 oracle: git's own wording, minus the tool prefix" \
+    grep -qx 'merge: nosuchrev - not something we can merge' "$WORKDIR/p43_gerr.txt"
+
 # --- Phase 42: the alignment algorithm is now a choice, and the two paths
 # make it DIFFERENTLY: `git diff` defaults to Myers, `git merge` to histogram
 # (measured, git 2.55.0 -- `git merge` also honours diff.algorithm, which is

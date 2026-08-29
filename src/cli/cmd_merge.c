@@ -12,6 +12,7 @@
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/revparse.h"
 #include "sg/snapshot.h"
 #include "sg/status.h"
 #include "sg/tree_build.h"
@@ -72,6 +73,80 @@ static void print_conflict_message(char **conflict_paths, size_t conflict_count)
     fprintf(stderr, "  sg commit -m \"...\"   finish this merge\n");
     fprintf(stderr, "Or give up this merge:\n");
     fprintf(stderr, "  sg merge --abort\n");
+}
+
+/* git's merge_name() (builtin/merge.c), measured against git 2.55.0 rather
+   than recalled -- every row below is a `git merge --no-commit` whose
+   .git/MERGE_MSG was read back:
+
+     topic              -> Merge branch 'topic'
+     refs/heads/topic   -> Merge branch 'refs/heads/topic'   (NOT shortened)
+     v1 / av1 (a tag)   -> Merge tag 'v1'
+     topic~0            -> Merge branch 'topic'              (suffix stripped)
+     <40-hex>           -> Merge commit '<40-hex>'
+
+   Two things are easy to get backwards. The name printed is the argument AS
+   TYPED, not the ref that was found -- which is why `refs/heads/topic` keeps
+   its prefix. And a trailing run of `^` or a trailing `~<digits>` is stripped
+   before classifying, then the SHORTENED name is what gets printed, so
+   `topic~0` reads as a branch merge. Anything that is neither a branch nor a
+   tag after stripping is a commit. */
+static void build_merge_name(const char *git_dir, const char *arg, char *out, size_t out_size)
+{
+    char base[SG_PATH_MAX];
+    size_t len;
+    unsigned char id[SG_SHA1_RAW_LEN];
+    char tag_path[SG_PATH_MAX];
+
+    if (snprintf(base, sizeof(base), "%s", arg) >= (int)sizeof(base)) {
+        snprintf(out, out_size, "commit '%s'", arg);
+        return;
+    }
+    for (;;) {
+        len = strlen(base);
+        while (len > 1 && base[len - 1] == '^')
+            len--;
+        if (len == strlen(base)) {
+            size_t digits = 0;
+
+            while (len > 1 && base[len - 1] >= '0' && base[len - 1] <= '9') {
+                len--;
+                digits++;
+            }
+            if (digits == 0 || len <= 1 || base[len - 1] != '~') {
+                /* nothing stripped this round -- the name is as short as it
+                   gets, so stop rather than loop forever */
+                len = strlen(base);
+                break;
+            }
+            len--;
+        }
+        base[len] = '\0';
+    }
+    if (sg_ref_branch_exists(git_dir, base) ||
+       (strncmp(base, "refs/heads/", 11) == 0 && sg_ref_read_path(git_dir, base, id) == 0)) {
+        snprintf(out, out_size, "branch '%s'", base);
+        return;
+    }
+    if (snprintf(tag_path, sizeof(tag_path), "refs/tags/%s", base) < (int)sizeof(tag_path) &&
+       sg_ref_read_path(git_dir, tag_path, id) == 0) {
+        snprintf(out, out_size, "tag '%s'", base);
+        return;
+    }
+    if (strncmp(base, "refs/tags/", 10) == 0 && sg_ref_read_path(git_dir, base, id) == 0) {
+        snprintf(out, out_size, "tag '%s'", base);
+        return;
+    }
+    snprintf(out, out_size, "commit '%s'", base);
+}
+
+/* git omits the " into <branch>" suffix on exactly two branch names,
+   measured: `master` and `main`. It is NOT the configured
+   init.defaultBranch -- setting that to `trunk` and merging on `trunk` still
+   produced " into trunk". A detached HEAD gets " into HEAD". */
+static int merge_msg_names_target(const char *ours_label)
+{
+    return strcmp(ours_label, "master") != 0 && strcmp(ours_label, "main") != 0;
 }
 
 static int do_three_way_merge(const char *git_dir, const char *repo_root, const char *current_branch,
@@ -199,7 +274,13 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         const char *name = env_or("GIT_AUTHOR_NAME", "small_git");
         const char *email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
 
-        snprintf(message, sizeof(message), "Merge branch '%s' into %s\n", branch_arg, ours_label);
+        char merge_name[SG_PATH_MAX];
+
+        build_merge_name(git_dir, branch_arg, merge_name, sizeof(merge_name));
+        if (merge_msg_names_target(ours_label))
+            snprintf(message, sizeof(message), "Merge %s into %s\n", merge_name, ours_label);
+        else
+            snprintf(message, sizeof(message), "Merge %s\n", merge_name);
         if (sg_message_cleanup(message, &cleaned_message) != 0) {
             fprintf(stderr, "sg: out of memory\n");
             rc = 1;
@@ -467,15 +548,16 @@ int sg_cmd_merge(int argc, char **argv)
             return 1;
         }
 
-        if (!sg_ref_branch_exists(git_dir, branch_arg)) {
-            fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
-            free(current_branch);
-            free(git_dir);
-            free(repo_root);
-            return 1;
-        }
-        if (sg_ref_read_branch(git_dir, branch_arg, theirs_commit) != 0) {
-            fprintf(stderr, "sg: failed to read branch '%s'\n", branch_arg);
+        /* Any revision sg_rev_parse_commit understands, not just a bare
+           branch name (Phase 43). The old code called sg_ref_branch_exists
+           directly, which made `sg merge v1` / `refs/heads/topic` /
+           `topic~0` fail with "invalid reference" while the equivalent `git
+           merge` succeeded -- and contradicted this project's own rule that
+           a user-supplied revision always goes through sg_rev_parse_commit.
+           That function peels annotated tags, which is what merge wants:
+           measured, `git merge <annotated-tag>` merges the tagged COMMIT. */
+        if (sg_rev_parse_commit(git_dir, branch_arg, theirs_commit) != 0) {
+            fprintf(stderr, "sg: %s - not something we can merge\n", branch_arg);
             free(current_branch);
             free(git_dir);
             free(repo_root);
