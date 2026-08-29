@@ -208,18 +208,16 @@ static void print_section(const char *title, const char **hints, size_t hint_cou
     printf("\n");
 }
 
-/* Prints every distinct path carrying a stage 1/2/3 entry (idx is sorted by
-   (path, stage), so duplicates for a path are contiguous), each with the
-   long-format label unmerged_label derives from which stages are present.
-   Returns the number of distinct unmerged paths found.
-
-   `ps` (Phase 37) is applied here directly, via sg_pathspec_matches, rather
-   than through any of the sg_status_list builders above -- this function
-   scans idx on its own, bypassing every one of them (see include/sg/status.h
-   and cmd_status.c's other call sites), so it is the one place that has to
-   filter for itself, or an unmerged path would leak through unfiltered
-   while every other section respects the pathspec. */
-static size_t print_unmerged(const sg_index *idx, const sg_pathspec *ps, int rebase_in_progress)
+/* Counts distinct paths carrying a stage 1/2/3 entry (idx is sorted by
+   (path, stage), so duplicates for a path are contiguous) that also match
+   `ps`. This is the single scale both the merge banner ("You have unmerged
+   paths." vs "All conflicts fixed but you are still merging.") and
+   print_unmerged's own suppression share -- Bug A (Phase 38, measured
+   against git 2.55.0) was exactly the two of them disagreeing: the banner
+   used to call sg_index_has_unmerged(idx) directly (unfiltered), while
+   print_unmerged counted its own filtered subset. Do not let the banner
+   site go back to scanning idx on its own; both must call this. */
+static size_t count_unmerged(const sg_index *idx, const sg_pathspec *ps)
 {
     size_t i;
     size_t count = 0;
@@ -233,8 +231,29 @@ static size_t print_unmerged(const sg_index *idx, const sg_pathspec *ps, int reb
             continue;
         count++;
     }
+    return count;
+}
+
+/* Prints every distinct path carrying a stage 1/2/3 entry, each with the
+   long-format label unmerged_label derives from which stages are present.
+   `count` is the already-filtered count from count_unmerged -- the caller
+   computes it once (needed earlier, for the merge banner) and passes it in
+   here rather than this function recomputing its own, so the two call sites
+   can never drift apart the way Bug A did.
+
+   `ps` (Phase 37) is applied here directly, via sg_pathspec_matches, rather
+   than through any of the sg_status_list builders above -- this function
+   scans idx on its own, bypassing every one of them (see include/sg/status.h
+   and cmd_status.c's other call sites), so it is the one place that has to
+   filter for itself, or an unmerged path would leak through unfiltered
+   while every other section respects the pathspec. */
+static void print_unmerged(const sg_index *idx, const sg_pathspec *ps, int rebase_in_progress,
+                           size_t count)
+{
+    size_t i;
+
     if (count == 0)
-        return 0;
+        return;
 
     printf("Unmerged paths:\n");
     printf("  (use \"sg add <file>...\" to mark resolution)\n");
@@ -258,7 +277,6 @@ static size_t print_unmerged(const sg_index *idx, const sg_pathspec *ps, int reb
         printf("\t%-17s%s\n", label, sg_quote_path(idx->entries[i].path));
     }
     printf("\n");
-    return count;
 }
 
 /* One porcelain line's worth of X/Y status. path is a borrowed pointer into
@@ -531,6 +549,7 @@ int sg_cmd_status(int argc, char **argv)
     char **ignored = NULL;
     size_t ignored_count = 0;
     size_t unmerged_count;
+    int merge_in_progress = 0;
     size_t i;
     int arg_i;
     char **pos;
@@ -655,6 +674,12 @@ int sg_cmd_status(int argc, char **argv)
     }
     branch = sg_ref_current_branch(git_dir);
 
+    /* Computed once, right after the index and pathspec are both available,
+       so the merge banner below and print_unmerged further down share the
+       exact same filtered count -- see count_unmerged's comment (Bug A,
+       Phase 38). */
+    unmerged_count = count_unmerged(&idx, &pathspec);
+
     if (opts.porcelain) {
         if (opts.branch)
             print_porcelain_branch_header(git_dir, branch);
@@ -707,10 +732,25 @@ int sg_cmd_status(int argc, char **argv)
            (measured, 2.55.0), and status must agree with the gates in
            switch/commit about whether a merge is in flight. */
         if (sg_merge_head_exists(git_dir)) {
-            if (sg_index_has_unmerged(&idx))
+            merge_in_progress = 1;
+            /* Bug A (Phase 38, measured against git 2.55.0): this used to
+               call sg_index_has_unmerged(&idx) directly, which is NOT
+               filtered by pathspec, while the closing-line suppression
+               below (Bug E) uses the filtered unmerged_count -- so with a
+               pathspec that does not match the conflicted path, sg printed
+               "You have unmerged paths." while git printed "All conflicts
+               fixed but you are still merging." and no closing line at all.
+               Both must be on the same, filtered scale. */
+            if (unmerged_count > 0)
                 printf("You have unmerged paths.\n");
             else
                 printf("All conflicts fixed but you are still merging.\n");
+            /* Bug A (Phase 38, measured against git 2.55.0): real git always
+               prints a blank line after this block, unconditionally -- even
+               when nothing else follows (the "mergebare" fixture: merge in
+               progress, nothing staged/unstaged/untracked). Same shape as
+               the rebase block above, which already has this printf("\n"). */
+            printf("\n");
         }
     }
     free(branch);
@@ -732,7 +772,10 @@ int sg_cmd_status(int argc, char **argv)
             free(content);
         }
     } else if (!opts.porcelain) {
-        printf("\nNo commits yet\n");
+        /* Bug B (Phase 38, measured against git 2.55.0): git's literal text
+           is "\nNo commits yet\n\n" -- a trailing blank line, not just the
+           leading one baked into the string already. */
+        printf("\nNo commits yet\n\n");
     }
 
     /* Renames ON here, unlike the safety gates in apply.c: this list is
@@ -825,7 +868,7 @@ int sg_cmd_status(int argc, char **argv)
         if (opts.ignored)
             print_porcelain_paths("!! ", ignored, ignored_count);
     } else {
-        unmerged_count = print_unmerged(&idx, &pathspec, sg_rebase_state_exists(git_dir));
+        print_unmerged(&idx, &pathspec, sg_rebase_state_exists(git_dir), unmerged_count);
 
         print_section("Changes to be committed:", staged_hints, 1, &staged);
         print_section("Changes not staged for commit:", unstaged_hints, 2, &unstaged);
@@ -836,12 +879,24 @@ int sg_cmd_status(int argc, char **argv)
             for (i = 0; i < untracked_count; i++)
                 printf("\t%s\n", sg_quote_path(untracked[i]));
             printf("\n");
-        } else if (opts.u_mode == STATUS_U_NO && staged.count > 0) {
+        } else if (opts.u_mode == STATUS_U_NO &&
+                  (staged.count > 0 || (merge_in_progress && unmerged_count == 0))) {
             /* Real git prints this exactly where "Untracked files:" would
                have gone, only when something is already staged -- with
                nothing staged, the single-line summary below covers it
                instead (measured, git 2.55.0). */
-            printf("Untracked files not listed (use -u option to show untracked files)\n\n");
+            /* Bug D (Phase 38, measured against git 2.55.0): only a single
+               trailing newline, not a blank line after it. */
+            /* Phase 38 round 2 (measured against git 2.55.0, mergebare/
+               mergeuntr/mergeunst -uno): a resolved-but-still-merging state
+               (Bug E's condition) prints this line unconditionally too, even
+               with nothing staged -- because Bug E makes the closing summary
+               below disappear entirely in that state, so this hedge is the
+               only thing left to say. Without this OR-clause, staged.count
+               alone wrongly stays silent whenever the merge resolution
+               happened to restage content identical to HEAD (staged.count
+               reports 0 diff even though "git add" was run). */
+            printf("Untracked files not listed (use -u option to show untracked files)\n");
         }
 
         if (opts.ignored && ignored_count > 0) {
@@ -852,7 +907,16 @@ int sg_cmd_status(int argc, char **argv)
             printf("\n");
         }
 
-        if (opts.u_mode == STATUS_U_NO) {
+        /* Bug E (Phase 38, measured against git 2.55.0, 5 data points): once
+           the merge block above has printed "All conflicts fixed but you
+           are still merging." (merge in progress, no remaining unmerged
+           entries), git prints NO closing summary line at all -- not even
+           in the -uno branch. When unmerged paths remain instead ("You have
+           unmerged paths."), the closing line prints as usual (row 1 of the
+           priority table below), which sg already got right. */
+        if (merge_in_progress && unmerged_count == 0) {
+            /* no closing line */
+        } else if (opts.u_mode == STATUS_U_NO) {
             /* -uno never learns whether untracked files exist, so its
                closing line can never claim the tree is fully clean the way
                the default mode's "working tree clean" does -- it always
@@ -864,6 +928,11 @@ int sg_cmd_status(int argc, char **argv)
                 if (unstaged.count > 0 || unmerged_count > 0)
                     printf("no changes added to commit (use \"git add\" and/or \"git commit "
                           "-a\")\n");
+                else if (!has_head)
+                    /* Bug C, priority 3 (Phase 38): unborn HEAD wins over
+                       the -uno-specific hedge below. */
+                    printf("nothing to commit (create/copy files and use \"git add\" to "
+                          "track)\n");
                 else
                     printf("nothing to commit (use -u to show untracked files)\n");
             }
@@ -887,6 +956,10 @@ int sg_cmd_status(int argc, char **argv)
             else if (untracked_count > 0)
                 printf("nothing added to commit but untracked files present (use \"git add\" "
                       "to track)\n");
+            else if (!has_head)
+                /* Bug C, priority 3 (Phase 38): unborn HEAD wins over the
+                   default "working tree clean" line. */
+                printf("nothing to commit (create/copy files and use \"git add\" to track)\n");
             else
                 printf("nothing to commit, working tree clean\n");
         }

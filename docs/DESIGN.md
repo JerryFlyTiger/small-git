@@ -5158,3 +5158,317 @@ gap in this project's test coverage, not a one-off bug.
     machine-readable cases in agreement (the remaining 16 are the
     long-format hint/closing-line strings the structural gap above already
     explains).
+
+## Phase 38: `sg status` long-format skeleton oracle, five bugs
+
+Phase 37's closing note flagged 16 long-format disagreements as an open gap
+without naming them individually. Phase 38 built a proper oracle to find out
+exactly which lines those were, and fixed the five distinct bugs behind them.
+
+### The skeleton comparison rule
+
+Compares `sg status` against `LC_ALL=C git -c core.quotepath=false status`
+after dropping exactly two line classes, everything else compared
+byte-for-byte, no tool-name normalization:
+
+1. Lines starting with `  (` (two spaces then an open paren) -- indented hint
+   lines. The two tools word these differently on purpose (`sg add` vs
+   `git add`, and git has `commit -a`-style shortcuts sg does not implement),
+   so these can never agree byte-for-byte and are not supposed to.
+   **The rule is `^  (`, not `^  (use "`** -- narrowing it to `(use "` was
+   tried first and found to silently let a real divergence through: in a
+   conflict state git also prints `  (fix conflicts and run "git commit")`,
+   which does not start with `(use "` and would have slipped past a narrower
+   filter uncaught.
+2. Lines starting with a tab -- path lines. **Measured, not assumed**: the
+   main conversation renamed `kind_label`'s `"modified:   "` to
+   `"MODIFIED:   "` and reran `bash tests/interop.sh --interop`
+   (1800/1803, 3 red), one of which was `phase23: sg status's untracked
+   paths match real git's byte-for-byte`. The reason that check catches a
+   *label* mutation despite its name naming only "paths" is worth stating
+   precisely, because the name understates its own reach: its preprocessing
+   is `sed -n 's/^\t//p'`, which strips only the leading tab -- **the label
+   column is compared right alongside the path, on the same line** (Q3's own
+   comment already says so: "git's labels are compared alongside the
+   paths"). So this tab-line rule is guarded for the untracked case (Phase
+   23), the untracked *section* (Phase 25), and staged-section ordering
+   (Phase 32) -- but that is not the same claim as "every tab-led line is
+   independently guarded". Phase 38 round 2 (item B3) closed part of the
+   remaining gap: of the seven `unmerged_label` strings, only
+   `both modified:` had a real-git oracle before round 2 -- and it comes from
+   **Q6** (`P23_CONF`, `tests/interop.sh`'s `# --- Q6: the unmerged ("both
+   modified") line`), a conflict fixture entirely separate from Q3's
+   `P23_ST`. Q3 is where the strip-tab-sort-cmp *technique* and the "labels
+   are compared alongside the paths" comment live, and Q3 is what proves the
+   `modified:`/`new file:`/`deleted:` labels are covered; it builds no
+   conflict at all. Attributing the unmerged label's oracle to Q3 (as an
+   earlier draft of this section did) sends the next reader looking for a
+   Q3 conflict fixture that does not exist. Round 2 added a second oracle
+   (see below) covering
+   `both added:`, `deleted by them:`, `deleted by us:`. The other three
+   (`both deleted:`, `added by us:`, `added by them:`) still have **no**
+   real-git oracle -- an ordinary merge cannot produce those stage
+   combinations (DD auto-resolves, AU/UA needs a rename or a hand-built
+   index) -- this is a pre-existing gap, not something Phase 38 introduced,
+   and it is not attempted here.
+
+Everything else -- the branch line, `No commits yet`, section headers,
+`Untracked files not listed (...)`, blank lines, and the closing summary
+line -- is compared byte-for-byte, **including the closing summary line**.
+This does not conflict with Phase 37's rejection of "normalize the tool name
+then cmp": that rejection was scoped to the *hint* lines (clause 1 above);
+the closing summary lines are a different case, because both tools
+hard-code the literal string `git add`/`git commit -a` in their wording
+regardless of which binary is actually running (re-measured this phase --
+`sg status`'s own closing lines already said `git add`, not `sg add`, before
+this phase touched anything), so they are supposed to be byte-identical and
+were not the source of any of the five bugs below.
+
+The fixture matrix (18 repos, 27 case x flag combinations) and the two tools
+implementing this rule (`mkfixtures.sh`, `cmp_skel.py`) were kept in the
+milestone scratchpad during development and their logic was folded into
+`tests/interop.sh`'s `phase38:` check group (one `check` per case, not
+merged, so a red line names exactly which state broke) and
+`tests/test_status_long_format.c` (named assertions for the two bugs with
+real branching logic, C and E below).
+
+### The five bugs (13 of 27 fixture cases were red before this phase)
+
+All measured against real git 2.55.0, `LC_ALL=C`.
+
+**Bug A -- merge block missing its trailing blank line.** `cmd_status.c`'s
+merge-in-progress block (`You have unmerged paths.` /
+`All conflicts fixed but you are still merging.`) printed no blank line
+after itself; git always does, unconditionally -- even when nothing else
+follows (the `mergebare` fixture: merge in progress, nothing else dirty).
+The adjacent rebase block already had this shape (an unconditional
+`printf("\n")` after its own lines); Bug A's fix is the same shape, one
+`printf("\n")` added right after the merge block.
+
+**Bug B -- unborn HEAD's `No commits yet` missing its trailing blank line.**
+The literal was `"\nNo commits yet\n"`; git's is `"\nNo commits yet\n\n"` --
+the leading blank line was already baked into the string, only the trailing
+one was missing.
+
+**Bug C -- unborn HEAD misplaced in the closing-line priority order.** Real
+git's "nothing" family has five ordered rows, measured with six fixtures
+pinning all five transitions:
+
+| # | Condition | Literal string |
+|---|---|---|
+| 1 | `unstaged > 0 \|\| unmerged > 0` | `no changes added to commit (use "git add" and/or "git commit -a")` |
+| 2 | `untracked > 0` (and `u_mode != no`) | `nothing added to commit but untracked files present (use "git add" to track)` |
+| 3 | unborn HEAD (`has_head == 0`) | `nothing to commit (create/copy files and use "git add" to track)` |
+| 4 | `u_mode == no` | `nothing to commit (use -u to show untracked files)` |
+| 5 | otherwise | `nothing to commit, working tree clean` |
+
+sg was missing row 3 entirely in both branches (the `u_mode == no` branch
+and the default branch), so an unborn HEAD fell through to row 4 or row 5
+depending on which branch it was in, instead of stopping at row 3. Fixed by
+inserting an `else if (!has_head)` check between the existing row-2 and
+row-4/row-5 checks in both branches -- `has_head` was already computed
+earlier in the function for other purposes, no new state needed.
+
+**Bug D -- `-uno`'s `Untracked files not listed (...)` had an extra blank
+line.** The literal ended `...)\n\n`; git's ends `...)\n`. Dropped the extra
+`\n`.
+
+**Bug E -- a resolved in-progress merge suppresses the closing line
+entirely.** Five fixtures pin this:
+
+| merge? | unmerged | staged | unstaged | untracked | git's closing line |
+|---|---|---|---|---|---|
+| yes | >0 | 0 | 0 | 0 | prints row 1 (`conflict`) |
+| yes | 0 | >0 | 0 | 0 | **none** (`resolved`) |
+| yes | 0 | 0 | 0 | 0 | **none** (`mergebare`) |
+| yes | 0 | 0 | 0 | >0 | **none** (`mergeuntr`) |
+| yes | 0 | 0 | >0 | any | **none** (`mergeunst`) |
+
+Once `cmd_status.c` has printed `All conflicts fixed but you are still
+merging.` (merge in progress, zero unmerged entries left), git prints no
+closing summary line at all -- not even in the `-uno` branch. When unmerged
+entries remain (`You have unmerged paths.`), the closing line prints
+normally (row 1), which sg already had right. Implemented as a single guard
+-- `if (merge_in_progress && unmerged_count == 0) { /* no closing line */ }`
+-- wrapping the entire existing if/else-if chain, rather than threading the
+condition into every individual branch.
+
+### Verification
+
+`bash tests/mutate.sh` against `test_status_long_format.c`, reverting Bug C's
+`else if (!has_head)` to `else if (0)` and Bug E's suppression guard to
+`if (0)`: both mutations turned the corresponding named assertions red
+(`test_priority3_unborn_beats_clean`, `test_priority3_unborn_beats_uno_hedge`
+for C; `test_bug_e_resolved_merge_suppresses_summary`,
+`test_bug_e_resolved_merge_suppresses_summary_uno` for E), confirming the
+new tests have discriminating power rather than being vacuously green.
+`tests/interop.sh`'s 27 `phase38:` checks and the full suite were green
+after the fix (see the completion-criteria gates in `CLAUDE.md`).
+
+Bugs A/B/D are covered by the interop skeleton comparison directly (they are
+pure formatting, no branching logic to unit-test); C and E have both the
+skeleton coverage and dedicated unit assertions, since they involve
+conditional logic a byte-diff alone would not localize as precisely.
+
+### Round 2: a cold-read fix, three fixture batches, an exit-code check
+
+A cold read of round 1's diff (before merge) found one real bug and three
+coverage gaps, all confirmed against real git 2.55.0.
+
+**Bug (new, item A) -- the merge banner and Bug E's suppression guard used
+two different scales.** The banner (`You have unmerged paths.` /
+`All conflicts fixed but you are still merging.`) called
+`sg_index_has_unmerged(&idx)` directly -- **not filtered by pathspec** --
+while Bug E's suppression already used `print_unmerged`'s filtered count.
+Measured with a fixture carrying one conflicted path (`f.txt`) and one clean
+tracked path (`other.txt`):
+
+| pathspec | git's banner | git's closing line | sg's banner (before fix) | verdict |
+|---|---|---|---|---|
+| `-- f.txt` (matches the conflict) | `You have unmerged paths.` | `no changes added to commit (...)` | same | correct |
+| `-- other.txt` (does not match) | `All conflicts fixed but you are still merging.` | **none** | `You have unmerged paths.` | wrong |
+| `-- nosuch` (does not match) | `All conflicts fixed but you are still merging.` | **none** | `You have unmerged paths.` | wrong |
+
+Fixed by extracting the counting loop out of `print_unmerged` into its own
+function, `count_unmerged(idx, ps)`, called exactly once right after the
+index and pathspec are both available (`cmd_status.c`, before the merge
+block prints anything), with the result stored in `unmerged_count` and
+threaded through to both the banner and `print_unmerged` (which now takes
+the count as a parameter instead of recomputing it). One value, two
+consumers -- the same shape Bug A itself violated.
+
+**Bug (new, found while building B1's fixtures) -- `-uno`'s
+`Untracked files not listed (...)` hedge also needs to fire when a
+just-resolved merge left literally nothing else to report.** The existing
+condition was `staged.count > 0`; measured against the `mergebare` fixture
+(merge resolved, `git add`-ed back to the exact content already in HEAD, so
+`sg_status_diff_staged` reports zero staged changes even though `git add`
+was run), real git still prints the hedge line -- because Bug E suppresses
+the closing summary entirely in that state, and without this line nothing
+at all would be printed after the banner, which real git never does.
+Confirmed with `mergeuntr` and `mergeunst` too (both also have
+`staged.count == 0` after their conflict resolves to HEAD's own content).
+Fixed by widening the guard to
+`staged.count > 0 || (merge_in_progress && unmerged_count == 0)`. This is
+outside PHASE38_ROUND2.md's item A as literally written (which only names
+the banner and the closing line), but it is the same underlying interaction
+(a resolved-but-still-merging state changing what the closing region of the
+long format has to say), found while making the B1 fixtures pass, and fixed
+in-scope (`cmd_status.c`'s long-format printer only).
+
+**B1 -- `-uno` on the four merge-resolved fixtures.** `conflict -uno` already
+existed but has `unmerged_count > 0`, so it never reaches either of the two
+bugs above; `resolved -uno`, `mergebare -uno`, `mergeuntr -uno`,
+`mergeunst -uno` were added specifically because they do.
+
+**B2 -- merge + pathspec, item A's regression guard.** The `conflict`
+fixture gained a second, untouched tracked file (`other.txt`), and three new
+cases: `conflict -- f.txt` (matches), `conflict -- other.txt` (does not),
+`conflict -- nosuch` (does not). Adding `other.txt` changes the plain
+`conflict` case's own output too (an extra unchanged tracked file shows up),
+but the comparison is dynamic (built from both tools' live output at check
+time, not a pinned string), so it tracked the fixture change automatically.
+
+**B3 -- a real-git oracle for four more `unmerged_label` strings.** Recipe
+(measured, produces byte-for-byte identical output on both sides):
+
+```sh
+for f in uu ud du; do echo base > $f.txt; done
+git add .; git commit -qm base
+git checkout -q -b other
+  echo theirs > uu.txt; rm ud.txt; echo theirs > du.txt; echo theirs > aa.txt
+  git add -A; git commit -qm theirs
+git checkout -q master
+  echo ours > uu.txt; echo ours > ud.txt; rm du.txt; echo ours > aa.txt
+  git add -A; git commit -qm ours
+git merge other > /dev/null 2>&1
+```
+
+produces `both added: aa.txt`, `both modified: uu.txt`,
+`deleted by them: ud.txt`, `deleted by us: du.txt`. This check is **not**
+run through the skeleton comparator (which drops every tab-led line, i.e.
+exactly where label text lives) -- it reuses Q3's own technique instead:
+strip the leading tab from both sides, sort, `cmp -s`. The remaining three
+labels (`both deleted:`, `added by us:`, `added by them:`) are still
+without a real-git oracle; see the round-1 skeleton section above for why
+(an ordinary merge cannot produce those stage combinations) -- pre-existing,
+not attempted this round either.
+
+**Item C -- `p38_cmp` now also asserts sg's own exit code is 0.**
+Previously both sides' stderr was discarded and neither exit code was
+checked; `test -s` on the git-side skeleton already guarded the worst case
+(both outputs empty), but sg printing a stray stderr warning or exiting
+non-zero on some fixture was invisible. Real git exits 0 on all 34 fixture
+combinations (measured); sg's exit code is now part of the same `check`.
+
+### Round 2 verification
+
+Fixture count: 27 (round 1) + 4 (B1) + 3 (B2) = 34 skeleton cases, all
+matching, plus B3's separate label comparison. `bash tests/mutate.sh` against
+`test_status_long_format.c`: reverting the banner's `unmerged_count > 0` back
+to `sg_index_has_unmerged(&idx)` turned
+`test_bug_a_pathspec_missing_conflict_shows_resolved_banner` red; reverting
+the widened `-uno` hedge guard back to `staged.count > 0` alone turned
+`test_uno_untracked_hedge_prints_on_bare_resolved_merge` red. Full gates
+(`bash tests/gates.sh`) green after both fixes.
+
+
+### Round 3: the oracle was borrowing the developer's environment
+
+Rounds 1 and 2 were fully green locally, on all five gates. CI then went red
+on **macOS only**, for 21 of the 34 skeleton cases; ubuntu/gcc, ubuntu/clang,
+both fuzzers and the ASan job all stayed green, and no unit test failed. Both
+runners and this machine run git **2.55.0**, so the obvious "the runner has an
+older git" explanation was checked first and is wrong.
+
+The failing set named the cause once it was listed in full: **every case whose
+output carries a non-indented parenthetical failed, and every case without one
+passed.** `clean` and `detached` passed because their closing line
+(`nothing to commit, working tree clean`) has no parentheses at all;
+`conflict -- f.txt` failed while `conflict -- other.txt` and
+`conflict -- nosuch` passed, because the merge-suppression rule means only the
+first of the three prints a closing line.
+
+The mechanism, measured:
+
+```
+$ git -c advice.statusHints=true status      $ git -c advice.statusHints=false status
+On branch master                             On branch master
+Untracked files:                             Untracked files:
+  (use "git add <file>..." to include ...)    	u.txt
+	u.txt
+                                             nothing added to commit but untracked
+nothing added to commit but untracked          files present
+  files present (use "git add" to track)
+```
+
+`advice.statusHints=false` does not only drop the indented hint lines -- which
+this comparison filters anyway, so they were invisible to it. It also strips
+the `(use "git add" to track)` tail off the **closing summary line**, which the
+comparison very much does compare. GitHub's macOS runner has advice off; this
+machine does not.
+
+The fix is not to filter more. It is for the oracle to **declare its
+environment** instead of inheriting it, exactly as it already declares
+`LC_ALL=C` (this machine's git is zh_TW-localized) and `core.quotepath=false`
+(sg emits `>=0x80` raw). `advice.statusHints=true` is simply the third axis,
+and the three now live in one `P38_GIT_FLAGS` variable so a future edit cannot
+pin one comparison and not another. sg has no advice configuration of its own,
+so pinning git to `true` is what makes the two comparable on any machine.
+
+A dropped pin would otherwise come back as 21 silent `cmp` failures naming no
+cause, so the group also gained
+`phase38 oracle: precondition -- the pinned flags keep git's closing-line
+parenthetical`, which probes through the same `$P38_GIT_FLAGS`. Verified by
+removing the pin and re-running under an injected
+`advice.statusHints=false` (`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=... `): 22
+phase38 checks go red, and the precondition is one of them. With the pin
+restored, interop is 1814/1814 **both** in the normal environment and under
+the injected one -- the reproducer was verified to actually reproduce before
+it was trusted, after a first attempt silently compared against an empty sg
+side because `gates.sh` had cleaned `build/`.
+
+**The general rule this is the third instance of**: a local green light is
+evidence about this machine, not about the code, whenever an external tool is
+the oracle. Every knob that changes the oracle's output has to be named on the
+command line.

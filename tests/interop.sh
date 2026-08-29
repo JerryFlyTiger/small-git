@@ -10739,6 +10739,269 @@ check "phase37 oracle: real git stash push -- nosuch also exits non-zero" \
     sh -c "! (cd '$P37_B1_GIT' && git stash push -q -m p37 -- nosuch) > /dev/null 2>&1"
 
 
+# --- Phase 38: sg status long-format skeleton oracle -------------------
+#
+# Skeleton comparison rule (CLAUDE.md's Phase 38 entry, and PHASE38_SPEC.md
+# section 0): drop exactly two line classes, cmp everything else
+# byte-for-byte, no tool-name normalization anywhere else.
+#   1. lines starting with "  (" -- indented hint lines. The two tools word
+#      these differently ("sg add" vs "git add", and git has commit -a-style
+#      shortcuts sg doesn't), and the rule is deliberately "^  (" and NOT
+#      "^  (use \"" -- a conflict's "  (fix conflicts and run ...)" line
+#      does not start with "(use \"" and would slip through uncaught if the
+#      rule were narrowed to that (measured).
+#   2. lines starting with a tab -- path lines. Already independently
+#      guarded by the Phase 23 (untracked paths), Phase 25 (untracked
+#      section), and Phase 32 (staged section ordering) checks; this rule
+#      does not duplicate them, it just has to skip past them to compare
+#      everything else.
+# Every other line -- branch line, "No commits yet", section headers,
+# "Untracked files not listed (...)", blank lines, and the closing summary
+# line -- is compared byte-for-byte. The closing summary lines are safe to
+# compare directly because both tools hard-code "git add"/"git commit -a" in
+# their wording regardless of the invoking binary's name (re-measured this
+# phase, also recorded in docs/DESIGN.md's Phase 37 section).
+# The git side of every phase38 comparison runs with these flags. They live
+# in one variable so the precondition check further down probes the SAME
+# invocation the comparisons use -- dropping the pin in one place and not
+# the other would defeat the guard.
+P38_GIT_FLAGS="-c core.quotepath=false -c advice.statusHints=true"
+
+p38_skel() {
+    grep -v '^  (' "$1" | grep -v "$(printf '^\t')"
+}
+
+p38_cmp() {
+    _slug="$1"; _label="$2"; _dir="$3"; shift 3
+    ( cd "$_dir" && "$SG" status "$@" ) > "$WORKDIR/p38_${_slug}_sg.txt" 2>/dev/null
+    _sg_rc=$?
+    # Three environment axes have to be declared on git's side, not
+    # inherited: LC_ALL=C (this machine's git is zh_TW-localized),
+    # core.quotepath=false (sg emits >=0x80 raw), and -- since Phase 38 --
+    # advice.statusHints=true. That third one was NOT hypothetical: this
+    # group went green locally and red on the macOS CI runner for 21 of its
+    # 34 cases, because that runner has advice turned off, and
+    # advice.statusHints=false strips the parenthetical out of the CLOSING
+    # SUMMARY line too ("nothing added to commit but untracked files
+    # present" with no "(use \"git add\" to track)"), not just the indented
+    # hint lines this comparison already filters. The failing set was
+    # exactly "every case whose output carries a non-indented parenthetical"
+    # -- clean/detached passed because their closing line has no parens at
+    # all. sg has no advice config, so pinning git to true is what makes the
+    # two comparable anywhere.
+    ( cd "$_dir" && LC_ALL=C git $P38_GIT_FLAGS status "$@" ) \
+        > "$WORKDIR/p38_${_slug}_git.txt" 2>/dev/null
+    p38_skel "$WORKDIR/p38_${_slug}_sg.txt" > "$WORKDIR/p38_${_slug}_sg_skel.txt"
+    p38_skel "$WORKDIR/p38_${_slug}_git.txt" > "$WORKDIR/p38_${_slug}_git_skel.txt"
+    # The "test -s" is not decoration: both sides of the cmp are produced by
+    # this same function with stderr discarded, so ANY failure that empties
+    # both outputs at once -- a fixture whose repo never got created, a
+    # broken $SG path, or a p38_skel edit that over-filters -- would leave
+    # two empty files and every one of these 27+ checks would pass while
+    # testing nothing. This project has shipped an unfailable test twice.
+    # git's long format always emits at least a branch/HEAD line, so an
+    # empty git-side skeleton means the fixture, not sg, is broken.
+    # Phase 38 round 2, item C: the exit code was previously not checked at
+    # all -- stderr from both sides was discarded, so sg printing a warning
+    # or exiting non-zero on some fixture was invisible to this oracle.
+    # Real git exits 0 on all 34 of these fixture combinations (measured), so sg
+    # must too.
+    check "phase38: sg status ($_label) matches real git skeleton" \
+        sh -c "test -s '$WORKDIR/p38_${_slug}_git_skel.txt' \
+            && cmp -s '$WORKDIR/p38_${_slug}_sg_skel.txt' '$WORKDIR/p38_${_slug}_git_skel.txt' \
+            && [ $_sg_rc = 0 ]"
+}
+
+P38_ROOT="$WORKDIR/p38fx"
+mkdir -p "$P38_ROOT"
+
+# Fixtures are built with "$SG" init (not "git init"), per this phase's own
+# convention -- everything else (add/commit/checkout/merge/mv) is plain git,
+# same as every other interop fixture in this file; sg's on-disk format is
+# byte-compatible so real git can operate on an sg-initialized repo freely.
+p38_init() {
+    ( cd "$P38_ROOT" && "$SG" init "$1" ) > /dev/null 2>&1
+    ( cd "$P38_ROOT/$1" && git config user.email "a@b.c" && git config user.name "git user" \
+        && git config commit.gpgsign false )
+}
+
+# "merge in progress, conflict already resolved to HEAD's content" common
+# prefix, shared by resolved/mergebare/mergeuntr/mergeunst.
+p38_mergebase() {
+    _d="$P38_ROOT/$1"
+    ( cd "$_d"
+      printf 'A\n' > f.txt; echo keep > g.txt; git add .; git commit -qm base
+      git checkout -q -b other; printf 'B\n' > f.txt; git commit -qam theirs
+      git checkout -q master; printf 'C\n' > f.txt; git commit -qam ours
+      git merge other -q > /dev/null 2>&1 )
+}
+
+for c in clean untracked unstaged staged mixed deleted renamed stagedonly; do
+    p38_init "$c"
+    ( cd "$P38_ROOT/$c"
+      echo base > f.txt; echo two > g.txt; git add .; git commit -qm base
+      case $c in
+          untracked)  echo n > u.txt ;;
+          unstaged)   echo m >> f.txt ;;
+          staged)     echo m >> f.txt; git add f.txt ;;
+          stagedonly) echo m >> f.txt; git add f.txt ;;
+          mixed)      echo m >> f.txt; git add f.txt; echo m2 >> g.txt; echo n > u.txt ;;
+          deleted)    rm f.txt ;;
+          renamed)    git mv f.txt renamed.txt ;;
+      esac )
+done
+
+p38_init unborn
+p38_init unbornu;  ( cd "$P38_ROOT/unbornu"; echo n > u.txt )
+p38_init unborns;  ( cd "$P38_ROOT/unborns"; echo s > s.txt; git add s.txt )
+
+# Phase 38 round 2, item B2: other.txt is a second, untouched-by-the-merge
+# file, added so a pathspec can distinguish "matches the conflicted path"
+# from "matches something else" -- this is the fixture that guards item A's
+# fix (the merge banner and the closing-line suppression now sharing one
+# filtered unmerged count). Note this changes the "conflict" (no pathspec)
+# case's own output too (other.txt now shows up as a second clean-tracked
+# file, which changes nothing visible since it is unchanged) -- the
+# comparison below is dynamic (built at check time, not pinned to a fixed
+# string), so it tracks the fixture automatically.
+p38_init conflict
+( cd "$P38_ROOT/conflict"
+  printf 'A\n' > f.txt; printf 'other\n' > other.txt; git add .; git commit -qm base
+  git checkout -q -b other; printf 'B\n' > f.txt; git commit -qam theirs
+  git checkout -q master; printf 'C\n' > f.txt; git commit -qam ours
+  git merge other -q > /dev/null 2>&1 )
+
+p38_init resolved;   p38_mergebase resolved;   ( cd "$P38_ROOT/resolved";   printf 'R\n' > f.txt; git add f.txt )
+p38_init mergebare;  p38_mergebase mergebare;  ( cd "$P38_ROOT/mergebare";  printf 'C\n' > f.txt; git add f.txt )
+p38_init mergeuntr;  p38_mergebase mergeuntr;  ( cd "$P38_ROOT/mergeuntr";  printf 'C\n' > f.txt; git add f.txt; echo n > u.txt )
+p38_init mergeunst;  p38_mergebase mergeunst;  ( cd "$P38_ROOT/mergeunst";  printf 'C\n' > f.txt; git add f.txt; echo d >> g.txt )
+
+p38_init detached
+( cd "$P38_ROOT/detached"
+  echo base > f.txt; git add .; git commit -qm base
+  echo two >> f.txt; git commit -qam second; git checkout -q HEAD~1 )
+
+p38_init ignored
+( cd "$P38_ROOT/ignored"
+  echo base > f.txt; echo 'build/' > .gitignore; git add f.txt .gitignore; git commit -qm base
+  mkdir -p build; echo x > build/o.txt; echo n > u.txt )
+
+# One check per fixture x flag combination -- 27 cases total, matching
+# PHASE38_SPEC.md section 1's enumeration, deliberately not merged into
+# fewer checks so a red line names exactly which state broke.
+p38_cmp clean              "clean"                  "$P38_ROOT/clean"
+p38_cmp untracked          "untracked"              "$P38_ROOT/untracked"
+p38_cmp unstaged           "unstaged"               "$P38_ROOT/unstaged"
+p38_cmp staged             "staged"                 "$P38_ROOT/staged"
+p38_cmp mixed              "mixed"                  "$P38_ROOT/mixed"
+p38_cmp deleted            "deleted"                "$P38_ROOT/deleted"
+p38_cmp renamed            "renamed"                "$P38_ROOT/renamed"
+p38_cmp detached           "detached"               "$P38_ROOT/detached"
+p38_cmp unborn             "unborn"                 "$P38_ROOT/unborn"
+p38_cmp unbornu            "unbornu"                "$P38_ROOT/unbornu"
+p38_cmp unborns            "unborns"                "$P38_ROOT/unborns"
+p38_cmp conflict           "conflict"               "$P38_ROOT/conflict"
+p38_cmp resolved           "resolved"               "$P38_ROOT/resolved"
+p38_cmp mergebare          "mergebare"              "$P38_ROOT/mergebare"
+p38_cmp mergeuntr          "mergeuntr"              "$P38_ROOT/mergeuntr"
+p38_cmp mergeunst          "mergeunst"              "$P38_ROOT/mergeunst"
+p38_cmp ignored            "ignored"                "$P38_ROOT/ignored"
+p38_cmp ignored_ignored    "ignored --ignored"      "$P38_ROOT/ignored"    --ignored
+p38_cmp ignored_uall       "ignored -uall"          "$P38_ROOT/ignored"    -uall
+p38_cmp ignored_uno        "ignored -uno"           "$P38_ROOT/ignored"    -uno
+p38_cmp mixed_uno          "mixed -uno"             "$P38_ROOT/mixed"      -uno
+p38_cmp mixed_uall         "mixed -uall"            "$P38_ROOT/mixed"      -uall
+p38_cmp stagedonly_uno     "stagedonly -uno"        "$P38_ROOT/stagedonly" -uno
+p38_cmp untracked_uno      "untracked -uno"         "$P38_ROOT/untracked"  -uno
+p38_cmp unborn_uno         "unborn -uno"            "$P38_ROOT/unborn"     -uno
+p38_cmp unbornu_uno        "unbornu -uno"           "$P38_ROOT/unbornu"    -uno
+p38_cmp conflict_uno       "conflict -uno"          "$P38_ROOT/conflict"   -uno
+
+# --- Phase 38 round 2, item B1: -uno on the four merge-in-progress fixtures
+# whose closing summary line is suppressed entirely once conflicts are
+# resolved (Bug E). "conflict -uno" already exists above, but that fixture
+# still has unmerged_count > 0, so it never reaches the suppression branch
+# and does not exercise this dimension -- these four do. ---
+p38_cmp resolved_uno       "resolved -uno"          "$P38_ROOT/resolved"   -uno
+p38_cmp mergebare_uno      "mergebare -uno"         "$P38_ROOT/mergebare"  -uno
+p38_cmp mergeuntr_uno      "mergeuntr -uno"         "$P38_ROOT/mergeuntr"  -uno
+p38_cmp mergeunst_uno      "mergeunst -uno"         "$P38_ROOT/mergeunst"  -uno
+
+# --- Phase 38 round 2, item B2: merge in progress + pathspec, the regression
+# guard for item A's fix (the merge banner and the closing-line suppression
+# now sharing count_unmerged's one filtered count instead of the banner
+# scanning idx unfiltered). "-- f.txt" matches the conflicted path (git's
+# banner is "You have unmerged paths."); "-- other.txt" and "-- nosuch" do
+# not (git's banner is "All conflicts fixed but you are still merging." and
+# it prints no closing summary line at all). ---
+p38_cmp conflict_pf        "conflict -- f.txt"      "$P38_ROOT/conflict"   -- f.txt
+p38_cmp conflict_pother    "conflict -- other.txt"  "$P38_ROOT/conflict"   -- other.txt
+p38_cmp conflict_pnosuch   "conflict -- nosuch"     "$P38_ROOT/conflict"   -- nosuch
+
+# --- Phase 38 round 2, item B3: real-git oracle for four of the seven
+# unmerged_label strings. Before this, only "both modified:" had an oracle
+# (Q3, phase23). This is NOT run through the skeleton comparator: p38_skel
+# drops every tab-led line, which is exactly where the label text lives, so
+# a skeleton pass here would compare nothing. Uses Q3's own technique
+# instead: strip the leading tab, sort, cmp -s -- so the label column is
+# compared alongside the path, same as Q3's own comment says. The recipe
+# below is measured to produce, byte-for-byte identical between sg and real
+# git: "both added: aa.txt", "both modified: uu.txt",
+# "deleted by them: ud.txt", "deleted by us: du.txt". The remaining three
+# labels ("both deleted:", "added by us:", "added by them:") cannot be
+# produced by an ordinary merge (DD auto-resolves, AU/UA need a rename or a
+# hand-built index) and are NOT attempted here -- see CLAUDE.md and
+# docs/DESIGN.md's Phase 38 section for that as a named, pre-existing gap.
+p38_label_fixture() {
+    _dir="$1"; _impl="$2"
+    mkdir -p "$_dir"
+    if [ "$_impl" = "git" ]; then
+        (cd "$_dir" && git init -q .) > /dev/null 2>&1
+    else
+        (cd "$WORKDIR" && "$_impl" init "$(basename "$_dir")") > /dev/null 2>&1
+    fi
+    (cd "$_dir" && git config user.email "a@b.c" && git config user.name "git user" \
+        && git config commit.gpgsign false) > /dev/null 2>&1
+    ( cd "$_dir"
+      for f in uu ud du; do echo base > $f.txt; done
+      git add .; git commit -qm base
+      git checkout -q -b other
+        echo theirs > uu.txt; rm ud.txt; echo theirs > du.txt; echo theirs > aa.txt
+        git add -A; git commit -qm theirs
+      git checkout -q master
+        echo ours > uu.txt; echo ours > ud.txt; rm du.txt; echo ours > aa.txt
+        git add -A; git commit -qm ours
+      git merge other > /dev/null 2>&1 )
+}
+P38_LBL_GIT="$WORKDIR/p38_label_git"
+p38_label_fixture "$P38_LBL_GIT" git
+check "phase38 oracle: precondition -- the label fixture merge really did conflict" \
+    test -f "$P38_LBL_GIT/.git/MERGE_HEAD"
+P38_LBL_SG="$WORKDIR/p38_label_sg"
+p38_label_fixture "$P38_LBL_SG" "$SG"
+check "phase38 oracle: precondition -- sg's label fixture merge also conflicted" \
+    test -f "$P38_LBL_SG/.git/MERGE_HEAD"
+(cd "$P38_LBL_SG" && "$SG" status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p38_label_sg.txt"
+(cd "$P38_LBL_GIT" && LC_ALL=C git $P38_GIT_FLAGS status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p38_label_git.txt"
+check "phase38: sg status's unmerged labels match real git byte-for-byte" \
+    cmp -s "$WORKDIR/p38_label_sg.txt" "$WORKDIR/p38_label_git.txt"
+
+# Precondition for the advice.statusHints half of $P38_GIT_FLAGS. Phase 38
+# went fully green locally and red on GitHub's macOS runner for 21 of its 34
+# cases, because that runner's git has advice turned off, and
+# advice.statusHints=false strips the "(use \"git add\" to track)" tail off
+# the CLOSING SUMMARY line as well as removing the indented hint lines the
+# skeleton already filters. Without this probe, dropping the pin would come
+# back as 21 silent cmp failures naming no cause; with it, one check names
+# the cause. Deliberately probes through $P38_GIT_FLAGS, the same variable
+# the comparisons use.
+(cd "$P38_ROOT/untracked" && LC_ALL=C git $P38_GIT_FLAGS status) \
+    > "$WORKDIR/p38_advice_probe.txt" 2>/dev/null
+check "phase38 oracle: precondition -- the pinned flags keep git's closing-line parenthetical" \
+    grep -q 'nothing added to commit but untracked files present (use "git add" to track)' \
+    "$WORKDIR/p38_advice_probe.txt"
+
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
