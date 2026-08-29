@@ -5298,6 +5298,59 @@ for p41f in nl.txt gap3.txt gap4.txt; do
         cmp -s "$WORKDIR/p41_c_sg.txt" "$WORKDIR/p41_c_git.txt"
 done
 
+# --- Phase 44: `git stash show`'s implied -p. Measured, git 2.55.0: the
+# default is a diffstat, but any DIFF option that is not itself a format
+# selector switches the output to a patch (-M, -C, --no-renames, --histogram,
+# --patience, -U<n>), while the stash-specific flags do not (-u,
+# --include-untracked, --only-untracked). An explicit format wins regardless
+# of order. sg had the default and the format flags right and the implied -p
+# missing entirely, so `sg stash show -M` printed a stat where git prints a
+# patch -- a divergence that predates this phase and was never recorded as
+# deliberate.
+P44="$WORKDIR/p44_stash_show"
+rm -rf "$P44"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P44")") > /dev/null 2>&1
+printf 'a\nb\nc\n' > "$P44/f.txt"
+(cd "$P44" && "$SG" add f.txt && "$SG" commit -m base) > /dev/null 2>&1
+printf 'a\nB\nc\n' > "$P44/f.txt"
+printf 'untracked\n' > "$P44/u.txt"
+(cd "$P44" && "$SG" stash push -u -m p44) > /dev/null 2>&1
+# p44_kind <flags...> -> prints PATCH / STAT / OTHER for each tool
+p44_kind() {
+    p44tool="$1"; shift
+    if [ "$p44tool" = sg ]; then
+        p44out=$( (cd "$P44" && "$SG" stash show "$@") 2>/dev/null | head -1 )
+    else
+        p44out=$( (cd "$P44" && LC_ALL=C git stash show "$@") 2>/dev/null | head -1 )
+    fi
+    case "$p44out" in
+        "diff --git"*) echo PATCH ;;
+        *"|"*) echo STAT ;;
+        *) echo OTHER ;;
+    esac
+}
+for p44case in "-M" "--no-renames" "--histogram"; do
+    check "phase44 oracle: git stash show $p44case implies -p" \
+        sh -c "test \"$(p44_kind git $p44case)\" = PATCH"
+    check "phase44: sg stash show $p44case implies -p too" \
+        sh -c "test \"$(p44_kind sg $p44case)\" = PATCH"
+done
+check "phase44 oracle: with no flag git stash show is a diffstat" \
+    sh -c "test \"$(p44_kind git)\" = STAT"
+check "phase44: sg agrees (the default is unchanged)" \
+    sh -c "test \"$(p44_kind sg)\" = STAT"
+# The order-independence half: an explicit format wins from either side. A
+# "last one wins" implementation passes one of these two and fails the other.
+check "phase44 oracle: git -M --stat is a stat" sh -c "test \"$(p44_kind git -M --stat)\" = STAT"
+check "phase44: sg -M --stat is a stat" sh -c "test \"$(p44_kind sg -M --stat)\" = STAT"
+check "phase44 oracle: git --stat -M is a stat too" sh -c "test \"$(p44_kind git --stat -M)\" = STAT"
+check "phase44: sg --stat -M is a stat too" sh -c "test \"$(p44_kind sg --stat -M)\" = STAT"
+# -u neither implies nor suppresses: alone it stays a stat, with -M it is a patch.
+check "phase44 oracle: git -u alone stays a stat" sh -c "test \"$(p44_kind git -u)\" = STAT"
+check "phase44: sg -u alone stays a stat" sh -c "test \"$(p44_kind sg -u)\" = STAT"
+check "phase44 oracle: git -u -M is a patch" sh -c "test \"$(p44_kind git -u -M)\" = PATCH"
+check "phase44: sg -u -M is a patch" sh -c "test \"$(p44_kind sg -u -M)\" = PATCH"
+
 # --- Phase 43: `sg merge` accepts any revision, not just a bare branch name.
 # Before this it called sg_ref_branch_exists directly, so a tag, a
 # refs/heads/... path and a `~N` suffix were all rejected with "invalid

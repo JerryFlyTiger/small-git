@@ -440,7 +440,8 @@ static int cmd_stash_show(int argc, char **argv)
         "usage: sg stash show [-p|--patch] [--stat[=<w>[,<n>]]] [--numstat] [--shortstat] "
         "[--name-only]\n"
         "                      [--name-status] [-M[<n>]|--find-renames[=<n>]|--no-renames]\n"
-        "                      [-u|--include-untracked] [--only-untracked] [<stash>]\n";
+        "                      [--histogram] [-u|--include-untracked] [--only-untracked] "
+        "[<stash>]\n";
     sg_diff_out_opts opts;
     const char *spec = NULL;
     show_untracked_mode umode = SHOW_UNTRACKED_NONE;
@@ -456,6 +457,18 @@ static int cmd_stash_show(int argc, char **argv)
     int exit_rc;
     /* Same scale and same default as `sg diff -M` -- see sg/similarity.h. */
     int rename_score = SG_SIMILARITY_DEFAULT;
+    /* git's implied -p (Phase 44), measured against git 2.55.0: `git stash
+       show` defaults to a diffstat, but any DIFF option that is not itself a
+       format selector switches it to a patch -- -M, -C, --no-renames,
+       --histogram, --patience and -U<n> all do. The stash-specific flags do
+       NOT (-u / --include-untracked / --only-untracked stay on the stat, and
+       -u -M still switches, so -u neither implies nor suppresses), and an
+       explicit format always wins REGARDLESS OF ORDER (`-M --stat` and
+       `--stat -M` both print a stat). That last part is why these are two
+       independent flags resolved after the loop instead of assignments
+       inside it: an in-loop "last one wins" would make the order matter. */
+    int format_given = 0;
+    int diff_opt_given = 0;
 
     memset(&opts, 0, sizeof(opts));
     opts.format = SG_DIFF_FORMAT_STAT; /* the default -- measured, `git stash show` prints a diffstat */
@@ -465,28 +478,40 @@ static int cmd_stash_show(int argc, char **argv)
 
         if (strcmp(a, "-p") == 0 || strcmp(a, "--patch") == 0) {
             opts.format = SG_DIFF_FORMAT_PATCH;
+            format_given = 1;
         } else if (strcmp(a, "--stat") == 0) {
             opts.format = SG_DIFF_FORMAT_STAT;
             opts.stat_width = 0;
             opts.stat_name_width = 0;
+            format_given = 1;
         } else if (strncmp(a, "--stat=", 7) == 0) {
             opts.format = SG_DIFF_FORMAT_STAT;
+            format_given = 1;
             if (sg_diff_parse_stat_arg(a + 7, &opts.stat_width, &opts.stat_name_width) != 0) {
                 fputs(usage, stderr);
                 return 1;
             }
         } else if (strcmp(a, "--numstat") == 0) {
             opts.format = SG_DIFF_FORMAT_NUMSTAT;
+            format_given = 1;
         } else if (strcmp(a, "--shortstat") == 0) {
             opts.format = SG_DIFF_FORMAT_SHORTSTAT;
+            format_given = 1;
         } else if (strcmp(a, "--name-only") == 0) {
             opts.format = SG_DIFF_FORMAT_NAME_ONLY;
+            format_given = 1;
         } else if (strcmp(a, "--name-status") == 0) {
             opts.format = SG_DIFF_FORMAT_NAME_STATUS;
+            format_given = 1;
         } else if (strcmp(a, "--no-renames") == 0) {
             rename_score = 0;
+            diff_opt_given = 1;
+        } else if (strcmp(a, "--histogram") == 0) {
+            opts.algorithm = SG_DIFF_ALGO_HISTOGRAM;
+            diff_opt_given = 1;
         } else if (strcmp(a, "-M") == 0 || strcmp(a, "--find-renames") == 0) {
             rename_score = SG_SIMILARITY_DEFAULT;
+            diff_opt_given = 1;
         } else if (strncmp(a, "-M", 2) == 0 || strncmp(a, "--find-renames=", 15) == 0) {
             const char *v = a[1] == 'M' ? a + 2 : a + 15;
 
@@ -494,6 +519,7 @@ static int cmd_stash_show(int argc, char **argv)
                 fputs(usage, stderr);
                 return 1;
             }
+            diff_opt_given = 1;
         } else if (strcmp(a, "-u") == 0 || strcmp(a, "--include-untracked") == 0) {
             umode = SHOW_UNTRACKED_INCLUDE;
         } else if (strcmp(a, "--only-untracked") == 0) {
@@ -508,6 +534,11 @@ static int cmd_stash_show(int argc, char **argv)
             return 1;
         }
     }
+
+    /* Resolved after the loop, not inside it -- see the comment on
+       format_given for why the order must not matter. */
+    if (!format_given && diff_opt_given)
+        opts.format = SG_DIFF_FORMAT_PATCH;
 
     if (sg_stash_parse_spec(spec, &index) != 0) {
         fprintf(stderr, "sg: invalid stash spec: %s\n", spec != NULL ? spec : "");

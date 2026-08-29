@@ -1542,6 +1542,8 @@ side when comparing the two directly.
 .RB [ \-\-shortstat ]
 .RB [ \-\-name\-only ]
 .RB [ \-\-name\-status ]
+.RB [ -M [ <n> ]| \-\-no\-renames ]
+.RB [ \-\-histogram ]
 .RB [ -u | \-\-include\-untracked ]
 .RB [ \-\-only\-untracked ]
 .RI [ stash ]
@@ -1690,7 +1692,31 @@ is accepted
 .BR \-\-shortstat ,
 .BR \-\-name\-only ,
 .BR \-\-name\-status ),
-and the diff is rendered by the same code as
+and so are the diff options
+.RB ( -M [ <n> ],
+.BR \-\-find\-renames [= <n> ],
+.BR \-\-no\-renames ,
+.BR \-\-histogram ).
+.PP
+Giving a diff option that is not itself a format selector switches the
+output to a patch, exactly as if
+.B -p
+had been given \(em this is git's own rule, measured:
+.B "git stash show -M"
+prints a patch, not a stat. The stash-specific flags do
+.I not
+do this
+.RB ( -u ,
+.BR \-\-include\-untracked ,
+.B \-\-only\-untracked
+stay on the diffstat), and an explicit format wins regardless of which side
+of the diff option it was written on, so
+.B "-M \-\-stat"
+and
+.B "\-\-stat -M"
+both print a stat.
+.PP
+The diff is rendered by the same code as
 .BR "sg diff" .
 .B \-\-stat
 also takes real git's
