@@ -300,6 +300,53 @@ static void test_one_sided_change_blocks_the_merge(void)
                "<<<<<<< ours\nourY\n=======\nthrY\n>>>>>>> theirs\n");
 }
 
+/* A merge that changes nothing must not change the bytes either, and a
+   conflict earlier in the file must not grow the file a newline at the end.
+   Both measured; both were WRONG in the first cut of Phase 41's region list,
+   and neither the fuzzer nor any other test here could see it: the sync-point
+   pass pushes a zero-length region after the final anchor, and terminating
+   the previous line before writing nothing gave a file that legitimately ends
+   without a newline one it never had. The clean case is the alarming one --
+   sg rewrote a file on a merge that resolved to "unchanged".
+
+   These two need base itself to lack the trailing newline, which is a shape
+   tests/fuzz_merge.py's generator could not produce until this round (it
+   built base from "base%02d\n" lines and only ever stripped the newline in
+   ours/theirs) -- so the fuzzer's 0/200 was, for this one dimension, zero
+   evidence. */
+static void test_noop_merge_keeps_missing_trailing_newline(void)
+{
+    CHECK_MERGE("no-op merge of a file with no trailing newline", "a\nb", "a\nb", "a\nb", 0,
+               "a\nb");
+}
+
+static void test_conflict_above_a_newlineless_last_line(void)
+{
+    CHECK_MERGE("conflict above a newline-less last line", "a\nb\nc", "a\nX\nc", "a\nY\nc", 1,
+               "a\n<<<<<<< ours\nX\n=======\nY\n>>>>>>> theirs\nc");
+}
+
+/* The empty-region guard asks whether the side being PRINTED is empty, not
+   whether the ours side is -- and for a one-sided pure insertion the two
+   answers differ. These two fixtures are what make that distinction
+   observable: theirs inserts a line where ours has nothing at all, so the
+   region is RESOLVED with an empty ours range and a non-empty theirs range.
+   Asking the wrong side there does not merely misplace a newline, it drops
+   the inserted line entirely, and the review round measured that all 13
+   named tests before these two stayed green under exactly that mutation.
+   (Both directions, because the mirror-image mistake is just as easy.) */
+static void test_theirs_pure_insertion_survives(void)
+{
+    CHECK_MERGE("theirs inserts where ours has nothing", "a\nb\n", "a\nb\n", "a\nNEW\nb\n", 0,
+               "a\nNEW\nb\n");
+}
+
+static void test_ours_pure_insertion_survives(void)
+{
+    CHECK_MERGE("ours inserts where theirs has nothing", "a\nb\n", "a\nNEW\nb\n", "a\nb\n", 0,
+               "a\nNEW\nb\n");
+}
+
 int main(void)
 {
     test_only_ours_changed();
@@ -315,6 +362,10 @@ int main(void)
     test_close_conflicts_merge_into_one();
     test_distant_conflicts_stay_separate();
     test_one_sided_change_blocks_the_merge();
+    test_noop_merge_keeps_missing_trailing_newline();
+    test_conflict_above_a_newlineless_last_line();
+    test_theirs_pure_insertion_survives();
+    test_ours_pure_insertion_survives();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

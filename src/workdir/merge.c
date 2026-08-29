@@ -559,17 +559,27 @@ static int emit_regions(bytebuf *out, const region_list *l, const sg_diff_line *
     for (i = 0; i < l->count; i++) {
         const merge_region *r = &l->v[i];
 
-        if (bytebuf_ensure_nl(out) != 0)
-            return -1;
         if (r->kind != REGION_CONFLICT) {
-            if (r->take_theirs) {
-                if (bytebuf_append_lines(out, theirs, r->ts, r->te) != 0)
-                    return -1;
-            } else if (bytebuf_append_lines(out, ours, r->os, r->oe) != 0) {
+            const sg_diff_line *src = r->take_theirs ? theirs : ours;
+            size_t from = r->take_theirs ? r->ts : r->os;
+            size_t to = r->take_theirs ? r->te : r->oe;
+
+            /* An empty region must not even terminate the previous line.
+               Zero-length regions are ordinary here -- the sync-point pass
+               emits one for every empty span, including the one after the
+               final anchor -- and calling bytebuf_ensure_nl before writing
+               nothing would give a file that legitimately ends without a
+               newline one it never had. Measured: merging three identical
+               copies of "x\ny" returned "x\ny\n", 4 bytes for a 3-byte
+               input, on a merge that changed nothing at all. */
+            if (from == to)
+                continue;
+            if (bytebuf_ensure_nl(out) != 0 || bytebuf_append_lines(out, src, from, to) != 0)
                 return -1;
-            }
             continue;
         }
+        if (bytebuf_ensure_nl(out) != 0)
+            return -1;
         *conflict_out = 1;
         if (bytebuf_append_str(out, "<<<<<<< ") != 0 ||
            bytebuf_append_str(out, ours_label) != 0 || bytebuf_append_str(out, "\n") != 0 ||

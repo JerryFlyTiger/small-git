@@ -6494,9 +6494,9 @@ are too close together to be worth separating.
 | after | 0 | 0 | 0 | **0 / 200** |
 | after, `--no-newline-edits` control | 0 | 0 | 0 | **0 / 200** (was 11) |
 
-Re-run on three seed ranges never used during development -- 1000, 5000,
-9000, 200 rounds each, 128-142 of each 200 producing a real conflict --
-**0 mismatches in all three**. 800 rounds total across four ranges.
+Re-run on seed ranges never used during development -- see section 10 for
+the final acceptance runs, which were redone after the generator itself was
+found to have a blind spot, so the numbers here are the ones that stand.
 
 Gates: `make test` 60/60, `interop.sh` 1946/1946 (9 new checks), `make
 sanitize` 60/60 with 0 sanitizer errors.
@@ -6559,3 +6559,89 @@ pinned); and git's `XDL_MERGE_ZEALOUS_ALNUM` variant of the simplification
 rule (where the gap must also contain an alphanumeric character) is not
 implemented, because plain `git merge` does not use it.
 
+### 10. The review round: a bug the whole net was blind to
+
+The region rewrite was handed to a cold reviewer with the five gates already
+green and the fuzzer at 0/200. It found a real defect, and independently of
+that the same defect surfaced while probing the region list by hand -- which
+is the only reason it is written up here as caught rather than as shipped.
+
+**The defect.** `emit_regions` called `bytebuf_ensure_nl` at the top of every
+region, before knowing whether that region would emit anything. The
+sync-point pass pushes a zero-length region after the final anchor as a
+matter of course, so a file whose last line legitimately has no newline got
+one appended. Measured against `git merge-file`:
+
+| inputs | git | sg (first cut) |
+|---|---|---|
+| base = ours = theirs = `a\nb` | `a\nb`, rc 0 | `a\nb\n`, rc 0 |
+| base `a\nb\nc`, ours `a\nX\nc`, theirs `a\nY\nc` (no trailing newline anywhere) | ends `>>>>>>> theirs\nc` | ends `>>>>>>> theirs\nc\n` |
+
+The first row is the alarming one: a merge that resolved to "nothing
+changed" rewrote the file anyway. The fix is one guard -- an empty region
+must not even terminate the previous line -- and the reverse mutation (back
+to an unconditional `ensure_nl`) turns exactly the two new tests red.
+
+**Why nothing caught it, and what that cost.** Five green gates, 800 fuzz
+rounds and eight mutations all missed it, for one reason:
+`tests/fuzz_merge.py`'s `gen_base` built every base line as `"base%02d\n"`.
+An anchor is always a BASE line, and `sg_diff_split_lines` only clears
+`has_nl` on a file's own last line, so **an anchor with `has_nl == 0` was
+unreachable by construction** -- the generator only ever stripped the newline
+from `ours`/`theirs`. The fuzzer was not weakly covering this shape, it could
+not build it at all, and 0/200 was therefore zero evidence about it. This is
+the `fixture generators create shared blind spots` pattern, and here it hid
+the most severe class of defect in the whole phase (silent content change on
+a clean merge) behind the most reassuring possible number.
+
+`gen_base` now drops the trailing newline 15% of the time, the same axis
+`mutate` already had. Proof that this closed the hole rather than merely
+widening the search: with the fix reverted, the OLD generator reports
+**0/200** and the new one reports **20/200**. Re-verified after the fix at
+200 rounds x 4 unused seed ranges (1000, 5000, 9000, 31337), **0 mismatches**
+in each, 129-144 conflicts per 200.
+
+**Two other review findings, recorded rather than acted on.** The tail check
+in `refine_conflicts` tests only `ai < r->oe` and not `bi < r->te`; the two
+reach their bounds together by the same `sg_diff_build_script` contract
+`script_matches` leans on, so the untested half cannot differ -- but if that
+contract were ever violated the failure would be silent loss of theirs-side
+content rather than an error, which is worth knowing before touching the
+aligner. And the empty-side guard in `refine_conflicts` is probably a pure
+optimisation (calling `sg_diff_build_script` with an empty side would produce
+the same single group), kept because it is also where git's own "no sense
+refining a conflict when one side is empty" rule is documented.
+
+### 11. The second review round, on the fix itself
+
+The fix in section 10 was written after the reviewer had already read the
+diff, so by this project's own rule it had not been cold-read by anyone. It
+went back out on its own, with the tail diff only.
+
+It came back with a coverage finding rather than a defect, and the finding is
+worth more than it first looks. The guard asks whether the side being PRINTED
+is empty (`from == to`, where `from`/`to` follow `take_theirs`), not whether
+the ours side is -- and for a **one-sided pure insertion** those two questions
+have different answers: theirs inserts a run where ours has nothing, so the
+region is `REGION_RESOLVED` with an empty ours range and a non-empty theirs
+range. Asking the wrong side there does not misplace a newline, it **drops
+the inserted run entirely**.
+
+Measured, both directions:
+
+| mutation | `test_merge_content` before | after |
+|---|---|---|
+| `from == to` -> `r->os == r->oe` | green (13 named tests) | red: "theirs inserts where ours has nothing" |
+| `from == to` -> `r->ts == r->te` | green | red: "ours inserts where theirs has nothing" |
+
+Every `RESOLVED` fixture in the file was a same-length replace, so nothing
+exercised the shape. `tests/fuzz_merge.py` did catch it -- 54/200 under the
+first mutation -- so this was probabilistic coverage with no named test
+behind it, which is the state this project's mutation table exists to
+prevent. Two fixtures, one per direction, close it.
+
+The other two findings were cross-confirmations rather than new: the
+asymmetric tail check in `refine_conflicts` (already recorded in section 10,
+same conclusion reached independently) and that the `sg_diff_lcs_table`
+removal leaves no residue -- verified by search, and separately by the clean
+rebuild the gates do anyway, which is the part a search cannot stand in for.

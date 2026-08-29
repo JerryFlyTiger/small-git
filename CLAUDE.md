@@ -430,6 +430,25 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   something. `bytebuf_ensure_nl` terminates it (git does the same in
   `xdl_recs_copy`); without it the output contains a line that appears in
   none of the three inputs, e.g. `base14=======`.
+  WARNING: **an EMPTY region must not even terminate the previous line.**
+  The sync-point pass pushes a zero-length region after the final anchor as
+  a matter of course, so calling `bytebuf_ensure_nl` before writing nothing
+  gives a file that legitimately ends without a newline one it never had --
+  including on a merge that resolved to "unchanged", i.e. rewriting a file
+  it did not merge. `tests/fuzz_merge.py` was blind to this for a whole
+  review round: an anchor is always a BASE line and only a file's own last
+  line can carry `has_nl == 0`, so while `gen_base` newline-terminated every
+  line the shape was unreachable and 0/200 meant nothing about it. The
+  generator now strips base's trailing newline 15% of the time; with the
+  guard reverted the old generator still reports 0/200 and the new one
+  reports 20/200.
+  WARNING: **the empty-region guard asks about the side being PRINTED**
+  (`from == to` after `take_theirs` is applied), not about the ours side.
+  For a one-sided pure insertion the two questions differ, and asking the
+  wrong one drops the inserted run entirely rather than misplacing a
+  newline. Both directions are pinned by their own fixture; before those
+  existed all 13 named tests stayed green under that mutation while
+  `fuzz_merge.py` caught it 54/200 -- probabilistic coverage, no witness.
   WARNING: **two conflicts separated by at most 3 identical lines print as
   ONE conflict** (`SG_MERGE_CONFLICT_GAP`, git's
   `xdl_simplify_non_conflicts`; measured: 0-3 merge, 4 splits) -- **but a

@@ -95,10 +95,25 @@ def git(cwd, *args):
 
 # ---------------------------------------------------------------- generation
 
-def gen_base(rng):
-    """A base file whose lines are individually distinguishable."""
+def gen_base(rng, newline_edits=True):
+    """A base file whose lines are individually distinguishable.
+
+    BASE ITSELF sometimes lacks a trailing newline, and that is not decoration.
+    Until it did, this generator could not produce the one shape where a SYNC
+    ANCHOR carries has_nl == 0: an anchor is always a base line, and
+    sg_diff_split_lines only clears has_nl on a file's own last line, so with
+    every base line newline-terminated the anchor path was unreachable no
+    matter how many rounds ran.  The first cut of Phase 41's region list
+    invented a trailing newline in exactly that shape -- including on a merge
+    that resolved to "unchanged", i.e. rewriting a file it had not merged --
+    and this fuzzer reported 0/200 straight through it.  A generator that
+    cannot build a shape gives zero evidence about it, however green it is.
+    """
     n = rng.randint(1, 40)
-    return ["base%02d\n" % i for i in range(n)]
+    lines = ["base%02d\n" % i for i in range(n)]
+    if newline_edits and rng.random() < 0.15:
+        lines[-1] = lines[-1].rstrip("\n")
+    return lines
 
 
 def mutate(rng, lines, tag, newline_edits=True):
@@ -174,7 +189,7 @@ def ours_labels(text):
 
 
 def one_round(rng, keep_dir, index, newline_edits=True):
-    base = gen_base(rng)
+    base = gen_base(rng, newline_edits)
     ours = mutate(rng, base, "ours", newline_edits)
     theirs = mutate(rng, base, "thrs", newline_edits)
 
