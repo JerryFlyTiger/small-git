@@ -6125,3 +6125,98 @@ something produced it, not that the widening rule did.
 Both gaps were confirmed the same way, and it is the only way that counts:
 mutate the code, watch every gate stay green, add the fixture, mutate
 again, watch the named checks go red.
+
+## Phase 41 (in progress): a differential net for the three-way merge
+
+**Status: investigation complete, no production code changed yet.** This
+section is written before the work so the measurements survive an
+interruption; the plan at the end is a plan, not a record.
+
+Phase 35 replaced the alignment step for 2-way patch bodies with a port of
+git's Myers algorithm and **deliberately left `src/workdir/merge.c` alone**,
+because no fuzzer covers merge's alignment -- there was no net to change its
+behaviour under. Phase 41's premise is that this is now the project's only
+uncovered alignment path, and that its failure mode is the worst one: a
+wrong alignment there writes conflict markers into the user's files, so the
+error lands on disk as data rather than as cosmetically odd output.
+
+### 0. Three divergences found while merely proving the oracle mechanism
+
+None of these is about alignment. All three fell out of the first attempt to
+compare sg's merge output with git's byte-for-byte, which is precisely the
+comparison no test in this project has ever made.
+
+**(a) The conflict marker's "ours" label.** sg writes the current branch
+name; **real git always writes `HEAD`**. Measured across five situations, to
+rule out the possibility that git merely happened to agree in one of them:
+
+| situation | git's ours label | git's theirs label |
+|---|---|---|
+| merge on branch `master` | `HEAD` | `topic` |
+| merge on branch `weird-branch-name` | `HEAD` | `topic` |
+| merging a tag | `HEAD` | `v1` |
+| merge from a detached HEAD | `HEAD` | `topic` |
+| rebase | `HEAD` | `11f17ed (theirs commit subject)` |
+
+git's ours label is invariant; only the theirs label varies. sg writes
+`master` / `weird-branch-name` in the first two rows. Note sg is already
+correct when detached, for an accidental reason: `cmd_merge.c:100` reads
+`current_branch != NULL ? current_branch : "HEAD"`, and detached makes that
+NULL. This is not on the deliberate-divergence list and nothing records it
+as intentional.
+
+**(b) `sg merge` accepts only a bare branch name.** Measured: a tag,
+`refs/heads/topic`, `refs/tags/v2` and `topic~0` are each rejected with
+`sg: invalid reference: <arg>`, while the equivalent `git merge` succeeds.
+This contradicts this project's own stated convention that a user-supplied
+revision always goes through `sg_rev_parse_commit`. **Deliberately NOT in
+Phase 41's scope** -- it is a rev-parsing gap with nothing to do with
+alignment, and folding it in would cost this milestone its focus. Recorded
+here so it is not rediscovered from scratch.
+
+**(c) The rebase theirs label's formatting.** git writes
+`<short-sha> (<subject>)`, sg writes `<short-sha> <subject>` -- the
+parentheses are missing (`cmd_rebase.c:138,172`).
+
+(a) and (c) are in scope, not because they matter much on their own, but
+because the net cannot measure alignment through them: every conflicting
+round would mismatch on the label line and drown out the signal.
+
+### 1. What the survey found, and why the swap is not a one-liner
+
+- `merge.c` calls `sg_diff_lcs_table` twice (base x ours, base x theirs,
+  `merge.c:364-365`) and backtracks each with its own `lcs_matches`
+  (`merge.c:283-313`) into a `match[]` array: for each base line, the line
+  it aligns to on the other side, or -1. A sync-point pass
+  (`merge.c:374-448`) then keeps only base lines aligned on BOTH sides as
+  anchors and classifies each span between anchors.
+- `sg_diff_build_script` produces `sg_diff_group`s (a_off/a_len,
+  b_off/b_len), **not** a `match[]`. **No function in the codebase converts
+  between them.** That adapter is new code, and new code is new risk: it
+  needs its own coverage rather than being treated as plumbing.
+- **The `has_nl` semantics are opposite.** `merge.c` deliberately compares
+  lines *ignoring* `has_nl` and repairs the final-line case afterwards
+  (`merge.c:430-447`); `sg_diff_build_script` is has_nl-aware, so "same text,
+  one side lacks the trailing newline" becomes two *different* lines and
+  never reaches that repair path. That block likely needs redesign, not
+  reuse.
+- **Scope boundary that must not be misread:** the three-way layer itself
+  (the sync-point classification) is sg's own design, **not a port of git's
+  `xdl_merge`**. Making the two 2-way alignments agree with git therefore
+  does *not* make the three-way result agree with git. "Swapped in Myers"
+  must never be written down as "equivalent to git's three-way merge".
+
+### 2. The order of work, and why it is not negotiable
+
+Build the net and **measure the baseline before touching `merge.c`**. The
+baseline is what decides whether the swap is even the right change: if the
+mismatch rate is dominated by the sg-specific three-way layer rather than by
+alignment, replacing the aligner will barely move it, and the honest
+conclusion would be that Phase 41 should end at the net. Measuring after the
+change can only produce a number with nothing to compare it against.
+
+The oracle must not borrow its expectation from sg: `git merge-file` takes
+three files and explicit `-L` labels, which makes it the closest real-git
+unit to `sg_merge_content` and removes the label question from the
+comparison entirely. Whether it is a faithful stand-in for the full
+`git merge` path is itself something to verify, not assume.
