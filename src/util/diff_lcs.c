@@ -717,6 +717,311 @@ out:
     return rc;
 }
 
+/* ==================== histogram diff ====================
+
+   A reconstruction of git's xdiff/xhistogram.c, which is what `git merge`
+   actually aligns with -- **measured**, git 2.55.0: `git merge` and `git
+   merge-file --diff-algorithm=histogram` agree byte for byte, while `git
+   merge-file`'s own default and `git diff`'s default are Myers. `git merge`
+   also honours `diff.algorithm` when it is set, so histogram is a default
+   and not a hard-coded choice; sg has no such config and always uses
+   histogram for merge, matching git's unconfigured behaviour.
+
+   The algorithm is patience-like: find the longest common run of lines
+   whose RAREST line is as rare as possible (occurrences counted within the
+   region, on the a side), split there, recurse on both halves. Where a
+   region has common lines but every candidate is too frequent, git gives up
+   and runs Myers on that sub-region; so does this, by calling myers_diff on
+   the slice, which is exactly git's xdl_fall_back_diff shape (a fresh
+   sub-problem, not a continuation of the outer one).
+
+   Like Phase 35's indent heuristic, this is a reconstruction validated
+   DIFFERENTIALLY rather than copied: git's source is not on this machine.
+   tests/fuzz_diff.py's histogram mode (`sg diff --histogram` against `git
+   diff --histogram`) and tests/fuzz_merge.py are the only judges of whether
+   it is right, and both are run at merge time -- see docs/DESIGN.md's Phase
+   42 section for the numbers.
+
+   ONE DELIBERATE DIFFERENCE, and it is not observable through the output:
+   git's scanA gives up (and falls back to Myers) when 64 DISTINCT lines
+   collide in one hash bucket, which is a property of git's own hash
+   function. sg classifies lines into exact class ids instead of hashing
+   into buckets, so that condition cannot arise here and there is nothing to
+   reproduce. The other 64 -- the one that matters -- is the occurrence-count
+   ceiling below, which is reproduced exactly. */
+
+#define SG_HIST_MAX_CHAIN 64 /* git: MAX_CHAIN_LENGTH */
+#define SG_HIST_NO_PTR ((size_t)-1)
+
+typedef struct {
+    const sg_diff_line *a, *b;
+    const long *acls, *bcls;
+    unsigned char *achanged, *bchanged;
+
+    /* Per-class scratch indexed by class id, valid only while
+       gen[cls] == cur_gen. The generation stamp is what makes rebuilding
+       the index for every region cost O(region) instead of O(nclasses):
+       the recursion visits many small regions, and clearing a
+       whole-file-sized array at each one would be quadratic. */
+    size_t *first; /* lowest a-index in this region carrying the class */
+    size_t *cnt;   /* occurrences of the class within this region */
+    unsigned long *gen;
+    unsigned long cur_gen;
+
+    size_t *next_ptr; /* per a-index: next occurrence below it, or NO_PTR */
+
+    /* Per-region search state (git: index->cnt / index->has_common). */
+    size_t best_cnt;
+    int has_common;
+} hist_ctx;
+
+static size_t hist_count_at(const hist_ctx *h, size_t ai)
+{
+    long cls = h->acls[ai];
+
+    return h->gen[cls] == h->cur_gen ? h->cnt[cls] : 0;
+}
+
+/* git's scanA. Walks the region BACKWARDS so that each class ends up
+   pointing at its FIRST (lowest) occurrence and next_ptr chains downward --
+   try_lcs below depends on that direction when it walks `np`. */
+static void hist_scan_a(hist_ctx *h, size_t a1, size_t count1)
+{
+    size_t i;
+
+    h->cur_gen++;
+    for (i = a1 + count1; i-- > a1;) {
+        long cls = h->acls[i];
+
+        if (h->gen[cls] == h->cur_gen) {
+            h->next_ptr[i] = h->first[cls];
+            h->first[cls] = i;
+            h->cnt[cls]++;
+        } else {
+            h->gen[cls] = h->cur_gen;
+            h->first[cls] = i;
+            h->cnt[cls] = 1;
+            h->next_ptr[i] = SG_HIST_NO_PTR;
+        }
+    }
+}
+
+/* git's try_lcs: for one b line, walk every occurrence of it in a, extend
+   each into the longest common run around it, and keep the run whose rarest
+   line is rarest (ties broken by length). Returns the next b index to look
+   at -- which can skip forward past a run just examined, and that skipping
+   is part of the algorithm, not an optimisation. */
+static size_t hist_try_lcs(hist_ctx *h, size_t b_ptr, size_t a1, size_t count1, size_t b1, size_t count2,
+                           size_t *lb1, size_t *le1, size_t *lb2, size_t *le2, int *found)
+{
+    size_t b_next = b_ptr + 1;
+    long cls = h->bcls[b_ptr];
+    size_t a_end = a1 + count1 - 1;
+    size_t b_end = b1 + count2 - 1;
+    size_t as, ae, bs, be, np, rc;
+
+    if (h->gen[cls] != h->cur_gen)
+        return b_next; /* this line does not occur in a's region at all */
+    if (h->cnt[cls] > h->best_cnt) {
+        /* Too frequent to be a good split point, but it IS a common line,
+           and that is what decides between "these regions share nothing"
+           and "fall back to Myers" once the scan finishes. */
+        h->has_common = 1;
+        return b_next;
+    }
+
+    as = h->first[cls];
+    h->has_common = 1;
+    for (;;) {
+        int stop = 0;
+
+        np = h->next_ptr[as];
+        bs = b_ptr;
+        ae = as;
+        be = bs;
+        rc = h->cnt[cls];
+
+        while (a1 < as && b1 < bs && h->acls[as - 1] == h->bcls[bs - 1]) {
+            size_t c;
+
+            as--;
+            bs--;
+            c = hist_count_at(h, as);
+            if (rc > 1 && c < rc)
+                rc = c;
+        }
+        while (ae < a_end && be < b_end && h->acls[ae + 1] == h->bcls[be + 1]) {
+            size_t c;
+
+            ae++;
+            be++;
+            c = hist_count_at(h, ae);
+            if (rc > 1 && c < rc)
+                rc = c;
+        }
+
+        if (b_next <= be)
+            b_next = be + 1;
+        /* git's exact predicate, initial lcs being a zero-length region at
+           0: a first candidate whose rc is already at the ceiling is NOT
+           taken, which is what makes "common lines exist but none is usable"
+           reachable and sends the region to Myers below. */
+        if (*le1 - *lb1 < ae - as || rc < h->best_cnt) {
+            *lb1 = as;
+            *le1 = ae;
+            *lb2 = bs;
+            *le2 = be;
+            h->best_cnt = rc;
+            *found = 1;
+        }
+
+        if (np == SG_HIST_NO_PTR)
+            break;
+        while (np <= ae) {
+            np = h->next_ptr[np];
+            if (np == SG_HIST_NO_PTR) {
+                stop = 1;
+                break;
+            }
+        }
+        if (stop)
+            break;
+        as = np;
+    }
+    return b_next;
+}
+
+/* git's find_lcs. Returns 1 when the region must fall back to Myers. */
+static int hist_find_lcs(hist_ctx *h, size_t a1, size_t count1, size_t b1, size_t count2, size_t *lb1,
+                         size_t *le1, size_t *lb2, size_t *le2, int *found)
+{
+    size_t b_ptr;
+
+    hist_scan_a(h, a1, count1);
+    h->best_cnt = SG_HIST_MAX_CHAIN + 1;
+    h->has_common = 0;
+    *found = 0;
+    *lb1 = *le1 = *lb2 = *le2 = 0;
+
+    for (b_ptr = b1; b_ptr < b1 + count2;)
+        b_ptr = hist_try_lcs(h, b_ptr, a1, count1, b1, count2, lb1, le1, lb2, le2, found);
+
+    return h->has_common && SG_HIST_MAX_CHAIN < h->best_cnt;
+}
+
+static int hist_region(hist_ctx *h, size_t a1, size_t count1, size_t b1, size_t count2)
+{
+    for (;;) {
+        size_t lb1, le1, lb2, le2;
+        size_t a_stop, b_stop;
+        int found;
+
+        if (count1 == 0 && count2 == 0)
+            return 0;
+        if (count1 == 0) {
+            while (count2--)
+                h->bchanged[b1++] = 1;
+            return 0;
+        }
+        if (count2 == 0) {
+            while (count1--)
+                h->achanged[a1++] = 1;
+            return 0;
+        }
+
+        if (hist_find_lcs(h, a1, count1, b1, count2, &lb1, &le1, &lb2, &le2, &found)) {
+            /* git's fall_back_to_classic_diff: the sub-region becomes its
+               own diff problem, classified and trimmed from scratch. The
+               slices are safe to hand myers_diff directly because it only
+               ever WRITES changed[0..count) and never reads the caller's
+               sentinels. */
+            return myers_diff(h->a + a1, count1, h->b + b1, count2, h->achanged + a1,
+                             h->bchanged + b1);
+        }
+        if (!found) {
+            while (count1--)
+                h->achanged[a1++] = 1;
+            while (count2--)
+                h->bchanged[b1++] = 1;
+            return 0;
+        }
+
+        if (hist_region(h, a1, lb1 - a1, b1, lb2 - b1) != 0)
+            return -1;
+        /* Tail-iterate on the right half instead of recursing again: a file
+           of N lines with no repeats splits into N regions, and recursing
+           on both sides would put that depth on the C stack. */
+        a_stop = a1 + count1;
+        b_stop = b1 + count2;
+        a1 = le1 + 1;
+        b1 = le2 + 1;
+        count1 = a_stop - a1;
+        count2 = b_stop - b1;
+    }
+}
+
+/* Same contract as myers_diff: fills achanged[0..na) / bchanged[0..nb) so
+   that between two 0-runs the two files agree line for line. */
+static int histogram_diff(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
+                          unsigned char *achanged, unsigned char *bchanged)
+{
+    classifier cf;
+    long *acls = NULL, *bcls = NULL;
+    long dstart, dend1, dend2, c1, c2;
+    size_t nclasses;
+    hist_ctx h;
+    int rc = -1;
+
+    memset(&cf, 0, sizeof(cf));
+    memset(&h, 0, sizeof(h));
+    if (classify_all(a, na, b, nb, &cf, &acls, &bcls) != 0) {
+        classifier_free(&cf);
+        return -1;
+    }
+
+    /* Trimming applies to every algorithm (git does it in xdl_prepare_env,
+       before choosing one). What does NOT apply is cleanup_side: that is
+       Myers's own reduction, and it DISCARDS lines outright, which would
+       destroy the occurrence counts this algorithm's whole decision rests
+       on. git skips it for histogram for the same reason. */
+    trim_ends(acls, na, bcls, nb, &dstart, &dend1, &dend2);
+
+    nclasses = cf.count > 0 ? cf.count : 1;
+    h.a = a;
+    h.b = b;
+    h.acls = acls;
+    h.bcls = bcls;
+    h.achanged = achanged;
+    h.bchanged = bchanged;
+    h.first = malloc(nclasses * sizeof(*h.first));
+    h.cnt = malloc(nclasses * sizeof(*h.cnt));
+    h.gen = calloc(nclasses, sizeof(*h.gen));
+    h.next_ptr = malloc((na > 0 ? na : 1) * sizeof(*h.next_ptr));
+    if (h.first == NULL || h.cnt == NULL || h.gen == NULL || h.next_ptr == NULL)
+        goto out;
+    h.cur_gen = 0; /* gen[] is all zeroes, so the first region's stamp is 1 */
+
+    c1 = dend1 - dstart + 1;
+    c2 = dend2 - dstart + 1;
+    if (c1 < 0)
+        c1 = 0;
+    if (c2 < 0)
+        c2 = 0;
+    (void)c1;
+    (void)c2;
+    rc = hist_region(&h, 0, na, 0, nb);
+
+out:
+    free(h.first);
+    free(h.cnt);
+    free(h.gen);
+    free(h.next_ptr);
+    free(acls);
+    free(bcls);
+    classifier_free(&cf);
+    return rc;
+}
+
 /* ---- indentation heuristic (git's diff.indentHeuristic, reconstructed) --
 
    Checked against git's xdiff/xdiffi.c (get_indent / measure_split /
@@ -1103,7 +1408,7 @@ static int build_groups_from_changed(const unsigned char *achanged, size_t na, c
 }
 
 sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
-                                    int indent_heuristic)
+                                    int indent_heuristic, sg_diff_algorithm algo)
 {
     group_builder final_gb;
     sg_diff_script *script;
@@ -1124,7 +1429,8 @@ sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_
     achanged = achanged_buf + 1;
     bchanged = bchanged_buf + 1;
 
-    if (myers_diff(a, na, b, nb, achanged, bchanged) != 0) {
+    if ((algo == SG_DIFF_ALGO_HISTOGRAM ? histogram_diff(a, na, b, nb, achanged, bchanged)
+                                       : myers_diff(a, na, b, nb, achanged, bchanged)) != 0) {
         free(achanged_buf);
         free(bchanged_buf);
         return NULL;

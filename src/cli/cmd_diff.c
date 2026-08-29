@@ -19,7 +19,8 @@
 
 static const char USAGE[] =
     "usage: sg diff [--cached|--staged] [--stat[=<w>[,<n>]]|--numstat|--shortstat|--name-only|"
-    "--name-status] [-M[<n>]|-C[<n>]|--no-renames] [-c|--cc] [<rev> [<rev>]] [--] [<path>...]\n";
+    "--name-status] [-M[<n>]|-C[<n>]|--no-renames] [-c|--cc] [--histogram] [<rev> [<rev>]] [--] "
+    "[<path>...]\n";
 
 /* Resolves rev to a tree id via sg_rev_parse_commit + sg_commit_tree_of --
    the one path every rev argument in this command goes through, per
@@ -259,6 +260,17 @@ int sg_cmd_diff(int argc, char **argv)
                 return 1;
             }
             detect_copies = 1;
+        } else if (strcmp(a, "--histogram") == 0) {
+            /* git's other three algorithm spellings (--patience, --minimal,
+               --diff-algorithm=<name>) are NOT implemented and fall through
+               to the unknown-flag branch below rather than being quietly
+               treated as this one. sg has exactly two aligners; answering
+               "patience" with histogram would be a wrong answer wearing the
+               right flag, the same reasoning as -C -C's outright rejection.
+               Measured: real git accepts all four and exits 129 on a bad
+               algorithm name, sg exits 1 -- this project's exit codes are
+               only ever 0 or 1. */
+            opts.algorithm = SG_DIFF_ALGO_HISTOGRAM;
         } else if (strcmp(a, "--cc") == 0) {
             /* Dense combined diff -- also what a bare `sg diff` uses for an
                unmerged path even without this flag (Phase 34 oracle 2: the

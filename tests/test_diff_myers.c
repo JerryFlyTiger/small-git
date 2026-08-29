@@ -84,7 +84,7 @@ static void test_pure_addition(void)
     sg_diff_line b[8];
     const char *bs[] = {"x", "y", NULL};
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(NULL, 0, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(NULL, 0, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -99,7 +99,7 @@ static void test_pure_deletion(void)
     sg_diff_line a[8];
     const char *as[] = {"x", "y", NULL};
     size_t na = lines_from(a, as);
-    sg_diff_script *script = sg_diff_build_script(a, na, NULL, 0, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, NULL, 0, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -116,7 +116,7 @@ static void test_replace(void)
     const char *bs[] = {"y", NULL};
     size_t na = lines_from(a, as);
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -133,7 +133,7 @@ static void test_head_and_tail_all_same(void)
     const char *bs[] = {"x", "y", "z", NULL};
     size_t na = lines_from(a, as);
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -147,7 +147,7 @@ static void test_head_and_tail_all_same(void)
 
 static void test_trim_both_empty(void)
 {
-    sg_diff_script *script = sg_diff_build_script(NULL, 0, NULL, 0, 0);
+    sg_diff_script *script = sg_diff_build_script(NULL, 0, NULL, 0, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -163,7 +163,7 @@ static void test_trim_only_start_differs(void)
     const char *bs[] = {"B", "x", "y", NULL};
     size_t na = lines_from(a, as);
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -180,7 +180,7 @@ static void test_trim_only_end_differs(void)
     const char *bs[] = {"x", "y", "B", NULL};
     size_t na = lines_from(a, as);
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -222,7 +222,7 @@ static void test_myers_aref_mapping_second_dup_deleted(void)
     const char *bs[] = {"pre", "m", "post", NULL};
     size_t na = lines_from(a, as);
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -245,7 +245,7 @@ static void test_myers_bref_mapping_second_dup_inserted(void)
     const char *bs[] = {"pre", "m", "m", "post", NULL};
     size_t na = lines_from(a, as);
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -288,7 +288,7 @@ static void test_discard_path_coordinate_mapping(void)
     const char *bs[] = {"ctx1", "ctx2", "UNIQUE_B", "ctx3", "ctx4", NULL};
     size_t na = lines_from(a, as);
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)
@@ -308,7 +308,7 @@ static void test_multi_hunk_group_contract(void)
     const char *bs[] = {"1", "2", "3", "4", "NEW", "5", "6", "ADDED", NULL};
     size_t na = lines_from(a, as);
     size_t nb = lines_from(b, bs);
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_MYERS);
 
     CHECK(script != NULL, "build_script returned NULL");
     if (script == NULL)

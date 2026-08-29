@@ -123,7 +123,7 @@ static int is_binary_data(const unsigned char *data, size_t len)
    file's general "best effort, never crash" policy for the stat machinery
    (a wrong stat count is far less bad than aborting the whole diff). */
 static void count_lines(const unsigned char *a_data, size_t a_len, const unsigned char *b_data,
-                        size_t b_len, long *added, long *deleted)
+                        size_t b_len, sg_diff_algorithm algo, long *added, long *deleted)
 {
     size_t na, nb;
     sg_diff_line *a = sg_diff_split_lines(a_data, a_len, &na);
@@ -135,7 +135,7 @@ static void count_lines(const unsigned char *a_data, size_t a_len, const unsigne
     *added = 0;
     *deleted = 0;
 
-    script = sg_diff_build_script(a, na, b, nb, 0);
+    script = sg_diff_build_script(a, na, b, nb, 0, algo);
     if (script == NULL) {
         free(a);
         free(b);
@@ -420,7 +420,7 @@ typedef struct {
    content_changed short-circuit below), and a field only one non-caller of
    this function would read is dead weight on every other caller. */
 static int build_entry_stat(const char *git_dir, const char *repo_root, const sg_diff_entry *e,
-                            entry_stat *st)
+                            sg_diff_algorithm algo, entry_stat *st)
 {
     memset(st, 0, sizeof(*st));
 
@@ -468,7 +468,7 @@ static int build_entry_stat(const char *git_dir, const char *repo_root, const sg
             st->old_size = a_len;
             st->new_size = b_len;
         } else {
-            count_lines(a_data, a_len, b_data, b_len, &st->added, &st->deleted);
+            count_lines(a_data, a_len, b_data, b_len, algo, &st->added, &st->deleted);
         }
         free(a_data);
         free(b_data);
@@ -543,7 +543,8 @@ static void print_hunk_range(char sign, size_t start, size_t count)
 static int print_text_diff_body(const char *old_path, const char *new_path,
                                 int old_present, int new_present,
                                 const unsigned char *a_data, size_t a_len,
-                                const unsigned char *b_data, size_t b_len)
+                                const unsigned char *b_data, size_t b_len,
+                                sg_diff_algorithm algo)
 {
     size_t na, nb;
     sg_diff_line *a = sg_diff_split_lines(a_data, a_len, &na);
@@ -551,7 +552,7 @@ static int print_text_diff_body(const char *old_path, const char *new_path,
     sg_diff_script *script;
     size_t hi; /* index of the first group of the NEXT hunk, i.e. loop cursor */
 
-    script = sg_diff_build_script(a, na, b, nb, 1 /* diff.indentHeuristic, on by default */);
+    script = sg_diff_build_script(a, na, b, nb, 1 /* diff.indentHeuristic, on by default */, algo);
     if (script == NULL) {
         free(a);
         free(b);
@@ -843,7 +844,8 @@ static int coalesce_lines(combine_lost **base, size_t *base_count, const combine
    you work through git's 1-based "insert after line N" convention -- see
    the design note in DESIGN.md's Phase 34 section. */
 static int combine_process_parent(combine_sline *sline, size_t cnt, const sg_diff_line *parent_lines,
-                                  size_t parent_cnt, const sg_diff_line *result_lines, int n)
+                                  size_t parent_cnt, const sg_diff_line *result_lines, int n,
+                                  sg_diff_algorithm algo)
 {
     sg_diff_script *script;
     size_t k;
@@ -852,7 +854,7 @@ static int combine_process_parent(combine_sline *sline, size_t cnt, const sg_dif
     size_t p_lno;
 
     (void)result_lines;
-    script = sg_diff_build_script(parent_lines, parent_cnt, result_lines, cnt, 1);
+    script = sg_diff_build_script(parent_lines, parent_cnt, result_lines, cnt, 1, algo);
     if (script == NULL)
         return -1;
 
@@ -1187,7 +1189,8 @@ static void combine_dump(const combine_sline *sline, size_t cnt, const unsigned 
    (print_patch never reads e->old_side/e->new_side for an unmerged row --
    both stay ABSENT by contract, see sg/diff.h). Returns 0, or -1 after
    printing a message (same convention as build_entry_stat/print_patch). */
-static int render_combined_patch(const char *git_dir, const char *repo_root, const sg_diff_entry *e, int dense)
+static int render_combined_patch(const char *git_dir, const char *repo_root, const sg_diff_entry *e, int dense,
+                                 sg_diff_algorithm algo)
 {
     unsigned char *ours_data = NULL, *theirs_data = NULL, *result_data = NULL;
     size_t ours_len = 0, theirs_len = 0, result_len = 0;
@@ -1308,8 +1311,8 @@ static int render_combined_patch(const char *git_dir, const char *repo_root, con
         for (i = 0; i < ncnt; i++)
             sline[i].line = r_lines[i];
 
-        if (combine_process_parent(sline, ncnt, a_lines, na, r_lines, 0) != 0 ||
-           combine_process_parent(sline, ncnt, b_lines, nb, r_lines, 1) != 0)
+        if (combine_process_parent(sline, ncnt, a_lines, na, r_lines, 0, algo) != 0 ||
+           combine_process_parent(sline, ncnt, b_lines, nb, r_lines, 1, algo) != 0)
             had_error = 1;
 
         if (!had_error) {
@@ -1337,7 +1340,8 @@ static int render_combined_patch(const char *git_dir, const char *repo_root, con
     return 0;
 }
 
-static int print_patch(const char *git_dir, const char *repo_root, const sg_diff_list *list, int combined)
+static int print_patch(const char *git_dir, const char *repo_root, const sg_diff_list *list, int combined,
+                       sg_diff_algorithm algo)
 {
     size_t i;
     int had_error = 0;
@@ -1375,7 +1379,7 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
                real conflict, even with no -c/--cc at all (PHASE34_ORACLE.md
                #2). */
             if (combinable(e)) {
-                if (render_combined_patch(git_dir, repo_root, e, dense) != 0)
+                if (render_combined_patch(git_dir, repo_root, e, dense, algo) != 0)
                     had_error = 1;
                 if (has_companion_row(list, i))
                     skip_next = 1;
@@ -1397,7 +1401,7 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
            because ordinary sg_diff_tree_workdir rows never set unmerged,
            but a row THIS pass filled must still check the flag itself). */
         if (combined != 0 && combinable(e)) {
-            if (render_combined_patch(git_dir, repo_root, e, dense) != 0)
+            if (render_combined_patch(git_dir, repo_root, e, dense, algo) != 0)
                 had_error = 1;
             continue;
         }
@@ -1522,7 +1526,7 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
         }
 
         if (print_text_diff_body(old_side_path(e), e->path, old_present, new_present,
-                                 a_data, a_len, b_data, b_len) != 0) {
+                                 a_data, a_len, b_data, b_len, algo) != 0) {
             fprintf(stderr, "sg: warning: out of memory diffing %s\n", sg_quote_path_delimited(e->path));
             had_error = 1;
         }
@@ -1702,7 +1706,8 @@ static char *entry_display_name(const sg_diff_entry *e)
     return strdup(sg_quote_path(e->path));
 }
 
-static int print_numstat(const char *git_dir, const char *repo_root, const sg_diff_list *list, int combined)
+static int print_numstat(const char *git_dir, const char *repo_root, const sg_diff_list *list, int combined,
+                         sg_diff_algorithm algo)
 {
     size_t i;
     int had_error = 0;
@@ -1724,7 +1729,7 @@ static int print_numstat(const char *git_dir, const char *repo_root, const sg_di
             continue;
         }
 
-        if (build_entry_stat(git_dir, repo_root, e, &st) != 0) {
+        if (build_entry_stat(git_dir, repo_root, e, algo, &st) != 0) {
             had_error = 1;
             continue;
         }
@@ -1761,7 +1766,8 @@ typedef struct {
 } stat_row;
 
 static int build_stat_rows(const char *git_dir, const char *repo_root, const sg_diff_list *list,
-                           int combined, stat_row **rows_out, size_t *count_out, int *had_error)
+                           int combined, sg_diff_algorithm algo, stat_row **rows_out,
+                           size_t *count_out, int *had_error)
 {
     stat_row *rows;
     size_t n = 0, i;
@@ -1794,7 +1800,7 @@ static int build_stat_rows(const char *git_dir, const char *repo_root, const sg_
             continue;
         }
 
-        if (build_entry_stat(git_dir, repo_root, e, &st) != 0) {
+        if (build_entry_stat(git_dir, repo_root, e, algo, &st) != 0) {
             *had_error = 1;
             continue;
         }
@@ -1935,7 +1941,8 @@ static int print_stat(const char *git_dir, const char *repo_root, const sg_diff_
     int files_changed = 0;
     long insertions = 0, deletions = 0;
 
-    if (build_stat_rows(git_dir, repo_root, list, opts->combined, &rows, &n, &had_error) != 0)
+    if (build_stat_rows(git_dir, repo_root, list, opts->combined, opts->algorithm, &rows, &n,
+                       &had_error) != 0)
         return -1;
 
     if (n == 0) {
@@ -2022,13 +2029,13 @@ int sg_diff_print(const char *git_dir, const char *repo_root, const sg_diff_list
 {
     switch (opts->format) {
     case SG_DIFF_FORMAT_PATCH:
-        return print_patch(git_dir, repo_root, list, opts->combined);
+        return print_patch(git_dir, repo_root, list, opts->combined, opts->algorithm);
     case SG_DIFF_FORMAT_STAT:
         return print_stat(git_dir, repo_root, list, opts, 0);
     case SG_DIFF_FORMAT_SHORTSTAT:
         return print_stat(git_dir, repo_root, list, opts, 1);
     case SG_DIFF_FORMAT_NUMSTAT:
-        return print_numstat(git_dir, repo_root, list, opts->combined);
+        return print_numstat(git_dir, repo_root, list, opts->combined, opts->algorithm);
     case SG_DIFF_FORMAT_NAME_ONLY:
         return print_name_only(list, opts->combined);
     case SG_DIFF_FORMAT_NAME_STATUS:

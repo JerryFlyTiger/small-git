@@ -5298,6 +5298,75 @@ for p41f in nl.txt gap3.txt gap4.txt; do
         cmp -s "$WORKDIR/p41_c_sg.txt" "$WORKDIR/p41_c_git.txt"
 done
 
+# --- Phase 42: the alignment algorithm is now a choice, and the two paths
+# make it DIFFERENTLY: `git diff` defaults to Myers, `git merge` to histogram
+# (measured, git 2.55.0 -- `git merge` also honours diff.algorithm, which is
+# how the default was established). sg mirrors both defaults, and `sg diff`
+# gains --histogram as the opt-in.
+P42="$WORKDIR/p42_histogram"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P42")") > /dev/null 2>&1
+# a/b chosen so the two algorithms give DIFFERENT answers: without that the
+# checks below would pass no matter which algorithm ran.
+printf '_helper = None\n        return None\n_helper = None\n' > "$P42/f.txt"
+(cd "$P42" && "$SG" add f.txt && "$SG" commit -m base) > /dev/null 2>&1
+printf '_helper = None\n_helper = None\n        return None\n' > "$P42/f.txt"
+check "phase42 oracle: precondition -- git's histogram and Myers disagree here" \
+    sh -c "! (cd '$P42' && LC_ALL=C git diff --histogram > $WORKDIR/p42_gh.txt && LC_ALL=C git diff > $WORKDIR/p42_gm.txt && cmp -s $WORKDIR/p42_gh.txt $WORKDIR/p42_gm.txt)"
+check "phase42: sg diff --histogram matches git diff --histogram byte-for-byte" \
+    sh -c "(cd '$P42' && '$SG' diff --histogram) > $WORKDIR/p42_sh.txt; cmp -s $WORKDIR/p42_sh.txt $WORKDIR/p42_gh.txt"
+check "phase42: plain sg diff still matches git's Myers default" \
+    sh -c "(cd '$P42' && '$SG' diff) > $WORKDIR/p42_sm.txt; cmp -s $WORKDIR/p42_sm.txt $WORKDIR/p42_gm.txt"
+# git accepts three more algorithm spellings; sg implements two aligners and
+# rejects the rest rather than quietly answering with the wrong one (same
+# reasoning as -C -C). Both sides pinned, including the exit-code divergence:
+# git uses 129 for a usage error, this project only ever uses 0 or 1.
+(cd "$P42" && LC_ALL=C git diff --patience) > /dev/null 2>&1
+check "phase42 oracle: real git accepts --patience" test $? = 0
+(cd "$P42" && "$SG" diff --patience) > /dev/null 2>&1
+check "phase42: sg rejects --patience rather than approximating it (exit 1, not git's 129)" \
+    test $? = 1
+(cd "$P42" && "$SG" diff --diff-algorithm=histogram) > /dev/null 2>&1
+check "phase42: sg rejects --diff-algorithm=<name> too (only --histogram is implemented)" \
+    test $? = 1
+
+# The merge path takes histogram with no flag at all, which is the whole
+# point of the phase. Same build-once-then-copy technique as phase41, and a
+# fixture where the two algorithms give different merges -- so this would stay
+# green on the wrong algorithm only if that fixture were badly chosen.
+P42M="$WORKDIR/p42_merge"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P42M")") > /dev/null 2>&1
+printf 'block02:\n\n' > "$P42M/m.txt"
+(cd "$P42M" && "$SG" add m.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P42M" && "$SG" branch topic) > /dev/null 2>&1
+printf '\n' > "$P42M/m.txt"
+(cd "$P42M" && "$SG" add m.txt && "$SG" commit -m ours) > /dev/null 2>&1
+(cd "$P42M" && "$SG" switch topic) > /dev/null 2>&1
+printf 'base00\n\n\nblock02:\n' > "$P42M/m.txt"
+(cd "$P42M" && "$SG" add m.txt && "$SG" commit -m theirs) > /dev/null 2>&1
+(cd "$P42M" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P42M.git-copy"
+cp -R "$P42M" "$P42M.git-copy"
+(cd "$P42M" && "$SG" merge topic) > /dev/null 2>&1
+(cd "$P42M.git-copy" && LC_ALL=C git merge topic) > /dev/null 2>&1
+check "phase42 oracle: precondition -- this merge conflicts on both sides" \
+    sh -c "grep -q '^<<<<<<< ' '$P42M/m.txt' && grep -q '^<<<<<<< ' '$P42M.git-copy/m.txt'"
+# The claim this phase rests on, checked rather than asserted: git's own
+# three-way merge of the SAME three buffers gives a DIFFERENT answer under
+# Myers than under histogram, and `git merge` agrees with the histogram one.
+printf 'block02:\n\n' > "$WORKDIR/p42_b.txt"
+printf '\n' > "$WORKDIR/p42_o.txt"
+printf 'base00\n\n\nblock02:\n' > "$WORKDIR/p42_t.txt"
+LC_ALL=C git merge-file --diff-algorithm=histogram -L L -L base -L topic -p \
+    "$WORKDIR/p42_o.txt" "$WORKDIR/p42_b.txt" "$WORKDIR/p42_t.txt" > "$WORKDIR/p42_mfh.txt" 2>&1
+LC_ALL=C git merge-file --diff-algorithm=myers -L L -L base -L topic -p \
+    "$WORKDIR/p42_o.txt" "$WORKDIR/p42_b.txt" "$WORKDIR/p42_t.txt" > "$WORKDIR/p42_mfm.txt" 2>&1
+check "phase42 oracle: precondition -- the two algorithms merge this differently" \
+    sh -c "! cmp -s $WORKDIR/p42_mfh.txt $WORKDIR/p42_mfm.txt"
+check "phase42 oracle: git merge agrees with --diff-algorithm=histogram, not with Myers" \
+    sh -c "sed '1,\$s/^<<<<<<< .*/<<<<<<< LABEL/' '$P42M.git-copy/m.txt' > $WORKDIR/p42_mg0.txt; sed '1,\$s/^<<<<<<< .*/<<<<<<< LABEL/' $WORKDIR/p42_mfh.txt > $WORKDIR/p42_mfh_n.txt; cmp -s $WORKDIR/p42_mg0.txt $WORKDIR/p42_mfh_n.txt"
+check "phase42: sg's merge matches git's byte-for-byte (ours label aside)" \
+    sh -c "sed '1,\$s/^<<<<<<< .*/<<<<<<< LABEL/' '$P42M/m.txt' > $WORKDIR/p42_ms.txt; sed '1,\$s/^<<<<<<< .*/<<<<<<< LABEL/' '$P42M.git-copy/m.txt' > $WORKDIR/p42_mg.txt; cmp -s $WORKDIR/p42_ms.txt $WORKDIR/p42_mg.txt"
+
 # --- row 9 (Phase 20 REVERSAL of the Phase 15 refusal): a stash real git
 # built with -u must now be poppable by sg -- the untracked half is restored
 # to disk, unstaged, and the entry is dropped, same as any other successful

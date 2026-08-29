@@ -330,7 +330,7 @@ static int segment_equal(const sg_diff_line *a, size_t as, size_t ae, const sg_d
    subscript ours_lines/theirs_lines. */
 static long *script_matches(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb)
 {
-    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0);
+    sg_diff_script *script = sg_diff_build_script(a, na, b, nb, 0, SG_DIFF_ALGO_HISTOGRAM);
     long *match;
     size_t i, ai = 0, bi = 0;
 
@@ -475,7 +475,7 @@ static int refine_conflicts(const region_list *in, region_list *out, const sg_di
         }
 
         script = sg_diff_build_script(ours + r->os, r->oe - r->os, theirs + r->ts,
-                                     r->te - r->ts, 0);
+                                     r->te - r->ts, 0, SG_DIFF_ALGO_HISTOGRAM);
         if (script == NULL)
             return -1;
 

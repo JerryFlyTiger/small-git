@@ -191,6 +191,9 @@ def build_case(repo, rng):
     return base, base_nl
 
 
+MODES = (("worktree", []), ("--cached", ["--cached"]))
+
+
 def main():
     if not os.path.exists(SG):
         print("error: %s not built; run `make` first" % SG, file=sys.stderr)
@@ -207,7 +210,21 @@ def main():
             else:
                 max_failures = value
             del argv[i:i + 2]
+    histogram = "--histogram" in argv
+    if histogram:
+        argv.remove("--histogram")
     iterations = int(argv[0]) if argv else 200
+
+    # The alignment algorithm is an axis of this comparison, not a detail of
+    # it. `git diff` defaults to Myers and `git merge` to histogram (measured,
+    # git 2.55.0), so sg carries both; this mode points the SAME fixtures at
+    # `git diff --histogram` on both sides, which is the only direct oracle
+    # the histogram port has -- everything else observes it through the merge,
+    # where sg's own three-way layer sits on top and can mask a difference.
+    global MODES
+    if histogram:
+        MODES = (("worktree --histogram", ["--histogram"]),
+                 ("--cached --histogram", ["--cached", "--histogram"]))
 
     root = tempfile.mkdtemp(prefix="sg_fuzz_diff_")
     failures = 0
@@ -219,7 +236,7 @@ def main():
         build_case(repo, rng)
 
         mismatch = None
-        for label, flags in (("worktree", []), ("--cached", ["--cached"])):
+        for label, flags in MODES:
             want = run(GIT_DIFF + flags, repo)
             got = sg(["diff"] + flags, repo, check=False)
             # A non-zero exit from either side is itself a divergence worth

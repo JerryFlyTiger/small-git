@@ -66,6 +66,20 @@ typedef struct {
     size_t count;
 } sg_diff_script;
 
+/* Which alignment algorithm sg_diff_build_script runs. There is no default
+   and the parameter is mandatory, the same idiom as sg_workdir_missing:
+   the two are not interchangeable and picking one silently is exactly the
+   bug this spells out. Measured against git 2.55.0, and the split is not
+   the one an outsider would guess -- `git diff` defaults to MYERS while
+   `git merge` defaults to HISTOGRAM (and honours diff.algorithm when set,
+   which is how the default was measured). sg mirrors that split:
+   src/cli/diff_out.c passes MYERS unless the user asked otherwise,
+   src/workdir/merge.c always passes HISTOGRAM. */
+typedef enum {
+    SG_DIFF_ALGO_MYERS = 0,
+    SG_DIFF_ALGO_HISTOGRAM = 1
+} sg_diff_algorithm;
+
 /* Builds the minimal edit script between a and b (has_nl-aware), then:
      1. group compaction -- a pure-insert or pure-delete group bordered by
         identical lines on either side can be slid up or down within its
@@ -84,7 +98,7 @@ typedef struct {
         against real git's, is the only judge of whether they are right.
    Returns NULL only on allocation failure. */
 sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
-                                    int indent_heuristic);
+                                    int indent_heuristic, sg_diff_algorithm algo);
 void sg_diff_script_free(sg_diff_script *script);
 
 #endif
