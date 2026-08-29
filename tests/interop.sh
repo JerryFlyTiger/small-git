@@ -10577,7 +10577,13 @@ p34_cmp() {
     p34_label="$2"
     shift 2
     (cd "$p34_dir" && "$SG" diff "$@") > "$WORKDIR/p34_sg.txt" 2>/dev/null
-    (cd "$p34_dir" && git -c core.quotepath=false diff "$@") > "$WORKDIR/p34_git.txt" 2>/dev/null
+    # LC_ALL=C alongside core.quotepath=false: the two knobs this comparison
+    # depends on, both declared on the command line rather than inherited
+    # (the lesson Phase 38 paid a CI red for -- an oracle must declare its
+    # own environment). Measured on this machine, `git diff`'s six formats
+    # are not localized today, so this changes no current result; it is here
+    # so a localized runner cannot turn 30-plus reused checks red at once.
+    (cd "$p34_dir" && LC_ALL=C git -c core.quotepath=false diff "$@") > "$WORKDIR/p34_git.txt" 2>/dev/null
     check "phase34: sg diff $p34_label matches real git byte-for-byte" \
         cmp -s "$WORKDIR/p34_sg.txt" "$WORKDIR/p34_git.txt"
 }
@@ -10896,6 +10902,90 @@ check "phase40: -c keeps it -- the same fixture must print an @@@ hunk header" \
 check "phase40: and the same discriminating pair on the result == parent 2 fixture" \
     sh -c "(cd '$P40_O' && '$SG' diff -c named) | grep -q '^@@@ '"
 p34_cmp "$P40_O" "phase40: -c, result == parent 2 -- non-dense keeps the hunk too" -c named
+
+# E-8: a conflict where only ONE of stage 2 / stage 3 exists (delete/modify)
+# must NEVER render combined -- there is nothing to combine. This closes a
+# blind spot that predates Phase 40 and was found by cold-reading this
+# phase's diff: deleting the `ours == ABSENT` half of
+# sg_diff_entry_is_combined's guard left interop at 1915/1915 with zero FAIL
+# lines (measured with tests/mutate.sh), because every conflict fixture in
+# this file goes through p34_mkconflict, which writes non-empty base/ours/
+# theirs strings and so can only ever produce the full {1,2,3} stage set.
+# Phase 40 did not introduce the gap, but it promoted that guard from a
+# file-local combinable() to a documented public predicate, so it is fixed
+# here rather than left for the next reader to rediscover.
+#
+# Measured against real git 2.55.0: both shapes print "* Unmerged path"
+# under no flag, under -c, and under --cc alike. du.txt is stages {1,3}
+# (ours deleted, theirs modified), ud.txt is stages {1,2} (the mirror) --
+# both, because the guard is one predicate over two symmetric sides and a
+# single-sided fixture would leave half of it unwitnessed.
+P40_DM="$WORKDIR/p40_delmod"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P40_DM")") > /dev/null 2>&1
+printf 'seed\n' > "$P40_DM/seed.txt"
+printf 'DU-base\n' > "$P40_DM/du.txt"
+printf 'UD-base\n' > "$P40_DM/ud.txt"
+(cd "$P40_DM" && "$SG" add seed.txt du.txt ud.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P40_DM" && "$SG" branch topic) > /dev/null 2>&1
+rm -f "$P40_DM/du.txt"
+printf 'UD-ours\n' > "$P40_DM/ud.txt"
+(cd "$P40_DM" && "$SG" add du.txt ud.txt && "$SG" commit -m ours) > /dev/null 2>&1
+(cd "$P40_DM" && "$SG" switch topic) > /dev/null 2>&1
+printf 'DU-theirs\n' > "$P40_DM/du.txt"
+rm -f "$P40_DM/ud.txt"
+(cd "$P40_DM" && "$SG" add du.txt ud.txt && "$SG" commit -m theirs) > /dev/null 2>&1
+(cd "$P40_DM" && "$SG" switch master) > /dev/null 2>&1
+(cd "$P40_DM" && "$SG" merge topic) > /dev/null 2>&1
+check "phase40: precondition -- du.txt really has stages 1 and 3 but no stage 2" \
+    sh -c "(cd '$P40_DM' && LC_ALL=C git ls-files -s du.txt) | awk '{print \$3}' | tr '\n' ' ' | grep -q '^1 3 $'"
+check "phase40: precondition -- ud.txt really has stages 1 and 2 but no stage 3" \
+    sh -c "(cd '$P40_DM' && LC_ALL=C git ls-files -s ud.txt) | awk '{print \$3}' | tr '\n' ' ' | grep -q '^1 2 $'"
+p34_cmp "$P40_DM" "phase40: one-sided conflict, no flag (PATCH's dense default must not combine)"
+p34_cmp "$P40_DM" "phase40: one-sided conflict, -c" -c
+p34_cmp "$P40_DM" "phase40: one-sided conflict, --cc" --cc
+p34_cmp "$P40_DM" "phase40: one-sided conflict, --name-status" --name-status
+check "phase40: a one-sided conflict prints \"* Unmerged path\" and never a combined header" \
+    sh -c "(cd '$P40_DM' && '$SG' diff --cc) | grep -q '^\* Unmerged path du.txt$' && ! (cd '$P40_DM' && '$SG' diff --cc) | grep -q '^diff --c'"
+
+# E-9: the widening rule reads the index group's LOWEST stage. Every other
+# fixture in this phase has a single-entry index group for the widened
+# path, where "first entry" and "last entry" are the same row -- measured
+# with tests/mutate.sh: rewriting the widening block to read the group's
+# LAST entry instead left interop at 1915/1915 with zero FAIL lines.
+#
+# This fixture is built so stage 1 and stage 3 give OPPOSITE answers to
+# "does this row exist at all", which is the only way to tell them apart:
+#   stage 1     = BASE   (differs from the working tree -> row must exist)
+#   stage 3     = ZZZ    (equals it -> reading stage 3 yields NO row)
+#   named tree  = ZZZ    (equals it, so the ordinary tree-vs-worktree test
+#                         finds nothing on its own)
+#   working tree = ZZZ
+# The plain `sg diff namedz` control below is what makes the -c result
+# meaningful: it must print nothing, so the row can only have come from the
+# widening rule.
+P40_WS="$WORKDIR/p40_widen_stage"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P40_WS")") > /dev/null 2>&1
+printf 'BASE\n' > "$P40_WS/f.txt"
+printf 'seed\n' > "$P40_WS/seed.txt"
+(cd "$P40_WS" && "$SG" add f.txt seed.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P40_WS" && "$SG" branch topic) > /dev/null 2>&1
+printf 'OURS\n' > "$P40_WS/f.txt"
+(cd "$P40_WS" && "$SG" add f.txt && "$SG" commit -m ours) > /dev/null 2>&1
+(cd "$P40_WS" && "$SG" switch topic) > /dev/null 2>&1
+printf 'ZZZ\n' > "$P40_WS/f.txt"
+(cd "$P40_WS" && "$SG" add f.txt && "$SG" commit -m theirs && "$SG" tag namedz) > /dev/null 2>&1
+(cd "$P40_WS" && "$SG" switch master) > /dev/null 2>&1
+(cd "$P40_WS" && "$SG" merge topic) > /dev/null 2>&1
+printf 'ZZZ\n' > "$P40_WS/f.txt"
+check "phase40: precondition -- f.txt carries all three stages here" \
+    sh -c "(cd '$P40_WS' && LC_ALL=C git ls-files -s f.txt) | awk '{print \$3}' | tr '\n' ' ' | grep -q '^1 2 3 $'"
+check "phase40 control: plain sg diff namedz prints nothing (tree == working tree)" \
+    sh -c "test -z \"$(cd '$P40_WS' && '$SG' diff namedz)\""
+check "phase40 oracle: real git's control is empty too" \
+    sh -c "test -z \"$(cd '$P40_WS' && LC_ALL=C git -c core.quotepath=false diff namedz)\""
+p34_cmp "$P40_WS" "phase40: widening reads the group's LOWEST stage, not its last" -c namedz
+check "phase40: ...and the row it produces names stage 1's blob, not stage 3's" \
+    sh -c "(cd '$P40_WS' && '$SG' diff -c namedz) | grep -q '^- BASE$'"
 
 # --- F: head-on collision -- "* Unmerged path" must NOT be quoted, but the
 # SAME filename in a combined header (--- a/..., +++ b/..., diff --cc ...)

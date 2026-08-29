@@ -6077,3 +6077,51 @@ Four details that each cost a fixture:
 - Mode-only change prints the `mode a,b..c` line and no hunks (H); a binary
   row prints `Binary files differ` and **no `---`/`+++` lines at all** (L);
   parent 1 == parent 2 is fine and still renders combined (H, N, O p1).
+
+### 6. Two blind spots the cold read found, and what made them invisible
+
+Neither is a bug this phase introduced; both are properties with no
+witness, found by reviewing the diff rather than by any gate. They are
+recorded because the *reason* each was invisible generalizes.
+
+**(a) The `ours == ABSENT` half of the combinable predicate.** A conflict
+where only one of stage 2 / stage 3 exists -- a delete/modify conflict --
+has nothing to combine, and real git prints `* Unmerged path` for it under
+no flag, under `-c`, and under `--cc` alike (measured). Deleting that half
+of the guard left `make test` and interop at **1915/1915 with zero FAIL
+lines**. The cause is a fixture monoculture: every conflict in
+`tests/interop.sh` is built by `p34_mkconflict`, which writes non-empty
+base/ours/theirs strings and therefore *cannot* produce anything but the
+full `{1,2,3}` stage set. A helper that can only build one shape makes
+every test that uses it blind to the same dimension, however many of them
+there are.
+
+Phase 40 did not create this gap -- it dates from Phase 34 -- but it
+promoted the guard from a file-local `combinable()` to a documented public
+`sg_diff_entry_is_combined`, and **a contract written in a header reads as
+a guarantee whether or not anything checks it**. That is the reason to fix
+it here rather than leave it.
+
+**(b) The widening rule reads the index group's LOWEST stage.** Rewriting
+that block to read the group's *last* entry instead also left interop fully
+green, because every fixture that reaches the widening branch has a
+single-entry index group for that path -- where "first" and "last" are the
+same row, so both spellings agree. Telling them apart needs a fixture where
+they disagree about something observable, which here means a conflicted
+path whose stage 1 and stage 3 give **opposite** answers to "does this row
+exist at all":
+
+```
+stage 1      = BASE   differs from the working tree  -> the row must exist
+stage 3      = ZZZ    equals it     -> reading stage 3 yields NO row
+named tree   = ZZZ    equals it, so the ordinary test finds nothing alone
+working tree = ZZZ
+```
+
+The `plain sg diff namedz prints nothing` control is what makes the result
+mean anything: without it, a row appearing under `-c` proves only that
+something produced it, not that the widening rule did.
+
+Both gaps were confirmed the same way, and it is the only way that counts:
+mutate the code, watch every gate stay green, add the fixture, mutate
+again, watch the named checks go red.

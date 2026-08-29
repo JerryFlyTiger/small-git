@@ -478,9 +478,10 @@ line, mode and
 lines for additions and deletions, hunk splitting at three lines of context,
 the function-name suffix and
 .BR "\e No newline at end of file" .
-Around two to three percent of hunks differ in position: sg aligns lines
-with an LCS backtrack where git defaults to Myers, and the two produce
-equally minimal but differently paired edit scripts.
+Hunk positioning matches too: since the alignment step became a direct port
+of git's own Myers algorithm, the two to three percent of hunks that used to
+differ in position are gone, re-measured at zero mismatches over several
+thousand randomized comparisons against real git.
 .PP
 A combinable unresolved conflict (both index stage 2 and stage 3 present,
 plain index-vs-working-directory comparison only) is rendered as git's
@@ -495,11 +496,31 @@ with
 .B -c
 and
 .B --cc
-on the command line wins. Combined with a
+on the command line wins.
+.PP
+Given exactly one
 .I rev
-argument, both are rejected \(em real git switches to a different parent
-pairing there (stage 1 vs the named tree blob) that sg does not implement,
-so refusing is preferred to a silently different answer.
+and no
+.BR --cached ,
+.B -c
+and
+.B --cc
+instead render a combined diff of the index's own entry for each path and
+that
+.IR rev 's
+blob, against the working-tree file. This applies to every path, not just
+conflicted ones, and a path is combined only when all three of those sides
+exist; otherwise its row falls back to exactly what plain
+.BI "sg diff " rev
+would have printed for it. Three consequences are easy to overlook: the
+index entry used is the one with the lowest stage present, which for an
+add/add conflict is stage 2 rather than stage 1; the output is reordered so
+that every combined row precedes every non-combined one, each half in path
+order; and rename and copy detection never sees a combined row.
+.B --cached
+and a second
+.I rev
+each override the flags entirely, leaving their ordinary output unchanged.
 .B -c
 and
 .B --cc

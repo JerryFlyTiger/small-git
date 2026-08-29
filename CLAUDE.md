@@ -842,9 +842,18 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   returning NULL has these same two causes, and the four commands that used
   to reject on it (merge/reset/rebase/push) have all been split apart.
   Of these, **merge and rebase were changed in Phase 19 to allow detached and
-  only reject corrupt**, leaving only push still rejecting unconditionally
-  (its HEAD check comes after the remote ref advertisement, unreachable
-  without a live remote, so it cannot be tested).
+  only reject corrupt**, leaving only push still rejecting unconditionally.
+  This entry used to add "its HEAD check comes after the remote ref
+  advertisement, unreachable without a live remote, so it cannot be tested".
+  **That was wrong, measured in Phase 40**: the refusal fires BEFORE any
+  connection attempt, so a remote whose URL simply never connects
+  (`http://127.0.0.1:9/`) is enough and no HTTP server is needed -- interop
+  now pins it, with two control groups (re-attaching HEAD, and giving an
+  explicit refspec) separating the refusal from the dead URL, since a push
+  that refused for any reason at all would otherwise look identical.
+  Note the explicit-refspec control is not just test scaffolding: since
+  Phase 39 a named refspec deliberately bypasses this check entirely
+  (`sg push origin HEAD:refs/heads/x` proceeds), matching real git.
 
   **`current_branch == NULL` now flows through the entire merge/rebase
   path**; when adding or modifying code in those two, any place that feeds it
