@@ -775,16 +775,23 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   the label attached to the path on the same line (see Q3's own comment).
   So the tab-line class is guarded for the untracked case (Phase 23), the
   untracked section (Phase 25), and staged-section ordering (Phase 32) --
-  **not** for every one of `unmerged_label`'s seven strings. As of Phase 38
-  round 2, four of the seven (`both added:`, `both modified:`,
-  `deleted by them:`, `deleted by us:`) have a real-git oracle (`phase38: sg
-  status's unmerged labels match real git byte-for-byte`, using Q3's own
-  strip-tab-sort-cmp technique, not the skeleton comparator); the remaining
-  three (`both deleted:`, `added by us:`, `added by them:`) still have none
-  -- an ordinary merge cannot produce those stage combinations (DD
-  auto-resolves; AU/UA needs a rename or a hand-built index) -- this is a
-  pre-existing gap, not something Phase 38 introduced, and it is recorded
-  here rather than papered over.
+  **not** for every one of `unmerged_label`'s seven strings. As of Phase 45
+  **all seven have a real-git oracle**. Phase 38 round 2 covered four
+  (`both added:`, `both modified:`, `deleted by them:`, `deleted by us:`,
+  via `phase38: sg status's unmerged labels match real git byte-for-byte`,
+  using Q3's own strip-tab-sort-cmp technique rather than the skeleton
+  comparator). The other three (`both deleted:`, `added by us:`,
+  `added by them:`) were recorded as unreachable because "an ordinary merge
+  cannot produce those stage combinations" -- true of a CONTENT merge, and
+  **false in general: a rename/rename produces all three at once**. Base has
+  `f.txt`, ours renames it to `a.txt`, theirs to `b.txt`, leaving `f.txt` at
+  stage 1 only, `a.txt` at stage 2 only, `b.txt` at stage 3 only (interop's
+  `phase45` group, which also pins the three porcelain codes).
+  WARNING: **that fixture must be built by GIT, not sg** -- `sg merge` has no
+  rename detection and resolves the same history CLEANLY, keeping both
+  renamed files. The divergence is pinned in the same group, so teaching sg
+  rename-aware merging turns a check red and says so rather than silently
+  changing how the fixture builds.
   The closing summary line is deliberately **not** in the dropped set --
   both tools hard-code `git add`/`git commit -a` regardless of the invoking
   binary's own name, so it is supposed to be byte-identical, and this is
