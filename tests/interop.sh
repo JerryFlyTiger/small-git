@@ -10827,8 +10827,15 @@ p34_cmp "$P40_N" "phase40: --name-status -c -C skips combined rows for rename/co
     --name-status -c -C named
 check "phase40 oracle: without -c, the control DOES pair src.txt/copy.txt as a copy" \
     sh -c "(cd '$P40_N' && git -c core.quotepath=false diff --name-status -C named) | grep -q '^C100.*src\\.txt.*copy\\.txt'"
+# The tab must come from $(printf '\t'), never a literal \t inside the
+# pattern: BSD grep (macOS) accepts \t as a tab, GNU grep (ubuntu) does not
+# and matches a literal "t" instead. Measured -- the original spelling of
+# this check passed on macOS and failed on all three ubuntu CI cells while
+# sg's actual output was correct all along (the p34_cmp byte-for-byte check
+# on the same fixture stayed green everywhere). Same idiom as the phase23,
+# phase31 and phase34 checks in this file.
 check "phase40: with -c, src.txt renders MM (combined) and copy.txt renders A (no pairing)" \
-    sh -c "(cd '$P40_N' && '$SG' diff --name-status -c -C named) | grep -q '^MM\\tsrc.txt$' && (cd '$P40_N' && '$SG' diff --name-status -c -C named) | grep -q '^A\\tcopy.txt$'"
+    sh -c "(cd '$P40_N' && '$SG' diff --name-status -c -C named) | grep -q \"^MM\$(printf '\\t')src.txt\$\" && (cd '$P40_N' && '$SG' diff --name-status -c -C named) | grep -q \"^A\$(printf '\\t')copy.txt\$\""
 
 # E-6 (SPEC section 6): per-format behaviour on a fixture mixing ONE
 # combined row with TWO plain ones -- fixture J's own lesson (round 1 used
