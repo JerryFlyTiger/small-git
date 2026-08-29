@@ -6678,39 +6678,59 @@ pins one of those fixtures byte-for-byte against `git merge-file`, so the
 argument now has a named witness and not merely a net -- the distinction this
 phase learned the hard way in section 11.
 
-**And the widened generator found a real residual: 5 / 1500 rounds (0.33%),
-every one of them in the three-way layer.** The attribution is not a judgement
-call, it is measured, and `--attribute` now does it automatically: for each
-saved case it builds a one-file repo, commits base, writes the other side into
-the working tree, and asks BOTH tools for the diff of the same repo (sg's
-on-disk format being git-readable is what makes this possible). If the two
-2-way diffs are byte-identical, alignment agreed and only the sync-point
-classification can be responsible.
+**And the widened generator found a real residual: 5 / 1500 rounds (0.33%)
+in the default mode, 4 / 1500 in the control.** The first attribution written
+here was wrong, and the way it was wrong is worth more than the number.
+
+The harness first asked "are the two 2-way diffs byte-identical to git's?",
+answered yes for every case, and concluded the divergence had to be in sg's
+own sync-point layer. That reasoning has a hole: it compares sg and git
+through their **diff** paths, which proves the aligners agree there, and then
+assumes the merge paths use the same aligner. Measured, they do not.
+
+**`git merge` defaults to the HISTOGRAM diff algorithm; `git merge-file`
+defaults to Myers.** On the one `rc` case, `git merge-file` reproduces sg's
+output byte for byte -- including the "lost" line that looked alarming -- and
+`git merge-file --diff-algorithm=histogram` reproduces `git merge`'s. Over all
+nine saved cases:
 
 | | count |
 |---|---|
-| `[3way]` alignment agrees with git, divergence is sg's own layer | **5 / 5** |
-| `[align]` a 2-way diff differs from git's | **0 / 5** |
+| sg == `git merge-file` (Myers), byte for byte | **9 / 9** |
+| `git merge` == `git merge-file --diff-algorithm=histogram` | **9 / 9** |
+| Myers and histogram agreeing with each other | 0 / 9 |
 
-The probe was checked to have discriminating power rather than assumed to:
-desyncing `sg diff`'s own aligner from git's flips saved cases from `[3way]`
-to `[align]`.
+So the entire residual is **which diff algorithm git's merge uses**, and
+nothing else. That is a considerably stronger result about sg than the wrong
+attribution suggested: on every case where sg disagrees with `git merge`, it
+reproduces git's OWN three-way merge of the same three buffers exactly, so
+sg's sync-point layer -- the part that is not a port of `xdl_merge` -- agrees
+with `xdl_merge` on all of them. Section 9's caution stands as a caution; the
+measurement did not find it.
 
-The shape, from the one `rc` case (sg conflicts where git does not): ours
-REPLACES base lines 8-10 while theirs makes a PURE INSERTION at the boundary
-just above them. git tracks each side's change as an interval on base and
-applies both, because a zero-length insertion at the edge of the other side's
-range is not an overlap. sg asks a different question -- "which base lines are
-matched on BOTH sides" -- and base lines 8-10, matched by theirs but rewritten
-by ours, are therefore not sync points, so both edits land inside one span and
-the span equals neither side. **This is the documented boundary from section
-9 finally producing a measured number**: making both 2-way alignments agree
-with git does not make the merge agree with git, and 0.33% is the size of what
-is left.
+It also corrects section 2, which chose `git merge-file` as the oracle "the
+closest real-git unit to `sg_merge_content`" and noted that whether it is a
+faithful stand-in for the full `git merge` path was "itself something to
+verify, not assume". It is not faithful, and this is where that assumption
+would have been paid for: had the fuzzer used `merge-file`, all nine of these
+would have been green and the algorithm difference would never have surfaced.
 
-Closing it means replacing the sync-point model with git's changed-interval
-model, which is a phase of its own and not a tail on this one. Until then the
-acceptance criterion for `tests/fuzz_merge.py` is **not "0"**: it is "0
-`[align]`, and any `[3way]` case attributed before it is accepted". Counting
-the two together is exactly how a real alignment regression would hide inside
-a known gap.
+`--attribute` now runs both oracles and labels each case:
+
+- **`[algo]`** -- sg reproduces `git merge-file` (Myers) exactly and `git
+  merge` matches histogram. Not sg's defect.
+- **`[3way]`** -- the 2-way diffs agree with git yet sg's merge differs from
+  git's own Myers merge: sg's sync-point layer.
+- **`[align]`** -- a 2-way diff itself differs from git's. An alignment
+  regression, never expected.
+
+Measured today: **9 `[algo]`, 0 `[3way]`, 0 `[align]`.** The `[align]` probe
+was checked to have discriminating power rather than assumed to -- desyncing
+`sg diff`'s own aligner from git's flips saved cases to `[align]`.
+
+Closing the remaining gap means porting git's histogram algorithm and using it
+in the merge path (only there -- `sg diff` matches git with Myers, thousands
+of fuzz rounds deep). That is a phase of its own. Until then the acceptance
+criterion for `tests/fuzz_merge.py` is **not "0"**: it is "0 `[align]`, 0
+`[3way]`, and every `[algo]` case is the known histogram gap". Counting them
+together is exactly how a real regression would hide inside a known gap.

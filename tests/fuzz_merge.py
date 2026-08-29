@@ -310,34 +310,48 @@ def one_round(rng, keep_dir, index, newline_edits=True):
 MARK = re.compile(r"^(<<<<<<< |=======$|>>>>>>> )")
 
 
+def merge_file(case_dir, algo=None):
+    """Runs `git merge-file` on a saved case, optionally forcing an algorithm.
+
+    This is git's own three-way merge of the same three buffers, reachable
+    without a repository, and it is the second oracle the attribution below
+    turns on. Labels are normalized the same way the harness does.
+    """
+    cmd = ["git", "merge-file"]
+    if algo:
+        cmd.append("--diff-algorithm=" + algo)
+    # "topic" is the branch name the harness's own repos use, so the closing
+    # marker matches without a second normalization; the opening one is
+    # normalized away for both sides anyway.
+    cmd += ["-L", "LABEL", "-L", "base", "-L", "topic", "-p",
+            os.path.join(case_dir, "ours.txt"), os.path.join(case_dir, "base.txt"),
+            os.path.join(case_dir, "theirs.txt")]
+    try:
+        return subprocess.run(cmd, capture_output=True, env=ENV, text=True).stdout
+    except OSError:
+        return None
+
+
 def two_way_matches_git(case_dir):
     """Does sg align base-vs-ours and base-vs-theirs exactly as git does?
 
-    Answers the attribution question the merge harness cannot answer from the
-    merged bytes alone.  sg's merge is two layers: two 2-way alignments (a port
-    of git's Myers algorithm since Phase 41) and a three-way classification on
-    top that is sg's OWN design, not a port of xdl_merge.  A merged-output
-    mismatch could come from either, and they call for opposite responses -- an
-    alignment regression is a bug in ported code, while the three-way layer
-    diverging is a known, measured, structural gap.
-
+    sg's merge is two layers -- two 2-way alignments (a port of git's Myers
+    algorithm since Phase 41) and a three-way classification on top that is
+    sg's OWN design -- and a merged-output mismatch could come from either.
     The probe builds a one-file repo with sg, commits base, writes the other
-    side into the working tree, and then asks BOTH tools for the diff of the
-    same repo, which works because sg's on-disk format is git-readable.  That
-    is a stronger comparison than re-implementing the check here: it is real
-    git's own output, including its group compaction.
+    side into the working tree, and asks BOTH tools for the diff of the same
+    repo, which works because sg's on-disk format is git-readable.
 
     Returns True (alignment agrees), False (it does not), or None if the probe
     itself could not run, which is deliberately NOT folded into either answer.
 
-    Two limits, stated rather than papered over.  The probe goes through each
-    tool's DIFF path, where both sides apply the indentation heuristic, while
-    merge asks for it to be off -- so a divergence that appears only with the
-    heuristic off would not be caught here (tests/test_merge_content.c's
-    test_merge_does_not_use_the_indent_heuristic is the witness for that
-    argument instead).  And it was checked to have discriminating power rather
-    than assumed to: desyncing sg diff's own aligner from git's flips saved
-    cases from [3way] to [align], measured.
+    Limit, stated rather than papered over: the probe goes through each tool's
+    DIFF path, where both sides apply the indentation heuristic, while merge
+    asks for it to be off -- so a divergence appearing only with the heuristic
+    off would not be caught here (test_merge_does_not_use_the_indent_heuristic
+    in tests/test_merge_content.c is that argument's witness instead). It was
+    checked to have discriminating power rather than assumed to: desyncing sg
+    diff's own aligner from git's flips saved cases to [align], measured.
     """
     try:
         base = open(os.path.join(case_dir, "base.txt"), "rb").read()
@@ -392,6 +406,7 @@ def attribute(root):
     buckets = collections.Counter()
     total = 0
     three_way = 0
+    algo_only = 0
     for name in sorted(os.listdir(root)):
         d = os.path.join(root, name)
         if not os.path.isdir(d):
@@ -405,10 +420,19 @@ def attribute(root):
         same_material = collections.Counter(nonmark(sgl)) == collections.Counter(nonmark(gil))
         sg_marks = sum(1 for l in sgl if MARK.match(l))
         gi_marks = sum(1 for l in gil if MARK.match(l))
-        aligned = two_way_matches_git(d)
-        if aligned is None:
-            layer = "?"
-        elif aligned:
+        sg_raw = normalize("".join(sgl))
+        gi_raw = normalize("".join(gil))
+        myers = merge_file(d)
+        hist = merge_file(d, "histogram")
+        if myers is not None and sg_raw == normalize(myers):
+            # sg reproduces git's OWN three-way merge of the same buffers, so
+            # neither sg's alignment nor its three-way layer is responsible.
+            if hist is not None and gi_raw == normalize(hist):
+                layer = "algo"
+            else:
+                layer = "algo?"
+            algo_only += 1
+        elif two_way_matches_git(d):
             layer = "3way"
             three_way += 1
         else:
@@ -429,8 +453,12 @@ def attribute(root):
     nl = sum(n for b, n in buckets.items() if "has_nl" in b)
     print()
     print("  involving a missing trailing newline: %d / %d" % (nl, total))
-    print("  [3way]  = both 2-way diffs match git, so alignment agreed and the")
-    print("            divergence is sg's own sync-point layer:  %d / %d" % (three_way, total))
+    print("  [algo]  = sg reproduces `git merge-file` (Myers) EXACTLY, and `git")
+    print("            merge` matches --diff-algorithm=histogram: the divergence")
+    print("            is git's merge defaulting to histogram, not sg:  %d / %d"
+          % (algo_only, total))
+    print("  [3way]  = both 2-way diffs match git yet the merge differs from git's")
+    print("            own Myers merge -- sg's sync-point layer:  %d / %d" % (three_way, total))
     print("  [align] = a 2-way diff differs from git's -- an ALIGNMENT regression,")
     print("            which is never expected and never part of the known residual")
     return 0
