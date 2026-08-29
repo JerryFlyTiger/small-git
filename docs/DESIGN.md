@@ -5866,3 +5866,262 @@ piece of behavior, recorded here rather than silently added).
 Item E above (`src_display`) was also found in this same cold read; its
 fix and reasoning are recorded inline in section B, next to the field it
 removed.
+
+## Phase 40: `-c`/`--cc` with a `<rev>`, and the three ways Phase 34 guessed wrong
+
+Phase 34 rejected `-c`/`--cc` together with a `<rev>` outright and recorded
+the reason as "real git switches to a completely different parent pairing
+there (stage 1 vs the named tree blob)". Rejecting rather than approximating
+was the right call. **The stated reason, however, was wrong in three
+separate ways**, and each error would have produced a plausible-looking but
+incorrect implementation:
+
+1. It is **not about conflicts at all**. A repository with no unmerged entry
+   anywhere still prints `diff --combined` under `-c <rev>`.
+2. Parent 1 is **the index**, not a merge base -- and not HEAD either.
+3. Parent 1 is the **lowest stage present**, not stage 1; an add/add
+   conflict has no stage 1 and pairs against stage 2.
+
+On top of that the feature reorders the entire output and changes which
+rows rename detection is even allowed to see -- two rules that no amount of
+reasoning about "parent pairing" would have suggested.
+
+All measurements below are against git 2.55.0 on 2026-08-29, driven from
+Python with argv passed directly to `subprocess` (never through a shell, so
+no argument is silently rewritten before git sees it), with `LC_ALL=C` and
+`-c core.quotepath=false`. Six fixture rounds; the ones a rule depends on
+are named per rule. **Every rule that needed a control group to be provable
+has one, and the control is named** -- a measurement of the target scenario
+alone cannot tell which line of output the new flag is responsible for.
+
+### 0. When the rev form activates
+
+| invocation | measured | fixture |
+|---|---|---|
+| `-c <rev>` / `--cc <rev>` | combined mode, sections 1-5 | B1, B2 |
+| `-c --cached <rev>` | ordinary tree-vs-index; `* Unmerged path` for conflicts | C1, L |
+| `-c <rev1> <rev2>` | ordinary tree-vs-tree, no combining | C2 |
+| `-c` with no rev | unchanged Phase 34 behaviour | A2, A3, K |
+
+So `--cached` and a second rev each beat `-c`. Note that **none of the three
+"no effect" rows needs a special-case branch in sg**: `sg_diff_trees` and
+`sg_diff_tree_index` never fill `ours`/`theirs`, so the combinable predicate
+is false for their rows and the flag degenerates on its own. This is the
+same "it falls out of the data layer" property Phase 34 already relied on to
+make `--cached` keep printing `* Unmerged path` regardless of `-c`/`--cc`.
+
+`-c`/`--cc` last-one-wins is unchanged (`-c --cc` -> `diff --cc`,
+`--cc -c` -> `diff --combined`, both measured in fixture L).
+
+### 1. The three sides
+
+For a row on path `P` from the ordinary `<rev>`-vs-working-tree comparison:
+
+- **parent 1 (left column)** = the **first index entry for `P`**, i.e. the
+  lowest stage present.
+- **parent 2 (right column)** = the named tree's blob for `P`.
+- **result** = the working-tree file.
+
+**Parent 1 is the index, not HEAD.** Rounds 1-2 could not tell the two apart
+because the index and HEAD held the same blob in every fixture. Fixture E
+was built specifically to separate them, giving `HEAD~1`, `HEAD`, the index
+and the working tree four different blobs:
+
+```
+$ git diff -c HEAD~1
+diff --combined a.txt
+index 50beca8,5d33834..0000000        <- 50beca8 is the INDEX entry
+@@@ -1,1 -1,1 +1,1 @@@
+- V3-staged                           <- the staged blob, not HEAD's V2
+ -V1-oldcommit
+++V4-worktree
+```
+
+**Parent 1 is the lowest stage, not stage 1.** Measured stage sets:
+
+| stages present for the path | parent 1 | fixture |
+|---|---|---|
+| `{0}` (ordinary path) | stage 0 | B, E, H, J, M, N, O |
+| `{1,2,3}` (content conflict) | stage 1 | A, D |
+| `{1,2}` (theirs deleted) | stage 1 | F |
+| `{1,3}` (ours deleted) | stage 1 | F |
+| **`{2,3}` (add/add -- no stage 1 exists)** | **stage 2** | C |
+
+A rule phrased as "stage 1 when the path is unmerged" is right for three of
+the five rows and silently picks nothing at all for add/add.
+
+### 2. Which rows render combined
+
+A row renders combined **iff all three sides are non-ABSENT**; otherwise it
+renders **byte-for-byte as plain `git diff <rev>` would**.
+
+That "byte-for-byte" is not a guess. Fixture G made the index blob differ
+from the named tree's blob for a path deleted from the working tree, so the
+two candidate pairings would print different hashes and different content:
+
+```
+$ git diff -c named            $ git diff named          (control)
+deleted file mode 100644       deleted file mode 100644
+index 998e834..0000000         index 998e834..0000000    <- the NAMED TREE's
+-GONE-v2-namedtree             -GONE-v2-namedtree           blob, not the
+                                                            index's a052637
+```
+
+**Control group for the whole section: fixture B is a repository with no
+unmerged entry anywhere, and `git diff -c HEAD~1` still prints
+`diff --combined`.** Conversely `git diff -c` with no rev on an ordinary
+dirty path prints a plain `diff --git` (B-a), so nothing about Phase 34's
+existing behaviour changes.
+
+### 2b. `-c <rev>` also widens which rows exist at all
+
+This rule was missing from the phase's own spec and was found during
+implementation, by the implementer measuring a case the spec did not cover.
+It is recorded here rather than quietly folded into section 2, because the
+spec being incomplete is itself the lesson: sections 1-5 were all derived
+from fixtures built to answer "how is a row rendered", and none of them
+would ever have asked "which rows are there to render".
+
+A row's inclusion test under `-c <rev>` is **"the result differs from ANY
+parent"**, not "the result differs from the named tree". The ordinary
+`<rev>`-vs-working-tree comparison only ever looks at the tree, so a path
+whose working tree happens to match the named tree exactly, but whose index
+entry does not (a staged edit reverted in the working tree), is absent from
+the plain comparison and present in the combined one:
+
+```
+$ git diff named                    $ git diff -c named
+(prints nothing at all)             diff --combined p3.txt
+                                    index 74bb2c6,8a205e8..0000000
+                                    @@@ -1,1 -1,1 +1,1 @@@
+                                    - index only
+                                    + shared
+```
+
+Both halves are the measurement: the empty left-hand side is what makes it a
+widening rather than a coincidence. In sg this is why
+`sg_diff_tree_workdir` takes a `combined` parameter at all -- a pass running
+after the builder cannot recover a row the builder never emitted, so this
+one rule genuinely cannot live in `sg_diff_fill_combined_from_index` with
+the rest of Phase 40's data work.
+
+### 3. Output order -- the rule that breaks every byte-for-byte check
+
+**All combined rows print first, in path order; then all non-combined rows,
+in path order.** In every format, patch included.
+
+Fixture M interleaves five combinable paths with four non-combinable ones,
+so path order and group order disagree on every line:
+
+```
+$ git diff --name-only -c named     $ git diff --name-only named  (control)
+a.txt c.txt e.txt g.txt i.txt       a.txt b.txt c.txt d.txt e.txt
+b.txt d.txt f.txt h.txt             f.txt g.txt h.txt i.txt
+```
+
+The control is what makes this provable rather than a coincidence of the
+fixture: without `-c` the same nine paths come out interleaved.
+
+### 4. Rename and copy detection sees only the non-combined rows
+
+Fixture N: `src.txt` is modified (so it is combinable) and `copy.txt` is a
+staged byte-identical copy of `src.txt`'s old content.
+
+```
+$ git diff --name-status -C named       (control)   $ git diff --name-status -c -C named
+C100    src.txt copy.txt                            MM      src.txt
+M       src.txt                                     A       copy.txt
+```
+
+So a combined row is removed from the queue **before** detection runs, and
+can serve as neither a rename source, a copy source, nor a destination.
+Without the `-C` control this is invisible: under plain `-M` a combined row
+is a modification and would never have been paired anyway, so the rule only
+becomes observable once copy detection makes modified paths eligible as
+sources. This is the same shape as Phase 29's "filter before detect" lesson
+-- ordering two passes wrongly has no symptom, it just answers differently
+in one specific scenario.
+
+The ordinary rename in fixture L still pairs normally, and needs no special
+rule: its destination is absent from the named tree, so it was never
+combinable in the first place.
+
+### 5. Per-format behaviour
+
+| format | combined row | non-combined row |
+|---|---|---|
+| patch, `-c` | `diff --combined P`, `index o,t..0000000`, hunks | ordinary |
+| patch, `--cc` | `diff --cc P`; dense drops every hunk that differs from only one parent, which can leave **header-only output** | ordinary |
+| `--stat` / `--numstat` / `--shortstat` | **contributes nothing at all** | ordinary |
+| `--name-only` | the path, once | ordinary |
+| `--name-status` | always `MM` | ordinary `A`/`D`/`M`/`R` |
+
+Four details that each cost a fixture:
+
+- **The `--stat` omission is per row, not whole-output.** Round 1 saw
+  `--stat -c <rev>` print nothing and could not distinguish "combined rows
+  contribute nothing" from "`--stat` gives up entirely", because every row
+  in that fixture was combined. Fixture J mixes one combined row with two
+  plain ones and prints a stat for exactly the two plain ones, with
+  `2 files changed` in the summary line.
+- **`--name-status` prints `MM` even when the result is byte-identical to
+  one of the parents** (fixture O, rows p2 and p3) and for a mode-only
+  change (fixture H). The two letters are not computed from content
+  equality -- a combined row is `MM` by construction, because all three
+  sides exist by definition of being combinable.
+- **The dense header-only shape is new territory**: `diff --cc P`,
+  `index o,t..0000000`, `--- a/P`, `+++ b/P`, and then nothing. It cannot
+  arise from a conflict, which is why no test before this phase covered it.
+  Fixture O builds it twice, once with the result equal to parent 1 (p2)
+  and once equal to parent 2 (p3).
+- Mode-only change prints the `mode a,b..c` line and no hunks (H); a binary
+  row prints `Binary files differ` and **no `---`/`+++` lines at all** (L);
+  parent 1 == parent 2 is fine and still renders combined (H, N, O p1).
+
+### 6. Two blind spots the cold read found, and what made them invisible
+
+Neither is a bug this phase introduced; both are properties with no
+witness, found by reviewing the diff rather than by any gate. They are
+recorded because the *reason* each was invisible generalizes.
+
+**(a) The `ours == ABSENT` half of the combinable predicate.** A conflict
+where only one of stage 2 / stage 3 exists -- a delete/modify conflict --
+has nothing to combine, and real git prints `* Unmerged path` for it under
+no flag, under `-c`, and under `--cc` alike (measured). Deleting that half
+of the guard left `make test` and interop at **1915/1915 with zero FAIL
+lines**. The cause is a fixture monoculture: every conflict in
+`tests/interop.sh` is built by `p34_mkconflict`, which writes non-empty
+base/ours/theirs strings and therefore *cannot* produce anything but the
+full `{1,2,3}` stage set. A helper that can only build one shape makes
+every test that uses it blind to the same dimension, however many of them
+there are.
+
+Phase 40 did not create this gap -- it dates from Phase 34 -- but it
+promoted the guard from a file-local `combinable()` to a documented public
+`sg_diff_entry_is_combined`, and **a contract written in a header reads as
+a guarantee whether or not anything checks it**. That is the reason to fix
+it here rather than leave it.
+
+**(b) The widening rule reads the index group's LOWEST stage.** Rewriting
+that block to read the group's *last* entry instead also left interop fully
+green, because every fixture that reaches the widening branch has a
+single-entry index group for that path -- where "first" and "last" are the
+same row, so both spellings agree. Telling them apart needs a fixture where
+they disagree about something observable, which here means a conflicted
+path whose stage 1 and stage 3 give **opposite** answers to "does this row
+exist at all":
+
+```
+stage 1      = BASE   differs from the working tree  -> the row must exist
+stage 3      = ZZZ    equals it     -> reading stage 3 yields NO row
+named tree   = ZZZ    equals it, so the ordinary test finds nothing alone
+working tree = ZZZ
+```
+
+The `plain sg diff namedz prints nothing` control is what makes the result
+mean anything: without it, a row appearing under `-c` proves only that
+something produced it, not that the widening rule did.
+
+Both gaps were confirmed the same way, and it is the only way that counts:
+mutate the code, watch every gate stay green, add the fixture, mutate
+again, watch the named checks go red.

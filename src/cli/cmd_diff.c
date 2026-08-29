@@ -180,6 +180,13 @@ int sg_cmd_diff(int argc, char **argv)
     char bad_path[SG_PATH_MAX];
     int rc;
     int exit_rc;
+    /* Only populated by the rev1-only, non-cached, no-rev2 branch below (the
+       one built by sg_diff_tree_workdir) -- kept alive past that branch,
+       unlike the other three branches' own `idx` locals, because Phase 40's
+       combined-diff fill pass needs it again after sg_diff_list_filter has
+       already run. */
+    sg_index rev_idx;
+    int have_rev_idx = 0;
 
     memset(&opts, 0, sizeof(opts));
     opts.format = SG_DIFF_FORMAT_PATCH;
@@ -341,16 +348,15 @@ int sg_cmd_diff(int argc, char **argv)
         goto done;
     }
 
-    /* Phase 34, decision 0.1: real git switches to a completely different
-       parent pairing (stage 1 vs the named tree blob) once a <rev> is
-       given, instead of the stage-2/stage-3 pairing this renderer
-       implements -- approximating it would silently answer a different
-       question. Rejected outright, same treatment as -C -C above. */
-    if (opts.combined != 0 && rev1 != NULL) {
-        fprintf(stderr, "sg: -c/--cc cannot be combined with a revision argument\n");
-        goto done;
-    }
-
+    /* Phase 40: -c/--cc combined with a <rev> is no longer rejected --
+       measured against git 2.55.0, it is accepted and renders a combined
+       diff of [the index's own entry for the path, the named tree's blob]
+       against the working tree (SPEC section 2). It only takes effect in
+       the plain `<rev>` form below (rev1 set, no --cached, no rev2) --
+       `-c --cached <rev>` and `-c <rev1> <rev2>` are unaffected, which needs
+       no special-case branch here: sg_diff_trees and sg_diff_tree_index
+       never fill ours/theirs, so sg_diff_entry_is_combined is false for
+       every row they produce and the flag degenerates on its own. */
     if (rev2 != NULL) {
         unsigned char old_tree[SG_SHA1_RAW_LEN];
         unsigned char new_tree[SG_SHA1_RAW_LEN];
@@ -384,16 +390,16 @@ int sg_cmd_diff(int argc, char **argv)
         sg_index_free(&idx);
     } else if (rev1 != NULL) {
         unsigned char tree_id[SG_SHA1_RAW_LEN];
-        sg_index idx;
 
         if (resolve_rev_tree(git_dir, rev1, tree_id) != 0)
             goto done;
-        if (sg_index_read(git_dir, &idx) != 0) {
+        if (sg_index_read(git_dir, &rev_idx) != 0) {
             fprintf(stderr, "sg: failed to read index (corrupt?)\n");
             goto done;
         }
-        rc = sg_diff_tree_workdir(git_dir, repo_root, tree_id, &idx, &list, bad_path);
-        sg_index_free(&idx);
+        have_rev_idx = 1;
+        rc = sg_diff_tree_workdir(git_dir, repo_root, tree_id, &rev_idx, &list, bad_path,
+                                  opts.combined != 0);
     } else {
         sg_index idx;
 
@@ -419,18 +425,52 @@ int sg_cmd_diff(int argc, char **argv)
        that is deliberate and what it costs. */
     sg_diff_list_filter(&list, &pathspec);
 
+    /* Phase 40: fills ours/theirs/result on the (already filtered)
+       tree-vs-workdir list so sg_diff_entry_is_combined can recognize rows
+       for `-c/--cc <rev>`. Only meaningful in this one branch (see
+       sg_diff_fill_combined_from_index's header comment) -- --cached and
+       two-rev diffs never populate rev_idx, and a bare `-c/--cc` with no
+       rev at all never sets have_rev_idx either. Gated on opts.combined
+       too: with no -c/--cc given this pass would be pure overhead, and (per
+       print_patch's per-producer note) a rev-mode row must not render
+       combined unless the flag was actually given. */
+    if (have_rev_idx && opts.combined != 0)
+        sg_diff_fill_combined_from_index(&rev_idx, &list);
+
     /* Rename detection runs AFTER the filter, never before -- measured
        against git 2.55.0, `git diff --cached --name-status -- b1.txt` on a
        renamed pair prints "A b1.txt", because git filters by pathspec first
-       and a spec naming half a rename leaves nothing to pair with. */
+       and a spec naming half a rename leaves nothing to pair with. It also
+       runs AFTER the fill pass above and BEFORE the reorder below: a
+       combined row must never be offered as a rename/copy source or
+       destination (Phase 40 SPEC section 5) -- src/workdir/rename.c's
+       is_deletion/is_addition/is_modification predicates skip any row
+       sg_diff_entry_is_combined reports true for. */
     if (sg_diff_detect_renames(git_dir, repo_root, &list, rename_score, detect_copies) != 0) {
         fprintf(stderr, "sg: out of memory, cannot detect renames\n");
         goto done;
     }
 
+    /* Phase 40 SPEC section 4: `-c/--cc <rev>` prints every combined row
+       first (path order), then every non-combined row (path order) -- in
+       every format, patch included. Measured with an interleaved fixture
+       specifically to rule out "the fixture happened to sort that way".
+       Scoped to this one mode on purpose: sg_diff_index_workdir's
+       conflict rows are NOT reordered (existing Phase 34 behaviour, which
+       interleaves an unmerged row with its own companion row by
+       construction and has interop pins relying on that order). */
+    if (have_rev_idx && opts.combined != 0) {
+        if (sg_diff_reorder_combined_first(&list) != 0) {
+            fprintf(stderr, "sg: out of memory\n");
+            goto done;
+        }
+    }
+
     exit_rc = sg_diff_print(git_dir, repo_root, &list, &opts) != 0 ? 1 : 0;
 
 done:
+    if (have_rev_idx)
+        sg_index_free(&rev_idx);
     sg_diff_list_free(&list);
     sg_pathspec_free(&pathspec);
     free(pos);

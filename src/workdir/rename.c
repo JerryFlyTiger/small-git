@@ -38,15 +38,31 @@
    settling for the best seen so far. */
 #define SG_RENAME_EXACT_ALTERNATIVES 100
 
+/* Phase 40 SPEC section 5: a row sg_diff_entry_is_combined recognizes
+   (either a real conflict, or a `-c/--cc <rev>` row Phase 40's fill pass
+   populated) must never be offered to rename/copy detection as a source or
+   a destination -- measured against git 2.55.0 with a fixture where a
+   combinable row's own path would otherwise have paired as a copy source.
+   `!e->unmerged` is kept alongside it rather than replaced: in production
+   an unmerged row's old_side/new_side are always ABSENT by construction
+   (sg/diff.h's contract), so `!e->unmerged` alone was always redundant
+   with the ABSENT checks below it for a REAL row -- but
+   test_modifications_and_unmerged_never_pair in tests/test_rename.c
+   deliberately builds an entry with unmerged=1 and old_side/new_side both
+   populated, to prove this predicate refuses to pair such a row even if
+   that contract were ever violated. Dropping `!e->unmerged` would silently
+   turn that defense-in-depth test into a false pass (the row's `ours`/
+   `theirs` are left ABSENT by that fixture, so sg_diff_entry_is_combined
+   alone would not have caught it). */
 static int is_deletion(const sg_diff_entry *e)
 {
-    return !e->unmerged && e->old_side.kind != SG_DIFF_SIDE_ABSENT &&
+    return !e->unmerged && !sg_diff_entry_is_combined(e) && e->old_side.kind != SG_DIFF_SIDE_ABSENT &&
            e->new_side.kind == SG_DIFF_SIDE_ABSENT;
 }
 
 static int is_addition(const sg_diff_entry *e)
 {
-    return !e->unmerged && e->old_side.kind == SG_DIFF_SIDE_ABSENT &&
+    return !e->unmerged && !sg_diff_entry_is_combined(e) && e->old_side.kind == SG_DIFF_SIDE_ABSENT &&
            e->new_side.kind != SG_DIFF_SIDE_ABSENT;
 }
 
@@ -55,7 +71,7 @@ static int is_addition(const sg_diff_entry *e)
    edited, which plain rename detection has no use for. */
 static int is_modification(const sg_diff_entry *e)
 {
-    return !e->unmerged && e->old_side.kind != SG_DIFF_SIDE_ABSENT &&
+    return !e->unmerged && !sg_diff_entry_is_combined(e) && e->old_side.kind != SG_DIFF_SIDE_ABSENT &&
            e->new_side.kind != SG_DIFF_SIDE_ABSENT;
 }
 
