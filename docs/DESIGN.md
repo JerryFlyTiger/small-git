@@ -6126,11 +6126,14 @@ Both gaps were confirmed the same way, and it is the only way that counts:
 mutate the code, watch every gate stay green, add the fixture, mutate
 again, watch the named checks go red.
 
-## Phase 41 (in progress): a differential net for the three-way merge
+## Phase 41: a differential net for the three-way merge, and what it caught
 
-**Status: investigation complete, no production code changed yet.** This
-section is written before the work so the measurements survive an
-interruption; the plan at the end is a plan, not a record.
+**Status: complete.** Sections 0-4 below were written BEFORE the work, so the
+measurements would survive an interruption; they are left as they were,
+including the plan in section 4, because sections 5-9 are partly a record of
+that plan being overtaken. The headline: the fuzzer went from **59/200 to
+0/200**, and the change that got it there was only half the one that was
+planned.
 
 Phase 35 replaced the alignment step for 2-way patch bodies with a port of
 git's Myers algorithm and **deliberately left `src/workdir/merge.c` alone**,
@@ -6379,3 +6382,180 @@ layer is sg's own design, not a port of `xdl_merge`; making both 2-way
 alignments agree with git does not make the merge agree with git. How much
 of the 5.5% residual belongs to that layer rather than to alignment is
 unmeasured, and is answered by re-attributing after the swap.
+
+### 5. What the Myers swap actually bought, measured one variable at a time
+
+The swap came with a second change that looked like plumbing: `merge.c`'s
+`segment_equal` had to stop ignoring `has_nl`, since the new alignment is
+has_nl-aware and leaving the span comparison blind would keep the same spans
+misclassified after the two sides had stopped being matched. **Two variables
+changed at once, so neither can be credited from the total alone.** All four
+combinations were built and measured, 200 rounds, seed 0:
+
+| aligner | `segment_equal` | rc | body | total |
+|---|---|---|---|---|
+| LCS backtrack (before) | has_nl-blind | 10 | 49 | **59 / 200** |
+| LCS backtrack | has_nl-aware | 4 | 55 | **59 / 200** |
+| Myers | has_nl-blind | 10 | 32 | **42 / 200** |
+| Myers | has_nl-aware | 0 | 36 | **36 / 200** |
+
+Neither half alone helps: the exact comparison on its own moves the total by
+nothing at all (it trades `rc` mismatches for `body` ones), and Myers on its
+own leaves every `rc` mismatch in place. Only together do the `rc` mismatches
+-- the class where sg reported a clean merge while dropping a user's edit --
+reach zero.
+
+**A third measurement says the algorithm swap is not what did it.** Holding
+has_nl-awareness constant and changing ONLY the algorithm (an exact LCS
+backtrack via the then-unused `sg_diff_lcs_table_exact`, versus Myers) gives
+**the same 12 failures on the same 12 seeds**. On this fuzzer's fixtures,
+Myers and the LCS backtrack are indistinguishable in output; what mattered
+was has_nl, which the swap brought along rather than caused.
+
+That does not make the swap pointless -- it makes its justification a
+different one, and one that has to be measured rather than assumed. Merging a
+6000-line file, same result both ways:
+
+| | peak RSS | time |
+|---|---|---|
+| LCS table (2 x `(n+1)*(m+1)` `size_t`) | 602 MB | 0.37s |
+| Myers | 10.8 MB | < 0.01s |
+
+At 2000 lines it is 75 MB vs 9.9 MB, i.e. exactly the quadratic it looks
+like. **That, plus having one aligner in the tree instead of two, is the
+honest case for the swap; "it matches git better" is not.**
+
+### 6. The three things the exact alignment then required
+
+Making the alignment has_nl-aware immediately broke a case that had been
+right before, which is how the remaining work was found. All three fixes are
+git's own behaviour, each measured against `git merge-file` before being
+written.
+
+**(a) A line that lacks a newline still has to be terminated when output
+follows it.** A `has_nl == 0` line is by construction the last line of ITS
+file, but the merged output interleaves three files, so it can still be
+followed by another side's lines or by a conflict marker. sg printed
+`base14=======`, inventing a line present in none of the three inputs; git
+prints `base14\n=======` (`xdl_recs_copy`'s `add_nl`). This is
+`bytebuf_ensure_nl`, called before every append that follows content and
+never after the last one, so a file that legitimately ends without a newline
+still does.
+
+**(b) Conflict refinement (git's `xdl_refine_conflict`).** With base `A\nB`
+(no trailing newline), ours `A\nB\nC\n` and theirs `A\nB\nD\n`, base's `B` no
+longer matches either side's `B\n`, so the whole tail is one conflict -- yet
+real git still prints `B` as ordinary context above the marker, because
+before printing it diffs the two conflicting sides against EACH OTHER and
+hoists what they agree on out of the conflict. Without that step sg printed
+`B` twice, once inside each side. This is exactly what
+`tests/test_merge_content.c`'s pre-existing `test_anchor_newline_not_glued`
+caught -- section 4 listed it as a test that could "legitimately go red on a
+re-alignment", and it was right that it would go red and wrong that it would
+be legitimate.
+
+**(c) Conflict simplification (git's `xdl_simplify_non_conflicts`), which is
+where the entire remaining residual lived.** Two conflicts separated by a
+short run of identical lines are printed as ONE conflict that swallows the
+gap. Every one of the 10-11 surviving mismatches was this same shape (`git
+blocks=1, sg blocks=2`), including all 11 of the `--no-newline-edits`
+control's -- which is why the control had sat at exactly 11, byte-identical,
+through all three earlier interventions.
+
+The threshold is git's constant, re-measured here rather than recalled:
+
+| identical lines between the two conflicts | git prints |
+|---|---|
+| 0, 1, 2, 3 | one conflict block |
+| 4, 5, 6 | two conflict blocks |
+
+**The gap is not measured in lines alone.** A one-sided change inside the gap
+blocks the merge however short it is: with a 3-line gap whose middle line is
+an ours-only change, git leaves two conflicts, where a purely distance-based
+rule gives one. (In git's terms the rule walks its `changes` list and refuses
+when either neighbour has `mode != 0`.) Both halves are pinned as a pair in
+`tests/test_merge_content.c`, and a distance-only implementation passes the
+first and fails the second.
+
+Expressing (b) and (c) at all meant `sg_merge_content` could no longer append
+bytes as it classified: both passes need to see a region's neighbours, and
+merging two conflicts across a gap has to reproduce that gap inside each side
+of the combined conflict, in that side's own words. Hence the `merge_region`
+list, `refine_conflicts`, `simplify_conflicts`, `emit_regions` -- and the
+ordering refine-then-simplify, which is git's and is not symmetric: refinement
+splits conflicts apart, and simplification then decides which of the pieces
+are too close together to be worth separating.
+
+### 7. Final measurement
+
+| | rc | label | body | total |
+|---|---|---|---|---|
+| before (baseline, section 3) | 10 | 0 | 49 | **59 / 200** |
+| after | 0 | 0 | 0 | **0 / 200** |
+| after, `--no-newline-edits` control | 0 | 0 | 0 | **0 / 200** (was 11) |
+
+Re-run on three seed ranges never used during development -- 1000, 5000,
+9000, 200 rounds each, 128-142 of each 200 producing a real conflict --
+**0 mismatches in all three**. 800 rounds total across four ranges.
+
+Gates: `make test` 60/60, `interop.sh` 1946/1946 (9 new checks), `make
+sanitize` 60/60 with 0 sanitizer errors.
+
+### 8. Mutation results, including the one that is green on purpose
+
+Every new rule was mutated individually (`bash tests/mutate.sh <name>
+src/workdir/merge.c <expr> test_merge_content`), and each was caught by the
+named check written for it, not merely by "something went red":
+
+| mutation | caught by |
+|---|---|
+| `segment_equal` back to has_nl-blind | trailing-newline removal (rc 1 -> 0, the dropped edit returns) |
+| `bytebuf_ensure_nl` neutered | conflict side without a trailing newline |
+| refinement skipped | refinement hoists the agreed line, + `test_anchor_newline_not_glued` |
+| gap threshold 3 -> 4 | gap of 4 stays split (and ONLY that one) |
+| gap threshold 3 -> 2 | gap of 3 merges (and ONLY that one) |
+| a resolved region no longer blocks | a resolved change blocks the merge |
+| adapter drops a group's `a_len` | three pre-existing merge tests |
+| threshold 3 -> 4, run against `--interop` | 2 of the 9 new interop checks, both gap4 |
+
+The threshold pair is the point of that fourth and fifth row: one mutation in
+each direction, each caught by exactly one test, is what makes 3 a measured
+threshold rather than a number someone typed.
+
+**One mutation is green, and it is not a coverage gap.** Removing the
+`bi < g->b_off` half of `script_matches`' lockstep walk changes nothing
+observable, because `sg_diff_build_script`'s documented contract ("between two
+consecutive groups, a[..]==b[..] line for line") makes `bi` and `g->b_off`
+equal at that point by construction. It is the third of the three categories
+in the mutation-testing notes (mathematically unobservable, not a blind spot
+and not a redundant guard): the clause exists so that a future violation of
+that contract degrades into "no sync point here" rather than into a `match[]`
+entry past `nb` that the sync-point pass would then use to subscript
+`ours_lines`. The failure direction is the whole value, and no test can
+observe a failure direction that cannot currently occur.
+
+### 9. What is now true, and what still is not
+
+`sg_diff_lcs_table` / `_exact` / `_free_table` are **gone**: merge was their
+last caller, and Phase 35's header comment saying so was about to become
+false. `sg_diff_lines_equal` (has_nl-blind) survives only because
+`src/cli/diff_out.c`'s combined diff still uses it.
+
+**Still do not write down "sg's three-way merge is a port of `xdl_merge`".**
+It is not. The region list reproduces two of git's post-passes and the
+sync-point classification underneath them is still sg's own design; it now
+AGREES with git on 800 fuzz rounds, which is a measurement, not an
+equivalence proof. The known gap in that measurement is the fixture generator
+itself: `tests/fuzz_merge.py` builds line-oriented text files with a fixed
+vocabulary of mutations, so a shape it cannot generate is a shape nothing
+here has tested (`fixture generators create shared blind spots` -- the same
+caveat Phase 30's rename fuzzer carries).
+
+Three things this phase deliberately did NOT do, so they are not
+re-discovered as bugs: `sg merge` still accepts only a bare branch name
+(section 0(b) -- a rev-parsing gap, unrelated to alignment); the ours label is
+still the branch name rather than `HEAD` (deliberate divergence #5, now
+pinned); and git's `XDL_MERGE_ZEALOUS_ALNUM` variant of the simplification
+rule (where the gap must also contain an alphanumeric character) is not
+implemented, because plain `git merge` does not use it.
+

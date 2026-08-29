@@ -5236,6 +5236,68 @@ check "phase41: sg's rebase theirs label now matches git byte-for-byte" \
 check "phase41: and the rebase ours label is HEAD on both sides" \
     sh -c "grep -qx '<<<<<<< HEAD' '$P41_R/g.txt' && grep -qx '<<<<<<< HEAD' '$P41_R.git-copy/g.txt'"
 
+# C. The merged CONTENT itself (Phase 41 round 2). Groups A and B pin the
+# label line; this one pins everything else, through the real `sg merge` path
+# rather than through sg_merge_content directly, on the three shapes that
+# changed when merge's alignment stopped ignoring has_nl. Same
+# build-once-then-copy technique, and the same one-line label normalization,
+# so the only thing being compared is the merge result.
+#
+# tests/fuzz_merge.py measures this over random inputs (200 rounds x 4 seed
+# ranges, 0 mismatches); these three name the shapes, so a regression arrives
+# with a name attached instead of as a rate that someone has to go and
+# attribute.
+P41_C="$WORKDIR/p41_merge_content"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P41_C")") > /dev/null 2>&1
+# nl.txt: ours' ONLY edit is removing the trailing newline. Before Phase 41
+# sg read that as "ours changed nothing", took theirs wholesale and reported
+# a CLEAN merge -- a user edit silently discarded. git conflicts.
+printf 'x\ny\nz\n' > "$P41_C/nl.txt"
+# gap3.txt / gap4.txt: two conflicts separated by 3 and by 4 identical lines.
+# git merges the first pair into one conflict block and leaves the second as
+# two (xdl_simplify_non_conflicts' `end - begin > 3`, re-measured).
+printf 'X\ng1\ng2\ng3\nY\n' > "$P41_C/gap3.txt"
+printf 'X\ng1\ng2\ng3\ng4\nY\n' > "$P41_C/gap4.txt"
+(cd "$P41_C" && "$SG" add nl.txt gap3.txt gap4.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P41_C" && "$SG" branch topic) > /dev/null 2>&1
+printf 'x\ny\nz' > "$P41_C/nl.txt"
+printf 'ourX\ng1\ng2\ng3\nourY\n' > "$P41_C/gap3.txt"
+printf 'ourX\ng1\ng2\ng3\ng4\nourY\n' > "$P41_C/gap4.txt"
+(cd "$P41_C" && "$SG" add nl.txt gap3.txt gap4.txt && "$SG" commit -m ours) > /dev/null 2>&1
+(cd "$P41_C" && "$SG" switch topic) > /dev/null 2>&1
+printf 'x\ny\nZZZ\n' > "$P41_C/nl.txt"
+printf 'thrX\ng1\ng2\ng3\nthrY\n' > "$P41_C/gap3.txt"
+printf 'thrX\ng1\ng2\ng3\ng4\nthrY\n' > "$P41_C/gap4.txt"
+(cd "$P41_C" && "$SG" add nl.txt gap3.txt gap4.txt && "$SG" commit -m theirs) > /dev/null 2>&1
+(cd "$P41_C" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P41_C.git-copy"
+cp -R "$P41_C" "$P41_C.git-copy"
+(cd "$P41_C" && "$SG" merge topic) > /dev/null 2>&1
+P41_C_SG_RC=$?
+(cd "$P41_C.git-copy" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P41_C_GIT_RC=$?
+check "phase41 oracle: real git conflicts when ours' only edit is dropping the trailing newline" \
+    sh -c "test $P41_C_GIT_RC != 0 && grep -q '^<<<<<<< ' '$P41_C.git-copy/nl.txt'"
+check "phase41: sg conflicts there too -- ours' edit is not silently discarded" \
+    sh -c "test $P41_C_SG_RC != 0 && grep -q '^<<<<<<< ' '$P41_C/nl.txt'"
+check "phase41 oracle: git merges two conflicts 3 lines apart into one block" \
+    sh -c "test \$(grep -c '^<<<<<<< ' '$P41_C.git-copy/gap3.txt') = 1"
+check "phase41 oracle: git leaves two conflicts 4 lines apart as two blocks" \
+    sh -c "test \$(grep -c '^<<<<<<< ' '$P41_C.git-copy/gap4.txt') = 2"
+check "phase41: sg merges the 3-line gap into one block, like git" \
+    sh -c "test \$(grep -c '^<<<<<<< ' '$P41_C/gap3.txt') = 1"
+check "phase41: sg leaves the 4-line gap as two blocks, like git" \
+    sh -c "test \$(grep -c '^<<<<<<< ' '$P41_C/gap4.txt') = 2"
+# Block counts alone would stay green if the content inside them drifted, so
+# each file is also compared in full, with only the ours label normalized
+# (divergence #5, pinned by group A above).
+for p41f in nl.txt gap3.txt gap4.txt; do
+    sed '1,$s/^<<<<<<< .*/<<<<<<< LABEL/' "$P41_C/$p41f" > "$WORKDIR/p41_c_sg.txt"
+    sed '1,$s/^<<<<<<< .*/<<<<<<< LABEL/' "$P41_C.git-copy/$p41f" > "$WORKDIR/p41_c_git.txt"
+    check "phase41: merged $p41f matches real git byte-for-byte (ours label aside)" \
+        cmp -s "$WORKDIR/p41_c_sg.txt" "$WORKDIR/p41_c_git.txt"
+done
+
 # --- row 9 (Phase 20 REVERSAL of the Phase 15 refusal): a stash real git
 # built with -u must now be poppable by sg -- the untracked half is restored
 # to disk, unstaged, and the entry is dropped, same as any other successful

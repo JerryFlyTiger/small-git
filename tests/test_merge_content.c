@@ -190,6 +190,116 @@ static void test_anchor_newline_not_glued(void)
     free(out);
 }
 
+/* ---- Phase 41: the four rules the merge learned from real git ----
+
+   Every `expected` string below was MEASURED, by running
+
+       git merge-file -L ours -L base -L theirs -p <ours> <base> <theirs>
+
+   on the same three inputs, and is pasted here byte for byte. They are not
+   derived from sg's own output, and they are not reasoned out from the
+   algorithm -- that is the whole point, since three of the four rules were
+   things sg got wrong while looking perfectly sensible. tests/fuzz_merge.py
+   runs the same comparison over random inputs; these pin the specific shapes
+   so a regression names itself instead of arriving as a rate.
+
+   Note git merge-file's exit code counts conflicts (2 for two conflict
+   blocks), while sg_merge_content only ever answers 0 or 1, so the rc
+   expectations below are sg's convention, not git's number. */
+static void check_merge(const char *name, const unsigned char *base, size_t base_len,
+                        const unsigned char *ours, size_t ours_len, const unsigned char *theirs,
+                        size_t theirs_len, int want_rc, const char *want, size_t want_len)
+{
+    unsigned char *out = NULL;
+    size_t out_len = 0;
+    int rc = sg_merge_content(base, base_len, ours, ours_len, theirs, theirs_len, "ours",
+                             "theirs", &out, &out_len);
+
+    CHECK(rc == want_rc, "%s: expected rc %d, got %d", name, want_rc, rc);
+    if (out == NULL) {
+        CHECK(0, "%s: result should not be NULL", name);
+        return;
+    }
+    CHECK(out_len == want_len && memcmp(out, want, want_len) == 0,
+         "%s: result differs from real git's\n  want: '%.*s'\n  got:  '%.*s'", name,
+         (int)want_len, want, (int)out_len, (const char *)out);
+    free(out);
+}
+
+#define CHECK_MERGE(name, base, ours, theirs, rc, want)                                          \
+    check_merge(name, (const unsigned char *)(base), sizeof(base) - 1,                            \
+               (const unsigned char *)(ours), sizeof(ours) - 1,                                   \
+               (const unsigned char *)(theirs), sizeof(theirs) - 1, rc, want, sizeof(want) - 1)
+
+/* Removing the trailing newline IS an edit. Before Phase 41 the line
+   comparison ignored has_nl, so ours' edit here read as "ours changed
+   nothing", theirs was taken wholesale, and the merge reported SUCCESS while
+   silently discarding what the user did -- the worst shape a merge bug can
+   take, because nothing tells the user. */
+static void test_trailing_newline_removal_is_an_edit(void)
+{
+    CHECK_MERGE("trailing-newline removal", "x\ny\nz\n", "x\ny\nz", "x\ny\nZZZ\n", 1,
+               "x\ny\n<<<<<<< ours\nz\n=======\nZZZ\n>>>>>>> theirs\n");
+}
+
+/* A conflict side whose last line has no newline still has to be followed by
+   one, or the marker is glued onto it and the output contains a line that
+   appears in none of the three inputs ("c=======" here). git does the same,
+   via xdl_recs_copy's add_nl. Note the "c" is NOT hoisted out of the conflict
+   by refinement: ours' "c" (no newline) and theirs' "c\n" are different
+   lines, so the two sides genuinely have nothing in common here. */
+static void test_conflict_side_missing_newline(void)
+{
+    CHECK_MERGE("conflict side without a trailing newline", "a\nb\nc\n", "a\nOURS\nc",
+               "a\nTHEIRS\nc\n", 1,
+               "a\n<<<<<<< ours\nOURS\nc\n=======\nTHEIRS\nc\n>>>>>>> theirs\n");
+}
+
+/* Refinement: the two sides of a conflict are diffed against each other and
+   what they agree on is hoisted OUT of the conflict. Without it "B" would be
+   printed twice, once inside each side. */
+static void test_conflict_refinement_hoists_agreement(void)
+{
+    CHECK_MERGE("refinement hoists the agreed line", "A\nB", "A\nB\nC\n", "A\nB\nD\n", 1,
+               "A\nB\n<<<<<<< ours\nC\n=======\nD\n>>>>>>> theirs\n");
+}
+
+/* Simplification, and its threshold. Two conflicts separated by 3 identical
+   lines are printed as ONE conflict that swallows the gap; at 4 they stay
+   separate. Both measured against git 2.55.0 -- the constant is git's
+   (xdl_simplify_non_conflicts' `end - begin > 3`), and the pair of tests is
+   what makes it a threshold rather than a number someone typed. */
+static void test_close_conflicts_merge_into_one(void)
+{
+    CHECK_MERGE("gap of 3 merges", "X\ng1\ng2\ng3\nY\n", "ourX\ng1\ng2\ng3\nourY\n",
+               "thrX\ng1\ng2\ng3\nthrY\n", 1,
+               "<<<<<<< ours\nourX\ng1\ng2\ng3\nourY\n"
+               "=======\nthrX\ng1\ng2\ng3\nthrY\n>>>>>>> theirs\n");
+}
+
+static void test_distant_conflicts_stay_separate(void)
+{
+    CHECK_MERGE("gap of 4 stays split", "X\ng1\ng2\ng3\ng4\nY\n",
+               "ourX\ng1\ng2\ng3\ng4\nourY\n", "thrX\ng1\ng2\ng3\ng4\nthrY\n", 1,
+               "<<<<<<< ours\nourX\n=======\nthrX\n>>>>>>> theirs\n"
+               "g1\ng2\ng3\ng4\n"
+               "<<<<<<< ours\nourY\n=======\nthrY\n>>>>>>> theirs\n");
+}
+
+/* The gap is not measured in lines alone: a one-sided change inside it blocks
+   the merge however short it is. Here the gap is 3 lines, exactly the width
+   that merges in the test above, but one of them is a line only ours touched,
+   and git keeps the two conflicts apart. A purely distance-based rule passes
+   the test above and fails this one. */
+static void test_one_sided_change_blocks_the_merge(void)
+{
+    CHECK_MERGE("a resolved change blocks the merge", "X\ng1\nR\ng2\nY\n",
+               "ourX\ng1\nourR\ng2\nourY\n", "thrX\ng1\nR\ng2\nthrY\n", 1,
+               "<<<<<<< ours\nourX\n=======\nthrX\n>>>>>>> theirs\n"
+               "g1\nourR\ng2\n"
+               "<<<<<<< ours\nourY\n=======\nthrY\n>>>>>>> theirs\n");
+}
+
 int main(void)
 {
     test_only_ours_changed();
@@ -199,6 +309,12 @@ int main(void)
     test_both_changed_identically();
     test_binary_content_conflicts();
     test_anchor_newline_not_glued();
+    test_trailing_newline_removal_is_an_edit();
+    test_conflict_side_missing_newline();
+    test_conflict_refinement_hoists_agreement();
+    test_close_conflicts_merge_into_one();
+    test_distant_conflicts_stay_separate();
+    test_one_sided_change_blocks_the_merge();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

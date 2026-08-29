@@ -54,64 +54,6 @@ int sg_diff_lines_equal_exact(sg_diff_line a, sg_diff_line b)
     return a.has_nl == b.has_nl && sg_diff_lines_equal(a, b);
 }
 
-static size_t **lcs_table_ex(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb, int exact)
-{
-    size_t **dp;
-    size_t i, j;
-    size_t allocated_rows = 0;
-
-    dp = malloc((na + 1) * sizeof(*dp));
-    if (dp == NULL)
-        return NULL;
-    for (i = 0; i <= na; i++) {
-        dp[i] = malloc((nb + 1) * sizeof(**dp));
-        if (dp[i] == NULL) {
-            for (allocated_rows = 0; allocated_rows < i; allocated_rows++)
-                free(dp[allocated_rows]);
-            free(dp);
-            return NULL;
-        }
-    }
-
-    for (i = na + 1; i-- > 0;) {
-        for (j = nb + 1; j-- > 0;) {
-            if (i == na || j == nb) {
-                dp[i][j] = 0;
-            } else if (exact ? sg_diff_lines_equal_exact(a[i], b[j]) : sg_diff_lines_equal(a[i], b[j])) {
-                dp[i][j] = dp[i + 1][j + 1] + 1;
-            } else {
-                size_t v1 = dp[i + 1][j];
-                size_t v2 = dp[i][j + 1];
-
-                dp[i][j] = v1 > v2 ? v1 : v2;
-            }
-        }
-    }
-
-    return dp;
-}
-
-size_t **sg_diff_lcs_table(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb)
-{
-    return lcs_table_ex(a, na, b, nb, 0);
-}
-
-size_t **sg_diff_lcs_table_exact(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb)
-{
-    return lcs_table_ex(a, na, b, nb, 1);
-}
-
-void sg_diff_lcs_free_table(size_t **dp, size_t na)
-{
-    size_t i;
-
-    if (dp == NULL)
-        return;
-    for (i = 0; i <= na; i++)
-        free(dp[i]);
-    free(dp);
-}
-
 /* ---- minimal edit script: Myers alignment + group compaction + indent heuristic */
 
 typedef struct {
@@ -143,12 +85,12 @@ static int gb_push(group_builder *gb, size_t a_off, size_t a_len, size_t b_off, 
    v2.55.0), replacing the old LCS-backtrack alignment. See Phase 35 of
    docs/DESIGN.md for the full rationale and the measurements that pinned
    down each of git's constants. sg_diff_lcs_table/_exact and
-   backtrack_into_groups (the old alignment this replaces) are gone from
-   this call path -- src/workdir/merge.c's three-way merge still calls
-   sg_diff_lcs_table/_exact directly and rolls its own backtrack, and that
-   is DELIBERATELY left untouched (Phase 35 scope decision 1b: merge's
-   alignment has no differential coverage, so changing its behaviour with
-   no net under it is not worth it). */
+   backtrack_into_groups (the old alignment this replaces) are gone
+   entirely: Phase 35 left src/workdir/merge.c's three-way merge on the LCS
+   table on purpose (no differential coverage there, so no net to change its
+   behaviour under), and Phase 41 built that net -- tests/fuzz_merge.py --
+   and then moved merge onto this aligner too, which removed the table's
+   last caller. */
 
 /* Each unique line (by sg_diff_lines_equal_exact) gets one class id,
    mirroring git's xdlclass_t / xdl_classify_record: the point is turning
