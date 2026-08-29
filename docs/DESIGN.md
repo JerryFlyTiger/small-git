@@ -6734,3 +6734,156 @@ of fuzz rounds deep). That is a phase of its own. Until then the acceptance
 criterion for `tests/fuzz_merge.py` is **not "0"**: it is "0 `[align]`, 0
 `[3way]`, and every `[algo]` case is the known histogram gap". Counting them
 together is exactly how a real regression would hide inside a known gap.
+
+
+## Phase 42: porting histogram, because that is what `git merge` aligns with
+
+Phase 41 ended with a measured 0.33% residual and a named cause: `git merge`
+defaults to the **histogram** algorithm while sg's merge ran Myers. This phase
+ports histogram and points the merge at it. The headline: **`tests/fuzz_merge.py`
+goes to 0/200 in every mode and seed range measured**, and the `[algo]` bucket
+that carried the whole Phase 41 residual is empty.
+
+### 1. The two defaults are not the same default, and that is the whole point
+
+Measured, git 2.55.0, on this machine with no diff/merge configuration set at
+all (`git config --get diff.algorithm` exits 1):
+
+| | default algorithm |
+|---|---|
+| `git diff` | Myers |
+| `git merge-file` | Myers |
+| `git merge` | **histogram** |
+
+`git merge` also honours `diff.algorithm` when it IS set -- `-c
+diff.algorithm=myers` changes its answer, which is how the default was
+established rather than assumed. sg has no such configuration, so it hard-codes
+histogram for merge and Myers for `sg diff`, mirroring git's unconfigured
+behaviour.
+
+`sg diff --histogram` exists as the opt-in, and it is not decoration: it is the
+only DIRECT oracle the port has. Everything else observes histogram through the
+merge, where sg's own three-way layer sits on top and can mask an alignment
+difference. `tests/fuzz_diff.py --histogram` points the same fixtures at `git
+diff --histogram` on both sides.
+
+### 2. What the port had to get right, and how each was established
+
+The algorithm was written from its definition, then checked against git's own
+`xdiff/xhistogram.c`, which was fetched for the purpose (it is not on this
+machine). Two structural points were found by MEASUREMENT first and confirmed
+in the source afterwards, which is the order that matters here because both
+were initially implemented the other way round:
+
+- **No trimming and no record cleanup for histogram.** sg's Myers path starts
+  with `trim_ends` (strip the common prefix/suffix) and `cleanup_side` (discard
+  lines with no counterpart). Running histogram after `trim_ends` scored
+  **9/500** on the histogram fuzzer; skipping it scored **5/500**, and the
+  minimal case explains why: with base `[P, R, P]` and ours `[P, P, R]`, git
+  matches the two-line run `P, R`, which the prefix trim makes unreachable by
+  pairing the first `P` positionally. git skips both steps for histogram (and
+  for patience) -- `xdl_optimize_ctxs`, which does trimming AND cleanup, is
+  guarded by `XDF_DIFF_ALG(xpp->flags) != XDF_HISTOGRAM_DIFF`. Cleanup would be
+  actively wrong here: it DISCARDS lines, and occurrence counts are what this
+  algorithm decides on.
+- **`scanA` walks its region backwards**, so each line's record points at its
+  FIRST occurrence and the chain runs downward; `try_lcs`'s `np` walk depends on
+  that direction. Reversing it is observable but only on a fixture where a line
+  occurs more than twice and the occurrences are not interchangeable -- see
+  section 4, where the first mutation of this found nothing.
+
+One deliberate difference, and it is not observable in the output: git's
+`scanA` gives up (falling back to Myers) when 64 DISTINCT lines collide in one
+hash bucket, a property of git's own hash function. sg classifies lines into
+exact class ids rather than hashing into buckets, so that condition cannot
+arise and there is nothing to reproduce. The other 64 -- the occurrence-count
+ceiling that decides whether a candidate can be a split point at all -- is
+reproduced exactly, and mutating it to 0 turns the histogram alignment test red
+(it degrades into the Myers answer, which is what the fallback is).
+
+### 3. The numbers
+
+| measurement | before | after |
+|---|---|---|
+| `fuzz_merge.py 200` (default) | 1 / 200 | **0 / 200** |
+| `fuzz_merge.py 200 --no-newline-edits` | 1 / 200 | **0 / 200** |
+| `fuzz_merge.py 200 --seed 1000` / `--seed 5000` | -- | **0 / 200** each |
+| `fuzz_diff.py 500` (Myers, regression check) | 0 / 500 | **0 / 500** (seeds 0 and 2000) |
+| `fuzz_diff.py 500 --histogram` | -- | **5 / 500** (seed 0), **4 / 500** (seed 2000) |
+
+Gates: `make` 0 warnings over 63 TUs, `make test` 61/61, `interop.sh`
+1956/1956, `make sanitize` 61/61 with 0 sanitizer errors.
+
+### 4. The residual, and why it is recorded rather than explained away
+
+**`sg diff --histogram` differs from `git diff --histogram` on about 0.9% of
+fuzz cases, and the port is NOT the obvious suspect.** Two independent
+transcriptions of git's published `xhistogram.c` -- the C written here and a
+separate one in Python, written to cross-check it -- agree with each other and
+disagree with this machine's git on exactly those cases. Reduced to three
+lines:
+
+```
+a = "P\nR\nP\n"   ->   b = "P\nP\nR\n"     both agree
+a = "R\n\nR\n\n"  ->   b = "R\nR\n\n"      git: 1 change, both transcriptions: 3
+```
+
+For the second, the published algorithm's `try_lcs` cannot take the later,
+equal-length, equal-rarity candidate -- `lcs->end1 - lcs->begin1 < ae - as ||
+rc < index->cnt` is false for it -- yet git's answer requires exactly that.
+Eight variants of the take-condition and the count-update policy were measured
+against git over a 400-case corpus; the faithful one scored best (10
+disagreements), no variant scored zero, and the two that appeared to were an
+artifact of the harness skipping cases that fell back to Myers. A patience-diff
+hypothesis was tested and rejected (this git's histogram differs from its own
+patience in 124/400 cases).
+
+So: the algorithm this machine's git calls "histogram" is not exactly the one
+its published source describes, and rather than tune sg toward an unexplained
+target, the divergence is measured, bounded, reproduced and left visible behind
+an opt-in flag. **The path that matters is not affected**: `sg merge` agrees
+with `git merge` on 800 fuzz rounds. Whether that is because merge's fixtures
+do not reach the divergent shapes is unknown, which is why the histogram
+fuzzer mode is a standing gate and not a one-off measurement.
+
+### 5. Scope decisions
+
+`--patience`, `--minimal` and `--diff-algorithm=<name>` are **rejected as
+unknown flags**, not approximated: sg has two aligners, and answering
+"patience" with either one is a wrong answer wearing the right flag (the same
+reasoning as `-C -C` in Phase 33). Real git accepts all four spellings and
+exits 129 on a bad algorithm name; sg exits 1, which is this project's
+convention. Both sides are pinned in `tests/interop.sh`'s `phase42` group.
+
+`sg stash show` did NOT gain the flag. While surveying, a pre-existing and
+unrelated divergence turned up there and is recorded here so it is not
+rediscovered as fallout from this phase: **`git stash show -M` implies `-p`
+and switches the output from `--stat` to a patch, while `sg stash show -M`
+stays on `--stat`** (measured). That is a general rule in git -- any pure diff
+option implies `-p` for `stash show` -- and adding `--histogram` there without
+fixing it would inherit the same hole.
+
+### 6. Coverage, including the mutation that found nothing
+
+Every rule got a named witness, and each was mutated individually:
+
+| mutation | caught by |
+|---|---|
+| `merge.c`'s `SG_DIFF_ALGO_HISTOGRAM` -> `MYERS` (both call sites) | `test_merge_aligns_with_histogram` |
+| `SG_HIST_MAX_CHAIN` 64 -> 0 (always fall back) | `test_histogram_alignment` |
+| `hist_scan_a` walking forwards | `test_scan_direction_is_observable` |
+
+The third row is the interesting one. The first attempt at that mutation was
+**green**: the alignment fixtures use a line that occurs twice in positions
+that make the two scan directions interchangeable. A fixture where a line
+occurs three times (`cc, cc, blank, cc` against `cc, aa, cc`) separates them,
+and it was found by running both directions of the model over a corpus rather
+than by staring at the code -- 249 of 3000 random pairs distinguish them, and
+none of the fixtures written by hand did.
+
+`merge.c` has TWO call sites, not one: `script_matches` (the sync-point
+alignment) and `refine_conflicts` (the zealous refinement Phase 41 added).
+Both take histogram, because git's refinement runs under the same `xpp` flags
+as the merge that called it. A survey that named only the first would have
+left the merge path internally inconsistent -- one layer on histogram, the
+other on Myers -- with nothing failing to say so.

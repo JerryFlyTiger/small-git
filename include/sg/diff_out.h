@@ -2,6 +2,7 @@
 #define SG_DIFF_OUT_H
 
 #include "sg/diff.h"
+#include "sg/diff_lcs.h"
 
 /* Rendering a change list (sg/diff.h) to stdout. Split from the list building
    so that `sg diff` and `sg stash show` render the same six ways without
@@ -38,6 +39,14 @@ typedef struct {
            silently start printing "MM" instead of "U".
        Never set by a builder, only by the CLI layer parsing -c/--cc. */
     int combined;
+    /* Which alignment algorithm the patch body / --stat counts / combined
+       diff run (Phase 42). Set by the CLI layer from --histogram or
+       --diff-algorithm=<name>; SG_DIFF_ALGO_MYERS is git's own default for
+       `git diff` and so is sg's here. NOTE the merge path deliberately does
+       NOT read this: `git merge` defaults to histogram regardless of what
+       `git diff` is doing (measured), so src/workdir/merge.c hard-codes
+       SG_DIFF_ALGO_HISTOGRAM instead of taking it from an option. */
+    sg_diff_algorithm algorithm;
 } sg_diff_out_opts;
 
 /* Every format except PATCH quotes paths with sg_quote_path -- measured

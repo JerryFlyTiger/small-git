@@ -373,6 +373,27 @@ static void test_merge_does_not_use_the_indent_heuristic(void)
                "=======\n\nbase03\ninner04:\nblock05:\n    base06\n>>>>>>> theirs\n");
 }
 
+/* The merge aligns with HISTOGRAM, not Myers (Phase 42), because that is what
+   `git merge` does -- measured, git 2.55.0: `git merge` and `git merge-file
+   --diff-algorithm=histogram` agree byte for byte, while `git merge-file`'s
+   own default and `git diff`'s default are Myers.
+
+   This fixture is a witness rather than a smoke test: the same three inputs
+   under the two algorithms give two DIFFERENT merges, both measured --
+
+     --diff-algorithm=myers      "<<<<<<< ours\n=======\nbase00\n\n>>>>>>> theirs\n\nblock02:\n"
+     --diff-algorithm=histogram  "<<<<<<< ours\n=======\nbase00\n>>>>>>> theirs\n\n\nblock02:\n"
+
+   -- so swapping merge.c's SG_DIFF_ALGO_HISTOGRAM back to MYERS turns this
+   red, while a fixture where the two agree would stay green and prove
+   nothing. */
+static void test_merge_aligns_with_histogram(void)
+{
+    CHECK_MERGE("merge uses the histogram algorithm", "block02:\n\n", "\n",
+               "base00\n\n\nblock02:\n", 1,
+               "<<<<<<< ours\n=======\nbase00\n>>>>>>> theirs\n\n\nblock02:\n");
+}
+
 int main(void)
 {
     test_only_ours_changed();
@@ -393,6 +414,7 @@ int main(void)
     test_theirs_pure_insertion_survives();
     test_ours_pure_insertion_survives();
     test_merge_does_not_use_the_indent_heuristic();
+    test_merge_aligns_with_histogram();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

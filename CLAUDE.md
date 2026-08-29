@@ -23,6 +23,7 @@ make sanitize                     # clean + rebuild with ASan/UBSan + run unit t
 python3 tests/fuzz_ignore.py      # .gitignore consistency fuzzer (200 rounds by default)
 python3 tests/fuzz_diff.py        # patch output consistency fuzzer (200 rounds by default)
 python3 tests/fuzz_merge.py       # three-way merge vs real git (200 rounds by default)
+python3 tests/fuzz_diff.py --histogram   # same, but both sides use --histogram
 ```
 
 **Run the first four gates in one shot: `bash tests/gates.sh`** (`--sanitize`
@@ -405,11 +406,33 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   backtrack produced identical output on all 200 rounds) but cost: 6000
   lines a side was 602 MB / 0.37s with the table and 10.8 MB / <0.01s with
   Myers, measured. `sg_diff_lines_equal` (has_nl-blind) survives only for
-  `diff_out.c`'s combined diff. When touching
-  `diff_out.c` / `diff_lcs.c` / `workdir/diff.c`, a green `make test`
-  **does not count**, run `python3 tests/fuzz_diff.py 500 --max-failures 0`
-  (across a few different `--seed` values, not just the default) and
-  report the actual mismatch count -- it should stay 0.
+  `diff_out.c`'s combined diff.
+  **Since Phase 42 the algorithm is a MANDATORY parameter of
+  `sg_diff_build_script`** (`sg_diff_algorithm`, no default, same idiom as
+  `sg_workdir_missing`), because git's own two defaults differ: `git diff` is
+  Myers, `git merge` is histogram. The histogram port is a reconstruction
+  cross-checked against git's `xdiff/xhistogram.c`; it deliberately does NOT
+  trim or clean up records first (git guards `xdl_optimize_ctxs` off for
+  histogram -- cleanup DISCARDS lines, and occurrence counts are exactly what
+  that algorithm decides on).
+  WARNING: **`sg diff --histogram` has a MEASURED ~0.9% divergence from `git
+  diff --histogram`** (5/500 and 4/500) and it is NOT understood: two
+  independent transcriptions of git's published algorithm agree with each
+  other and disagree with this machine's git on those cases. Read Phase 42 of
+  `docs/DESIGN.md` before touching the histogram code -- eight rule variants
+  were already measured against git and the faithful one scored best. `sg
+  merge` is unaffected (0/800 rounds).
+  WARNING: **`--patience`, `--minimal` and `--diff-algorithm=<name>` are
+  rejected as unknown flags, not approximated** -- sg has two aligners and
+  answering "patience" with one of them is a wrong answer wearing the right
+  flag (same reasoning as `-C -C`). git accepts all four and exits 129 on a
+  bad name; sg exits 1. Both sides pinned in interop's `phase42` group.
+  When touching `diff_out.c` / `diff_lcs.c` / `workdir/diff.c`, a green
+  `make test` **does not count**, run `python3 tests/fuzz_diff.py 500
+  --max-failures 0` AND `python3 tests/fuzz_diff.py 500 --histogram
+  --max-failures 0` (across a few different `--seed` values, not just the
+  default) and report both actual mismatch counts -- Myers should stay 0,
+  histogram should stay at or below its recorded ~0.9%.
 - **The three-way merge (`sg_merge_content`, `src/workdir/merge.c`) builds a
   region list and post-processes it, it does not append bytes as it
   classifies** (Phase 41). Order is fixed and is git's: sync-point
@@ -418,24 +441,23 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   count**: run `python3 tests/fuzz_merge.py 200` AND
   `python3 tests/fuzz_merge.py 200 --no-newline-edits` (real git is the
   oracle) and report both counts.
-  WARNING: **the baseline is NOT 0 and must not be read as a pass/fail
-  number.** Measured over 1500 rounds each: **5 (0.33%)** default, **4**
-  control -- and all nine are the same known gap, `[algo]`.
-  WARNING: **`git merge` defaults to the HISTOGRAM diff algorithm while
-  `git merge-file` defaults to Myers** (measured, git 2.55.0). sg's merge
-  runs Myers, so it reproduces `git merge-file` byte for byte on all nine
-  residual cases while differing from `git merge` -- i.e. sg's sync-point
-  layer agrees with `xdl_merge` on every one of them, and the whole residual
-  is the algorithm default. **Never use `git merge-file` as the only oracle
-  for `sg merge`**: it would have called all nine green.
-  Always re-run `python3 tests/fuzz_merge.py --attribute <keep-dir>`, which
-  runs both oracles and labels each case `[algo]` (the known histogram gap,
-  not sg's defect), `[3way]` (sg's sync-point layer) or `[align]` (the
-  aligner itself -- never expected). The criterion is **0 `[3way]`, 0
-  `[align]`, and every `[algo]` accounted for** -- counting them together is
-  how a real regression would hide inside a known gap. Closing the gap means
-  porting histogram for the merge path only; `sg diff` matches git with
-  Myers.
+  Baseline for both is **0**, measured at 200 rounds x 4 seed ranges after
+  Phase 42 closed the algorithm gap.
+  WARNING: **`git merge` defaults to the HISTOGRAM algorithm while `git diff`
+  and `git merge-file` default to Myers** (measured, git 2.55.0; `git merge`
+  also honours `diff.algorithm`, which is how the default was established).
+  So `src/workdir/merge.c` passes `SG_DIFF_ALGO_HISTOGRAM` at **both** of its
+  `sg_diff_build_script` call sites -- `script_matches` AND
+  `refine_conflicts` -- while `diff_out.c` passes Myers unless the user wrote
+  `--histogram`. Changing only one of merge's two leaves the merge path
+  internally inconsistent, with nothing failing to say so.
+  **Never use `git merge-file` as the only oracle for `sg merge`**: its
+  default is Myers, so it would call a whole class of divergence green.
+  `python3 tests/fuzz_merge.py --attribute <keep-dir>` runs both oracles and
+  labels each saved case `[algo]` (git's merge algorithm default), `[3way]`
+  (sg's sync-point layer) or `[align]` (the aligner itself). All three
+  buckets should now be empty; a non-empty one needs attributing before it
+  is accepted.
   WARNING: **line comparison here is has_nl-AWARE**
   (`sg_diff_lines_equal_exact`), on both the alignment and the span
   comparison. It was has_nl-blind until Phase 41, and that one choice meant

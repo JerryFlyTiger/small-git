@@ -358,6 +358,7 @@ being dropped silently.
 .RB [ --stat [= <width> [, <name-width> ]]| --numstat | --shortstat | --name-only | --name-status ]
 .RB [ -M [ <n> ]| -C [ <n> ]| --no-renames ]
 .RB [ -c | --cc ]
+.RB [ --histogram ]
 .RI [ rev " [" rev ]]
 .RB [ -- ]
 .RI [ path ...]
@@ -482,6 +483,25 @@ Hunk positioning matches too: since the alignment step became a direct port
 of git's own Myers algorithm, the two to three percent of hunks that used to
 differ in position are gone, re-measured at zero mismatches over several
 thousand randomized comparisons against real git.
+.PP
+.B \-\-histogram
+aligns with git's histogram algorithm instead of the Myers default. This
+matters because the two are used in different places by git itself: git
+.B diff
+defaults to Myers, while git
+.B merge
+defaults to histogram, and
+.B sg
+mirrors both, so
+.B sg merge
+uses histogram with no flag involved. git's other spellings
+.RB ( --patience ,
+.BR --minimal ,
+.BR --diff-algorithm= <name> )
+are not implemented and are rejected as unknown options rather than
+approximated with one of the two aligners
+.B sg
+has.
 .PP
 A combinable unresolved conflict (both index stage 2 and stage 3 present,
 plain index-vs-working-directory comparison only) is rendered as git's
