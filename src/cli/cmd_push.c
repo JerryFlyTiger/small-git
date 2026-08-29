@@ -9,6 +9,7 @@
 #include "sg/pack.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/revparse.h"
 #include "sg/transport.h"
 #include "sg/workdir.h"
 
@@ -519,13 +520,43 @@ done:
    sg_push_ref_update.ref_name is borrowed (transport.h:88-89); they are
    freed only at the very end of sg_cmd_push. */
 typedef struct {
-    char *name;     /* malloc'd short name (branch or tag), owned */
-    char *ref_path; /* malloc'd "refs/heads/<name>" or "refs/tags/<name>", owned */
+    char *name;     /* malloc'd short name (branch or tag), owned; NULL until
+                       known (a pending explicit-dst/delete candidate fills
+                       this in only after dst completion, see complete_dst) */
+    char *ref_path; /* malloc'd full ref path, owned; NULL until known, same
+                       caveat as name */
     int is_tag;
-    int is_new;  /* remote had no such ref before this push */
-    int forced;  /* tag only: overwrote a differing remote tag via --force */
+    int is_new;    /* remote had no such ref before this push */
+    int forced;    /* overwrote a differing remote ref via --force (tag: any
+                      differing id; branch/other: a non-fast-forward allowed
+                      through --force or a leading '+' on this refspec) */
+    int is_delete; /* Phase 39: this candidate/entry is a ":dst" or
+                      "--delete <name>" deletion -- new_id is always zero,
+                      never fast-forward-checked, never walked, never part
+                      of the pack (see the module note in CLAUDE.md) */
+    int explicit_dst; /* Phase 39: true for a "<src>:<dst>" candidate still
+                      awaiting dst completion (name/ref_path/is_tag are NULL/
+                      unset until complete_dst runs, after the advertisement
+                      is known) -- never true on a fully-built push_entry */
+    int refspec_force; /* Phase 39: this specific refspec had a leading '+'
+                      (as opposed to a blanket --force/-f); OR'd with the
+                      global force flag at fast-forward-check time */
+    char *dst_raw;    /* Phase 39: malloc'd raw dst text (post-colon, or the
+                      bare name given to --delete), owned; only meaningful
+                      while explicit_dst || is_delete, NULL afterwards */
+    char *raw_arg;    /* Phase 39: malloc'd, owned; the whole original
+                      command-line argument this candidate came from
+                      ("<src>:<dst>", ":<dst>", or a bare --delete name),
+                      used only for complete_dst's invalid-refspec message;
+                      NULL when explicit_dst == is_delete == 0 (nothing in
+                      that path is unvalidated free-form user input) */
+    char *src_exact_ref_path; /* Phase 39: malloc'd, owned; the src's own
+                      exact ref path from resolve_refspec_src (NULL if src
+                      wasn't a literal ref, or this candidate has no src at
+                      all), consumed by complete_dst's rule 2, unused
+                      afterwards */
     unsigned char old_id[SG_SHA1_RAW_LEN];
-    unsigned char new_id[SG_SHA1_RAW_LEN];
+    unsigned char new_id[SG_SHA1_RAW_LEN]; /* meaningless when is_delete */
 } push_entry;
 
 static void push_entry_free_all(push_entry *entries, size_t count)
@@ -535,6 +566,9 @@ static void push_entry_free_all(push_entry *entries, size_t count)
     for (i = 0; i < count; i++) {
         free(entries[i].name);
         free(entries[i].ref_path);
+        free(entries[i].dst_raw);
+        free(entries[i].src_exact_ref_path);
+        free(entries[i].raw_arg);
     }
     free(entries);
 }
@@ -595,12 +629,309 @@ static void free_string_array(char **arr, size_t count)
     free(arr);
 }
 
+/* ---- Phase 39: refspec support ----
+
+   Stage A (pure syntax, no I/O): sg_push_refspec_parse below.
+   Stage B ("<src>" resolution, done BEFORE any network round trip -- a
+   src that resolves to nothing aborts the ENTIRE push, not just that one
+   ref, see CLAUDE.md's push module note) is resolve_refspec_src.
+   Stage C ("<dst>" completion, done AFTER the remote advertisement is
+   known) is complete_dst. See docs/DESIGN.md Phase 39 for the three
+   measured tables (syntax, dst completion, dst format validation) these
+   three functions each implement. */
+
+/* [+]<src>[:<dst>] split into {force, src, dst, is_delete}, no I/O at all.
+   Non-static (but intentionally not declared in any public header, same
+   convention as sg_parse_push_report_status in src/net/transport.c) so
+   tests/test_refspec.c can call it directly via its own `extern`
+   declaration. */
+typedef struct {
+    int force;     /* leading '+' */
+    char *src;     /* malloc'd, owned; "" (empty, never NULL) for a ":dst"
+                      delete form */
+    char *dst;     /* malloc'd, owned; NULL if the argument had no ':' at
+                      all (dst is derived some other way by the caller) */
+    int is_delete; /* src is empty, i.e. ":dst" or "+:dst" */
+} sg_push_refspec;
+
+void sg_push_refspec_free(sg_push_refspec *r)
+{
+    if (r == NULL)
+        return;
+    free(r->src);
+    free(r->dst);
+}
+
+/* Returns 0 on success (fields of *out filled in, caller must still free
+   them via sg_push_refspec_free), -1 on a syntax error -- a message is
+   already printed to stderr in every -1 case, matching real git's wording
+   where it was measured (docs/DESIGN.md Phase 39 section 0). *out is
+   zeroed but not otherwise meaningfully filled on -1.
+
+   Splits on the LAST ':' (strrchr, not strchr) -- measured against real
+   git 2.55.0: "a:b:c:d" reports src "a:b:c", dst "d". Also rejects, with
+   their own named messages and never approximated, the two forms this
+   milestone deliberately does not implement (docs/DESIGN.md Phase 39
+   section 6): a wildcard anywhere in the argument, and the bare
+   push-matching "[+]:" form. */
+int sg_push_refspec_parse(const char *raw_arg, sg_push_refspec *out)
+{
+    const char *p = raw_arg;
+    const char *colon;
+
+    memset(out, 0, sizeof(*out));
+
+    if (*p == '+')
+        p++;
+
+    if (strcmp(p, ":") == 0) {
+        fprintf(stderr,
+               "sg: refspec '%s' (push \"matching\" refs) is not supported, name refs explicitly\n",
+               raw_arg);
+        return -1;
+    }
+    if (strchr(p, '*') != NULL) {
+        fprintf(stderr, "sg: wildcard refspec '%s' is not supported, name refs explicitly\n", raw_arg);
+        return -1;
+    }
+
+    out->force = (raw_arg[0] == '+');
+
+    colon = strrchr(p, ':');
+    if (colon == NULL) {
+        out->src = strdup(p);
+        out->dst = NULL;
+        out->is_delete = 0;
+        return out->src != NULL ? 0 : -1;
+    }
+
+    if (colon[1] == '\0') {
+        fprintf(stderr, "fatal: invalid refspec '%s'\n", raw_arg);
+        return -1;
+    }
+
+    out->src = strndup(p, (size_t)(colon - p));
+    out->dst = strdup(colon + 1);
+    out->is_delete = (colon == p);
+    if (out->src == NULL || out->dst == NULL) {
+        /* Round 3 fix: whichever of src/dst DID allocate must not leak --
+           the header comment promises "*out is zeroed but not otherwise
+           meaningfully filled on -1", so honor that here too. */
+        sg_push_refspec_free(out);
+        memset(out, 0, sizeof(*out));
+        return -1;
+    }
+
+    /* Stage C's format validation (docs/DESIGN.md Phase 39 section 3) is
+       mostly deferred until the advertisement is known (a dst that doesn't
+       start with "refs/" isn't a full ref path yet, see complete_dst's own
+       rule 1/2 guessing). But every measured invalid-format example in
+       section 3 is already "refs/"-prefixed as given, which makes it a pure
+       string check with no dependency on the remote at all -- so it is
+       done right here, BEFORE any network round trip, same batch-abort
+       shape as the empty-dst check just above. complete_dst still
+       revalidates its own guessed/rule-2-constructed path too, as
+       defense in depth against a hostile/corrupt advertisement. */
+    if (strncmp(out->dst, "refs/", 5) == 0 && !sg_ref_name_valid_for_create(out->dst)) {
+        fprintf(stderr, "fatal: invalid refspec '%s'\n", raw_arg);
+        /* Round 3 fix: both src and dst are already allocated at this
+           point -- same leak as above. */
+        sg_push_refspec_free(out);
+        memset(out, 0, sizeof(*out));
+        return -1;
+    }
+    return 0;
+}
+
+/* Resolves an explicit-dst refspec's <src> (Stage B, before any network
+   round trip -- CLAUDE.md's push module note explains why this specific
+   function must not be sg_rev_parse_commit): a literal ref name --
+   "refs/tags/<src>", "refs/heads/<src>", or src itself if it already
+   starts with "refs/" -- is looked up by EXACT ref read, id NOT peeled, so
+   an annotated tag given as src stays a tag object all the way to the
+   remote. Anything else (HEAD, "~"/"^"/"@{N}" suffixes, a full hex id)
+   falls back to the full sg_rev_parse_commit grammar, which does peel.
+
+   Returns 0 with id_out and *exact_ref_path_out (malloc'd, or NULL if src
+   was resolved via the sg_rev_parse_commit fallback rather than a literal
+   ref) filled in. Returns -1 if src matches nothing at all (nothing
+   printed; the caller reports "src refspec ... does not match any" once it
+   knows whether to keep resolving the rest of the batch). Returns -2 if
+   src matches both a local tag and a local branch of that name (message
+   already printed: "src refspec '%s' matches more than one", same wording
+   as the pre-Phase-39 no-colon path). Returns -3 on allocation failure. */
+static int resolve_refspec_src(const char *git_dir, const char *src,
+                               unsigned char id_out[SG_SHA1_RAW_LEN], char **exact_ref_path_out)
+{
+    char tag_path[SG_PATH_MAX];
+    unsigned char tag_id[SG_SHA1_RAW_LEN];
+    int tag_exists;
+    int br_exists;
+
+    *exact_ref_path_out = NULL;
+
+    if (strncmp(src, "refs/", 5) == 0 && sg_ref_read_path(git_dir, src, id_out) == 0) {
+        *exact_ref_path_out = strdup(src);
+        return *exact_ref_path_out != NULL ? 0 : -3;
+    }
+
+    snprintf(tag_path, sizeof(tag_path), "refs/tags/%s", src);
+    tag_exists = (sg_ref_read_path(git_dir, tag_path, tag_id) == 0);
+    br_exists = sg_ref_branch_exists(git_dir, src);
+
+    if (tag_exists && br_exists) {
+        fprintf(stderr, "sg: src refspec '%s' matches more than one\n", src);
+        return -2;
+    }
+    if (tag_exists) {
+        memcpy(id_out, tag_id, SG_SHA1_RAW_LEN);
+        *exact_ref_path_out = strdup(tag_path);
+        return *exact_ref_path_out != NULL ? 0 : -3;
+    }
+    if (br_exists) {
+        char br_path[SG_PATH_MAX];
+        unsigned char br_id[SG_SHA1_RAW_LEN];
+
+        if (sg_ref_read_branch(git_dir, src, br_id) != 0)
+            return -1;
+        snprintf(br_path, sizeof(br_path), "refs/heads/%s", src);
+        memcpy(id_out, br_id, SG_SHA1_RAW_LEN);
+        *exact_ref_path_out = strdup(br_path);
+        return *exact_ref_path_out != NULL ? 0 : -3;
+    }
+
+    if (sg_rev_parse_commit(git_dir, src, id_out) != 0)
+        return -1;
+    return 0;
+}
+
+/* Stage C: completes a "<dst>" (already known not to be empty) into a full
+   ref path, once the remote's advertisement is known -- see
+   docs/DESIGN.md Phase 39 section 2 for the exact three-rule table this
+   implements and the measurements pinning rule 1 ahead of rule 2.
+   src_exact_ref_path is the src's own exact ref path from
+   resolve_refspec_src (NULL if none), used only by rule 2; pass NULL here
+   unconditionally for a deletion (deletion has no src, so rule 2 can never
+   apply to it, only rule 1).
+
+   On success, returns 0 and fills *ref_path_out (malloc'd). Also fills
+   *old_id_out / *remote_exists_out by scanning adv for the completed path
+   (a candidate for a NEW ref simply has *remote_exists_out == 0).
+   Returns -1 if dst cannot be resolved into any full ref name at all
+   (rules 1 and 2 both fail) -- the message differs by caller (a plain
+   push names the generic "not a full refname" error, a delete names its
+   own "remote ref does not exist" message), so nothing is printed here.
+   Returns -2 if the completed path fails sg_ref_name_valid_for_create
+   (message already printed: "fatal: invalid refspec '%s'\n" against
+   raw_arg, the whole original command-line argument, not just dst).
+   Returns -3 on allocation failure. Returns -4 if rule 1 alone matches MORE
+   THAN ONE advertised ref across the different guessed prefixes (message
+   already printed: "sg: dst refspec '%s' matches more than one\n", wording
+   borrowed from real git's own "error: dst refspec %s matches more than
+   one" -- measured against git 2.55.0: with the remote holding both
+   refs/heads/dup and refs/tags/dup, `topic:dup` is REJECTED outright, git
+   does not silently pick one guessed prefix over another in this case). */
+static int complete_dst(const sg_ref_adv *adv, const char *dst_raw, const char *src_exact_ref_path,
+                        const char *raw_arg, char **ref_path_out,
+                        unsigned char old_id_out[SG_SHA1_RAW_LEN], int *remote_exists_out)
+{
+    static const char *const guess_prefixes[] = {"refs/", "refs/tags/", "refs/heads/", "refs/remotes/"};
+    size_t i;
+
+    *ref_path_out = NULL;
+
+    if (strncmp(dst_raw, "refs/", 5) == 0) {
+        *ref_path_out = strdup(dst_raw);
+    } else {
+        size_t k;
+        size_t match_count = 0;
+        char matched_path[SG_PATH_MAX];
+
+        matched_path[0] = '\0';
+        /* Round 3 fix: this must scan EVERY guessed prefix, not stop at the
+           first match -- an early "*ref_path_out == NULL" loop condition
+           (the pre-round-3 shape) silently picks whichever guess prefix
+           comes first in guess_prefixes[] when more than one guess matches
+           an advertised ref, which is exactly the "matches more than one"
+           case real git refuses instead of guessing. */
+        for (k = 0; k < sizeof(guess_prefixes) / sizeof(guess_prefixes[0]); k++) {
+            char candidate[SG_PATH_MAX];
+            size_t j;
+
+            snprintf(candidate, sizeof(candidate), "%s%s", guess_prefixes[k], dst_raw);
+            for (j = 0; j < adv->count; j++) {
+                if (strcmp(adv->refs[j].name, candidate) == 0) {
+                    match_count++;
+                    if (match_count == 1)
+                        snprintf(matched_path, sizeof(matched_path), "%s", candidate);
+                    break;
+                }
+            }
+        }
+        if (match_count > 1) {
+            fprintf(stderr, "sg: dst refspec '%s' matches more than one\n", dst_raw);
+            return -4;
+        }
+        if (match_count == 1) {
+            *ref_path_out = strdup(matched_path);
+            if (*ref_path_out == NULL)
+                return -3;
+        }
+        if (*ref_path_out == NULL && src_exact_ref_path != NULL) {
+            const char *prefix = NULL;
+
+            if (strncmp(src_exact_ref_path, "refs/heads/", 11) == 0)
+                prefix = "refs/heads/";
+            else if (strncmp(src_exact_ref_path, "refs/tags/", 10) == 0)
+                prefix = "refs/tags/";
+            if (prefix != NULL) {
+                char buf[SG_PATH_MAX];
+
+                snprintf(buf, sizeof(buf), "%s%s", prefix, dst_raw);
+                *ref_path_out = strdup(buf);
+            }
+        }
+        if (*ref_path_out == NULL)
+            return -1;
+    }
+    if (*ref_path_out == NULL)
+        return -3;
+
+    if (!sg_ref_name_valid_for_create(*ref_path_out)) {
+        fprintf(stderr, "fatal: invalid refspec '%s'\n", raw_arg);
+        free(*ref_path_out);
+        *ref_path_out = NULL;
+        return -2;
+    }
+
+    *remote_exists_out = 0;
+    memset(old_id_out, 0, SG_SHA1_RAW_LEN); /* a not-found match means a brand new ref: old_id
+                                               must be all-zero, not whatever was on the stack */
+    for (i = 0; i < adv->count; i++) {
+        if (strcmp(adv->refs[i].name, *ref_path_out) == 0) {
+            memcpy(old_id_out, adv->refs[i].id, SG_SHA1_RAW_LEN);
+            *remote_exists_out = 1;
+            break;
+        }
+    }
+    return 0;
+}
+
+/* Phase 39: usage is duplicated at three call sites below (argument-parsing
+   failure, --tags/refspec mutual exclusion, --delete misuse) -- kept as one
+   macro so all three stay in sync, the way CLAUDE.md's module notes call
+   out for exactly this command. */
+#define SG_PUSH_USAGE \
+    "usage: sg push [<remote>] [<refspec>...] [--tags] [--force|-f] [--delete <name>...]\n"
+
 int sg_cmd_push(int argc, char **argv)
 {
     const char *remote = "origin";
-    char *name_arg = NULL;
+    const char **refspec_args = NULL; /* borrowed pointers into argv */
+    size_t refspec_arg_count = 0, refspec_arg_cap = 0;
     int force = 0;
     int tags_flag = 0;
+    int delete_flag = 0;
     char *git_dir = NULL;
     char *url = NULL;
     char *safe_url = NULL;
@@ -615,6 +946,10 @@ int sg_cmd_push(int argc, char **argv)
     push_entry *entries = NULL;
     size_t entry_count = 0, entry_cap = 0;
     int had_rejection = 0;
+    int src_resolve_failed = 0; /* Phase 39: an explicit-dst refspec's <src>
+                                   matched nothing -- aborts the ENTIRE push
+                                   before any network round trip, see
+                                   CLAUDE.md's push module note */
     /* refs/sg/chunks propagation (see the phase 6 push-side durability fix):
        populated below, right after the ref-update decisions, only when this
        repo has ever genuinely used chunked storage locally. */
@@ -625,44 +960,70 @@ int sg_cmd_push(int argc, char **argv)
 
     {
         int i;
-        const char *positional[2];
-        int npos = 0;
+        int have_remote = 0;
 
         for (i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--force") == 0 || strcmp(argv[i], "-f") == 0) {
                 force = 1;
             } else if (strcmp(argv[i], "--tags") == 0) {
                 tags_flag = 1;
+            } else if (strcmp(argv[i], "--delete") == 0) {
+                delete_flag = 1;
             } else if (argv[i][0] == '-') {
-                fprintf(stderr, "usage: sg push [<remote>] [<name>] [--tags] [--force|-f]\n");
+                fprintf(stderr, SG_PUSH_USAGE);
+                free(refspec_args);
                 return 1;
-            } else if (npos < 2) {
-                positional[npos++] = argv[i];
+            } else if (!have_remote) {
+                remote = argv[i];
+                have_remote = 1;
             } else {
-                fprintf(stderr, "usage: sg push [<remote>] [<name>] [--tags] [--force|-f]\n");
-                return 1;
-            }
-        }
-        if (npos >= 1)
-            remote = positional[0];
-        if (npos >= 2) {
-            name_arg = strdup(positional[1]);
-            if (name_arg == NULL) {
-                fprintf(stderr, "sg: out of memory\n");
-                return 1;
+                if (refspec_arg_count == refspec_arg_cap) {
+                    size_t new_cap = refspec_arg_cap == 0 ? 4 : refspec_arg_cap * 2;
+                    const char **grown = realloc(refspec_args, new_cap * sizeof(*grown));
+
+                    if (grown == NULL) {
+                        fprintf(stderr, "sg: out of memory\n");
+                        free(refspec_args);
+                        return 1;
+                    }
+                    refspec_args = grown;
+                    refspec_arg_cap = new_cap;
+                }
+                refspec_args[refspec_arg_count++] = argv[i];
             }
         }
     }
 
-    if (tags_flag && name_arg != NULL) {
-        fprintf(stderr, "usage: sg push [<remote>] [<name>] [--tags] [--force|-f]\n");
-        free(name_arg);
+    if (delete_flag) {
+        if (tags_flag || refspec_arg_count == 0) {
+            fprintf(stderr, SG_PUSH_USAGE);
+            free(refspec_args);
+            return 1;
+        }
+        /* "Any one of them containing ':' rejects the whole command" --
+           checked up front, before touching the network, same batch-abort
+           shape as a refspec syntax error (docs/DESIGN.md Phase 39
+           section 0.7). */
+        {
+            size_t i;
+
+            for (i = 0; i < refspec_arg_count; i++) {
+                if (strchr(refspec_args[i], ':') != NULL) {
+                    fprintf(stderr, "fatal: --delete only accepts plain target ref names\n");
+                    free(refspec_args);
+                    return 1;
+                }
+            }
+        }
+    } else if (tags_flag && refspec_arg_count > 0) {
+        fprintf(stderr, SG_PUSH_USAGE);
+        free(refspec_args);
         return 1;
     }
 
     git_dir = sg_require_git_dir();
     if (git_dir == NULL) {
-        free(name_arg);
+        free(refspec_args);
         return 1;
     }
 
@@ -713,38 +1074,172 @@ int sg_cmd_push(int argc, char **argv)
                 goto done;
             }
         }
-    } else if (name_arg != NULL) {
-        unsigned char tag_id[SG_SHA1_RAW_LEN];
-        char tag_path[SG_PATH_MAX];
-        int tag_exists;
-        int br_exists;
+    } else if (delete_flag) {
+        /* --delete <name>...: each name is a bare target, already checked
+           above to contain no ':'. Nothing more can be decided from local
+           state alone -- dst completion (rule 1 only, no rule 2: there is
+           no src) needs the remote's advertisement, so these candidates
+           stay pending (explicit_dst) until that arrives. */
+        size_t i;
 
-        snprintf(tag_path, sizeof(tag_path), "refs/tags/%s", name_arg);
-        tag_exists = (sg_ref_read_path(git_dir, tag_path, tag_id) == 0);
-        br_exists = sg_ref_branch_exists(git_dir, name_arg);
-
-        if (tag_exists && br_exists) {
-            fprintf(stderr, "sg: src refspec '%s' matches more than one\n", name_arg);
-            goto done;
-        } else if (tag_exists) {
+        for (i = 0; i < refspec_arg_count; i++) {
             push_entry cand;
 
+            /* Same pre-connection format check as sg_push_refspec_parse's
+               explicit-dst case (docs/DESIGN.md Phase 39 section 3) --
+               only meaningful when already "refs/"-prefixed, same reason. */
+            if (strncmp(refspec_args[i], "refs/", 5) == 0 &&
+               !sg_ref_name_valid_for_create(refspec_args[i])) {
+                fprintf(stderr, "fatal: invalid refspec '%s'\n", refspec_args[i]);
+                goto done;
+            }
+
             memset(&cand, 0, sizeof(cand));
-            cand.name = strdup(name_arg);
-            cand.ref_path = strdup(tag_path);
-            cand.is_tag = 1;
-            memcpy(cand.new_id, tag_id, SG_SHA1_RAW_LEN);
-            if (cand.name == NULL || cand.ref_path == NULL ||
+            cand.is_delete = 1;
+            cand.explicit_dst = 1;
+            cand.dst_raw = strdup(refspec_args[i]);
+            cand.raw_arg = strdup(refspec_args[i]);
+            if (cand.dst_raw == NULL || cand.raw_arg == NULL ||
                push_entries_push(&candidates, &candidate_count, &candidate_cap, &cand) != 0) {
-                free(cand.name);
-                free(cand.ref_path);
+                free(cand.dst_raw);
+                free(cand.raw_arg);
                 fprintf(stderr, "sg: out of memory\n");
                 goto done;
             }
-        } else {
-            if (build_branch_candidate(git_dir, name_arg, &candidates, &candidate_count,
-                                       &candidate_cap) != 0)
-                goto done;
+        }
+    } else if (refspec_arg_count > 0) {
+        size_t i;
+
+        for (i = 0; i < refspec_arg_count; i++) {
+            sg_push_refspec parsed;
+
+            if (sg_push_refspec_parse(refspec_args[i], &parsed) != 0) {
+                /* Round 3 fix: defense in depth alongside the fix inside
+                   sg_push_refspec_parse itself -- *out is documented to be
+                   zeroed on failure, so this is a no-op free today, but a
+                   future change to that contract must not silently start
+                   leaking again just because this call site trusted it. */
+                sg_push_refspec_free(&parsed);
+                goto done; /* message already printed */
+            }
+
+            if (parsed.is_delete) {
+                push_entry cand;
+
+                memset(&cand, 0, sizeof(cand));
+                cand.is_delete = 1;
+                cand.explicit_dst = 1;
+                cand.refspec_force = parsed.force;
+                cand.dst_raw = strdup(parsed.dst);
+                cand.raw_arg = strdup(refspec_args[i]);
+                if (cand.dst_raw == NULL || cand.raw_arg == NULL ||
+                   push_entries_push(&candidates, &candidate_count, &candidate_cap, &cand) != 0) {
+                    free(cand.dst_raw);
+                    free(cand.raw_arg);
+                    sg_push_refspec_free(&parsed);
+                    fprintf(stderr, "sg: out of memory\n");
+                    goto done;
+                }
+            } else if (parsed.dst == NULL) {
+                /* No colon: dst is derived from the SAME literal-name rule
+                   this command has always used (docs/DESIGN.md Phase 39
+                   section 0.2), not the full rev-parse grammar below --
+                   see resolve_refspec_src's own header comment for why
+                   those two are deliberately different code paths. */
+                unsigned char tag_id[SG_SHA1_RAW_LEN];
+                char tag_path[SG_PATH_MAX];
+                int tag_exists;
+                int br_exists;
+
+                snprintf(tag_path, sizeof(tag_path), "refs/tags/%s", parsed.src);
+                tag_exists = (sg_ref_read_path(git_dir, tag_path, tag_id) == 0);
+                br_exists = sg_ref_branch_exists(git_dir, parsed.src);
+
+                if (tag_exists && br_exists) {
+                    fprintf(stderr, "sg: src refspec '%s' matches more than one\n", parsed.src);
+                    sg_push_refspec_free(&parsed);
+                    goto done;
+                } else if (tag_exists) {
+                    push_entry cand;
+
+                    memset(&cand, 0, sizeof(cand));
+                    cand.name = strdup(parsed.src);
+                    cand.ref_path = strdup(tag_path);
+                    cand.is_tag = 1;
+                    cand.refspec_force = parsed.force;
+                    memcpy(cand.new_id, tag_id, SG_SHA1_RAW_LEN);
+                    if (cand.name == NULL || cand.ref_path == NULL ||
+                       push_entries_push(&candidates, &candidate_count, &candidate_cap, &cand) != 0) {
+                        free(cand.name);
+                        free(cand.ref_path);
+                        sg_push_refspec_free(&parsed);
+                        fprintf(stderr, "sg: out of memory\n");
+                        goto done;
+                    }
+                } else {
+                    if (build_branch_candidate(git_dir, parsed.src, &candidates, &candidate_count,
+                                               &candidate_cap) != 0) {
+                        sg_push_refspec_free(&parsed);
+                        goto done;
+                    }
+                    candidates[candidate_count - 1].refspec_force = parsed.force;
+                }
+            } else {
+                /* Explicit dst: full rev-parse grammar for src (Stage B),
+                   done now, before any network round trip -- a failure
+                   here aborts the WHOLE push, not just this one ref (see
+                   CLAUDE.md's push module note and docs/DESIGN.md Phase 39
+                   section 1). Dst completion (Stage C) needs the
+                   advertisement, so it is deferred (explicit_dst). */
+                push_entry cand;
+                int src_rc;
+
+                memset(&cand, 0, sizeof(cand));
+                src_rc = resolve_refspec_src(git_dir, parsed.src, cand.new_id, &cand.src_exact_ref_path);
+                if (src_rc == -2) {
+                    sg_push_refspec_free(&parsed);
+                    goto done; /* message already printed */
+                }
+                if (src_rc == -3) {
+                    /* Round 3 fix: an allocation failure is not the same
+                       kind of thing as "src matched nothing" -- every other
+                       OOM path in this function aborts immediately
+                       (fprintf + goto done), continuing to parse the rest of
+                       the batch on top of a failed allocation is exactly the
+                       inconsistency this fix removes. */
+                    sg_push_refspec_free(&parsed);
+                    fprintf(stderr, "sg: out of memory\n");
+                    goto done;
+                }
+                if (src_rc != 0) {
+                    fprintf(stderr, "error: src refspec %s does not match any\n", parsed.src);
+                    src_resolve_failed = 1;
+                    sg_push_refspec_free(&parsed);
+                    continue;
+                }
+
+                cand.is_delete = 0;
+                cand.explicit_dst = 1;
+                cand.refspec_force = parsed.force;
+                cand.dst_raw = strdup(parsed.dst);
+                cand.raw_arg = strdup(refspec_args[i]);
+                if (cand.dst_raw == NULL || cand.raw_arg == NULL ||
+                   push_entries_push(&candidates, &candidate_count, &candidate_cap, &cand) != 0) {
+                    free(cand.dst_raw);
+                    free(cand.src_exact_ref_path);
+                    free(cand.raw_arg);
+                    sg_push_refspec_free(&parsed);
+                    fprintf(stderr, "sg: out of memory\n");
+                    goto done;
+                }
+            }
+            sg_push_refspec_free(&parsed);
+        }
+
+        if (src_resolve_failed) {
+            fprintf(stderr, "error: failed to push some refs to '%s'\n",
+                   safe_url != NULL ? safe_url : "(remote)");
+            goto done;
         }
     } else {
         /* See cmd_reset.c: a corrupt HEAD is not a detached one. Here the
@@ -778,38 +1273,149 @@ int sg_cmd_push(int argc, char **argv)
             push_entry *cand = &candidates[ci];
             unsigned char remote_old_id[SG_SHA1_RAW_LEN];
             int remote_ref_exists = 0;
+            int cand_force;
             size_t j;
 
-            for (j = 0; j < adv.count; j++) {
-                if (strcmp(adv.refs[j].name, cand->ref_path) == 0) {
-                    memcpy(remote_old_id, adv.refs[j].id, SG_SHA1_RAW_LEN);
-                    remote_ref_exists = 1;
-                    break;
+            if (cand->explicit_dst) {
+                /* Stage C: dst completion, deferred until now because it
+                   needs the advertisement (docs/DESIGN.md Phase 39 section
+                   2). Covers both a "<src>:<dst>" candidate and a
+                   "--delete"/":dst" one -- the latter passes NULL for
+                   src_exact_ref_path, so rule 2 can never fire for it. */
+                char *completed_path = NULL;
+                int comp_rc = complete_dst(&adv, cand->dst_raw, cand->src_exact_ref_path, cand->raw_arg,
+                                           &completed_path, remote_old_id, &remote_ref_exists);
+
+                if (comp_rc == -1) {
+                    if (cand->is_delete) {
+                        fprintf(stderr, "sg: unable to delete '%s': remote ref does not exist\n",
+                               cand->dst_raw);
+                        had_rejection = 1;
+                        continue; /* per-ref failure (docs/DESIGN.md Phase 39 section 5) */
+                    }
+                    fprintf(stderr,
+                           "error: The destination you provided is not a full refname (i.e., starting "
+                           "with \"refs/\").\n");
+                    goto done;
                 }
+                if (comp_rc == -2)
+                    goto done; /* message already printed by complete_dst */
+                if (comp_rc == -4)
+                    goto done; /* message already printed by complete_dst, round 3 */
+                if (comp_rc == -3) {
+                    fprintf(stderr, "sg: out of memory\n");
+                    goto done;
+                }
+
+                cand->ref_path = completed_path;
+                cand->is_tag = strncmp(completed_path, "refs/tags/", 10) == 0;
+                /* Round 3 fix: `name` must be the WHOLE remainder after
+                   stripping the completed path's own namespace prefix, not
+                   just the last path segment -- a multi-segment dst like
+                   "master:notrefs/x" completes (via rule 2) to
+                   "refs/heads/notrefs/x", and taking only the last segment
+                   (the old `strrchr(..., '/')` behavior) silently truncated
+                   both the remote-tracking ref this builds later
+                   ("refs/remotes/<remote>/<name>") and the report line to
+                   ".../x" instead of ".../notrefs/x". For a completed path
+                   under neither refs/heads/ nor refs/tags/ (an explicit
+                   refs/remotes/... dst, or some other refs/... path), there
+                   is no well-known namespace prefix to strip, so this falls
+                   back to the last path segment, same as before. */
+                if (strncmp(completed_path, "refs/heads/", 11) == 0)
+                    cand->name = strdup(completed_path + 11);
+                else if (strncmp(completed_path, "refs/tags/", 10) == 0)
+                    cand->name = strdup(completed_path + 10);
+                else {
+                    const char *slash = strrchr(completed_path, '/');
+
+                    cand->name = strdup(slash != NULL ? slash + 1 : completed_path);
+                }
+                if (cand->name == NULL) {
+                    fprintf(stderr, "sg: out of memory\n");
+                    goto done;
+                }
+            } else {
+                for (j = 0; j < adv.count; j++) {
+                    if (strcmp(adv.refs[j].name, cand->ref_path) == 0) {
+                        memcpy(remote_old_id, adv.refs[j].id, SG_SHA1_RAW_LEN);
+                        remote_ref_exists = 1;
+                        break;
+                    }
+                }
+                if (!remote_ref_exists)
+                    memset(remote_old_id, 0, sizeof(remote_old_id));
             }
-            if (!remote_ref_exists)
-                memset(remote_old_id, 0, sizeof(remote_old_id));
+
+            cand_force = force || cand->refspec_force;
+
+            if (cand->is_delete) {
+                /* Deletion candidate protocol: new_id all-zero, never
+                   fast-forward-checked, never object-walked, never part of
+                   the pack (docs/DESIGN.md Phase 39 section 4 -- the three
+                   named callers that assume new_id is readable must never
+                   see one of these). remote_ref_exists == 0 here can only
+                   happen for a "refs/..."-prefixed dst that complete_dst
+                   accepted syntactically but which the remote does not
+                   actually have. */
+                push_entry e;
+
+                if (!remote_ref_exists) {
+                    fprintf(stderr, "sg: unable to delete '%s': remote ref does not exist\n",
+                           cand->dst_raw);
+                    had_rejection = 1;
+                    continue;
+                }
+
+                memset(&e, 0, sizeof(e));
+                e.name = strdup(cand->name);
+                e.ref_path = strdup(cand->ref_path);
+                e.is_tag = cand->is_tag;
+                e.is_delete = 1;
+                memcpy(e.old_id, remote_old_id, SG_SHA1_RAW_LEN);
+                memset(e.new_id, 0, sizeof(e.new_id));
+                if (e.name == NULL || e.ref_path == NULL ||
+                   push_entries_push(&entries, &entry_count, &entry_cap, &e) != 0) {
+                    free(e.name);
+                    free(e.ref_path);
+                    fprintf(stderr, "sg: out of memory\n");
+                    goto done;
+                }
+                continue;
+            }
 
             if (!cand->is_tag) {
                 sg_push_ff_status status =
                     check_fast_forward(git_dir, remote_old_id, cand->new_id, remote_ref_exists);
                 push_entry e;
 
+                /* Phase 39: both of these used to be a whole-batch abort
+                   (goto done) -- safe when a push could only ever carry one
+                   non-tag ref, but with refspecs now able to name several,
+                   docs/DESIGN.md Phase 39 section 5 (measured against real
+                   git: "topic -> newbr" lands while "master -> fromhead" is
+                   refused IN THE SAME invocation) requires this to be a
+                   per-ref skip instead, same shape the tag path and the
+                   deletion path already use just above. A single-ref push's
+                   own observable behavior (message, exit code) is
+                   unaffected by this change. */
                 if (status == SG_PUSH_UNKNOWN_REMOTE) {
                     fprintf(stderr,
                            "sg: push refused: the remote's %s has commits we don't know about, "
                            "cannot tell whether this would overwrite someone else's work; run sg fetch first\n",
                            cand->name);
-                    goto done;
+                    had_rejection = 1;
+                    continue;
                 }
-                if (status == SG_PUSH_NON_FF && !force) {
+                if (status == SG_PUSH_NON_FF && !cand_force) {
                     fprintf(stderr,
                            "sg: push refused: not a fast-forward, this would lose the following commits on the remote's %s:\n",
                            cand->name);
                     print_lost_commits(git_dir, remote_old_id, cand->new_id);
                     fprintf(stderr,
                            "sg: run sg fetch then sg merge to integrate the changes, or re-run with --force if you really want to overwrite\n");
-                    goto done;
+                    had_rejection = 1;
+                    continue;
                 }
                 if (remote_ref_exists && memcmp(remote_old_id, cand->new_id, SG_SHA1_RAW_LEN) == 0)
                     continue; /* already up to date -- nothing to send for this ref */
@@ -819,6 +1425,7 @@ int sg_cmd_push(int argc, char **argv)
                 e.ref_path = strdup(cand->ref_path);
                 e.is_tag = 0;
                 e.is_new = !remote_ref_exists;
+                e.forced = (status == SG_PUSH_NON_FF); /* Phase 39: only reachable via cand_force above */
                 memcpy(e.old_id, remote_old_id, SG_SHA1_RAW_LEN);
                 memcpy(e.new_id, cand->new_id, SG_SHA1_RAW_LEN);
                 if (e.name == NULL || e.ref_path == NULL ||
@@ -837,7 +1444,7 @@ int sg_cmd_push(int argc, char **argv)
                rejection here only skips this one tag rather than aborting
                the whole push (so `--tags` can still land the rest). */
             if (!remote_ref_exists || memcmp(remote_old_id, cand->new_id, SG_SHA1_RAW_LEN) != 0) {
-                if (remote_ref_exists && !force) {
+                if (remote_ref_exists && !cand_force) {
                     fprintf(stderr,
                            "sg: tag '%s' already exists on the remote (use --force to overwrite)\n",
                            cand->name);
@@ -869,6 +1476,23 @@ int sg_cmd_push(int argc, char **argv)
                date, nothing to send. */
         }
     }
+
+    /* Round 3 fix: had_rejection with an empty entries list means EVERY
+       candidate was rejected (non-fast-forward, unknown remote, etc, all of
+       which "continue" instead of aborting -- see docs/DESIGN.md Phase 39
+       section 5), not "nothing needed sending". Before this fix such a push
+       fell through into the unconditional chunks-propagation block below,
+       which still builds a pack and calls sg_transport_push whenever this
+       repo has ever used chunked storage locally -- an actual write to the
+       remote (and a spurious "To <url>" line) for a push whose sole refspec
+       was refused outright, contradicting pre-Phase-39 behavior where a
+       rejected single-ref push never touched the remote beyond the
+       read-only advertisement. Do NOT fold this into the entry_count == 0
+       check just below: "everything already up to date" is ALSO
+       entry_count == 0, but had_rejection == 0 there, and that case must
+       still be allowed to propagate refs/sg/chunks. */
+    if (had_rejection && entry_count == 0)
+        goto done;
 
     /* refs/sg/chunks propagation: if this repo has never chunked anything
        locally, SG_CHUNK_KEEPALIVE_REF simply doesn't exist here and there is
@@ -961,6 +1585,12 @@ int sg_cmd_push(int argc, char **argv)
         if (build_have_set(git_dir, &adv, &have_set) != 0)
             build_ok = 0;
         for (i = 0; build_ok && i < entry_count; i++) {
+            /* Phase 39: a deletion's new_id is all-zero, not a real object
+               -- must never reach walk_add_object (see the module note in
+               CLAUDE.md for the three call sites that assume new_id is
+               readable). */
+            if (entries[i].is_delete)
+                continue;
             if (walk_add_object(git_dir, entries[i].new_id, &send_set) < 0)
                 build_ok = 0;
         }
@@ -1060,7 +1690,12 @@ int sg_cmd_push(int argc, char **argv)
                         found = 1;
 
                         if (report.refs[j].ok) {
-                            if (e->is_new) {
+                            if (e->is_delete) {
+                                /* Phase 39: sg's own report styling (no byte-for-byte git
+                                   output requirement for this line, see docs/DESIGN.md
+                                   Phase 39 section 6.3). */
+                                printf(" - [deleted]           %s -> %s/%s\n", e->name, remote, e->name);
+                            } else if (e->is_new) {
                                 printf(" * [new %s]%s%s -> %s/%s\n", e->is_tag ? "tag" : "branch",
                                       e->is_tag ? "         " : "      ", e->name, remote, e->name);
                             } else {
@@ -1129,10 +1764,15 @@ int sg_cmd_push(int argc, char **argv)
                 }
             }
 
-            /* Real git never creates a remote-tracking ref for a pushed tag
-               -- only for the (at most one) branch entry in this push. */
+            /* Real git never creates a remote-tracking ref for a pushed tag.
+               Phase 39: a single push can now update more than one branch
+               (multiple refspecs), so every non-tag, non-delete entry gets
+               its own remote-tracking ref update -- no longer just the
+               first one (a deletion has no meaningful new_id to record
+               here, and this milestone doesn't remove the local
+               remote-tracking ref either, see the Phase 39 write-up). */
             for (i = 0; i < entry_count; i++) {
-                if (!entries[i].is_tag) {
+                if (!entries[i].is_tag && !entries[i].is_delete) {
                     char remote_ref_path[SG_PATH_MAX];
 
                     snprintf(remote_ref_path, sizeof(remote_ref_path), "refs/remotes/%s/%s", remote,
@@ -1149,7 +1789,6 @@ int sg_cmd_push(int argc, char **argv)
                         fprintf(stderr, "sg: push succeeded, but failed to update local %s\n", remote_ref_path);
                         goto done;
                     }
-                    break;
                 }
             }
         }
@@ -1165,7 +1804,7 @@ done:
     push_entry_free_all(entries, entry_count);
     free_string_array(tag_names, tag_name_count);
     free(current_branch);
-    free(name_arg);
+    free(refspec_args);
     free(safe_url);
     free(url);
     free(git_dir);

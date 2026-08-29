@@ -42,6 +42,16 @@ int sg_ref_name_valid_for_create(const char *name)
     if (strstr(name, "//") != NULL || strstr(name, "..") != NULL ||
        strstr(name, "@{") != NULL)
         return 0;
+    /* No path component may start with '.' (measured against real git
+     * 2.55.0: `git branch .hidden` and `git branch x/.hidden` both fail
+     * check-ref-format). name[0] == '.' covers the first component; this
+     * covers every component after a '/'. */
+    if (name[0] == '.')
+        return 0;
+    for (i = 0; i < len; i++) {
+        if (name[i] == '/' && i + 1 < len && name[i + 1] == '.')
+            return 0;
+    }
     for (i = 0; i < len; i++) {
         unsigned char c = (unsigned char)name[i];
 

@@ -1542,6 +1542,157 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         sh -c "test -z \"\$(cd '$HTTP_SERVERROOT/repo.git' && git branch --list ambiguous-name)\""
     (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
 
+    # --- Phase 39: refspec support for sg push ---
+
+    P39_HEAD=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+
+    # <src>:<dst> updates a differently-named remote ref
+    P39_EXPLICIT_OUT="$WORKDIR/http_push_p39_explicit_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin "$HTTP_SRC_BRANCH:refs/heads/p39-explicit" < /dev/null) > "$P39_EXPLICIT_OUT" 2>&1
+    check "phase39: sg push <src>:<dst> exits 0" test $? = 0
+    check "phase39: bare repo gained refs/heads/p39-explicit at the pushed commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p39-explicit)\" = '$P39_HEAD'"
+
+    # an annotated tag used as <src> is NOT peeled -- the remote object stays
+    # a tag, not the commit it points at (docs/DESIGN.md Phase 39 section 1,
+    # this is the "do not use sg_rev_parse_commit for src" trap)
+    (cd "$HTTP_DEST" && "$SG" tag -a p39-anntag -m "phase39 annotated") > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" push origin p39-anntag:refs/tags/p39-anntag-copy < /dev/null) > /dev/null 2>&1
+    check "phase39: pushed annotated-tag src stays a tag object on the remote (not peeled)" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git cat-file -t refs/tags/p39-anntag-copy)\" = tag"
+
+    # dst completion rule 1 (an existing remote ref named <dst>) takes
+    # priority over rule 2 (prefixing src's own namespace) -- measured
+    # against real git 2.55.0, docs/DESIGN.md Phase 39 section 2
+    (cd "$HTTP_DEST" && "$SG" tag p39-rule1) > /dev/null 2>&1
+    P39_RULE1_TAG_ID=$(cd "$HTTP_DEST" && git rev-parse refs/tags/p39-rule1)
+    (cd "$HTTP_DEST" && "$SG" push origin "$HTTP_SRC_BRANCH:refs/heads/p39-rule1-target" < /dev/null) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" push origin p39-rule1:p39-rule1-target < /dev/null) > /dev/null 2>&1
+    check "phase39: dst completion rule 1 (existing branch) wins over rule 2 (tag prefix)" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p39-rule1-target)\" = '$P39_RULE1_TAG_ID'"
+    check "phase39: dst completion rule 1 did not also create a refs/tags/ copy" \
+        sh -c "! (cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/tags/p39-rule1-target) >/dev/null 2>&1"
+
+    # --- Round 3 item B: rule 2's completed path must not be truncated to
+    # its last path segment. "master:notrefs/x" completes (via rule 2,
+    # $HTTP_SRC_BRANCH resolves as an exact refs/heads/ literal) to
+    # "refs/heads/notrefs/x" -- the WHOLE dst string prefixed, not just its
+    # last segment (docs/DESIGN.md Phase 39 section 2, rule 2). Before the
+    # round-3 fix, `strrchr(completed_path, '/')` gave `name = "x"`, which
+    # both mis-built the local remote-tracking ref path
+    # (refs/remotes/origin/x instead of refs/remotes/origin/notrefs/x) and
+    # was a factually wrong report line.
+    (cd "$HTTP_DEST" && "$SG" push origin "$HTTP_SRC_BRANCH:notrefs/x" < /dev/null) > /dev/null 2>&1
+    check "phase39: multi-segment dst completes to the full refs/heads/notrefs/x on the remote" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/notrefs/x)\" = '$P39_HEAD'"
+    check "phase39: multi-segment dst updates the correctly-named local remote-tracking ref" \
+        sh -c "test \"\$(cd '$HTTP_DEST' && git rev-parse refs/remotes/origin/notrefs/x 2>/dev/null)\" = '$P39_HEAD'"
+    check "phase39: multi-segment dst does NOT also create a truncated refs/remotes/origin/x" \
+        sh -c "! (cd '$HTTP_DEST' && git rev-parse --verify refs/remotes/origin/x) >/dev/null 2>&1"
+
+    # --- Round 3 item D: an unqualified dst that matches MORE THAN ONE
+    # advertised ref (a branch and a tag sharing the same name) must be
+    # refused outright -- measured against real git 2.55.0: with the remote
+    # holding both refs/heads/dup and refs/tags/dup, `topic:dup` fails with
+    # "error: dst refspec dup matches more than one" and neither ref is
+    # touched. Before the round-3 fix, sg's rule-1 guessing loop stopped at
+    # the FIRST guess prefix that matched (refs/tags/dup, since "refs/tags/"
+    # is tried before "refs/heads/" in guess_prefixes[]) and silently wrote
+    # there instead of refusing.
+    (cd "$HTTP_DEST" && "$SG" switch -c p39-dup-src < /dev/null) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" push origin p39-dup-src:refs/heads/dup < /dev/null) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" push origin p39-dup-src:refs/tags/dup < /dev/null) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
+
+    P39_DUP_BRANCH_BEFORE=$(cd "$HTTP_SERVERROOT/repo.git" && git rev-parse refs/heads/dup)
+    P39_DUP_TAG_BEFORE=$(cd "$HTTP_SERVERROOT/repo.git" && git rev-parse refs/tags/dup)
+
+    P39_DUP_OUT="$WORKDIR/http_push_p39_dup_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin "$HTTP_SRC_BRANCH:dup" < /dev/null) > "$P39_DUP_OUT" 2>&1
+    check "phase39: an unqualified dst matching both a branch and a tag is rejected" test $? -ne 0
+    check "phase39: sg reports the ambiguous dst refspec" \
+        grep -q "matches more than one" "$P39_DUP_OUT"
+    check "phase39: the ambiguous dst push left refs/heads/dup untouched" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/dup)\" = '$P39_DUP_BRANCH_BEFORE'"
+    check "phase39: the ambiguous dst push left refs/tags/dup untouched" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/dup)\" = '$P39_DUP_TAG_BEFORE'"
+
+    P39_DUP_ORACLE_SRC="$WORKDIR/http_diverge_src_p39_dup"
+    (cd "$WORKDIR" && git clone -q "$HTTP_SERVERROOT/repo.git" http_diverge_src_p39_dup) > /dev/null 2>&1
+    (cd "$P39_DUP_ORACLE_SRC" && git config user.email "p39dup@example.com" && git config user.name "p39dup tester")
+    P39_DUP_ORACLE_OUT="$WORKDIR/http_push_p39_dup_oracle_out.txt"
+    # LC_ALL=C: git translates this message under a localized environment
+    # (this machine's git is zh_TW), and the assertion below greps its
+    # English wording.
+    (cd "$P39_DUP_ORACLE_SRC" && LC_ALL=C git push origin "HEAD:dup") > "$P39_DUP_ORACLE_OUT" 2>&1
+    check "phase39 oracle: real git also rejects an unqualified dst matching both a branch and a tag" test $? -ne 0
+    check "phase39 oracle: real git's ambiguous-dst message matches the wording sg's message was borrowed from" \
+        grep -q "matches more than one" "$P39_DUP_ORACLE_OUT"
+
+    # --delete
+    (cd "$HTTP_DEST" && "$SG" push origin --delete p39-explicit < /dev/null) > /dev/null 2>&1
+    check "phase39: --delete removed the remote branch" \
+        sh -c "! (cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/heads/p39-explicit) >/dev/null 2>&1"
+
+    P39_DELETE_MISSING_OUT="$WORKDIR/http_push_p39_delete_missing_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin --delete p39-explicit < /dev/null) > "$P39_DELETE_MISSING_OUT" 2>&1
+    check "phase39: deleting an already-gone remote ref fails" test $? -ne 0
+    check "phase39: deleting an already-gone remote ref reports the expected message" \
+        grep -q "remote ref does not exist" "$P39_DELETE_MISSING_OUT"
+
+    # multiple refspecs in a single invocation: two brand-new branches land
+    # together from one `sg push`
+    (cd "$HTTP_DEST" && "$SG" push origin "$HTTP_SRC_BRANCH:refs/heads/p39-multi-a" "$HTTP_SRC_BRANCH:refs/heads/p39-multi-b" < /dev/null) > /dev/null 2>&1
+    check "phase39: a multi-refspec push lands the first ref" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p39-multi-a)\" = '$P39_HEAD'"
+    check "phase39: a multi-refspec push lands the second ref" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p39-multi-b)\" = '$P39_HEAD'"
+
+    # multiple refspecs, one of them non-fast-forward: the whole command
+    # still exits non-zero, but each ref update is independent -- the
+    # fast-forwardable one must land anyway (same "each ref update is
+    # independent" shape as --tags's own mixed-success case above), and the
+    # rejected one must be left exactly where it was (docs/DESIGN.md Phase 39
+    # section 5's "non-ff is a per-ref failure" row). Divergence is built the
+    # same way case 3 above builds it: a real git push directly into the bare
+    # repo, an `sg fetch` so the object is known locally (without moving any
+    # local branch -- the "known but not an ancestor" shape, not the
+    # separate "remote commit we've never seen" shape).
+    DIVERGE_SRC2="$WORKDIR/http_diverge_src_p39"
+    (cd "$WORKDIR" && git clone -q "$HTTP_SERVERROOT/repo.git" http_diverge_src_p39) > /dev/null 2>&1
+    (cd "$DIVERGE_SRC2" && git config user.email "diverge2@example.com" && git config user.name "diverge2 tester")
+    (cd "$DIVERGE_SRC2" && git checkout -q -b p39-multi-b "origin/p39-multi-b" 2>/dev/null || git checkout -q p39-multi-b)
+    printf 'phase39 server-side divergent commit\n' >> "$DIVERGE_SRC2/top.txt"
+    (cd "$DIVERGE_SRC2" && git add top.txt && git commit -q -m "phase39 server-side divergent commit")
+    (cd "$DIVERGE_SRC2" && git push -q origin HEAD:refs/heads/p39-multi-b) > /dev/null 2>&1
+    P39_MULTI_B_DIVERGED=$(cd "$HTTP_SERVERROOT/repo.git" && git rev-parse refs/heads/p39-multi-b)
+
+    (cd "$HTTP_DEST" && "$SG" fetch) > /dev/null 2>&1
+    printf 'phase39 local divergent commit\n' >> "$HTTP_DEST/top.txt"
+    (cd "$HTTP_DEST" && "$SG" add top.txt) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" commit -m "phase39 local divergent commit") > /dev/null 2>&1
+    P39_MULTI_LOCAL_HEAD=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+
+    P39_MULTI_OUT="$WORKDIR/http_push_p39_multi_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin "HEAD:refs/heads/p39-multi-a" "HEAD:refs/heads/p39-multi-b" < /dev/null) > "$P39_MULTI_OUT" 2>&1
+    check "phase39: a multi-refspec push with one non-ff exits non-zero" test $? -ne 0
+    check "phase39: the fast-forwardable ref in the same push still landed" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p39-multi-a)\" = '$P39_MULTI_LOCAL_HEAD'"
+    check "phase39: the non-fast-forward ref in the same push was left untouched" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p39-multi-b)\" = '$P39_MULTI_B_DIVERGED'"
+
+    # a leading '+' force-pushes just that one refspec, without a global --force
+    P39_PLUS_OUT="$WORKDIR/http_push_p39_plus_out.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin "+HEAD:refs/heads/p39-multi-b" < /dev/null) > "$P39_PLUS_OUT" 2>&1
+    check "phase39: a leading '+' force-pushes just that refspec" test $? = 0
+    check "phase39: the '+'-forced ref now matches the forced commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p39-multi-b)\" = '$P39_MULTI_LOCAL_HEAD'"
+
+    (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
+
+    check "phase39: git fsck still passes on the bare repo after refspec pushes" \
+        sh -c "git -C '$HTTP_SERVERROOT/repo.git' fsck > /dev/null 2>&1"
+
     kill "$HTTP_SERVER_PID" 2>/dev/null
     HTTP_SERVER_PID=""
 else
@@ -1570,6 +1721,136 @@ check "phase5c bugfix: sg push --tags with zero local tags against an unreachabl
     test $? -ne 0
 check "phase5c bugfix: sg push --tags with zero local tags against an unreachable remote does not print Everything up-to-date" \
     sh -c "! grep -q 'Everything up-to-date' '$ZEROTAG_OUT'"
+
+# --- Phase 39: refspec support for sg push -- the checks that must fail
+# BEFORE any network round trip, verified the same way as the zero-tags
+# bugfix just above: an unreachable URL only ever distinguishes "gave up
+# without trying" from "tried and failed", both of which are failures, so
+# these checks additionally confirm the failure happened for the RIGHT
+# reason (grepping the actual message), not merely that the exit code was
+# non-zero. ---
+P39N_REPO="$WORKDIR/p39_noHTTP_repo"
+"$SG" init "$P39N_REPO" > /dev/null 2>&1
+(cd "$P39N_REPO" && git config user.email "p39@example.com" && git config user.name "p39 tester")
+printf 'hello\n' > "$P39N_REPO/f.txt"
+(cd "$P39N_REPO" && "$SG" add f.txt && "$SG" commit -m "init") > /dev/null 2>&1
+printf '[remote "origin"]\n\turl = http://127.0.0.1:1/unreachable\n' >> "$P39N_REPO/.git/config"
+
+# real git's own client-side refspec parser rejects a syntax error (empty
+# dst, "<src>:") before ever touching the network -- exit 128, no
+# connection-failure text at all (confirmed by hand against git 2.55.0: the
+# same command against a genuinely unreachable URL prints only the invalid
+# refspec message, never "Failed to connect"). sg uses exit 1 for the same
+# case (CLAUDE.md's "exit codes are only ever 0 or 1" convention) -- this is
+# THE deliberate, named divergence from docs/DESIGN.md Phase 39 section 5,
+# pinned here on both sides so "fixing" it back into silent agreement with
+# git would itself be caught.
+P39N_GIT_EMPTYDST_OUT="$WORKDIR/p39n_git_emptydst_out.txt"
+(LC_ALL=C git -C "$P39N_REPO" push origin "master:") > "$P39N_GIT_EMPTYDST_OUT" 2>&1
+check "phase39 oracle: real git rejects an empty dst before connecting (exit 128)" \
+    test $? = 128
+check "phase39 oracle: real git's empty-dst rejection never attempted a connection" \
+    sh -c "! grep -qi 'failed to connect\|couldn.t connect' '$P39N_GIT_EMPTYDST_OUT'"
+
+P39N_SG_EMPTYDST_OUT="$WORKDIR/p39n_sg_emptydst_out.txt"
+(cd "$P39N_REPO" && "$SG" push origin "master:") > "$P39N_SG_EMPTYDST_OUT" 2>&1
+check "phase39: sg push with an empty dst (\"<src>:\") fails" test $? = 1
+check "phase39: sg push with an empty dst reports invalid refspec" \
+    grep -q "invalid refspec" "$P39N_SG_EMPTYDST_OUT"
+check "phase39: sg's empty-dst rejection never attempted a connection either" \
+    sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect' '$P39N_SG_EMPTYDST_OUT'"
+
+# --delete with a colon-containing argument rejects the WHOLE command,
+# before connecting -- same divergence, same pinning shape.
+P39N_GIT_DELCOLON_OUT="$WORKDIR/p39n_git_delcolon_out.txt"
+(LC_ALL=C git -C "$P39N_REPO" push origin --delete "a:b") > "$P39N_GIT_DELCOLON_OUT" 2>&1
+check "phase39 oracle: real git rejects --delete with a colon before connecting (exit 128)" \
+    test $? = 128
+check "phase39 oracle: real git's --delete/colon rejection never attempted a connection" \
+    sh -c "! grep -qi 'failed to connect\|couldn.t connect' '$P39N_GIT_DELCOLON_OUT'"
+
+P39N_SG_DELCOLON_OUT="$WORKDIR/p39n_sg_delcolon_out.txt"
+(cd "$P39N_REPO" && "$SG" push origin --delete "a:b") > "$P39N_SG_DELCOLON_OUT" 2>&1
+check "phase39: sg push --delete with a colon-containing name fails" test $? = 1
+check "phase39: sg push --delete with a colon-containing name reports the expected message" \
+    grep -q "only accepts plain target ref names" "$P39N_SG_DELCOLON_OUT"
+
+# a malformed dst that is already "refs/"-prefixed is a pure string check,
+# rejected before connecting on both sides too (docs/DESIGN.md Phase 39
+# section 3's format-validation table).
+P39N_GIT_BADFMT_OUT="$WORKDIR/p39n_git_badfmt_out.txt"
+(LC_ALL=C git -C "$P39N_REPO" push origin "master:refs/heads/../escape") > "$P39N_GIT_BADFMT_OUT" 2>&1
+check "phase39 oracle: real git rejects refs/heads/../escape before connecting (exit 128)" \
+    test $? = 128
+check "phase39 oracle: real git's bad-dst-format rejection never attempted a connection" \
+    sh -c "! grep -qi 'failed to connect\|couldn.t connect' '$P39N_GIT_BADFMT_OUT'"
+
+P39N_SG_BADFMT_OUT="$WORKDIR/p39n_sg_badfmt_out.txt"
+(cd "$P39N_REPO" && "$SG" push origin "master:refs/heads/../escape") > "$P39N_SG_BADFMT_OUT" 2>&1
+check "phase39: sg push with an invalid dst format fails" test $? = 1
+check "phase39: sg push with an invalid dst format reports invalid refspec" \
+    grep -q "invalid refspec" "$P39N_SG_BADFMT_OUT"
+
+# review round: a dst naming a leading-dot path component (sg_ref_name_valid_
+# for_create's ".hidden" fix) must be caught by this same dst-format gate,
+# before connecting -- same divergence shape (git 128, sg 1), same pinning.
+P39N_GIT_DOTFMT_OUT="$WORKDIR/p39n_git_dotfmt_out.txt"
+(LC_ALL=C git -C "$P39N_REPO" push origin "master:refs/heads/.hidden") > "$P39N_GIT_DOTFMT_OUT" 2>&1
+check "phase39 oracle: real git rejects refs/heads/.hidden before connecting (exit 128)" \
+    test $? = 128
+check "phase39 oracle: real git's dotfile-dst rejection never attempted a connection" \
+    sh -c "! grep -qi 'failed to connect\|couldn.t connect' '$P39N_GIT_DOTFMT_OUT'"
+
+P39N_SG_DOTFMT_OUT="$WORKDIR/p39n_sg_dotfmt_out.txt"
+(cd "$P39N_REPO" && "$SG" push origin "master:refs/heads/.hidden") > "$P39N_SG_DOTFMT_OUT" 2>&1
+check "phase39: sg push with a dst naming a leading-dot component fails" test $? = 1
+check "phase39: sg push with a dst naming a leading-dot component reports invalid refspec" \
+    grep -q "invalid refspec" "$P39N_SG_DOTFMT_OUT"
+check "phase39: sg's dotfile-dst rejection never attempted a connection either" \
+    sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect' '$P39N_SG_DOTFMT_OUT'"
+
+# wildcard refspecs and the bare push-matching ":" are real git features
+# this milestone deliberately does not implement (docs/DESIGN.md Phase 39
+# section 6) -- real git actually tries to connect for both (measured: it
+# fails with a connection error, not a refspec error), so there is no
+# matching divergence pair to pin here, only sg's own named rejection.
+P39N_SG_WILDCARD_OUT="$WORKDIR/p39n_sg_wildcard_out.txt"
+(cd "$P39N_REPO" && "$SG" push origin 'refs/heads/*:refs/heads/*') > "$P39N_SG_WILDCARD_OUT" 2>&1
+check "phase39: sg push of a wildcard refspec fails" test $? = 1
+check "phase39: sg push of a wildcard refspec reports it as unsupported" \
+    grep -q "wildcard refspec" "$P39N_SG_WILDCARD_OUT"
+check "phase39: sg's wildcard rejection never attempted a connection" \
+    sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect' '$P39N_SG_WILDCARD_OUT'"
+
+P39N_SG_MATCHING_OUT="$WORKDIR/p39n_sg_matching_out.txt"
+(cd "$P39N_REPO" && "$SG" push origin ":") > "$P39N_SG_MATCHING_OUT" 2>&1
+check "phase39: sg push of a bare ':' (push matching) fails" test $? = 1
+check "phase39: sg push of a bare ':' reports it as unsupported" \
+    grep -q "not supported" "$P39N_SG_MATCHING_OUT"
+
+# src resolution happens before connecting too, and a src matching nothing
+# aborts the WHOLE push -- not one ref pushed, not even a connection
+# attempt (docs/DESIGN.md Phase 39 section 1). Confirmed against real git
+# 2.55.0 by hand: "git push <url> mainbr:newbr nosuchbranch:x" against a
+# genuinely unreachable URL prints only "src refspec ... does not match
+# any" / "failed to push some refs", no connection-failure text, exit 1 on
+# BOTH sides (this one is NOT part of the 128-vs-1 divergence: git's own
+# exit code here is already 1).
+P39N_GIT_BADSRC_OUT="$WORKDIR/p39n_git_badsrc_out.txt"
+(LC_ALL=C git -C "$P39N_REPO" push origin "master:newbr" "nosuchbranch:x") > "$P39N_GIT_BADSRC_OUT" 2>&1
+check "phase39 oracle: real git's src-does-not-match-any is exit 1, not 128" test $? = 1
+check "phase39 oracle: real git's bad-src abort never attempted a connection" \
+    sh -c "! grep -qi 'failed to connect\|couldn.t connect' '$P39N_GIT_BADSRC_OUT'"
+check "phase39 oracle: real git reports the bad src by name" \
+    grep -q "nosuchbranch" "$P39N_GIT_BADSRC_OUT"
+
+P39N_SG_BADSRC_OUT="$WORKDIR/p39n_sg_badsrc_out.txt"
+(cd "$P39N_REPO" && "$SG" push origin "master:newbr" "nosuchbranch:x") > "$P39N_SG_BADSRC_OUT" 2>&1
+check "phase39: sg push with an unresolvable src aborts the whole push" test $? = 1
+check "phase39: sg push reports the bad src does not match any" \
+    grep -q "src refspec nosuchbranch does not match any" "$P39N_SG_BADSRC_OUT"
+check "phase39: sg's bad-src abort never attempted a connection" \
+    sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect' '$P39N_SG_BADSRC_OUT'"
 
 # --- Phase 6a: content-defined chunking for large/binary files ---
 
@@ -1888,6 +2169,47 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         check "phase6a: that push transfers every chunk of the newly added file to the remote" \
             p6a_all_chunks_present_on_remote "$P6A_HTTP_SERVERROOT/repo.git" "$P6A_CHUNK_IDS2"
 
+        # --- Round 3 item C: a single-refspec push whose sole candidate is
+        # REJECTED (non-fast-forward) must leave the remote entirely
+        # untouched -- including refs/sg/chunks, even when this repo has
+        # real pending chunk state to send. Before the round-3 fix,
+        # entry_count == 0 alone gated the chunks-propagation block, so a
+        # rejected single refspec (entries stays empty, had_rejection = 1)
+        # fell through into that unconditional block and actually wrote
+        # refs/sg/chunks to the remote, plus printed a spurious "To <url>"
+        # line -- a real write for a push whose one and only refspec was
+        # refused, contradicting pre-Phase-39 behavior.
+        head -c 5242880 /dev/urandom > "$P6A_HTTP_DEST/big3.bin" 2>/dev/null
+        (cd "$P6A_HTTP_DEST" && "$SG" add big3.bin) > /dev/null 2>&1
+
+        P6A_R3_CHUNKS_REMOTE_BEFORE=$(git -C "$P6A_HTTP_SERVERROOT/repo.git" rev-parse refs/sg/chunks 2>/dev/null)
+        P6A_R3_LOCAL_CHUNKS=$(git -C "$P6A_HTTP_DEST" rev-parse refs/sg/chunks 2>/dev/null)
+        # Fixture premise, asserted rather than assumed: this push must have
+        # real refs/sg/chunks work pending, otherwise the check below would
+        # go green even with the bug still present.
+        check "phase39 round3 setup: local refs/sg/chunks is ahead of the remote's before the rejected push" \
+            test -n "$P6A_R3_LOCAL_CHUNKS" -a "$P6A_R3_LOCAL_CHUNKS" != "$P6A_R3_CHUNKS_REMOTE_BEFORE"
+
+        P6A_R3_ALT_SRC="$WORKDIR/phase6a_round3_alt_src"
+        (cd "$WORKDIR" && git clone -q "$P6A_HTTP_SERVERROOT/repo.git" phase6a_round3_alt_src) > /dev/null 2>&1
+        (cd "$P6A_R3_ALT_SRC" && git config user.email "p6ar3@example.com" && git config user.name "p6ar3 tester")
+        (cd "$P6A_R3_ALT_SRC" && git checkout -q --orphan p39c-reject && git reset -q --hard)
+        printf 'phase39 round3 unrelated commit\n' > "$P6A_R3_ALT_SRC/unrelated.txt"
+        (cd "$P6A_R3_ALT_SRC" && git add unrelated.txt && git commit -q -m "phase39 round3 unrelated commit")
+        (cd "$P6A_R3_ALT_SRC" && git push -q origin p39c-reject) > /dev/null 2>&1
+
+        P6A_R3_REMOTE_SNAPSHOT_BEFORE=$(git -C "$P6A_HTTP_SERVERROOT/repo.git" for-each-ref)
+
+        P6A_R3_OUT="$WORKDIR/p6a_round3_reject_out.txt"
+        (cd "$P6A_HTTP_DEST" && "$SG" push origin "HEAD:refs/heads/p39c-reject" < /dev/null) > "$P6A_R3_OUT" 2>&1
+        check "phase39: a single non-fast-forward refspec push exits non-zero" test $? -ne 0
+
+        P6A_R3_REMOTE_SNAPSHOT_AFTER=$(git -C "$P6A_HTTP_SERVERROOT/repo.git" for-each-ref)
+        check "phase39: a single rejected refspec push leaves the ENTIRE remote untouched, including refs/sg/chunks" \
+            test "$P6A_R3_REMOTE_SNAPSHOT_BEFORE" = "$P6A_R3_REMOTE_SNAPSHOT_AFTER"
+        check "phase39: a single rejected refspec push prints no 'To <url>' line" \
+            sh -c "! grep -q '^To ' '$P6A_R3_OUT'"
+
         kill "$HTTP_SERVER_PID" 2>/dev/null
         HTTP_SERVER_PID=""
     fi
@@ -1902,6 +2224,10 @@ else
     skip "phase6a: a push with only refs/sg/chunks behind does not short-circuit to Everything up-to-date"
     skip "phase6a: that push advances the remote's refs/sg/chunks to the local keep-alive commit"
     skip "phase6a: that push transfers every chunk of the newly added file to the remote"
+    skip "phase39 round3 setup: local refs/sg/chunks is ahead of the remote's before the rejected push"
+    skip "phase39: a single non-fast-forward refspec push exits non-zero"
+    skip "phase39: a single rejected refspec push leaves the ENTIRE remote untouched, including refs/sg/chunks"
+    skip "phase39: a single rejected refspec push prints no 'To <url>' line"
 fi
 
 # --- Phase 6b: chunk durability (refs/sg/chunks keep-alive) and the
@@ -2926,7 +3252,7 @@ check "phase9 case5: unmerged branch gone after the forced delete" test $? != 0
 
 # case 6: invalid creation names -- sg rejects each, and real git's
 # check-ref-format agrees every one is invalid
-for bad in 'a..b' 'a b' 'a.lock' 'HEAD' 'a/' '@{x}'; do
+for bad in 'a..b' 'a b' 'a.lock' 'HEAD' 'a/' '@{x}' '.hidden' 'x/.hidden'; do
     (cd "$P9B_REPO" && "$SG" branch "$bad") > /dev/null 2>&1
     check "phase9 case6: sg rejects invalid creation name '$bad'" test $? = 1
     (cd "$P9B_REPO" && git check-ref-format --branch "$bad") > /dev/null 2>&1
@@ -3066,7 +3392,7 @@ check "phase12 case6: stale packed line purged as part of the delete" test $? !=
 
 # case 7: invalid creation names -- sg rejects each, and real git's
 # check-ref-format --tag agrees every one is invalid
-for bad in 'a..b' 'a b' 'a.lock' 'HEAD' 'a/' '@{x}'; do
+for bad in 'a..b' 'a b' 'a.lock' 'HEAD' 'a/' '@{x}' '.hidden' 'x/.hidden'; do
     (cd "$P12_REPO" && "$SG" tag "$bad") > /dev/null 2>&1
     check "phase12 case7: sg rejects invalid creation name '$bad'" test $? = 1
     (cd "$P12_REPO" && git check-ref-format --tag "$bad") > /dev/null 2>&1

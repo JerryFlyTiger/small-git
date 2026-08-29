@@ -5472,3 +5472,397 @@ side because `gates.sh` had cleaned `build/`.
 evidence about this machine, not about the code, whenever an external tool is
 the oracle. Every knob that changes the oracle's output has to be named on the
 command line.
+
+## Phase 39: refspec support for `sg push`
+
+All measurements below are against real git 2.55.0, `LC_ALL=C`, done by hand
+against a scratch fixture (a bare `remote.git` served locally). Before this
+phase `sg push` only ever took a bare ref name (or none at all); there was no
+refspec parser anywhere in the project. This phase adds `[+]<src>[:<dst>]`
+support and `--delete <name>...`, entirely inside `src/cli/cmd_push.c` --
+`include/sg/*.h` was deliberately left untouched (see section A below).
+
+### 0. Syntax, `[+]<src>[:<dst>]`
+
+1. **Split on the LAST `:`, not the first** (`strrchr`, not `strchr`).
+   Measured: `a:b:c:d` reports src `a:b:c`, dst `d`; `aaa:bbb:ccc` reports
+   src `aaa:bbb`, dst `ccc`.
+2. No colon at all -> only `<src>`; dst is derived by the SAME literal
+   tag/branch lookup this command always used (section 1 below explains why
+   this is deliberately not the same code path as an explicit dst's src
+   resolution).
+3. `:<dst>` (empty src) -> delete `<dst>`.
+4. `<src>:` (empty dst) -> error, git prints `fatal: invalid refspec
+   '<the whole original argument>'`.
+5. A leading `+` forces just THAT ONE refspec. `+:dst` (forced delete) is
+   legal and is exactly a delete.
+6. `--force`/`-f` forces every refspec in the invocation (measured: a single
+   `--force` forced two independent refspecs at once).
+7. `--delete <name>...` deletes each name in turn; ANY of them containing a
+   `:` rejects the WHOLE command with `fatal: --delete only accepts plain
+   target ref names`.
+
+Implemented as `sg_push_refspec_parse` (non-static, but deliberately not
+declared in any header -- the same "internal but linkable" convention
+`sg_parse_push_report_status` in `src/net/transport.c` already used, so
+`tests/test_refspec.c` can `extern` it without a network round trip). Pure
+syntax, no I/O at all.
+
+### 1. `<src>` resolution -- done BEFORE connecting, and it is NOT a peeling lookup
+
+- The full rev-parse grammar (`HEAD`, `~N`/`^N`/`@{N}`, a full hex id) is only
+  used for an EXPLICIT-dst refspec (`<src>:<dst>`). A no-colon refspec keeps
+  the pre-Phase-39 literal name lookup (checks `refs/tags/<name>` then
+  `refs/heads/<name>` for an exact match, nothing else) -- confirmed against
+  real git: `git push origin HEAD~1` (no colon, not a real ref name) fails
+  with the SAME "src refspec ... does not match any" message as a
+  completely bogus name, because without an explicit dst git has no way to
+  derive one from a rev expression either. Only when a dst is given
+  explicitly does the richer grammar make sense (git can name the target
+  ref unambiguously either way).
+- **An annotated tag given as `<src>` is NOT peeled.** Measured: after
+  `v2:refs/tags/v2copy`, the remote's `refs/tags/v2copy` is a **tag**
+  object, not the commit it points at. This means `resolve_refspec_src`
+  cannot be `sg_rev_parse_commit` (`include/sg/revparse.h`), which peels by
+  definition -- it must instead try an EXACT ref lookup first
+  (`refs/tags/<src>`, `refs/heads/<src>`, or `<src>` itself if already
+  `refs/`-qualified), taking whatever raw id is stored there, and only fall
+  back to `sg_rev_parse_commit` when none of those literal lookups match
+  (this is also the path that makes `HEAD`, `~`/`^`/`@{N}`, and a bare hex
+  id work as an explicit-dst src).
+- `HEAD` works even while detached (measured: `HEAD:refs/heads/fromdetached`
+  succeeds) -- the pre-Phase-39 "detached HEAD is rejected" gate in
+  `sg_cmd_push` only guards the no-name-given path, and must not be
+  generalized to the refspec path.
+- `<src>` matching both a local tag and a local branch is still rejected
+  (`src refspec '%s' matches more than one`), same wording as before Phase
+  39, now applied per-refspec inside a loop instead of once for a single
+  name.
+- **A `<src>` that resolves to nothing aborts the ENTIRE push, before any
+  network round trip** -- not a per-ref skip. Measured: `git push origin
+  topic:newbr2 nosuch:x` against a real remote leaves `refs/heads/newbr2`
+  **not created**, rc=1, and the output is exactly two lines with no `To
+  <url>` line at all:
+  ```
+  error: src refspec nosuch does not match any
+  error: failed to push some refs to '<url>'
+  ```
+  Also measured directly (by hand, unreachable URL, so a stray network
+  attempt would show up as a curl error): git's own exit code here is
+  already **1**, not 128 -- this case is NOT part of the 128-vs-1 exit-code
+  divergence in section 5, only genuine refspec SYNTAX errors are.
+
+### 2. `<dst>` completion -- done AFTER the advertisement is known
+
+Three ordered rules, each measured directly against git's own error text:
+
+1. `<dst>` starts with `refs/` -> used as-is.
+2. **Rule 1**: does the remote already have a ref that some
+   `refs/<dst>`/`refs/tags/<dst>`/`refs/heads/<dst>`/`refs/remotes/<dst>`
+   guess matches? If so, use that guessed path. Measured and pinned: with
+   the remote already holding `refs/heads/fromhead`, `v1:fromhead` (src is a
+   TAG) updates `refs/heads/fromhead` -- it does **not** also create
+   `refs/tags/fromhead`. Rule 1 wins even though src's own namespace would
+   suggest rule 2.
+3. **Rule 2**: if `<src>` is itself a ref under `refs/heads/` or
+   `refs/tags/` (i.e. it came from an EXACT literal match in section 1, not
+   the rev-parse fallback), prefix that ref's whole namespace onto the
+   entire dst string. Measured: `master:notrefs/x` builds
+   `refs/heads/notrefs/x` (the WHOLE dst string gets the prefix, not just
+   its last segment). Rule 2 never applies to a `--delete`/`:dst` deletion
+   (there is no src to take a namespace from).
+4. Neither rule fires -> hard error, git prints `error: The destination you
+   provided is not a full refname (i.e., starting with "refs/").` (plus
+   more hint lines this project does not reproduce, output text is
+   explicitly out of scope, see section 6.3).
+
+Implemented as `complete_dst`, called once per candidate inside the same
+loop that used to do only fast-forward checking. **Whether a dst-completion
+hard error (rule 4) aborts the whole batch or is a per-ref skip: measured by
+the main conversation in the review round.** `git push origin topic:okbranch
+<sha>:cannotqualify` against a real bare remote exits 1, prints only "The
+destination you provided is not a full refname ..." (no `To <url>` line and
+no per-ref report), and the remote afterward has NOT gained
+`refs/heads/okbranch` -- i.e. **whole-batch abort**, the same shape as a
+syntax error, confirming this implementation's conservative reading of
+git's `die()`-style wording was the correct one. No code change was needed.
+
+### 3. `<dst>` format validation -- a brand-new free-input pipeline
+
+Before this phase, every dst was program-constructed
+(`"refs/heads/" + name`) and every user-typed name had already gone through
+`sg_ref_name_valid_for_create` at ref-CREATION time somewhere upstream. An
+explicit `<dst>` breaks both assumptions: it is free-form user text that
+gets `snprintf`'d straight into a pkt-line line sent to the remote. Measured
+tolerance (`git push origin master:<dst>`):
+
+| dst | git |
+|---|---|
+| `refs/heads/ok1` | success |
+| `notrefs/x` | success (rule 2 -> `refs/heads/notrefs/x`) |
+| `refs/heads/../escape` | `fatal: invalid refspec '<original arg>'` |
+| `refs/heads/a..b` | same |
+| `refs/heads/a b` (space) | same |
+| `refs/heads/a~1` / `refs/heads/a^` | same |
+| `refs/heads/a\b` | same |
+| `refs/heads/.hidden` | same |
+| `refs/heads/end.lock` | same |
+| `refs/heads/` (trailing slash) | same |
+| `refs/heads/a//b` | same |
+| dst containing an ESC byte | same |
+
+`sg_ref_name_valid_for_create` (`include/sg/refs.h`) already implements
+check-ref-format-level validation and was reused as-is here -- **do not add
+a second copy**. It now agrees with every row above. **Review-round fix**:
+the first cut of this phase left one gap, reported rather than silently
+widened -- `refs/heads/.hidden` (a path component starting with `.`) was
+rejected by real git but ACCEPTED by `sg_ref_name_valid_for_create`, because
+the function only checked for a literal `".."` substring, never a
+leading-`.` path COMPONENT. The main conversation asked for this to be
+fixed in the shared validator (not approximated in `cmd_push.c`), reasoning
+that shipping a known-wrong validator on a brand-new free-input pipeline was
+worse than fixing it, and that the fix also corrects `sg branch`/`sg tag`
+(which had the same bug: `sg branch .hidden` and `sg branch x/.hidden` both
+used to exit 0 and create the ref, where real git's `git branch .hidden`
+exits 128). `sg_ref_name_valid_for_create` gained exactly one added rule:
+no `/`-separated path component may start with `.` (the first component is
+covered by checking `name[0] == '.'` directly, every later component by
+scanning for `/.`). No other rule was touched -- the table above already
+showed the other 19 measured names agreeing with git before this fix, and
+touching them would have manufactured a new divergence nobody asked for.
+`tests/test_ref_name_dot.c` pins the full 21-row table as regression
+coverage; `tests/interop.sh` pins `.hidden`/`x/.hidden` against real git for
+`sg branch`, `sg tag`, and `sg push origin master:refs/heads/.hidden`
+(the last one via the unreachable-URL technique, confirming the rejection
+happens before connecting, same as the rest of this section).
+
+**Validation timing**: whenever `<dst>` (or a bare `--delete` name) already
+starts with `refs/`, it is validated immediately in
+`sg_push_refspec_parse`/the `--delete` argument loop, BEFORE connecting --
+confirmed against real git by hand with an unreachable URL: `git push
+<unreachable> master:refs/heads/../escape` fails with the invalid-refspec
+message and no connection-attempt text at all. Every measured row above is
+already `refs/`-prefixed as given, so this covers 100% of the measured
+table with a pure string check. Only the rule-1/rule-2 GUESSED path (dst
+not already `refs/`-prefixed) defers validation until after
+`complete_dst`'s guessing, since the final path isn't known any earlier;
+`complete_dst` revalidates that guessed/rule-2-constructed path too, as
+defense in depth against a corrupt or hostile advertisement.
+
+### 4. Deletion
+
+- Protocol-wise a deletion is just `new_id` = all-zero; `sg_push_ref_update`
+  (`include/sg/transport.h`) already supports this, `src/net/transport.c`
+  needed no changes at all.
+- Deletion candidates are a THIRD kind, branched off at candidate-
+  construction time (`push_entry.is_delete`), not threaded through the
+  existing branch/tag `if`s with an `is_zero` check bolted on. Three
+  call sites assume `new_id` names a readable object and must never see a
+  deletion: `check_fast_forward` (would `sg_object_read` a zero id),
+  `walk_add_object` (would abort the whole pack build), and
+  `print_lost_commits` (would treat zero as a real ancestor root). All three
+  are explicitly skipped for `is_delete` entries.
+- Deleting a ref the remote doesn't have is a per-ref failure (not a batch
+  abort): `sg: unable to delete '<name>': remote ref does not exist`, rc=1,
+  `had_rejection=1`, the loop continues to the next candidate. Matches
+  git's own `error: unable to delete '<name>': remote ref does not exist`
+  in spirit (message text itself is explicitly out of scope, section 6.3).
+- `--delete` accepts both a short name and a full `refs/...` path (measured:
+  `--delete refs/tags/baz` works), and combines fine with `--force`
+  (measured rc=0; force is simply irrelevant to a deletion's own logic,
+  which never fast-forward-checks anything).
+
+### 5. Per-ref failure vs. whole-batch abort -- and a pre-existing bug this phase's fixture exposed
+
+| situation | when | already-successful refs land? | rc |
+|---|---|---|---|
+| `<src>` resolves to nothing | before connecting | **no, none of them** | 1 |
+| refspec syntax error (empty dst, `--delete` with a colon) | before connecting | no | git 128 -> **sg 1** |
+| dst completion hard error | after the advertisement | batch-abort (confirmed against real git, see section 2) | 1 |
+| non-fast-forward rejection | after the advertisement | **yes** (measured: `topic -> newbr` lands, `master -> fromhead` in the SAME push is refused) | 1 |
+| delete of a nonexistent remote ref | after the advertisement | per-ref | 1 |
+
+**Exit code**: git uses 128 for a client-side refspec syntax error, but this
+project's convention is "exit codes are only ever 0 or 1" (`CLAUDE.md`). sg
+uses 1 for the same case, message text borrowed from git's own wording.
+This is a **deliberate, named divergence**, pinned on both sides in
+`tests/interop.sh` (git-side 128, sg-side 1, for: an empty dst, `--delete`
+with a colon, and an already-`refs/`-prefixed malformed dst) -- see the
+project-wide divergence list below.
+
+**The non-fast-forward row above was a real, pre-existing design bug this
+phase's own multi-refspec test fixture exposed, not a new requirement
+invented for Phase 39.** Before this phase a push could only ever carry ONE
+non-tag ref (a single branch, or none), so `check_fast_forward`'s
+`SG_PUSH_NON_FF`/`SG_PUSH_UNKNOWN_REMOTE` handling doing `goto done` (a
+whole-batch abort) was unobservable as a bug -- there was never a SECOND ref
+in the same invocation for the abort to wrongly take down. Once refspecs let
+one invocation carry two independent branches, the abort became directly
+observable: pushing a fast-forwardable ref alongside a non-fast-forward one
+in a single `sg push` command discarded the good one too, contradicting the
+measured git behavior above and contradicting the tag path's and the
+deletion path's own per-ref-skip convention (`had_rejection=1; continue;`),
+which sat right next to it in the same function. Fixed by changing both
+`goto done`s to the same `had_rejection=1; continue;` shape. A single-ref
+push's own observable behavior (message text, exit code, no ref landing) is
+unchanged by this fix -- verified via `bash tests/interop.sh` staying fully
+green on every pre-existing phase5c push check.
+
+**A second, purely mechanical bug found by the same fixture**: `complete_dst`
+left `old_id_out` uninitialized (stack garbage) whenever the guessed/
+completed dst did not match any advertised ref (the ordinary "this is a
+brand new ref" case) -- `remote_exists_out` was correctly set to 0, but
+`old_id_out` was never memset, and the garbage bytes were then sent to the
+remote as the ref update's compare-and-swap `old_id`. Real git's
+`git-receive-pack` correctly rejected this (`unable to resolve reference`)
+every time, so the bug was 100% reproducible on the very first explicit-dst
+push, not a rare race -- caught immediately when running the phase's own
+interop fixture, not by any pre-existing test (there was nothing before
+Phase 39 that could ever leave old_id uninitialized this way). Fixed by an
+unconditional `memset(old_id_out, 0, SG_SHA1_RAW_LEN)` before the
+scan-for-a-match loop.
+
+### 6. Deliberately excluded, named rejection (not approximated)
+
+Same treatment as `-C -C`/`--find-copies-harder` (Phase 33) and `-c`/`--cc`
+plus an explicit `<rev>` (Phase 34): reject with a specific message, don't
+guess.
+
+1. **Wildcard refspecs** (`refs/heads/*:refs/heads/*`) -- rejected outright.
+   Measured: real git actually implements this (it is a real feature, not
+   invalid syntax) and DOES attempt to connect to the remote for it, so
+   there is no matching exit-code divergence to pin here the way there is
+   for the syntax-error cases in section 5 -- only sg's own rejection
+   behavior is checked in `tests/interop.sh`.
+2. **The bare push-"matching" `:`** (and `+:`) -- same treatment, same
+   reasoning (real git also tries to connect for this one).
+3. **Push output is not required to be byte-for-byte identical to git's.**
+   The pre-existing sg push report style (`" * [new %s] ..."`,
+   `"   %.7s..%.7s ..."`) is kept and extended with one new line style for
+   deletions (`" - [deleted]  <name> -> <remote>/<name>"`); this milestone's
+   acceptance criterion is "which refs changed to what, and the exit code",
+   not the report text. **This is a known, accepted gap, recorded here
+   rather than hidden.**
+
+### A. Why no new header
+
+Per this project's own convention (`tests/test_push_report.c`,
+`tests/test_refadv.c`): a function that needs unit tests but has no other
+caller outside its own `.c` file is made non-static and declared via
+`extern` in the test file, rather than promoted to a public header just for
+testability. `sg_push_refspec_parse`/`sg_push_refspec_free` follow this
+exactly; `resolve_refspec_src` and `complete_dst` stay `static` (only
+covered by `tests/interop.sh`, no direct unit test, since they need real
+on-disk refs / an advertisement to exercise meaningfully).
+
+### B. Data model
+
+`push_entry` (previously: `name` + program-derived `ref_path`, nothing
+else) gained: `is_delete`, `explicit_dst` (still awaiting `complete_dst`),
+`refspec_force` (this candidate's own leading `+`, ORed with the global
+`--force` at fast-forward-check time as `cand_force`), `dst_raw` (raw
+`<dst>` text pending completion), `raw_arg`/`src_exact_ref_path` (both
+owned, used only for messages and rule 2, freed alongside `name`/`ref_path`
+in `push_entry_free_all`). No other struct in `include/sg/*.h` was touched.
+
+**Round 3 cold-read fix**: an initial `src_display` field (meant to hold the
+user's raw `<src>` text for the report line) was allocated and freed but
+never actually read anywhere -- the report line has always printed
+`e->name` for both sides (`"%s -> %s/%s"`, `e->name`, remote, `e->name`),
+never a distinct src string. Per section 6.3 above ("push output is not
+required to be byte-for-byte identical to git's" -- the pre-existing sg
+report style is a known, accepted gap), changing the report line to print
+git's own raw-src convention would be a bigger, unrequested behavior change
+than this milestone's own stated scope. Decision: removed the dead field
+rather than wiring it up, and recorded here instead of leaving a
+write-only field with a comment claiming a use that doesn't exist.
+
+The candidate/entries split from before Phase 39 is unchanged in shape
+(`candidates` built before the advertisement, `entries` built after), just
+now the candidates loop distinguishes three shapes instead of two: already-
+fully-resolved (legacy `--tags`/no-colon path, `explicit_dst == 0`),
+pending explicit-dst (`explicit_dst == 1, is_delete == 0`), and pending
+delete (`explicit_dst == 1, is_delete == 1`) -- the last two share
+`complete_dst`, differing only in whether rule 2 is allowed to fire.
+
+The remote-tracking-ref-update loop at the very end of `sg_cmd_push` used to
+`break` after the FIRST non-tag entry, because a push could only ever carry
+one branch. With multiple branches now possible in one push, it updates
+`refs/remotes/<remote>/<name>` for EVERY non-tag, non-delete entry instead
+(a deletion's local remote-tracking ref is deliberately left alone by this
+milestone -- real git does remove it, but that is a separate, un-scoped
+piece of behavior, recorded here rather than silently added).
+
+### C. Round 3: a cold read plus main-conversation measurement found five more bugs
+
+1. **Memory leak on every `-1` return of `sg_push_refspec_parse` that
+   happens after `out->src`/`out->dst` are already allocated**
+   (`src/cli/cmd_push.c`, the two `return -1`s inside the function, plus its
+   only caller). The header comment promised "*out is zeroed but not
+   otherwise meaningfully filled on -1", the code didn't honor it. Fixed by
+   calling `sg_push_refspec_free(out)` + `memset` before each of those two
+   returns, and defensively also freeing at the call site. Manually
+   confirmed with a 2,000,000-iteration loop harness calling
+   `sg_push_refspec_parse("master:refs/heads/../escape", ...)` without
+   freeing: pre-fix peak footprint ~98 MB, post-fix ~1.7 MB for the same
+   iteration count -- `/usr/bin/leaks --atExit` on a SINGLE invocation
+   reported 0 leaks either way (a known blind spot of that conservative
+   scanner for a small malloc whose owning stack frame has already
+   returned, see CLAUDE.md's leak-detection section), so the loop harness
+   was needed to get a signal at all. This is exactly the shape that goes
+   unnoticed on macOS (no `detect_leaks` support) but turns red on CI's
+   ubuntu ASan job (`detect_leaks=1`), where LeakSanitizer's `atexit` hook
+   overwrites the process exit code -- `tests/interop.sh` already has an
+   unconditional (non-`HTTP_AVAILABLE`) check that hits this exact path
+   (`sg push origin master:refs/heads/../escape`, asserting exit 1).
+2. **A multi-segment `<dst>` was truncated to its last path segment**
+   (`src/cli/cmd_push.c`, the candidate-completion loop): rule 2 can
+   complete `master:notrefs/x` to `refs/heads/notrefs/x`, but `name` was
+   taken via `strrchr(completed_path, '/')`, giving `"x"` instead of
+   `"notrefs/x"` -- this fed a wrong `refs/remotes/<remote>/<name>` path
+   and a factually wrong report line. Fixed by stripping the known
+   `refs/heads/`/`refs/tags/` prefix (the whole remainder, not the last
+   segment) and only falling back to the last-segment rule for a completed
+   path under neither namespace. Pinned by a new HTTP interop check
+   asserting both `refs/heads/notrefs/x` on the remote AND
+   `refs/remotes/origin/notrefs/x` locally (not `.../x`).
+3. **A single-refspec push, once entirely rejected, still ran the
+   unconditional `refs/sg/chunks` propagation block**, writing to the
+   remote and printing a spurious `To <url>` line -- contradicting
+   pre-Phase-39 behavior where a rejected push never touched the remote
+   beyond the read-only advertisement. The gate `entry_count == 0 &&
+   !send_chunks_update` doesn't distinguish "everything already up to
+   date" (also `entry_count == 0`, `had_rejection == 0`) from "everything
+   was rejected" (`entry_count == 0`, `had_rejection == 1`). Fixed by
+   adding `if (had_rejection && entry_count == 0) goto done;` right after
+   the candidate loop, before the chunks block. Pinned by a new HTTP
+   interop check (extending the phase 6a chunked-push fixture, since it
+   already has real pending `refs/sg/chunks` state to send) asserting the
+   remote's ENTIRE `for-each-ref` output is byte-identical before and
+   after a rejected single-refspec push.
+4. **An unqualified `<dst>` matching more than one advertised ref (rule 1)
+   was silently resolved to whichever guessed prefix came first**
+   (`refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/`, in that order)
+   instead of being refused -- measured against real git 2.55.0: with the
+   remote holding both `refs/heads/dup` and `refs/tags/dup`, `topic:dup`
+   is rejected outright (`error: dst refspec dup matches more than one`),
+   not resolved to either one. `complete_dst`'s rule-1 loop used to stop
+   scanning at the first guess-prefix match; fixed to scan every prefix,
+   count matches, and return a new `-4` ("ambiguous", message already
+   printed: `sg: dst refspec '%s' matches more than one`) when more than
+   one matches. Pinned by a new HTTP interop check (setting up the
+   colliding branch/tag pair first via explicit `refs/...`-prefixed
+   pushes, which bypass the ambiguity check entirely) plus a `phase39
+   oracle:` check confirming real git also rejects it (run under
+   `LC_ALL=C`, since this machine's git is zh_TW-localized and translates
+   the message).
+5. **`resolve_refspec_src`'s `-3` (allocation failure) was handled the
+   same way as `-1` ("src matches nothing")** -- setting
+   `src_resolve_failed` and `continue`-ing to parse the rest of the batch,
+   instead of aborting immediately like every other OOM path in this
+   function. Fixed to `fprintf` + `goto done` immediately on `-3`, matching
+   the rest of `sg_cmd_push`'s OOM convention.
+
+Item E above (`src_display`) was also found in this same cold read; its
+fix and reasoning are recorded inline in section B, next to the field it
+removed.
