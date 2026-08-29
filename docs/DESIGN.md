@@ -6316,3 +6316,66 @@ residual. But whether it does either is now a measurement, not a
 prediction -- `merge.c:430-447`'s trailing-newline special case exists
 *because* the comparison is has_nl-blind, and its behaviour after the swap
 is unknown until measured.
+
+### 4. Where the next step starts (anchors, so this is not re-surveyed)
+
+Line numbers are anchors as of this writing and may drift -- go by name.
+
+**The two calls to replace** (`src/workdir/merge.c`):
+
+| what | where |
+|---|---|
+| `sg_diff_lcs_table` called twice, base x ours and base x theirs | `merge.c:364-365` |
+| `lcs_matches`, merge.c's own backtrack, DP table -> `long *match` | `merge.c:283-313` |
+| the sync-point pass that turns two `match[]` into merged output | `merge.c:374-448` |
+| the trailing-newline special case (`is_final_line`, forcing `has_nl`) | `merge.c:430-447` |
+| binary short-circuit, `content_has_nul` on all three sides | `merge.c:343-356` |
+| conflict markers written | `merge.c:417-428` |
+
+`match[i]` is "base line i aligns to line N on the other side, or -1".
+`sg_diff_build_script` returns `sg_diff_group`s (`a_off/a_len`,
+`b_off/b_len`) instead, and **no converter between the two exists** -- the
+adapter is new code and needs its own coverage rather than being treated as
+plumbing.
+
+**The three call sites that inherit any behaviour change:**
+
+| caller | where | labels it passes |
+|---|---|---|
+| `sg merge` | `cmd_merge.c:141` | branch name (divergence #5) / `branch_arg` |
+| `sg rebase` | `cmd_rebase.c:177` | literal `"HEAD"` / `<short-sha> (<subject>)` |
+| `sg stash apply`/`pop` | `stash.c:1117`, `:1255` | `Updated upstream` / `Stashed changes` |
+
+`sg rebase` amplifies the risk: one rebase runs the three-way merge once per
+replayed commit, so an alignment change lands N times rather than once.
+
+**Existing tests that can legitimately go red on a re-alignment** (i.e. red
+does not immediately mean broken -- attribute before "fixing"):
+
+- `tests/test_merge_content.c`'s `test_both_changed_different_regions`
+  (byte-exact `expected` string) and `test_anchor_newline_not_glued`
+  (sensitive to where lines break).
+- Everything else in that file uses substring checks, and
+  `tests/test_merge_result_apply.c` plus interop's `phase4b`/`phase6d`
+  groups are existence/exit-code level, so they are insensitive to a legal
+  re-alignment. That insensitivity is the gap this phase exists to close;
+  `tests/fuzz_merge.py` is the only thing that measures it.
+
+**Acceptance is a measurement, not a green build.** Re-run both modes and
+report the actual numbers against the baseline in section 3:
+
+```
+python3 tests/fuzz_merge.py 200                     # baseline 59/200
+python3 tests/fuzz_merge.py 200 --no-newline-edits  # baseline 11/200
+python3 tests/fuzz_merge.py --attribute <keep-dir>  # then re-attribute
+```
+
+Either number growing is a regression. The attribution matters as much as
+the total: a change that halves the count while moving failures from
+`has_nl` into `material-differs` has made things worse, not better.
+
+**Do not write down "sg's three-way merge now matches git".** The sync-point
+layer is sg's own design, not a port of `xdl_merge`; making both 2-way
+alignments agree with git does not make the merge agree with git. How much
+of the 5.5% residual belongs to that layer rather than to alignment is
+unmeasured, and is answered by re-attributing after the swap.

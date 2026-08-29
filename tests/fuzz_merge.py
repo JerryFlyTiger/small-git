@@ -234,6 +234,64 @@ def one_round(rng, keep_dir, index, newline_edits=True):
         shutil.rmtree(parent, ignore_errors=True)
 
 
+# ------------------------------------------------------------------- attribute
+
+MARK = re.compile(r"^(<<<<<<< |=======$|>>>>>>> )")
+
+
+def attribute(root):
+    """Bucket saved failures by cause.
+
+    A diff-of-diffs would read "the same lines arranged differently" as
+    "different content", and that is exactly the distinction this phase turns
+    on, so the first split is by MULTISET of non-marker lines: the same
+    multiset means the two tools chose different boundaries for the same
+    material, a different multiset means content was lost or invented, which
+    no re-alignment excuses.
+
+    Run this again after any change to merge.c: the counts on their own
+    cannot say whether a change moved the right bucket.
+    """
+    import collections
+
+    def read(path):
+        with open(path) as fh:
+            return fh.read().splitlines(True)
+
+    buckets = collections.Counter()
+    total = 0
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        total += 1
+        kind = name.rsplit("_", 1)[1]
+        sgl, gil = read(os.path.join(d, "sg_result.txt")), read(os.path.join(d, "git_result.txt"))
+        sides = [read(os.path.join(d, n)) for n in ("base.txt", "ours.txt", "theirs.txt")]
+        no_nl = any(side and not side[-1].endswith("\n") for side in sides)
+        nonmark = lambda ls: [l for l in ls if not MARK.match(l)]
+        same_material = collections.Counter(nonmark(sgl)) == collections.Counter(nonmark(gil))
+        sg_marks = sum(1 for l in sgl if MARK.match(l))
+        gi_marks = sum(1 for l in gil if MARK.match(l))
+        if kind == "rc":
+            b = "rc/has_nl" if no_nl else "rc/other"
+        elif same_material and sg_marks == gi_marks:
+            b = "body/same-material-same-marker-count"
+        elif same_material:
+            b = "body/same-material-different-marker-count"
+        else:
+            b = "body/material-differs (has_nl)" if no_nl else "body/material-differs"
+        buckets[b] += 1
+
+    print("=== attribution over %d saved cases ===" % total)
+    for b, n in buckets.most_common():
+        print("  %-42s %3d" % (b, n))
+    nl = sum(n for b, n in buckets.items() if "has_nl" in b)
+    print()
+    print("  involving a missing trailing newline: %d / %d" % (nl, total))
+    return 0
+
+
 # ------------------------------------------------------------------------ main
 
 def main():
@@ -253,8 +311,15 @@ def main():
                          "remains is attributable to something else. A "
                          "correlation measured only with the cause switched "
                          "ON is not an attribution.")
+    ap.add_argument("--attribute", metavar="DIR",
+                    help="do not fuzz; bucket the failures already saved in "
+                         "DIR by cause and exit (see attribute()'s docstring "
+                         "for why the split is by multiset, not by diff)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    if args.attribute:
+        return attribute(args.attribute)
 
     if not os.path.exists(SG):
         print("fuzz_merge: %s not found -- run make first" % SG)
