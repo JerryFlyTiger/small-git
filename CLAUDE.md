@@ -846,6 +846,15 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   "branch name or 40-hex" fragment again. To list/delete refs under any
   prefix use `sg_ref_list_under`/`sg_ref_delete_under` (`prefix` must end
   with `/`).
+  **Exception: `sg push`'s explicit-dst refspec `<src>` (Phase 39,
+  `src/cli/cmd_push.c`'s `resolve_refspec_src`) must NOT use this
+  function** -- `sg_rev_parse_commit` peels annotated tags by definition,
+  but measured against real git: `v2:refs/tags/v2copy` leaves the remote's
+  `refs/tags/v2copy` as a **tag** object, not the commit it points at.
+  `resolve_refspec_src` tries an exact, unpeeled ref lookup first
+  (`refs/tags/<src>`/`refs/heads/<src>`/an already-`refs/`-qualified
+  `<src>`) and only falls back to `sg_rev_parse_commit` when none of those
+  literal lookups match.
 - **A user-supplied commit/tag message always goes through
   `sg_message_cleanup`** first (`include/sg/object.h`), otherwise the
   resulting object id differs from real git's. **The exception is
@@ -895,10 +904,53 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   deletion, then stage a deletion of that same path, then pop -- sg rejects
   it while real git does not (the same "ours is HEAD, not the index" rule).
   Details in Phase 21 of `docs/DESIGN.md`.
+- **`sg push` gained refspec support (`[+]<src>[:<dst>]`) and
+  `--delete <name>...` in Phase 39** (`src/cli/cmd_push.c`, no header
+  changes -- see the Phase 39 section of `docs/DESIGN.md` for why). Three
+  things are especially easy to get backwards:
+  1. **Split on the LAST `:`, not the first** (`strrchr`). Measured:
+     `a:b:c:d` reports src `a:b:c`, dst `d`.
+  2. **An annotated tag given as `<src>` is never peeled** -- `<src>`
+     resolution must not be `sg_rev_parse_commit` (see that function's own
+     entry above for why, and the exact fallback order).
+  3. **"`<src>` matches nothing" and "non-fast-forward" are two different
+     failure classes, do not conflate them.** A src that resolves to
+     nothing aborts the WHOLE push before any network round trip -- not one
+     ref lands, not even a connection attempt (measured: `git push origin
+     topic:newbr2 nosuch:x` leaves `newbr2` uncreated). A non-fast-forward
+     rejection, by contrast, is a PER-REF failure discovered only after the
+     advertisement arrives -- a fast-forwardable ref in the SAME invocation
+     still lands (measured: `topic -> newbr` succeeds alongside a refused
+     `master -> fromhead`). Before Phase 39 a push could only ever carry one
+     non-tag ref, so the pre-existing `check_fast_forward` rejection path
+     doing a whole-batch `goto done` was unobservable as a bug; Phase 39's
+     own multi-refspec fixture exposed it directly (a good ref got
+     discarded alongside a bad one in the same push) and it was fixed to
+     `had_rejection=1; continue;`, the same per-ref shape the tag-rejection
+     and delete-target-missing paths already used right next to it.
+  4. **An unqualified `<dst>` that matches MORE THAN ONE advertised ref is
+     refused, not guessed at.** Measured: with both `refs/heads/dup` and
+     `refs/tags/dup` on the remote, `git push origin topic:dup` prints
+     `error: dst refspec dup matches more than one` and changes neither.
+     `complete_dst`'s rule-1 loop therefore has to scan **every** guess
+     prefix and count matches -- a "stop at the first hit" loop silently
+     writes to whichever prefix comes first in `guess_prefixes[]`, i.e. to a
+     ref the user never named. Same shape as the pre-existing
+     `src refspec '%s' matches more than one` rule one layer up.
+  5. **A push where every requested ref was rejected must touch the remote
+     nowhere at all**, hence `if (had_rejection && entry_count == 0) goto
+     done;` between the candidate loop and the `refs/sg/chunks` propagation
+     block. Item 3's `goto done` -> `continue` change is what made this
+     necessary: without the gate a fully-refused push falls through into
+     chunks propagation and performs a REAL remote write (and prints
+     `To <url>`), which pre-Phase-39 single-ref behaviour never did.
+     **"Everything was already up to date" also leaves `entry_count` at 0**
+     -- that case must still propagate chunks, which is why the gate tests
+     `had_rejection` and not just the count.
 
 ## Deliberate divergences from real git
 
-Four places where sg's answer differs from real git **on purpose**, not by
+Five places where sg's answer differs from real git **on purpose**, not by
 oversight -- each was measured against git 2.55.0, each is pinned on both
 sides by an interop check (so accidentally "fixing" one back into silent
 agreement with git would itself go undetected without the pin), and none of
@@ -922,6 +974,15 @@ why the divergence exists.
    always reports the one that draws the user's attention rather than the one
    that could silently claim "clean". See the Phase 36 section of
    `docs/DESIGN.md` for the full three-row measurement.
+5. **`sg push` uses exit code 1 where real git uses 128 for a client-side
+   refspec syntax error** (empty dst, `--delete` with a colon, an
+   already-`refs/`-prefixed malformed dst -- Phase 39) -- this project's own
+   convention is "exit codes are only ever 0 or 1" (see Code conventions
+   below), message text is otherwise borrowed from git's own wording. Pinned
+   on both sides in `tests/interop.sh` (git-side 128, sg-side 1). **Does
+   NOT apply** to a `<src>` that resolves to nothing (`error: src refspec
+   ... does not match any`) -- git's own exit code there is already 1, no
+   divergence to pin.
 
 ## Core types cheat sheet
 

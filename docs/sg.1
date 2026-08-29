@@ -1276,51 +1276,164 @@ there is no
 .SS push
 .B sg push
 .RI [ remote ]
-.RI [ branch | tag ]
+.RI [ refspec ... ]
 .RB [ --tags ]
 .RB [ --force | -f ]
+.RB [ --delete
+.IR name ... ]
 .PP
-Pushes a local branch (or tag) to
+Pushes to
 .I remote
 (default
 .BR origin )
-over the git smart HTTP protocol.
-With no name and no
+over the git smart HTTP protocol. With no
+.I refspec
+and no
 .BR --tags ,
 pushes the current branch (and a name is required if
 .B HEAD
 is detached).
 .PP
-An explicit
-.I name
-is looked up as both a branch and a tag; if only one exists, that one is
-pushed. If both a branch and a tag have that name, the push is rejected as
-ambiguous
-.RI ( "src refspec '" name "' matches more than one" ),
-matching real git.
-.B --tags
-pushes every local tag under
-.B refs/tags/
-in one round trip, instead of a branch.
+Each
+.I refspec
+has the form
+.BI [+] src [: dst ],
+matched literally against real git 2.55.0's own grammar:
+.IP \(bu 3
+.I src
+is resolved through the full revision grammar (branch, tag, full 40-hex,
+.BR HEAD ,
+.BR ~N / ^N / @{N} ,
+etc.), evaluated locally before any connection is made. If ANY
+.I src
+in the whole command fails to resolve, the entire push aborts before
+connecting \(em not one ref lands, matching real git's own behavior for a
+multi-refspec push with one bad
+.IR src .
+An annotated tag given as
+.I src
+is pushed as the tag object itself, not peeled to the commit it points at.
+.IP \(bu 3
+.I dst
+(after the local ref is resolved but before the actual update) is completed
+against the remote's advertisement: if it already starts with
+.BR refs/ ,
+it is used as-is; otherwise, if the remote already has a ref of that exact
+name, that ref is updated \(em and if
+.I dst
+matches
+.B more than one
+advertised ref (say both a branch and a tag of that short name), the push is
+rejected outright rather than guessing which was meant
+.RI ( "dst refspec '" dst "' matches more than one" ),
+leaving every ref on the remote untouched; otherwise, if
+.I src
+is itself under
+.B refs/heads/
+or
+.BR refs/tags/ ,
+that same prefix is prepended to
+.I dst
+in full. If none of these apply, the push is rejected
+.RI ( "The destination you provided is not a full refname..." ) .
+When multiple refspecs are given, a
+.I dst
+that cannot be completed this way aborts the whole batch, the same as an
+unresolvable
+.IR src .
+.IP \(bu 3
+Omitting
+.I dst
+(bare
+.IR src )
+falls back to the pre-refspec behavior described below: an explicit name is
+looked up as both a branch and a tag, and if both exist the push is
+rejected as ambiguous
+.RI ( "src refspec '" name "' matches more than one" ) .
+.IP \(bu 3
+.BI : dst
+(empty
+.IR src )
+deletes
+.I dst
+on the remote, equivalent to
+.BI --delete\  dst
+below.
+.I src:
+(empty
+.IR dst )
+is a syntax error.
+.IP \(bu 3
+A leading
+.B +
+forces that one refspec only, regardless of
+.BR --force .
 .PP
 .B --force
 (or
 .BR -f )
-allows a non-fast-forward update of a pushed branch; without it, a branch
-push that is not a fast-forward is rejected. A tag update is never treated
-as a fast-forward or merge question at all: if the remote already has a tag
-of that name pointing at a different object, the push of that tag is
-rejected outright
+forces every refspec in the command, allowing a non-fast-forward update of
+a pushed branch; without it (and without a
+.B +
+prefix on that refspec), a branch push that is not a fast-forward is
+rejected. A tag update is never treated as a fast-forward or merge question
+at all: if the remote already has a tag of that name pointing at a
+different object, the push of that tag is rejected outright
 .RI ( "tag '" name "' already exists on the remote (use --force to overwrite)" )
-unless
-.B --force
-is given, in which case the remote tag is overwritten. With
-.BR --tags ,
-a rejected tag does not stop the others from being pushed, but the command
-still exits non-zero if any tag was rejected. Pushing a tag never creates a
+unless forced, in which case the remote tag is overwritten. With multiple
+refspecs (including
+.BR --tags ),
+a rejected ref does not stop the others from being pushed \(em that
+rejection is per-ref, unlike an unresolvable
+.I src
+or an uncompletable
+.I dst
+above, both of which abort the whole batch \(em but the command still exits
+non-zero if any ref was rejected.
+.PP
+.B --tags
+pushes every local tag under
+.B refs/tags/
+in one round trip, instead of a branch, and cannot be combined with an
+explicit refspec. Pushing a tag never creates a
 .B refs/remotes/<remote>/<tag>
 tracking ref (real git does not either); that only ever happens for a
 pushed branch.
+.PP
+.BI --delete\  name ...
+deletes one or more named refs on the remote (each may be a short name or a
+full
+.B refs/...
+path) without pushing anything. It is rejected outright, before
+connecting, if any
+.I name
+contains a
+.B :
+.RI ( "--delete only accepts plain target ref names" ) .
+Deleting a ref the remote does not have is a per-ref failure
+.RI ( "unable to delete '" name "': remote ref does not exist" ) ,
+it does not stop other names in the same
+.B --delete
+invocation from being processed. Deleting a ref does not remove the local
+.B refs/remotes/<remote>/<name>
+tracking ref, if one exists.
+.PP
+A wildcard refspec
+.RI ( "refs/heads/*:refs/heads/*" )
+and the bare push-matching refspec
+.RB ( : )
+are both explicitly rejected, not approximated;
+.B -C
+.RB ( "find-copies-harder" )-style
+near-misses are avoided by naming them outright rather than silently doing
+something else. Exit codes are 0 or 1 only, never a third value: this
+differs from real git, which exits 128 for a client-side refspec syntax
+error (empty
+.IR dst ,
+a colon in a
+.B --delete
+name) \(em sg reports the identical situation with exit 1, matching this
+project's own exit-code convention.
 .PP
 If this repository has ever used chunked storage locally, the push also
 attempts to update the remote's
