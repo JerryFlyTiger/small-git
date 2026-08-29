@@ -6645,3 +6645,72 @@ asymmetric tail check in `refine_conflicts` (already recorded in section 10,
 same conclusion reached independently) and that the `sg_diff_lcs_table`
 removal leaves no residue -- verified by search, and separately by the clean
 rebuild the gates do anyway, which is the part a search cannot stand in for.
+
+### 12. Witnessing the indentation-heuristic argument, and what that uncovered
+
+`script_matches` asks `sg_diff_build_script` NOT to apply git's indentation
+heuristic, because git's own `ll_merge` does not set `XDF_INDENT_HEURISTIC`
+(only `git diff` turns it on by default). That argument shipped with **no
+witness at all**: passing `1` instead of `0` measured **0/200**, identical to
+passing `0`. A parameter whose two values cannot be told apart is not a
+verified choice, it is an unasked question.
+
+Two generator dimensions had to be added before the values separated, and the
+order matters because the first one alone was not enough:
+
+1. **Indentation.** Every line the generator produced started at column 0,
+   and the heuristic scores candidate positions BY indentation. Adding
+   blocks, indented bodies and blank lines: still **0/200 either way**.
+2. **Slidable groups.** The heuristic only chooses when there is something to
+   choose between, i.e. a pure insert/delete bordered by identical lines,
+   which can sit at more than one position without changing what the diff
+   means. Every inserted line carried a unique tag, so no group was ever
+   slidable. Adding a `dupblock` op -- duplicate a run of EXISTING lines in
+   place -- finally separated them:
+
+| `indent_heuristic` | mismatches |
+|---|---|
+| 0 (shipped) | 1 / 200 |
+| 1 | 9 / 200 |
+
+`tests/test_merge_content.c`'s `test_merge_does_not_use_the_indent_heuristic`
+pins one of those fixtures byte-for-byte against `git merge-file`, so the
+argument now has a named witness and not merely a net -- the distinction this
+phase learned the hard way in section 11.
+
+**And the widened generator found a real residual: 5 / 1500 rounds (0.33%),
+every one of them in the three-way layer.** The attribution is not a judgement
+call, it is measured, and `--attribute` now does it automatically: for each
+saved case it builds a one-file repo, commits base, writes the other side into
+the working tree, and asks BOTH tools for the diff of the same repo (sg's
+on-disk format being git-readable is what makes this possible). If the two
+2-way diffs are byte-identical, alignment agreed and only the sync-point
+classification can be responsible.
+
+| | count |
+|---|---|
+| `[3way]` alignment agrees with git, divergence is sg's own layer | **5 / 5** |
+| `[align]` a 2-way diff differs from git's | **0 / 5** |
+
+The probe was checked to have discriminating power rather than assumed to:
+desyncing `sg diff`'s own aligner from git's flips saved cases from `[3way]`
+to `[align]`.
+
+The shape, from the one `rc` case (sg conflicts where git does not): ours
+REPLACES base lines 8-10 while theirs makes a PURE INSERTION at the boundary
+just above them. git tracks each side's change as an interval on base and
+applies both, because a zero-length insertion at the edge of the other side's
+range is not an overlap. sg asks a different question -- "which base lines are
+matched on BOTH sides" -- and base lines 8-10, matched by theirs but rewritten
+by ours, are therefore not sync points, so both edits land inside one span and
+the span equals neither side. **This is the documented boundary from section
+9 finally producing a measured number**: making both 2-way alignments agree
+with git does not make the merge agree with git, and 0.33% is the size of what
+is left.
+
+Closing it means replacing the sync-point model with git's changed-interval
+model, which is a phase of its own and not a tail on this one. Until then the
+acceptance criterion for `tests/fuzz_merge.py` is **not "0"**: it is "0
+`[align]`, and any `[3way]` case attributed before it is accepted". Counting
+the two together is exactly how a real alignment regression would hide inside
+a known gap.

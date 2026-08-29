@@ -417,8 +417,17 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `emit_regions`. When touching any of it, a green `make test` **does not
   count**: run `python3 tests/fuzz_merge.py 200` AND
   `python3 tests/fuzz_merge.py 200 --no-newline-edits` (real git is the
-  oracle) and report both counts -- baseline for both is **0**, re-measured
-  at 200 rounds x 4 seed ranges.
+  oracle) and report both counts.
+  WARNING: **the baseline is NOT 0 and must not be read as a pass/fail
+  number.** Measured over 1500 rounds: **5 (0.33%)**, and all five are
+  `[3way]` -- sg's sync-point three-way classification, which is its own
+  design and not a port of `xdl_merge`. Always re-run
+  `python3 tests/fuzz_merge.py --attribute <keep-dir>`: it rebuilds each
+  case as a repo and asks both tools for the same 2-way diffs, so it can
+  say which layer diverged. The criterion is **0 `[align]` cases, plus every
+  `[3way]` case attributed before it is accepted** -- counting them together
+  is how an alignment regression would hide inside the known gap. The
+  `--no-newline-edits` control is 0.
   WARNING: **line comparison here is has_nl-AWARE**
   (`sg_diff_lines_equal_exact`), on both the alignment and the span
   comparison. It was has_nl-blind until Phase 41, and that one choice meant

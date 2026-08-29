@@ -108,12 +108,51 @@ def gen_base(rng, newline_edits=True):
     that resolved to "unchanged", i.e. rewriting a file it had not merged --
     and this fuzzer reported 0/200 straight through it.  A generator that
     cannot build a shape gives zero evidence about it, however green it is.
+
+    HALF THE ROUNDS ARE INDENTED, for the same reason and found the same way.
+    sg's merge asks sg_diff_build_script NOT to apply git's indentation
+    heuristic, because git's own ll_merge does not set XDF_INDENT_HEURISTIC
+    (only `git diff` turns it on by default).  That argument had no witness:
+    every line this generator produced started at column 0, and the heuristic
+    only ever moves a slidable group when the candidate positions DIFFER in
+    indentation -- so passing 1 instead of 0 was measured at 0/200, exactly
+    like passing 0.  A parameter whose two values are indistinguishable is not
+    a verified choice, it is an unasked question.  With blocks and blank lines
+    in the mix the two values separate.
+
+    Flat rounds are kept, not replaced: they are the shape every earlier
+    measurement in this phase was made on, and the blank line / indented body
+    mix does not subsume them.
     """
     n = rng.randint(1, 40)
-    lines = ["base%02d\n" % i for i in range(n)]
+    if rng.random() < 0.5:
+        lines = ["base%02d\n" % i for i in range(n)]
+    else:
+        lines = []
+        depth = 0
+        for i in range(n):
+            roll = rng.random()
+            if roll < 0.18:
+                lines.append("block%02d:\n" % i)
+                depth = 1
+            elif roll < 0.28:
+                lines.append("\n")
+            elif roll < 0.38 and depth < 2:
+                lines.append("%sinner%02d:\n" % ("    " * depth, i))
+                depth += 1
+            else:
+                lines.append("%sbase%02d\n" % ("    " * depth, i))
     if newline_edits and rng.random() < 0.15:
         lines[-1] = lines[-1].rstrip("\n")
     return lines
+
+
+def indent_of(line):
+    """The leading whitespace of a line, so an inserted run can be written at
+    the depth its neighbour sits at.  An insertion that always starts at
+    column 0 cannot make the indentation heuristic prefer one slide position
+    over another, which would leave the widening above half-done."""
+    return line[:len(line) - len(line.lstrip(" "))]
 
 
 def mutate(rng, lines, tag, newline_edits=True):
@@ -123,18 +162,35 @@ def mutate(rng, lines, tag, newline_edits=True):
         if not out:
             out.append("%s-new0\n" % tag)
             continue
-        op = rng.choice(("replace", "insert", "delete", "runreplace"))
+        op = rng.choice(("replace", "insert", "delete", "runreplace", "dupblock"))
         i = rng.randrange(len(out))
         if op == "replace":
-            out[i] = "%s-r%d\n" % (tag, i)
+            out[i] = "%s%s-r%d\n" % (indent_of(out[i]), tag, i)
         elif op == "insert":
+            pad = indent_of(out[i])
             for k in range(rng.randint(1, 3)):
-                out.insert(i, "%s-i%d-%d\n" % (tag, i, k))
+                out.insert(i, "%s%s-i%d-%d\n" % (pad, tag, i, k))
         elif op == "delete":
             del out[i:i + rng.randint(1, 3)]
-        else:
+        elif op == "runreplace":
             end = min(len(out), i + rng.randint(2, 4))
-            out[i:end] = ["%s-run%d\n" % (tag, i)]
+            out[i:end] = ["%s%s-run%d\n" % (indent_of(out[i]), tag, i)]
+        else:
+            # Duplicate a run of EXISTING lines in place. This is the only op
+            # that produces a SLIDABLE group: a pure insertion whose first
+            # line equals the line following the group can sit at either
+            # position without changing what the diff means, and choosing
+            # between those positions is the entire job of group compaction
+            # and of git's indentation heuristic on top of it.
+            #
+            # Without it the generator could not tell the two values of
+            # sg_diff_build_script's indent_heuristic argument apart, however
+            # indented the text was -- every inserted line carried a unique
+            # tag, so no group was ever slidable and the heuristic had nothing
+            # to choose between. Measured: with indentation but no duplicate
+            # blocks, passing 1 instead of 0 was still 0/200.
+            end = min(len(out), i + rng.randint(2, 4))
+            out[i:i] = list(out[i:end])
     # No trailing newline on the last line, sometimes: merge.c has a dedicated
     # special case for it (merge.c:430-447) and Myers treats has_nl as part of
     # line identity, so this axis is exactly where the two can disagree.
@@ -254,6 +310,58 @@ def one_round(rng, keep_dir, index, newline_edits=True):
 MARK = re.compile(r"^(<<<<<<< |=======$|>>>>>>> )")
 
 
+def two_way_matches_git(case_dir):
+    """Does sg align base-vs-ours and base-vs-theirs exactly as git does?
+
+    Answers the attribution question the merge harness cannot answer from the
+    merged bytes alone.  sg's merge is two layers: two 2-way alignments (a port
+    of git's Myers algorithm since Phase 41) and a three-way classification on
+    top that is sg's OWN design, not a port of xdl_merge.  A merged-output
+    mismatch could come from either, and they call for opposite responses -- an
+    alignment regression is a bug in ported code, while the three-way layer
+    diverging is a known, measured, structural gap.
+
+    The probe builds a one-file repo with sg, commits base, writes the other
+    side into the working tree, and then asks BOTH tools for the diff of the
+    same repo, which works because sg's on-disk format is git-readable.  That
+    is a stronger comparison than re-implementing the check here: it is real
+    git's own output, including its group compaction.
+
+    Returns True (alignment agrees), False (it does not), or None if the probe
+    itself could not run, which is deliberately NOT folded into either answer.
+
+    Two limits, stated rather than papered over.  The probe goes through each
+    tool's DIFF path, where both sides apply the indentation heuristic, while
+    merge asks for it to be off -- so a divergence that appears only with the
+    heuristic off would not be caught here (tests/test_merge_content.c's
+    test_merge_does_not_use_the_indent_heuristic is the witness for that
+    argument instead).  And it was checked to have discriminating power rather
+    than assumed to: desyncing sg diff's own aligner from git's flips saved
+    cases from [3way] to [align], measured.
+    """
+    try:
+        base = open(os.path.join(case_dir, "base.txt"), "rb").read()
+    except OSError:
+        return None
+    for side in ("ours.txt", "theirs.txt"):
+        repo = tempfile.mkdtemp(prefix="sg_fuzz_2way_")
+        try:
+            if sg(repo, "init", ".").returncode != 0:
+                return None
+            with open(os.path.join(repo, "f.txt"), "wb") as fh:
+                fh.write(base)
+            sg(repo, "add", "f.txt")
+            sg(repo, "commit", "-m", "base")
+            with open(os.path.join(repo, "f.txt"), "wb") as fh:
+                fh.write(open(os.path.join(case_dir, side), "rb").read())
+            if sg(repo, "diff").stdout != git(repo, "-c", "core.quotepath=false",
+                                             "diff").stdout:
+                return False
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+    return True
+
+
 def attribute(root):
     """Bucket saved failures by cause.
 
@@ -263,6 +371,14 @@ def attribute(root):
     multiset means the two tools chose different boundaries for the same
     material, a different multiset means content was lost or invented, which
     no re-alignment excuses.
+
+    Every case is ALSO asked the one question that separates the two layers
+    sg's merge is made of: are the two 2-way diffs (base vs ours, base vs
+    theirs) byte-identical to real git's?  If they are, the alignment agreed
+    and the divergence is in sg's own sync-point three-way classification --
+    which is not a port of git's xdl_merge and is not claimed to be.  That
+    split is what keeps a real alignment regression from hiding inside the
+    known model gap; the two must never be counted together.
 
     Run this again after any change to merge.c: the counts on their own
     cannot say whether a change moved the right bucket.
@@ -275,6 +391,7 @@ def attribute(root):
 
     buckets = collections.Counter()
     total = 0
+    three_way = 0
     for name in sorted(os.listdir(root)):
         d = os.path.join(root, name)
         if not os.path.isdir(d):
@@ -288,6 +405,14 @@ def attribute(root):
         same_material = collections.Counter(nonmark(sgl)) == collections.Counter(nonmark(gil))
         sg_marks = sum(1 for l in sgl if MARK.match(l))
         gi_marks = sum(1 for l in gil if MARK.match(l))
+        aligned = two_way_matches_git(d)
+        if aligned is None:
+            layer = "?"
+        elif aligned:
+            layer = "3way"
+            three_way += 1
+        else:
+            layer = "align"
         if kind == "rc":
             b = "rc/has_nl" if no_nl else "rc/other"
         elif same_material and sg_marks == gi_marks:
@@ -296,7 +421,7 @@ def attribute(root):
             b = "body/same-material-different-marker-count"
         else:
             b = "body/material-differs (has_nl)" if no_nl else "body/material-differs"
-        buckets[b] += 1
+        buckets["%s  [%s]" % (b, layer)] += 1
 
     print("=== attribution over %d saved cases ===" % total)
     for b, n in buckets.most_common():
@@ -304,6 +429,10 @@ def attribute(root):
     nl = sum(n for b, n in buckets.items() if "has_nl" in b)
     print()
     print("  involving a missing trailing newline: %d / %d" % (nl, total))
+    print("  [3way]  = both 2-way diffs match git, so alignment agreed and the")
+    print("            divergence is sg's own sync-point layer:  %d / %d" % (three_way, total))
+    print("  [align] = a 2-way diff differs from git's -- an ALIGNMENT regression,")
+    print("            which is never expected and never part of the known residual")
     return 0
 
 
