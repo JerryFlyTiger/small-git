@@ -6645,3 +6645,92 @@ asymmetric tail check in `refine_conflicts` (already recorded in section 10,
 same conclusion reached independently) and that the `sg_diff_lcs_table`
 removal leaves no residue -- verified by search, and separately by the clean
 rebuild the gates do anyway, which is the part a search cannot stand in for.
+
+### 12. Witnessing the indentation-heuristic argument, and what that uncovered
+
+`script_matches` asks `sg_diff_build_script` NOT to apply git's indentation
+heuristic, because git's own `ll_merge` does not set `XDF_INDENT_HEURISTIC`
+(only `git diff` turns it on by default). That argument shipped with **no
+witness at all**: passing `1` instead of `0` measured **0/200**, identical to
+passing `0`. A parameter whose two values cannot be told apart is not a
+verified choice, it is an unasked question.
+
+Two generator dimensions had to be added before the values separated, and the
+order matters because the first one alone was not enough:
+
+1. **Indentation.** Every line the generator produced started at column 0,
+   and the heuristic scores candidate positions BY indentation. Adding
+   blocks, indented bodies and blank lines: still **0/200 either way**.
+2. **Slidable groups.** The heuristic only chooses when there is something to
+   choose between, i.e. a pure insert/delete bordered by identical lines,
+   which can sit at more than one position without changing what the diff
+   means. Every inserted line carried a unique tag, so no group was ever
+   slidable. Adding a `dupblock` op -- duplicate a run of EXISTING lines in
+   place -- finally separated them:
+
+| `indent_heuristic` | mismatches |
+|---|---|
+| 0 (shipped) | 1 / 200 |
+| 1 | 9 / 200 |
+
+`tests/test_merge_content.c`'s `test_merge_does_not_use_the_indent_heuristic`
+pins one of those fixtures byte-for-byte against `git merge-file`, so the
+argument now has a named witness and not merely a net -- the distinction this
+phase learned the hard way in section 11.
+
+**And the widened generator found a real residual: 5 / 1500 rounds (0.33%)
+in the default mode, 4 / 1500 in the control.** The first attribution written
+here was wrong, and the way it was wrong is worth more than the number.
+
+The harness first asked "are the two 2-way diffs byte-identical to git's?",
+answered yes for every case, and concluded the divergence had to be in sg's
+own sync-point layer. That reasoning has a hole: it compares sg and git
+through their **diff** paths, which proves the aligners agree there, and then
+assumes the merge paths use the same aligner. Measured, they do not.
+
+**`git merge` defaults to the HISTOGRAM diff algorithm; `git merge-file`
+defaults to Myers.** On the one `rc` case, `git merge-file` reproduces sg's
+output byte for byte -- including the "lost" line that looked alarming -- and
+`git merge-file --diff-algorithm=histogram` reproduces `git merge`'s. Over all
+nine saved cases:
+
+| | count |
+|---|---|
+| sg == `git merge-file` (Myers), byte for byte | **9 / 9** |
+| `git merge` == `git merge-file --diff-algorithm=histogram` | **9 / 9** |
+| Myers and histogram agreeing with each other | 0 / 9 |
+
+So the entire residual is **which diff algorithm git's merge uses**, and
+nothing else. That is a considerably stronger result about sg than the wrong
+attribution suggested: on every case where sg disagrees with `git merge`, it
+reproduces git's OWN three-way merge of the same three buffers exactly, so
+sg's sync-point layer -- the part that is not a port of `xdl_merge` -- agrees
+with `xdl_merge` on all of them. Section 9's caution stands as a caution; the
+measurement did not find it.
+
+It also corrects section 2, which chose `git merge-file` as the oracle "the
+closest real-git unit to `sg_merge_content`" and noted that whether it is a
+faithful stand-in for the full `git merge` path was "itself something to
+verify, not assume". It is not faithful, and this is where that assumption
+would have been paid for: had the fuzzer used `merge-file`, all nine of these
+would have been green and the algorithm difference would never have surfaced.
+
+`--attribute` now runs both oracles and labels each case:
+
+- **`[algo]`** -- sg reproduces `git merge-file` (Myers) exactly and `git
+  merge` matches histogram. Not sg's defect.
+- **`[3way]`** -- the 2-way diffs agree with git yet sg's merge differs from
+  git's own Myers merge: sg's sync-point layer.
+- **`[align]`** -- a 2-way diff itself differs from git's. An alignment
+  regression, never expected.
+
+Measured today: **9 `[algo]`, 0 `[3way]`, 0 `[align]`.** The `[align]` probe
+was checked to have discriminating power rather than assumed to -- desyncing
+`sg diff`'s own aligner from git's flips saved cases to `[align]`.
+
+Closing the remaining gap means porting git's histogram algorithm and using it
+in the merge path (only there -- `sg diff` matches git with Myers, thousands
+of fuzz rounds deep). That is a phase of its own. Until then the acceptance
+criterion for `tests/fuzz_merge.py` is **not "0"**: it is "0 `[align]`, 0
+`[3way]`, and every `[algo]` case is the known histogram gap". Counting them
+together is exactly how a real regression would hide inside a known gap.

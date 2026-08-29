@@ -417,8 +417,25 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `emit_regions`. When touching any of it, a green `make test` **does not
   count**: run `python3 tests/fuzz_merge.py 200` AND
   `python3 tests/fuzz_merge.py 200 --no-newline-edits` (real git is the
-  oracle) and report both counts -- baseline for both is **0**, re-measured
-  at 200 rounds x 4 seed ranges.
+  oracle) and report both counts.
+  WARNING: **the baseline is NOT 0 and must not be read as a pass/fail
+  number.** Measured over 1500 rounds each: **5 (0.33%)** default, **4**
+  control -- and all nine are the same known gap, `[algo]`.
+  WARNING: **`git merge` defaults to the HISTOGRAM diff algorithm while
+  `git merge-file` defaults to Myers** (measured, git 2.55.0). sg's merge
+  runs Myers, so it reproduces `git merge-file` byte for byte on all nine
+  residual cases while differing from `git merge` -- i.e. sg's sync-point
+  layer agrees with `xdl_merge` on every one of them, and the whole residual
+  is the algorithm default. **Never use `git merge-file` as the only oracle
+  for `sg merge`**: it would have called all nine green.
+  Always re-run `python3 tests/fuzz_merge.py --attribute <keep-dir>`, which
+  runs both oracles and labels each case `[algo]` (the known histogram gap,
+  not sg's defect), `[3way]` (sg's sync-point layer) or `[align]` (the
+  aligner itself -- never expected). The criterion is **0 `[3way]`, 0
+  `[align]`, and every `[algo]` accounted for** -- counting them together is
+  how a real regression would hide inside a known gap. Closing the gap means
+  porting histogram for the merge path only; `sg diff` matches git with
+  Myers.
   WARNING: **line comparison here is has_nl-AWARE**
   (`sg_diff_lines_equal_exact`), on both the alignment and the span
   comparison. It was has_nl-blind until Phase 41, and that one choice meant

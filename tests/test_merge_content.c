@@ -347,6 +347,32 @@ static void test_ours_pure_insertion_survives(void)
                "a\nNEW\nb\n");
 }
 
+/* The aligner is asked NOT to apply git's indentation heuristic, because
+   git's own ll_merge does not set XDF_INDENT_HEURISTIC -- only `git diff`
+   turns it on by default. That argument had no witness for a whole phase:
+   passing 1 instead of 0 was measured at 0/200 on the fuzzer, identical to
+   passing 0, because nothing in the generator was both indented AND slidable.
+   This fixture is one that separates them (found once the generator could
+   build slidable duplicate blocks): with 0 the result below is byte-identical
+   to `git merge-file`, with 1 the conflict starts one line earlier and its
+   ours side gains a line.
+
+   A rule with no test that distinguishes its two values is not a verified
+   choice, it is an unasked question -- and a fuzzer that happens to catch it
+   is a net, not a witness. */
+static void test_merge_does_not_use_the_indent_heuristic(void)
+{
+    CHECK_MERGE("merge does not apply git's indent heuristic",
+               "base00\nbase01\n\nbase03\ninner04:\nblock05:\n    base06\n",
+               "base00\nbase03\nbase00\nbase03\n    ours-run6\n",
+               "thrs-i0-2\nthrs-r1\nthrs-i0-0\nbase00\nbase01\n\nbase03\n\nbase03\n"
+               "inner04:\nblock05:\n    base06",
+               1,
+               "thrs-i0-2\nthrs-r1\nthrs-i0-0\nbase00\nbase03\n"
+               "<<<<<<< ours\nbase00\nbase03\n    ours-run6\n"
+               "=======\n\nbase03\ninner04:\nblock05:\n    base06\n>>>>>>> theirs\n");
+}
+
 int main(void)
 {
     test_only_ours_changed();
@@ -366,6 +392,7 @@ int main(void)
     test_conflict_above_a_newlineless_last_line();
     test_theirs_pure_insertion_survives();
     test_ours_pure_insertion_survives();
+    test_merge_does_not_use_the_indent_heuristic();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
