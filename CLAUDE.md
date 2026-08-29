@@ -906,7 +906,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   Details in Phase 21 of `docs/DESIGN.md`.
 - **`sg push` gained refspec support (`[+]<src>[:<dst>]`) and
   `--delete <name>...` in Phase 39** (`src/cli/cmd_push.c`, no header
-  changes -- see the Phase 39 section of `docs/DESIGN.md` for why). Three
+  changes -- see the Phase 39 section of `docs/DESIGN.md` for why). Five
   things are especially easy to get backwards:
   1. **Split on the LAST `:`, not the first** (`strrchr`). Measured:
      `a:b:c:d` reports src `a:b:c`, dst `d`.
