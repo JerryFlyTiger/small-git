@@ -272,15 +272,36 @@ static void test_separate_u_no_is_not_uno(void)
     int rc_split;
     int rc_joined;
 
+    /* The fixture MUST have a commit, and that is the whole reason this test
+       can discriminate at all. Phase 38 gave the closing summary its missing
+       unborn-HEAD branch (priority 3, measured against git 2.55.0): on an
+       unborn HEAD, "nothing to commit (create/copy files and use \"git
+       add\" to track)" outranks both "working tree clean" (priority 5) and
+       the -uno hedge (priority 4). Real git behaves the same way -- measured,
+       all four cells identical:
+
+           unborn repo   : -u no and -uno BOTH print the priority-3 line
+           repo w/ commit: -u no -> "working tree clean"
+                           -uno  -> "nothing to commit (use -u to show ...)"
+
+       So on the unborn fixture this test used before Phase 38, the two argv
+       shapes produce byte-identical output and the assertions below cannot
+       tell a correctly-parsed pathspec from a mode -- the test would pass
+       even if "no" were swallowed as -uno, which is precisely what it exists
+       to rule out. Adding the commit restores the divergence. */
+    write_file("tracked.txt", "content\n");
+    run_add("tracked.txt");
+    run_commit("base");
+
     argv_split[0] = "status";
     argv_split[1] = "-u";
     argv_split[2] = "no";
     rc_split = run_status_capture(3, argv_split, out_split, sizeof(out_split));
     CHECK(rc_split == 0, "separate '-u' 'no' is now a (non-matching) pathspec, got rc=%d",
          rc_split);
-    /* The header ("On branch"/"No commits yet") is unconditional -- pathspec
-       only filters the change lists -- so only "nothing to commit" is
-       checked, not that the whole output is empty. */
+    /* The header ("On branch") is unconditional -- pathspec only filters the
+       change lists -- so only the closing line is checked, not that the whole
+       output is empty. */
     CHECK(strstr(out_split, "nothing to commit, working tree clean") != NULL,
          "separate '-u' 'no' matching nothing must report a clean tree, got %s", out_split);
 
@@ -288,14 +309,18 @@ static void test_separate_u_no_is_not_uno(void)
     argv_joined[1] = "-uno";
     rc_joined = run_status_capture(2, argv_joined, out_joined, sizeof(out_joined));
     CHECK(rc_joined == 0, "'-uno' (joined) must be accepted, got rc=%d", rc_joined);
+    /* The actual discriminator: -uno takes priority 4, the split form takes
+       priority 5. Asserting both directions means neither a parser that
+       swallows "no" as a mode nor one that drops the -uno mode entirely can
+       stay green. */
+    CHECK(strstr(out_joined, "nothing to commit (use -u to show untracked files)") != NULL,
+         "'-uno' (joined) must take the -uno closing line, got %s", out_joined);
+    CHECK(strstr(out_joined, "working tree clean") == NULL,
+         "'-uno' (joined) must NOT report a clean tree, got %s", out_joined);
 
     free(repo_root);
 }
 
-/* -uno's three different closing lines, each pinned with its own stdout
-   assertion -- this project has shipped a message-formatting bug before
-   (Phase 19's "Fast-forwarded (null) to master.") that every non-stdout
-   check let straight through, so a new message always gets one of these. */
 static void test_uno_closing_line_clean_except_untracked(void)
 {
     char out[8192];
