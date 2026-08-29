@@ -6250,3 +6250,69 @@ three files and explicit `-L` labels, which makes it the closest real-git
 unit to `sg_merge_content` and removes the label question from the
 comparison entirely. Whether it is a faithful stand-in for the full
 `git merge` path is itself something to verify, not assume.
+
+### 3. The baseline, and what it says about the plan
+
+`tests/fuzz_merge.py` (new, this phase). Each round builds one repository
+with sg, copies it, and merges the SAME two commits with `sg merge` in one
+copy and `git merge` in the other -- two independently built repositories
+would carry different commit ids, and the rebase-style labels that embed a
+short sha could then only be compared by shape. The expectation comes only
+from git; nothing is derived from sg's own output.
+
+Exactly one normalization is applied, to both sides: the `<<<<<<< ` label,
+which is deliberate divergence #5 and pinned separately. To keep that honest
+the harness checks the label *before* erasing it and reports a `label`
+mismatch if it is not the expected one -- otherwise the step that hides the
+label would also hide a regression in it.
+
+**Baseline, 200 rounds, seed 0, measured before any change to `merge.c`:**
+
+| | rc | label | body | total |
+|---|---|---|---|---|
+| default | 10 | 0 | 49 | **59 / 200 (29.5%)** |
+| `--no-newline-edits` (control) | **0** | 0 | 11 | **11 / 200 (5.5%)** |
+
+The control switches off the generator's one suspicious axis -- removing a
+file's trailing newline. **A correlation measured only with the suspected
+cause switched on is not an attribution**, which is why the flag exists.
+With it off, every `rc` mismatch disappears and body mismatches fall from 49
+to 11. (It is not an exact subtraction: the same seeds produce different
+content once the mutation is off, so this is the rate with the cause absent,
+not the same 200 cases minus some.)
+
+So the mismatch rate is dominated by ONE root cause, and it is not
+alignment: **`merge.c` compares lines ignoring `has_nl`**
+(`sg_diff_lines_equal`), so "the user removed the trailing newline" reads as
+"the user changed nothing". Minimal reproduction, with two controls:
+
+```
+base   = "x\ny\nz\n"
+ours   = "x\ny\nz"      <- the only edit is removing the trailing newline
+theirs = "x\ny\nZZZ\n"
+
+git: conflict (rc=1)
+sg : rc=0, result "x\ny\nZZZ\n"   <- ours' edit silently discarded
+```
+
+Control B (ours makes a *text* change instead) conflicts in both tools, so
+the fixture is not simply one that never conflicts. Control C (only ours
+removes the newline, theirs untouched) is clean in both and sg preserves the
+removal -- so sg can represent the edit; the loss in A comes from the merge
+comparison, not from anywhere else in the pipeline.
+
+**This reads worse than a diff-alignment defect and should be recorded as
+such**: sg does not merely lay the conflict out differently, it drops a
+user's edit and reports success while doing it.
+
+**What the baseline does to the plan.** The phase was chosen as "build the
+net, then swap the aligner to Myers". The net says the swap targets the
+**5.5% residual**, not the 29.5% headline -- the headline is one root cause
+that no re-alignment is *guaranteed* to address. The swap is still the
+coherent single change, because `sg_diff_build_script` is has_nl-aware and
+so removes the dominant cause structurally rather than patching the
+comparison, and because it is the only change with any chance of moving the
+residual. But whether it does either is now a measurement, not a
+prediction -- `merge.c:430-447`'s trailing-newline special case exists
+*because* the comparison is has_nl-blind, and its behaviour after the swap
+is unknown until measured.
