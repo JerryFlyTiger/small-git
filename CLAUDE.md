@@ -977,6 +977,20 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   real git's `head-name`) to record that it started out detached, while in
   memory it is NULL; **an absent `orig-branch` file still counts as
   corrupt**, it must not be treated as detached.
+- **`sg merge <rev>` takes any revision since Phase 43** (tag, `refs/...`
+  path, `~N`/`^N`, 40-hex), not just a bare branch name. The merge MESSAGE
+  follows git's naming rules, all measured: the name printed is **the
+  argument as typed** (`refs/heads/topic` keeps its prefix), a trailing `^`
+  run or `~<digits>` is **stripped before classifying and the shortened name
+  is printed** (`topic~0` -> `Merge branch 'topic'`), and the form is
+  branch/tag/commit accordingly. The ` into <branch>` suffix is omitted on
+  exactly `master` and `main` -- **hard-coded, not `init.defaultBranch`**
+  (measured: setting that to `trunk` still appends ` into trunk`); a detached
+  HEAD gets ` into HEAD`. The conflict marker's theirs label is the argument
+  as typed in every form. See Phase 43 of `docs/DESIGN.md` for the tables.
+  WARNING: **the fast-forward output is still a bare `Fast-forward`** where
+  git prints `Updating <a>..<b>` plus a diffstat -- a pre-existing divergence,
+  unrelated to which revisions are accepted, deliberately left alone.
 - **A user-supplied revision string always goes through
   `sg_rev_parse_commit`** (`include/sg/revparse.h`): `HEAD`/tag/branch/full
   40-hex/full `refs/...` path, plus `~N`/`^N`/`@{N}` (Phase 17, reflog index,

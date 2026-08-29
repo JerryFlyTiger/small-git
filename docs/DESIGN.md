@@ -6887,3 +6887,82 @@ Both take histogram, because git's refinement runs under the same `xpp` flags
 as the merge that called it. A survey that named only the first would have
 left the merge path internally inconsistent -- one layer on histogram, the
 other on Myers -- with nothing failing to say so.
+
+## Phase 43: `sg merge` takes a revision, not just a branch name
+
+`sg merge` called `sg_ref_branch_exists` directly, so a tag, a
+`refs/heads/...` path and a `topic~0` were each rejected with `invalid
+reference` while the equivalent `git merge` worked. That contradicted this
+project's own stated rule -- a user-supplied revision always goes through
+`sg_rev_parse_commit` -- and Phase 41 recorded it as out of scope rather than
+fixed. It is one line of resolution plus one thing that is not obvious: the
+merge MESSAGE depends on which form the user typed.
+
+### 1. What git names a merge, measured
+
+Every row is a `git merge --no-commit` whose `.git/MERGE_MSG` was read back,
+git 2.55.0:
+
+| argument | message |
+|---|---|
+| `topic` | `Merge branch 'topic'` |
+| `refs/heads/topic` | `Merge branch 'refs/heads/topic'` |
+| `v1` (lightweight tag) | `Merge tag 'v1'` |
+| `av1` (annotated tag) | `Merge tag 'av1'` |
+| `topic~0` | `Merge branch 'topic'` |
+| `<40-hex>` | `Merge commit '<40-hex>'` |
+
+Two things are easy to get backwards, and both are in that table. **The name
+printed is the argument AS TYPED, not the ref that was found** -- which is why
+`refs/heads/topic` keeps its prefix instead of being shortened. And **a
+trailing run of `^`, or a trailing `~<digits>`, is stripped before
+classifying, and the SHORTENED name is what gets printed** -- which is why
+`topic~0` reads as a branch merge rather than a commit merge.
+
+The conflict marker's theirs label is simpler: it is the argument as typed in
+all six forms, which is what sg already did.
+
+### 2. The " into <branch>" suffix, and what it does NOT follow
+
+| current branch | message |
+|---|---|
+| `master` | `Merge branch 'topic'` |
+| `main` | `Merge branch 'topic'` |
+| `trunk` | `Merge branch 'topic' into trunk` |
+| `trunk`, with `init.defaultBranch=trunk` | `Merge branch 'topic' into trunk` |
+| detached HEAD | `Merge branch 'topic' into HEAD` |
+
+So the omission is hard-coded to the two names, **not** to the configured
+default branch -- measured, because assuming it followed `init.defaultBranch`
+would have been the natural guess. sg previously appended the suffix always,
+which was right for every branch except the two that matter most.
+
+All twelve argument x branch combinations were compared against git after the
+change and all twelve match byte for byte.
+
+### 3. Pinned, and mutated
+
+`tests/interop.sh`'s `phase43` group builds the history ONCE with sg and
+copies it, so both tools merge identical commits; 16 checks. Four mutations,
+each caught by exactly the checks written for it:
+
+| mutation | caught by |
+|---|---|
+| `build_merge_name` always says "branch" | the two tag messages |
+| the suffix rule always appends | all five messages (they run on master) |
+| the `~N` stripping disabled | only `topic~0`'s message |
+| resolution back to `sg_ref_branch_exists` | the tag and `~N` acceptance checks |
+
+### 4. Deliberately unchanged
+
+**`sg merge`'s fast-forward output stays a bare `Fast-forward`** where git
+prints `Updating <a>..<b>`, `Fast-forward`, and a diffstat. That divergence
+predates this phase, is identical for a plain branch argument, and has
+nothing to do with which revision forms are accepted -- fixing it means
+implementing the diffstat line, which is its own piece of work. Recorded here
+so the next reader does not discover it as fallout from this change.
+
+The error wording now matches git's (`<rev> - not something we can merge`)
+with this project's own `sg: ` prefix where git writes `merge: `, and exit 1
+where git also uses 1. Both sides are pinned.
+
