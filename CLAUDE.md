@@ -991,7 +991,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 
 ## Deliberate divergences from real git
 
-Four places where sg's answer differs from real git **on purpose**, not by
+Five places where sg's answer differs from real git **on purpose**, not by
 oversight -- each was measured against git 2.55.0, each is pinned on both
 sides by an interop check (so accidentally "fixing" one back into silent
 agreement with git would itself go undetected without the pin), and none of
@@ -1020,6 +1020,20 @@ why the divergence exists.
    NOT apply** to a `<src>` that resolves to nothing (`error: src refspec
    ... does not match any`) -- git's own exit code there is already 1, no
    divergence to pin.
+5. **`sg merge`'s conflict-marker "ours" label names the current branch
+   where real git always writes `HEAD`** (`cmd_merge.c`'s `ours_label`,
+   which also feeds the generated merge message and the summary line).
+   Measured in Phase 41 across five situations -- a differently named
+   branch, merging a tag, a detached HEAD, and rebase -- git's ours label is
+   invariant; only the theirs label varies. **This is the oldest entry on
+   this list and the last to get a witness**: it predates the list, and
+   `cmd_merge.c`'s own comment claimed it was "pinned by phase4b" when no
+   such check existed. Pinned on both sides since Phase 41 (interop's
+   `phase41` group), including the asymmetry that **a detached HEAD makes
+   the divergence disappear** -- `current_branch` is NULL there and sg falls
+   back to git's own answer. `sg rebase` and `sg stash` are NOT on this
+   list: rebase passes a literal `"HEAD"` and matches git, and stash's
+   `Updated upstream`/`Stashed changes` match git's too.
 
 ## Core types cheat sheet
 

@@ -5154,6 +5154,88 @@ P15_POPCONFLICT_STAGES=$(cd "$P15_POPCONFLICT" && git ls-files -u c.txt | awk '{
 check "phase15 row8 (conflicting pop): index has all three stages for c.txt" \
     sh -c "echo \"$P15_POPCONFLICT_STAGES\" | sort -u | tr -d '\n' | grep -qx '123'"
 
+# --- Phase 41: conflict-marker labels, the one thing merge output had no
+# oracle for at all. Both groups build the repo ONCE with sg and then copy
+# it, so sg and git rebase/merge the SAME commits -- two independently built
+# repos would carry different shas and the rebase label could then only be
+# compared by shape, not byte for byte.
+
+# A. `sg merge`'s ours label is a DELIBERATE divergence: sg names the branch,
+# real git always writes HEAD (measured across five situations in
+# docs/DESIGN.md's Phase 41 section). cmd_merge.c's comment claimed phase4b
+# pinned this; it did not. Pinned here on both sides, the same idiom the
+# other deliberate divergences in this file use -- so "fixing" sg back into
+# silent agreement with git would itself turn a check red rather than pass
+# unnoticed.
+P41_M="$WORKDIR/p41_merge_label"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P41_M")") > /dev/null 2>&1
+printf 'l1\nl2\nl3\nl4\n' > "$P41_M/f.txt"
+(cd "$P41_M" && "$SG" add f.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P41_M" && "$SG" branch topic) > /dev/null 2>&1
+printf 'l1\nl2\nOURS-3\nl4\n' > "$P41_M/f.txt"
+(cd "$P41_M" && "$SG" add f.txt && "$SG" commit -m ours) > /dev/null 2>&1
+(cd "$P41_M" && "$SG" switch topic) > /dev/null 2>&1
+printf 'l1\nl2\nTHEIRS-3\nl4\n' > "$P41_M/f.txt"
+(cd "$P41_M" && "$SG" add f.txt && "$SG" commit -m theirs) > /dev/null 2>&1
+(cd "$P41_M" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P41_M.git-copy"
+cp -R "$P41_M" "$P41_M.git-copy"
+(cd "$P41_M" && "$SG" merge topic) > /dev/null 2>&1
+(cd "$P41_M.git-copy" && LC_ALL=C git merge topic) > /dev/null 2>&1
+check "phase41: precondition -- both copies really conflicted on f.txt" \
+    sh -c "grep -q '^<<<<<<< ' '$P41_M/f.txt' && grep -q '^<<<<<<< ' '$P41_M.git-copy/f.txt'"
+check "phase41 oracle: real git's merge ours label is HEAD, not the branch name" \
+    grep -qx '<<<<<<< HEAD' "$P41_M.git-copy/f.txt"
+check "phase41: sg deliberately names the branch instead (divergence, both sides pinned)" \
+    grep -qx '<<<<<<< master' "$P41_M/f.txt"
+check "phase41: the theirs label agrees with git even though the ours label does not" \
+    sh -c "grep -qx '>>>>>>> topic' '$P41_M/f.txt' && grep -qx '>>>>>>> topic' '$P41_M.git-copy/f.txt'"
+# The divergence is confined to that one line: everything else about the
+# conflicted file must still match git byte for byte. Without this, sg could
+# drift anywhere else in the marker block and the two greps above would stay
+# green.
+check "phase41: apart from the ours label the conflicted file matches git byte-for-byte" \
+    sh -c "sed '1,\$s/^<<<<<<< .*/<<<<<<< LABEL/' '$P41_M/f.txt' > $WORKDIR/p41_sg_norm.txt; sed '1,\$s/^<<<<<<< .*/<<<<<<< LABEL/' '$P41_M.git-copy/f.txt' > $WORKDIR/p41_git_norm.txt; cmp -s $WORKDIR/p41_sg_norm.txt $WORKDIR/p41_git_norm.txt"
+# Detached HEAD is where sg and git AGREE, because current_branch is NULL and
+# sg falls back to git's own answer. Pinning it keeps that accident honest:
+# it is the only state in which the divergence above disappears.
+P41_MD="$WORKDIR/p41_merge_label_detached"
+rm -rf "$P41_MD"
+cp -R "$P41_M.git-copy" "$P41_MD"
+(cd "$P41_MD" && LC_ALL=C git merge --abort) > /dev/null 2>&1
+(cd "$P41_MD" && "$SG" switch --detach HEAD) > /dev/null 2>&1
+(cd "$P41_MD" && "$SG" merge topic) > /dev/null 2>&1
+check "phase41: with HEAD detached sg writes HEAD too -- the divergence disappears" \
+    grep -qx '<<<<<<< HEAD' "$P41_MD/f.txt"
+
+# B. `sg rebase`'s theirs label. Real git writes "<short-sha> (<subject>)";
+# sg omitted the parentheses until Phase 41 measured them side by side.
+# Nothing recorded that as deliberate -- no comment, no test -- so it was
+# corrected rather than pinned as-is. Same copy-the-repo technique, so both
+# tools rebase identical commits and the short shas match.
+P41_R="$WORKDIR/p41_rebase_label"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P41_R")") > /dev/null 2>&1
+printf 'r1\nr2\nr3\nr4\n' > "$P41_R/g.txt"
+(cd "$P41_R" && "$SG" add g.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P41_R" && "$SG" branch topic) > /dev/null 2>&1
+printf 'r1\nr2\nMASTER-3\nr4\n' > "$P41_R/g.txt"
+(cd "$P41_R" && "$SG" add g.txt && "$SG" commit -m "master edits g") > /dev/null 2>&1
+(cd "$P41_R" && "$SG" switch topic) > /dev/null 2>&1
+printf 'r1\nr2\nTOPIC-3\nr4\n' > "$P41_R/g.txt"
+(cd "$P41_R" && "$SG" add g.txt && "$SG" commit -m "topic subject line") > /dev/null 2>&1
+rm -rf "$P41_R.git-copy"
+cp -R "$P41_R" "$P41_R.git-copy"
+(cd "$P41_R" && "$SG" rebase master) > /dev/null 2>&1
+(cd "$P41_R.git-copy" && LC_ALL=C git rebase master) > /dev/null 2>&1
+check "phase41: precondition -- both copies really conflicted during rebase" \
+    sh -c "grep -q '^>>>>>>> ' '$P41_R/g.txt' && grep -q '^>>>>>>> ' '$P41_R.git-copy/g.txt'"
+check "phase41 oracle: real git's rebase theirs label parenthesizes the subject" \
+    grep -qE '^>>>>>>> [0-9a-f]{7} \(topic subject line\)$' "$P41_R.git-copy/g.txt"
+check "phase41: sg's rebase theirs label now matches git byte-for-byte" \
+    sh -c "grep '^>>>>>>> ' '$P41_R/g.txt' > $WORKDIR/p41_r_sg.txt; grep '^>>>>>>> ' '$P41_R.git-copy/g.txt' > $WORKDIR/p41_r_git.txt; cmp -s $WORKDIR/p41_r_sg.txt $WORKDIR/p41_r_git.txt"
+check "phase41: and the rebase ours label is HEAD on both sides" \
+    sh -c "grep -qx '<<<<<<< HEAD' '$P41_R/g.txt' && grep -qx '<<<<<<< HEAD' '$P41_R.git-copy/g.txt'"
+
 # --- row 9 (Phase 20 REVERSAL of the Phase 15 refusal): a stash real git
 # built with -u must now be poppable by sg -- the untracked half is restored
 # to disk, unstaged, and the entry is dropped, same as any other successful

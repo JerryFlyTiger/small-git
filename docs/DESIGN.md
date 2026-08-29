@@ -6162,8 +6162,29 @@ git's ours label is invariant; only the theirs label varies. sg writes
 `master` / `weird-branch-name` in the first two rows. Note sg is already
 correct when detached, for an accidental reason: `cmd_merge.c:100` reads
 `current_branch != NULL ? current_branch : "HEAD"`, and detached makes that
-NULL. This is not on the deliberate-divergence list and nothing records it
-as intentional.
+NULL.
+
+**Correction, on checking the source rather than the output:** this
+divergence IS deliberate and IS explained, in the comment at
+`cmd_merge.c:93-99`. What that comment gets wrong is the next clause -- it
+calls the divergence "a pre-existing divergence pinned by phase4b", and
+**no such check exists**. All three mentions of `<<<<<<<` in
+`tests/interop.sh` are something else: two assert the marker is *absent*
+after an abort, and the third pins the *stash* labels (`Updated upstream`),
+a different call site. `tests/test_merge_content.c` pins only that
+`sg_merge_content` writes whatever label its caller hands it -- not which
+label `cmd_merge.c` chooses. So the behaviour is intended, unpinned, and
+absent from the "Four places where sg's answer differs from real git on
+purpose" list in `CLAUDE.md`, which presents itself as exhaustive.
+
+**A comment asserting a pin that does not exist is worse than no comment**,
+because it tells the next reader the property is already guarded and stops
+them adding the guard. It is the same failure this project recorded one
+phase earlier, in Phase 40's section 6: a contract reads as a guarantee
+whether or not anything checks it. The fix here is therefore not to change
+the behaviour -- it is deliberate and must stay -- but to add the pin the
+comment promised, correct the comment, and grow the `CLAUDE.md` list from
+four entries to five.
 
 **(b) `sg merge` accepts only a bare branch name.** Measured: a tag,
 `refs/heads/topic`, `refs/tags/v2` and `topic~0` are each rejected with
@@ -6178,9 +6199,18 @@ here so it is not rediscovered from scratch.
 `<short-sha> (<subject>)`, sg writes `<short-sha> <subject>` -- the
 parentheses are missing (`cmd_rebase.c:138,172`).
 
-(a) and (c) are in scope, not because they matter much on their own, but
-because the net cannot measure alignment through them: every conflicting
-round would mismatch on the label line and drown out the signal.
+The original plan recorded here was to "fix" (a) and (c) so the net could
+measure alignment without the label line drowning out the signal. **(a) must
+not be fixed** -- see the correction above. That removes the reason to touch
+(c) as well, because the oracle no longer needs the labels to agree: `git
+merge-file` takes explicit `-L` labels, so comparing at the content level
+sidesteps both label questions entirely rather than legislating them away.
+
+What (a) and (c) still need is a witness. (a) gets a pin for its current,
+deliberate behaviour. (c) is different in kind -- it has no comment, no
+test, and no sign anyone decided it -- so it reads as an oversight against
+this project's stated goal of byte-compatibility, and is corrected to match
+git rather than pinned as-is.
 
 ### 1. What the survey found, and why the swap is not a one-liner
 
