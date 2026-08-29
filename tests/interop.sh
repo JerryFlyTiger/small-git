@@ -5298,6 +5298,82 @@ for p41f in nl.txt gap3.txt gap4.txt; do
         cmp -s "$WORKDIR/p41_c_sg.txt" "$WORKDIR/p41_c_git.txt"
 done
 
+# --- Phase 45: the three unmerged labels that had no oracle. CLAUDE.md has
+# recorded since Phase 38 that four of `unmerged_label`'s seven strings are
+# checked against real git and three are not -- `both deleted:`,
+# `added by us:`, `added by them:` -- because "an ordinary merge cannot
+# produce those stage combinations". That is true of a CONTENT merge; a
+# rename/rename produces all three at once, measured:
+#
+#   base has f.txt, ours renames it to a.txt, theirs renames it to b.txt
+#     -> f.txt keeps stage 1 only   (both deleted)
+#     -> a.txt has stage 2 only     (added by us)
+#     -> b.txt has stage 3 only     (added by them)
+#
+# The fixture has to be built by GIT, because sg's merge has no rename
+# detection and resolves the same history cleanly -- that divergence is
+# pinned at the bottom of this group rather than left implicit, since it is
+# the reason the oracle looks one-directional here.
+P45="$WORKDIR/p45_rename_rename"
+rm -rf "$P45"
+mkdir -p "$P45"
+( cd "$P45" && LC_ALL=C git init -q -b master . &&
+  printf 'base\ncontent\nhere\n' > f.txt &&
+  LC_ALL=C git add -A && LC_ALL=C git commit -qm base &&
+  LC_ALL=C git branch topic &&
+  mv f.txt a.txt && LC_ALL=C git add -A && LC_ALL=C git commit -qm ours &&
+  LC_ALL=C git switch -q topic &&
+  mv f.txt b.txt && LC_ALL=C git add -A && LC_ALL=C git commit -qm theirs &&
+  LC_ALL=C git switch -q master &&
+  LC_ALL=C git merge topic ) > /dev/null 2>&1
+P45_STAGES=$(cd "$P45" && LC_ALL=C git ls-files -u | awk '{print $4 ":" $3}' | sort | tr '\n' ' ')
+check "phase45 oracle: precondition -- one stage-1-only, one stage-2-only, one stage-3-only path" \
+    sh -c "test \"$P45_STAGES\" = 'a.txt:2 b.txt:3 f.txt:1 '"
+# The long format. Same strip-tab-sort-cmp technique phase38 used for the
+# other four labels, so the two groups fail the same way and read the same.
+(cd "$P45" && "$SG" status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p45_sg.txt"
+# The same three environment axes phase38 pins, spelled out here instead of
+# reusing its variable: this group runs EARLIER in the file, and under `set
+# -u` an unset $P38_GIT_FLAGS aborts the subshell silently -- git never runs,
+# the file comes out empty, and the cmp fails while looking like a real label
+# divergence. (Measured: that is exactly how this check first failed.)
+P45_GIT_FLAGS="-c core.quotepath=false -c advice.statusHints=true"
+(cd "$P45" && LC_ALL=C git $P45_GIT_FLAGS status) 2>/dev/null | sed -n 's/^\t//p' | sort > "$WORKDIR/p45_git.txt"
+check "phase45: sg's both-deleted / added-by-us / added-by-them labels match real git byte-for-byte" \
+    cmp -s "$WORKDIR/p45_sg.txt" "$WORKDIR/p45_git.txt"
+# Named per label as well, so a failure says WHICH of the three moved rather
+# than only that the sorted block differs.
+check "phase45: 'both deleted:' names f.txt" \
+    grep -qx 'both deleted:    f.txt' "$WORKDIR/p45_sg.txt"
+check "phase45: 'added by us:' names a.txt" \
+    grep -qx 'added by us:     a.txt' "$WORKDIR/p45_sg.txt"
+check "phase45: 'added by them:' names b.txt" \
+    grep -qx 'added by them:   b.txt' "$WORKDIR/p45_sg.txt"
+# Porcelain reads the same lookup table, and its three codes had no oracle
+# either.
+(cd "$P45" && "$SG" status --porcelain) 2>/dev/null | sort > "$WORKDIR/p45_sgp.txt"
+(cd "$P45" && LC_ALL=C git status --porcelain) 2>/dev/null | sort > "$WORKDIR/p45_gitp.txt"
+check "phase45: porcelain's DD / AU / UA match real git byte-for-byte" \
+    cmp -s "$WORKDIR/p45_sgp.txt" "$WORKDIR/p45_gitp.txt"
+# The divergence that makes the fixture one-directional: sg's merge has no
+# rename detection, so the same history merges CLEANLY under sg. Pinned on
+# both sides -- if sg ever grows rename-aware merging this check turns red
+# and says so, instead of the phase45 fixture quietly starting to build
+# itself the other way.
+P45SG="$WORKDIR/p45_sg_merge"
+rm -rf "$P45SG"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P45SG")") > /dev/null 2>&1
+printf 'base\ncontent\nhere\n' > "$P45SG/f.txt"
+(cd "$P45SG" && "$SG" add f.txt && "$SG" commit -m base && "$SG" branch topic) > /dev/null 2>&1
+(cd "$P45SG" && mv f.txt a.txt && "$SG" add a.txt f.txt && "$SG" commit -m ours) > /dev/null 2>&1
+(cd "$P45SG" && "$SG" switch topic) > /dev/null 2>&1
+(cd "$P45SG" && mv f.txt b.txt && "$SG" add b.txt f.txt && "$SG" commit -m theirs) > /dev/null 2>&1
+(cd "$P45SG" && "$SG" switch master && "$SG" merge topic) > /dev/null 2>&1
+check "phase45: sg's own merge resolves rename/rename cleanly (no rename detection -- divergence, pinned)" \
+    test ! -f "$P45SG/.git/MERGE_HEAD"
+check "phase45: and keeps both renamed files" \
+    sh -c "test -f '$P45SG/a.txt' && test -f '$P45SG/b.txt' && test ! -f '$P45SG/f.txt'"
+
 # --- Phase 44: `git stash show`'s implied -p. Measured, git 2.55.0: the
 # default is a diffstat, but any DIFF option that is not itself a format
 # selector switches the output to a patch (-M, -C, --no-renames, --histogram,

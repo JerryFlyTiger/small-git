@@ -7022,3 +7022,76 @@ single-boolean implementation gets caught by exactly one check each, so the
 tests distinguish the three plausible wrong implementations from each other
 rather than merely failing together.
 
+## Phase 45: the three unmerged labels that had no oracle
+
+`unmerged_label` maps seven stage combinations to seven long-format strings
+and seven porcelain codes. Phase 38 gave four of them a real-git oracle and
+recorded the other three -- `both deleted:`, `added by us:`, `added by them:`
+-- as unreachable, on the grounds that "an ordinary merge cannot produce those
+stage combinations (DD auto-resolves; AU/UA needs a rename or a hand-built
+index)". That was true of a CONTENT merge and false in general.
+
+### 1. One fixture produces all three
+
+Measured, eight merge shapes tried:
+
+| shape | stages left unmerged |
+|---|---|
+| modify/delete | `1,2` (deleted by them) |
+| delete/modify | `1,3` (deleted by us) |
+| add/add | `2,3` (both added) |
+| rename/delete | `1,2` |
+| rename/modify | none -- resolves |
+| **rename/rename to different names** | **`f.txt:1`, `a.txt:2`, `b.txt:3`** |
+
+The last row is the whole phase: base has `f.txt`, ours renames it to
+`a.txt`, theirs renames it to `b.txt`, and git leaves three unmerged paths --
+one with only stage 1, one with only stage 2, one with only stage 3 -- which
+is exactly the three combinations that had no witness. sg already printed all
+three correctly; nothing had ever checked.
+
+### 2. Why the fixture is built by git, and what that pins
+
+`sg merge` has no rename detection, so the same history merges **cleanly**
+under sg: it sees `f.txt` deleted on both sides, `a.txt` added by ours only,
+`b.txt` added by theirs only, and keeps both files. So the oracle here is
+necessarily one-directional -- git builds the index state, sg reads it, the
+same bidirectional-interop shape the stash groups already use.
+
+That divergence is pinned in the same group rather than left implicit. If sg
+ever grows rename-aware merging, `phase45: sg's own merge resolves
+rename/rename cleanly` turns red and says so, instead of the fixture quietly
+starting to build itself the other way and the labels losing their oracle
+without anyone noticing.
+
+### 3. What went wrong while writing the check, and why it is worth recording
+
+The first run failed with what looked like a real label divergence: sg
+printed three labels, git printed none. The cause was neither tool. The group
+reused `$P38_GIT_FLAGS` -- the three declared environment axes from Phase 38
+-- but sits EARLIER in `interop.sh` than the line that defines it, and
+`interop.sh` runs under `set -u`, so the subshell aborted before git ran and
+the comparison file came out empty.
+
+**An empty oracle file compares as a difference, not as an error**, which is
+the same failure direction this project has recorded before: verification
+tooling fails toward "already verified" or toward a confident wrong answer,
+never toward "I could not run". The flags are now spelled out locally with a
+comment saying why, rather than depending on declaration order.
+
+### 4. Coverage
+
+Five mutations, each caught by exactly the checks written for it:
+
+| mutation | caught by |
+|---|---|
+| `both deleted:` -> `BOTH DELETED:` | the byte-for-byte cmp + its own named check |
+| `added by us:` -> `added by US:` | same, its own |
+| `added by them:` -> `added by THEM:` | same, its own |
+| the `DD` porcelain code | only the porcelain cmp |
+| the `AU` porcelain code | only the porcelain cmp |
+
+The per-label checks exist alongside the sorted byte-for-byte comparison on
+purpose: the cmp alone would say "the block differs" without saying which of
+the three moved.
+
