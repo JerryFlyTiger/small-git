@@ -6966,3 +6966,59 @@ The error wording now matches git's (`<rev> - not something we can merge`)
 with this project's own `sg: ` prefix where git writes `merge: `, and exit 1
 where git also uses 1. Both sides are pinned.
 
+## Phase 44: `sg stash show`'s implied `-p`
+
+Found while surveying for Phase 42, not by a failing test: **`git stash show
+-M` prints a patch, `sg stash show -M` printed a diffstat.** The divergence
+predates every phase that touched stash, was never recorded as deliberate, and
+nothing in the suite could see it -- there was no check that gave `sg stash
+show` a diff option and looked at which FORMAT came back.
+
+### 1. git's rule, measured
+
+`git stash show` defaults to `--stat`. Beyond that:
+
+| flag class | example | output |
+|---|---|---|
+| format selector | `--stat`, `--numstat`, `--shortstat`, `--name-only`, `--name-status`, `-p` | that format |
+| other diff option | `-M`, `-C`, `--no-renames`, `--histogram`, `--patience`, `-U5` | **patch** |
+| stash-specific | `-u`, `--include-untracked`, `--only-untracked` | stat (unchanged) |
+
+Two details decide the implementation, and both are measured:
+
+- **`-u` neither implies nor suppresses.** `-u` alone stays a stat; `-u -M`
+  is a patch. So the stash flags are simply not part of the rule, rather than
+  being a third state.
+- **An explicit format wins regardless of order.** `-M --stat` and `--stat
+  -M` both print a stat. That rules out the obvious implementation -- setting
+  the format from inside the parse loop, last-one-wins -- which passes one of
+  those two and fails the other. `cmd_stash.c` therefore tracks
+  `format_given` and `diff_opt_given` and resolves them after the loop.
+
+All 22 flag combinations tried now match git.
+
+### 2. `--histogram` came along, on purpose
+
+`sg diff` gained `--histogram` in Phase 42 and `sg stash show` shares the same
+renderer, so it would have been the one command where the algorithm could not
+be chosen. It is also a second, independent witness for the implied-`-p` rule:
+a fix that special-cased `-M` alone would pass the rename checks and fail the
+histogram one.
+
+### 3. Coverage
+
+`tests/interop.sh`'s `phase44` group is 16 checks, each half an oracle
+(what git does) and half sg's answer. Three mutations, each caught by exactly
+the check written for it:
+
+| mutation | caught by |
+|---|---|
+| drop the implied `-p` | the three "implies -p" checks + `-u -M` |
+| resolve the format inside the parse loop | only `--stat -M`, i.e. the order half |
+| make `-u` count as a diff option | only `-u alone stays a stat` |
+
+The second and third rows are the point of writing the rule as two flags: a
+single-boolean implementation gets caught by exactly one check each, so the
+tests distinguish the three plausible wrong implementations from each other
+rather than merely failing together.
+

@@ -1025,7 +1025,17 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `index_tree` (parents[1]), and the optional `untracked_tree` (parents[2]).
   Output goes through `sg_diff_print`.
   WARNING: **the default format is `--stat`, not patch** (measured against
-  real git). WARNING: `-u` and `--only-untracked` **are not two independent
+  real git) -- **but any diff option that is not itself a format selector
+  switches it to a patch** (Phase 44), exactly as if `-p` had been given.
+  `-M[<n>]`, `--find-renames[=<n>]`, `--no-renames` and `--histogram` all do;
+  the stash-specific `-u`/`--include-untracked`/`--only-untracked` do NOT
+  (and `-u -M` is still a patch, so `-u` neither implies nor suppresses).
+  **An explicit format wins regardless of order** -- `-M --stat` and `--stat
+  -M` both print a stat -- which is why `cmd_stash.c` tracks `format_given`
+  and `diff_opt_given` and resolves them AFTER the parse loop; an in-loop
+  "last one wins" passes one of those two and fails the other. Until Phase 44
+  sg simply ignored the rule, so `sg stash show -M` printed a stat where git
+  prints a patch. WARNING: `-u` and `--only-untracked` **are not two independent
   booleans, they are the same mode selector, and whichever is written last
   wins** (both orderings measured). WARNING: the untracked half of `-u`
   needs to compare an **empty tree** (`NULL`) against `untracked_tree`, **not**
