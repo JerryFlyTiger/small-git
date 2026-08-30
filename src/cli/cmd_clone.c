@@ -9,6 +9,7 @@
 #include "sg/quote.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/ssh.h"
 #include "sg/transport.h"
 #include "sg/workdir.h"
 
@@ -19,21 +20,36 @@
 
 /* Takes the last non-empty path segment of the URL, stripping a trailing
    ".git" -- e.g. "http://host/a/b/repo.git" -> "repo", matching `git clone`
-   with no explicit destination directory. */
+   with no explicit destination directory.
+
+   The scp-like ssh shorthand needs one extra stop (Phase 47): a single-segment
+   remote path has NO slash at all, so scanning back to the last '/' runs off
+   the front and takes the host with it -- `sg clone git@host:myproject.git`
+   would have created a directory literally named "git@host:myproject". The
+   scan therefore also stops at the colon that separates host from path in
+   that form. Measured: real git clones it into "myproject". */
 static char *derive_target_dir(const char *url)
 {
     size_t len = strlen(url);
     size_t end = len;
     size_t start;
     size_t seg_len;
+    size_t floor = 0;
     char *name;
 
-    while (end > 0 && url[end - 1] == '/')
+    if (sg_ssh_is_ssh_url(url) && strncmp(url, "ssh://", 6) != 0) {
+        const char *colon = strchr(url, ':');
+
+        if (colon != NULL)
+            floor = (size_t)(colon - url) + 1;
+    }
+
+    while (end > floor && url[end - 1] == '/')
         end--;
-    if (end == 0)
+    if (end == floor)
         return NULL;
     start = end;
-    while (start > 0 && url[start - 1] != '/')
+    while (start > floor && url[start - 1] != '/')
         start--;
 
     seg_len = end - start;

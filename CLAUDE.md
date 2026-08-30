@@ -957,8 +957,17 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   request, the flush that ends an advertisement-only connection, and the
   `waitpid` on every path each prevent a specific hang or silent kill --
   see `src/net/ssh.c`'s own comments before simplifying any of them.
+  WARNING: **a new URL form can break code no one edited.** Phase 47's worst
+  bug was in `derive_target_dir` (`cmd_clone.c`), untouched by the phase: it
+  scans back to the last `/`, which every earlier URL form had, so
+  `sg clone git@host:myproject.git` created a directory named
+  `git@host:myproject`. Every scp-like fixture had passed an explicit
+  destination directory -- the convenient thing to write, and the one that
+  skips the guesser entirely.
   WARNING: **`sg_url_redact` treats a schemeless string as scp-like** since
-  Phase 47. It used to return such a string unchanged, which would print the
+  Phase 47, and uses the SAME "colon before any slash" rule the transport
+  routes on -- without it a local path like `a/b@c:d` gets rewritten to
+  `***@c:d`. It used to return such a string unchanged, which would print the
   user name out of `git@host:path`. An `@` AFTER the colon is path, not
   userinfo.
   WARNING: **a LOCAL `make sanitize` does not cover the ssh spawn path.**

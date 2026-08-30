@@ -90,7 +90,11 @@ int sg_ssh_parse_url(const char *url, char **user_host_out, char **port_out, cha
         if (port_start != NULL)
             host_end = port_start;
         *user_host_out = dup_range(rest, (size_t)(host_end - rest));
-        if (port_start != NULL)
+        /* An EMPTY port is no port: measured, git runs ssh with no -p at all
+           for "ssh://host:/repo.git". Passing the empty string through would
+           put a bare -p "" on ssh's command line, where at best it is a
+           confusing error and at worst an option that swallows the host. */
+        if (port_start != NULL && slash > port_start + 1)
             *port_out = dup_range(port_start + 1, (size_t)(slash - port_start - 1));
         /* The leading slash is kept, EXCEPT before a '~': measured against
            git, ssh://host/~alice/repo asks for "~alice/repo" so the far
@@ -247,10 +251,18 @@ static int ssh_spawn(char **argv, ssh_proc *out)
            message from ssh is the only useful thing it can offer. */
         if (dup2(to_child[0], STDIN_FILENO) < 0 || dup2(from_child[1], STDOUT_FILENO) < 0)
             _exit(126);
-        close(to_child[0]);
-        close(to_child[1]);
-        close(from_child[0]);
-        close(from_child[1]);
+        /* Only close the ORIGINALS if they are not the descriptors just
+           installed. If sg was invoked with stdin closed, pipe() can hand
+           back fd 0 itself, dup2(0, 0) is a no-op, and an unconditional
+           close would then sever the child's stdin one line before exec. */
+        if (to_child[0] > STDERR_FILENO)
+            close(to_child[0]);
+        if (to_child[1] > STDERR_FILENO)
+            close(to_child[1]);
+        if (from_child[0] > STDERR_FILENO)
+            close(from_child[0]);
+        if (from_child[1] > STDERR_FILENO)
+            close(from_child[1]);
         execvp(argv[0], argv);
         fprintf(stderr, "sg: cannot run '%s': %s\n", argv[0], strerror(errno));
         _exit(127);
@@ -305,10 +317,18 @@ static int ssh_pump(ssh_proc *p, const void *request, size_t request_len, sg_buf
        would read to the user as a crash rather than as a remote failure. */
     old_pipe = signal(SIGPIPE, SIG_IGN);
 
-    if (request == NULL || request_len == 0) {
+    /* No request means "close the write side immediately". It does NOT mean
+       "send a flush": a caller that wants the protocol's "I want nothing"
+       must pass those four bytes itself, as sg_ssh_advertise does, because
+       EOF alone makes upload-pack report a hung-up connection. Without this
+       branch a zero-length request would never register the write fd, never
+       close it, and both sides would wait forever. */
+    if (request == NULL) {
+        request_len = 0;
+    }
+    if (request_len == 0) {
         close(p->in_fd);
         p->in_fd = -1;
-        written = request_len;
     }
 
     for (;;) {
@@ -454,8 +474,16 @@ int sg_ssh_advertise(const char *url, const char *service, sg_buf *out)
     {
         size_t adv = advertisement_len(out->data, out->len);
 
-        if (adv > 0)
-            out->len = adv;
+        /* Caught here rather than left to the parser: a remote command that
+           exits 0 while sending nothing usable would otherwise surface as
+           "not a valid git smart HTTP ref advertisement", naming the wrong
+           transport for a pure-ssh failure. */
+        if (adv == 0) {
+            fprintf(stderr, "sg: ssh: %s did not send a ref advertisement\n", service);
+            sg_buf_free(out);
+            return -1;
+        }
+        out->len = adv;
     }
     return 0;
 }

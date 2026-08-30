@@ -78,6 +78,14 @@ char *sg_url_redact(const char *url)
 
         if (scp_colon == NULL)
             return strdup(url);
+        /* Same rule the ssh transport routes on: a colon AFTER a slash makes
+           this a local path that merely contains a colon, not host:path.
+           Without this a relative path like "a/b@c:d" would be rewritten to
+           "***@c:d" -- corrupting a string that was never a URL, and
+           contradicting this function's own promise to leave input with no
+           userinfo alone. */
+        if (memchr(url, '/', (size_t)(scp_colon - url)) != NULL)
+            return strdup(url);
         for (q = url; q < scp_colon; q++) {
             if (*q == '@')
                 scp_at = q;

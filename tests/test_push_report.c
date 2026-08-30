@@ -287,6 +287,19 @@ static void test_url_redact_at_sign_in_path(void)
     free(redacted);
 }
 
+/* A colon AFTER a slash makes this a local path that merely contains a
+   colon -- the same rule the ssh transport routes on. Redacting it would
+   corrupt a string that was never a URL. */
+static void test_url_redact_path_with_colon_and_at(void)
+{
+    char *redacted = sg_url_redact("a/b@c:d");
+
+    CHECK(redacted != NULL && strcmp(redacted, "a/b@c:d") == 0,
+         "a path whose colon follows a slash is not scp-like, got '%s'",
+         redacted ? redacted : "(null)");
+    free(redacted);
+}
+
 int main(void)
 {
     test_all_ok();
@@ -303,6 +316,7 @@ int main(void)
     test_url_redact_scp_like();
     test_url_redact_scp_like_without_user();
     test_url_redact_at_sign_in_path();
+    test_url_redact_path_with_colon_and_at();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

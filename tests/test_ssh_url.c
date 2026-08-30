@@ -94,6 +94,14 @@ static void test_parse(void)
     expect_parse("host:repo.git", "host", NULL, "repo.git");
     expect_parse("user@host:srv/repo.git", "user@host", NULL, "srv/repo.git");
     expect_parse("host:22", "host", NULL, "22");
+    /* An empty port is NO port, not an empty one: measured, git runs ssh
+       with no -p at all for this. Letting "" through would put a bare
+       -p "" on ssh's command line. */
+    expect_parse("ssh://host:/repo.git", "host", NULL, "/repo.git");
+    /* Userinfo with an empty host is passed through verbatim -- measured,
+       git hands ssh the host argument "user@" and lets it fail. Rejecting
+       it locally would be a tidier answer than git's, not the same one. */
+    expect_parse("ssh://user@/repo.git", "user@", NULL, "/repo.git");
     /* Where the local error lives, measured: only a form with no path
        SEPARATOR at all fails here. An empty path after the separator is
        passed through and refused by the far side, which is what git does --

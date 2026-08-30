@@ -5662,6 +5662,22 @@ check "phase47: sg clone over the scp-like shorthand exits 0" test $? = 0
 check "phase47: and lands on the same commit" \
     sh -c "test \"\$(cd '$P47_SCPCLONE' && git rev-parse HEAD)\" = '$P47_HEAD2'"
 
+# The scp-like shorthand with NO explicit destination directory, and a
+# single-segment remote path -- the shape with no slash anywhere after the
+# host. Before Phase 47's review round the directory-name guesser scanned
+# back to the last '/', ran off the front of the string, and created a
+# directory literally named "localhost:p47_remote". Measured: git clones the
+# same url into "p47_remote".
+P47_DERIVE="$WORKDIR/p47_derive"
+rm -rf "$P47_DERIVE"
+mkdir -p "$P47_DERIVE"
+cp -R "$P47_BARE" "$P47_DERIVE/p47_remote.git"
+(cd "$P47_DERIVE" && GIT_SSH_COMMAND="$P47_SSH" "$SG" clone "localhost:p47_remote.git" < /dev/null) > /dev/null 2>&1
+check "phase47: a bare scp-like url with no destination clones into the repo's own name" \
+    sh -c "test -d '$P47_DERIVE/p47_remote/.git'"
+check "phase47: and NOT into a directory named after the host" \
+    sh -c "! ls -d '$P47_DERIVE'/*:* > /dev/null 2>&1"
+
 # The seam between this phase and the last one: Phase 46's refspec forms over
 # Phase 47's transport. Each was tested against its own remote and neither
 # run would have noticed the other breaking -- which is exactly where a
