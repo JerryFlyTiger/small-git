@@ -7482,3 +7482,239 @@ The advertisement check and the `dup2` guard do not: reaching them needs a
 remote command that exits 0 while sending garbage, and an sg invoked with fd
 0 closed. Both are recorded here as unverified rather than counted as covered.
 
+
+## Phase 48: the reflog gaps Phase 17 left behind
+
+Phase 17 generalized the reflog and, in doing so, wrote down three places it
+deliberately did not reach. All three are closed here. None of them is
+large; what makes them worth a section is that each one's *measured* shape
+disagrees with the shape you would guess.
+
+### 1. `sg stash push` never logged the reset it performs
+
+`git stash` resets the working tree to HEAD, and logs that reset.
+Measured on a repo with one commit and one dirty file:
+
+| log | after `git stash` |
+|---|---|
+| `logs/HEAD` | `commit (initial): one`, then `reset: moving to HEAD` |
+| `logs/refs/heads/master` | `commit (initial): one` -- **nothing added** |
+| `logs/refs/stash` | `WIP on master: <sha> one` |
+
+The asymmetry is not a special case in stash; it is Phase 17's rule 1
+falling out. The reset moves HEAD from a commit to *the same* commit, so
+`old == new`: a concrete ref suppresses that as a no-op, while `logs/HEAD`
+appends unconditionally. Routing the write through `sg_ref_move_head` --
+the same function `commit`/`reset`/`merge` already use -- reproduces both
+halves with no branch of its own.
+
+The write is deliberately **not** fatal on failure. By the time it runs the
+stash commit exists, `refs/stash` is updated and the working tree is
+already reset; returning failure there would report a broken stash for a
+stash that is entirely intact. A stderr warning names it instead.
+
+The interop check compares the message column of both log files against
+real git's, and pins the branch log's *emptiness* separately -- a
+"append to both" implementation matches `logs/HEAD` perfectly.
+
+#### 1a. Two cases where git logs nothing, and one of them was never about stash
+
+Measuring only the fixture above gets this wrong. Two more, both measured,
+both of which sg got wrong when the line was first added:
+
+| command | `logs/HEAD` gains |
+|---|---|
+| `git stash` on a branch | `reset: moving to HEAD` |
+| `git stash push -- <path>` | **nothing** |
+| `git stash` on a detached HEAD | **nothing** |
+
+The partial push is easy once seen: it resets only the named paths, so HEAD
+is never updated at all. sg's partial path (`restore_matched_paths`) likewise
+has no HEAD update of its own, so the call is simply skipped there.
+
+The detached case is not a stash fact at all. Checked against `reset --hard`,
+which shares nothing with stash but the ref write:
+
+| situation | git logs |
+|---|---|
+| symbolic -> detached, same commit | yes (`checkout: moving from ...`) |
+| detached -> detached, same commit | **no** |
+| detached -> detached, other commit | yes |
+| on a branch, same commit | yes (mirrored from the branch's suppressed update) |
+
+So **Phase 17's "logs/HEAD always appends, even for a no-op" is a property of
+the mirroring path, not of HEAD's file.** When HEAD is written *directly* --
+which is exactly the detached case -- it obeys the ordinary `old != new` rule
+like any other ref. The one thing that must not be swallowed with it is the
+symbolic-to-detached transition, which git logs even when the commit is
+unchanged; the condition is therefore "HEAD was *already* detached **and**
+old == new", and it lives in `sg_ref_set_head_detached`, the single writer of
+a detached HEAD.
+
+This was a pre-existing divergence, not one this phase introduced: `sg reset
+--hard HEAD` on a detached HEAD grew a line real git does not write, and had
+since Phase 18. Adding the stash line is what made it worth measuring. A
+corrupt HEAD (`sg_ref_head_is_detached` returning -1) deliberately counts as
+"not already detached" and still logs -- it is about to be overwritten, and a
+spurious line is a safer failure direction than silence.
+
+Suppressing too much is as wrong as suppressing too little, so the interop
+fixture pins all three corners in one repo: the no-op logs nothing, the move
+still logs, and the transition into detachment still logs.
+
+### 2. `sg clone` created no `refs/remotes/<remote>/HEAD`
+
+Measured, after `git clone bare.git dst`:
+
+```
+dst/.git/refs/remotes/origin/HEAD        -> "ref: refs/remotes/origin/master"
+dst/.git/logs/refs/remotes/origin/HEAD   -> one line, "clone: from <url>"
+dst/.git/logs/refs/remotes/origin/master -> does not exist
+```
+
+Three separate facts, and only the first is obvious:
+
+- it is a **symbolic** ref, not a copy of the branch's sha;
+- its log's old id is all-zeros and its new id is the branch tip;
+- the remote-tracking **branch** gets no log at all. Clone writes those refs
+  directly; their logs only start at the first fetch. So "give everything
+  under `refs/remotes/` a log" passes every check about `origin/HEAD` while
+  inventing history for refs git leaves alone, and the interop group pins
+  that absence on both sides for exactly that reason.
+
+Phase 17 recorded this as a deliberate divergence, with a reason that was
+sound at the time: writing only the *log* was tried and removed, because
+`sg reflog origin/HEAD` resolves names through `sg_rev_parse_ref_path`,
+which needs the ref -- so a log with no ref claims a history the repository
+does not have. Phase 48 creates the ref, which removes the reason rather
+than overruling it. The old interop pin ("no ref, and no log either") is
+replaced by a pin of the pairing itself: **never one without the other**.
+
+This is the project's first arbitrary symbolic ref. `sg_ref_set_symref`
+follows `sg_ref_set_head`'s shape exactly -- append the log line first,
+write the file, truncate the log back off if the write then fails -- and
+inherits Phase 17's namespace policy unchanged (a message for a ref outside
+the four logged namespaces is refused outright, writing nothing).
+
+Its old-id lookup has a known limitation, stated in the header: a symref
+that already exists reads as all-zeros, because a `ref: ...` file has no id
+to parse. That is the same limitation `sg_ref_set_head_detached` documents,
+and it is harmless here because the only caller creates the ref.
+
+### 3. bare `@{N}` and bare `@`
+
+`@{1}` is **not** `HEAD@{1}`. Measured, in a repo where a checkout away and
+back has moved `logs/HEAD` but not the branch's log:
+
+| expression | resolves to |
+|---|---|
+| `@{1}` | `master@{1}` -- the current branch's log |
+| `HEAD@{1}` | a different commit |
+| `@` | `HEAD` |
+| `@~1`, `@{1}~1` | suffixes chain normally |
+
+git's own out-of-range message settles it beyond doubt: `@{99}` reports
+`refs/heads/master` has too few entries, naming the branch, not HEAD.
+On a **detached** HEAD there is no branch and it falls back to `logs/HEAD`;
+on an **unborn** HEAD git rejects the argument outright. A corrupt HEAD must
+be rejected too, and only `sg_ref_head_is_detached`'s tri-state separates it
+from detached -- Phase 18's rule, and the reason a NULL test on
+`sg_ref_current_branch` is the wrong predicate here.
+
+Both spellings are implemented by rewriting `base` before anything else
+runs, so the `@{N}` lookup, `resolve_base` and the `~`/`^` loop below are
+untouched and `@{1}~1` works for free. The one thing the rewrite must not
+do is swallow an empty base generally: `~1`, `^` and `@{` alone are still
+parse errors, and a unit test pins that.
+
+One measured case is **deliberately not reproduced**. With the current
+branch's reflog file deleted by hand, real git lets `@{0}` fall back to the
+branch's tip while still rejecting the spelled-out `master@{0}`:
+
+```
+$ git rev-parse @{0}         # -> the tip
+$ git rev-parse nolog@{0}    # -> fatal: ambiguous argument
+```
+
+sg rejects both. This is not on the deliberate-divergence list, because
+reaching it requires deleting a log file by hand -- both tools write one for
+every `refs/heads/` update -- and because the divergence sg would be
+choosing is *between its own two spellings*. A uniform rejection is a
+smaller lie than an asymmetry whose rule this phase could not measure the
+boundary of.
+
+### Mutation record
+
+Nine mutations, all against `--interop`. Each turned the check named beside
+it red, and the last one is the deliberately over-broad direction:
+
+| mutation | caught by |
+|---|---|
+| `"ref: %s\n"` -> `"%s\n"` | the symref cmp, the "holds a ref: line" check, and three `git fsck` checks |
+| clone's reflog message -> `NULL` | the one-line log check, and phase17d's never-one-without-the-other pairing |
+| bare `@{N}` always reads HEAD | `sg resolves a bare @{1} to the same commit git does` |
+| bare `@` rejected | three probes, phase17c and phase48 |
+| stash's reflog message -> `NULL` | the `logs/HEAD` message cmp |
+| clone logs remote-tracking branches too | the negative "no log for origin/`<branch>`" checks |
+| never suppress the detached no-op | the detached-stash cmp **and** the `reset --hard` count |
+| write the line for a partial push | the partial-stash cmp |
+| suppress the symbolic-to-detached transition as well | `and it still logs the transition`, plus two phase18e checks |
+| drop `ref_path_reflog_allowed` from `sg_ref_set_symref` | `test_refs` only -- interop has no witness for this guard, deliberately noted rather than claimed |
+
+One defense line is **unverifiable and recorded as such**: the
+`sg_reflog_truncate` calls on `sg_ref_set_symref`'s failure branches. No test
+forces a mid-write failure (a read-only directory, a full disk), so removing
+any one of them turns nothing red. This is the "mathematically unobservable"
+category, not a coverage gap a better mutation could reach; closing it would
+take a fault-injection fixture the project does not have.
+
+A second review round, over the code the first round's fixes produced, found
+that one of those fixes was itself untestable: the first attempt at the
+truncation problem added a guard on a `snprintf` into a 4 KB buffer, and
+nothing in the suite can drive a 4 KB clone url through that path, so
+reverting the guard would have passed all five gates. The second fix deletes
+the buffer instead -- the message is `reflog_msg`, already malloc'd to fit
+and already the string every other reflog line of the clone uses, so the
+failure mode stops existing rather than being guarded against. **Preferring
+"remove the branch" over "add a guard you cannot test" is the general rule
+here**, and it is the same reasoning as the project's standing note that a
+review-found fix with no failing test behind it has not landed.
+
+Two defense lines from that round are recorded as not independently
+observable, rather than counted: the if/else fixture builder behaves
+identically to the `&&`/`||` spelling it replaced unless the builder actually
+fails, and the "refusing `@~1` left HEAD where it was" check cannot be tripped
+by any single mutation without also tripping the check beside it, because
+`cmd_switch.c` resolves the revision and returns before writing anything.
+Both are insurance against a future refactor, not present coverage.
+
+A cold review also asked whether a no-op symref update should be suppressed
+the way a concrete ref's own log is. Measured rather than reasoned about:
+running `git remote set-head origin master` twice with nothing changing
+appends a line each time, so the unconditional append is git's own answer.
+It stays unreachable until a second caller exists, and is now written down
+as measured instead of inherited.
+
+Two things went wrong while measuring, and both are the kind that fake a
+pass:
+
+- the first attempt at the stash mutation matched the phrase inside the
+  **comment** above the call, not the call. `mutate.sh` reported a clean
+  green and it read as a blind spot. The rule is the one already in
+  `CLAUDE.md`: a literal that also appears in prose needs surrounding
+  context, not `/g`.
+- the detached/partial checks were first written with `$( )` nested inside a
+  quoted `sh -c "..."`, and the escaping collapsed into a **shell syntax
+  error**. `bash` aborted `interop.sh` at that line, so every check below it
+  silently did not run -- and two mutation rounds were then scored as
+  "caught" on the strength of red lines that all came from checks *above* the
+  break. The values are computed into shell variables first now, and
+  `bash -n tests/interop.sh` is the check that would have caught it in one
+  second.
+
+### What this closes, and what it does not
+
+The phase does not touch `@{<date>}`, `@{upstream}`, or
+`sg reflog expire|delete`; those remain unimplemented and are listed here so
+the next reader does not mistake "Phase 17's gaps are closed" for "the
+reflog is complete".

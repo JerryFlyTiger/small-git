@@ -279,6 +279,7 @@ static int write_config_stanza(const char *git_dir, const char *url, const char 
 int sg_cmd_clone(int argc, char **argv)
 {
     const char *url;
+    const char *remote_name;
     char *target_dir = NULL;
     char git_dir[SG_PATH_MAX];
     char *repo_root = NULL;
@@ -350,7 +351,12 @@ int sg_cmd_clone(int argc, char **argv)
     if (fetch_and_store_pack(git_dir, url, want_ids, want_count) != 0)
         goto done;
 
-    if (write_remote_and_tag_refs(git_dir, &adv, "origin") != 0) {
+    /* The only remote a clone ever creates. Named once so the config stanza,
+       the remote-tracking refs and refs/remotes/<remote>/HEAD below cannot
+       drift apart; sg clone has no --origin flag. */
+    remote_name = "origin";
+
+    if (write_remote_and_tag_refs(git_dir, &adv, remote_name) != 0) {
         fprintf(stderr, "sg: failed to write remote-tracking refs\n");
         goto done;
     }
@@ -424,15 +430,59 @@ int sg_cmd_clone(int argc, char **argv)
         }
     }
 
-    /* Not written here, deliberately: refs/remotes/<remote>/HEAD. Real git's
-       clone creates it as a symbolic ref and logs one "clone: from <url>"
-       line to it (measured). sg does not model that ref anywhere in this
-       codebase, and creating it is a separate feature. Writing only its
-       reflog was tried and removed: a log file for a ref that does not exist
-       is unreachable -- `sg reflog origin/HEAD` resolves the name through
-       sg_rev_parse_ref_path, which requires the ref itself -- so it would be
-       a file claiming a history for something the repo does not have.
-       Recorded as a known divergence in docs/DESIGN.md instead. */
+    /* refs/remotes/<remote>/HEAD, which real git's clone creates as a
+       SYMBOLIC ref to the remote's default branch, with one
+       "clone: from <url>" line in its own log (measured: the file holds
+       "ref: refs/remotes/origin/master").
+
+       Phase 17 left this out for a reason that no longer applies. Back then
+       only the log was attempted, and a log for a ref that does not exist is
+       unreachable -- `sg reflog origin/HEAD` resolves the name through
+       sg_rev_parse_ref_path, which requires the ref. Phase 48 creates the ref
+       itself, so the log has something to belong to.
+
+       It points at default_branch, which is whatever the checkout above
+       used: the remote's advertised HEAD symref when there was one, else the
+       main/master/first-advertised guess. Deliberately the same value rather
+       than a second, independent guess -- origin/HEAD disagreeing with the
+       branch the clone actually checked out would be worse than either
+       answer on its own. The two early-exit paths above (an empty remote,
+       and a tags-only remote) return before reaching here and so create no
+       origin/HEAD, which is also what real git does -- there is no branch
+       for it to point at.
+
+       Not fatal on failure: the clone is complete and checked out by the time
+       this runs, and refusing here would report failure for a repository that
+       is entirely usable. The user is told instead -- the same shape as the
+       remote-tracking ref updates above. */
+    {
+        char origin_head_path[SG_PATH_MAX];
+        char origin_branch_path[SG_PATH_MAX];
+
+        /* reflog_msg, not a third local buffer holding the same string: it is
+           already "clone: from <url>", already malloc'd to fit, and its own
+           comment above says it is reused for every reflog line clone writes.
+           An earlier version of this block formatted the message again into a
+           fixed 4 KB buffer, which a long enough url truncates -- so the
+           three logs of one clone could disagree about where it came from.
+           Reusing the string deletes that failure mode instead of adding a
+           guard against it, which matters because nothing can drive a 4 KB
+           url through this code path in a test.
+
+           Truncation of the two PATHS is reported, never silently skipped: a
+           ref path that long means an absurd branch name from the remote, and
+           "quietly did not create it" is the one outcome the user cannot
+           distinguish from success. */
+        if (snprintf(origin_head_path, sizeof(origin_head_path), "refs/remotes/%s/HEAD",
+                    remote_name) >= (int)sizeof(origin_head_path) ||
+           snprintf(origin_branch_path, sizeof(origin_branch_path), "refs/remotes/%s/%s",
+                   remote_name, default_branch) >= (int)sizeof(origin_branch_path)) {
+            fprintf(stderr, "sg: warning: remote-tracking HEAD path too long, not created\n");
+        } else if (sg_ref_set_symref(git_dir, origin_head_path, origin_branch_path,
+                                    reflog_msg) != 0) {
+            fprintf(stderr, "sg: warning: cannot write %s\n", origin_head_path);
+        }
+    }
 
     if (write_config_stanza(git_dir, url, default_branch) != 0) {
         fprintf(stderr, "sg: failed to write config\n");

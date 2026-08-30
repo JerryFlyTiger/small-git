@@ -184,12 +184,23 @@ int sg_ref_update(const char *git_dir, const char *ref_path,
 int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_msg);
 
 /* Writes .git/HEAD as a raw 40-hex object id, i.e. detaches it. The mirror
-   of sg_ref_set_head, with the same reflog contract: reflog_msg == NULL
-   writes only HEAD; otherwise one line -- old/new possibly equal -- is
-   appended to logs/HEAD first and truncated back off if the HEAD write then
-   fails. old_id comes from sg_ref_resolve_head (all-zeros only for an
-   unborn HEAD), so detaching FROM a branch correctly records the commit
-   being left, which is what real git writes there (measured, git 2.55.0).
+   of sg_ref_set_head, with almost the same reflog contract: reflog_msg ==
+   NULL writes only HEAD; otherwise one line is appended to logs/HEAD first
+   and truncated back off if the HEAD write then fails. old_id comes from
+   sg_ref_resolve_head (all-zeros only for an unborn HEAD), so detaching FROM
+   a branch correctly records the commit being left, which is what real git
+   writes there (measured, git 2.55.0).
+
+   The one difference from sg_ref_set_head, measured in Phase 48: a NO-OP is
+   suppressed here, but ONLY when HEAD was ALREADY detached. Writing HEAD
+   directly obeys the ordinary "old != new" rule like any other ref -- real
+   git logs nothing for a detached `reset --hard HEAD` or a detached `stash`
+   -- while sg_ref_set_head's unconditional line is a property of the
+   MIRRORING path (rule 2), not of HEAD's file. The symbolic-to-detached
+   TRANSITION is still logged even when the commit does not change, which is
+   why the condition is not simply "old == new". A corrupt HEAD counts as
+   "not already detached" and still logs: it is about to be overwritten, and
+   a spurious line is a safer failure direction than silence.
 
    Not expressible via sg_ref_update(git_dir, "HEAD", ...): that produces the
    same HEAD file, but reads old_id with sg_ref_read_path, which cannot parse
@@ -197,6 +208,39 @@ int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_
    failure. */
 int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
                              const char *reflog_msg);
+
+/* Writes an arbitrary SYMBOLIC ref -- "ref: <target_ref_path>" -- with the
+   same reflog contract as sg_ref_set_head: reflog_msg == NULL writes only the
+   ref file; otherwise one line is appended first and truncated back off if
+   the write then fails. new_id is the target's current tip (all-zeros if the
+   target has none yet); old_id is this ref's own previous value, which for a
+   symref that already exists reads as all-zeros because a "ref: ..." file has
+   no id to parse -- the same limitation sg_ref_set_head_detached's comment
+   describes, and harmless here because the only caller creates the ref.
+
+   Both arguments are full ref PATHS the caller builds, not user-typed
+   names, and are guarded by sg_ref_branch_name_is_safe (path traversal) --
+   deliberately NOT sg_ref_name_valid_for_create, whose check-ref-format
+   rules are about typos and would reject the literal "HEAD".
+
+   A NO-OP is deliberately NOT suppressed here, unlike a concrete ref's own
+   log (Phase 17's rule 1): measured against git 2.55.0, running
+   `git remote set-head origin master` twice with nothing changing appends a
+   line each time. So this follows sg_ref_set_head's unconditional shape
+   because that is what git does for a symref, not merely by inheritance --
+   though the only caller today creates the ref, so the case is unreachable
+   until a second one exists.
+
+   The reflog namespace policy applies unchanged: a ref_path outside HEAD,
+   refs/heads/, refs/remotes/ and refs/stash with a non-NULL message is
+   refused outright, writing nothing at all (Phase 17's rule).
+
+   Added in Phase 48 for `refs/remotes/<remote>/HEAD`, which real git creates
+   on clone as a symref to the remote's default branch (measured: the file is
+   "ref: refs/remotes/origin/master" and its log holds one
+   "clone: from <url>" line). Returns 0, -1 on failure. */
+int sg_ref_set_symref(const char *git_dir, const char *ref_path, const char *target_ref_path,
+                      const char *reflog_msg);
 
 /* Moves whatever HEAD names to target: the current branch, or -- when HEAD is
    detached -- HEAD itself, leaving every branch alone. branch NULL means

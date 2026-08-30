@@ -233,10 +233,67 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
     while (rev[base_len] != '\0' && rev[base_len] != '~' && rev[base_len] != '^' &&
           !(rev[base_len] == '@' && rev[base_len + 1] == '{'))
         base_len++;
-    if (base_len == 0 || base_len >= sizeof(base))
+    if (base_len >= sizeof(base))
         return -1;
     memcpy(base, rev, base_len);
     base[base_len] = '\0';
+
+    /* Two bare "@" spellings, both measured against git 2.55.0 (Phase 48).
+       They are resolved here, by rewriting base, so that everything below --
+       the @{N} lookup, resolve_base, and the ~/^ suffix loop -- keeps working
+       on an ordinary name and needs no second code path. "@{1}~1" and "@~1"
+       both parse for free because of it. */
+    if (base_len == 0) {
+        /* An empty base is only legal as the "@{N}" shorthand. "~1" or "^"
+           with nothing in front of it is still a parse error. */
+        if (rev[0] != '@' || rev[1] != '{')
+            return -1;
+
+        /* Measured: `git rev-parse @{1}` reads the CURRENT BRANCH's log, not
+           HEAD's -- with a checkout between them the two logs give different
+           answers, and git's own out-of-range message names "master", not
+           "HEAD". On a detached HEAD there is no branch and it reads HEAD's
+           log instead. An unborn HEAD resolves to neither and is rejected,
+           which is also what git does (it prints the argument back and
+           fails). A CORRUPT HEAD must not be mistaken for detached, hence
+           sg_ref_head_is_detached's tri-state rather than a NULL test on
+           sg_ref_current_branch (Phase 18's rule).
+
+           Note the two predicates do not partition every conceivable HEAD:
+           sg_ref_head_is_detached answers 0 for any "ref: ..." line, while
+           sg_ref_current_branch returns NULL unless the target is under
+           refs/heads/. A HEAD symlinked somewhere else entirely would land
+           in the else branch and be rejected by the NULL test -- the safe
+           direction, and unreachable anyway since nothing in this codebase
+           writes such a HEAD. */
+        {
+            int detached = sg_ref_head_is_detached(git_dir);
+            char *branch;
+
+            if (detached < 0)
+                return -1;
+            if (detached == 1) {
+                memcpy(base, "HEAD", 5);
+            } else {
+                branch = sg_ref_current_branch(git_dir);
+                if (branch == NULL)
+                    return -1;
+                if (strlen(branch) >= sizeof(base)) {
+                    free(branch);
+                    return -1;
+                }
+                strcpy(base, branch);
+                free(branch);
+            }
+        }
+    } else if (strcmp(base, "@") == 0) {
+        /* Measured: "@" on its own is HEAD, suffixes and all ("@~1" is
+           HEAD~1). Rewriting it here rather than teaching resolve_base about
+           it keeps the rule in one place, and deliberately makes "@" mean
+           HEAD even if a branch literally named "@" exists -- which is git's
+           documented rule too. */
+        memcpy(base, "HEAD", 5);
+    }
 
     pos = base_len;
 
