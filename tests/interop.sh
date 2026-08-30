@@ -5662,6 +5662,19 @@ check "phase47: sg clone over the scp-like shorthand exits 0" test $? = 0
 check "phase47: and lands on the same commit" \
     sh -c "test \"\$(cd '$P47_SCPCLONE' && git rev-parse HEAD)\" = '$P47_HEAD2'"
 
+# The seam between this phase and the last one: Phase 46's refspec forms over
+# Phase 47's transport. Each was tested against its own remote and neither
+# run would have noticed the other breaking -- which is exactly where a
+# split-in-two milestone hides its gaps.
+(cd "$P47_SRC" && "$SG" branch p47w1 && "$SG" branch p47w2) > /dev/null 2>&1
+(cd "$P47_SRC" && GIT_SSH_COMMAND="$P47_SSH" "$SG" push origin 'refs/heads/p47w*:refs/heads/p47w*' < /dev/null) > /dev/null 2>&1
+check "phase47: a wildcard refspec pushes over ssh" test $? = 0
+check "phase47: and both matching branches reached the remote" \
+    sh -c "(cd '$P47_BARE' && git rev-parse --verify refs/heads/p47w1 && git rev-parse --verify refs/heads/p47w2) > /dev/null 2>&1"
+(cd "$P47_SRC" && GIT_SSH_COMMAND="$P47_SSH" "$SG" push origin --delete p47w2 < /dev/null) > /dev/null 2>&1
+check "phase47: --delete works over ssh too" \
+    sh -c "! (cd '$P47_BARE' && git rev-parse --verify refs/heads/p47w2) > /dev/null 2>&1"
+
 # a path that does not exist on the far side must fail, not report success
 P47_BADOUT="$WORKDIR/p47_bad.txt"
 (cd "$WORKDIR" && GIT_SSH_COMMAND="$P47_SSH" "$SG" clone "ssh://localhost$WORKDIR/p47_nosuch.git" p47_bad < /dev/null) > "$P47_BADOUT" 2>&1
