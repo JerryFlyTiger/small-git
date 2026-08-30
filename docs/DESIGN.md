@@ -7214,3 +7214,54 @@ capture length is computed from the pattern. Asserting the exact set of refs
 under the prefix is what finally turns it red. Both dead ends are recorded
 because either one alone reads as "this rule has coverage".
 
+### 6. The review round: one real defect, and two checks that proved nothing
+
+A cold read of the diff found one defect that no gate caught, and its shape is
+worth more than the fix.
+
+**`refs/sg/chunks` had two owners.** `wildcard_expand_candidates` enumerates
+every local ref under the pattern's namespace, and the keepalive ref is a
+local ref like any other -- while the dedicated chunks-propagation block
+further down computes its OWN old/new pair for that same ref on every push,
+sometimes merging the two sides into a fresh commit. A pattern wide enough to
+match it queues both. Reproduced: the remote answers
+
+```
+error: multiple updates for ref 'refs/sg/chunks' not allowed
+```
+
+and because the push is atomic **nothing lands at all** -- not the chunks
+ref, and not the ordinary branch the user actually meant. Every Phase 46
+fixture up to that point used narrow patterns rooted at `refs/heads/`, which
+structurally cannot reach it. The fix gives the ref exactly one owner: the
+expansion skips it.
+
+**Two checks written for that fix proved nothing, in two different ways**,
+and both are recorded because each looked correct:
+
+- The first version reused the shared HTTP fixture, whose remote already had
+  a keepalive ref from earlier pushes. With both sides equal the propagation
+  block sends nothing, so there is no second update to collide with:
+  **removing the exclusion left the check green.** It now builds its own
+  empty bare repo and its own fresh local repo, and asserts the precondition
+  (local has one, remote does not) rather than assuming it.
+- The second version grepped the push output for git's collision wording.
+  Under the mutation that check **stayed green while the push had in fact
+  failed**. The exit code is the property that matters; the message is the
+  remote's to word.
+
+Two other findings were acted on. The remote-tracking narrowing (only a
+destination under `refs/heads/` gets one) had no fixture at all -- correct by
+inspection, unprovable by test -- and now has one that turns red when the
+narrowing is removed. And two over-long-name paths silently `continue`d where
+the rest of the function aborts; they now report, matching this project's
+rule that a reporting path must never quietly drop a ref.
+
+Two are recorded and NOT acted on, so they are not rediscovered as bugs:
+`matching_force = matching_force || parsed.force` is untested, because no
+fixture passes two `:` arguments in one invocation; and for a destination
+outside `refs/heads/`/`refs/tags/` the report line prints the full path on
+both sides (`refs/remotes/up/topic/sub -> origin/refs/remotes/up/topic/sub`),
+which is ugly but honest, and this command's report has never been required
+to match git byte for byte.
+

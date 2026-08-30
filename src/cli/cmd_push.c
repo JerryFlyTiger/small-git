@@ -888,8 +888,15 @@ static int wildcard_expand_candidates(const char *git_dir, const sg_push_refspec
         size_t full_len;
         push_entry cand;
 
-        if (snprintf(full, sizeof(full), "%s%s", listdir, names[i]) >= (int)sizeof(full))
-            continue;
+        /* A name too long to reassemble is REPORTED, not skipped: this
+           project's path-truncation rule is that a reporting path must
+           never silently drop a ref, and the two other over-long checks in
+           this function already abort. Silently skipping would push some of
+           the pattern's matches and not others, with nothing said. */
+        if (snprintf(full, sizeof(full), "%s%s", listdir, names[i]) >= (int)sizeof(full)) {
+            fprintf(stderr, "sg: ref name under '%s' is too long to expand\n", listdir);
+            goto out;
+        }
         full_len = strlen(full);
         if (full_len < src_pre_len + src_suf_len)
             continue;
@@ -904,6 +911,19 @@ static int wildcard_expand_candidates(const char *git_dir, const sg_push_refspec
             fprintf(stderr, "sg: expanded refspec for '%s' is too long\n", full);
             goto out;
         }
+        /* refs/sg/chunks belongs to the keepalive propagation block further
+           down, which computes its own old/new pair for every push and may
+           MERGE the two sides into a fresh commit. A pattern wide enough to
+           match it (a mirror of the whole refs namespace is the obvious
+           one) would queue a second,
+           independently computed update for the same ref name in the same
+           request -- and the remote refuses that outright: measured,
+           "error: multiple updates for ref 'refs/sg/chunks' not allowed",
+           and because the push is atomic NOTHING lands, not even the branch
+           the user actually meant. Skipping it here leaves that ref with
+           exactly one owner. */
+        if (strcmp(full, SG_CHUNK_KEEPALIVE_REF) == 0)
+            continue;
         if (strncmp(dst, "refs/", 5) != 0 || !sg_ref_name_valid_for_create(dst)) {
             fprintf(stderr, "sg: refspec '%s' expands to invalid destination '%s'\n", raw_arg, dst);
             goto out;
@@ -960,8 +980,10 @@ static int matching_expand_candidates(const char *git_dir, const sg_ref_adv *adv
         push_entry cand;
         int on_remote = 0;
 
-        if (snprintf(path, sizeof(path), "refs/heads/%s", names[i]) >= (int)sizeof(path))
-            continue;
+        if (snprintf(path, sizeof(path), "refs/heads/%s", names[i]) >= (int)sizeof(path)) {
+            fprintf(stderr, "sg: branch name '%s' is too long\n", names[i]);
+            goto out;
+        }
         for (j = 0; j < adv->count && !on_remote; j++) {
             if (strcmp(adv->refs[j].name, path) == 0)
                 on_remote = 1;
@@ -1263,6 +1285,22 @@ int sg_cmd_push(int argc, char **argv)
             for (i = 0; i < refspec_arg_count; i++) {
                 if (strchr(refspec_args[i], ':') != NULL) {
                     fprintf(stderr, "fatal: --delete only accepts plain target ref names\n");
+                    free(refspec_args);
+                    return 1;
+                }
+                /* No patterns here either (Phase 46). --delete builds its
+                   candidates directly and never goes through
+                   sg_push_refspec_parse, so the star check that rejects a
+                   wildcard deletion written as ":<pattern>" does not cover
+                   this spelling -- and this is the one place where guessing
+                   wrong deletes other people's refs. Measured: git rejects
+                   BOTH spellings as `fatal: invalid refspec ':<name>'`
+                   before connecting, whether or not the name is
+                   refs/-qualified. Without this, an unqualified pattern got
+                   as far as the network and was only stopped later by dst
+                   completion finding no match. */
+                if (strchr(refspec_args[i], '*') != NULL) {
+                    fprintf(stderr, "fatal: invalid refspec ':%s'\n", refspec_args[i]);
                     free(refspec_args);
                     return 1;
                 }

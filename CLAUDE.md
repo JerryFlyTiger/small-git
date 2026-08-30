@@ -1101,6 +1101,14 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   no-colon wildcard mirrors itself, and a pattern matching nothing is exit 0,
   not an error. An annotated tag matched by a pattern reaches the remote
   unpeeled, the same trap `resolve_refspec_src` documents.
+  WARNING: **a wildcard must skip `SG_CHUNK_KEEPALIVE_REF`** -- that ref is
+  owned by the chunks-propagation block, which computes its own old/new pair
+  on every push. A pattern wide enough to match it queues a SECOND update
+  for the same ref, and the remote refuses the whole atomic transaction
+  (`multiple updates for ref 'refs/sg/chunks' not allowed`), so **nothing
+  lands, not even the branch the user meant**. Narrow fixtures rooted at
+  `refs/heads/` cannot reach this; the pin needs a repo whose remote has no
+  keepalive ref yet.
   WARNING: **`sg_push_refspec` is defined in `cmd_push.c` AND duplicated in
   `tests/test_refspec.c`** (deliberate convention -- no public header for a
   test-only export). Adding a field to one and not the other is a

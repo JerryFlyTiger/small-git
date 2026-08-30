@@ -1754,6 +1754,56 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         sh -c "! (cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/heads/p46-local-only) > /dev/null 2>&1"
     (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
 
+    # A pattern wide enough to match refs/sg/chunks must NOT queue its own
+    # update for it -- that ref belongs to the keepalive propagation block,
+    # which computes its own old/new pair every push. Measured before the
+    # exclusion: the remote answers "multiple updates for ref
+    # 'refs/sg/chunks' not allowed" and, because the push is atomic, NOTHING
+    # lands -- not even the branch the user actually meant.
+    #
+    # This uses its own EMPTY bare repo and its own fresh local repo rather
+    # than the shared fixture above. Written against the shared one it proved
+    # nothing: that remote already had a keepalive ref from earlier pushes,
+    # so the propagation block had nothing to send and there was no second
+    # update to collide with -- removing the exclusion left the check green
+    # (measured).
+    P46_CH_BARE="$HTTP_SERVERROOT/p46chunks.git"
+    rm -rf "$P46_CH_BARE"
+    (LC_ALL=C git init -q --bare -b master "$P46_CH_BARE" &&
+     LC_ALL=C git --git-dir "$P46_CH_BARE" config http.receivepack true) > /dev/null 2>&1
+    P46_CH_LOCAL="$WORKDIR/p46_chunks_local"
+    rm -rf "$P46_CH_LOCAL"
+    "$SG" init "$P46_CH_LOCAL" > /dev/null 2>&1
+    printf 'chunks fixture\n' > "$P46_CH_LOCAL/f.txt"
+    (cd "$P46_CH_LOCAL" && "$SG" add f.txt && "$SG" commit -m "p46 chunks") > /dev/null 2>&1
+    P46_CH_HEAD=$(cd "$P46_CH_LOCAL" && git rev-parse HEAD)
+    mkdir -p "$P46_CH_LOCAL/.git/refs/sg"
+    printf '%s\n' "$P46_CH_HEAD" > "$P46_CH_LOCAL/.git/refs/sg/chunks"
+    printf '[remote "origin"]\n\turl = http://127.0.0.1:%s/p46chunks.git\n' "$HTTP_PORT" >> "$P46_CH_LOCAL/.git/config"
+    check "phase46 oracle: precondition -- the local repo really has a keepalive ref and the remote has none" \
+        sh -c "test -f '$P46_CH_LOCAL/.git/refs/sg/chunks' && ! (cd '$P46_CH_BARE' && git rev-parse --verify refs/sg/chunks) > /dev/null 2>&1"
+    P46_CHUNKS_OUT="$WORKDIR/http_push_p46_chunks.txt"
+    (cd "$P46_CH_LOCAL" && "$SG" push origin 'refs/*:refs/*' < /dev/null) > "$P46_CHUNKS_OUT" 2>&1
+    # The exit code, not the message: with the collision the remote refuses
+    # the whole atomic transaction, and grepping for its wording proved to
+    # be the weaker check -- under the mutation it stayed green while the
+    # push had in fact failed (measured).
+    check "phase46: a whole-namespace mirror does not collide with the chunks keepalive ref" \
+        test $? = 0
+    check "phase46: and the ordinary branch in that same push still landed" \
+        sh -c "test \"\$(cd '$P46_CH_BARE' && git rev-parse refs/heads/master)\" = '$P46_CH_HEAD'"
+
+    # The remote-tracking ref is written only for a destination under
+    # refs/heads/. A wildcard can aim anywhere, and before Phase 46 every
+    # non-tag entry got one -- which for this pattern would invent
+    # refs/remotes/origin/... entries for things that are not remote
+    # branches at all.
+    (cd "$HTTP_DEST" && "$SG" push origin 'refs/heads/p46-mid-*:refs/remotes/up/*' < /dev/null) > /dev/null 2>&1
+    check "phase46: a wildcard into another namespace reaches the remote" \
+        sh -c "(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/remotes/up/tail) > /dev/null 2>&1"
+    check "phase46: and writes no local remote-tracking ref for it" \
+        sh -c "! (cd '$HTTP_DEST' && git rev-parse --verify refs/remotes/origin/tail) > /dev/null 2>&1 && ! ls '$HTTP_DEST/.git/refs/remotes/origin/refs' > /dev/null 2>&1"
+
     # Wildcard candidates go through the SAME per-ref fast-forward gate as
     # an explicit refspec -- they share the candidate->entry loop, and this
     # is what pins that they do. The remote's p46-b is moved ahead of the
@@ -1924,6 +1974,25 @@ for p46bad in 'refs/heads/*:refs/heads/x' 'refs/heads/f*t*:refs/heads/f*t*' ':re
         grep -q "invalid refspec" "$P46_BAD_OUT"
     check "phase46: '$p46bad' never attempted a connection" \
         sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect\|failed to connect' '$P46_BAD_OUT'"
+done
+
+# --delete builds its candidates directly and never goes through the refspec
+# parser, so the star rejection above does not cover this spelling. Both
+# forms are checked -- refs/-qualified and not -- because only the first was
+# rejected before Phase 46, and the unqualified one got as far as the
+# network. Deleting is where guessing wrong destroys other people's refs, so
+# this is the rejection on the list that matters most.
+for p46delbad in 'refs/heads/*' 'p46*'; do
+    P46_DEL_OUT="$WORKDIR/p46_del_out.txt"
+    (cd "$P39N_REPO" && "$SG" push origin --delete "$p46delbad") > "$P46_DEL_OUT" 2>&1
+    check "phase46: --delete '$p46delbad' is rejected (exit 1)" test $? = 1
+    # -F: the pattern itself contains a '*', which a basic regex would read
+    # as a quantifier and match a DIFFERENT string (measured -- the first
+    # version of this check failed against correct output for that reason).
+    check "phase46: --delete '$p46delbad' uses git's own wording" \
+        grep -qxF "fatal: invalid refspec ':$p46delbad'" "$P46_DEL_OUT"
+    check "phase46: --delete '$p46delbad' never attempted a connection" \
+        sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect\|failed to connect' '$P46_DEL_OUT'"
 done
 
 # src resolution happens before connecting too, and a src matching nothing
