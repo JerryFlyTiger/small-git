@@ -17,6 +17,8 @@ typedef struct {
     char *src;
     char *dst;
     int is_delete;
+    int is_wildcard; /* Phase 46 */
+    int is_matching; /* Phase 46 */
 } sg_push_refspec;
 
 extern int sg_push_refspec_parse(const char *raw_arg, sg_push_refspec *out);
@@ -135,44 +137,93 @@ static void test_forced_delete(void)
     sg_push_refspec_free(&r);
 }
 
-/* ---- section 6.1/6.2: wildcard refspecs and bare push-matching ":" are
-   named rejections, not approximated ---- */
+/* ---- Phase 46: wildcard and push-matching are PARSED now, not rejected.
+   Phase 39 rejected both by name; these four tests used to assert those
+   rejections and are the reason the switch could not be made silently. ---- */
 
-static void test_wildcard_rejected(void)
+static void test_wildcard_parsed(void)
 {
     sg_push_refspec r;
     int rc = sg_push_refspec_parse("refs/heads/*:refs/heads/*", &r);
 
-    CHECK(rc == -1, "wildcard refspec should be rejected, got %d", rc);
+    CHECK(rc == 0, "wildcard refspec should parse, got %d", rc);
+    CHECK(r.is_wildcard == 1, "is_wildcard should be set");
+    CHECK(r.is_matching == 0, "is_matching should not be set");
+    CHECK(streq_or_null(r.src, "refs/heads/*"), "src should keep the pattern, got '%s'", r.src);
+    CHECK(streq_or_null(r.dst, "refs/heads/*"), "dst should keep the pattern, got '%s'", r.dst);
+    sg_push_refspec_free(&r);
+}
+
+/* A no-colon wildcard mirrors itself -- measured against git: a bare
+   pattern argument pushes every match to the same name. The non-wildcard
+   no-colon form (test_no_colon above) leaves dst NULL instead, so these two
+   deliberately disagree and both are pinned. */
+static void test_wildcard_no_colon_mirrors(void)
+{
+    sg_push_refspec r;
+    int rc = sg_push_refspec_parse("refs/heads/*", &r);
+
+    CHECK(rc == 0, "no-colon wildcard should parse, got %d", rc);
+    CHECK(r.is_wildcard == 1, "is_wildcard should be set");
+    CHECK(streq_or_null(r.dst, "refs/heads/*"), "dst should mirror src, got '%s'", r.dst);
     sg_push_refspec_free(&r);
 }
 
 static void test_wildcard_in_src_only_rejected(void)
 {
     sg_push_refspec r;
-    /* '*' only in src, explicit non-wildcard dst -- still rejected, real
-       git's refspec wildcard is a whole-refspec property, not per-side. */
+    /* A star on ONE side only stays a hard error: measured, real git says
+       `fatal: invalid refspec` for it. */
     int rc = sg_push_refspec_parse("refs/heads/top*:refs/heads/rev1", &r);
 
     CHECK(rc == -1, "src-only wildcard refspec should be rejected, got %d", rc);
     sg_push_refspec_free(&r);
 }
 
-static void test_bare_colon_rejected(void)
+static void test_two_stars_rejected(void)
+{
+    sg_push_refspec r;
+    /* Exactly one star per side; two is `fatal: invalid refspec` in git. */
+    int rc = sg_push_refspec_parse("refs/heads/f*t*:refs/heads/f*t*", &r);
+
+    CHECK(rc == -1, "two stars on a side should be rejected, got %d", rc);
+    sg_push_refspec_free(&r);
+}
+
+static void test_wildcard_delete_rejected(void)
+{
+    sg_push_refspec r;
+    /* A deletion cannot be a pattern: measured, git rejects a bare-colon
+       deletion carrying a star as an invalid refspec rather than deleting
+       every matching remote ref -- the failure direction that matters most
+       on this whole list. */
+    int rc = sg_push_refspec_parse(":refs/heads/*", &r);
+
+    CHECK(rc == -1, "wildcard deletion should be rejected, got %d", rc);
+    sg_push_refspec_free(&r);
+}
+
+static void test_bare_colon_is_matching(void)
 {
     sg_push_refspec r;
     int rc = sg_push_refspec_parse(":", &r);
 
-    CHECK(rc == -1, "bare ':' (push matching) should be rejected, got %d", rc);
+    CHECK(rc == 0, "bare ':' should parse as push-matching, got %d", rc);
+    CHECK(r.is_matching == 1, "is_matching should be set");
+    CHECK(r.force == 0, "force should default to 0");
+    CHECK(r.src == NULL && r.dst == NULL, "matching carries no src/dst");
+    CHECK(r.is_delete == 0, "matching is not a deletion");
     sg_push_refspec_free(&r);
 }
 
-static void test_forced_bare_colon_rejected(void)
+static void test_forced_bare_colon_is_matching(void)
 {
     sg_push_refspec r;
     int rc = sg_push_refspec_parse("+:", &r);
 
-    CHECK(rc == -1, "'+:' (forced push matching) should be rejected, got %d", rc);
+    CHECK(rc == 0, "'+:' should parse as forced push-matching, got %d", rc);
+    CHECK(r.is_matching == 1, "is_matching should be set");
+    CHECK(r.force == 1, "force should be set by the leading '+'");
     sg_push_refspec_free(&r);
 }
 
@@ -185,10 +236,13 @@ int main(void)
     test_empty_dst_is_error();
     test_leading_plus_forces();
     test_forced_delete();
-    test_wildcard_rejected();
+    test_wildcard_parsed();
+    test_wildcard_no_colon_mirrors();
+    test_two_stars_rejected();
+    test_wildcard_delete_rejected();
     test_wildcard_in_src_only_rejected();
-    test_bare_colon_rejected();
-    test_forced_bare_colon_rejected();
+    test_bare_colon_is_matching();
+    test_forced_bare_colon_is_matching();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

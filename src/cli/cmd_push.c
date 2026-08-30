@@ -652,7 +652,29 @@ typedef struct {
     char *dst;     /* malloc'd, owned; NULL if the argument had no ':' at
                       all (dst is derived some other way by the caller) */
     int is_delete; /* src is empty, i.e. ":dst" or "+:dst" */
+    /* Phase 46. Wildcard: src and dst are patterns carrying exactly one '*'
+       each, expanded against the LOCAL refs before any network round trip.
+       Matching: the bare "[+]:" form, which can only be expanded AFTER the
+       advertisement arrives because it pushes exactly the branches that
+       already exist on the remote. The two flags are mutually exclusive and
+       both are 0 for every form Phase 39 already handled. */
+    int is_wildcard;
+    int is_matching;
 } sg_push_refspec;
+
+/* Number of '*' characters in s. git allows exactly one per side of a
+   wildcard refspec: measured, a side carrying two stars is
+   `fatal: invalid refspec`, and so is a star on only one side. */
+static size_t star_count(const char *s)
+{
+    size_t n = 0;
+
+    for (; *s != '\0'; s++) {
+        if (*s == '*')
+            n++;
+    }
+    return n;
+}
 
 void sg_push_refspec_free(sg_push_refspec *r)
 {
@@ -684,25 +706,45 @@ int sg_push_refspec_parse(const char *raw_arg, sg_push_refspec *out)
     if (*p == '+')
         p++;
 
-    if (strcmp(p, ":") == 0) {
-        fprintf(stderr,
-               "sg: refspec '%s' (push \"matching\" refs) is not supported, name refs explicitly\n",
-               raw_arg);
-        return -1;
-    }
-    if (strchr(p, '*') != NULL) {
-        fprintf(stderr, "sg: wildcard refspec '%s' is not supported, name refs explicitly\n", raw_arg);
-        return -1;
-    }
-
     out->force = (raw_arg[0] == '+');
+
+    /* The bare "[+]:" push-matching form (Phase 46). It carries no src and
+       no dst at all: which refs it means is a question only the remote's
+       advertisement can answer, so the expansion happens later. */
+    if (strcmp(p, ":") == 0) {
+        out->is_matching = 1;
+        return 0;
+    }
 
     colon = strrchr(p, ':');
     if (colon == NULL) {
         out->src = strdup(p);
         out->dst = NULL;
         out->is_delete = 0;
-        return out->src != NULL ? 0 : -1;
+        if (out->src == NULL)
+            return -1;
+        /* A wildcard with no ':' mirrors itself -- measured: a bare
+           pattern argument pushes every matching ref to the SAME name, i.e.
+           it behaves as though the same pattern had been written on both
+           sides of a colon. That is a different dst rule from the no-colon
+           NON-wildcard form just below, which goes through this command's
+           literal-name lookup instead. */
+        if (star_count(out->src) > 0) {
+            if (star_count(out->src) != 1) {
+                fprintf(stderr, "fatal: invalid refspec '%s'\n", raw_arg);
+                sg_push_refspec_free(out);
+                memset(out, 0, sizeof(*out));
+                return -1;
+            }
+            out->dst = strdup(out->src);
+            if (out->dst == NULL) {
+                sg_push_refspec_free(out);
+                memset(out, 0, sizeof(*out));
+                return -1;
+            }
+            out->is_wildcard = 1;
+        }
+        return 0;
     }
 
     if (colon[1] == '\0') {
@@ -722,6 +764,26 @@ int sg_push_refspec_parse(const char *raw_arg, sg_push_refspec *out)
         return -1;
     }
 
+    /* Exactly one '*' on EACH side, or none at all -- measured against git
+       2.55.0: two stars on a side, a star on only one side, and a star in a
+       ":dst" deletion are each `fatal: invalid refspec`. Checked here rather
+       than at expansion time so the whole batch aborts before any network
+       round trip, the same shape as the empty-dst check above. */
+    {
+        size_t src_stars = star_count(out->src);
+        size_t dst_stars = star_count(out->dst);
+
+        if (src_stars != 0 || dst_stars != 0) {
+            if (src_stars != 1 || dst_stars != 1 || out->is_delete) {
+                fprintf(stderr, "fatal: invalid refspec '%s'\n", raw_arg);
+                sg_push_refspec_free(out);
+                memset(out, 0, sizeof(*out));
+                return -1;
+            }
+            out->is_wildcard = 1;
+        }
+    }
+
     /* Stage C's format validation (docs/DESIGN.md Phase 39 section 3) is
        mostly deferred until the advertisement is known (a dst that doesn't
        start with "refs/" isn't a full ref path yet, see complete_dst's own
@@ -732,7 +794,8 @@ int sg_push_refspec_parse(const char *raw_arg, sg_push_refspec *out)
        shape as the empty-dst check just above. complete_dst still
        revalidates its own guessed/rule-2-constructed path too, as
        defense in depth against a hostile/corrupt advertisement. */
-    if (strncmp(out->dst, "refs/", 5) == 0 && !sg_ref_name_valid_for_create(out->dst)) {
+    if (!out->is_wildcard && strncmp(out->dst, "refs/", 5) == 0 &&
+       !sg_ref_name_valid_for_create(out->dst)) {
         fprintf(stderr, "fatal: invalid refspec '%s'\n", raw_arg);
         /* Round 3 fix: both src and dst are already allocated at this
            point -- same leak as above. */
@@ -741,6 +804,214 @@ int sg_push_refspec_parse(const char *raw_arg, sg_push_refspec *out)
         return -1;
     }
     return 0;
+}
+
+/* The display name a report line and the remote-tracking ref use, derived
+   from a full ref path the same way the explicit-dst path derives it (the
+   WHOLE remainder after the namespace prefix, not just the last segment --
+   see complete_dst's caller for why truncating there was a bug). */
+static char *ref_display_name(const char *ref_path)
+{
+    if (strncmp(ref_path, "refs/heads/", 11) == 0)
+        return strdup(ref_path + 11);
+    if (strncmp(ref_path, "refs/tags/", 10) == 0)
+        return strdup(ref_path + 10);
+    /* Neither well-known namespace: keep the WHOLE path rather than the last
+       segment. A wildcard can aim anywhere -- a pattern into refs/remotes/
+       matched a nested branch and the last-segment rule would have reported
+       "sub" for refs/remotes/up/topic/sub, the same truncation Phase 39's
+       round 3 fixed for explicit multi-segment destinations. */
+    return strdup(ref_path);
+}
+
+/* Expands a wildcard refspec against the LOCAL refs (Phase 46).
+
+   The source set is local, not remote -- measured: pushing a pattern creates
+   remote branches that did not exist there, so this is not an intersection
+   with the advertisement and there is no prune semantics. That is why the
+   expansion runs BEFORE the network round trip, keeping Phase 39's rule that
+   a src resolving to nothing aborts the whole batch before anything lands.
+
+   Matching is a plain prefix/suffix comparison around the single star, which
+   IS git's rule: the star may sit anywhere, including mid-segment, and it
+   CROSSES '/' (measured -- a pattern rooted at refs/ matched
+   refs/remotes/origin/topic/sub). Whatever the star stood for is substituted
+   into the dst pattern's star.
+
+   The expanded dst is used VERBATIM, with no dwim completion -- also
+   measured, and the opposite of what an explicit dst does: git sent the
+   uncompleted name to the remote, which refused it as a "funny refname".
+   sg refuses it locally instead, with its own message; both exit 1. */
+static int wildcard_expand_candidates(const char *git_dir, const sg_push_refspec *rs,
+                                      const char *raw_arg, push_entry **candidates, size_t *count,
+                                      size_t *cap)
+{
+    const char *src_star = strchr(rs->src, '*');
+    const char *dst_star = strchr(rs->dst, '*');
+    size_t src_pre_len = (size_t)(src_star - rs->src);
+    const char *src_suf = src_star + 1;
+    size_t src_suf_len = strlen(src_suf);
+    size_t dst_pre_len = (size_t)(dst_star - rs->dst);
+    const char *dst_suf = dst_star + 1;
+    char listdir[SG_PATH_MAX];
+    char **names = NULL;
+    size_t name_count = 0;
+    size_t i;
+    size_t cut = 0;
+    int rc = -1;
+
+    /* The namespace to enumerate: everything up to and including the last
+       '/' that precedes the star. With no such '/', the pattern is matched
+       against whole ref paths and "refs/" is the widest thing sg can list --
+       which is also why a pattern that is not rooted at refs/ simply matches
+       nothing, exactly as git behaves (measured: a bare "m*:m*" is
+       "Everything up-to-date", not an error). */
+    for (i = 0; i < src_pre_len; i++) {
+        if (rs->src[i] == '/')
+            cut = i + 1;
+    }
+    if (cut == 0) {
+        snprintf(listdir, sizeof(listdir), "refs/");
+    } else if (snprintf(listdir, sizeof(listdir), "%.*s", (int)cut, rs->src) >= (int)sizeof(listdir)) {
+        fprintf(stderr, "sg: refspec '%s' is too long\n", raw_arg);
+        return -1;
+    }
+
+    if (sg_ref_list_under(git_dir, listdir, &names, &name_count) != 0) {
+        fprintf(stderr, "sg: cannot list local refs under '%s'\n", listdir);
+        return -1;
+    }
+
+    for (i = 0; i < name_count; i++) {
+        char full[SG_PATH_MAX];
+        char dst[SG_PATH_MAX];
+        size_t full_len;
+        push_entry cand;
+
+        /* A name too long to reassemble is REPORTED, not skipped: this
+           project's path-truncation rule is that a reporting path must
+           never silently drop a ref, and the two other over-long checks in
+           this function already abort. Silently skipping would push some of
+           the pattern's matches and not others, with nothing said. */
+        if (snprintf(full, sizeof(full), "%s%s", listdir, names[i]) >= (int)sizeof(full)) {
+            fprintf(stderr, "sg: ref name under '%s' is too long to expand\n", listdir);
+            goto out;
+        }
+        full_len = strlen(full);
+        if (full_len < src_pre_len + src_suf_len)
+            continue;
+        if (strncmp(full, rs->src, src_pre_len) != 0)
+            continue;
+        if (strcmp(full + full_len - src_suf_len, src_suf) != 0)
+            continue;
+
+        if (snprintf(dst, sizeof(dst), "%.*s%.*s%s", (int)dst_pre_len, rs->dst,
+                    (int)(full_len - src_pre_len - src_suf_len), full + src_pre_len,
+                    dst_suf) >= (int)sizeof(dst)) {
+            fprintf(stderr, "sg: expanded refspec for '%s' is too long\n", full);
+            goto out;
+        }
+        /* refs/sg/chunks belongs to the keepalive propagation block further
+           down, which computes its own old/new pair for every push and may
+           MERGE the two sides into a fresh commit. A pattern wide enough to
+           match it (a mirror of the whole refs namespace is the obvious
+           one) would queue a second,
+           independently computed update for the same ref name in the same
+           request -- and the remote refuses that outright: measured,
+           "error: multiple updates for ref 'refs/sg/chunks' not allowed",
+           and because the push is atomic NOTHING lands, not even the branch
+           the user actually meant. Skipping it here leaves that ref with
+           exactly one owner. */
+        if (strcmp(full, SG_CHUNK_KEEPALIVE_REF) == 0)
+            continue;
+        if (strncmp(dst, "refs/", 5) != 0 || !sg_ref_name_valid_for_create(dst)) {
+            fprintf(stderr, "sg: refspec '%s' expands to invalid destination '%s'\n", raw_arg, dst);
+            goto out;
+        }
+
+        memset(&cand, 0, sizeof(cand));
+        /* Read the ref EXACTLY, not through sg_rev_parse_commit: an
+           annotated tag matched by a pattern must reach the remote as a tag
+           object, the same trap resolve_refspec_src documents for an
+           explicit src (measured: git keeps it a tag). */
+        if (sg_ref_read_path(git_dir, full, cand.new_id) != 0) {
+            fprintf(stderr, "sg: cannot read ref '%s'\n", full);
+            goto out;
+        }
+        cand.name = ref_display_name(dst);
+        cand.ref_path = strdup(dst);
+        cand.is_tag = strncmp(dst, "refs/tags/", 10) == 0;
+        cand.refspec_force = rs->force;
+        if (cand.name == NULL || cand.ref_path == NULL ||
+           push_entries_push(candidates, count, cap, &cand) != 0) {
+            free(cand.name);
+            free(cand.ref_path);
+            fprintf(stderr, "sg: out of memory\n");
+            goto out;
+        }
+    }
+    rc = 0;
+
+out:
+    free_string_array(names, name_count);
+    return rc;
+}
+
+/* Expands the bare "[+]:" push-matching form (Phase 46). Unlike a wildcard
+   this CANNOT run before the network round trip: it means "every local
+   branch that already exists on the remote", so the advertisement is half
+   of its input. It never creates a remote ref -- measured: a local-only
+   branch is not pushed -- and it never touches tags, even one that moved
+   locally. */
+static int matching_expand_candidates(const char *git_dir, const sg_ref_adv *adv, int force,
+                                      push_entry **candidates, size_t *count, size_t *cap)
+{
+    char **names = NULL;
+    size_t name_count = 0;
+    size_t i, j;
+    int rc = -1;
+
+    if (sg_ref_list_branches(git_dir, &names, &name_count) != 0) {
+        fprintf(stderr, "sg: cannot list local branches\n");
+        return -1;
+    }
+    for (i = 0; i < name_count; i++) {
+        char path[SG_PATH_MAX];
+        push_entry cand;
+        int on_remote = 0;
+
+        if (snprintf(path, sizeof(path), "refs/heads/%s", names[i]) >= (int)sizeof(path)) {
+            fprintf(stderr, "sg: branch name '%s' is too long\n", names[i]);
+            goto out;
+        }
+        for (j = 0; j < adv->count && !on_remote; j++) {
+            if (strcmp(adv->refs[j].name, path) == 0)
+                on_remote = 1;
+        }
+        if (!on_remote)
+            continue;
+
+        memset(&cand, 0, sizeof(cand));
+        if (sg_ref_read_path(git_dir, path, cand.new_id) != 0) {
+            fprintf(stderr, "sg: cannot read branch '%s'\n", names[i]);
+            goto out;
+        }
+        cand.name = strdup(names[i]);
+        cand.ref_path = strdup(path);
+        cand.refspec_force = force;
+        if (cand.name == NULL || cand.ref_path == NULL ||
+           push_entries_push(candidates, count, cap, &cand) != 0) {
+            free(cand.name);
+            free(cand.ref_path);
+            fprintf(stderr, "sg: out of memory\n");
+            goto out;
+        }
+    }
+    rc = 0;
+
+out:
+    free_string_array(names, name_count);
+    return rc;
 }
 
 /* Resolves an explicit-dst refspec's <src> (Stage B, before any network
@@ -946,6 +1217,10 @@ int sg_cmd_push(int argc, char **argv)
     push_entry *entries = NULL;
     size_t entry_count = 0, entry_cap = 0;
     int had_rejection = 0;
+    /* Phase 46: "[+]:" cannot be expanded until the advertisement arrives,
+       so the parse loop only records that it was asked for. */
+    int matching_requested = 0;
+    int matching_force = 0;
     int src_resolve_failed = 0; /* Phase 39: an explicit-dst refspec's <src>
                                    matched nothing -- aborts the ENTIRE push
                                    before any network round trip, see
@@ -1010,6 +1285,22 @@ int sg_cmd_push(int argc, char **argv)
             for (i = 0; i < refspec_arg_count; i++) {
                 if (strchr(refspec_args[i], ':') != NULL) {
                     fprintf(stderr, "fatal: --delete only accepts plain target ref names\n");
+                    free(refspec_args);
+                    return 1;
+                }
+                /* No patterns here either (Phase 46). --delete builds its
+                   candidates directly and never goes through
+                   sg_push_refspec_parse, so the star check that rejects a
+                   wildcard deletion written as ":<pattern>" does not cover
+                   this spelling -- and this is the one place where guessing
+                   wrong deletes other people's refs. Measured: git rejects
+                   BOTH spellings as `fatal: invalid refspec ':<name>'`
+                   before connecting, whether or not the name is
+                   refs/-qualified. Without this, an unqualified pattern got
+                   as far as the network and was only stopped later by dst
+                   completion finding no match. */
+                if (strchr(refspec_args[i], '*') != NULL) {
+                    fprintf(stderr, "fatal: invalid refspec ':%s'\n", refspec_args[i]);
                     free(refspec_args);
                     return 1;
                 }
@@ -1121,6 +1412,33 @@ int sg_cmd_push(int argc, char **argv)
                    leaking again just because this call site trusted it. */
                 sg_push_refspec_free(&parsed);
                 goto done; /* message already printed */
+            }
+
+            if (parsed.is_matching) {
+                /* Deferred: which branches "[+]:" means is a question only
+                   the advertisement can answer, so nothing is built here.
+                   Two "[+]:" arguments in one invocation collapse into one
+                   expansion, forced if EITHER carried the '+'. */
+                matching_requested = 1;
+                matching_force = matching_force || parsed.force;
+                sg_push_refspec_free(&parsed);
+                continue;
+            }
+
+            if (parsed.is_wildcard) {
+                /* Expanded from LOCAL refs, before the network round trip --
+                   see wildcard_expand_candidates for why the source set is
+                   not an intersection with the remote. A pattern matching
+                   nothing is not an error: it simply contributes no
+                   candidates and the invocation goes on to say "Everything
+                   up-to-date." like any other push with nothing to send. */
+                int wrc = wildcard_expand_candidates(git_dir, &parsed, refspec_args[i], &candidates,
+                                                    &candidate_count, &candidate_cap);
+
+                sg_push_refspec_free(&parsed);
+                if (wrc != 0)
+                    goto done; /* message already printed */
+                continue;
             }
 
             if (parsed.is_delete) {
@@ -1263,6 +1581,17 @@ int sg_cmd_push(int argc, char **argv)
     if (sg_transport_ls_refs_push(url, &adv) != 0)
         goto done;
     have_adv = 1;
+
+    /* The deferred half of Phase 46: "[+]:" means every local branch that
+       already exists on the remote, so it can only be expanded now that the
+       advertisement is in hand. Appended to `candidates` BEFORE the
+       candidate->entry loop below, so every rule that loop already
+       implements -- fast-forward checks, per-ref rejection, the report --
+       applies unchanged. */
+    if (matching_requested &&
+       matching_expand_candidates(git_dir, &adv, matching_force, &candidates, &candidate_count,
+                                 &candidate_cap) != 0)
+        goto done;
 
     /* ---- resolve each candidate against the remote's advertisement into
        the final list of ref updates to actually send ---- */
@@ -1772,7 +2101,15 @@ int sg_cmd_push(int argc, char **argv)
                here, and this milestone doesn't remove the local
                remote-tracking ref either, see the Phase 39 write-up). */
             for (i = 0; i < entry_count; i++) {
-                if (!entries[i].is_tag && !entries[i].is_delete) {
+                /* Only a destination under refs/heads/ gets a
+                   remote-tracking ref. Before Phase 46 every non-tag,
+                   non-delete entry did, which was harmless while a dst could
+                   only be a branch or a tag; a wildcard can aim at any
+                   namespace, and mirroring refs/remotes/up/topic/sub into
+                   refs/remotes/origin/... would invent a tracking ref for
+                   something that is not a remote branch at all. */
+                if (!entries[i].is_tag && !entries[i].is_delete &&
+                   strncmp(entries[i].ref_path, "refs/heads/", 11) == 0) {
                     char remote_ref_path[SG_PATH_MAX];
 
                     snprintf(remote_ref_path, sizeof(remote_ref_path), "refs/remotes/%s/%s", remote,
