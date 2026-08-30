@@ -16,7 +16,7 @@
                                          as-is if it exists -- see
                                          sg_rev_parse_ref_path's header
                                          comment)
-     <rev>  ::= <base> [ "@{" N "}" ] ( "~" [N] | "^" [N] )*
+     <rev>  ::= ( <base> | "@" ) [ "@{" N "}" ] ( "~" [N] | "^" [N] )*
 
    "@{N}" is git's reflog notation: it must immediately follow <base> (not
    after any "~"/"^" suffix -- "topic~1@{1}" is rejected, "topic@{1}~1" is
@@ -26,13 +26,30 @@
    must be purely decimal digits (leading zeros allowed, "01" == "1") --
    deliberately NOT supported: git's "@{u}"/"@{upstream}" and date-ish
    selectors like "@{now}"/"@{2.days.ago}" (no upstream-tracking or reflog
-   date index in this project), and a bare "@{N}"/"@" with no <base> at all
-   (real git treats that as "the current branch"/"HEAD" respectively --
-   measured to NOT be the same value as "HEAD@{N}", so guessing HEAD here
-   would silently be the wrong answer rather than an unsupported feature;
-   left unimplemented instead). A tag has no reflog, so "<tag>@{N}" always
+   date index in this project). A tag has no reflog, so "<tag>@{N}" always
    fails (an empty/missing logs/refs/tags/<tag> reads as zero entries, which
    is out of range for any N).
+
+   The two bare "@" spellings ARE supported as of Phase 48, and the first is
+   the one worth knowing: a bare "@{N}" reads the CURRENT BRANCH's log, which
+   is measurably NOT the same value as "HEAD@{N}" (a checkout away and back
+   adds lines to logs/HEAD and none to the branch's, and git's own
+   out-of-range message names the branch). On a detached HEAD there is no
+   branch and it falls back to logs/HEAD; an unborn HEAD is rejected, and so
+   is a CORRUPT one -- the two are separated by sg_ref_head_is_detached's
+   tri-state, never by a NULL test on sg_ref_current_branch (Phase 18's
+   rule). A bare "@" on its own is HEAD, suffixes included ("@~1" is
+   "HEAD~1"), and means HEAD even if a branch literally named "@" exists.
+   Both are implemented by rewriting <base> before anything else runs, so
+   they inherit the "@{N}" lookup and the suffix loop unchanged.
+
+   One measured case is deliberately NOT reproduced: when the current branch
+   has no reflog file at all, real git lets a bare "@{0}" fall back to the
+   branch's own tip while still rejecting the spelled-out "<branch>@{0}".
+   sg rejects both. Reaching this at all takes deleting a log file by hand
+   (sg and git both create one for every refs/heads/ update), and inventing
+   an asymmetry between the two spellings is a worse answer than a uniform
+   rejection.
 
    Base resolution order is full hex, then HEAD, then tag, then branch --
    real git's own gitrevisions disambiguation order (full SHA-1 object

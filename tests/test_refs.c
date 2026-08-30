@@ -279,6 +279,112 @@ static void test_delete_branch_missing_reflog_still_succeeds(void)
     free(git_dir);
 }
 
+/* sg_ref_set_symref writes "ref: <target>" and, when given a message, one
+   reflog line -- reusing sg_ref_set_head's shape. The three properties worth
+   pinning are the file's exact bytes, that old_id/new_id come from the two
+   refs rather than from thin air, and that the reflog namespace policy still
+   applies (Phase 17): a message for a ref outside the four logged namespaces
+   is refused OUTRIGHT, writing nothing at all -- not "written without a
+   log". */
+static void test_set_symref_writes_ref_and_log(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char id[SG_SHA1_RAW_LEN];
+    char path[4096];
+    char buf[256];
+    sg_reflog log;
+    FILE *f;
+    size_t n;
+
+    fill_id(id, 0x42);
+    CHECK(sg_ref_write_path(git_dir, "refs/remotes/origin/master", id) == 0,
+         "failed to write the target branch");
+
+    CHECK(sg_ref_set_symref(git_dir, "refs/remotes/origin/HEAD", "refs/remotes/origin/master",
+                           "clone: from http://example/repo.git") == 0,
+         "sg_ref_set_symref failed");
+
+    snprintf(path, sizeof(path), "%s/refs/remotes/origin/HEAD", git_dir);
+    f = fopen(path, "rb");
+    CHECK(f != NULL, "refs/remotes/origin/HEAD was not created");
+    if (f != NULL) {
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+        CHECK(strcmp(buf, "ref: refs/remotes/origin/master\n") == 0,
+             "expected a symref line, got \"%s\"", buf);
+    }
+
+    if (sg_reflog_read(git_dir, "refs/remotes/origin/HEAD", &log) != 0) {
+        CHECK(0, "no reflog was written for refs/remotes/origin/HEAD");
+    } else {
+        CHECK(log.count == 1, "expected exactly 1 reflog line, got %zu", log.count);
+        if (log.count == 1) {
+            unsigned char zero[SG_SHA1_RAW_LEN];
+
+            memset(zero, 0, SG_SHA1_RAW_LEN);
+            /* old_id: this ref did not exist, so all-zeros. new_id: the
+               TARGET's current tip, not zeros -- a symref's log records where
+               it now points, and reading it off the target is the only way to
+               get it. */
+            CHECK(memcmp(log.entries[0].old_id, zero, SG_SHA1_RAW_LEN) == 0,
+                 "old_id should be all-zeros for a ref that did not exist");
+            CHECK(memcmp(log.entries[0].new_id, id, SG_SHA1_RAW_LEN) == 0,
+                 "new_id should be the target ref's tip");
+            CHECK(strcmp(log.entries[0].message, "clone: from http://example/repo.git") == 0,
+                 "wrong reflog message: \"%s\"", log.entries[0].message);
+        }
+        sg_reflog_free(&log);
+    }
+
+    free(git_dir);
+}
+
+static void test_set_symref_refuses_a_message_outside_logged_namespaces(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char id[SG_SHA1_RAW_LEN];
+    char path[4096];
+    struct stat st;
+
+    fill_id(id, 0x11);
+    CHECK(sg_ref_write_path(git_dir, "refs/heads/master", id) == 0, "failed to write the target");
+
+    /* refs/tags/ is not a logged namespace. The refusal must be total: no
+       ref file either, so a caller cannot end up with a ref whose history
+       silently does not exist. */
+    CHECK(sg_ref_set_symref(git_dir, "refs/tags/sym", "refs/heads/master", "some message") != 0,
+         "a message for refs/tags/ must be refused");
+    snprintf(path, sizeof(path), "%s/refs/tags/sym", git_dir);
+    CHECK(lstat(path, &st) != 0, "the ref file must not exist after a refused write");
+
+    /* With no message the same write is fine -- the policy is about logging,
+       not about which refs may be symbolic. */
+    CHECK(sg_ref_set_symref(git_dir, "refs/tags/sym", "refs/heads/master", NULL) == 0,
+         "an unlogged symref outside the logged namespaces must still be allowed");
+    CHECK(lstat(path, &st) == 0, "the ref file should exist now");
+    snprintf(path, sizeof(path), "%s/logs/refs/tags/sym", git_dir);
+    CHECK(lstat(path, &st) != 0, "no log should have been written for it");
+
+    free(git_dir);
+}
+
+static void test_set_symref_rejects_path_traversal(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char id[SG_SHA1_RAW_LEN];
+
+    fill_id(id, 0x33);
+    CHECK(sg_ref_write_path(git_dir, "refs/heads/master", id) == 0, "failed to write the target");
+
+    CHECK(sg_ref_set_symref(git_dir, "refs/../../evil", "refs/heads/master", NULL) != 0,
+         "a traversing ref_path must be rejected");
+    CHECK(sg_ref_set_symref(git_dir, "refs/remotes/origin/HEAD", "refs/../../evil", NULL) != 0,
+         "a traversing target must be rejected");
+
+    free(git_dir);
+}
+
 int main(void)
 {
     test_list_excludes_prefix_collision();
@@ -286,6 +392,9 @@ int main(void)
     test_delete_branch_removes_reflog_file();
     test_delete_under_tag_missing_reflog_still_succeeds();
     test_delete_branch_missing_reflog_still_succeeds();
+    test_set_symref_writes_ref_and_log();
+    test_set_symref_refuses_a_message_outside_logged_namespaces();
+    test_set_symref_rejects_path_traversal();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

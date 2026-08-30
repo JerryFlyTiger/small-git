@@ -807,6 +807,36 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         return -2;
     }
 
+    /* A whole-tree stash is implemented as a reset to HEAD, and real git
+       logs that reset even though nothing moves: HEAD ends up where it
+       started, a no-op is suppressed in a concrete ref's OWN log but not in
+       the logs/HEAD line it mirrors (Phase 17's asymmetric rule 1). Measured
+       against git 2.55.0: exactly one "reset: moving to HEAD" in logs/HEAD,
+       and nothing in the branch's own log. Without it a stash leaves no
+       trace in logs/HEAD at all, so HEAD@{1} skips straight over it.
+
+       Two measured cases where git writes NOTHING, and neither is a rule
+       this call site invents:
+
+         - a PARTIAL push (`git stash push -- <path>`) resets only the named
+           paths, so HEAD is never updated and no line appears. Skipped here
+           explicitly, because sg's partial path (restore_matched_paths) is
+           an ordinary function call with no HEAD update of its own to
+           suppress.
+         - a DETACHED HEAD. That one needs no condition here at all: HEAD is
+           written directly rather than mirrored, and sg_ref_set_head_detached
+           suppresses old == new the same way any other ref does. `branch`
+           being NULL means exactly detached, never corrupt -- a corrupt HEAD
+           has already failed sg_ref_resolve_head far above.
+
+       Failure here is deliberately NOT fatal: the stash commit is already
+       written and the working tree already reset, so refusing now would
+       report failure for work that actually happened. The user is told
+       instead. */
+    if (!partial &&
+       sg_ref_move_head(git_dir, branch, head_commit, "reset: moving to HEAD") != 0)
+        fprintf(stderr, "sg: warning: stash succeeded but its reflog line could not be written\n");
+
     /* --keep-index (measured against real git 2.55.0): after the reset to
        HEAD above, re-apply the index tree on top so staged changes land
        back in both the working tree and the index. This is deliberately

@@ -851,6 +851,69 @@ int sg_ref_delete_branch(const char *git_dir, const char *branch)
     return sg_ref_delete_under(git_dir, BRANCH_PREFIX, branch);
 }
 
+static int ref_path_reflog_allowed(const char *ref_path);
+
+int sg_ref_set_symref(const char *git_dir, const char *ref_path, const char *target_ref_path,
+                      const char *reflog_msg)
+{
+    char path[SG_PATH_MAX];
+    FILE *f;
+    long long offset = 0;
+    int wrote_log = 0;
+    int rc;
+
+    /* sg_ref_branch_name_is_safe, not sg_ref_name_valid_for_create: both
+       arguments here are full ref PATHS built by the caller, not names a
+       user typed, so what is needed is the path-traversal guard applied to
+       every ref access -- the creation-time validator enforces
+       check-ref-format rules that do not apply (and rejects the literal
+       "HEAD", which is a perfectly valid thing to write a symref to). */
+    if (!sg_ref_branch_name_is_safe(ref_path) || !sg_ref_branch_name_is_safe(target_ref_path))
+        return -1;
+
+    if (reflog_msg != NULL) {
+        unsigned char old_id[SG_SHA1_RAW_LEN];
+        unsigned char new_id[SG_SHA1_RAW_LEN];
+
+        if (!ref_path_reflog_allowed(ref_path))
+            return -1;
+        if (sg_ref_read_path(git_dir, ref_path, old_id) != 0)
+            memset(old_id, 0, SG_SHA1_RAW_LEN);
+        if (sg_ref_read_path(git_dir, target_ref_path, new_id) != 0)
+            memset(new_id, 0, SG_SHA1_RAW_LEN);
+        if (sg_reflog_append(git_dir, ref_path, old_id, new_id, reflog_msg, &offset) != 0)
+            return -1;
+        wrote_log = 1;
+    }
+
+    if (snprintf(path, sizeof(path), "%s/%s", git_dir, ref_path) >= (int)sizeof(path)) {
+        if (wrote_log)
+            sg_reflog_truncate(git_dir, ref_path, offset);
+        return -1;
+    }
+    if (sg_mkdir_parents(path) != 0) {
+        if (wrote_log)
+            sg_reflog_truncate(git_dir, ref_path, offset);
+        return -1;
+    }
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        if (wrote_log)
+            sg_reflog_truncate(git_dir, ref_path, offset);
+        return -1;
+    }
+    if (fprintf(f, "ref: %s\n", target_ref_path) < 0) {
+        fclose(f);
+        if (wrote_log)
+            sg_reflog_truncate(git_dir, ref_path, offset);
+        return -1;
+    }
+    rc = fclose(f) == 0 ? 0 : -1;
+    if (rc != 0 && wrote_log)
+        sg_reflog_truncate(git_dir, ref_path, offset);
+    return rc;
+}
+
 /* Only these namespaces get a reflog, matching real git (measured against
    2.55.0): HEAD itself, any branch, any remote-tracking ref, and refs/stash.
    refs/tags/... and sg's own internal refs (refs/sg/chunks,
@@ -977,6 +1040,8 @@ int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1
     unsigned char old_id[SG_SHA1_RAW_LEN];
     long long offset = 0;
     int wrote_log = 0;
+    int was_detached = (reflog_msg != NULL) ? sg_ref_head_is_detached(git_dir) : 0;
+    int want_log = (reflog_msg != NULL);
 
     if (reflog_msg != NULL) {
         /* The old value MUST come from sg_ref_resolve_head, not from
@@ -990,6 +1055,29 @@ int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1
            ref_path of "HEAD" even though that would produce the right FILE. */
         if (sg_ref_resolve_head(git_dir, old_id) != 0)
             memset(old_id, 0, SG_SHA1_RAW_LEN); /* unborn HEAD: nothing to come from */
+
+        /* A no-op is suppressed here, and ONLY when HEAD was ALREADY
+           detached. Measured against git 2.55.0, all four corners:
+
+             symbolic -> detached, same commit   logs ("checkout: moving ...")
+             detached -> detached, same commit   NOTHING
+             detached -> detached, other commit  logs
+             on a branch, same commit            logs (via rule 2's mirror)
+
+           So Phase 17's "logs/HEAD always appends, even for a no-op" is a
+           property of the MIRRORING path, not of HEAD's file: when HEAD is
+           written directly it obeys the ordinary "old != new" rule, like any
+           other ref. Without this, `sg reset --hard HEAD` and `sg stash` on a
+           detached HEAD each grow a reflog line real git does not write.
+
+           A CORRUPT HEAD (-1) deliberately counts as "not already detached"
+           and still logs: it is about to be overwritten, and a line is the
+           safer failure direction than silence. */
+        if (was_detached == 1 && memcmp(old_id, id, SG_SHA1_RAW_LEN) == 0)
+            want_log = 0;
+    }
+
+    if (want_log) {
         if (sg_reflog_append(git_dir, "HEAD", old_id, id, reflog_msg, &offset) != 0)
             return -1;
         wrote_log = 1;

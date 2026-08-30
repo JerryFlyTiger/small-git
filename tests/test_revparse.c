@@ -812,6 +812,137 @@ static void test_at_notation_trailing_garbage_rejected(void)
    accepts this too (gitrevisions' "refs/<name>" disambiguation rule), and
    it must not disturb the existing precedence (40-hex still wins, tag
    still beats a same-named branch looked up by bare name). */
+/* Phase 48's two bare "@" spellings. Both were measured against git 2.55.0,
+   and the first one is the counter-intuitive half: "@{N}" reads the CURRENT
+   BRANCH's reflog, not HEAD's. The two logs are seeded with different oids
+   here for exactly that reason -- with identical logs the test would pass
+   whichever one the implementation picked. */
+static void test_bare_at_brace_reads_the_current_branchs_log(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char c1[SG_SHA1_RAW_LEN], c2[SG_SHA1_RAW_LEN];
+    unsigned char zero[SG_SHA1_RAW_LEN];
+    unsigned char out[SG_SHA1_RAW_LEN];
+
+    memset(zero, 0, SG_SHA1_RAW_LEN);
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    make_commit(git_dir, "c2", (const unsigned char (*)[SG_SHA1_RAW_LEN])c1, 1, c2);
+    set_master(git_dir, c2);
+
+    CHECK(sg_reflog_append(git_dir, "HEAD", zero, c1, "head move", NULL) == 0, "HEAD append failed");
+    CHECK(sg_reflog_append(git_dir, "refs/heads/master", zero, c2, "branch move", NULL) == 0,
+         "branch append failed");
+
+    CHECK(sg_rev_parse_commit(git_dir, "@{0}", out) == 0 && memcmp(out, c2, SG_SHA1_RAW_LEN) == 0,
+         "@{0} should read the current branch's log (c2), not logs/HEAD (c1)");
+
+    /* The suffix loop below the rewrite has to keep working on it. */
+    CHECK(sg_rev_parse_commit(git_dir, "@{0}~1", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
+         "@{0}~1 should be c2's parent");
+
+    /* "@@{0}" is the two rules composed: the base "@" becomes HEAD, and the
+       reflog lookup then runs on HEAD's own log -- so it must equal
+       HEAD@{0} (c1 here), NOT the bare "@{0}" above (c2). Measured against
+       git 2.55.0, which agrees. */
+    CHECK(sg_rev_parse_commit(git_dir, "@@{0}", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
+         "@@{0} should be HEAD@{0} (c1), not the bare @{0} (c2)");
+
+    free(git_dir);
+}
+
+/* On a detached HEAD there is no current branch, and git falls back to
+   HEAD's own log. Seeded so the branch log would give a different answer:
+   if the fallback were ever "whatever branch master happens to be", this
+   would return c2. */
+static void test_bare_at_brace_falls_back_to_head_when_detached(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char c1[SG_SHA1_RAW_LEN], c2[SG_SHA1_RAW_LEN];
+    unsigned char zero[SG_SHA1_RAW_LEN];
+    unsigned char out[SG_SHA1_RAW_LEN];
+
+    memset(zero, 0, SG_SHA1_RAW_LEN);
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    make_commit(git_dir, "c2", (const unsigned char (*)[SG_SHA1_RAW_LEN])c1, 1, c2);
+    set_master(git_dir, c2);
+    CHECK(sg_reflog_append(git_dir, "refs/heads/master", zero, c2, "branch move", NULL) == 0,
+         "branch append failed");
+    CHECK(sg_ref_set_head_detached(git_dir, c1, NULL) == 0, "failed to detach HEAD");
+    CHECK(sg_reflog_append(git_dir, "HEAD", zero, c1, "head move", NULL) == 0, "HEAD append failed");
+
+    CHECK(sg_rev_parse_commit(git_dir, "@{0}", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
+         "detached @{0} should read logs/HEAD (c1), not master's log (c2)");
+
+    free(git_dir);
+}
+
+/* An unborn HEAD has neither a branch nor a log to read, and git rejects the
+   argument outright there. A corrupt HEAD must be rejected too rather than
+   silently taking the detached path -- that is Phase 18's rule, and the only
+   thing separating the two is sg_ref_head_is_detached's tri-state. */
+static void test_bare_at_brace_rejects_unborn_and_corrupt_head(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char out[SG_SHA1_RAW_LEN];
+    char head_path[4096];
+    FILE *f;
+
+    CHECK(sg_rev_parse_commit(git_dir, "@{0}", out) != 0, "@{0} must fail on an unborn HEAD");
+
+    snprintf(head_path, sizeof(head_path), "%s/HEAD", git_dir);
+    f = fopen(head_path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "cannot open HEAD\n");
+        exit(1);
+    }
+    fputs("not a ref and not a sha\n", f);
+    fclose(f);
+
+    CHECK(sg_rev_parse_commit(git_dir, "@{0}", out) != 0, "@{0} must fail on a corrupt HEAD");
+
+    free(git_dir);
+}
+
+/* "@" alone is HEAD, suffixes included. The branch is deliberately left at a
+   different commit from HEAD so a fallback to "the current branch's tip"
+   would be visible. */
+static void test_bare_at_is_head(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char c1[SG_SHA1_RAW_LEN], c2[SG_SHA1_RAW_LEN];
+    unsigned char out[SG_SHA1_RAW_LEN];
+
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    make_commit(git_dir, "c2", (const unsigned char (*)[SG_SHA1_RAW_LEN])c1, 1, c2);
+    set_master(git_dir, c2);
+    CHECK(sg_ref_set_head_detached(git_dir, c1, NULL) == 0, "failed to detach HEAD");
+
+    CHECK(sg_rev_parse_commit(git_dir, "@", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
+         "@ should be HEAD (c1), not master's tip (c2)");
+
+    free(git_dir);
+}
+
+/* The rewrite must not swallow an empty base for the OTHER suffixes: "~1"
+   and "^" with nothing in front of them stay parse errors, and so does a
+   lone "@{". */
+static void test_bare_suffixes_without_a_base_still_fail(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char c[SG_SHA1_RAW_LEN];
+    unsigned char out[SG_SHA1_RAW_LEN];
+
+    make_commit(git_dir, "c", NULL, 0, c);
+    set_master(git_dir, c);
+
+    CHECK(sg_rev_parse_commit(git_dir, "~1", out) != 0, "a bare ~1 must be rejected");
+    CHECK(sg_rev_parse_commit(git_dir, "^", out) != 0, "a bare ^ must be rejected");
+    CHECK(sg_rev_parse_commit(git_dir, "@{", out) != 0, "an unterminated @{ must be rejected");
+    CHECK(sg_rev_parse_commit(git_dir, "@{}", out) != 0, "@{} must be rejected");
+
+    free(git_dir);
+}
+
 static void test_refs_prefix_passthrough(void)
 {
     char *git_dir = make_tmp_repo();
@@ -867,6 +998,11 @@ int main(void)
     test_at_notation_rejects_non_digit_even_when_in_range();
     test_at_notation_trailing_garbage_rejected();
     test_refs_prefix_passthrough();
+    test_bare_at_brace_reads_the_current_branchs_log();
+    test_bare_at_brace_falls_back_to_head_when_detached();
+    test_bare_at_brace_rejects_unborn_and_corrupt_head();
+    test_bare_at_is_head();
+    test_bare_suffixes_without_a_base_still_fail();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

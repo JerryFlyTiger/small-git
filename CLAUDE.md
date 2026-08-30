@@ -3,7 +3,7 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (1700 checks, using real `git` as
+git; this is guarded by `tests/interop.sh` (2077 checks, using real `git` as
 the oracle).
 
 On top of that there are two things real git does not have: `src/safety/`
@@ -17,7 +17,7 @@ section when needed, do not read the whole thing**).
 
 ```bash
 make                              # build/sg, with -g
-make test                         # 50 unit test binaries, any failure fails the whole thing
+make test                         # 62 unit test binaries, any failure fails the whole thing
 bash tests/interop.sh             # interop test against real git (needs a prior make)
 make sanitize                     # clean + rebuild with ASan/UBSan + run unit tests
 python3 tests/fuzz_ignore.py      # .gitignore consistency fuzzer (200 rounds by default)
@@ -25,6 +25,16 @@ python3 tests/fuzz_diff.py        # patch output consistency fuzzer (200 rounds 
 python3 tests/fuzz_merge.py       # three-way merge vs real git (200 rounds by default)
 python3 tests/fuzz_diff.py --histogram   # same, but both sides use --histogram
 ```
+
+**After editing `tests/interop.sh`, run `bash -n tests/interop.sh` before
+anything else.** A quoting mistake aborts the script at that line, so **every
+check below it silently does not run** -- no FAIL, no error in the summary,
+only a smaller `M` in the `interop: N/M` line. Measured in Phase 48: a nested
+`sh -c "test \"$(...)\" = ..."` killed everything from line 12538 on, and two
+mutation rounds were then read as "caught" on the strength of red lines that
+all came from checks *above* the break, while the new checks had never
+executed. This is the same failure direction as the `M`-shrinking warning
+below, just with a different cause.
 
 **Run the first four gates in one shot: `bash tests/gates.sh`** (`--sanitize`
 also runs the fourth gate, `--rebuild` cleans first). It prints a summary
@@ -38,7 +48,7 @@ these four things (the script's comments have the full WHY):
 - The line that prints "0 TUs recompiled" **does not give you a warning
   count**: make compiled nothing this run, so the 0 means "not measured", not
   "measured as zero". To actually measure, use `--rebuild`.
-- In the `make test` line's "N/50 ran", if N is less than 50 it means
+- In the `make test` line's "N/62 ran", if N is less than 62 it means
   **aborted partway through** (the Makefile stops at the first failing
   binary), not "the rest passed".
 - A non-zero exit code with zero FAIL lines still counts as FAIL: crashes,
@@ -81,7 +91,7 @@ ASan job. Two things about reading its row, both measured:
 - **A crashed binary yields exit code 0 and no summary line at all**, so
   reading the exit code alone would score a segfault as green. The gate
   therefore demands the `N leaks for M total leaked bytes` line from every
-  binary and reports `analyzed N/50`, the same "not measured != measured as
+  binary and reports `analyzed N/62`, the same "not measured != measured as
   zero" shape as the `make` and `make test` rows. Non-macOS is a `skip` row,
   never a silent pass.
 
@@ -188,6 +198,27 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   symref, hex parsing necessarily fails and is silently recorded as all
   zeros, so "detaching from A to B" gets written as "B created out of
   nowhere".
+
+  WARNING: **"logs/HEAD is always appended, even for a no-op" is a property
+  of the MIRRORING path, not of HEAD's file** (measured in Phase 48, and a
+  pre-existing bug until then). When HEAD is written **directly** -- i.e.
+  while DETACHED -- it obeys the ordinary `old != new` rule like any other
+  ref: real git logs nothing for a detached no-op (`reset --hard HEAD`,
+  `stash` on a detached HEAD), but still logs the **symbolic-to-detached
+  transition** even when the commit does not change. The condition is
+  therefore "HEAD was ALREADY detached **and** old == new", it lives in
+  `sg_ref_set_head_detached` (the single writer of a detached HEAD), and a
+  corrupt HEAD deliberately counts as "not already detached" and still logs.
+  Suppressing too much is as wrong as suppressing too little; interop pins
+  all three corners in one fixture.
+
+  **An arbitrary SYMBOLIC ref goes through `sg_ref_set_symref`** (Phase 48),
+  which is `sg_ref_set_head`'s shape generalized to any ref path -- append
+  the log line first, write the file, truncate the log back off if the write
+  fails -- and inherits the namespace policy below unchanged. Its one caller
+  is `sg clone`, which creates `refs/remotes/<remote>/HEAD`; note its old_id
+  reads as all-zeros for a symref that already exists (a `ref: ...` file has
+  no id to parse), the same limitation `sg_ref_set_head_detached` documents.
 
   The two asymmetric reflog rules (a concrete ref's log is only appended when
   `old != new`; `logs/HEAD` is always appended, and is byte-for-byte identical
@@ -1055,7 +1086,24 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `sg_rev_parse_commit`** (`include/sg/revparse.h`): `HEAD`/tag/branch/full
   40-hex/full `refs/...` path, plus `~N`/`^N`/`@{N}` (Phase 17, reflog index,
   must immediately follow the ref name, digits only, `@{<date>}`/
-  `@{upstream}`/bare `@{N}` are not supported), and it peels annotated tags.
+  `@{upstream}` are not supported), and it peels annotated tags.
+  **Bare `@{N}` and bare `@` are supported as of Phase 48**, and the first is
+  easy to get backwards: **`@{N}` reads the CURRENT BRANCH's log, not
+  HEAD's** -- measurably a different commit once a checkout away and back has
+  added lines to `logs/HEAD` and none to the branch's, and git's own
+  out-of-range message names the branch. Detached falls back to `logs/HEAD`;
+  unborn is rejected; **a corrupt HEAD must be rejected too, which is why the
+  predicate is `sg_ref_head_is_detached`'s tri-state and not a NULL test on
+  `sg_ref_current_branch`** (Phase 18's rule). Bare `@` is HEAD, suffixes
+  included. Both work by rewriting `base` before anything else runs, so
+  `@{1}~1` and `@~1` come for free -- but the rewrite must not swallow an
+  empty base in general: `~1`, `^` and `@{` alone are still parse errors.
+  WARNING: **one measured case is deliberately NOT reproduced** -- with the
+  current branch's reflog file deleted by hand, real git lets `@{0}` fall
+  back to the branch tip while still rejecting `<branch>@{0}`; sg rejects
+  both, rather than inventing an asymmetry between its own two spellings.
+  It is not on the deliberate-divergence list (reaching it takes deleting a
+  log file by hand); see Phase 48 of `docs/DESIGN.md`.
   **Abbreviated sha is not supported** (deliberately). Do not hand-roll a
   "branch name or 40-hex" fragment again. To list/delete refs under any
   prefix use `sg_ref_list_under`/`sg_ref_delete_under` (`prefix` must end
@@ -1102,6 +1150,16 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `base_tree` against `untracked_tree` -- the latter would report a phantom
   deletion for every path that exists only on the tracked side, printing the
   same path twice.
+- **`sg stash push` writes `reset: moving to HEAD` to `logs/HEAD`** (Phase
+  48), matching real git -- and the branch's own log gets nothing, which is
+  Phase 17's rule 1 falling out rather than a special case. WARNING: **two
+  measured cases log nothing at all**, and only one of them is a stash rule:
+  a **partial** push (`sg stash push -- <path>`) never updates HEAD, so the
+  call is skipped explicitly; a **detached** HEAD needs no condition at the
+  call site, because `sg_ref_set_head_detached` suppresses the no-op itself
+  (see the WARNING under the ref-writing bullet above). The write is
+  deliberately **not fatal** on failure -- the stash commit and the working
+  tree reset have both already happened by then.
 - **`sg stash` supports `-u`/`--include-untracked`, `-a`/`--all`,
   `--keep-index`, `--index` (Phase 20)**. `sg_stash_push` takes
   `sg_stash_push_opts` (`include/sg/stash.h`), not a run of positional
@@ -1369,7 +1427,7 @@ bumping the version, keep the man page in sync.
 
 ## Testing conventions
 
-- 50 independent unit test `.c` files, **no shared header, no test
+- 62 independent unit test `.c` files, **no shared header, no test
   framework**. Each file carries its own `static int failures = 0;` and a
   same-named `CHECK(cond, ...)` macro (prints `FAIL %s:%d` and
   `failures++` on failure, **does not abort**), and `main` ends with

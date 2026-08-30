@@ -1,4 +1,4 @@
-.TH SG 1 "2026-08-16" "small_git 0.1" "User Commands"
+.TH SG 1 "2026-08-30" "small_git 0.1" "User Commands"
 .SH NAME
 sg \- small_git: a git-object-format-compatible version control tool
 .SH SYNOPSIS
@@ -1288,12 +1288,26 @@ and a tracking
 stanza in
 .BR .git/config .
 If the remote has no branches (only tags, or is entirely empty), the clone
-completes without a checkout. There is no support for
-.BR git:// ,
-.BR ssh:// ,
+completes without a checkout.
+.PP
+Also creates
+.BR refs/remotes/origin/HEAD ,
+a
+.B symbolic
+ref pointing at the remote's default branch, with a single
+.B "clone: from " \fIurl\fP
+line in its reflog \(em matching real git. The remote-tracking
+.B branches
+get no reflog at all at clone time; theirs begin at the first
+.BR fetch ,
+which is also what real git does.
+.PP
+There is no support for
+.B git://
 or local filesystem clone sources, and no
-.BR --depth / --branch / --bare
-options.
+.BR --depth / --branch / --bare / --origin
+options; the remote is always named
+.BR origin .
 .SS fetch
 .B sg fetch
 .RI [ remote ]
@@ -1607,6 +1621,17 @@ is fully readable by
 and vice versa; see
 .B FILES
 below.
+.PP
+The reset that
+.B "sg stash push"
+performs is itself logged, as real git logs it: one
+.B "reset: moving to HEAD"
+line in
+.BR .git/logs/HEAD .
+The current branch's own log gets nothing \(em the reset moves HEAD from a
+commit to the same commit, and a concrete ref's log suppresses a no-op while
+.B logs/HEAD
+does not.
 .PP
 .I stash
 identifies an entry as
@@ -2027,14 +2052,44 @@ heuristic in real git, not a documented cutoff, so
 does not attempt to replicate it and simply always reads
 .I N
 as an index).
-A bare
-.B @{N}
-with no ref name in front of it is rejected \(em in real git this means
-"the current branch", not
+.TP
+.B @
+On its own,
 .BR HEAD ,
-and the two can differ, so
+including with suffixes \(em
+.B @~1
+is
+.BR HEAD~1 .
+This holds even if a branch is literally named
+.BR @ .
+.TP
+.BI @{ N }
+.RI "(with no ref name in front of it)"
+The
+.IR N th
+most recent entry in
+.B the current branch's
+reflog \(em
+.B not
+.BR HEAD 's.
+The two are genuinely different files and give different answers once a
+checkout away and back has appended to
+.B logs/HEAD
+without touching the branch's own log. On a detached
+.B HEAD
+there is no branch and
+.B logs/HEAD
+is used instead; on an unborn
+.B HEAD
+the expression is rejected, as it is in real git.
+.IP
+One measured case is deliberately not reproduced: if the current branch's
+reflog file is missing entirely, real git lets
+.B @{0}
+fall back to the branch's own tip while still rejecting the spelled-out
+.BR <branch>@{0} .
 .B sg
-refuses rather than silently substituting the wrong one.
+rejects both.
 .SH TRANSPORTS
 .B sg
 reaches a remote two ways.

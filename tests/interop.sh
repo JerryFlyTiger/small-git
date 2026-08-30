@@ -1231,6 +1231,69 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     check "phase5b: sg clone wrote refs/tags/v1.0 with the correct sha" \
         sh -c "test -f '$HTTP_DEST/.git/refs/tags/v1.0' && test \"\$(cat '$HTTP_DEST/.git/refs/tags/v1.0')\" = '$HTTP_SRC_V1'"
 
+    # --- Phase 48: refs/remotes/<remote>/HEAD. Real git's clone creates it as
+    # a SYMBOLIC ref to the remote's default branch and gives it a one-line
+    # log; sg created neither before Phase 48. Real git cloning the SAME url
+    # is the oracle, so the expected bytes are never spelled out here.
+    #
+    # The log line's middle field (committer identity + timestamp) is the one
+    # part that legitimately differs between the two runs, so the comparison
+    # is split: the two shas are cmp'd as a pair (they are the whole point --
+    # old must be all-zeros, new must be the branch tip), and the message
+    # after the tab is cmp'd separately. Comparing the whole line would fail
+    # for a reason that has nothing to do with what is being tested.
+    P48_GIT_DEST="$WORKDIR/http_git_clone_dest"
+    rm -rf "$P48_GIT_DEST"
+    git clone -q "$HTTP_BASE_URL" "$P48_GIT_DEST" > /dev/null 2>&1
+    check "phase48 oracle: precondition -- real git can clone the same url" \
+        test -d "$P48_GIT_DEST/.git"
+
+    check "phase48 oracle: precondition -- real git created refs/remotes/origin/HEAD" \
+        test -f "$P48_GIT_DEST/.git/refs/remotes/origin/HEAD"
+
+    check "phase48: sg clone creates refs/remotes/origin/HEAD byte-for-byte like git" \
+        cmp -s "$HTTP_DEST/.git/refs/remotes/origin/HEAD" \
+               "$P48_GIT_DEST/.git/refs/remotes/origin/HEAD"
+
+    # It must be a SYMBOLIC ref, not a copy of the sha. A 40-hex file would
+    # still "exist" and would still make `sg reflog origin/HEAD` resolve, so
+    # the cmp above is what distinguishes them -- this check names the
+    # property so a failure says which shape it got.
+    check "phase48: refs/remotes/origin/HEAD holds a ref: line, not a sha" \
+        grep -q '^ref: refs/remotes/origin/' "$HTTP_DEST/.git/refs/remotes/origin/HEAD"
+
+    P48_SG_LOG="$HTTP_DEST/.git/logs/refs/remotes/origin/HEAD"
+    P48_GIT_LOG="$P48_GIT_DEST/.git/logs/refs/remotes/origin/HEAD"
+    check "phase48 oracle: precondition -- real git logged one line for origin/HEAD" \
+        sh -c "test -f '$P48_GIT_LOG' && test \"\$(wc -l < '$P48_GIT_LOG' | tr -d ' ')\" = 1"
+
+    check "phase48: sg's origin/HEAD log has exactly one line, like git's" \
+        sh -c "test -f '$P48_SG_LOG' && test \"\$(wc -l < '$P48_SG_LOG' | tr -d ' ')\" = 1"
+
+    if [ -f "$P48_SG_LOG" ] && [ -f "$P48_GIT_LOG" ]; then
+        cut -d' ' -f1,2 < "$P48_SG_LOG"  > "$WORKDIR/p48_sg_shas.txt"
+        cut -d' ' -f1,2 < "$P48_GIT_LOG" > "$WORKDIR/p48_git_shas.txt"
+        check "phase48: the old/new shas of sg's origin/HEAD log match git's" \
+            cmp -s "$WORKDIR/p48_sg_shas.txt" "$WORKDIR/p48_git_shas.txt"
+
+        sed 's/.*	//' < "$P48_SG_LOG"  > "$WORKDIR/p48_sg_msg.txt"
+        sed 's/.*	//' < "$P48_GIT_LOG" > "$WORKDIR/p48_git_msg.txt"
+        check "phase48: the reflog message of sg's origin/HEAD log matches git's" \
+            cmp -s "$WORKDIR/p48_sg_msg.txt" "$WORKDIR/p48_git_msg.txt"
+    else
+        skip "phase48: the old/new shas of sg's origin/HEAD log match git's"
+        skip "phase48: the reflog message of sg's origin/HEAD log matches git's"
+    fi
+
+    # The remote-tracking BRANCH gets no log from either tool -- clone writes
+    # those refs directly. Without this, "write a log for everything under
+    # refs/remotes/" would pass every check above while inventing history for
+    # refs git leaves alone.
+    check "phase48 oracle: precondition -- real git wrote no log for origin/$HTTP_SRC_BRANCH" \
+        test ! -f "$P48_GIT_DEST/.git/logs/refs/remotes/origin/$HTTP_SRC_BRANCH"
+    check "phase48: sg wrote no log for origin/$HTTP_SRC_BRANCH either" \
+        test ! -f "$HTTP_DEST/.git/logs/refs/remotes/origin/$HTTP_SRC_BRANCH"
+
     # --- .idx must be byte-for-byte identical to real `git index-pack`'s output ---
     HTTP_PACK_FILE=$(find "$HTTP_DEST/.git/objects/pack" -name '*.pack' | head -1)
     HTTP_OUR_IDX=$(find "$HTTP_DEST/.git/objects/pack" -name '*.idx' | head -1)
@@ -7391,17 +7454,25 @@ check "phase17c: master^@{1} (@{N} not adjacent to base) is rejected by both sg 
     p17c_probe_agree at10 'master^@{1}'
 check "phase17c: master@{} (empty braces) is rejected by both sg and git" p17c_probe_agree at11 'master@{}'
 
-# Deliberate divergence: real git's bare "@{N}" DWIMs to the current
-# branch, sg deliberately does not (see revparse.h's header comment: the
-# value is measurably NOT the same as spelling the branch name out, so
-# guessing would be a wrong answer). Note "@{u}" (upstream) isn't usable as
-# a comparable divergence here -- this repo's master has no upstream
-# configured, so real git rejects it too, just for an unrelated reason; the
-# "@{u}"/"@{now}" rejections are covered by the unit test instead.
-P17C_BARE_GIT_RC=$(cd "$P17C" && git rev-parse '@{1}' > /dev/null 2>&1; echo $?)
-(cd "$P17C" && "$SG" tag p17c_probe_bare '@{1}') > /dev/null 2>&1
-check "phase17c: bare @{1} -- git treats it as the current branch, sg deliberately does not (sg-specific, no shared oracle result)" \
-    test "$P17C_BARE_GIT_RC" -eq 0 -a $? -ne 0
+# Was a pinned divergence through Phase 47 (sg rejected the bare form
+# outright); Phase 48 implements it, so it joins the agreement probes above
+# and is compared by VALUE -- rejecting it and resolving it to the wrong
+# commit are both failures now, where the old assertion could only tell
+# "rejected" from "not rejected". The dedicated phase48 block near the end of
+# this file additionally builds a fixture where logs/HEAD and the branch log
+# disagree; this repo's may or may not, so agreement here is necessary but
+# not sufficient. Note "@{u}" (upstream) still isn't usable as a comparable
+# divergence -- this repo's master has no upstream configured, so real git
+# rejects it too, just for an unrelated reason; the "@{u}"/"@{now}"
+# rejections are covered by the unit test instead.
+check "phase17c: bare @{1} matches git (the current branch's log, not HEAD's)" \
+    p17c_probe_agree at12 '@{1}'
+check "phase17c: bare @ matches git (it is HEAD)" p17c_probe_agree at13 '@'
+check "phase17c: bare @~1 matches git" p17c_probe_agree at14 '@~1'
+# The two rules composed: "@" becomes HEAD, then the reflog lookup runs on
+# HEAD's log -- so "@@{1}" is HEAD@{1}, which is NOT the bare "@{1}".
+check "phase17c: @@{1} matches git (it is HEAD@{1}, not the bare @{1})" \
+    p17c_probe_agree at15 '@@{1}'
 
 # --- `sg reflog` output, compared line-for-line against `git reflog` on the
 # very same (sg-built) repo. ---
@@ -7578,8 +7649,8 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         skip "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)"
         skip "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'"
         skip "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'"
-        skip "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)"
-        skip "phase17d: and no orphan reflog for it either"
+        skip "phase17d: sg clone creates refs/remotes/origin/HEAD, like git does here too"
+        skip "phase17d: and its reflog exists alongside it, never one without the other"
         skip "phase17d: sg clone did NOT write a log for refs/remotes/origin/<branch>"
         skip "phase17d: sg fetch reflog message: fast-forward"
         skip "phase17d: git oracle agrees: a real git fetch of the same fast-forward also logs 'fetch origin: fast-forward'"
@@ -7619,16 +7690,22 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         check "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'" \
             test "$P17D_BRANCH_LOG_MSG" = "clone: from $P17D_BASE_URL"
 
-        # Known divergence, asserted so it stays deliberate: real git's clone
-        # creates refs/remotes/origin/HEAD as a symref and logs a line to it.
-        # sg models neither. Writing just the log was tried and removed --
-        # `sg reflog origin/HEAD` resolves names through the ref itself, so a
-        # log without a ref is unreachable and claims a history the repo does
-        # not have. Pinned in both directions: no ref, and no log for it.
-        check "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)" \
-            test ! -e "$P17D_DEST/.git/refs/remotes/origin/HEAD"
-        check "phase17d: and no orphan reflog for it either" \
-            test ! -e "$P17D_DEST/.git/logs/refs/remotes/origin/HEAD"
+        # Was a pinned divergence through Phase 47 (sg created neither the ref
+        # nor its log); Phase 48 creates both, and the byte-for-byte oracle
+        # for them lives in the phase48 group up in the phase5b section. What
+        # is asserted here is the pairing that made the old divergence
+        # deliberate rather than an oversight: writing just the log was tried
+        # once and removed, because `sg reflog origin/HEAD` resolves names
+        # through the ref itself, so a log without a ref is unreachable and
+        # claims a history the repo does not have. Neither-or-both, and this
+        # fixture is the one that has a real-git clone sitting beside it.
+        check "phase17d: sg clone creates refs/remotes/origin/HEAD, like git does here too" \
+            sh -c "test -e '$P17D_DEST/.git/refs/remotes/origin/HEAD' && test -e '$WORKDIR/p17d_dest_git/.git/refs/remotes/origin/HEAD'"
+        P17D_OH_REF=0; P17D_OH_LOG=0
+        [ -e "$P17D_DEST/.git/refs/remotes/origin/HEAD" ] && P17D_OH_REF=1
+        [ -e "$P17D_DEST/.git/logs/refs/remotes/origin/HEAD" ] && P17D_OH_LOG=1
+        check "phase17d: and its reflog exists alongside it, never one without the other" \
+            test "$P17D_OH_REF" = "$P17D_OH_LOG"
 
         # negative assertion: refs/remotes/origin/<branch>'s log must NOT
         # exist right after clone -- this is the reflog analogue of the file
@@ -7696,8 +7773,8 @@ else
     skip "phase17d: sg clone left logs/HEAD with exactly one line (git oracle: clone logs once, not once per ref written)"
     skip "phase17d: sg clone wrote logs/HEAD with 'clone: from <url>'"
     skip "phase17d: sg clone wrote the default branch's own log with 'clone: from <url>'"
-    skip "phase17d: sg clone creates no refs/remotes/origin/HEAD ref (divergence from git, deliberate)"
-    skip "phase17d: and no orphan reflog for it either"
+    skip "phase17d: sg clone creates refs/remotes/origin/HEAD, like git does here too"
+    skip "phase17d: and its reflog exists alongside it, never one without the other"
     skip "phase17d: sg clone did NOT write a log for refs/remotes/origin/<branch>"
     skip "phase17d: sg fetch reflog message: fast-forward"
     skip "phase17d: git oracle agrees: a real git fetch of the same fast-forward also logs 'fetch origin: fast-forward'"
@@ -12323,6 +12400,272 @@ check "phase38: sg status's unmerged labels match real git byte-for-byte" \
 check "phase38 oracle: precondition -- the pinned flags keep git's closing-line parenthetical" \
     grep -q 'nothing added to commit but untracked files present (use "git add" to track)' \
     "$WORKDIR/p38_advice_probe.txt"
+
+
+# ============================================================
+# Phase 48: the two remaining reflog gaps left over from Phase 17, plus the
+# two bare "@" revision spellings. refs/remotes/<remote>/HEAD is covered by
+# the phase48 group up in the phase5b section (it needs a real clone); this
+# block covers the two that need no network.
+#
+# Both halves use real git as the oracle in a repo built the same way by each
+# tool, and compare the reflog MESSAGE column only -- the identity and
+# timestamp fields legitimately differ between the two runs, so comparing
+# whole lines would fail for a reason that has nothing to do with the
+# property under test.
+
+P48_ROOT="$WORKDIR/phase48"
+mkdir -p "$P48_ROOT"
+
+# --- 1. `stash push` resets the working tree to HEAD, and real git logs that
+# reset. Measured: logs/HEAD gains a "reset: moving to HEAD" line, and the
+# BRANCH's own log gains nothing at all -- old == new there, and Phase 17's
+# rule 1 suppresses a concrete ref's no-op while logs/HEAD always appends.
+# Pinning only logs/HEAD would leave "append to both" passing.
+for tool in git sg; do
+    d="$P48_ROOT/stash_$tool"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$tool" = git ]; then
+        (cd "$d" && git init -q . &&
+         echo a > a.txt && git add a.txt &&
+         git -c user.email=t@t -c user.name=t commit -qm one &&
+         echo b >> a.txt && git stash -q) > /dev/null 2>&1
+    else
+        (cd "$d" && "$SG" init . &&
+         echo a > a.txt && "$SG" add a.txt &&
+         GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t "$SG" commit -m one &&
+         echo b >> a.txt && "$SG" stash) > /dev/null 2>&1
+    fi
+    sed 's/.*	//' "$d/.git/logs/HEAD" > "$P48_ROOT/${tool}_head_msgs.txt" 2>/dev/null
+    sed 's/.*	//' "$d/.git/logs/refs/heads/master" \
+        > "$P48_ROOT/${tool}_branch_msgs.txt" 2>/dev/null
+done
+
+check "phase48 oracle: precondition -- git's stash fixture really stashed something" \
+    sh -c "test -f '$P48_ROOT/stash_git/.git/refs/stash'"
+check "phase48 oracle: precondition -- sg's stash fixture really stashed something" \
+    sh -c "test -f '$P48_ROOT/stash_sg/.git/refs/stash'"
+
+check "phase48: sg stash push logs the same logs/HEAD messages as git" \
+    cmp -s "$P48_ROOT/sg_head_msgs.txt" "$P48_ROOT/git_head_msgs.txt"
+
+# Named separately from the cmp above: the cmp fails the same way whether the
+# line is missing, extra, or misspelled, and this is the line the phase added.
+check "phase48 oracle: precondition -- git's logs/HEAD ends with 'reset: moving to HEAD'" \
+    sh -c "test \"\$(tail -1 '$P48_ROOT/git_head_msgs.txt')\" = 'reset: moving to HEAD'"
+check "phase48: and so does sg's" \
+    sh -c "test \"\$(tail -1 '$P48_ROOT/sg_head_msgs.txt')\" = 'reset: moving to HEAD'"
+
+check "phase48: the branch's own log stays untouched, exactly as in git's" \
+    cmp -s "$P48_ROOT/sg_branch_msgs.txt" "$P48_ROOT/git_branch_msgs.txt"
+check "phase48 oracle: precondition -- git's branch log has no reset line to match" \
+    sh -c "! grep -q 'reset: moving to HEAD' '$P48_ROOT/git_branch_msgs.txt'"
+
+# --- Two measured cases where git logs NOTHING for the same command. Both
+# were found by measuring past the first fixture, and both were wrong in sg
+# before Phase 48 -- the second one has nothing to do with stash and was
+# wrong for `reset --hard` too.
+#
+#   a PARTIAL push resets only the named paths, so HEAD is never updated;
+#   a DETACHED HEAD is written directly rather than mirrored through a
+#   branch, and there the ordinary "old != new" rule applies.
+#
+# Asserted as full-file cmp against git rather than "the last line is not
+# ...", so an EXTRA line anywhere is caught too.
+# The stash command is spelled with an if/else, NOT `[ cond ] && A || B`:
+# in that idiom a FAILING A silently falls through to B, so a partial push
+# that errored would quietly be replaced by a full stash -- and every
+# precondition below would still pass, because a full stash also creates
+# refs/stash. Same reason the detach step is a plain `if` rather than
+# `... || true`, and why each fixture records its own builder exit status.
+for tool in git sg; do
+    for case in detached partial; do
+        d="$P48_ROOT/${case}_$tool"
+        rm -rf "$d"; mkdir -p "$d"
+        if [ "$tool" = git ]; then
+            (cd "$d" && git init -q . &&
+             echo a > a.txt && echo x > b.txt && git add a.txt b.txt &&
+             git -c user.email=t@t -c user.name=t commit -qm one &&
+             if [ "$case" = detached ]; then git checkout -q --detach HEAD; fi &&
+             echo b >> a.txt && echo y >> b.txt &&
+             if [ "$case" = partial ]; then
+                 git stash push -q -- a.txt
+             else
+                 git stash -q
+             fi) > /dev/null 2>&1
+        else
+            (cd "$d" && "$SG" init . &&
+             echo a > a.txt && echo x > b.txt && "$SG" add a.txt b.txt &&
+             GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t "$SG" commit -m one &&
+             if [ "$case" = detached ]; then "$SG" switch --detach HEAD; fi &&
+             echo b >> a.txt && echo y >> b.txt &&
+             if [ "$case" = partial ]; then
+                 "$SG" stash push -- a.txt
+             else
+                 "$SG" stash
+             fi) > /dev/null 2>&1
+        fi
+        eval "P48_RC_${case}_${tool}=$?"
+        sed 's/.*	//' "$d/.git/logs/HEAD" > "$P48_ROOT/${case}_${tool}_msgs.txt" 2>/dev/null
+    done
+done
+
+check "phase48 oracle: precondition -- git's detached fixture built cleanly" \
+    test "$P48_RC_detached_git" = 0
+check "phase48 oracle: precondition -- sg's detached fixture built cleanly" \
+    test "$P48_RC_detached_sg" = 0
+check "phase48 oracle: precondition -- git's partial fixture built cleanly" \
+    test "$P48_RC_partial_git" = 0
+check "phase48 oracle: precondition -- sg's partial fixture built cleanly" \
+    test "$P48_RC_partial_sg" = 0
+
+# "refs/stash exists" cannot tell a partial push from a full one, and cannot
+# tell a detached run from an attached one -- so a check comparing two runs
+# that both silently degraded to the same wrong shape would pass. These say
+# what each fixture actually IS.
+# The "-f .git/HEAD" conjunct is not padding: `!` turns ANY failure of the
+# git call into a pass, including "that is not a repository at all", so
+# without it a fixture that never got built would read as detached.
+check "phase48 oracle: precondition -- git's detached fixture really is detached" \
+    sh -c "test -f '$P48_ROOT/detached_git/.git/HEAD' && ! git -C '$P48_ROOT/detached_git' symbolic-ref -q HEAD > /dev/null"
+check "phase48 oracle: precondition -- sg's detached fixture really is detached" \
+    sh -c "test -f '$P48_ROOT/detached_sg/.git/HEAD' && ! git -C '$P48_ROOT/detached_sg' symbolic-ref -q HEAD > /dev/null"
+check "phase48 oracle: precondition -- git's partial push stashed only a.txt" \
+    sh -c "grep -q '^y$' '$P48_ROOT/partial_git/b.txt'"
+check "phase48 oracle: precondition -- sg's partial push stashed only a.txt" \
+    sh -c "grep -q '^y$' '$P48_ROOT/partial_sg/b.txt'"
+
+check "phase48 oracle: precondition -- git's detached stash really stashed something"     sh -c "test -f '$P48_ROOT/detached_git/.git/refs/stash'"
+check "phase48 oracle: precondition -- sg's detached stash really stashed something"     sh -c "test -f '$P48_ROOT/detached_sg/.git/refs/stash'"
+check "phase48 oracle: precondition -- git's partial stash really stashed something"     sh -c "test -f '$P48_ROOT/partial_git/.git/refs/stash'"
+check "phase48 oracle: precondition -- sg's partial stash really stashed something"     sh -c "test -f '$P48_ROOT/partial_sg/.git/refs/stash'"
+check "phase48 oracle: precondition -- git logs no reset line for a detached stash"     sh -c "! grep -q 'reset: moving to HEAD' '$P48_ROOT/detached_git_msgs.txt'"
+check "phase48 oracle: precondition -- git logs no reset line for a partial stash"     sh -c "! grep -q 'reset: moving to HEAD' '$P48_ROOT/partial_git_msgs.txt'"
+
+check "phase48: a detached-HEAD stash logs what git logs, no extra reset line"     cmp -s "$P48_ROOT/detached_sg_msgs.txt" "$P48_ROOT/detached_git_msgs.txt"
+check "phase48: a partial-pathspec stash logs what git logs, no extra reset line"     cmp -s "$P48_ROOT/partial_sg_msgs.txt" "$P48_ROOT/partial_git_msgs.txt"
+
+# The detached rule is NOT stash-specific: it lives in sg_ref_set_head_detached
+# and `reset --hard` was wrong the same way. Three corners in one fixture,
+# because suppressing too much is as wrong as suppressing too little: a
+# detached no-op logs nothing, a detached MOVE still logs, and the
+# symbolic->detached transition logs even when the commit does not change.
+for tool in git sg; do
+    d="$P48_ROOT/dreset_$tool"
+    rm -rf "$d"; mkdir -p "$d"
+    if [ "$tool" = git ]; then
+        (cd "$d" && git init -q . &&
+         for i in 1 2; do
+             echo "$i" > f.txt; git add f.txt
+             git -c user.email=t@t -c user.name=t commit -qm "c$i"
+         done &&
+         git checkout -q --detach HEAD &&
+         echo x >> f.txt && git reset -q --hard HEAD &&
+         git reset -q --hard HEAD~1) > /dev/null 2>&1
+    else
+        (cd "$d" && "$SG" init . &&
+         for i in 1 2; do
+             echo "$i" > f.txt; "$SG" add f.txt
+             GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t "$SG" commit -m "c$i"
+         done &&
+         "$SG" switch --detach HEAD &&
+         echo x >> f.txt && "$SG" reset --hard --force HEAD < /dev/null &&
+         "$SG" reset --hard --force HEAD~1 < /dev/null) > /dev/null 2>&1
+    fi
+    sed 's/.*	//' "$d/.git/logs/HEAD" > "$P48_ROOT/dreset_${tool}_msgs.txt" 2>/dev/null
+done
+
+# Computed up front rather than inside sh -c: the values are compared more
+# than once, and nesting command substitution inside a quoted sh -c string is
+# exactly how the first version of this block ended up a syntax error that
+# aborted the whole script partway (silently costing every check below it).
+P48_DR_GIT_BLOB=$(git -C "$P48_ROOT/dreset_git" rev-parse HEAD:f.txt 2>/dev/null)
+P48_DR_SG_BLOB=$(git -C "$P48_ROOT/dreset_sg" rev-parse HEAD:f.txt 2>/dev/null)
+P48_DR_GIT_LAST=$(tail -1 "$P48_ROOT/dreset_git_msgs.txt" 2>/dev/null)
+P48_DR_GIT_RESETS=$(grep -c '^reset: ' "$P48_ROOT/dreset_git_msgs.txt" 2>/dev/null || true)
+P48_DR_SG_RESETS=$(grep -c '^reset: ' "$P48_ROOT/dreset_sg_msgs.txt" 2>/dev/null || true)
+
+check "phase48 oracle: precondition -- both dreset fixtures ended at the same commit" \
+    sh -c "test -n '$P48_DR_GIT_BLOB' && test '$P48_DR_GIT_BLOB' = '$P48_DR_SG_BLOB'"
+check "phase48 oracle: precondition -- git's detached fixture logged the moving reset" \
+    test "$P48_DR_GIT_LAST" = "reset: moving to HEAD~1"
+check "phase48 oracle: precondition -- git logged the symbolic-to-detached transition" \
+    grep -q '^checkout: moving from' "$P48_ROOT/dreset_git_msgs.txt"
+check "phase48 oracle: precondition -- git logged exactly one reset line, not two" \
+    test "$P48_DR_GIT_RESETS" = 1
+check "phase48: sg reset --hard on a detached HEAD logs exactly what git logs" \
+    test "$P48_DR_SG_RESETS" = "$P48_DR_GIT_RESETS"
+check "phase48: and it still logs the transition into the detached state" \
+    grep -q '^checkout: moving from' "$P48_ROOT/dreset_sg_msgs.txt"
+
+# --- 2. bare "@{N}" and "@". The fixture makes logs/HEAD and the branch's own
+# log DISAGREE (a switch away and back adds two lines to logs/HEAD and none to
+# the branch's), because "@{1}" reading HEAD's log instead of the current
+# branch's is the single most likely way to get this wrong, and with matching
+# logs both answers look right.
+P48_REV="$P48_ROOT/revs"
+rm -rf "$P48_REV"; mkdir -p "$P48_REV"
+(cd "$P48_REV" && git init -q . &&
+ for i in 1 2 3; do
+     echo "$i" > f.txt
+     git add f.txt
+     git -c user.email=t@t -c user.name=t commit -qm "c$i"
+ done &&
+ git checkout -q -b sidebranch &&
+ git checkout -q master) > /dev/null 2>&1
+
+P48_C3=$(cd "$P48_REV" && git rev-parse master)
+P48_C2=$(cd "$P48_REV" && git rev-parse master~1)
+P48_C1=$(cd "$P48_REV" && git rev-parse master~2)
+
+check "phase48 oracle: precondition -- logs/HEAD and the branch log really disagree" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse 'HEAD@{1}')\" != \"\$(git -C '$P48_REV' rev-parse 'master@{1}')\""
+check "phase48 oracle: git's bare @{1} follows the branch's log, not HEAD's" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse '@{1}')\" = '$P48_C2'"
+
+# sg has no rev-parse, so `sg switch --detach <rev>` is what makes a resolved
+# revision observable: it writes the resolved oid straight into HEAD.
+(cd "$P48_REV" && "$SG" switch --detach '@{1}') > /dev/null 2>&1
+check "phase48: sg resolves a bare @{1} to the same commit git does" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse HEAD)\" = '$P48_C2'"
+
+# Now detached: git falls back to HEAD's own log there. Measured fresh rather
+# than hard-coded, because the line above just moved HEAD and so changed what
+# HEAD@{1} means.
+P48_DETACHED_EXPECT=$(cd "$P48_REV" && git rev-parse '@{1}')
+check "phase48 oracle: precondition -- detached, git's @{1} equals HEAD@{1}" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse 'HEAD@{1}')\" = '$P48_DETACHED_EXPECT'"
+(cd "$P48_REV" && "$SG" switch --detach '@{1}') > /dev/null 2>&1
+check "phase48: detached, sg's bare @{1} falls back to HEAD's log like git's" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse HEAD)\" = '$P48_DETACHED_EXPECT'"
+
+# "@" alone is HEAD. Checked from a detached HEAD sitting at a commit the
+# branch is NOT at, so resolving it as "the current branch" would be visible.
+(cd "$P48_REV" && git checkout -q --detach "$P48_C1") > /dev/null 2>&1
+check "phase48 oracle: precondition -- HEAD and master differ for the @ test" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse HEAD)\" != '$P48_C3'"
+check "phase48 oracle: git's bare @ is HEAD" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse '@')\" = '$P48_C1'"
+# HEAD is at the ROOT commit here, so "@~1" has no parent to reach. Both
+# tools must refuse it -- asserted as AGREEMENT with git rather than as a
+# bare "sg exits 1", because sg's exit codes are only ever 0 or 1 and
+# "rejected @ as unparseable" would look identical to "parsed @, then ~1 ran
+# off the end". The witness that bare "@" is actually resolved is the "@~2"
+# check below, which pins a specific commit; this one only guards against sg
+# ACCEPTING something git rejects.
+P48_GIT_AT1_RC=$(cd "$P48_REV" && git rev-parse '@~1' > /dev/null 2>&1; echo $?)
+(cd "$P48_REV" && "$SG" switch --detach '@~1') > /dev/null 2>&1
+P48_SG_AT1_RC=$?
+check "phase48 oracle: precondition -- git also refuses @~1 at a root commit" \
+    test "$P48_GIT_AT1_RC" != 0
+check "phase48: sg refuses @~1 at a root commit, same as git" \
+    test "$P48_SG_AT1_RC" != 0
+check "phase48: and refusing it left HEAD where it was" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse HEAD)\" = '$P48_C1'"
+(cd "$P48_REV" && git checkout -q --detach "$P48_C3") > /dev/null 2>&1
+(cd "$P48_REV" && "$SG" switch --detach '@~2') > /dev/null 2>&1
+check "phase48: sg resolves @~2 the same as git's HEAD~2" \
+    sh -c "test \"\$(git -C '$P48_REV' rev-parse HEAD)\" = '$P48_C1'"
 
 
 echo ""
