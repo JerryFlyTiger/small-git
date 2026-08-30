@@ -1754,6 +1754,22 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
         sh -c "! (cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/heads/p46-local-only) > /dev/null 2>&1"
     (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
 
+    # Wildcard candidates go through the SAME per-ref fast-forward gate as
+    # an explicit refspec -- they share the candidate->entry loop, and this
+    # is what pins that they do. The remote's p46-b is moved ahead of the
+    # local one so pushing the pattern is a non-fast-forward for that ref
+    # only.
+    (cd "$HTTP_SERVERROOT/repo.git" && git update-ref refs/heads/p46-b "$P46_A_ADVANCED") > /dev/null 2>&1
+    P46_FF_OUT="$WORKDIR/http_push_p46_ff.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin 'refs/heads/p46-b:refs/heads/p46-b' < /dev/null) > "$P46_FF_OUT" 2>&1
+    check "phase46: a non-fast-forward under a wildcard is refused" test $? = 1
+    check "phase46: and the remote ref is left exactly where it was" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p46-b)\" = '$P46_A_ADVANCED'"
+    (cd "$HTTP_DEST" && "$SG" push origin '+refs/heads/p46-*:refs/heads/p46-*' < /dev/null) > "$P46_FF_OUT" 2>&1
+    check "phase46: a leading '+' on the PATTERN forces it through" test $? = 0
+    check "phase46: and the remote ref moved back to the local commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p46-b)\" = '$P46_HEAD'"
+
     (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
 
     check "phase39: git fsck still passes on the bare repo after refspec pushes" \
