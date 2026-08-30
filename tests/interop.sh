@@ -1688,6 +1688,72 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     check "phase39: the '+'-forced ref now matches the forced commit" \
         sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p39-multi-b)\" = '$P39_MULTI_LOCAL_HEAD'"
 
+    # --- Phase 46: wildcard and push-matching refspecs, the two forms Phase
+    # 39 named and deliberately refused. Every rule below was measured
+    # against real git 2.55.0 with a local bare remote (docs/DESIGN.md Phase
+    # 46 has the tables).
+    (cd "$HTTP_DEST" && "$SG" branch p46-a && "$SG" branch p46-b) > /dev/null 2>&1
+    P46_HEAD=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+    P46_WILD_OUT="$WORKDIR/http_push_p46_wild.txt"
+    (cd "$HTTP_DEST" && "$SG" push origin 'refs/heads/p46-*:refs/heads/p46-*' < /dev/null) > "$P46_WILD_OUT" 2>&1
+    check "phase46: a wildcard push exits 0" test $? = 0
+    check "phase46: it created BOTH matching branches in one push" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p46-a)\" = '$P46_HEAD' && test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p46-b)\" = '$P46_HEAD'"
+    # The source set is LOCAL, not an intersection with the remote -- these
+    # two branches did not exist there before. A prune-style implementation
+    # would have pushed nothing at all.
+    check "phase46: and the pattern did not touch a branch outside it" \
+        sh -c "! (cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/heads/p46) > /dev/null 2>&1"
+    (cd "$HTTP_DEST" && "$SG" push origin 'refs/heads/p46-*:refs/heads/p46-*' < /dev/null) > "$P46_WILD_OUT" 2>&1
+    check "phase46: pushing the same pattern again is a no-op" \
+        grep -q "Everything up-to-date" "$P46_WILD_OUT"
+    # A pattern matching nothing is exit 0, not an error (measured).
+    (cd "$HTTP_DEST" && "$SG" push origin 'refs/heads/p46zzz*:refs/heads/p46zzz*' < /dev/null) > "$P46_WILD_OUT" 2>&1
+    check "phase46: a pattern matching nothing still exits 0" test $? = 0
+    # An annotated tag matched by a pattern reaches the remote as a TAG
+    # object, the same trap an explicit src has (Phase 39 section 1).
+    (cd "$HTTP_DEST" && "$SG" tag -a p46-anntag -m "phase46 annotated") > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" push origin 'refs/tags/p46-*:refs/tags/p46-*' < /dev/null) > /dev/null 2>&1
+    check "phase46: a pattern-matched annotated tag stays a tag object on the remote" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git cat-file -t refs/tags/p46-anntag)\" = tag"
+
+    # A star in the MIDDLE, so the pattern has a non-empty suffix. Without a
+    # fixture like this the suffix half of the match is dead weight: deleting
+    # it left every check above green (measured), because a pattern ending in
+    # '*' has nothing after the star to compare.
+    (cd "$HTTP_DEST" && "$SG" branch p46-mid-tail && "$SG" branch p46-mid-other) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" push origin 'refs/heads/p46-*-tail:refs/heads/p46-*-tail' < /dev/null) > /dev/null 2>&1
+    check "phase46: a star in the middle matches only the refs with that suffix" \
+        sh -c "(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/heads/p46-mid-tail) > /dev/null 2>&1"
+    # The EXACT set, not just "the other name is absent": dropping the
+    # suffix comparison does not resurrect that name, it invents a truncated
+    # one (the capture length is computed from the pattern, so p46-mid-other
+    # would land as p46-mid-oth-tail). Measured -- the absence-only version
+    # of this check stayed green under exactly that mutation.
+    check "phase46: and creates NO other ref under that prefix" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git for-each-ref --format='%(refname)' 'refs/heads/p46-mid*' | tr '\n' ' ')\" = 'refs/heads/p46-mid-tail '"
+    # The captured text is substituted into the dst pattern's own star, which
+    # is what makes the dst a template rather than a fixed prefix.
+    (cd "$HTTP_DEST" && "$SG" push origin 'refs/heads/p46-mid-*:refs/heads/p46mirror-*' < /dev/null) > /dev/null 2>&1
+    check "phase46: the captured text is substituted into the dst pattern" \
+        sh -c "(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/heads/p46mirror-tail) > /dev/null 2>&1 && (cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/heads/p46mirror-other) > /dev/null 2>&1"
+
+    # push-matching ":" -- only branches that ALREADY exist on the remote,
+    # never a creation. p46-local-only is the discriminator: a rule that
+    # pushed "every local branch" would create it.
+    (cd "$HTTP_DEST" && "$SG" branch p46-local-only) > /dev/null 2>&1
+    (cd "$HTTP_DEST" && "$SG" switch p46-a) > /dev/null 2>&1
+    printf 'p46 matching\n' > "$HTTP_DEST/p46m.txt"
+    (cd "$HTTP_DEST" && "$SG" add p46m.txt && "$SG" commit -m "p46 advance a") > /dev/null 2>&1
+    P46_A_ADVANCED=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+    (cd "$HTTP_DEST" && "$SG" push origin ':' < /dev/null) > /dev/null 2>&1
+    check "phase46: a matching push exits 0" test $? = 0
+    check "phase46: it advanced the branch that exists on both ends" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p46-a)\" = '$P46_A_ADVANCED'"
+    check "phase46: and did NOT create the local-only branch" \
+        sh -c "! (cd '$HTTP_SERVERROOT/repo.git' && git rev-parse --verify refs/heads/p46-local-only) > /dev/null 2>&1"
+    (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
+
     (cd "$HTTP_DEST" && "$SG" switch "$HTTP_SRC_BRANCH" < /dev/null) > /dev/null 2>&1
 
     check "phase39: git fsck still passes on the bare repo after refspec pushes" \
@@ -1809,24 +1875,40 @@ check "phase39: sg push with a dst naming a leading-dot component reports invali
 check "phase39: sg's dotfile-dst rejection never attempted a connection either" \
     sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect' '$P39N_SG_DOTFMT_OUT'"
 
-# wildcard refspecs and the bare push-matching ":" are real git features
-# this milestone deliberately does not implement (docs/DESIGN.md Phase 39
-# section 6) -- real git actually tries to connect for both (measured: it
-# fails with a connection error, not a refspec error), so there is no
-# matching divergence pair to pin here, only sg's own named rejection.
+# Phase 46 REVERSAL of Phase 39 section 6: wildcard refspecs and the bare
+# push-matching ":" are implemented now, so neither is rejected before
+# connecting any more -- both reach the network exactly as real git does
+# (measured: git fails with a connection error for both, not a refspec
+# error). These two checks are what makes that reversal visible instead of
+# silent: a regression back to the old named rejection turns them red.
 P39N_SG_WILDCARD_OUT="$WORKDIR/p39n_sg_wildcard_out.txt"
 (cd "$P39N_REPO" && "$SG" push origin 'refs/heads/*:refs/heads/*') > "$P39N_SG_WILDCARD_OUT" 2>&1
-check "phase39: sg push of a wildcard refspec fails" test $? = 1
-check "phase39: sg push of a wildcard refspec reports it as unsupported" \
-    grep -q "wildcard refspec" "$P39N_SG_WILDCARD_OUT"
-check "phase39: sg's wildcard rejection never attempted a connection" \
-    sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect' '$P39N_SG_WILDCARD_OUT'"
+check "phase46: sg push of a wildcard refspec fails only because the URL is dead" test $? = 1
+check "phase46: a wildcard refspec is no longer rejected as unsupported" \
+    sh -c "! grep -q 'wildcard refspec' '$P39N_SG_WILDCARD_OUT'"
+check "phase46: it got as far as attempting the connection" \
+    sh -c "grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect\|failed to connect' '$P39N_SG_WILDCARD_OUT'"
 
 P39N_SG_MATCHING_OUT="$WORKDIR/p39n_sg_matching_out.txt"
 (cd "$P39N_REPO" && "$SG" push origin ":") > "$P39N_SG_MATCHING_OUT" 2>&1
-check "phase39: sg push of a bare ':' (push matching) fails" test $? = 1
-check "phase39: sg push of a bare ':' reports it as unsupported" \
-    grep -q "not supported" "$P39N_SG_MATCHING_OUT"
+check "phase46: sg push of a bare ':' fails only because the URL is dead" test $? = 1
+check "phase46: a bare ':' is no longer rejected as unsupported" \
+    sh -c "! grep -q 'not supported' '$P39N_SG_MATCHING_OUT'"
+
+# What IS still rejected, and still before any connection: a star on only
+# one side, two stars on a side, and a wildcard DELETION. The last one is
+# the one that matters -- approximating it would delete every matching
+# remote ref, so it stays a hard local error (measured: git calls all three
+# `fatal: invalid refspec`).
+for p46bad in 'refs/heads/*:refs/heads/x' 'refs/heads/f*t*:refs/heads/f*t*' ':refs/heads/*'; do
+    P46_BAD_OUT="$WORKDIR/p46_bad_out.txt"
+    (cd "$P39N_REPO" && "$SG" push origin "$p46bad") > "$P46_BAD_OUT" 2>&1
+    check "phase46: '$p46bad' is rejected (exit 1)" test $? = 1
+    check "phase46: '$p46bad' is reported as an invalid refspec" \
+        grep -q "invalid refspec" "$P46_BAD_OUT"
+    check "phase46: '$p46bad' never attempted a connection" \
+        sh -c "! grep -qi 'GET .* failed\|couldn.t resolve\|couldn.t connect\|failed to connect' '$P46_BAD_OUT'"
+done
 
 # src resolution happens before connecting too, and a src matching nothing
 # aborts the WHOLE push -- not one ref pushed, not even a connection

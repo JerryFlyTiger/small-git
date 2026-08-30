@@ -7095,3 +7095,122 @@ The per-label checks exist alongside the sorted byte-for-byte comparison on
 purpose: the cmp alone would say "the block differs" without saying which of
 the three moved.
 
+## Phase 46: the two push refspec forms Phase 39 refused
+
+Phase 39 implemented `[+]<src>[:<dst>]` and named two real git features it
+deliberately would not approximate: **wildcard refspecs** and the bare
+**push-matching `:`**. Both are implemented here. The interesting part is not
+the code -- it is that the two forms need their input from opposite sides of
+the network round trip.
+
+### 1. Wildcards take their source set from the LOCAL repo
+
+Measured against git 2.55.0 with a local bare remote:
+
+| refspec | effect |
+|---|---|
+| `refs/heads/*:refs/heads/*` | pushes every matching LOCAL ref, **creating** ones the remote lacks |
+| `refs/heads/*` (no colon) | mirrors: same as writing the pattern on both sides |
+| `refs/heads/*:refs/remotes/up/*` | the captured text is substituted into the dst's star |
+| `refs/tags/*:refs/tags/*` | an annotated tag arrives as a **tag object**, unpeeled |
+| a pattern matching nothing | exit 0, "Everything up-to-date" |
+| `refs/*:refs/*` | matched `refs/remotes/origin/topic/sub` -- **the star crosses `/`** |
+| `refs/heads/fe*`, `refs/heads/*/sub` | fine -- the star may sit anywhere, not only at a segment boundary |
+| a star on one side only, or two on a side | `fatal: invalid refspec` |
+| `:refs/heads/*` (wildcard deletion) | `fatal: invalid refspec` |
+
+Because the source is local, expansion runs **before** the network round
+trip, which keeps Phase 39's rule that a src resolving to nothing aborts the
+whole batch before anything lands. There is no prune semantics: a pattern
+never deletes a remote ref that no longer exists locally.
+
+Matching is a plain prefix/suffix comparison around the single star, which is
+git's own rule, and the captured middle is substituted into the dst pattern.
+The refs to consider come from `sg_ref_list_under` on the namespace up to the
+last `/` before the star -- or `refs/` when the star comes first, which is
+also why a pattern not rooted at `refs/` simply matches nothing instead of
+erroring (measured: `m*:m*` is "Everything up-to-date").
+
+**One measured difference worth knowing before touching this**: an expanded
+dst is used VERBATIM, with no dwim completion -- the opposite of an explicit
+dst. git sent the uncompleted name to the remote, which refused it as a
+"funny refname"; sg refuses it locally with its own message. Both exit 1.
+Routing wildcard destinations through `complete_dst` instead would have been
+the natural-looking choice and would have quietly turned `refs/heads/*:x*`
+into pushes to `refs/heads/x<name>`.
+
+### 2. Push-matching cannot be expanded until the advertisement arrives
+
+`:` means "every local branch that already exists on the remote", so half its
+input is the remote's advertisement. Measured:
+
+- a local-only branch is **not** created;
+- a tag that moved locally is **not** updated -- matching is branches only;
+- per-ref rules are unchanged: one branch can land while another is rejected
+  as non-fast-forward, exit 1, and `+:` forces;
+- when nothing matches, exit 0 and "Everything up-to-date" (git only errors
+  when the remote has no refs at all, which is a transport-level message).
+
+So the expansion is appended to `candidates` right after
+`sg_transport_ls_refs_push` and before the candidate->entry loop, which
+leaves every rule that loop already implements -- fast-forward checks,
+per-ref rejection, the report, the remote-tracking update -- applying
+unchanged.
+
+### 3. Two things the survey caught that the spec had not
+
+A survey of `cmd_push.c` was run before writing any code, and two of its
+findings changed the design:
+
+- **`push_entry` assumed one refspec produces at most one candidate.** Both
+  new forms are fan-outs. Everything downstream turned out to cope, because
+  Phase 39 had already made the entry loop multi-ref, but the candidate
+  builders had to grow a second shape.
+- **`complete_dst`'s "dst matches more than one" rule would have killed every
+  wildcard.** That rule exists to stop an ambiguous unqualified dst; a
+  wildcard is ambiguous by definition. Expanded dsts bypass completion
+  entirely (see section 1), so the two never meet -- but routing them through
+  it was the obvious implementation and would have rejected every valid
+  wildcard push.
+
+The survey also asserted that wildcard expansion must happen after the
+advertisement. That was wrong, and the measurement in section 1 is why: the
+source set is local, so it can and must happen before.
+
+### 4. A struct with two definitions, and the sanitizer that caught it
+
+`sg_push_refspec` lives in `cmd_push.c` with no public header;
+`tests/test_refspec.c` declares its own copy via `extern`, a convention this
+project uses on purpose and documents in that file: *"The struct definition
+below must stay field-for-field identical to cmd_push.c's."*
+
+Adding `is_wildcard` and `is_matching` broke exactly that. The library's
+`memset(out, 0, sizeof(*out))` then wrote 40 bytes into the test's 32-byte
+stack object. **`make test` did not catch it** -- it reported only the three
+expected assertion failures from the behaviour change. ASan caught it:
+`stack-buffer-overflow ... WRITE of size 40`. This is the case CLAUDE.md
+already describes ("adding a field to a shared struct also counts as touching
+memory management") appearing in the one shape that note does not mention: a
+struct duplicated across translation units on purpose.
+
+### 5. Coverage, including the check that had to be rewritten
+
+Five mutations, each caught by the checks written for it:
+
+| mutation | caught by |
+|---|---|
+| matching drops its "already on the remote" filter | "did NOT create the local-only branch" |
+| the wildcard's suffix comparison removed | "creates NO other ref under that prefix" |
+| the dst substitution drops the capture | four checks, including the substitution one |
+| the matched ref read through `sg_rev_parse_commit` (peeling) | only the annotated-tag check |
+| (Phase 39's own rejection restored) | the phase46 reversal checks |
+
+The second row took two tries. The first fixture used patterns ending in
+`*`, where the suffix is empty and the comparison is dead weight -- the
+mutation stayed green. A star in the MIDDLE makes it live, and even then the
+first check was the wrong discriminator: dropping the suffix comparison does
+not resurrect the excluded name, it invents a TRUNCATED one, because the
+capture length is computed from the pattern. Asserting the exact set of refs
+under the prefix is what finally turns it red. Both dead ends are recorded
+because either one alone reads as "this rule has coverage".
+

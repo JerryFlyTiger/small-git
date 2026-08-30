@@ -1075,6 +1075,39 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   deletion, then stage a deletion of that same path, then pop -- sg rejects
   it while real git does not (the same "ours is HEAD, not the index" rule).
   Details in Phase 21 of `docs/DESIGN.md`.
+- **`sg push` takes wildcard and push-matching refspecs since Phase 46**,
+  the two forms Phase 39 named and deliberately refused. They need their
+  input from OPPOSITE sides of the network round trip, and that is the whole
+  design: a **wildcard's source set is LOCAL** (measured -- a pattern
+  CREATES remote branches that did not exist there, so it is not an
+  intersection with the advertisement and there is no prune semantics), so
+  it expands BEFORE connecting and Phase 39's whole-batch-abort rule still
+  holds; **`:` means "every local branch that already exists on the remote"**,
+  so it can only expand AFTER the advertisement and is appended to
+  `candidates` there, leaving the candidate->entry loop's rules untouched.
+  WARNING: **an expanded wildcard dst is used VERBATIM, with no dwim
+  completion** -- the opposite of an explicit dst. Routing it through
+  `complete_dst` is the natural-looking choice and is wrong twice over: it
+  would turn `refs/heads/*:x*` into pushes to `refs/heads/x<name>` (git sends
+  the uncompleted name and lets the remote refuse it), and
+  `complete_dst`'s "dst matches more than one" rule would reject every valid
+  wildcard, since a wildcard is ambiguous by definition.
+  WARNING: **exactly one `*` per side, on BOTH sides** -- a star on one side
+  only, two on a side, and a wildcard DELETION are each `fatal: invalid
+  refspec` (measured). The deletion case is the one that matters:
+  approximating it would delete every matching remote ref.
+  WARNING: **the star may sit anywhere and it CROSSES `/`** (measured: a
+  pattern rooted at `refs/` matched `refs/remotes/origin/topic/sub`), a
+  no-colon wildcard mirrors itself, and a pattern matching nothing is exit 0,
+  not an error. An annotated tag matched by a pattern reaches the remote
+  unpeeled, the same trap `resolve_refspec_src` documents.
+  WARNING: **`sg_push_refspec` is defined in `cmd_push.c` AND duplicated in
+  `tests/test_refspec.c`** (deliberate convention -- no public header for a
+  test-only export). Adding a field to one and not the other is a
+  stack-buffer-overflow that `make test` does NOT catch, only ASan does
+  (measured in Phase 46: the library's `memset` wrote 40 bytes into the
+  test's 32-byte object while `make test` reported only ordinary assertion
+  failures).
 - **`sg push` gained refspec support (`[+]<src>[:<dst>]`) and
   `--delete <name>...` in Phase 39** (`src/cli/cmd_push.c`, no header
   changes -- see the Phase 39 section of `docs/DESIGN.md` for why). Five

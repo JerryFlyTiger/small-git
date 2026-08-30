@@ -1323,6 +1323,15 @@ there is no
 .RB [ --delete
 .IR name ... ]
 .PP
+A
+.I refspec
+may be
+.RI [ + ] src [: dst ],
+a wildcard pattern such as
+.BR refs/heads/*:refs/heads/* ,
+or the bare push-matching
+.RB [ + ] : .
+.PP
 Pushes to
 .I remote
 (default
@@ -1459,15 +1468,35 @@ invocation from being processed. Deleting a ref does not remove the local
 .B refs/remotes/<remote>/<name>
 tracking ref, if one exists.
 .PP
-A wildcard refspec
-.RI ( "refs/heads/*:refs/heads/*" )
-and the bare push-matching refspec
-.RB ( : )
-are both explicitly rejected, not approximated;
-.B -C
-.RB ( "find-copies-harder" )-style
-near-misses are avoided by naming them outright rather than silently doing
-something else. Exit codes are 0 or 1 only, never a third value: this
+A wildcard refspec (a pattern carrying exactly one
+.B *
+on each side) pushes every LOCAL ref the source pattern matches, creating
+remote refs that do not exist yet; whatever the star stood for is
+substituted into the destination pattern. The star may sit anywhere,
+including mid-segment, and it crosses
+.BR / .
+Written without a colon, a pattern mirrors itself. A pattern matching
+nothing is not an error. An annotated tag matched by a pattern is pushed as
+the tag object, unpeeled, and the expanded destination is used verbatim \(em
+it is
+.I not
+completed against the advertisement the way an explicit
+.I dst
+is. A star on only one side, two stars on a side, and a wildcard deletion
+are each rejected as an invalid refspec, the last because approximating it
+would delete every matching remote ref.
+.PP
+The bare push-matching refspec
+.RB ( :
+or
+.BR +: )
+pushes every local branch that
+.I already exists
+on the remote. It never creates a remote ref and never touches tags; a
+local-only branch is left alone. Per-ref rules are unchanged, so one branch
+can land while another is refused as a non-fast-forward.
+.PP
+Exit codes are 0 or 1 only, never a third value: this
 differs from real git, which exits 128 for a client-side refspec syntax
 error (empty
 .IR dst ,
