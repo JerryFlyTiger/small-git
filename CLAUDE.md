@@ -961,6 +961,13 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   Phase 47. It used to return such a string unchanged, which would print the
   user name out of `git@host:path`. An `@` AFTER the colon is path, not
   userinfo.
+  WARNING: **`make sanitize` does NOT cover the ssh spawn path.** That gate
+  builds the unit tests with ASan and runs those; `src/net/ssh.c`'s fork,
+  poll loop and pipe handling are only reached through `interop.sh`, which
+  runs against the ordinary build. When touching that file, build with
+  `make sanitize` and then drive a clone/push/fetch over the shim by hand --
+  the recipe is in Phase 47 of `docs/DESIGN.md`. Done once for Phase 47
+  itself: clean on clone, push, fetch and the failing-path case.
   Not read: `core.sshCommand`. `GIT_SSH_COMMAND` (word-split, git-compatible)
   then `GIT_SSH` then `ssh`.
 - Remote/user strings must pass through a gate function before becoming a

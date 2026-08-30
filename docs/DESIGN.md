@@ -7394,3 +7394,24 @@ callers rather than to a transport.
 little else, and `GIT_SSH_COMMAND`/`GIT_SSH` cover the same need without
 teaching it a new section.
 
+### 7. The sanitizer does not see this code, and what was done about it
+
+`make sanitize` builds the unit test binaries with ASan and runs those. The
+only ssh code a unit test reaches is URL parsing -- **the fork, the poll loop
+and the pipe handling are exercised only by `interop.sh`, which runs against
+the ordinary build.** So the newest and least precedented code in the project
+is the code its memory gate cannot see.
+
+Rather than leave that implicit, the scenario was driven by hand against an
+ASan build, and the recipe is short enough to repeat:
+
+```
+make clean && make sanitize          # builds build/sg with ASan too
+export GIT_SSH_COMMAND=<shim>        # the same shim tests/interop.sh writes
+sg clone ssh://localhost<bare> c && (cd c && sg push origin master && sg fetch origin)
+sg clone ssh://localhost<nosuch>     # the failing path matters too
+```
+
+Clean on all four for Phase 47. Anyone touching `src/net/ssh.c` should redo
+it; a green `make sanitize` says nothing about that file.
+
