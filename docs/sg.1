@@ -1261,7 +1261,10 @@ while a rebase is in progress.
 .I url
 .RI [ directory ]
 .PP
-Clones a repository served over the git smart HTTP protocol (an
+Clones a repository served over the git smart HTTP protocol or reached over
+SSH (see
+.B TRANSPORTS
+below) (an
 .B http://
 or
 .B https://
@@ -1336,7 +1339,9 @@ Pushes to
 .I remote
 (default
 .BR origin )
-over the git smart HTTP protocol. With no
+over the git smart HTTP protocol or over SSH (see
+.B TRANSPORTS
+below). With no
 .I refspec
 and no
 .BR --tags ,
@@ -2030,6 +2035,58 @@ with no ref name in front of it is rejected \(em in real git this means
 and the two can differ, so
 .B sg
 refuses rather than silently substituting the wrong one.
+.SH TRANSPORTS
+.B sg
+reaches a remote two ways.
+.PP
+An
+.BR http:// / https://
+url uses the git smart HTTP protocol.
+.PP
+An
+.B ssh://[user@]host[:port]/path
+url, or the scp-like shorthand
+.BR [user@]host:path ,
+runs
+.B git\-upload\-pack
+or
+.B git\-receive\-pack
+on the far side through
+.BR ssh .
+The two spellings differ in one place worth knowing: after
+.BR ssh:// ,
+the path keeps its leading slash
+.RB ( ssh://host/srv/x
+asks for
+.IR /srv/x )
+while the shorthand has none to keep
+.RB ( host:srv/x
+asks for
+.IR srv/x );
+and a path beginning
+.B ~
+drops the slash so the far side's shell expands it. The shorthand has no
+port: in
+.BR host:22 ,
+.B 22
+is the path.
+.PP
+The ssh program is taken from
+.B GIT_SSH_COMMAND
+(split on whitespace, as git does), then
+.BR GIT_SSH ,
+then
+.BR ssh .
+.B core.sshCommand
+is not read. Anything ssh prints \(em host key prompts, authentication
+failures \(em reaches the terminal unchanged, because
+.B sg
+has no way to authenticate on its own.
+.PP
+Unlike git,
+.B sg
+opens a separate connection for the ref advertisement and for the transfer
+that follows, rather than holding one open across both.
 .SH FILES
 .TP
 .B .gitignore

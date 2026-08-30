@@ -170,7 +170,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 | `index/` | index v2 binary read/write and ordered entry operations, does not read objects | hash |
 | `util/` | zlib, SHA-1, levenshtein, LCS table, wildmatch, rename similarity | -- |
 | `storage/` | Objects and refs on disk: loose, pack, chunk, refs, reflog, repo, revparse | object, workdir |
-| `net/` | smart-HTTP: libcurl wrapper, pkt-line, transport | -- |
+| `net/` | smart-HTTP + SSH: libcurl wrapper, ssh subprocess, pkt-line, transport | -- |
 | `workdir/` | Working directory: path/file I/O, ignore, status, diff (change list), apply, merge, tree_build | almost everything |
 | `safety/` | snapshot (recoverable backup refs), rebase sequencer state, stash | storage, workdir |
 | `cli/` | 24 `sg_cmd_*` + dispatcher + six diff output formats (`diff_out.c`), the only assembly point | everything |
@@ -930,6 +930,39 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   this** (using `git mktree` to build a tree containing a `..` entry, going
   through `sg diff <rev> <rev>` and `sg stash show` respectively, asserting
   the error message names the path), so **it is now safe to converge them**.
+- **`sg clone`/`fetch`/`push` speak SSH as well as smart HTTP since Phase
+  47** (`src/net/ssh.c`, `include/sg/ssh.h`): `ssh://[user@]host[:port]/path`
+  and the scp-like `[user@]host:path`. **pkt-line framing, want/have
+  negotiation, sideband demux and the push report are transport-independent
+  and reused byte for byte** -- only three things differ, and each is a trap:
+  WARNING: **the `# service=...` packet and the flush after it are
+  smart-HTTP's envelope, not the protocol's.** Over ssh the service IS the
+  remote command, so the advertisement starts at the first ref;
+  `parse_ref_advertisement_for_service` takes `expect_service_line` for
+  exactly this, and requiring it over ssh rejects every valid advertisement
+  as malformed.
+  WARNING: **the two URL forms disagree about the leading slash** (measured
+  with a logging stand-in for ssh): `ssh://host/srv/x` asks for `/srv/x`, the
+  scp-like `host:srv/x` asks for `srv/x`, and `ssh://host/~alice/x` DROPS the
+  slash so the far side's shell expands the home directory. Also **`host:22`
+  is a PATH named 22** -- the scp-like syntax has no port.
+  WARNING: **each `sg_transport_*` call opens its OWN connection** and
+  `sg_ssh_request` therefore reads and discards an advertisement it has
+  already seen. Real git holds one connection across both phases; matching
+  that means threading a connection object through three commands, which is
+  the trade Phase 40's write-up explains. Do not "fix" the discard without
+  changing that shape first.
+  WARNING: **this is the only subprocess in `src/`.** The poll loop
+  (write and read at once), the ignored SIGPIPE, the half-close after the
+  request, the flush that ends an advertisement-only connection, and the
+  `waitpid` on every path each prevent a specific hang or silent kill --
+  see `src/net/ssh.c`'s own comments before simplifying any of them.
+  WARNING: **`sg_url_redact` treats a schemeless string as scp-like** since
+  Phase 47. It used to return such a string unchanged, which would print the
+  user name out of `git@host:path`. An `@` AFTER the colon is path, not
+  userinfo.
+  Not read: `core.sshCommand`. `GIT_SSH_COMMAND` (word-split, git-compatible)
+  then `GIT_SSH` then `ssh`.
 - Remote/user strings must pass through a gate function before becoming a
   file path: `sg_ref_name_is_safe` (`include/sg/transport.h:38`),
   `sg_ref_branch_name_is_safe` (`include/sg/refs.h:13`). **Creating** a new

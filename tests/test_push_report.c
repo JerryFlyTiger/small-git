@@ -245,9 +245,45 @@ static void test_url_redact_no_scheme_unchanged(void)
     const char *url = "not-a-url-at-all";
     char *redacted = sg_url_redact(url);
 
+    /* Still true after Phase 47, but for a narrower reason than the name
+       suggests: a schemeless string is now read as the scp-like ssh
+       shorthand, and this one survives because it has no ':' to split on,
+       not because "no scheme" means "leave it alone". */
     CHECK(redacted != NULL && strcmp(redacted, url) == 0,
-         "a string with no scheme should be returned unchanged, got %s",
+         "a string with no scheme and no colon should be returned unchanged, got %s",
          redacted != NULL ? redacted : "(null)");
+    free(redacted);
+}
+
+/* Phase 47: the scp-like ssh shorthand has no "scheme://", and before ssh
+   existed this function returned such a string untouched -- which would print
+   a user name straight into an error message. */
+static void test_url_redact_scp_like(void)
+{
+    char *redacted = sg_url_redact("git@host.example.com:srv/repo.git");
+
+    CHECK(redacted != NULL && strcmp(redacted, "***@host.example.com:srv/repo.git") == 0,
+         "scp-like userinfo should be redacted, got '%s'", redacted ? redacted : "(null)");
+    free(redacted);
+}
+
+static void test_url_redact_scp_like_without_user(void)
+{
+    char *redacted = sg_url_redact("host.example.com:srv/repo.git");
+
+    CHECK(redacted != NULL && strcmp(redacted, "host.example.com:srv/repo.git") == 0,
+         "a scp-like url with no userinfo is unchanged, got '%s'", redacted ? redacted : "(null)");
+    free(redacted);
+}
+
+/* An '@' AFTER the colon is part of the path, not userinfo -- redacting on
+   the last '@' in the whole string would eat the host name here. */
+static void test_url_redact_at_sign_in_path(void)
+{
+    char *redacted = sg_url_redact("host.example.com:srv/we@ird.git");
+
+    CHECK(redacted != NULL && strcmp(redacted, "host.example.com:srv/we@ird.git") == 0,
+         "an '@' in the path is not userinfo, got '%s'", redacted ? redacted : "(null)");
     free(redacted);
 }
 
@@ -264,6 +300,9 @@ int main(void)
     test_url_redact_username_only();
     test_url_redact_no_credentials_unchanged();
     test_url_redact_no_scheme_unchanged();
+    test_url_redact_scp_like();
+    test_url_redact_scp_like_without_user();
+    test_url_redact_at_sign_in_path();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

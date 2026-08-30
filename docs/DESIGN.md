@@ -7265,3 +7265,132 @@ both sides (`refs/remotes/up/topic/sub -> origin/refs/remotes/up/topic/sub`),
 which is ugly but honest, and this command's report has never been required
 to match git byte for byte.
 
+## Phase 47: the SSH transport
+
+`sg clone`/`fetch`/`push` spoke smart HTTP and nothing else. This adds
+`ssh://[user@]host[:port]/path` and the scp-like `[user@]host:path`.
+
+The surprise is how little of it is protocol. **pkt-line framing, the
+want/have negotiation, sideband demultiplexing and the push report are all
+transport-independent and are reused byte for byte.** Three things are not:
+
+1. **The `# service=...` envelope is smart-HTTP's, not the protocol's.** It
+   exists so a single GET can declare which service it wants. Over ssh the
+   service IS the command run on the far side, so the advertisement starts at
+   the first ref. `parse_ref_advertisement_for_service` grew an
+   `expect_service_line` parameter; requiring it over ssh rejects every valid
+   advertisement as malformed.
+2. **It is one bidirectional stream**, not a request/response pair.
+3. **There is no URL to build**: the path is an argument to the remote
+   command and the host is an argument to `ssh`.
+
+### 1. What git actually runs, measured
+
+`GIT_SSH_COMMAND` was pointed at a script that logs its argv:
+
+| url | argv git runs |
+|---|---|
+| `ssh://host/srv/repo.git` | `ssh -o SendEnv=GIT_PROTOCOL host "git-upload-pack '/srv/repo.git'"` |
+| `ssh://user@host:2222/srv/repo.git` | `ssh -o ... -p 2222 user@host "git-upload-pack '/srv/repo.git'"` |
+| `host:srv/repo.git` | `ssh host "git-upload-pack 'srv/repo.git'"` |
+| `ssh://host/~alice/repo.git` | `ssh host "git-upload-pack '~alice/repo.git'"` |
+| a push | ... `git-receive-pack '<path>'` |
+
+Four things that decide the implementation, none of them guessable:
+
+- **The remote command is ONE argument**, with the path single-quoted,
+  because the far side runs it through a shell.
+- **The two URL forms disagree about the leading slash.** `ssh://` keeps it;
+  the scp-like form has none to keep. And `ssh://host/~alice/...` DROPS it,
+  so the far side's shell expands the home directory -- that row is not a
+  typo.
+- **`host:22` is a PATH named 22.** The scp-like syntax has no port at all.
+- **`GIT_SSH_COMMAND` is word-split**: `"<prog> -vvv"` reaches ssh as two
+  argv entries.
+
+Also measured, and NOT reproduced: git runs `ssh -G` first as a capability
+probe, and passes `-o SendEnv=GIT_PROTOCOL` to hand the far side a protocol
+version. sg speaks protocol v0 only, so it sends neither -- there is nothing
+for the far side to select.
+
+Where the local error lives was measured too, because the tidy-looking answer
+is the wrong one: `ssh://host/` asks for the path `/` and `host:` asks for
+the empty path, both refused by the far side; only `ssh://host`, with no path
+separator at all, fails locally.
+
+### 2. One connection per call, deliberately
+
+Real git holds ONE ssh connection open across the advertisement and the
+negotiation. sg's four `sg_transport_*` entry points are each independently
+callable, which is the shape smart HTTP gave them, and changing that means
+threading a connection object through `clone`/`fetch`/`push`.
+
+So each call opens its own connection, and `sg_ssh_request` **reads and
+discards the advertisement it is sent again** before writing its request.
+The cost is one extra `ssh` spawn per operation. The benefit is that no
+public API changed and the HTTP path is untouched.
+
+### 3. The first subprocess in this codebase
+
+Nothing in `src/` had ever forked or exec'd anything. Each piece of the
+plumbing is there for a specific failure:
+
+- **`poll()` writing and reading at once.** The far side starts answering
+  before it has consumed the whole request, so write-everything-then-read
+  deadlocks as soon as both pipe buffers fill.
+- **`SIGPIPE` ignored around the write.** A far side that dies mid-request
+  makes the write raise it, and the default action kills sg outright with no
+  message -- which reads as a crash rather than as a remote failure.
+- **Half-close after the request.** The far side reads to EOF to know the
+  request is complete; keeping the pipe open hangs both ends.
+- **A flush before closing an advertisement-only connection.** That is a
+  client saying "I want nothing"; without it upload-pack reports a hung-up
+  connection, an error message for a successful operation.
+- **The child's stderr is left alone**, so ssh's own diagnostics (host key
+  prompts, permission denied) reach the user. This transport cannot
+  authenticate on its own and that message is the only useful thing it has.
+- **`waitpid` on every path**, success included, so no zombie is left behind.
+
+A path containing a single quote is refused rather than escaped: it is a
+shape this project has no measured behaviour for, and guessing at quoting for
+a string that reaches a remote shell is a failure direction that does not get
+a second chance.
+
+### 4. A credential leak the new URL form would have opened
+
+`sg_url_redact` returned any string with no `scheme://` unchanged. The
+scp-like form has no scheme and real userinfo, so `git@host:path` would have
+printed the user name straight into an error message. It now redacts up to
+the FIRST colon -- an `@` after the colon is part of the path, not userinfo,
+and redacting on the last `@` in the whole string would have eaten the host
+name. The pre-existing "no scheme is returned unchanged" test still passes,
+but its claim was narrowed: that string survives because it has no colon, not
+because schemeless means untouched.
+
+### 5. Testing needs no server
+
+The HTTP group needs a live CGI server and skips itself when one cannot
+start. The ssh group needs nothing: `ssh` is replaced by a shim that ignores
+its options and the host and runs the remote command locally -- which is what
+git itself does with `GIT_SSH_COMMAND`. So **real git is the oracle over the
+same transport**: both tools clone the same URL through the same shim and the
+two working trees are compared byte for byte.
+
+12 checks, and five mutations each caught by them: never recognising an ssh
+URL, dropping the "I want nothing" flush, keeping the advertisement in the
+response, requiring the service line over ssh, and dropping the `~` rule
+(that last one only the unit test sees, which is why it exists).
+
+### 6. Known, and not fixed here
+
+`sg` warns `ignoring invalid ref name 'HEAD' from remote` on every fetch and
+clone, because the advertisement's first ref is `HEAD` and
+`sg_ref_name_is_safe` requires a `refs/` prefix. **This is pre-existing and
+identical over HTTP** -- measured, not assumed -- so it is not something the
+ssh path introduced, and fixing it is a separate change to that predicate's
+callers rather than to a transport.
+
+`core.sshCommand` is not read: sg's config reader knows about remotes and
+little else, and `GIT_SSH_COMMAND`/`GIT_SSH` cover the same need without
+teaching it a new section.
+
