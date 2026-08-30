@@ -7394,16 +7394,25 @@ callers rather than to a transport.
 little else, and `GIT_SSH_COMMAND`/`GIT_SSH` cover the same need without
 teaching it a new section.
 
-### 7. The sanitizer does not see this code, and what was done about it
+### 7. Which sanitizer sees this code, and which does not
 
-`make sanitize` builds the unit test binaries with ASan and runs those. The
-only ssh code a unit test reaches is URL parsing -- **the fork, the poll loop
-and the pipe handling are exercised only by `interop.sh`, which runs against
-the ordinary build.** So the newest and least precedented code in the project
-is the code its memory gate cannot see.
+A LOCAL `make sanitize` builds the unit test binaries with ASan and runs
+those. The only ssh code a unit test reaches is URL parsing -- the fork, the
+poll loop and the pipe handling live behind `interop.sh`, which locally runs
+against the ordinary build. So on this machine the newest and least
+precedented code in the project is the code its memory gate cannot see.
 
-Rather than leave that implicit, the scenario was driven by hand against an
-ASan build, and the recipe is short enough to repeat:
+**CI is not in that position, and checking rather than assuming is the point
+of this section.** Its ASan job runs `interop.sh` itself under ASan+UBSan
+with `detect_leaks=1` (`.github/workflows/ci.yml`), so the whole ssh group --
+clone, push, fetch, the failing path -- is sanitized and leak-checked there,
+and this phase's own CI run passed with the group in place. The first draft
+of this section said flatly that the sanitizer could not see this code; that
+was true locally and wrong about CI, which is exactly the kind of claim this
+file exists to keep honest.
+
+Locally the scenario was still driven by hand against an ASan build, because
+a green local `make sanitize` proves nothing about that file:
 
 ```
 make clean && make sanitize          # builds build/sg with ASan too
@@ -7413,5 +7422,5 @@ sg clone ssh://localhost<nosuch>     # the failing path matters too
 ```
 
 Clean on all four for Phase 47. Anyone touching `src/net/ssh.c` should redo
-it; a green `make sanitize` says nothing about that file.
+it locally, or push and let CI's ASan job do it properly.
 
