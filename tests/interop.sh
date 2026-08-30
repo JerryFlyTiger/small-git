@@ -5594,6 +5594,112 @@ check "phase44: sg -u alone stays a stat" sh -c "test \"$(p44_kind sg -u)\" = ST
 check "phase44 oracle: git -u -M is a patch" sh -c "test \"$(p44_kind git -u -M)\" = PATCH"
 check "phase44: sg -u -M is a patch" sh -c "test \"$(p44_kind sg -u -M)\" = PATCH"
 
+# --- Phase 47: the SSH transport. No server is needed and none is started:
+# `ssh` is replaced by a shim that ignores its options and the host and runs
+# the remote command locally, which is exactly what git itself does when
+# GIT_SSH_COMMAND points somewhere. That makes these checks unconditional
+# (unlike the smart-HTTP group, which needs a live CGI server) and lets real
+# git act as the oracle over the SAME transport -- both tools are pointed at
+# the same shim.
+P47_SSH="$WORKDIR/p47_ssh.sh"
+cat > "$P47_SSH" <<'P47EOF'
+#!/bin/sh
+# A stand-in for ssh: the remote command is always the LAST argument, and
+# every option and the host itself are ignored.
+for last do :; done
+exec /bin/sh -c "$last"
+P47EOF
+chmod +x "$P47_SSH"
+P47_BARE="$WORKDIR/p47_remote.git"
+rm -rf "$P47_BARE"
+(LC_ALL=C git init -q --bare -b master "$P47_BARE") > /dev/null 2>&1
+P47_SRC="$WORKDIR/p47_src"
+rm -rf "$P47_SRC"
+"$SG" init "$P47_SRC" > /dev/null 2>&1
+printf 'ssh transport\nsecond line\n' > "$P47_SRC/f.txt"
+(cd "$P47_SRC" && "$SG" add f.txt && "$SG" commit -m "p47 base") > /dev/null 2>&1
+P47_HEAD=$(cd "$P47_SRC" && git rev-parse HEAD)
+printf '[remote "origin"]\n\turl = ssh://localhost%s\n' "$P47_BARE" >> "$P47_SRC/.git/config"
+
+# push over ssh:// -- the write half, and the first thing that proves the
+# advertisement was read from a stream rather than a smart-HTTP envelope.
+P47_PUSH_OUT="$WORKDIR/p47_push.txt"
+(cd "$P47_SRC" && GIT_SSH_COMMAND="$P47_SSH" "$SG" push origin master < /dev/null) > "$P47_PUSH_OUT" 2>&1
+check "phase47: sg push over ssh:// exits 0" test $? = 0
+check "phase47: and the bare repo gained the pushed commit" \
+    sh -c "test \"\$(cd '$P47_BARE' && git rev-parse refs/heads/master)\" = '$P47_HEAD'"
+
+# clone over ssh://, and real git cloning the SAME url through the SAME shim
+# as the oracle: if sg's stream handling were subtly wrong the two working
+# trees would differ.
+P47_SGCLONE="$WORKDIR/p47_clone_sg"
+P47_GITCLONE="$WORKDIR/p47_clone_git"
+rm -rf "$P47_SGCLONE" "$P47_GITCLONE"
+(cd "$WORKDIR" && GIT_SSH_COMMAND="$P47_SSH" "$SG" clone "ssh://localhost$P47_BARE" p47_clone_sg < /dev/null) > /dev/null 2>&1
+check "phase47: sg clone over ssh:// exits 0" test $? = 0
+(cd "$WORKDIR" && GIT_SSH_COMMAND="$P47_SSH" LC_ALL=C git clone -q "ssh://localhost$P47_BARE" p47_clone_git) > /dev/null 2>&1
+check "phase47 oracle: real git clones the same url through the same shim" test $? = 0
+check "phase47: sg's clone is at the same commit as git's" \
+    sh -c "test \"\$(cd '$P47_SGCLONE' && git rev-parse HEAD)\" = \"\$(cd '$P47_GITCLONE' && git rev-parse HEAD)\""
+check "phase47: and the working tree matches byte-for-byte" \
+    cmp -s "$P47_SGCLONE/f.txt" "$P47_GITCLONE/f.txt"
+
+# fetch over ssh, after the remote moves on
+printf 'third line\n' >> "$P47_SRC/f.txt"
+(cd "$P47_SRC" && "$SG" add f.txt && "$SG" commit -m "p47 second") > /dev/null 2>&1
+P47_HEAD2=$(cd "$P47_SRC" && git rev-parse HEAD)
+(cd "$P47_SRC" && GIT_SSH_COMMAND="$P47_SSH" "$SG" push origin master < /dev/null) > /dev/null 2>&1
+(cd "$P47_SGCLONE" && GIT_SSH_COMMAND="$P47_SSH" "$SG" fetch origin < /dev/null) > /dev/null 2>&1
+check "phase47: sg fetch over ssh exits 0" test $? = 0
+check "phase47: and the remote-tracking ref advanced" \
+    sh -c "test \"\$(cd '$P47_SGCLONE' && git rev-parse refs/remotes/origin/master)\" = '$P47_HEAD2'"
+
+# the scp-like shorthand reaches the same repository
+P47_SCPCLONE="$WORKDIR/p47_clone_scp"
+rm -rf "$P47_SCPCLONE"
+(cd "$WORKDIR" && GIT_SSH_COMMAND="$P47_SSH" "$SG" clone "localhost:$P47_BARE" p47_clone_scp < /dev/null) > /dev/null 2>&1
+check "phase47: sg clone over the scp-like shorthand exits 0" test $? = 0
+check "phase47: and lands on the same commit" \
+    sh -c "test \"\$(cd '$P47_SCPCLONE' && git rev-parse HEAD)\" = '$P47_HEAD2'"
+
+# The scp-like shorthand with NO explicit destination directory, and a
+# single-segment remote path -- the shape with no slash anywhere after the
+# host. Before Phase 47's review round the directory-name guesser scanned
+# back to the last '/', ran off the front of the string, and created a
+# directory literally named "localhost:p47_remote". Measured: git clones the
+# same url into "p47_remote".
+P47_DERIVE="$WORKDIR/p47_derive"
+rm -rf "$P47_DERIVE"
+mkdir -p "$P47_DERIVE"
+cp -R "$P47_BARE" "$P47_DERIVE/p47_remote.git"
+(cd "$P47_DERIVE" && GIT_SSH_COMMAND="$P47_SSH" "$SG" clone "localhost:p47_remote.git" < /dev/null) > /dev/null 2>&1
+check "phase47: a bare scp-like url with no destination clones into the repo's own name" \
+    sh -c "test -d '$P47_DERIVE/p47_remote/.git'"
+check "phase47: and NOT into a directory named after the host" \
+    sh -c "! ls -d '$P47_DERIVE'/*:* > /dev/null 2>&1"
+
+# The seam between this phase and the last one: Phase 46's refspec forms over
+# Phase 47's transport. Each was tested against its own remote and neither
+# run would have noticed the other breaking -- which is exactly where a
+# split-in-two milestone hides its gaps.
+(cd "$P47_SRC" && "$SG" branch p47w1 && "$SG" branch p47w2) > /dev/null 2>&1
+(cd "$P47_SRC" && GIT_SSH_COMMAND="$P47_SSH" "$SG" push origin 'refs/heads/p47w*:refs/heads/p47w*' < /dev/null) > /dev/null 2>&1
+check "phase47: a wildcard refspec pushes over ssh" test $? = 0
+check "phase47: and both matching branches reached the remote" \
+    sh -c "(cd '$P47_BARE' && git rev-parse --verify refs/heads/p47w1 && git rev-parse --verify refs/heads/p47w2) > /dev/null 2>&1"
+(cd "$P47_SRC" && GIT_SSH_COMMAND="$P47_SSH" "$SG" push origin --delete p47w2 < /dev/null) > /dev/null 2>&1
+check "phase47: --delete works over ssh too" \
+    sh -c "! (cd '$P47_BARE' && git rev-parse --verify refs/heads/p47w2) > /dev/null 2>&1"
+
+# a path that does not exist on the far side must fail, not report success
+P47_BADOUT="$WORKDIR/p47_bad.txt"
+(cd "$WORKDIR" && GIT_SSH_COMMAND="$P47_SSH" "$SG" clone "ssh://localhost$WORKDIR/p47_nosuch.git" p47_bad < /dev/null) > "$P47_BADOUT" 2>&1
+check "phase47: a nonexistent remote path fails (exit 1), not a silent empty clone" test $? = 1
+# An HTTP url must NOT be treated as ssh: it has a colon too, and the whole
+# scp-like rule turns on excluding "://" first.
+check "phase47: an http url is still handled by the HTTP transport, not ssh" \
+    sh -c "(cd '$WORKDIR' && '$SG' clone 'http://127.0.0.1:1/nope.git' p47_http_probe < /dev/null) 2>&1 | grep -qi 'connect\|GET .* failed'"
+
 # --- Phase 43: `sg merge` accepts any revision, not just a bare branch name.
 # Before this it called sg_ref_branch_exists directly, so a tag, a
 # refs/heads/... path and a `~N` suffix were all rejected with "invalid

@@ -65,8 +65,44 @@ char *sg_url_redact(const char *url)
     size_t suffix_len;
     char *out;
 
-    if (scheme_end == NULL)
-        return strdup(url);
+    if (scheme_end == NULL) {
+        /* No scheme: the scp-like ssh shorthand "[user@]host:path" (Phase
+           47), which has real userinfo and reaches the same error messages
+           as any other remote. Returning it unchanged -- what this function
+           did before ssh existed -- would print a user name that the URL
+           form was the only reason to have. The authority here ends at the
+           FIRST ':', because everything after it is the path. */
+        const char *scp_colon = strchr(url, ':');
+        const char *scp_at = NULL;
+        const char *q;
+
+        if (scp_colon == NULL)
+            return strdup(url);
+        /* Same rule the ssh transport routes on: a colon AFTER a slash makes
+           this a local path that merely contains a colon, not host:path.
+           Without this a relative path like "a/b@c:d" would be rewritten to
+           "***@c:d" -- corrupting a string that was never a URL, and
+           contradicting this function's own promise to leave input with no
+           userinfo alone. */
+        if (memchr(url, '/', (size_t)(scp_colon - url)) != NULL)
+            return strdup(url);
+        for (q = url; q < scp_colon; q++) {
+            if (*q == '@')
+                scp_at = q;
+        }
+        if (scp_at == NULL)
+            return strdup(url);
+        {
+            size_t tail = strlen(scp_at);
+            char *scp_out = malloc(3 + tail + 1);
+
+            if (scp_out == NULL)
+                return NULL;
+            memcpy(scp_out, "***", 3);
+            memcpy(scp_out + 3, scp_at, tail + 1);
+            return scp_out;
+        }
+    }
     authority_start = scheme_end + 3;
     authority_end = authority_start;
     while (*authority_end != '\0' && *authority_end != '/')

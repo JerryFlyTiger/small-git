@@ -3,6 +3,7 @@
 
 #include "sg/http.h"
 #include "sg/pktline.h"
+#include "sg/ssh.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
@@ -142,8 +143,15 @@ static char *find_head_symref(const char *capabilities)
    name). Not part of the public sg/transport.h surface (same convention as
    src/storage/pack.c's non-static varint helpers), declared via extern in
    tests/test_refadv.c. */
+/* expect_service_line is smart-HTTP's envelope, not the protocol's: a
+   "# service=<name>" packet followed by a flush, which exists so one GET can
+   declare which service it wants. Over ssh the service IS the command run on
+   the far side, so the advertisement starts at the first ref and this pair
+   must be skipped -- requiring it there would reject every valid ssh
+   advertisement as malformed. */
 static int parse_ref_advertisement_for_service(const unsigned char *data, size_t len,
-                                               const char *service_prefix, sg_ref_adv *adv_out)
+                                               const char *service_prefix, int expect_service_line,
+                                               sg_ref_adv *adv_out)
 {
     size_t pos = 0;
     sg_pkt_type type;
@@ -156,19 +164,21 @@ static int parse_ref_advertisement_for_service(const unsigned char *data, size_t
 
     memset(adv_out, 0, sizeof(*adv_out));
 
-    if (sg_pkt_read(data, len, &pos, &type, &payload, &payload_len) != 0 || type != SG_PKT_DATA)
-        goto malformed;
-    {
-        size_t plen = payload_len;
+    if (expect_service_line) {
+        if (sg_pkt_read(data, len, &pos, &type, &payload, &payload_len) != 0 || type != SG_PKT_DATA)
+            goto malformed;
+        {
+            size_t plen = payload_len;
 
-        if (plen > 0 && payload[plen - 1] == '\n')
-            plen--;
-        if (plen != strlen(service_prefix) || memcmp(payload, service_prefix, plen) != 0)
+            if (plen > 0 && payload[plen - 1] == '\n')
+                plen--;
+            if (plen != strlen(service_prefix) || memcmp(payload, service_prefix, plen) != 0)
+                goto malformed;
+        }
+
+        if (sg_pkt_read(data, len, &pos, &type, &payload, &payload_len) != 0 || type != SG_PKT_FLUSH)
             goto malformed;
     }
-
-    if (sg_pkt_read(data, len, &pos, &type, &payload, &payload_len) != 0 || type != SG_PKT_FLUSH)
-        goto malformed;
 
     for (;;) {
         unsigned char id[SG_SHA1_RAW_LEN];
@@ -257,14 +267,14 @@ fail:
    exercise the parser directly via extern, without a network round trip. */
 int sg_parse_ref_advertisement(const unsigned char *data, size_t len, sg_ref_adv *adv_out)
 {
-    return parse_ref_advertisement_for_service(data, len, "# service=git-upload-pack", adv_out);
+    return parse_ref_advertisement_for_service(data, len, "# service=git-upload-pack", 1, adv_out);
 }
 
 /* Same as sg_parse_ref_advertisement, for the receive-pack advertisement --
    exposed the same way for tests/test_refadv.c. */
 int sg_parse_ref_advertisement_push(const unsigned char *data, size_t len, sg_ref_adv *adv_out)
 {
-    return parse_ref_advertisement_for_service(data, len, "# service=git-receive-pack", adv_out);
+    return parse_ref_advertisement_for_service(data, len, "# service=git-receive-pack", 1, adv_out);
 }
 
 int sg_transport_ls_refs(const char *base_url, sg_ref_adv *adv_out)
@@ -272,6 +282,14 @@ int sg_transport_ls_refs(const char *base_url, sg_ref_adv *adv_out)
     char url[SG_PATH_MAX];
     sg_buf resp;
     int rc;
+
+    if (sg_ssh_is_ssh_url(base_url)) {
+        if (sg_ssh_advertise(base_url, "git-upload-pack", &resp) != 0)
+            return -1;
+        rc = parse_ref_advertisement_for_service(resp.data, resp.len, NULL, 0, adv_out);
+        sg_buf_free(&resp);
+        return rc;
+    }
 
     snprintf(url, sizeof(url), "%s/info/refs?service=git-upload-pack", base_url);
 
@@ -288,6 +306,14 @@ int sg_transport_ls_refs_push(const char *base_url, sg_ref_adv *adv_out)
     char url[SG_PATH_MAX];
     sg_buf resp;
     int rc;
+
+    if (sg_ssh_is_ssh_url(base_url)) {
+        if (sg_ssh_advertise(base_url, "git-receive-pack", &resp) != 0)
+            return -1;
+        rc = parse_ref_advertisement_for_service(resp.data, resp.len, NULL, 0, adv_out);
+        sg_buf_free(&resp);
+        return rc;
+    }
 
     snprintf(url, sizeof(url), "%s/info/refs?service=git-receive-pack", base_url);
 
@@ -443,14 +469,19 @@ int sg_transport_fetch_pack(const char *base_url,
     if (sg_pkt_append_str(&body, &body_len, &body_cap, "done\n") != 0)
         goto done;
 
-    snprintf(url, sizeof(url), "%s/git-upload-pack", base_url);
-
     memset(&resp, 0, sizeof(resp));
     memset(&pack_buf, 0, sizeof(pack_buf));
 
-    if (sg_http_post(url, "application/x-git-upload-pack-request",
-                     "application/x-git-upload-pack-result", body, body_len, &resp) != 0)
-        goto done;
+    /* Identical request bytes either way -- only the plumbing differs. */
+    if (sg_ssh_is_ssh_url(base_url)) {
+        if (sg_ssh_request(base_url, "git-upload-pack", body, body_len, &resp) != 0)
+            goto done;
+    } else {
+        snprintf(url, sizeof(url), "%s/git-upload-pack", base_url);
+        if (sg_http_post(url, "application/x-git-upload-pack-request",
+                         "application/x-git-upload-pack-result", body, body_len, &resp) != 0)
+            goto done;
+    }
 
     rc = sg_demux_sideband_response(resp.data, resp.len, &pack_buf);
     sg_buf_free(&resp);
@@ -718,12 +749,16 @@ int sg_transport_push(const char *base_url, const sg_push_ref_update *updates, s
     if (raw_append(&body, &body_len, &body_cap, pack_data, pack_len) != 0)
         goto done;
 
-    snprintf(url, sizeof(url), "%s/git-receive-pack", base_url);
-
     memset(&resp, 0, sizeof(resp));
-    if (sg_http_post(url, "application/x-git-receive-pack-request",
-                     "application/x-git-receive-pack-result", body, body_len, &resp) != 0)
-        goto done;
+    if (sg_ssh_is_ssh_url(base_url)) {
+        if (sg_ssh_request(base_url, "git-receive-pack", body, body_len, &resp) != 0)
+            goto done;
+    } else {
+        snprintf(url, sizeof(url), "%s/git-receive-pack", base_url);
+        if (sg_http_post(url, "application/x-git-receive-pack-request",
+                         "application/x-git-receive-pack-result", body, body_len, &resp) != 0)
+            goto done;
+    }
 
     if (use_side_band_64k) {
         sg_buf band1;

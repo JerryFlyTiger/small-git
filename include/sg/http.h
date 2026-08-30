@@ -34,8 +34,11 @@ int sg_http_post(const char *url, const char *content_type, const char *accept_h
 
 /* Returns a malloc'd copy of url with any "user:pass@" (or "user@") userinfo
    in its authority component replaced by "***@", so it's safe to print.
-   Returns a plain copy, unchanged, for a URL with no such userinfo, or one
-   with no recognizable "scheme://" prefix. Caller frees. Every place that
+   Returns a plain copy, unchanged, for a URL with no such userinfo. A URL
+   with no "scheme://" is treated as the scp-like ssh shorthand
+   "[user@]host:path" and gets the same treatment up to its first ':'
+   (Phase 47) -- before ssh existed this function returned such a string
+   untouched, which would now print a user name. Caller frees. Every place that
    prints a URL (this file's own error messages included) must go through
    this first -- leaking credentials into stdout/stderr/logs is a real
    security issue, not just cosmetic. */
