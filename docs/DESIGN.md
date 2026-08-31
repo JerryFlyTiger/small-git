@@ -7911,6 +7911,33 @@ and so does base 644 / ours 644 / theirs 755. Taking ours' mode passes the
 first fixture and fails the second, so the unit test runs the pair -- a
 single-direction fixture would have called the wrong rule green.
 
+**And the conflict body's two sides were swapped whenever THEIRS did the
+renaming.** `emit_standalone_landing` swapped the marker LABELS by `is_ours`
+but fed `merge_blob_content`'s ours/theirs slots unconditionally from
+`side_e`/`other_e`, where `side_e` is the *renaming* side. The merge still
+conflicted on the same lines and every index stage was still filled
+correctly, so nothing but the marker body showed it: what the user sees above
+`=======`, next to their own branch name, was the other branch's edit --
+and hand-resolving a conflict is exactly how that gets committed the wrong
+way round. The same shape was in `compute_kept_landing` on the collision
+path, so both were fixed and the helper now takes `is_ours` explicitly.
+
+This one is worth more than its diff, because of WHY it survived: **every
+fixture in the phase had OURS doing the renaming** -- the unit tests, interop's
+`oneside_rev` (which does rename on theirs' side, but with no edit, so the
+inner merge is always clean and no markers are ever printed), and the
+fuzzer's `rename_edit` shape (which hardcodes the direction). Three
+independent layers, one shared blind spot, and it is the same failure mode
+`fixture-generators-create-shared-blind-spots` records: a generator that can
+only build one shape leaves every test that uses it blind in the same
+dimension. All three layers now carry the mirrored direction -- a
+`rename_edit_rev` fuzzer shape, an interop `revconflict` fixture whose check
+compares the marker body after normalizing only the ours label, and a unit
+test asserting each side's text follows its OWN label rather than merely
+being present somewhere in the file. Measured on the pre-fix build, the new
+fuzzer shape mismatches 8 of its 14 rounds while all seven other shapes stay
+at 0.
+
 ### 5. What the fuzzer measured
 
 `tests/fuzz_merge_rename.py` exists because `tests/fuzz_merge.py` is

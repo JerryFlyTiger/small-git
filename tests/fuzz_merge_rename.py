@@ -76,6 +76,13 @@ that are independently, lightly mutated on each side, or left alone, purely
 for variety and never load-bearing for the comparison):
 
   rename_edit             -- ours renames+edits, theirs edits in place;
+  rename_edit_rev         -- the MIRROR: theirs renames+edits, ours edits in
+                             place. Its own shape because every layer of this
+                             phase's testing (this fuzzer, interop, and the
+                             unit tests) originally had OURS doing the
+                             renaming, so the one input that can expose an
+                             ours/theirs mix-up in the conflict-marker body
+                             never occurred anywhere;
                               the rename's edit intensity is drawn from a
                               spread of fractions straddling the ~50%
                               similarity line git's own rename detector
@@ -158,6 +165,7 @@ MARKER_OURS_RE = re.compile(r"^(<{7,8} )([^:\n]+)((?::[^\n]*)?)$", re.M)
 
 SHAPES = [
     "rename_edit",
+    "rename_edit_rev",
     "edit_only",
     "delete",
     "rename_add_collision",
@@ -274,6 +282,16 @@ def gen_round_files(rng):
         ours_overlay[src] = None
         ours_overlay[dst] = edit_lines(rng, base, rng.choice(FRACS), "ours")
         theirs_overlay[src] = edit_lines(rng, base, rng.choice(FRACS), "thrs")
+
+    elif shape == "rename_edit_rev":
+        # Mirror of rename_edit. Kept as a separate shape rather than a coin
+        # flip inside it so the per-shape mismatch table names the direction.
+        src, dst = make_path(rng, "target.txt"), make_path(rng, "renamed.txt")
+        base = gen_lines(rng, "base")
+        base_files[src] = base
+        theirs_overlay[src] = None
+        theirs_overlay[dst] = edit_lines(rng, base, rng.choice(FRACS), "thrs")
+        ours_overlay[src] = edit_lines(rng, base, rng.choice(FRACS), "ours")
 
     elif shape == "edit_only":
         src = make_path(rng, "target.txt")

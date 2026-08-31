@@ -844,6 +844,56 @@ static void test_rename_rename_1to2_conflict_stage_blob_exists(void)
     free(git_dir);
 }
 
+
+/* Regression, second cold read. THEIRS renames and edits, ours edits the
+   same region in place -- the mirror of test_rename_conflict_other_side_edits
+   above, and the direction every layer of this phase's testing was blind to
+   (this file's other cases, interop's oneside_rev shape, and the fuzzer's
+   rename_edit shape all had OURS doing the renaming).
+
+   The bug it pins: emit_standalone_landing swapped the marker LABELS by
+   is_ours but fed merge_blob_content's ours/theirs slots unconditionally
+   from side_e/other_e, where side_e is the RENAMING side. The merge still
+   conflicted at the same lines and every index stage was still filled
+   correctly, so only the marker BODY showed it: ours' branch name sat above
+   theirs' text. Verified against real git, whose output for this fixture is
+   identical apart from the ours label sg deliberately writes as the branch
+   name (divergence #5). */
+static void test_theirs_side_rename_conflict_sides_not_swapped(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char base_tree[SG_SHA1_RAW_LEN], ours_tree[SG_SHA1_RAW_LEN], theirs_tree[SG_SHA1_RAW_LEN];
+    tree_spec base_specs[] = {{"p.txt", "l1\nl2\nBASE3\nl4\nl5\n"}};
+    tree_spec ours_specs[] = {{"p.txt", "l1\nl2\nOURS3\nl4\nl5\n"}};
+    tree_spec theirs_specs[] = {{"dst.txt", "l1\nl2\nTHEIRS3\nl4\nl5\n"}};
+    sg_merge_result result;
+    const sg_merge_result_entry *e;
+
+    build_tree(git_dir, base_specs, 1, base_tree);
+    build_tree(git_dir, ours_specs, 1, ours_tree);
+    build_tree(git_dir, theirs_specs, 1, theirs_tree);
+
+    CHECK(sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, "ours", "theirs",
+                        SG_SIMILARITY_DEFAULT, &result) == 0,
+         "sg_merge_trees failed");
+    e = find_entry(&result, "dst.txt");
+    CHECK(e != NULL, "expected a conflict entry at dst.txt");
+    if (e != NULL) {
+        CHECK(e->conflict, "expected a conflict");
+        /* The whole point: not just "both texts are somewhere in the file",
+           which a swap also satisfies -- each side's text must follow its
+           OWN label. */
+        CHECK(contains(e->conflict_content, e->conflict_content_len,
+                      "<<<<<<< ours:p.txt\nOURS3\n"),
+             "ours' label must be followed by OURS' text, not theirs'");
+        CHECK(contains(e->conflict_content, e->conflict_content_len,
+                      "=======\nTHEIRS3\n>>>>>>> theirs:dst.txt\n"),
+             "theirs' text must sit between the separator and theirs' label");
+    }
+    sg_merge_result_free(&result);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_rename_clean_other_side_edits();
@@ -857,6 +907,7 @@ int main(void)
     test_rename_add_collision();
     test_rename_rename_2to1();
     test_theirs_side_rename_lands_and_removes_source();
+    test_theirs_side_rename_conflict_sides_not_swapped();
     test_rename_rename_1to2_conflict_stage_blob_exists();
     test_rename_score_zero_is_unaffected();
 

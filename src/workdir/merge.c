@@ -1332,17 +1332,25 @@ static contribution *contribution_find_or_add(contribution_list *cl, const char 
    tolerates that same shape from every other conflict-turned-clean path).
    Returns 0 on success (*out_mode/out_sha1 filled, *out_conflict tells
    whether the object holds marker text), -1 on error. */
+/* is_ours says which side the LANDING belongs to; ours_label/theirs_label
+   are already in ours/theirs order. Both are needed because the operands
+   must be swapped in step with the labels -- see the long comment at
+   emit_standalone_landing's merge_blob_content call for what taking
+   "side" as "ours" unconditionally does to the marker body. */
 static int compute_kept_landing(const char *git_dir, const sg_flat_entry *base_e,
                                 unsigned int side_mode, const unsigned char *side_sha1,
-                                const sg_flat_entry *other_e, const char *side_label,
-                                const char *other_label, int marker_size, int *out_conflict,
+                                const sg_flat_entry *other_e, int is_ours, const char *ours_label,
+                                const char *theirs_label, int marker_size, int *out_conflict,
                                 unsigned int *out_mode, unsigned char out_sha1[SG_SHA1_RAW_LEN])
 {
     unsigned char *conflict_content = NULL;
     size_t conflict_content_len = 0;
     int conflict = 0;
-    int rc = merge_blob_content(git_dir, base_e->path, 1, base_e->mode, base_e->sha1, side_mode,
-                                side_sha1, other_e->mode, other_e->sha1, side_label, other_label,
+    int rc = merge_blob_content(git_dir, base_e->path, 1, base_e->mode, base_e->sha1,
+                                is_ours ? side_mode : other_e->mode,
+                                is_ours ? side_sha1 : other_e->sha1,
+                                is_ours ? other_e->mode : side_mode,
+                                is_ours ? other_e->sha1 : side_sha1, ours_label, theirs_label,
                                 marker_size, &conflict, out_mode, out_sha1, &conflict_content,
                                 &conflict_content_len);
 
@@ -1429,8 +1437,22 @@ static int emit_standalone_landing(const char *git_dir, const sg_flat_list *base
             free(entry.path);
             return -1;
         }
-        rc = merge_blob_content(git_dir, dst, 1, base_e->mode, base_e->sha1, side_e->mode,
-                                side_e->sha1, other_e->mode, other_e->sha1,
+        /* The OPERANDS have to be swapped by is_ours exactly like the
+           labels below them, not left as side/other. `side_e` is the
+           RENAMING side, which is theirs when is_ours == 0 -- feeding it to
+           merge_blob_content's ours slot while the ours LABEL correctly
+           names ours puts each side's text under the other's marker. The
+           merge stays a merge (three-way is near-symmetric, so the same
+           lines conflict either way) and every stage is filled correctly by
+           the code below, so nothing but the marker body shows it: what the
+           user sees above `=======`, next to their own branch name, is the
+           other branch's edit. Whoever resolves that by hand keeps the
+           wrong half. */
+        rc = merge_blob_content(git_dir, dst, 1, base_e->mode, base_e->sha1,
+                                is_ours ? side_e->mode : other_e->mode,
+                                is_ours ? side_e->sha1 : other_e->sha1,
+                                is_ours ? other_e->mode : side_e->mode,
+                                is_ours ? other_e->sha1 : side_e->sha1,
                                 is_ours ? own_label : other_label_c,
                                 is_ours ? other_label_c : own_label, 7, &conflict, &mode, sha1,
                                 &conflict_content, &conflict_content_len);
@@ -1530,7 +1552,7 @@ static int resolve_landing_for_collision(const char *git_dir, const sg_flat_list
             free(other_label_c);
             return -1;
         }
-        rc = compute_kept_landing(git_dir, base_e, side_e->mode, side_e->sha1, other_e,
+        rc = compute_kept_landing(git_dir, base_e, side_e->mode, side_e->sha1, other_e, is_ours,
                                   is_ours ? own_label : other_label_c,
                                   is_ours ? other_label_c : own_label, 8, &conflict, out_mode,
                                   out_sha1);

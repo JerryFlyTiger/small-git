@@ -572,6 +572,22 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   makes it answer "ours already has this here" for a path ours does not have
   at all -- and the renamed-to file is never created, while the merge
   commit's tree stays correct. Only a working-tree assertion can see this.
+  WARNING: **the merge OPERANDS must be swapped by `is_ours` in step with the
+  marker labels.** In `emit_standalone_landing` and `compute_kept_landing`,
+  `side_e` is the RENAMING side -- which is THEIRS when `is_ours == 0`. Feeding
+  it to `merge_blob_content`'s ours slot while the ours label correctly names
+  ours puts each side's text under the other's marker. The merge still
+  conflicts on the same lines and every index stage is still correct, so only
+  the marker BODY shows it, and whoever resolves by hand keeps the wrong half.
+  WARNING: **fixtures for this default to OURS doing the renaming, in every
+  layer.** That is how the swap above survived a full green board plus a cold
+  read: the unit tests, interop's `oneside_rev` (theirs renames, but with no
+  edit, so the inner merge is clean and no markers are printed) and the
+  fuzzer's `rename_edit` shape were all one-directional. The mirrored
+  direction now exists in all three (`rename_edit_rev`, interop's
+  `revconflict`, and a unit test asserting each side's text follows its OWN
+  label -- not merely that both texts appear somewhere). Any new rename
+  fixture needs the same question asked of it.
   WARNING: **a consumed rename source that the other side still has needs its
   own `deleted` entry** (`emit_consumed_source_deletion`), or the old file is
   left behind as an untracked leftover. This is a separate half from the

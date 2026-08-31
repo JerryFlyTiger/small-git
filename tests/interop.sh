@@ -5687,6 +5687,13 @@ p49_build() {
               mv a.txt c.txt &&
               printf 'l1\nl2\nl3\nTHEIRS4\nl5\nl6\nl7\nl8\n' > c.txt &&
               p49do add c.txt a.txt && p49do commit theirs ;;
+          revconflict)
+              printf 'l1\nl2\nl3\nOURS4\nl5\nl6\nl7\nl8\n' > a.txt &&
+              p49do add a.txt && p49do commit ours &&
+              p49do switch topic &&
+              mv a.txt b.txt &&
+              printf 'l1\nl2\nl3\nTHEIRS4\nl5\nl6\nl7\nl8\n' > b.txt &&
+              p49do add b.txt a.txt && p49do commit theirs ;;
           renadd)
               mv a.txt b.txt && p49do add b.txt a.txt && p49do commit ours &&
               p49do switch topic &&
@@ -5706,7 +5713,7 @@ p49_snapshot() {
     ( cd "$1" && find . -type f -not -path './.git/*' | sed 's|^\./||' | sort ) > "$2.files"
 }
 
-for p49shape in oneside oneside_rev rendel ren1to2 renadd; do
+for p49shape in oneside oneside_rev rendel ren1to2 renadd revconflict; do
     P49SG="$WORKDIR/p49_${p49shape}_sg"
     P49GIT="$WORKDIR/p49_${p49shape}_git"
     p49_build sg "$P49SG" "$p49shape"
@@ -5741,6 +5748,19 @@ for p49shape in oneside oneside_rev rendel; do
     check "phase49: $p49shape -- b.txt's bytes match real git's" \
         cmp -s "$WORKDIR/p49_${p49shape}_sg/b.txt" "$WORKDIR/p49_${p49shape}_git/b.txt"
 done
+
+# WHICH side's text sits under WHICH marker label is a dimension none of the
+# comparisons above can see: a swap leaves the stage layout, the file set and
+# even the set of conflicting lines identical. It cost a second cold read to
+# find, because every fixture in this phase -- here, in the unit tests, and in
+# the fuzzer -- originally had OURS doing the renaming, and the swap only
+# shows when THEIRS renames. Only sg's ours label is normalized (it writes the
+# branch name where git writes HEAD, deliberate divergence #5); the `:path`
+# suffix and the marker width are left alone, since those are under test too.
+sed 's/^<<<<<<< master:/<<<<<<< HEAD:/' "$WORKDIR/p49_revconflict_sg/b.txt" \
+    > "$WORKDIR/p49_revconflict_sg_norm.txt" 2>/dev/null
+check "phase49: revconflict -- each side's text follows its OWN marker label" \
+    cmp -s "$WORKDIR/p49_revconflict_sg_norm.txt" "$WORKDIR/p49_revconflict_git/b.txt"
 
 # The rename really is what makes the one-sided cases work: with detection
 # off this same history is a modify/delete conflict leaving BOTH names in the
