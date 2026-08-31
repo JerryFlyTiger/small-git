@@ -9,6 +9,7 @@
 #include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/object.h"
+#include "sg/objstore.h"
 #include "sg/repo.h"
 #include "sg/similarity.h"
 #include "sg/tree_build.h"
@@ -704,6 +705,145 @@ static void test_rename_rename_1to2_merged_mode(void)
     check_1to2_modes(0100644, 0100644, 0100644, "neither changed the mode");
 }
 
+
+/* Regression, cold-review + fuzzer finding #1. THEIRS does the renaming and
+   ours leaves the source alone -- the single most common real-world shape,
+   and the one direction none of the tests above exercises (they all rename
+   on OURS' side). Two independent halves, and each needs its own assertion
+   because fixing one leaves the other broken:
+
+     a) the landing must actually be WRITTEN. The entry at the destination
+        used to carry ours' blob AT THE SOURCE PATH in ours_present/
+        ours_sha1, so sg_merge_entry_touches_ours answered "ours already has
+        this exact content here" for a path ours does not have at all, and
+        sg_merge_result_apply skipped the write. The merge COMMIT's tree was
+        correct the whole time, so only a working-tree assertion can see it.
+     b) the source must actually be REMOVED. Nothing emitted an entry for a
+        consumed rename source that ours still had, so no remove() ever ran
+        and the old file stayed behind as an untracked leftover.
+
+   All four gates were green for both halves; tests/fuzz_merge_rename.py is
+   what caught them. */
+static void test_theirs_side_rename_lands_and_removes_source(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = repo_root_of(git_dir);
+    unsigned char base_tree[SG_SHA1_RAW_LEN], ours_tree[SG_SHA1_RAW_LEN], theirs_tree[SG_SHA1_RAW_LEN];
+    const char *body = "line1\nline2\nline3\nline4\nline5\n";
+    tree_spec base_specs[] = {{"p.txt", "line1\nline2\nline3\nline4\nline5\n"}};
+    tree_spec ours_specs[] = {{"p.txt", "line1\nline2\nline3\nline4\nline5\n"}};
+    tree_spec theirs_specs[] = {{"np.txt", "line1\nline2\nline3\nline4\nline5\n"}};
+    sg_merge_result result;
+    sg_index new_idx;
+    char **conflict_paths = NULL;
+    size_t conflict_count = 0;
+    char abspath[4096];
+    size_t i;
+    int saw_np = 0, saw_p = 0;
+
+    build_tree(git_dir, base_specs, 1, base_tree);
+    build_tree(git_dir, ours_specs, 1, ours_tree);
+    build_tree(git_dir, theirs_specs, 1, theirs_tree);
+
+    /* The pre-merge working tree is ours', so the source really is on disk;
+       without planting it, "p.txt is gone" would be true even if no code
+       ever removed anything. */
+    snprintf(abspath, sizeof(abspath), "%s/p.txt", repo_root);
+    CHECK(sg_write_file_mkdirs(abspath, (const unsigned char *)body, strlen(body), 0644) == 0,
+         "failed to plant the pre-merge p.txt");
+
+    CHECK(sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, "ours", "theirs",
+                        SG_SIMILARITY_DEFAULT, &result) == 0,
+         "sg_merge_trees failed");
+    CHECK(sg_merge_result_apply(git_dir, repo_root, &result, &new_idx, &conflict_paths,
+                               &conflict_count) == 0,
+         "sg_merge_result_apply failed");
+    CHECK(conflict_count == 0, "a pure one-sided rename must merge cleanly, got %zu conflict(s)",
+         conflict_count);
+
+    CHECK(file_exists(repo_root, "np.txt"),
+         "half (a): the renamed-to file must be written to the working tree");
+    CHECK(!file_exists(repo_root, "p.txt"),
+         "half (b): the consumed rename source must be removed from the working tree");
+    if (file_exists(repo_root, "np.txt")) {
+        unsigned char *got = NULL;
+        size_t got_len = 0;
+
+        snprintf(abspath, sizeof(abspath), "%s/np.txt", repo_root);
+        CHECK(sg_read_file(abspath, &got, &got_len) == 0, "failed to read np.txt");
+        if (got != NULL)
+            CHECK(got_len == strlen(body) && memcmp(got, body, got_len) == 0,
+                 "np.txt must carry the merged content");
+        free(got);
+    }
+    for (i = 0; i < new_idx.count; i++) {
+        if (strcmp(new_idx.entries[i].path, "np.txt") == 0)
+            saw_np = 1;
+        if (strcmp(new_idx.entries[i].path, "p.txt") == 0)
+            saw_p = 1;
+    }
+    CHECK(saw_np, "the index must carry the destination path");
+    CHECK(!saw_p, "the index must not carry the consumed rename source");
+
+    free(conflict_paths);
+    sg_index_free(&new_idx);
+    sg_merge_result_free(&result);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Regression, fuzzer finding #2. rename/rename-1to2 whose INNER content
+   merge conflicts: merge_blob_content deliberately leaves *out_sha1
+   untouched on a conflict (an ordinary conflict has no resolved blob), so
+   the two stages used to be handed an uninitialized stack array and the
+   index named an object that does not exist -- a corrupt repository, not a
+   merely wrong answer. Measured against real git: both stages hold the
+   marker-laden merge result as a REAL blob, byte-identical to the
+   working-tree file.
+
+   interop's phase45 fixture cannot see this: its renames are pure, so the
+   inner merge is CLEAN and takes the branch that does fill the sha1. */
+static void test_rename_rename_1to2_conflict_stage_blob_exists(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char base_tree[SG_SHA1_RAW_LEN], ours_tree[SG_SHA1_RAW_LEN], theirs_tree[SG_SHA1_RAW_LEN];
+    tree_spec base_specs[] = {{"a.txt", "line1\nline2\nline3\nline4\nline5\n"}};
+    tree_spec ours_specs[] = {{"b.txt", "line1\nOURS\nline3\nline4\nline5\n"}};
+    tree_spec theirs_specs[] = {{"c.txt", "line1\nTHEIRS\nline3\nline4\nline5\n"}};
+    sg_merge_result result;
+    const sg_merge_result_entry *eo, *et;
+
+    build_tree(git_dir, base_specs, 1, base_tree);
+    build_tree(git_dir, ours_specs, 1, ours_tree);
+    build_tree(git_dir, theirs_specs, 1, theirs_tree);
+
+    CHECK(sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, "ours", "theirs",
+                        SG_SIMILARITY_DEFAULT, &result) == 0,
+         "sg_merge_trees failed");
+    eo = find_entry(&result, "b.txt");
+    et = find_entry(&result, "c.txt");
+    CHECK(eo != NULL && et != NULL, "expected entries at both destinations");
+    if (eo != NULL && et != NULL) {
+        unsigned char *stored = NULL;
+        size_t stored_len = 0;
+        sg_obj_type type;
+
+        CHECK(memcmp(eo->ours_sha1, et->theirs_sha1, SG_SHA1_RAW_LEN) == 0,
+             "stage 2 and stage 3 must name the SAME blob");
+        CHECK(sg_object_read(git_dir, eo->ours_sha1, &type, &stored, &stored_len) == 0,
+             "stage 2's blob must actually exist in the object store");
+        if (stored != NULL) {
+            CHECK(type == SG_OBJ_BLOB, "stage 2 must name a blob");
+            CHECK(stored_len == eo->conflict_content_len &&
+                     memcmp(stored, eo->conflict_content, stored_len) == 0,
+                 "the stored blob must be byte-identical to the working-tree conflict content");
+            free(stored);
+        }
+    }
+    sg_merge_result_free(&result);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_rename_clean_other_side_edits();
@@ -716,6 +856,8 @@ int main(void)
     test_rename_rename_1to2_apply_leaves_no_file_at_source();
     test_rename_add_collision();
     test_rename_rename_2to1();
+    test_theirs_side_rename_lands_and_removes_source();
+    test_rename_rename_1to2_conflict_stage_blob_exists();
     test_rename_score_zero_is_unaffected();
 
     if (failures > 0) {

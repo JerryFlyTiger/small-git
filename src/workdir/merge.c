@@ -1446,23 +1446,30 @@ static int emit_standalone_landing(const char *git_dir, const sg_flat_list *base
             entry.mode = mode;
             memcpy(entry.sha1, sha1, SG_SHA1_RAW_LEN);
             /* fill_conflict_sides' job, done by hand since there is no
-               triple here: Phase 20's stash touched-check needs the clean
-               ours side even on a path that only exists post-rename. */
-            entry.base_present = 1;
-            entry.base_mode = base_e->mode;
-            memcpy(entry.base_sha1, base_e->sha1, SG_SHA1_RAW_LEN);
-            entry.ours_present = 1;
-            entry.theirs_present = 1;
+               triple here -- and these three describe THIS ENTRY'S PATH
+               (dst), not the rename's source. Only the renaming side's tree
+               actually has dst; base and the other side have the SOURCE
+               path, which is a different entry.
+
+               This is load-bearing, not bookkeeping:
+               sg_merge_entry_touches_ours reads exactly ours_present /
+               ours_mode / ours_sha1 to decide whether
+               sg_merge_result_apply may SKIP writing this path on the
+               grounds that ours already has this content here. Filling the
+               ours side from the source path made that check answer "yes"
+               for a file ours does not have at all whenever theirs did the
+               renaming and nobody edited the content -- so the renamed-to
+               file was never created in the working tree, while the merge
+               COMMIT's tree was correct. All four gates stayed green;
+               tests/fuzz_merge_rename.py caught it. */
             if (is_ours) {
+                entry.ours_present = 1;
                 entry.ours_mode = side_e->mode;
                 memcpy(entry.ours_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
-                entry.theirs_mode = other_e->mode;
-                memcpy(entry.theirs_sha1, other_e->sha1, SG_SHA1_RAW_LEN);
             } else {
+                entry.theirs_present = 1;
                 entry.theirs_mode = side_e->mode;
                 memcpy(entry.theirs_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
-                entry.ours_mode = other_e->mode;
-                memcpy(entry.ours_sha1, other_e->sha1, SG_SHA1_RAW_LEN);
             }
             return append_result_entry(out, cap, &entry);
         }
@@ -1688,6 +1695,21 @@ static int emit_rename_rename_1to2(const char *git_dir, const sg_flat_list *base
         if (read_blob_chunk_aware(git_dir, merged_sha1, o_dst, &conflict_content,
                                   &conflict_content_len) != 0)
             return -1;
+    } else if (store_new_blob(git_dir, conflict_content, conflict_content_len, merged_sha1) != 0) {
+        /* merge_blob_content leaves out_sha1 UNTOUCHED on a conflict -- an
+           ordinary conflict has no resolved blob, so no caller of it ever
+           needed one. This shape does: measured against real git, stage 2
+           and stage 3 both hold the marker-laden merge RESULT as a real
+           blob (cat-file on either stage prints exactly the working-tree
+           file). Without storing it here, merged_sha1 is still the
+           uninitialized stack array and both stages name an object that
+           does not exist -- a corrupt index, not merely a wrong answer.
+           make/make test/interop/sanitize were all green for it, because
+           interop's phase45 fixture is a PURE rename whose inner merge is
+           clean, and the clean branch above does fill merged_sha1;
+           tests/fuzz_merge_rename.py is what caught it. */
+        free(conflict_content);
+        return -1;
     }
 
     memset(&e_p, 0, sizeof(e_p));
@@ -1750,6 +1772,51 @@ static int emit_rename_rename_1to2(const char *git_dir, const sg_flat_list *base
    does); the caller sorts *out by path afterward, since these entries land
    at destinations that are not necessarily where the union walk's cursor
    currently is. Returns 0 on success, -1 on error. */
+/* A rename source that the OTHER side never renamed away is still physically
+   present in ours' tree, and therefore in the pre-merge working tree -- but
+   the merge result must not contain it (measured: git's index has no entry
+   at the old name and the file is gone from disk). Nothing else emits it:
+   the ordinary union walk skips every rename source
+   (path_is_rename_consumed), and the landing entry lives at the DESTINATION
+   path. So it needs a deleted entry of its own.
+
+   ours' side is filled in deliberately: that is exactly what
+   sg_merge_entry_touches_ours reads for a deleted entry, and returning 0
+   there is what stops sg_merge_result_apply from unlinking a same-named
+   UNTRACKED file on a path ours never had (Phase 20). Here ours did have
+   it, so the remove() is the right answer.
+
+   Reached whenever ours kept the source and theirs renamed it (sec 3.1's
+   mirror, sec 3.2's mirror, and both collision shapes -- in a 2-to-1
+   collision ours keeps THEIRS' source). Never reached for sec 3.4, where
+   both sides renamed p away, so it cannot double-emit against
+   emit_rename_rename_1to2's own stage-1 entry at p. */
+static int emit_consumed_source_deletion(const sg_flat_list *base_flat,
+                                         const sg_flat_list *ours_flat, const char *p,
+                                         sg_merge_result *out, size_t *cap)
+{
+    const sg_flat_entry *ours_e = flat_find(ours_flat, p);
+    const sg_flat_entry *base_e = flat_find(base_flat, p);
+    sg_merge_result_entry entry;
+
+    if (ours_e == NULL)
+        return 0;
+    memset(&entry, 0, sizeof(entry));
+    entry.path = strdup(p);
+    if (entry.path == NULL)
+        return -1;
+    entry.deleted = 1;
+    entry.ours_present = 1;
+    entry.ours_mode = ours_e->mode;
+    memcpy(entry.ours_sha1, ours_e->sha1, SG_SHA1_RAW_LEN);
+    if (base_e != NULL) {
+        entry.base_present = 1;
+        entry.base_mode = base_e->mode;
+        memcpy(entry.base_sha1, base_e->sha1, SG_SHA1_RAW_LEN);
+    }
+    return append_result_entry(out, cap, &entry);
+}
+
 static int handle_renames(const char *git_dir, const sg_flat_list *base_flat,
                           const sg_flat_list *ours_flat, const sg_flat_list *theirs_flat,
                           const rename_map *ro, const rename_map *rt, const char *ours_label,
@@ -1820,6 +1887,11 @@ static int handle_renames(const char *git_dir, const sg_flat_list *base_flat,
                 goto done;
             c->theirs.kind = o_kept ? LANDING_KEPT : LANDING_DELETED;
             c->theirs.src_path = p;
+            /* o_kept means ours still physically has p; theirs renamed it
+               away, so p has to be removed from the working tree. */
+            if (o_kept &&
+               emit_consumed_source_deletion(base_flat, ours_flat, p, out, cap) != 0)
+                goto done;
         }
     }
 

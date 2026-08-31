@@ -7827,3 +7827,134 @@ conflicted text that gets hashed into stage 2.
   conflict list with `sg add` instructions), so `CONFLICT (rename/rename): ...`
   and `Auto-merging <path>` are not reproduced. The dimensions this phase
   holds to real git are exit code, working-tree bytes, and index stage layout.
+
+### 3. What was built
+
+Detection reuses the existing machinery unchanged: `sg_diff_trees` is run
+twice (base vs ours, base vs theirs) and each list is handed to
+`sg_diff_detect_renames`. That works because a tree-vs-tree list has only
+`SG_DIFF_SIDE_BLOB` sides, and `sg_diff_side_read`'s BLOB branch never
+touches `repo_root` -- so no working directory or index is needed, which is
+what makes the detector usable from inside `sg_merge_trees` at all.
+
+What is new is the layer that consumes those two maps. `sg_merge_trees`'s
+union walk is keyed on the path string, so it cannot express "the same file
+under two names"; every base path that is a rename source, and every
+ours/theirs path that is a rename destination, is therefore lifted out of
+the walk (`path_is_rename_consumed`) and resolved by a two-stage pass:
+stage one classifies each source's landing on each side, stage two resolves
+each destination -- because a collision needs both sides classified before
+either can be answered.
+
+Three API changes, all mandatory parameters with no default, the idiom this
+codebase already uses for `sg_workdir_missing` and
+`sg_status_diff_staged`'s `rename_score`:
+
+- `sg_merge_content` takes a `marker_size` (7, or 8 for the two shapes git
+  widens).
+- `sg_merge_trees` takes a `rename_score`; 0 reproduces pre-Phase-49
+  behaviour byte for byte, and all four call sites -- merge, rebase, and
+  stash's two -- pass `SG_SIMILARITY_DEFAULT`, because real git is
+  rename-aware in all three commands.
+- `sg_merge_result_entry` gains `conflict_no_workdir_file`, the one shape
+  the struct could not previously express: rename/rename-1to2's stage-1-only
+  entry at the original path, which git leaves with an index stage and no
+  file.
+
+The `:<path>` marker suffix needed no signature change -- `sg_merge_content`
+takes its labels verbatim, so the caller composes `"<label>:<that side's
+path>"`.
+
+### 4. Three bugs every gate was green for
+
+All of `make`, `make test`, `bash tests/interop.sh` and `make sanitize`
+passed on code carrying all three of these. Two came out of a cold read plus
+the phase's own fuzzer, one out of measuring an answer the spec had left to
+the implementer's judgement.
+
+**A clean rename merge did not write the file.** When THEIRS did the
+renaming and ours left the source alone -- the commonest real-world shape,
+and the one direction none of the unit tests exercised -- the entry at the
+destination was filled with ours' blob *at the source path*.
+`sg_merge_entry_touches_ours` reads exactly those fields to decide whether
+`sg_merge_result_apply` may skip a write on the grounds that ours already
+has this content here, so it answered yes for a path ours did not have at
+all, and the renamed-to file was never created. The merge COMMIT's tree was
+correct throughout, which is why nothing else noticed: only a working-tree
+assertion can see it.
+
+**The consumed rename source was never deleted.** Nothing emitted an entry
+for a rename source that the other side still had, so no `remove()` ever
+ran and the old name stayed behind as an untracked leftover. This is the
+same need `conflict_no_workdir_file` was built for in the 1to2 shape,
+un-generalized to the other four.
+
+The two halves are independent -- fixing either alone leaves the other
+broken -- so they carry separate assertions and separate mutations.
+
+**rename/rename-1to2's stages named objects that did not exist.**
+`merge_blob_content` deliberately leaves `*out_sha1` untouched on a
+conflict, since an ordinary conflict has no resolved blob and no other
+caller wanted one. This shape does: measured, git stores the marker-laden
+merge result as a real blob and puts it at BOTH stage 2 and stage 3. The
+uninitialized stack array was being copied into both stages instead, i.e. a
+corrupt index. Interop's own phase45 fixture cannot see it, because its
+renames are pure and the inner merge takes the CLEAN branch, which does fill
+the sha1 -- the same "the fixture only reaches the working half" shape as
+the mode bug below.
+
+**And the mode.** The spec left "what mode do the two 1to2 stages carry" to
+the implementer, who chose ours' own mode and flagged it as the highest-risk
+guess in the hand-off. Measured in both directions, it is the ordinary
+merged mode: base 644 / ours 755 / theirs 644 gives 100755 at both stages,
+and so does base 644 / ours 644 / theirs 755. Taking ours' mode passes the
+first fixture and fails the second, so the unit test runs the pair -- a
+single-direction fixture would have called the wrong rule green.
+
+### 5. What the fuzzer measured
+
+`tests/fuzz_merge_rename.py` exists because `tests/fuzz_merge.py` is
+STRUCTURALLY blind here: its `build_repo` only ever writes one fixed
+filename, so no number of rounds can produce a rename. It builds one history,
+runs the merge once with sg and once with real git, and compares the exit
+code, the working tree, and the index stage layout -- the last read out of
+BOTH repositories with real `git ls-files -s`, since sg's index is
+format-compatible. Blob ids are never compared (a conflicted blob embeds the
+ours label, which diverges by design); the blobs' CONTENT is, after one
+narrow normalization of the ours label that deliberately preserves both the
+`:path` suffix and the marker width, since those are dimensions under test.
+
+Measured progression on the same 150 rounds, seed 1: **22 mismatches** for
+the first implementation, **9** after the two working-tree fixes, **3** after
+the stage-blob fix, and **0** once the remaining three were attributed. Three
+independent seed ranges (1, 5000, 9000) x 150 rounds now give 0, 0 and 1 --
+the single remaining one being the pre-existing case below.
+
+Two attribution results are worth keeping, because both look like coverage
+and are not:
+
+- **The directory-rename divergence is removed from the comparison by
+  declaring the oracle's environment, not by labelling it afterwards.** sg
+  deliberately does not implement directory rename detection and its answer
+  is byte-compatible with `merge.directoryRenames=false`, so the git side
+  runs with that knob pinned on the command line. The first version instead
+  classified such rounds from git's own `CONFLICT (file location)` message
+  and skipped them -- which discards the WHOLE round, so a genuine rename bug
+  occurring in the same round would have been discarded with it. That
+  classifier is kept as a tripwire and should now always report 0.
+- **rename/rename-2to1 is a control, not a discriminator.** When two
+  different sources are renamed onto one name, the destination has no
+  counterpart in base either way, so git resolves it as an ordinary add/add
+  whether or not it noticed the renames, landing on stage 2/3 blobs
+  byte-identical to what a rename-blind tool produces. Its 0-out-of-N is the
+  correct answer, not a gap; the shape is kept precisely so that stays
+  written down.
+
+The one remaining mismatch (seed 9058) is **not a rename bug and not new**:
+it is `filler1.txt`, a file no rename touches, where git merges two adjacent
+conflicts across a two-line gap that contains a one-sided deletion and sg
+keeps them separate. Reproduced on `master` with the same seed, so it
+predates this phase; `fuzz_merge.py`'s single-file generator cannot build the
+shape (it needs a deletion inside a short gap between two conflicts), which
+is why 200 x 2 rounds of it stay at 0. Recorded here as the next thing to
+attribute properly, in the same spirit as the `--histogram` residual.

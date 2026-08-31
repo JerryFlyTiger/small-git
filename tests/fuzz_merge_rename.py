@@ -506,13 +506,25 @@ def one_round(rng, keep_dir, index, seed, verbose):
     try:
         repo, err = build_repo(parent, base_files, ours_files, theirs_files)
         if repo is None:
-            return "setup", err, shape
+            return "setup", err, shape, False
 
         gitcopy = repo + ".gitcopy"
         shutil.copytree(repo, gitcopy)
 
         sg_res = sg(repo, "merge", "theirs")
-        git_res = git(gitcopy, "merge", "theirs")
+        # Declare the oracle's environment instead of labelling the
+        # divergence afterwards. sg deliberately does not implement
+        # DIRECTORY rename detection, and its answer is byte-compatible with
+        # merge.directoryRenames=false (measured, docs/DESIGN.md Phase 49
+        # sec 2) -- git's default, `conflict`, relocates a file added under a
+        # directory the other side renamed. Pinning the knob on the command
+        # line makes every remaining mismatch a real one; the dirrename
+        # bucket below stays as a tripwire and should now always read 0. The
+        # alternative -- skipping any round whose git output mentions
+        # CONFLICT (file location) -- discards the WHOLE round, so a genuine
+        # rename bug in the same round would be discarded with it.
+        git_res = git(gitcopy, "-c", "merge.directoryRenames=false",
+                      "merge", "theirs")
 
         mismatches = []
 
@@ -561,7 +573,20 @@ def one_round(rng, keep_dir, index, seed, verbose):
         if verbose and not mismatches:
             print("fuzz_merge_rename: round %d (%s) ok" % (index, shape))
 
-        return mismatches, None, shape
+        # Directory rename detection is DELIBERATELY not implemented (see
+        # docs/DESIGN.md Phase 49 sec 2): git's default,
+        # merge.directoryRenames=conflict, relocates a file added under a
+        # directory the other side renamed; sg is byte-compatible with
+        # merge.directoryRenames=false instead. Attribute those rounds here
+        # from GIT's OWN message rather than leaving them in the headline
+        # number, so a real regression is not buried under a documented
+        # divergence -- and so nobody has to triage them by hand every run.
+        # Classified from the oracle side only; nothing is borrowed from sg.
+        git_out = git_res.stdout
+        if isinstance(git_out, bytes):
+            git_out = git_out.decode("utf-8", "replace")
+        dirrename = "CONFLICT (file location)" in git_out
+        return mismatches, None, shape, dirrename
     finally:
         shutil.rmtree(parent, ignore_errors=True)
 
@@ -593,6 +618,7 @@ def main():
 
     category_counts = {}
     setup_failures = 0
+    dirrename_rounds = 0
     shape_total = {}
     shape_mismatch = {}
     mismatching_rounds = 0
@@ -601,13 +627,20 @@ def main():
         seed = args.seed + i
         rng = random.Random(seed)
         result = one_round(rng, args.keep, i, seed, args.verbose)
-        mismatches, setup_err, shape = result
+        mismatches, setup_err, shape, dirrename = result
         shape_total[shape] = shape_total.get(shape, 0) + 1
 
         if setup_err is not None:
             setup_failures += 1
             print("fuzz_merge_rename: round %d (seed %d, shape %s) setup "
                   "failure: %s" % (i, seed, shape, setup_err))
+            continue
+
+        if mismatches and dirrename:
+            dirrename_rounds += 1
+            print("fuzz_merge_rename: round %d (seed %d, shape %s) attributed "
+                  "to the documented directory-rename divergence, not counted"
+                  % (i, seed, shape))
             continue
 
         if mismatches:
@@ -641,6 +674,9 @@ def main():
         print("  setup failures:  %4d  (these measure nothing -- fix first)"
               % setup_failures)
     print()
+    if dirrename_rounds:
+        print("attributed to the directory-rename divergence (not counted): %d"
+              % dirrename_rounds)
     print("mismatching rounds: %d / %d" % (mismatching_rounds, args.rounds))
     return 1 if mismatching_rounds else 0
 
