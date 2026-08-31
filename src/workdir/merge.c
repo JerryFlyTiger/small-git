@@ -1134,7 +1134,7 @@ static int build_rename_map(const char *git_dir, const unsigned char base_tree[S
     memset(list_out, 0, sizeof(*list_out));
     memset(map_out, 0, sizeof(*map_out));
 
-    rc = sg_diff_trees(git_dir, base_tree, side_tree, list_out, bad_path);
+    rc = sg_diff_trees(git_dir, base_tree, side_tree, list_out, bad_path, 0);
     if (rc == -2) {
         fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
                sg_quote_path_delimited(bad_path));

@@ -242,8 +242,13 @@ static void exact_pass(rename_cand *srcs, size_t nsrc, rename_cand *dsts,
             /* Outside copy detection a source is spent once it is claimed.
                Copy detection lets it be claimed again, but still prefers one
                that has not been -- that is what makes the score below 1
-               rather than 0 for a fresh source. */
-            if (s->used && !detect_copies)
+               rather than 0 for a fresh source.
+               The question is `uses`, git's rename_used, NOT the `used`
+               flag: a source that exists on both sides is registered with a
+               use already spent, so it is never "fresh" and must lose to a
+               deletion holding the same content. Measured against git
+               2.55.0 -- see the WARNING in rename.c's header comment. */
+            if (s->uses > 0 && !detect_copies)
                 continue;
             if (memcmp(s->id, d->id, SG_SHA1_RAW_LEN) != 0)
                 continue;
@@ -258,7 +263,7 @@ static void exact_pass(rename_cand *srcs, size_t nsrc, rename_cand *dsts,
             /* Among identical sources git prefers the one that already has
                the destination's file name; otherwise the first in path
                order, which is what a strictly-greater comparison keeps. */
-            score = (s->used ? 0 : 1) + basename_same(se->path, de->path);
+            score = (s->uses > 0 ? 0 : 1) + basename_same(se->path, de->path);
             if (score > best_score) {
                 best = (int)si;
                 best_score = score;
@@ -469,7 +474,13 @@ static void claim_from_matrix(const rename_slot *mx, size_t used_slots,
             break;
         if (dsts[di].used)
             continue;
-        if (!copies && srcs[si].used)
+        /* git's find_renames tests rename_used, which a source existing on
+           both sides already holds at 1. So the rename walk refuses it
+           outright and the destination is left for the copy walk, even when
+           it outscores every deletion. Reading the `used` flag here instead
+           lets a copy source win the rename round and strands a real
+           deletion as a plain D. Measured against git 2.55.0. */
+        if (!copies && srcs[si].uses > 0)
             continue;
         srcs[si].used = 1;
         srcs[si].uses++;
@@ -554,6 +565,27 @@ static int matrix_pass(const char *git_dir, const char *repo_root,
     return 0;
 }
 
+/* Phase 51: removes every row still carrying `unchanged` -- see
+   sg_diff_detect_renames's own header comment for why this has to run on
+   every success path, including both early-outs below. Such a row is never
+   a destination, so it never holds an old_path; freeing `path` is the only
+   cleanup it needs. */
+static void strip_unchanged_rows(sg_diff_list *list)
+{
+    size_t i, write = 0;
+
+    for (i = 0; i < list->count; i++) {
+        if (list->entries[i].unchanged) {
+            free(list->entries[i].path);
+            continue;
+        }
+        if (write != i)
+            list->entries[write] = list->entries[i];
+        write++;
+    }
+    list->count = write;
+}
+
 /* --------------------------------------------------------------- driver */
 
 int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
@@ -565,10 +597,14 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
     char *is_copy = NULL;
     char **copied_path = NULL;
     size_t nsrc = 0, ndst = 0, i;
-    int rc = -1, paired = 0;
+    int rc = -1;
 
-    if (list == NULL || list->count == 0 || min_score <= 0)
+    if (list == NULL || list->count == 0)
         return 0;
+    if (min_score <= 0) {
+        strip_unchanged_rows(list);
+        return 0;
+    }
 
     srcs = calloc(list->count, sizeof(*srcs));
     dsts = calloc(list->count, sizeof(*dsts));
@@ -610,6 +646,7 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
         pair_score[i] = 0;
     }
     if (nsrc == 0 || ndst == 0) {
+        strip_unchanged_rows(list);
         rc = 0;
         goto done;
     }
@@ -680,10 +717,14 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
         }
         d->old_side = s->old_side;
         d->score = sg_similarity_percent(pair_score[i]);
-        paired = 1;
     }
 
-    if (paired) {
+    /* Unconditional (previously gated on "did anything pair at all"): even a
+       round that paired nothing can still be holding unchanged rows appended
+       purely as -C -C's copy-source pool (Phase 51), and those must never
+       survive to the caller. When nothing paired and no row is unchanged,
+       this is a plain copy of the list onto itself. */
+    {
         size_t write = 0;
 
         /* Drop the claimed sources. Which ones those are is recorded
@@ -699,6 +740,14 @@ int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
                    same reason sg_diff_list_filter does it -- so ownership
                    here does not depend on that argument staying true. */
                 free(list->entries[i].old_path);
+                continue;
+            }
+            if (list->entries[i].unchanged) {
+                /* Phase 51: never a destination, so never owns old_path --
+                   only `path` needs freeing, same as strip_unchanged_rows
+                   above (this loop cannot just call that helper, since it
+                   is already mid-compaction over `claimed`). */
+                free(list->entries[i].path);
                 continue;
             }
             if (write != i)

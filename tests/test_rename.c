@@ -79,6 +79,15 @@ static void add_addition(sg_diff_list *l, const char *path, unsigned char tag)
     add(l, path, 0, 0, 1, tag);
 }
 
+/* Phase 51: a row present, identical, on both sides -- the shape a builder
+   emits for `-C -C`'s copy-source pool. `add` already leaves `unchanged` at
+   0 (memset), so this just flips it on the just-appended entry. */
+static void add_unchanged(sg_diff_list *l, const char *path, unsigned char tag)
+{
+    add(l, path, 1, tag, 1, tag);
+    l->entries[l->count - 1].unchanged = 1;
+}
+
 static const sg_diff_entry *find(const sg_diff_list *l, const char *path)
 {
     size_t i;
@@ -1197,6 +1206,369 @@ static void test_a_side_that_cannot_be_read_is_never_paired(void)
     rmdir(root);
 }
 
+/* ------------------------------------------------- Phase 51: -C -C ------ */
+
+static int any_unchanged(const sg_diff_list *l)
+{
+    size_t i;
+
+    for (i = 0; i < l->count; i++)
+        if (l->entries[i].unchanged)
+            return 1;
+    return 0;
+}
+
+/* An unchanged row (both sides present, identical content -- the shape a
+   builder emits for -C -C) pairs as a copy source exactly like a
+   modification: registered with uses=1, so any destination it pairs with
+   always finds a use remaining afterward. Measured against git 2.55.0:
+   one unchanged source with one destination is a copy, never a rename. */
+static void test_unchanged_source_pairs_as_copy_never_rename(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    add_addition(&l, "dst.txt", 0xAA);
+    add_unchanged(&l, "src.txt", 0xAA);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 1) == 0,
+          "detection succeeds");
+    e = find(&l, "dst.txt");
+    CHECK(e != NULL && e->old_path != NULL && strcmp(e->old_path, "src.txt") == 0,
+          "dst.txt is paired to the unchanged source");
+    CHECK(e != NULL && e->is_copy == 1, "and it is a COPY -- an unchanged source is never spent");
+    CHECK(find(&l, "src.txt") == NULL,
+          "the unchanged source row itself is gone -- stripped, not left behind like a "
+          "modification source would be");
+    sg_diff_list_free(&l);
+}
+
+/* SPEC section 2.4: this is the shape that tells an unchanged source apart
+   from a DELETED one -- a deleted source with two destinations gives one
+   copy and one rename (test_one_source_two_copies_gives_a_copy_then_a_rename
+   above), but an unchanged source gives TWO copies, because its own
+   uses=1 head start means neither consumption ever reaches zero. Measured:
+   git prints "C094 src aaa" and "C094 src zzz" for exactly this shape. */
+static void test_one_unchanged_source_two_destinations_both_copies(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    add_addition(&l, "aaa.txt", 0xAA);
+    add_unchanged(&l, "src.txt", 0xAA);
+    add_addition(&l, "zzz.txt", 0xAA);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 1) == 0,
+          "detection succeeds");
+    e = find(&l, "aaa.txt");
+    CHECK(e != NULL && e->is_copy == 1 && e->old_path != NULL &&
+             strcmp(e->old_path, "src.txt") == 0,
+          "aaa.txt is a copy off the unchanged source");
+    e = find(&l, "zzz.txt");
+    CHECK(e != NULL && e->is_copy == 1 && e->old_path != NULL &&
+             strcmp(e->old_path, "src.txt") == 0,
+          "zzz.txt is ALSO a copy off the same unchanged source, not a rename");
+    CHECK(find(&l, "src.txt") == NULL, "the unchanged source is stripped either way");
+    sg_diff_list_free(&l);
+}
+
+/* The exact pass (identical content, settled by id) reuses one unchanged
+   source for two byte-identical destinations, same as it already does for a
+   modification source -- no new code path, just the existing `uses` machinery
+   applied to a wider source pool. */
+static void test_exact_pass_reuses_one_unchanged_source_for_two_destinations(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    add_addition(&l, "aaa.txt", 0xEE);
+    add_unchanged(&l, "src.txt", 0xEE);
+    add_addition(&l, "zzz.txt", 0xEE);
+
+    /* SG_SIMILARITY_MAX: exact-only threshold, same discipline as
+       test_exact_only_threshold_still_finds_exact_renames -- proves this is
+       genuinely the exact pass, not the matrix falling back to a perfect
+       score. */
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, SG_SIMILARITY_MAX, 1) == 0,
+          "detection succeeds");
+    e = find(&l, "aaa.txt");
+    CHECK(e != NULL && e->old_path != NULL && e->score == 100, "aaa.txt is a 100%% copy");
+    e = find(&l, "zzz.txt");
+    CHECK(e != NULL && e->old_path != NULL && e->score == 100, "zzz.txt is a 100%% copy too");
+    sg_diff_list_free(&l);
+}
+
+/* An unchanged row's old_side is never ABSENT (that is the definition of
+   "unchanged"), so is_addition can never admit it -- it is structurally
+   impossible for it to be selected as a destination. This fixture makes that
+   observable: if a bug ever let it be classified as an addition, it would
+   pick up "old.txt" as its old_path via the exact pass (same id), which the
+   assertions below rule out directly. */
+static void test_an_unchanged_row_is_never_a_destination(void)
+{
+    sg_diff_list l;
+
+    memset(&l, 0, sizeof(l));
+    add_deletion(&l, "old.txt", 0xAA);
+    add_unchanged(&l, "mid.txt", 0xAA); /* same content as the deletion, on purpose */
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 1) == 0,
+          "detection succeeds");
+    CHECK(find(&l, "mid.txt") == NULL, "the unchanged row is stripped, not turned into a copy");
+    CHECK(find(&l, "old.txt") != NULL,
+          "the deletion is untouched -- there was no real addition for it to pair with");
+    CHECK(find(&l, "old.txt") != NULL && find(&l, "old.txt")->old_path == NULL,
+          "and it never gained an old_path, which only a DESTINATION would carry");
+    sg_diff_list_free(&l);
+}
+
+/* Every returning path that reports success must leave no `unchanged` row
+   behind -- both when something paired and when nothing did. */
+static void test_every_unchanged_row_is_stripped_when_paired(void)
+{
+    sg_diff_list l;
+
+    memset(&l, 0, sizeof(l));
+    add_addition(&l, "dst.txt", 0xAA);
+    add_unchanged(&l, "src.txt", 0xAA);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 1) == 0,
+          "detection succeeds");
+    CHECK(!any_unchanged(&l), "no row still carries `unchanged` after a successful pairing");
+    sg_diff_list_free(&l);
+}
+
+static void test_every_unchanged_row_is_stripped_when_not_paired(void)
+{
+    sg_diff_list l;
+
+    memset(&l, 0, sizeof(l));
+    /* Different content and no basename match -- SG_SIMILARITY_MAX asks for
+       an exact match only, so nothing pairs at all. */
+    add_addition(&l, "dst.txt", 0xAA);
+    add_unchanged(&l, "src.txt", 0xBB);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, SG_SIMILARITY_MAX, 1) == 0,
+          "detection succeeds");
+    CHECK(!any_unchanged(&l), "the unchanged row is stripped even though nothing paired");
+    CHECK(l.count == 1 && find(&l, "dst.txt") != NULL,
+          "dst.txt is left as a plain, unpaired addition");
+    sg_diff_list_free(&l);
+}
+
+/* The min_score <= 0 (--no-renames) early-out, specifically named in
+   sg_diff_detect_renames's own header comment as the easiest one to forget. */
+static void test_unchanged_row_stripped_on_the_min_score_early_out(void)
+{
+    sg_diff_list l;
+
+    memset(&l, 0, sizeof(l));
+    add_addition(&l, "dst.txt", 0xAA);
+    add_unchanged(&l, "src.txt", 0xAA);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 0, 1) == 0,
+          "min_score <= 0 still reports success");
+    CHECK(!any_unchanged(&l), "the unchanged row does not survive --no-renames either");
+    CHECK(l.count == 1 && find(&l, "dst.txt") != NULL, "dst.txt is untouched");
+    sg_diff_list_free(&l);
+}
+
+/* With detect_copies == 0, an unchanged row is not registered as a source at
+   all (same rule as an ordinary modification: `detect_copies && is_modification(e)`),
+   but it must still be stripped -- a caller with plain -M has no idea the
+   flag even exists. */
+static void test_unchanged_row_not_a_source_without_copy_detection(void)
+{
+    sg_diff_list l;
+
+    memset(&l, 0, sizeof(l));
+    add_addition(&l, "dst.txt", 0xAA);
+    add_unchanged(&l, "src.txt", 0xAA);
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, 50, 0) == 0,
+          "detection succeeds");
+    CHECK(!any_unchanged(&l), "still stripped even with copy detection off");
+    CHECK(l.count == 1, "dst.txt has nothing to pair with, got %zu", l.count);
+    CHECK(find(&l, "dst.txt") != NULL && find(&l, "dst.txt")->old_path == NULL,
+          "dst.txt stays a plain addition");
+    sg_diff_list_free(&l);
+}
+
+/* --------------- pre-Phase-51 bug, exposed by fuzz_rename.py --copies-harder
+   and fixed on master (rc/uses vs used confusion): a source that exists on
+   both sides is registered with `uses = 1` already spent (git's
+   rename_used), which is what is supposed to make it lose to a fresh
+   deletion in the "real renames only" first walk. Two call sites were
+   reading the `used` flag instead of `uses`, which starts at 0 for
+   EVERYONE (deletion or modification-shaped source alike) until something
+   actually claims it -- so a modification/unchanged source could win a
+   destination purely on score, before the deletion-only walk got a look
+   at it. */
+
+/* Writes 40 lines "m-1".."m-40" (a body shared by the deletion and the
+   modification source below), optionally followed by extra lines. */
+static void write_body_plus(const char *root, const char *rel, int body_lines,
+                            const char *const *extra, size_t n_extra)
+{
+    char path[512];
+    FILE *f;
+    int i;
+    size_t j;
+
+    snprintf(path, sizeof(path), "%s/%s", root, rel);
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "setup failed: fopen %s\n", path);
+        exit(1);
+    }
+    for (i = 1; i <= body_lines; i++)
+        fprintf(f, "m-%d\n", i);
+    for (j = 0; j < n_extra; j++)
+        fprintf(f, "%s\n", extra[j]);
+    fclose(f);
+}
+
+/* Witness A (matrix_pass): a DELETED source (del.txt, 58% similar to the
+   destination -- 25 of the destination's 40 shared lines plus 16 lines of
+   noise) competes against a MODIFICATION source (mod.txt, 96% similar,
+   still present on both sides) for the same destination. Measured against
+   git 2.55.0: git resolves ordinary renames -- deletion sources only --
+   BEFORE copies are considered at all, so the LOWER-scoring deletion wins
+   the destination outright and the higher-scoring modification is left
+   untouched. The buggy `used`-based check let the higher score win instead,
+   handing dest.txt to mod.txt as a copy and leaving del.txt an ordinary D. */
+static void test_matrix_pass_prefers_a_weaker_deletion_over_a_stronger_modification(void)
+{
+    char tmpl[] = "/tmp/sg_rename_matrix_prio_XXXXXX";
+    char *root = scratch_dir(tmpl);
+    static const char *noise[] = {
+        "n-1", "n-2", "n-3", "n-4", "n-5", "n-6", "n-7", "n-8",
+        "n-9", "n-10", "n-11", "n-12", "n-13", "n-14", "n-15", "n-16",
+    };
+    static const char *extra1[] = { "extra" };
+    static const char *extra2[] = { "extra2" };
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    /* del.txt: the first 25 of the 40 shared body lines, plus 16 unrelated
+       noise lines -- 58% similar to dest.txt, measured against git 2.55.0. */
+    {
+        char path[512];
+        FILE *f;
+        int i;
+        size_t j;
+
+        snprintf(path, sizeof(path), "%s/del.txt", root);
+        f = fopen(path, "wb");
+        if (f == NULL) {
+            fprintf(stderr, "setup failed: fopen %s\n", path);
+            exit(1);
+        }
+        for (i = 1; i <= 25; i++)
+            fprintf(f, "m-%d\n", i);
+        for (j = 0; j < sizeof(noise) / sizeof(noise[0]); j++)
+            fprintf(f, "%s\n", noise[j]);
+        fclose(f);
+    }
+    write_body_plus(root, "mod.txt", 40, extra1, 1);  /* 96% similar to dest.txt */
+    write_body_plus(root, "dest.txt", 40, extra2, 1);
+
+    memset(&l, 0, sizeof(l));
+    add_addition(&l, "dest.txt", 0xEE);
+    add_deletion(&l, "del.txt", 0xAA);
+    add(&l, "mod.txt", 1, 0xCC, 1, 0xDD); /* modification: present on both sides */
+
+    CHECK(sg_diff_detect_renames("/nonexistent", root, &l, SG_SIMILARITY_DEFAULT, 1) == 0,
+          "detection succeeds");
+    e = find(&l, "dest.txt");
+    CHECK(e != NULL && e->old_path != NULL && strcmp(e->old_path, "del.txt") == 0,
+          "dest.txt is paired to the DELETED source, not the higher-scoring modification");
+    CHECK(e != NULL && e->is_copy == 0, "and it is an ordinary RENAME, since the source is gone");
+    CHECK(e != NULL && e->score == 58, "git scores del.txt vs dest.txt at 58%%, got %d",
+          e != NULL ? e->score : -1);
+    e = find(&l, "mod.txt");
+    CHECK(e != NULL && e->old_path == NULL,
+          "mod.txt is untouched -- the higher-scoring copy never claims the "
+          "already-resolved destination");
+    CHECK(find(&l, "del.txt") == NULL, "del.txt is gone, consumed by the rename");
+
+    sg_diff_list_free(&l);
+    remove_file(root, "del.txt");
+    remove_file(root, "mod.txt");
+    remove_file(root, "dest.txt");
+    rmdir(root);
+}
+
+/* Witness B (exact_pass), DISCRIMINATING direction: aaa_mod.txt (a
+   MODIFICATION, sorts first) and zzz_del.txt (a DELETION, sorts second)
+   both held content X; zzz_del.txt is removed, aaa_mod.txt changes to Y,
+   and dest.txt is added with X -- an exact match for BOTH candidates.
+   Before the fix, exact_pass's tie-break was "first source examined in
+   list order wins" (both scored equally under the buggy `used` check,
+   since neither had been used yet), so the MODIFICATION -- sorted and thus
+   examined first -- incorrectly won as a copy, leaving the real deletion an
+   ordinary D. Fixed: the modification's `uses` is pre-loaded to 1 (git's
+   rename_used), scoring it lower than the fresh deletion, so the deletion
+   wins regardless of iteration order. */
+static void test_exact_pass_prefers_a_deletion_over_a_modification_sorted_first(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    /* Sorted by path: aaa_mod.txt, dest.txt, zzz_del.txt. */
+    add(&l, "aaa_mod.txt", 1, 0xAA, 1, 0xCC); /* modification: X -> Y */
+    add_addition(&l, "dest.txt", 0xAA);       /* X, exact match for both candidates */
+    add_deletion(&l, "zzz_del.txt", 0xAA);    /* X, deleted */
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, SG_SIMILARITY_DEFAULT, 1) == 0,
+          "detection succeeds");
+    e = find(&l, "dest.txt");
+    CHECK(e != NULL && e->old_path != NULL && strcmp(e->old_path, "zzz_del.txt") == 0,
+          "dest.txt is paired to the DELETED source, not the modification sorted before it");
+    CHECK(e != NULL && e->is_copy == 0 && e->score == 100,
+          "and it is a plain 100%% rename, since the source is gone");
+    e = find(&l, "aaa_mod.txt");
+    CHECK(e != NULL && e->old_path == NULL,
+          "aaa_mod.txt is untouched -- it never becomes a copy source here");
+    CHECK(find(&l, "zzz_del.txt") == NULL, "zzz_del.txt is gone, consumed by the rename");
+
+    sg_diff_list_free(&l);
+}
+
+/* Witness B's control, NON-discriminating direction (same content shapes,
+   names swapped so the DELETION sorts first): both the pre-fix and the
+   fixed code already agree here, because list-order iteration alone hands
+   the deletion the tie regardless of the `used`/`uses` bug. Kept as a
+   regression guard, not as evidence the bug is fixed -- see the test above
+   for the direction that actually discriminates. */
+static void test_exact_pass_deletion_sorted_first_is_not_discriminating(void)
+{
+    sg_diff_list l;
+    const sg_diff_entry *e;
+
+    memset(&l, 0, sizeof(l));
+    /* Sorted by path: aaa_del.txt, dest.txt, zzz_mod.txt. */
+    add_deletion(&l, "aaa_del.txt", 0xAA);    /* X, deleted */
+    add_addition(&l, "dest.txt", 0xAA);       /* X, exact match for both candidates */
+    add(&l, "zzz_mod.txt", 1, 0xAA, 1, 0xCC); /* modification: X -> Y */
+
+    CHECK(sg_diff_detect_renames("/nonexistent", "/nonexistent", &l, SG_SIMILARITY_DEFAULT, 1) == 0,
+          "detection succeeds");
+    e = find(&l, "dest.txt");
+    CHECK(e != NULL && e->old_path != NULL && strcmp(e->old_path, "aaa_del.txt") == 0,
+          "dest.txt is still paired to the deletion here");
+    CHECK(e != NULL && e->is_copy == 0 && e->score == 100, "a plain 100%% rename");
+    e = find(&l, "zzz_mod.txt");
+    CHECK(e != NULL && e->old_path == NULL, "zzz_mod.txt is untouched");
+    CHECK(find(&l, "aaa_del.txt") == NULL, "aaa_del.txt is gone, consumed by the rename");
+
+    sg_diff_list_free(&l);
+}
+
 int main(void)
 {
     test_exact_rename_becomes_one_row();
@@ -1226,6 +1598,17 @@ int main(void)
     test_without_copy_detection_the_same_fixture_is_one_rename();
     test_a_modified_row_as_copy_source_is_always_a_copy();
     test_without_copy_detection_a_modification_is_never_a_source();
+    test_unchanged_source_pairs_as_copy_never_rename();
+    test_one_unchanged_source_two_destinations_both_copies();
+    test_exact_pass_reuses_one_unchanged_source_for_two_destinations();
+    test_an_unchanged_row_is_never_a_destination();
+    test_every_unchanged_row_is_stripped_when_paired();
+    test_every_unchanged_row_is_stripped_when_not_paired();
+    test_unchanged_row_stripped_on_the_min_score_early_out();
+    test_unchanged_row_not_a_source_without_copy_detection();
+    test_matrix_pass_prefers_a_weaker_deletion_over_a_stronger_modification();
+    test_exact_pass_prefers_a_deletion_over_a_modification_sorted_first();
+    test_exact_pass_deletion_sorted_first_is_not_discriminating();
 
     if (failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);

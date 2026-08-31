@@ -440,6 +440,7 @@ static int cmd_stash_show(int argc, char **argv)
         "usage: sg stash show [-p|--patch] [--stat[=<w>[,<n>]]] [--numstat] [--shortstat] "
         "[--name-only]\n"
         "                      [--name-status] [-M[<n>]|--find-renames[=<n>]|--no-renames]\n"
+        "                      [-C[<n>]|--find-copies[=<n>]|--find-copies-harder]\n"
         "                      [--histogram] [-u|--include-untracked] [--only-untracked] "
         "[<stash>]\n";
     sg_diff_out_opts opts;
@@ -455,8 +456,20 @@ static int cmd_stash_show(int argc, char **argv)
     char bad_path[SG_PATH_MAX];
     int rc;
     int exit_rc;
-    /* Same scale and same default as `sg diff -M` -- see sg/similarity.h. */
-    int rename_score = SG_SIMILARITY_DEFAULT;
+    /* Same scale and same default as `sg diff -M` -- see sg/similarity.h.
+       Computed after the argv loop from detect/cli_score/harder below. */
+    int rename_score;
+    int detect_copies;
+    int copies_harder;
+    /* Phase 51: same state machine as sg_cmd_diff -- see cmd_diff.c and
+       docs/DESIGN.md Phase 51 for the measured truth table. Duplicated
+       rather than shared: the two commands' argv loops have different
+       shapes (this one also resolves format_given/diff_opt_given), and
+       neither file is on the list of files this phase's spec allows adding
+       a new shared header to. */
+    enum { DETECT_NONE, DETECT_RENAME, DETECT_COPY } detect = DETECT_RENAME;
+    int cli_score = 0; /* 0 means "use the default" */
+    int harder = 0;
     /* git's implied -p (Phase 44), measured against git 2.55.0: `git stash
        show` defaults to a diffstat, but any DIFF option that is not itself a
        format selector switches it to a patch -- -M, -C, --no-renames,
@@ -504,21 +517,49 @@ static int cmd_stash_show(int argc, char **argv)
             opts.format = SG_DIFF_FORMAT_NAME_STATUS;
             format_given = 1;
         } else if (strcmp(a, "--no-renames") == 0) {
-            rename_score = 0;
+            /* Leaves cli_score and harder alone, same as sg_cmd_diff. */
+            detect = DETECT_NONE;
             diff_opt_given = 1;
         } else if (strcmp(a, "--histogram") == 0) {
             opts.algorithm = SG_DIFF_ALGO_HISTOGRAM;
             diff_opt_given = 1;
+        } else if (strcmp(a, "--no-find-copies-harder") == 0) {
+            harder = 0;
+            diff_opt_given = 1;
+        } else if (strcmp(a, "--find-copies-harder") == 0) {
+            harder = 1;
+            diff_opt_given = 1;
+        } else if (strcmp(a, "-C") == 0 || strcmp(a, "--find-copies") == 0) {
+            cli_score = 0;
+            if (detect == DETECT_COPY)
+                harder = 1;
+            else
+                detect = DETECT_COPY;
+            diff_opt_given = 1;
+        } else if (strncmp(a, "-C", 2) == 0 || strncmp(a, "--find-copies=", 14) == 0) {
+            const char *v = a[1] == 'C' ? a + 2 : a + strlen("--find-copies=");
+
+            if (sg_similarity_parse_score_arg(v, &cli_score) != 0) {
+                fputs(usage, stderr);
+                return 1;
+            }
+            if (detect == DETECT_COPY)
+                harder = 1;
+            else
+                detect = DETECT_COPY;
+            diff_opt_given = 1;
         } else if (strcmp(a, "-M") == 0 || strcmp(a, "--find-renames") == 0) {
-            rename_score = SG_SIMILARITY_DEFAULT;
+            cli_score = 0;
+            detect = DETECT_RENAME;
             diff_opt_given = 1;
         } else if (strncmp(a, "-M", 2) == 0 || strncmp(a, "--find-renames=", 15) == 0) {
             const char *v = a[1] == 'M' ? a + 2 : a + 15;
 
-            if (sg_similarity_parse_score_arg(v, &rename_score) != 0) {
+            if (sg_similarity_parse_score_arg(v, &cli_score) != 0) {
                 fputs(usage, stderr);
                 return 1;
             }
+            detect = DETECT_RENAME;
             diff_opt_given = 1;
         } else if (strcmp(a, "-u") == 0 || strcmp(a, "--include-untracked") == 0) {
             umode = SHOW_UNTRACKED_INCLUDE;
@@ -539,6 +580,17 @@ static int cmd_stash_show(int argc, char **argv)
        format_given for why the order must not matter. */
     if (!format_given && diff_opt_given)
         opts.format = SG_DIFF_FORMAT_PATCH;
+
+    /* Same resolution as sg_cmd_diff -- see cmd_diff.c and docs/DESIGN.md
+       Phase 51. detect's init is DETECT_RENAME for the identical reason
+       cmd_diff.c's is: `sg stash show` already detected renames by default
+       (rename_score initialized to SG_SIMILARITY_DEFAULT) before this phase,
+       and section 1's oracle table cannot distinguish the two inits. */
+    if (harder)
+        detect = DETECT_COPY;
+    rename_score = (detect == DETECT_NONE) ? 0 : (cli_score ? cli_score : SG_SIMILARITY_DEFAULT);
+    detect_copies = (detect == DETECT_COPY);
+    copies_harder = harder;
 
     if (sg_stash_parse_spec(spec, &index) != 0) {
         fprintf(stderr, "sg: invalid stash spec: %s\n", spec != NULL ? spec : "");
@@ -588,7 +640,7 @@ static int cmd_stash_show(int argc, char **argv)
            exactly that, an empty diff list. */
         const unsigned char *new_tree = trees.has_untracked ? trees.untracked_tree : NULL;
 
-        rc = sg_diff_trees(git_dir, NULL, new_tree, &diff_list, bad_path);
+        rc = sg_diff_trees(git_dir, NULL, new_tree, &diff_list, bad_path, 0);
     } else if (umode == SHOW_UNTRACKED_INCLUDE && trees.has_untracked) {
         sg_diff_list tracked_list;
         sg_diff_list untracked_list;
@@ -596,7 +648,15 @@ static int cmd_stash_show(int argc, char **argv)
         memset(&tracked_list, 0, sizeof(tracked_list));
         memset(&untracked_list, 0, sizeof(untracked_list));
 
-        rc = sg_diff_trees(git_dir, trees.base_tree, trees.theirs_tree, &tracked_list, bad_path);
+        /* Phase 51: include_unchanged only on this, the TRACKED half --
+           SPEC section 3.2, measured: `stash show -u -C -C` prints
+           "C094 src.txt untracked.txt", an untracked addition copying off a
+           tracked unchanged file, which only works because this tracked
+           list is what -C -C's unchanged rows come from; the untracked
+           half's own comparison below (against the empty tree) can never
+           hold an unchanged row, since it has no old side at all. */
+        rc = sg_diff_trees(git_dir, trees.base_tree, trees.theirs_tree, &tracked_list, bad_path,
+                           copies_harder);
         if (rc == 0)
             /* NULL (empty tree), not trees.base_tree, on the old side here:
                diffing base_tree vs untracked_tree would also report every
@@ -611,7 +671,7 @@ static int cmd_stash_show(int argc, char **argv)
                "a.txt\na.txt\nb.txt\nc.txt\nc.txt" -- a.txt/c.txt doubled,
                once as the tracked_list's genuine modification and once as
                a phantom "deletion" from this call -- before this fix). */
-            rc = sg_diff_trees(git_dir, NULL, trees.untracked_tree, &untracked_list, bad_path);
+            rc = sg_diff_trees(git_dir, NULL, trees.untracked_tree, &untracked_list, bad_path, 0);
         if (rc == 0 && merge_diff_lists(&tracked_list, &untracked_list, &diff_list) != 0)
             rc = -1;
         if (rc != 0) {
@@ -622,7 +682,8 @@ static int cmd_stash_show(int argc, char **argv)
         /* Default, and -u with no untracked parent (measured: falls back to
            the tracked-only diff rather than erroring, same as
            --only-untracked's fallback above). */
-        rc = sg_diff_trees(git_dir, trees.base_tree, trees.theirs_tree, &diff_list, bad_path);
+        rc = sg_diff_trees(git_dir, trees.base_tree, trees.theirs_tree, &diff_list, bad_path,
+                           copies_harder);
     }
 
     if (rc == -2) {
@@ -649,7 +710,7 @@ static int cmd_stash_show(int argc, char **argv)
        merge, would quietly give a different answer. It needs no special case
        here, only this ordering -- it falls out of the pass order documented
        in sg/diff.h. */
-    if (sg_diff_detect_renames(git_dir, repo_root, &diff_list, rename_score, 0) != 0) {
+    if (sg_diff_detect_renames(git_dir, repo_root, &diff_list, rename_score, detect_copies) != 0) {
         fprintf(stderr, "sg: out of memory, cannot detect renames\n");
         sg_diff_list_free(&diff_list);
         free(repo_root);

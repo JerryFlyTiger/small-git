@@ -188,7 +188,7 @@ static void test_trees_add_delete_modify(void)
     build_tree(git_dir, old_specs, 3, old_tree);
     build_tree(git_dir, new_specs, 3, new_tree);
 
-    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL) == 0, "sg_diff_trees failed");
+    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL, 0) == 0, "sg_diff_trees failed");
     CHECK(list.count == 3, "expected 3 changed paths (add/delete/modify), got %zu", list.count);
 
     e = find_entry(&list, "added.txt");
@@ -244,7 +244,7 @@ static void test_trees_mode_only_change(void)
     CHECK(sg_tree_build(git_dir, entries, 1, new_tree) == 0, "new tree build failed");
     free(entries[0].path);
 
-    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL) == 0, "sg_diff_trees failed");
+    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL, 0) == 0, "sg_diff_trees failed");
     CHECK(list.count == 1, "expected exactly the mode-only change, got %zu entries", list.count);
     e = find_entry(&list, "run.sh");
     CHECK(e != NULL, "run.sh missing from diff list");
@@ -275,7 +275,7 @@ static void test_null_tree_is_empty_tree(void)
 
     build_tree(git_dir, specs, 2, new_tree);
 
-    CHECK(sg_diff_trees(git_dir, NULL, new_tree, &list, NULL) == 0, "sg_diff_trees with NULL old_tree failed");
+    CHECK(sg_diff_trees(git_dir, NULL, new_tree, &list, NULL, 0) == 0, "sg_diff_trees with NULL old_tree failed");
     CHECK(list.count == 2, "NULL old_tree should make everything in new_tree an addition, got %zu",
          list.count);
     if (list.count == 2) {
@@ -285,7 +285,7 @@ static void test_null_tree_is_empty_tree(void)
     }
     sg_diff_list_free(&list);
 
-    CHECK(sg_diff_trees(git_dir, NULL, NULL, &list, NULL) == 0, "sg_diff_trees with both NULL failed");
+    CHECK(sg_diff_trees(git_dir, NULL, NULL, &list, NULL, 0) == 0, "sg_diff_trees with both NULL failed");
     CHECK(list.count == 0, "both trees NULL should produce an empty diff list, got %zu", list.count);
     sg_diff_list_free(&list);
 
@@ -317,7 +317,7 @@ static void test_output_sorted_by_path(void)
 
     build_tree(git_dir, specs, 3, new_tree);
 
-    CHECK(sg_diff_trees(git_dir, NULL, new_tree, &list, NULL) == 0, "sg_diff_trees failed");
+    CHECK(sg_diff_trees(git_dir, NULL, new_tree, &list, NULL, 0) == 0, "sg_diff_trees failed");
     CHECK(list.count == 3, "expected 3 entries, got %zu", list.count);
     if (list.count == 3) {
         CHECK(strcmp(list.entries[0].path, "a.txt") == 0, "entry 0 should be a.txt, got %s",
@@ -370,7 +370,7 @@ static void test_tree_index_stage0_add_delete_modify(void)
     index_upsert_blob(&idx, "changed.txt", 0100644, id_changed_new);
     index_upsert_blob(&idx, "same.txt", 0100644, id_same);
 
-    CHECK(sg_diff_tree_index(git_dir, old_tree, &idx, &list, NULL) == 0, "sg_diff_tree_index failed");
+    CHECK(sg_diff_tree_index(git_dir, old_tree, &idx, &list, NULL, 0) == 0, "sg_diff_tree_index failed");
     CHECK(list.count == 3, "expected 3 changed paths (add/delete/modify), got %zu", list.count);
 
     e = find_entry(&list, "added.txt");
@@ -440,7 +440,7 @@ static void test_tree_index_unmerged_is_single_row(void)
     index_upsert_stage(&idx, "new_conflict.txt", 2, 0100644, id2);
     index_upsert_stage(&idx, "new_conflict.txt", 3, 0100644, id3);
 
-    CHECK(sg_diff_tree_index(git_dir, old_tree, &idx, &list, NULL) == 0, "sg_diff_tree_index failed");
+    CHECK(sg_diff_tree_index(git_dir, old_tree, &idx, &list, NULL, 0) == 0, "sg_diff_tree_index failed");
     CHECK(list.count == 2, "expected exactly one row per conflicted path, got %zu", list.count);
 
     e = find_entry(&list, "conflict.txt");
@@ -635,7 +635,7 @@ static void test_tree_workdir_addition_side_has_id_and_mode(void)
     memset(&idx, 0, sizeof(idx));
     index_upsert_blob(&idx, "added.sh", 0100755, id);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir failed");
 
     e = find_entry(&list, "added.sh");
@@ -780,7 +780,7 @@ static void test_tree_workdir_rm_cached_is_deletion(void)
 
     memset(&idx, 0, sizeof(idx));
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir failed");
     CHECK(list.count == 1,
          "expected tracked.txt to be reported despite being unchanged on disk, got %zu entries",
@@ -834,7 +834,7 @@ static void test_tree_workdir_content_compare_and_addition(void)
     index_upsert_blob(&idx, "unchanged.txt", 0100644, id_unchanged);
     index_upsert_blob(&idx, "staged.txt", 0100644, id_unchanged);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir failed");
 
     e = find_entry(&list, "changed.txt");
@@ -902,7 +902,7 @@ static void test_tree_workdir_unmerged_not_special(void)
     index_upsert_stage(&idx, "resolved.txt", 2, 0100644, id2);
     index_upsert_stage(&idx, "resolved.txt", 3, 0100644, id3);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir failed");
     CHECK(list.count == 1, "expected exactly conflict.txt's row, got %zu", list.count);
 
@@ -1023,7 +1023,7 @@ static void test_flatten_bad_path_propagates(void)
     free(serialized);
 
     memset(bad_path, 0, sizeof(bad_path));
-    rc = sg_diff_trees(git_dir, root_tree, NULL, &list, bad_path);
+    rc = sg_diff_trees(git_dir, root_tree, NULL, &list, bad_path, 0);
     CHECK(rc == -2, "expected sg_diff_trees to propagate sg_tree_flatten's -2, got %d", rc);
     CHECK(strcmp(bad_path, ".git") == 0, "expected bad_path \".git\", got \"%s\"", bad_path);
 
@@ -1151,7 +1151,7 @@ static void test_chunk_pointer_normalization_tree_workdir(void)
     memset(&empty_idx, 0, sizeof(empty_idx));
     index_upsert_blob(&empty_idx, "big.bin", 0100644, pointer_id);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir failed");
     CHECK(list.count == 0,
          "unmodified chunked content in a TREE entry must normalize to the working tree's hash "
@@ -1166,7 +1166,7 @@ static void test_chunk_pointer_normalization_tree_workdir(void)
     data[0] ^= 0xFF;
     write_workdir_file_bytes(repo_root, "big.bin", data, len);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, tree_id, &empty_idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir failed on the modified fixture");
     CHECK(list.count == 1, "modified chunked content should be reported as changed, got %zu",
          list.count);
@@ -1295,7 +1295,7 @@ static void test_tree_workdir_unreadable_blob_does_not_silence_others(void)
     index_upsert_blob(&idx, "broken.txt", 0100644, id_broken);
     index_upsert_blob(&idx, "other.txt", 0100644, id_other);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir must return 0, not -1, when one path's tree blob is unreadable");
     CHECK(list.count == 2, "expected both paths to be reported, got %zu", list.count);
 
@@ -1444,7 +1444,7 @@ static void test_tree_workdir_unreadable_workdir_file_is_absent(void)
     memset(&idx, 0, sizeof(idx));
     index_upsert_blob(&idx, "was_file.txt", 0100644, id);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir failed");
     CHECK(list.count == 1, "expected exactly one row, got %zu", list.count);
 
@@ -1503,7 +1503,7 @@ static void test_tree_workdir_unreadable_addition_is_still_reported(void)
     index_upsert_blob(&idx, "added.txt", 0100644, id);
     index_upsert_blob(&idx, "unrelated.txt", 0100644, id);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir failed");
 
     e = find_entry(&list, "added.txt");
@@ -1523,6 +1523,151 @@ static void test_tree_workdir_unreadable_addition_is_still_reported(void)
              "a non-regular stand-in must report 100644, not its own permission bits (got %06o)",
              e->new_side.mode);
     }
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* --------------------------------- Phase 51: include_unchanged ---------- */
+
+/* sg_diff_trees: an unchanged path is only appended when asked, carries
+   `unchanged = 1`, both sides filled exactly as an ordinary row's would be,
+   and the list stays sorted by path (it sits between "added.txt" and
+   "changed.txt" here on purpose). */
+static void test_trees_include_unchanged(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    unsigned char new_tree[SG_SHA1_RAW_LEN];
+    tree_spec old_specs[] = {
+        {"before.txt", 0100644, "steady state\n"},
+        {"changed.txt", 0100644, "before\n"},
+    };
+    tree_spec new_specs[] = {
+        {"added.txt", 0100644, "brand new\n"},
+        {"before.txt", 0100644, "steady state\n"},
+        {"changed.txt", 0100644, "after\n"},
+    };
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    build_tree(git_dir, old_specs, 2, old_tree);
+    build_tree(git_dir, new_specs, 3, new_tree);
+
+    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL, 0) == 0, "sg_diff_trees failed");
+    CHECK(find_entry(&list, "before.txt") == NULL,
+         "include_unchanged=0 must reproduce the pre-Phase-51 behaviour exactly");
+    sg_diff_list_free(&list);
+
+    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL, 1) == 0, "sg_diff_trees failed");
+    CHECK(list.count == 3, "added.txt, before.txt (unchanged), changed.txt, got %zu", list.count);
+    CHECK(strcmp(list.entries[0].path, "added.txt") == 0 &&
+             strcmp(list.entries[1].path, "before.txt") == 0 &&
+             strcmp(list.entries[2].path, "changed.txt") == 0,
+         "the list must stay sorted by path with the unchanged row in its natural position");
+    e = find_entry(&list, "before.txt");
+    CHECK(e != NULL && e->unchanged == 1, "before.txt is present and flagged unchanged");
+    if (e != NULL) {
+        CHECK(e->old_side.kind == SG_DIFF_SIDE_BLOB && e->new_side.kind == SG_DIFF_SIDE_BLOB,
+             "an unchanged row still carries real BLOB sides, same as any other row");
+        CHECK(memcmp(e->old_side.id, e->new_side.id, SG_SHA1_RAW_LEN) == 0,
+             "an unchanged row's two sides carry identical content");
+    }
+    e = find_entry(&list, "changed.txt");
+    CHECK(e != NULL && !e->unchanged, "a genuinely changed row is never flagged unchanged");
+
+    sg_diff_list_free(&list);
+    free(git_dir);
+}
+
+/* sg_diff_tree_index: same contract, plus an unmerged path must never be
+   reported as unchanged even when include_unchanged is set. */
+static void test_tree_index_include_unchanged(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    unsigned char id_same[SG_SHA1_RAW_LEN];
+    unsigned char id1[SG_SHA1_RAW_LEN], id2[SG_SHA1_RAW_LEN], id3[SG_SHA1_RAW_LEN];
+    tree_spec old_specs[] = {
+        {"conflict.txt", 0100644, "base content\n"},
+        {"same.txt", 0100644, "unchanged\n"},
+    };
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    build_tree(git_dir, old_specs, 2, old_tree);
+    blob(git_dir, "unchanged\n", id_same);
+    blob(git_dir, "base\n", id1);
+    blob(git_dir, "ours\n", id2);
+    blob(git_dir, "theirs\n", id3);
+
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "same.txt", 0100644, id_same);
+    index_upsert_stage(&idx, "conflict.txt", 1, 0100644, id1);
+    index_upsert_stage(&idx, "conflict.txt", 2, 0100644, id2);
+    index_upsert_stage(&idx, "conflict.txt", 3, 0100644, id3);
+
+    CHECK(sg_diff_tree_index(git_dir, old_tree, &idx, &list, NULL, 1) == 0,
+         "sg_diff_tree_index failed");
+    CHECK(list.count == 2, "conflict.txt (unmerged) plus same.txt (unchanged), got %zu",
+         list.count);
+    e = find_entry(&list, "same.txt");
+    CHECK(e != NULL && e->unchanged == 1, "same.txt is reported and flagged unchanged");
+    e = find_entry(&list, "conflict.txt");
+    CHECK(e != NULL && e->unmerged && !e->unchanged,
+         "an unmerged path is never unchanged, no matter what include_unchanged says");
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(git_dir);
+}
+
+/* sg_diff_tree_workdir: same contract, plus a path whose working-tree file
+   is missing must never be reported as unchanged. */
+static void test_tree_workdir_include_unchanged(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    unsigned char id[SG_SHA1_RAW_LEN];
+    tree_spec specs[] = {
+        {"gone.txt", 0100644, "will be removed from disk\n"},
+        {"steady.txt", 0100644, "steady state\n"},
+    };
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    build_tree(git_dir, specs, 2, old_tree);
+    blob(git_dir, "will be removed from disk\n", id); /* just to get an id for the index */
+
+    write_workdir_file(repo_root, "steady.txt", "steady state\n");
+    /* gone.txt deliberately never written to disk: index has it, but the
+       working tree does not -- must never be reported unchanged even though
+       include_unchanged is set. */
+
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "gone.txt", 0100644, id);
+    index_upsert_blob(&idx, "steady.txt", 0100644, id); /* content irrelevant to this index */
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 0) == 0,
+         "sg_diff_tree_workdir failed");
+    CHECK(find_entry(&list, "gone.txt") != NULL,
+         "gone.txt is a deletion (tree has it, workdir does not) regardless of include_unchanged");
+    CHECK(find_entry(&list, "steady.txt") == NULL,
+         "include_unchanged=0 must reproduce the pre-Phase-51 behaviour exactly");
+    sg_diff_list_free(&list);
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 0, 1) == 0,
+         "sg_diff_tree_workdir failed");
+    e = find_entry(&list, "steady.txt");
+    CHECK(e != NULL && e->unchanged == 1, "steady.txt is present and flagged unchanged");
+    e = find_entry(&list, "gone.txt");
+    CHECK(e != NULL && !e->unchanged,
+         "gone.txt is a deletion (missing from the working tree), never unchanged");
 
     sg_diff_list_free(&list);
     sg_index_free(&idx);
@@ -1558,6 +1703,9 @@ int main(void)
     test_index_workdir_unreadable_workdir_file_is_absent();
     test_tree_workdir_unreadable_workdir_file_is_absent();
     test_tree_workdir_unreadable_addition_is_still_reported();
+    test_trees_include_unchanged();
+    test_tree_index_include_unchanged();
+    test_tree_workdir_include_unchanged();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

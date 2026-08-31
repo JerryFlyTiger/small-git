@@ -378,7 +378,7 @@ static void run_and_check(const char *git_dir, head_builder *hb, sg_index *idx,
 
     CHECK(sg_status_diff_staged(git_dir, git_dir, has_tree ? tree_id : NULL, idx, 0, NULL, &slist, NULL) == 0,
          "%s: sg_status_diff_staged failed", label);
-    CHECK(sg_diff_tree_index(git_dir, has_tree ? tree_id : NULL, idx, &dlist, NULL) == 0,
+    CHECK(sg_diff_tree_index(git_dir, has_tree ? tree_id : NULL, idx, &dlist, NULL, 0) == 0,
          "%s: sg_diff_tree_index failed", label);
 
     for (i = 0; i < n_paths; i++) {
@@ -781,7 +781,7 @@ static void test_corrupt_index_duplicate_path(void)
 
     CHECK(sg_status_diff_staged(git_dir, git_dir, has_tree ? tree_id : NULL, &idx, 0, NULL, &slist, NULL) == 0,
          "corrupt_dup: sg_status_diff_staged failed");
-    CHECK(sg_diff_tree_index(git_dir, has_tree ? tree_id : NULL, &idx, &dlist, NULL) == 0,
+    CHECK(sg_diff_tree_index(git_dir, has_tree ? tree_id : NULL, &idx, &dlist, NULL, 0) == 0,
          "corrupt_dup: sg_diff_tree_index failed");
 
     fprintf(stderr,
@@ -1150,7 +1150,7 @@ static void fuzz_parity_round(uint64_t seed)
 
     status_rc = sg_status_diff_staged(git_dir, git_dir, has_tree ? tree_id : NULL, &idx, 0, NULL,
                                      &slist, NULL);
-    diff_rc = sg_diff_tree_index(git_dir, has_tree ? tree_id : NULL, &idx, &dlist, NULL);
+    diff_rc = sg_diff_tree_index(git_dir, has_tree ? tree_id : NULL, &idx, &dlist, NULL, 0);
 
     CHECK(status_rc == 0, "seed %llu: sg_status_diff_staged failed unexpectedly",
          (unsigned long long)seed);

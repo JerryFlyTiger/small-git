@@ -69,7 +69,7 @@ static void print_fast_forward_report(const char *git_dir, const char *repo_root
     if (sg_commit_tree_of(git_dir, ours_commit, ours_tree) != 0)
         return;
     memset(&list, 0, sizeof(list));
-    if (sg_diff_trees(git_dir, ours_tree, theirs_tree, &list, bad_path) != 0) {
+    if (sg_diff_trees(git_dir, ours_tree, theirs_tree, &list, bad_path, 0) != 0) {
         sg_diff_list_free(&list);
         return;
     }

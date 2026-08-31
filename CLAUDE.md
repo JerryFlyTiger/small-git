@@ -463,8 +463,10 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   WARNING: **`--patience`, `--minimal` and `--diff-algorithm=<name>` are
   rejected as unknown flags, not approximated** -- sg has two aligners and
   answering "patience" with one of them is a wrong answer wearing the right
-  flag (same reasoning as `-C -C`). git accepts all four and exits 129 on a
-  bad name; sg exits 1. Both sides pinned in interop's `phase42` group.
+  flag (same reasoning as `--find-copies-harder=<anything>` staying rejected
+  rather than quietly treated as plain `--find-copies-harder`, Phase 51).
+  git accepts all four and exits 129 on a bad name; sg exits 1. Both sides
+  pinned in interop's `phase42` group.
   When touching `diff_out.c` / `diff_lcs.c` / `workdir/diff.c`, a green
   `make test` **does not count**, run `python3 tests/fuzz_diff.py 500
   --max-failures 0` AND `python3 tests/fuzz_diff.py 500 --histogram
@@ -764,11 +766,61 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   merely edited file); a source may be paired more than once; and **the
   same-file-name shortcut is skipped entirely**. Dropping any one of them
   gives a different answer from git.
-  WARNING: **`-C -C` / `--find-copies-harder` is REJECTED, not approximated**
-  (`cmd_diff.c` exits 1 with a named message). It offers every *unchanged*
-  path as a copy source, and `sg_diff_list` only holds paths that changed --
-  answering it as plain `-C` would be a quietly wrong answer. Real git accepts
-  it; interop pins both halves of that divergence.
+  WARNING: **`-C -C` / `--find-copies-harder` is implemented as of Phase 51**
+  (previously rejected outright). It offers every *unchanged* path as a copy
+  source in addition to plain `-C`'s deleted/edited ones, which needed a
+  data-layer change: `sg_diff_list` used to only ever hold paths that
+  changed, so the three tree-facing builders (`sg_diff_trees`,
+  `sg_diff_tree_index`, `sg_diff_tree_workdir`) gained a mandatory
+  `include_unchanged` parameter and `sg_diff_entry` gained an `unchanged`
+  field that `sg_diff_detect_renames` strips before returning, on every
+  success path. `sg_diff_index_workdir` deliberately did NOT gain the
+  parameter -- every path there comes from the index, so there is no
+  addition for a copy to land on (measured: `git diff -C -C` with no `--cached`
+  and no `<rev>` still prints only `M`, never `C`, for a staged-then-edited
+  or an unchanged-plus-modified fixture). The CLI state machine (`detect` in
+  {NONE, RENAME, COPY}, a staged `score`, and `harder`, resolved only AFTER
+  the argv loop) is a faithful port of git's own; see Phase 51 of
+  `docs/DESIGN.md` for the full measured truth table -- three results falsify
+  simpler models: `--no-renames` does NOT cancel `--find-copies-harder` and
+  does NOT reset the score; a bare `-C` RESETS the score to the default; and
+  `-C95 --no-renames -C` finds nothing, because `--no-renames` cleared
+  `detect` first so the following `-C` takes the "not yet COPY" branch and
+  never sets `harder`.
+  WARNING: **a genuinely PRE-EXISTING bug was exposed and fixed during
+  Phase 51**: `src/workdir/rename.c`'s `exact_pass` and
+  `claim_from_matrix` were reading git's `rename_used` counter (`uses` on
+  `rename_cand`) as if it were the plain boolean `used` flag, at two call
+  sites. `uses` starts at 0 for a fresh deletion and is PRE-LOADED to 1 for
+  a source that exists on both sides (a modification, or -- since Phase 51
+  -- an unchanged row) -- **`uses` IS git's `rename_used`, `used` is NOT a
+  substitute for it**: real git resolves ordinary renames (deletion
+  sources only) in a dedicated FIRST pass, and only THEN considers copies
+  (modification/unchanged sources) for whatever destinations are still
+  unclaimed, so a modification/unchanged source must never win the
+  "real renames only" walk regardless of score. Reading `used` erased that
+  distinction, since `used` starts at 0 for every FRESH source no matter
+  its kind, letting a higher-scoring modification/unchanged source
+  outscore or out-tie-break a genuine deletion for the same destination.
+  Reproduced (and pinned) with plain `-C` and a genuine modification
+  source -- no `-C -C`, no `unchanged` row needed, i.e. this predates
+  Phase 51 entirely. Fixed at three sites, all in `src/workdir/rename.c`:
+  `exact_pass`'s skip condition and its tie-break score, and
+  `claim_from_matrix`'s rename-only-walk skip -- all three now read
+  `uses > 0` instead of `used`. See Phase 51 of `docs/DESIGN.md` for the
+  two measured witness shapes (`matrix_pass`, `exact_pass`) and their
+  fixtures.
+  WARNING: **the `exact_pass` witness has a direction trap, and both
+  directions are pinned** (`tests/test_rename.c`,
+  `tests/interop.sh`'s `phase51:` group): with the modification's path
+  sorting BEFORE the deletion's, the old iteration-order tie-break picked
+  the modification and was wrong; with the deletion sorting first, plain
+  iteration order already gave the right answer even before the fix, so
+  that direction alone is a control, not evidence -- the same
+  "fixtures all pointing one way hide the gap" lesson this project has
+  hit before. `tests/fuzz_rename.py --copies-harder` (new in Phase 51)
+  measured 0.8%-1.7% mismatches per 120-round sample before the fix,
+  0/120 across two seed ranges after it.
   WARNING: **`-M` and `-C` write the same mode; the LAST one wins.** Measured:
   `git diff -C -M` finds renames only, `-M -C` finds copies. So every `-M`
   branch in `cmd_diff.c` must clear `detect_copies`, and every `-C` branch
@@ -1428,19 +1480,23 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 
 ## Deliberate divergences from real git
 
-Five places where sg's answer differs from real git **on purpose**, not by
+Four places where sg's answer differs from real git **on purpose**, not by
 oversight -- each was measured against git 2.55.0, each is pinned on both
 sides by an interop check (so accidentally "fixing" one back into silent
 agreement with git would itself go undetected without the pin), and none of
 them should be "fixed" without first re-reading the WARNING that explains
 why the divergence exists.
 
-1. **`-C -C` / `--find-copies-harder` is rejected outright** (Phase 33,
-   `cmd_diff.c`), not approximated -- see the module notes' `-C -C` WARNING.
-2. **`* Unmerged path` stays unquoted regardless of `core.quotePath`**
+(This list used to have a fifth entry, `-C -C` / `--find-copies-harder`
+being rejected outright -- **implemented as of Phase 51**, see the module
+notes' `-C -C` WARNING and the Phase 51 section of `docs/DESIGN.md`. It is
+no longer a divergence, so it is gone from this list rather than marked
+"fixed" in place, to keep the numbering meaning what it says.)
+
+1. **`* Unmerged path` stays unquoted regardless of `core.quotePath`**
    (Phase 34) -- real git leaves this one line unquoted even when every
    other path is quoted; see PHASE34_ORACLE.md #1.
-3. **`sg status --porcelain` prints a fixed `AD` for a path that escapes the
+2. **`sg status --porcelain` prints a fixed `AD` for a path that escapes the
    repository via a crafted index, in all three possible real-world states**
    (Phase 36) -- real git actually reads the file outside the repository to
    decide between `A `/`AM`/`AD`; sg refuses to read it at all (the fix Phase
@@ -1448,7 +1504,7 @@ why the divergence exists.
    always reports the one that draws the user's attention rather than the one
    that could silently claim "clean". See the Phase 36 section of
    `docs/DESIGN.md` for the full three-row measurement.
-4. **`sg push` uses exit code 1 where real git uses 128 for a client-side
+3. **`sg push` uses exit code 1 where real git uses 128 for a client-side
    refspec syntax error** (empty dst, `--delete` with a colon, an
    already-`refs/`-prefixed malformed dst -- Phase 39) -- this project's own
    convention is "exit codes are only ever 0 or 1" (see Code conventions
@@ -1457,7 +1513,7 @@ why the divergence exists.
    NOT apply** to a `<src>` that resolves to nothing (`error: src refspec
    ... does not match any`) -- git's own exit code there is already 1, no
    divergence to pin.
-5. **`sg merge`'s conflict-marker "ours" label names the current branch
+4. **`sg merge`'s conflict-marker "ours" label names the current branch
    where real git always writes `HEAD`** (`cmd_merge.c`'s `ours_label`,
    which also feeds the generated merge message and the summary line).
    Measured in Phase 41 across five situations -- a differently named

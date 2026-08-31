@@ -243,7 +243,7 @@ static void build_cached_list(const char *git_dir, const char *repo_root, sg_dif
         tree_ptr = tree_id;
     }
     CHECK(sg_index_read(git_dir, &idx) == 0, "index read failed");
-    CHECK(sg_diff_tree_index(git_dir, tree_ptr, &idx, out, bad_path) == 0, "sg_diff_tree_index failed");
+    CHECK(sg_diff_tree_index(git_dir, tree_ptr, &idx, out, bad_path, 0) == 0, "sg_diff_tree_index failed");
     sg_index_free(&idx);
 }
 
@@ -489,7 +489,7 @@ static void test_name_status_add_delete(void)
     CHECK(sg_commit_tree_of(git_dir, old_commit, old_tree) == 0, "commit_tree_of(old) failed");
     CHECK(sg_commit_tree_of(git_dir, new_commit, new_tree) == 0, "commit_tree_of(new) failed");
 
-    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL) == 0, "sg_diff_trees failed");
+    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL, 0) == 0, "sg_diff_trees failed");
 
     memset(&opts, 0, sizeof(opts));
     opts.format = SG_DIFF_FORMAT_NAME_STATUS;
@@ -807,7 +807,7 @@ static void test_patch_add_and_delete_index_lines(void)
     CHECK(sg_commit_tree_of(git_dir, old_commit, old_tree) == 0, "commit_tree_of(old) failed");
     CHECK(sg_commit_tree_of(git_dir, new_commit, new_tree) == 0, "commit_tree_of(new) failed");
 
-    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL) == 0, "sg_diff_trees failed");
+    CHECK(sg_diff_trees(git_dir, old_tree, new_tree, &list, NULL, 0) == 0, "sg_diff_trees failed");
 
     memset(&opts, 0, sizeof(opts));
     opts.format = SG_DIFF_FORMAT_PATCH;
