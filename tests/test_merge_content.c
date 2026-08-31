@@ -300,6 +300,58 @@ static void test_one_sided_change_blocks_the_merge(void)
                "<<<<<<< ours\nourY\n=======\nthrY\n>>>>>>> theirs\n");
 }
 
+/* ...but only ONE side changing blocks it. A span BOTH sides changed the
+   same way is not a resolution, it is agreement, and git records no
+   changes-list entry for it at all -- so it does not block, and the distance
+   it contributes is its length in OURS' lines (Phase 50). All four
+   expectations below are the bytes real git 2.55.0 actually produced for
+   these exact three inputs, not predictions.
+
+   The four are a matrix, and each one fails a different wrong rule:
+     A, B  -- "any non-SAME region blocks" (the pre-Phase-50 rule) splits both.
+     C     -- "both-sides changes never block" merges what git splits; the
+              agreed line still counts as distance.
+     B, C  -- together they place the threshold, the way the gap-3/gap-4 pair
+              above does for plain identical lines.
+     D     -- "measure the gap in BASE lines" splits it: base has 4 lines
+              between the conflicts, ours has 3, and git merges. A and D
+              differ only in which side of the limit the base count falls. */
+static void test_both_sides_deleting_does_not_block_the_merge(void)
+{
+    CHECK_MERGE("a both-sides deletion is agreement, not a resolution",
+               "X\ng1\nD\ng2\nY\n", "ourX\ng1\ng2\nourY\n", "thrX\ng1\ng2\nthrY\n", 1,
+               "<<<<<<< ours\nourX\ng1\ng2\nourY\n"
+               "=======\nthrX\ng1\ng2\nthrY\n>>>>>>> theirs\n");
+}
+
+static void test_both_sides_editing_does_not_block_the_merge(void)
+{
+    CHECK_MERGE("a both-sides identical edit is agreement too",
+               "X\ng1\nM\ng2\nY\n", "ourX\ng1\nBOTH\ng2\nourY\n",
+               "thrX\ng1\nBOTH\ng2\nthrY\n", 1,
+               "<<<<<<< ours\nourX\ng1\nBOTH\ng2\nourY\n"
+               "=======\nthrX\ng1\nBOTH\ng2\nthrY\n>>>>>>> theirs\n");
+}
+
+static void test_both_sides_edit_still_counts_as_distance(void)
+{
+    CHECK_MERGE("an agreed line is distance, so 4 of them still split",
+               "X\ng1\nM\ng2\ng3\nY\n", "ourX\ng1\nBOTH\ng2\ng3\nourY\n",
+               "thrX\ng1\nBOTH\ng2\ng3\nthrY\n", 1,
+               "<<<<<<< ours\nourX\n=======\nthrX\n>>>>>>> theirs\n"
+               "g1\nBOTH\ng2\ng3\n"
+               "<<<<<<< ours\nourY\n=======\nthrY\n>>>>>>> theirs\n");
+}
+
+static void test_gap_is_measured_in_ours_lines_not_base_lines(void)
+{
+    CHECK_MERGE("4 base lines but 3 ours lines still merges",
+               "X\ng1\ng2\nD\ng3\nY\n", "ourX\ng1\ng2\ng3\nourY\n",
+               "thrX\ng1\ng2\ng3\nthrY\n", 1,
+               "<<<<<<< ours\nourX\ng1\ng2\ng3\nourY\n"
+               "=======\nthrX\ng1\ng2\ng3\nthrY\n>>>>>>> theirs\n");
+}
+
 /* A merge that changes nothing must not change the bytes either, and a
    conflict earlier in the file must not grow the file a newline at the end.
    Both measured; both were WRONG in the first cut of Phase 41's region list,
@@ -409,6 +461,10 @@ int main(void)
     test_close_conflicts_merge_into_one();
     test_distant_conflicts_stay_separate();
     test_one_sided_change_blocks_the_merge();
+    test_both_sides_deleting_does_not_block_the_merge();
+    test_both_sides_editing_does_not_block_the_merge();
+    test_both_sides_edit_still_counts_as_distance();
+    test_gap_is_measured_in_ours_lines_not_base_lines();
     test_noop_merge_keeps_missing_trailing_newline();
     test_conflict_above_a_newlineless_last_line();
     test_theirs_pure_insertion_survives();

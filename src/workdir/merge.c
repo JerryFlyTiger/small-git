@@ -382,14 +382,30 @@ static long *script_matches(const sg_diff_line *a, size_t na, const sg_diff_line
 typedef enum {
     /* Identical on both sides. Does NOT block merging two conflicts across
        it -- git keeps such lines out of its changes list entirely, so its
-       simplify pass never sees them as an obstacle, only as distance. */
+       simplify pass never sees them as an obstacle, only as distance.
+
+       "Identical on both sides" is the whole test, and it is NOT the same
+       as "equal to base" (Phase 50): a span BOTH sides changed the same way
+       is also SAME. git records no changes-list entry for one of those
+       either -- there is nothing left to resolve -- so it does not block,
+       and it contributes its OURS-side length as distance like any other
+       SAME region. Two measured rows that a "SAME means untouched" reading
+       gets wrong, with a gap of one line either side of it: a line deleted
+       by both sides (git merges the two conflicts; that span is 0 ours
+       lines long, so a 4-base-line gap still fits under the limit) and a
+       line edited identically by both sides (git merges at a 3-line gap and
+       splits at 4, because that span is 1 ours line long). refine_conflicts
+       has always relied on this reading -- the common text it hoists out of
+       a conflict is SAME while differing from base. */
     REGION_SAME,
-    /* Exactly one side changed and its version won (git's mode != 0). This
+    /* Exactly ONE side changed and its version won (git's mode != 0). This
        DOES block merging two conflicts across it, however short it is --
        measured against git 2.55.0, see the gap table in Phase 41 of
        docs/DESIGN.md: with a one-line ours-only change inside a 3-line gap,
        git leaves two conflicts where a purely distance-based rule would
-       have produced one. */
+       have produced one. The emphasis on ONE is load-bearing; see
+       REGION_SAME above for the both-sides case, which is the other half of
+       the same rule and goes the other way. */
     REGION_RESOLVED,
     REGION_CONFLICT
 } region_kind;
@@ -707,8 +723,15 @@ int sg_merge_content(const unsigned char *base, size_t base_len, const unsigned 
         } else if (ours_eq_base) {
             if (region_push(&raw, os, oe, ts, te, REGION_RESOLVED, 1) != 0)
                 goto done;
-        } else if (theirs_eq_base || ours_eq_theirs) {
+        } else if (theirs_eq_base) {
             if (region_push(&raw, os, oe, ts, te, REGION_RESOLVED, 0) != 0)
+                goto done;
+        } else if (ours_eq_theirs) {
+            /* BOTH sides made the same change. That is SAME, not RESOLVED:
+               only ONE side changing blocks the simplify pass (Phase 50,
+               measured -- see region_kind's comment). Emission is unaffected,
+               since take_theirs 0 prints ours and ours equals theirs here. */
+            if (region_push(&raw, os, oe, ts, te, REGION_SAME, 0) != 0)
                 goto done;
         } else if (region_push(&raw, os, oe, ts, te, REGION_CONFLICT, 0) != 0) {
             goto done;
@@ -1368,8 +1391,12 @@ static int compute_kept_landing(const char *git_dir, const sg_flat_entry *base_e
 }
 
 /* Emits the standalone (non-colliding) result of one side's rename landing:
-   KEPT is exactly Phase 49 sec 3.1 (reuses compute_kept_landing, then fills
-   either a clean entry or the stages-1/2/3-all-at-dst conflict shape);
+   KEPT is exactly Phase 49 sec 3.1 (its own inline merge_blob_content at
+   marker size 7, then fills either a clean entry or the
+   stages-1/2/3-all-at-dst conflict shape). It deliberately does NOT reuse
+   compute_kept_landing: that one is the COLLISION path's helper and merges
+   at marker size 8, which is the wrong width for a landing nothing collides
+   with -- resolve_landing_for_collision is its only caller;
    DELETED is exactly sec 3.2 (always a conflict, never a merge -- see the
    big comment block below sg_merge_trees' rename section intro for why the
    ordinary blob_eq shortcuts are unsafe here and this cannot reuse

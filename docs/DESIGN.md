@@ -7985,3 +7985,218 @@ predates this phase; `fuzz_merge.py`'s single-file generator cannot build the
 shape (it needs a deletion inside a short gap between two conflicts), which
 is why 200 x 2 rounds of it stay at 0. Recorded here as the next thing to
 attribute properly, in the same spirit as the `--histogram` residual.
+
+## Phase 50: the both-sides-agreement gap rule, `sg merge`'s fast-forward report, and Phase 49's test debt
+
+Three items in one milestone, batched because they share a verification
+surface: everything below is guarded by the same `fuzz_merge.py` /
+`fuzz_merge_rename.py` pair plus interop, so one gate run covers all three.
+They are written up in the order they were done, which is deliberately the
+reverse of their size -- the test debt went first so the net was in place
+before the merge engine was touched.
+
+### 1. Phase 49's recorded-but-unfixed items
+
+Four of the five were addressed; the fifth (base flattened three times per
+merge) is still open and still only a cost, not a correctness risk.
+
+**The wrong comment.** `emit_standalone_landing`'s header claimed its KEPT
+branch "reuses compute_kept_landing". It does not, and the difference
+matters: `compute_kept_landing` is the COLLISION path's helper and merges at
+marker size **8**, while a standalone landing merges at **7**.
+`resolve_landing_for_collision` is `compute_kept_landing`'s only caller. The
+comment now says which one is which and why they cannot be shared.
+
+**interop's phase49 group had no precondition.** `p49_build` runs its whole
+recipe as one `&&` chain inside a subshell and then throws that subshell's
+exit code away, keeping only the *merge's* exit code. A shape whose build
+died halfway left a half-built fixture, and since both tools run the SAME
+recipe, the failure direction is "both sides are equally wrong, therefore
+equal" -- every `cmp` in the group stays green over a fixture that never
+tested what it names. The build's exit code is now captured into
+`$dir.build_rc` and checked per shape per tool, in the style phase38/45/48
+already use.
+
+**The mode column never varied.** `p49_snapshot` compares `git ls-files -s`'s
+mode field, but all six shapes wrote plain 644 files, so that field was
+constant and the merged-mode rules were pinned by nothing -- a tool
+hard-coding 100644 passed the entire group. Two shapes were added,
+`renmode` and `renmode_rev`, where one side renames AND `chmod +x`'s while
+the other edits in place, once in each direction. They come with their own
+precondition (`grep -q '^100755 0 b.txt$'` against **git's** snapshot), for
+the usual reason: if both tools wrote 644 the `cmp` would still be green and
+the shape would be pinning nothing while looking like coverage.
+
+Mutation, measured: forcing the merged mode to fall back to base's
+(`if (0 && ours_mode != base_mode)`) turns exactly
+`phase49: renmode -- sg's index stage layout matches real git's` and
+`phase49: renmode -- sg's landing carries the executable bit too` red, and
+nothing else in 2164 checks. Before this phase that mutation was invisible.
+
+**stash + rename had no regression test at all.** `sg_stash_apply` and
+`sg_stash_apply_check_dirty` are two of the four call sites passing
+`SG_SIMILARITY_DEFAULT` to `sg_merge_trees`, and neither was covered:
+`fuzz_merge_rename.py` never runs `sg stash`, and interop's only stash+rename
+group (Phase 31) exercises `sg stash show`, which goes through
+`sg_diff_detect_renames` -- a different code path entirely.
+`tests/test_stash_rename.c` adds two tests for two genuinely different
+dimensions, both with expectations measured against real git 2.55.0 rather
+than reasoned out:
+
+1. **The stash's own content contains a rename** relative to the commit it
+   was taken from, and HEAD has since edited the old name. git's `pop` is
+   clean, leaves `b.txt` only in the working tree, and `b.txt` carries HEAD's
+   edit -- the edit followed the rename. Without detection this is a
+   modify/delete conflict.
+2. **The index holds a staged rename at apply time** that the stash never
+   touches. This never reaches the merge; it exercises the re-stage loop,
+   which has no concept of a rename and handles the deleted source and the
+   added destination as unrelated paths. It came out right by construction
+   rather than by design, which is exactly why it needed pinning.
+
+Mutation, measured, per site rather than in batch:
+
+| mutation | result |
+|---|---|
+| `sg_stash_apply`'s `rename_score` -> 0 | **caught**, 3 named FAILs |
+| re-stage loop's `sg_index_remove(&new_idx, path)` -> no-op | **caught**, the "source must NOT be resurrected" assertion |
+| `sg_stash_apply_check_dirty`'s `rename_score` -> 0 | **green** |
+
+The third one is **not a coverage gap**, and this was settled by experiment
+rather than by argument. A throwaway probe printed
+`sg_stash_apply_check_dirty`'s full answer (rc plus the reported path list)
+for three variants -- clean, dirty at the rename destination, dirty at the
+rename source -- against both a normal build and the mutated one, with the
+mutation verified present in the copied tree. The two builds' output is
+byte-identical on all three:
+
+```
+variant 0: rc=0 paths=0 []
+variant 1: rc=0 paths=0 []
+variant 2: rc=1 paths=1 [a.txt]
+```
+
+The reason is structural: that function only reports **which touched paths
+are dirty**, and rename detection changes how a path resolves, not which
+paths the merge touches -- the union of involved paths is the same either
+way. So it belongs in the "mathematically unobservable" bucket, with the
+proof written down; do not send the next person hunting for a test that
+cannot exist. (Worth noting separately, and NOT fixed here: variant 1 shows
+an untracked file sitting at the rename destination does not block the
+apply.)
+
+### 2. Two conflicts separated by a both-sides agreement
+
+`tests/fuzz_merge_rename.py --seed 9058` was Phase 49's one known non-zero,
+recorded as a pre-existing content-merge divergence on a file no rename
+touches. It is fixed here, and the recorded description of it ("a two-line
+gap containing a one-sided deletion") was wrong in the part that matters:
+the deletion is **two-sided**.
+
+The rule was re-derived by measurement, not from git's source. A generator
+built three-way fixtures of the shape `pre | conflict A | <gap> | conflict B
+| post` and counted the conflict blocks real git produced, over six gap kinds
+x seven gap widths:
+
+| gap content | git prints ONE conflict when |
+|---|---|
+| identical lines only | n <= 3 |
+| a line **both** sides deleted | n <= 4 |
+| a line **both** sides edited the same way | n <= 3 |
+| a line **both** sides added identically | n <= 2 (plus the added line) |
+| a line only ours deleted | n <= 2 |
+| a line only ours edited | n <= 2 |
+
+One rule explains all 38 rows: **a span both sides changed the same way is
+agreement, not a resolution.** It does not block the merge, and it
+contributes its length **in OURS' lines** as distance. That is what makes
+both-deleted (0 ours lines) reach one further than both-edited (1 ours line),
+and it is why the gap is counted in ours' coordinates -- git's
+`xdl_simplify_non_conflicts` measures between `m->i1 + m->chg1` and
+`next_m->i1`, which are the OURS fields of `xdmerge_t`. The one-sided rows
+agree with sg both before and after the fix, but at n <= 2 they agree
+trivially: a one-sided change leaves no anchor, so conflict A, the gap and
+conflict B are already a single span between sync points and never reach the
+simplify pass at all.
+
+The fix is one branch in the sync-point classifier. `theirs_eq_base ||
+ours_eq_theirs` was one `REGION_RESOLVED` case; it is now two, and the
+`ours_eq_theirs` half pushes `REGION_SAME`. Emission is unchanged --
+`take_theirs == 0` prints ours, and ours equals theirs there -- so the only
+behavioural difference is in `simplify_conflicts`, which is the entire point.
+`REGION_SAME` already meant "identical on both sides" rather than "equal to
+base": `refine_conflicts` has always hoisted agreed text out of a conflict as
+`REGION_SAME` while it differs from base. The classifier was the one place
+that read it the other way.
+
+Four named tests in `tests/test_merge_content.c` pin the matrix, each with the
+bytes real git actually produced:
+
+| test | fails which wrong rule |
+|---|---|
+| both-sides deletion inside a 3-line gap | "any changed span blocks" (the pre-fix rule) |
+| both-sides identical edit, 3 ours lines | same |
+| both-sides identical edit, 4 ours lines | "both-sides changes never block" |
+| 4 base lines but 3 ours lines | "measure the gap in BASE lines" |
+
+Reverse mutation (`REGION_SAME` -> `REGION_RESOLVED` in the new branch) turns
+three of the four red. The fourth is the upper half of a threshold and stays
+green under it by design, exactly like the existing gap-3/gap-4 pair: it is
+red under the opposite, too-wide mutation instead. interop pins the same two
+halves against real git as well.
+
+Measured after the fix: `fuzz_merge_rename.py` 150 rounds x 4 seed ranges
+(including the range containing 9058) = **0**; `fuzz_merge.py` 200 rounds x 4
+seed ranges plus 200 x 2 with `--no-newline-edits` = **0**. Phase 49's known
+non-zero is gone and no bucket replaced it.
+
+### 3. `sg merge`'s fast-forward report
+
+`sg merge` printed a bare `Fast-forward` where git prints a three-part
+report. Measured against git 2.55.0, that report is exactly:
+
+```
+Updating <7hex>..<7hex>
+Fast-forward
+<the output of `git diff --stat --summary <old> <new>`>
+```
+
+Four things were measured rather than assumed:
+
+- **Rename detection is on** -- it is `git diff`'s own default, so a renamed
+  file appears as `a => b | 0` with a `rename` summary line, not as an add
+  and a delete. `--no-renames` produces visibly different output, which is
+  how the default was established.
+- **The `mode change` line drops its path when it follows a `rename` line
+  for the same entry**, because git has already named it one line up.
+- **An empty diff prints the two header lines and nothing else** -- an empty
+  `--stat` is empty, not " 0 files changed".
+- **An UNBORN HEAD prints nothing at all**, not even `Fast-forward`, while
+  still moving HEAD. This is the one fast-forward shape with no report, and
+  it is easy to "fix" into printing a header with a zero id.
+
+`sg_diff_out_opts` gains a `summary` field: git's `--summary` block, printed
+after the chosen format's own output rather than instead of it. It is not a
+seventh format (it composes with one), and only `--stat` exercises it. The
+alternative -- rendering those four line shapes inside `cmd_merge.c` -- would
+have been a second diff formatter, which this codebase spent Phase 25
+eliminating.
+
+`do_fast_forward` gains an `ours_commit` parameter that is **NULL for the
+unborn case**, which is also the whole implementation of the silent-unborn
+rule: no separate flag, no zero-id sentinel.
+
+Verified differentially: the same fixture (a modification, an addition, a
+deletion, a rename, and a chmod) built with sg and with git, merged with
+each, and the two reports compared after normalizing only the two
+abbreviated ids -- which cannot match, since sg's and git's commits differ in
+their author/committer bytes. **Byte-identical**, summary lines included.
+interop pins that comparison, with five preconditions asserting git's own
+report really does reach all four summary shapes, plus the unborn pair.
+
+Not implemented, deliberately: nothing else about `sg merge`'s stdout moves
+toward git. The merge-commit vocabulary
+(`Merge made by '<x>' [<sha>] into '<y>'.` and the `sg add`-flavoured
+conflict list) is still sg's own, and interop still does not compare it --
+this phase changed one specific output that git and sg were free to make
+identical, not the command's whole voice.
