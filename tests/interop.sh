@@ -5540,10 +5540,13 @@ done
 #     -> a.txt has stage 2 only     (added by us)
 #     -> b.txt has stage 3 only     (added by them)
 #
-# The fixture has to be built by GIT, because sg's merge has no rename
-# detection and resolves the same history cleanly -- that divergence is
-# pinned at the bottom of this group rather than left implicit, since it is
-# the reason the oracle looks one-directional here.
+# The fixture is built by GIT here regardless: this group's first half is
+# about `sg status`'s LABEL/porcelain lookup tables, which need a real
+# conflicted index as input, and letting real git build that input keeps
+# this group independent of whatever sg's own merge does with the same
+# history. As of Phase 49 sg's merge is rename-aware too and produces the
+# identical shape -- that comparison is the second half of this group,
+# below the labels/porcelain checks.
 P45="$WORKDIR/p45_rename_rename"
 rm -rf "$P45"
 mkdir -p "$P45"
@@ -5585,11 +5588,16 @@ check "phase45: 'added by them:' names b.txt" \
 (cd "$P45" && LC_ALL=C git status --porcelain) 2>/dev/null | sort > "$WORKDIR/p45_gitp.txt"
 check "phase45: porcelain's DD / AU / UA match real git byte-for-byte" \
     cmp -s "$WORKDIR/p45_sgp.txt" "$WORKDIR/p45_gitp.txt"
-# The divergence that makes the fixture one-directional: sg's merge has no
-# rename detection, so the same history merges CLEANLY under sg. Pinned on
-# both sides -- if sg ever grows rename-aware merging this check turns red
-# and says so, instead of the phase45 fixture quietly starting to build
-# itself the other way.
+# Phase 49 closed the gap this group used to pin: sg's merge is now
+# rename-aware, so the same history conflicts under sg too, in the same
+# shape real git produced above ($P45) -- f.txt keeps only a stage-1 entry
+# and no working-tree file, a.txt and b.txt each get a single stage (2 and 3
+# respectively) carrying the SAME content, and MERGE_HEAD is left in place
+# for the user to resolve. This is no longer a divergence, so it is compared
+# against $P45's own real-git-built working tree rather than merely
+# asserted -- if a future change reopened the gap, the byte-for-byte content
+# check below would be the one to catch it, not just the file-existence
+# shape (which a content-blind "resolve arbitrarily" bug could satisfy too).
 P45SG="$WORKDIR/p45_sg_merge"
 rm -rf "$P45SG"
 (cd "$WORKDIR" && "$SG" init "$(basename "$P45SG")") > /dev/null 2>&1
@@ -5599,10 +5607,16 @@ printf 'base\ncontent\nhere\n' > "$P45SG/f.txt"
 (cd "$P45SG" && "$SG" switch topic) > /dev/null 2>&1
 (cd "$P45SG" && mv f.txt b.txt && "$SG" add b.txt f.txt && "$SG" commit -m theirs) > /dev/null 2>&1
 (cd "$P45SG" && "$SG" switch master && "$SG" merge topic) > /dev/null 2>&1
-check "phase45: sg's own merge resolves rename/rename cleanly (no rename detection -- divergence, pinned)" \
-    test ! -f "$P45SG/.git/MERGE_HEAD"
-check "phase45: and keeps both renamed files" \
+check "phase45: sg's own merge now conflicts too (rename-aware, Phase 49)" \
+    test -f "$P45SG/.git/MERGE_HEAD"
+check "phase45: sg keeps a.txt and b.txt, drops f.txt -- same shape as real git" \
     sh -c "test -f '$P45SG/a.txt' && test -f '$P45SG/b.txt' && test ! -f '$P45SG/f.txt'"
+check "phase45: sg's a.txt/b.txt content matches real git's post-merge content byte-for-byte" \
+    sh -c "cmp -s '$P45SG/a.txt' '$P45/a.txt' && cmp -s '$P45SG/b.txt' '$P45/b.txt'"
+(cd "$P45SG" && "$SG" status --porcelain) 2>/dev/null | awk '{print $1}' | sort > "$WORKDIR/p45sg_codes.txt"
+(cd "$P45" && LC_ALL=C git status --porcelain) 2>/dev/null | awk '{print $1}' | sort > "$WORKDIR/p45_codes.txt"
+check "phase45: sg's porcelain codes for the rename/rename conflict match real git's (DD/AU/UA)" \
+    cmp -s "$WORKDIR/p45sg_codes.txt" "$WORKDIR/p45_codes.txt"
 
 # --- Phase 44: `git stash show`'s implied -p. Measured, git 2.55.0: the
 # default is a diffstat, but any DIFF option that is not itself a format

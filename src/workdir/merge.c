@@ -1,6 +1,7 @@
 #include "sg/merge.h"
 
 #include "sg/chunk.h"
+#include "sg/diff.h"
 #include "sg/diff_lcs.h"
 #include "sg/loose.h"
 #include "sg/object.h"
@@ -550,9 +551,23 @@ static void simplify_conflicts(region_list *l)
     }
 }
 
+/* Appends `count` copies of `ch` (7 normally, 8 for the two widened shapes
+   Phase 49 introduces -- see sg_merge_content's header comment). */
+static int bytebuf_append_marker(bytebuf *out, char ch, int count)
+{
+    char buf[16];
+
+    if (count < 1)
+        count = 1;
+    if ((size_t)count >= sizeof(buf))
+        count = (int)sizeof(buf) - 1;
+    memset(buf, ch, (size_t)count);
+    return bytebuf_append(out, buf, (size_t)count);
+}
+
 static int emit_regions(bytebuf *out, const region_list *l, const sg_diff_line *ours,
                         const sg_diff_line *theirs, const char *ours_label,
-                        const char *theirs_label, int *conflict_out)
+                        const char *theirs_label, int marker_size, int *conflict_out)
 {
     size_t i;
 
@@ -581,13 +596,16 @@ static int emit_regions(bytebuf *out, const region_list *l, const sg_diff_line *
         if (bytebuf_ensure_nl(out) != 0)
             return -1;
         *conflict_out = 1;
-        if (bytebuf_append_str(out, "<<<<<<< ") != 0 ||
-           bytebuf_append_str(out, ours_label) != 0 || bytebuf_append_str(out, "\n") != 0 ||
+        if (bytebuf_append_marker(out, '<', marker_size) != 0 ||
+           bytebuf_append_str(out, " ") != 0 || bytebuf_append_str(out, ours_label) != 0 ||
+           bytebuf_append_str(out, "\n") != 0 ||
            bytebuf_append_lines(out, ours, r->os, r->oe) != 0 || bytebuf_ensure_nl(out) != 0 ||
-           bytebuf_append_str(out, "=======\n") != 0 ||
+           bytebuf_append_marker(out, '=', marker_size) != 0 ||
+           bytebuf_append_str(out, "\n") != 0 ||
            bytebuf_append_lines(out, theirs, r->ts, r->te) != 0 || bytebuf_ensure_nl(out) != 0 ||
-           bytebuf_append_str(out, ">>>>>>> ") != 0 ||
-           bytebuf_append_str(out, theirs_label) != 0 || bytebuf_append_str(out, "\n") != 0)
+           bytebuf_append_marker(out, '>', marker_size) != 0 ||
+           bytebuf_append_str(out, " ") != 0 || bytebuf_append_str(out, theirs_label) != 0 ||
+           bytebuf_append_str(out, "\n") != 0)
             return -1;
     }
     return 0;
@@ -599,8 +617,8 @@ typedef struct {
 
 int sg_merge_content(const unsigned char *base, size_t base_len, const unsigned char *ours,
                      size_t ours_len, const unsigned char *theirs, size_t theirs_len,
-                     const char *ours_label, const char *theirs_label, unsigned char **out,
-                     size_t *out_len)
+                     const char *ours_label, const char *theirs_label, int marker_size,
+                     unsigned char **out, size_t *out_len)
 {
     size_t nbase = 0, nours = 0, ntheirs = 0;
     sg_diff_line *base_lines = NULL;
@@ -727,7 +745,7 @@ int sg_merge_content(const unsigned char *base, size_t base_len, const unsigned 
         goto done;
     simplify_conflicts(&regions);
     if (emit_regions(&outbuf, &regions, ours_lines, theirs_lines, ours_label, theirs_label,
-                    &conflict) != 0)
+                    marker_size, &conflict) != 0)
         goto done;
 
     *out = outbuf.buf;
@@ -824,12 +842,50 @@ static int read_blob_chunk_aware(const char *git_dir, const unsigned char sha1[S
     return rc;
 }
 
-/* Handles the "all three present" (modify/modify) and "base absent, both
-   added" (add/add) conflict candidates by calling sg_merge_content; a clean
-   result (rc 0) turns out not to be a conflict after all and gets a freshly
-   written blob. */
-static int resolve_via_content_merge(const char *git_dir, const triple *t, const char *ours_label,
-                                     const char *theirs_label, sg_merge_result_entry *out)
+/* Writes `len` bytes as a new blob object, chunk-aware per this repo's own
+   configured threshold (same policy sg add and a clean multi-line merge
+   already use) so a large rename-merge result -- clean or, since Phase 49,
+   the marker-laden text of a NESTED conflict that itself has to become a
+   real object -- isn't silently forced back into full-size, non-deduplicated
+   storage. Returns 0 on success, -1 on failure. Does not free `bytes`. */
+static int store_new_blob(const char *git_dir, const unsigned char *bytes, size_t len,
+                          unsigned char out_sha1[SG_SHA1_RAW_LEN])
+{
+    int enabled = 0;
+    size_t threshold = SG_CHUNK_DEFAULT_THRESHOLD;
+    int chunked;
+
+    sg_repo_read_chunk_config(git_dir, &enabled, &threshold);
+    if (enabled)
+        return sg_chunk_store_blob(git_dir, bytes, len, threshold, out_sha1, &chunked);
+    return sg_loose_write(git_dir, SG_OBJ_BLOB, bytes, len, out_sha1);
+}
+
+/* The engine behind resolve_via_content_merge (the ordinary modify/modify
+   and add/add conflict candidates), generalized to take explicit mode/sha1
+   operands rather than a triple pointing into a flattened tree -- Phase 49's
+   rename-aware paths need to feed it SYNTHETIC operands (a rename's landing
+   content, possibly itself the freshly-written result of an inner merge)
+   that have no sg_flat_entry of their own to point at.
+
+   Runs sg_merge_content(base?, ours, theirs) and either writes a freshly
+   merged clean blob (returning it via *out_mode/out_sha1, *out_conflict left
+   at 0) or hands back the conflict bytes verbatim (*out_conflict_content,
+   *out_conflict_content_len, *out_conflict set to 1) -- exactly
+   resolve_via_content_merge's old two outcomes, just factored so both
+   callers can reuse the chunk-aware reads, the sg_merge_content call, and
+   the clean-path chunk-or-loose write. Returns 0 on success, -1 on error
+   (I/O/allocation) -- on -1 nothing has been written and *out_conflict is
+   unspecified. */
+static int merge_blob_content(const char *git_dir, const char *path, int base_present,
+                              unsigned int base_mode, const unsigned char *base_sha1,
+                              unsigned int ours_mode, const unsigned char *ours_sha1,
+                              unsigned int theirs_mode, const unsigned char *theirs_sha1,
+                              const char *ours_label, const char *theirs_label, int marker_size,
+                              int *out_conflict, unsigned int *out_mode,
+                              unsigned char out_sha1[SG_SHA1_RAW_LEN],
+                              unsigned char **out_conflict_content,
+                              size_t *out_conflict_content_len)
 {
     unsigned char *base_content = NULL;
     size_t base_len = 0;
@@ -841,22 +897,23 @@ static int resolve_via_content_merge(const char *git_dir, const triple *t, const
     size_t merged_len = 0;
     int rc;
 
-    if (t->base_present &&
-       read_blob_chunk_aware(git_dir, t->base_e->sha1, t->path, &base_content, &base_len) != 0)
+    *out_conflict_content = NULL;
+    *out_conflict_content_len = 0;
+
+    if (base_present && read_blob_chunk_aware(git_dir, base_sha1, path, &base_content, &base_len) != 0)
         return -1;
-    if (read_blob_chunk_aware(git_dir, t->ours_e->sha1, t->path, &ours_content, &ours_len) != 0) {
+    if (read_blob_chunk_aware(git_dir, ours_sha1, path, &ours_content, &ours_len) != 0) {
         free(base_content);
         return -1;
     }
-    if (read_blob_chunk_aware(git_dir, t->theirs_e->sha1, t->path, &theirs_content, &theirs_len) !=
-       0) {
+    if (read_blob_chunk_aware(git_dir, theirs_sha1, path, &theirs_content, &theirs_len) != 0) {
         free(base_content);
         free(ours_content);
         return -1;
     }
 
     rc = sg_merge_content(base_content, base_len, ours_content, ours_len, theirs_content, theirs_len,
-                          ours_label, theirs_label, &merged, &merged_len);
+                          ours_label, theirs_label, marker_size, &merged, &merged_len);
     free(base_content);
     free(ours_content);
     free(theirs_content);
@@ -865,46 +922,54 @@ static int resolve_via_content_merge(const char *git_dir, const triple *t, const
 
     if (rc == 0) {
         unsigned char new_sha1[SG_SHA1_RAW_LEN];
-        int enabled = 0;
-        size_t threshold = SG_CHUNK_DEFAULT_THRESHOLD;
-        int chunked;
 
-        /* A clean multi-line merge can itself produce a file large enough to
-           deserve chunking (e.g. two branches each touched a different part
-           of a multi-megabyte text file) -- store it the same chunk-aware
-           way `sg add` does, using this repo's own configured threshold, so
-           the merge result isn't silently forced back into full-size,
-           non-deduplicated storage. */
-        sg_repo_read_chunk_config(git_dir, &enabled, &threshold);
-        if (enabled) {
-            if (sg_chunk_store_blob(git_dir, merged, merged_len, threshold, new_sha1, &chunked) !=
-               0) {
-                free(merged);
-                return -1;
-            }
-        } else if (sg_loose_write(git_dir, SG_OBJ_BLOB, merged, merged_len, new_sha1) != 0) {
+        if (store_new_blob(git_dir, merged, merged_len, new_sha1) != 0) {
             free(merged);
             return -1;
         }
         free(merged);
-        out->conflict = 0;
-        out->deleted = 0;
-        memcpy(out->sha1, new_sha1, SG_SHA1_RAW_LEN);
-        if (t->base_present) {
-            if (t->ours_e->mode != t->base_e->mode)
-                out->mode = t->ours_e->mode;
-            else if (t->theirs_e->mode != t->base_e->mode)
-                out->mode = t->theirs_e->mode;
+        *out_conflict = 0;
+        memcpy(out_sha1, new_sha1, SG_SHA1_RAW_LEN);
+        if (base_present) {
+            if (ours_mode != base_mode)
+                *out_mode = ours_mode;
+            else if (theirs_mode != base_mode)
+                *out_mode = theirs_mode;
             else
-                out->mode = t->base_e->mode;
+                *out_mode = base_mode;
         } else {
-            out->mode = t->ours_e->mode;
+            *out_mode = ours_mode;
         }
         return 0;
     }
 
-    out->conflict_content = merged;
-    out->conflict_content_len = merged_len;
+    *out_conflict = 1;
+    *out_conflict_content = merged;
+    *out_conflict_content_len = merged_len;
+    return 0;
+}
+
+/* Handles the "all three present" (modify/modify) and "base absent, both
+   added" (add/add) conflict candidates by calling sg_merge_content; a clean
+   result (rc 0) turns out not to be a conflict after all and gets a freshly
+   written blob. Always uses the ordinary 7-character marker width -- the
+   ordinary union walk never produces one of Phase 49's two widened shapes. */
+static int resolve_via_content_merge(const char *git_dir, const triple *t, const char *ours_label,
+                                     const char *theirs_label, sg_merge_result_entry *out)
+{
+    int conflict = 0;
+    int rc = merge_blob_content(
+       git_dir, t->path, t->base_present, t->base_present ? t->base_e->mode : 0,
+       t->base_present ? t->base_e->sha1 : NULL, t->ours_e->mode, t->ours_e->sha1,
+       t->theirs_e->mode, t->theirs_e->sha1, ours_label, theirs_label, 7, &conflict, &out->mode,
+       out->sha1, &out->conflict_content, &out->conflict_content_len);
+
+    if (rc != 0)
+        return -1;
+    if (!conflict) {
+        out->conflict = 0;
+        out->deleted = 0;
+    }
     return 0;
 }
 
@@ -992,12 +1057,828 @@ static int process_path(const char *git_dir, const triple *t, const char *ours_l
     return 0;
 }
 
+/* ==================== Phase 49: rename-aware tree merge ====================
+
+   The overall shape (docs/DESIGN.md Phase 49 has the measured tables this
+   ports): a base path that is a rename SOURCE on either side, and every
+   ours/theirs path that is a rename DESTINATION, is pulled out of the
+   ordinary union walk above and handled here instead; the ordinary walk is
+   otherwise unchanged (rename_score == 0 skips all of this and reproduces
+   pre-Phase-49 behaviour exactly, since neither list below is ever built).
+
+   Two base paths independently renamed to the SAME destination by opposite
+   sides (rename/rename "2 to 1") is why this cannot just process one base
+   path at a time and emit immediately: the destination has to be seen as a
+   single collision point that MAY be fed by two entirely different source
+   paths, one from each side. So this is a two-pass "contribution map" keyed
+   by destination path: pass one classifies every rename source and records
+   what each side WANTS to land at its destination (an inner three-way merge
+   against the other side's unmoved copy, or a raw verbatim blob when the
+   other side deleted the source outright); pass two looks at each
+   destination once, decides whether only one side showed up (plain
+   rename-vs-KEPT or rename-vs-DELETE) or both did (an add/add collision,
+   with or without an inner merge nested inside one or both sides), and
+   emits exactly one sg_merge_result_entry (or, for rename/rename-1to2,
+   three, at three different paths) per destination. */
+
+typedef struct {
+    const char *base_path; /* borrowed, owned by the sg_diff_list this came from */
+    const char *dst_path;  /* likewise */
+} rename_pair;
+
+typedef struct {
+    rename_pair *v;
+    size_t count;
+} rename_map;
+
+/* Builds base_path -> new_path out of a base-vs-side tree diff: renames only
+   (old_path != NULL && !is_copy -- sg_merge_trees never asks for copy
+   detection, so is_copy is always 0 here; checked anyway so this reads
+   correctly if that default is ever revisited). *list_out is kept alive
+   alongside *map_out (whose pairs borrow strings out of it) and must be
+   freed with sg_diff_list_free once the caller is done with the map.
+   Returns 0 on success, -1 on error (already reported to stderr for a -2
+   from sg_diff_trees, matching how the plain sg_tree_flatten calls above
+   report the same failure). */
+static int build_rename_map(const char *git_dir, const unsigned char base_tree[SG_SHA1_RAW_LEN],
+                            const unsigned char side_tree[SG_SHA1_RAW_LEN], int rename_score,
+                            sg_diff_list *list_out, rename_map *map_out)
+{
+    char bad_path[SG_PATH_MAX];
+    int rc;
+    size_t i;
+
+    memset(list_out, 0, sizeof(*list_out));
+    memset(map_out, 0, sizeof(*map_out));
+
+    rc = sg_diff_trees(git_dir, base_tree, side_tree, list_out, bad_path);
+    if (rc == -2) {
+        fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
+               sg_quote_path_delimited(bad_path));
+        return -1;
+    }
+    if (rc != 0)
+        return -1;
+
+    /* sg_diff_detect_renames' pairing only ever reads through
+       sg_diff_side_read for scoring, and that function's SG_DIFF_SIDE_BLOB
+       branch (verified by reading src/workdir/diff.c) goes straight to
+       sg_chunk_read_blob without ever touching repo_root -- confirmed here
+       rather than assumed, per Phase 49 sec 2. sg_diff_trees only ever
+       produces BLOB or ABSENT sides, never WORKDIR, so repo_root can never
+       actually be dereferenced on this call path. Passed as "" rather than
+       NULL anyway: a future change that did need it would get a path-join
+       failure instead of a NULL dereference. detect_copies is 0 -- a copy
+       still has its source present at its old path too, which is not a
+       rename Phase 49 is in scope for (see docs/DESIGN.md). */
+    if (sg_diff_detect_renames(git_dir, "", list_out, rename_score, 0) != 0) {
+        sg_diff_list_free(list_out);
+        memset(list_out, 0, sizeof(*list_out));
+        return -1;
+    }
+
+    map_out->v = calloc(list_out->count > 0 ? list_out->count : 1, sizeof(*map_out->v));
+    if (map_out->v == NULL) {
+        sg_diff_list_free(list_out);
+        memset(list_out, 0, sizeof(*list_out));
+        return -1;
+    }
+    for (i = 0; i < list_out->count; i++) {
+        const sg_diff_entry *e = &list_out->entries[i];
+
+        if (e->old_path != NULL && !e->is_copy) {
+            map_out->v[map_out->count].base_path = e->old_path;
+            map_out->v[map_out->count].dst_path = e->path;
+            map_out->count++;
+        }
+    }
+    return 0;
+}
+
+static void rename_map_free(rename_map *m)
+{
+    free(m->v);
+    m->v = NULL;
+    m->count = 0;
+}
+
+static const char *rename_map_dst(const rename_map *m, const char *base_path)
+{
+    size_t i;
+
+    for (i = 0; i < m->count; i++) {
+        if (strcmp(m->v[i].base_path, base_path) == 0)
+            return m->v[i].dst_path;
+    }
+    return NULL;
+}
+
+/* Reverse lookup: is `dst` some p's destination, and if so which p. Used to
+   tell a genuine rename destination apart from an unrelated addition that
+   happens to share its name (Phase 49 sec 3.5's "not itself a rename
+   destination" clause). */
+static const char *rename_map_src(const rename_map *m, const char *dst)
+{
+    size_t i;
+
+    for (i = 0; i < m->count; i++) {
+        if (strcmp(m->v[i].dst_path, dst) == 0)
+            return m->v[i].base_path;
+    }
+    return NULL;
+}
+
+static const sg_flat_entry *flat_find(const sg_flat_list *list, const char *path)
+{
+    size_t lo = 0, hi = list->count;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(list->entries[mid].path, path);
+
+        if (cmp == 0)
+            return &list->entries[mid];
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return NULL;
+}
+
+/* True iff `path` takes part in rename handling at all -- either as a base
+   source on either side, or as a destination on either side -- and must
+   therefore be skipped by the ordinary union walk (which advances its own
+   list pointers first and only then checks this, exactly like every other
+   per-path decision it already makes). */
+static int path_is_rename_consumed(const rename_map *ro, const rename_map *rt, const char *path)
+{
+    return rename_map_dst(ro, path) != NULL || rename_map_dst(rt, path) != NULL ||
+          rename_map_src(ro, path) != NULL || rename_map_src(rt, path) != NULL;
+}
+
+/* Appends a fully-formed entry (already owning path/conflict_content) to
+   *out, growing *cap exactly like sg_merge_trees' own union-walk loop does.
+   On allocation failure the entry's own memory is freed (matching that
+   loop's existing convention) and -1 is returned. */
+static int append_result_entry(sg_merge_result *out, size_t *cap, sg_merge_result_entry *entry)
+{
+    if (out->count == *cap) {
+        size_t new_cap = *cap == 0 ? 16 : *cap * 2;
+        sg_merge_result_entry *grown = realloc(out->entries, new_cap * sizeof(*grown));
+
+        if (grown == NULL) {
+            free(entry->path);
+            free(entry->conflict_content);
+            return -1;
+        }
+        out->entries = grown;
+        *cap = new_cap;
+    }
+    out->entries[out->count] = *entry;
+    out->count++;
+    return 0;
+}
+
+static int result_entry_path_cmp(const void *a, const void *b)
+{
+    return strcmp(((const sg_merge_result_entry *)a)->path, ((const sg_merge_result_entry *)b)->path);
+}
+
+/* "<label>:<path>" (Phase 49 sec 4), malloc'd, caller frees. Only ever
+   called when the two sides' own paths differ -- the caller decides that,
+   this just formats. */
+static char *compose_conflict_label(const char *label, const char *path)
+{
+    size_t len = strlen(label) + 1 + strlen(path) + 1;
+    char *out = malloc(len);
+
+    if (out == NULL)
+        return NULL;
+    snprintf(out, len, "%s:%s", label, path);
+    return out;
+}
+
+/* One side's contribution to a destination path, built while classifying
+   rename sources (pass one) and consumed while resolving destinations
+   (pass two). */
+typedef enum {
+    LANDING_NONE = 0,
+    /* The other side still has the source path unchanged (relative to this
+       classification -- its OWN content may have been edited, "KEPT" only
+       means "not renamed away"): landing needs an inner three-way merge of
+       base[src]/this_side[dst]/other_side[src]. */
+    LANDING_KEPT,
+    /* The other side deleted the source outright: landing is this side's
+       own dst content verbatim, no merge (Phase 49 sec 3.2). */
+    LANDING_DELETED,
+    /* Not from any rename at all -- an ordinary addition that happens to
+       land on the same path as the OTHER side's rename destination (Phase
+       49 sec 3.5). Landing is this side's own dst content verbatim. */
+    LANDING_PLAIN
+} landing_kind;
+
+typedef struct {
+    landing_kind kind;
+    const char *src_path; /* valid iff kind == LANDING_KEPT || LANDING_DELETED */
+} landing;
+
+typedef struct {
+    const char *dst;
+    landing ours;
+    landing theirs;
+} contribution;
+
+typedef struct {
+    contribution *v;
+    size_t count, cap;
+} contribution_list;
+
+static contribution *contribution_find_or_add(contribution_list *cl, const char *dst)
+{
+    size_t i;
+    contribution *grown;
+
+    for (i = 0; i < cl->count; i++) {
+        if (strcmp(cl->v[i].dst, dst) == 0)
+            return &cl->v[i];
+    }
+    if (cl->count == cl->cap) {
+        size_t new_cap = cl->cap == 0 ? 8 : cl->cap * 2;
+
+        grown = realloc(cl->v, new_cap * sizeof(*grown));
+        if (grown == NULL)
+            return NULL;
+        cl->v = grown;
+        cl->cap = new_cap;
+    }
+    cl->v[cl->count].dst = dst;
+    cl->v[cl->count].ours.kind = LANDING_NONE;
+    cl->v[cl->count].theirs.kind = LANDING_NONE;
+    return &cl->v[cl->count++];
+}
+
+/* Runs the inner three-way content merge for a KEPT landing and turns it
+   into a real object either way: store_new_blob for a clean result (same as
+   an ordinary content merge), and -- because this landing may end up
+   nested inside an outer add/add collision, where "the inner conflicted
+   text is what gets hashed into stage 2" (Phase 49 sec 3.5) -- ALSO for a
+   conflicting one, which an ordinary standalone conflict never does. The
+   caller decides marker_size and whether nesting is actually happening (a
+   non-colliding, standalone caller still routes through here so the
+   KEPT-vs-DELETED classification stays in one place, and eagerly writing a
+   throwaway object on the non-colliding conflict path is a correctness
+   no-op, not a bug -- the object is unreferenced but the store already
+   tolerates that same shape from every other conflict-turned-clean path).
+   Returns 0 on success (*out_mode/out_sha1 filled, *out_conflict tells
+   whether the object holds marker text), -1 on error. */
+static int compute_kept_landing(const char *git_dir, const sg_flat_entry *base_e,
+                                unsigned int side_mode, const unsigned char *side_sha1,
+                                const sg_flat_entry *other_e, const char *side_label,
+                                const char *other_label, int marker_size, int *out_conflict,
+                                unsigned int *out_mode, unsigned char out_sha1[SG_SHA1_RAW_LEN])
+{
+    unsigned char *conflict_content = NULL;
+    size_t conflict_content_len = 0;
+    int conflict = 0;
+    int rc = merge_blob_content(git_dir, base_e->path, 1, base_e->mode, base_e->sha1, side_mode,
+                                side_sha1, other_e->mode, other_e->sha1, side_label, other_label,
+                                marker_size, &conflict, out_mode, out_sha1, &conflict_content,
+                                &conflict_content_len);
+
+    if (rc != 0)
+        return -1;
+    *out_conflict = conflict;
+    if (conflict) {
+        rc = store_new_blob(git_dir, conflict_content, conflict_content_len, out_sha1);
+        free(conflict_content);
+        if (rc != 0)
+            return -1;
+        *out_mode = side_mode;
+    }
+    return 0;
+}
+
+/* Emits the standalone (non-colliding) result of one side's rename landing:
+   KEPT is exactly Phase 49 sec 3.1 (reuses compute_kept_landing, then fills
+   either a clean entry or the stages-1/2/3-all-at-dst conflict shape);
+   DELETED is exactly sec 3.2 (always a conflict, never a merge -- see the
+   big comment block below sg_merge_trees' rename section intro for why the
+   ordinary blob_eq shortcuts are unsafe here and this cannot reuse
+   process_path). is_ours selects which of base/ours/theirs role this side
+   plays. Returns 0 on success (an entry has been appended to *out or
+   allocation failed -- see append_result_entry), -1 on error. */
+static int emit_standalone_landing(const char *git_dir, const sg_flat_list *base_flat,
+                                   const sg_flat_list *ours_flat, const sg_flat_list *theirs_flat,
+                                   const char *dst, int is_ours, const landing *l,
+                                   const char *ours_label, const char *theirs_label,
+                                   sg_merge_result *out, size_t *cap)
+{
+    const sg_flat_entry *base_e = flat_find(base_flat, l->src_path);
+    const sg_flat_entry *side_e = flat_find(is_ours ? ours_flat : theirs_flat, dst);
+    sg_merge_result_entry entry;
+
+    memset(&entry, 0, sizeof(entry));
+    entry.path = strdup(dst);
+    if (entry.path == NULL || base_e == NULL || side_e == NULL) {
+        free(entry.path);
+        return -1;
+    }
+    entry.conflict = 1;
+    entry.base_present = 1;
+    entry.base_mode = base_e->mode;
+    memcpy(entry.base_sha1, base_e->sha1, SG_SHA1_RAW_LEN);
+
+    if (l->kind == LANDING_DELETED) {
+        /* Phase 49 sec 3.2: always a conflict, ours'/theirs' own content
+           verbatim, no marker text at all. */
+        if (is_ours) {
+            entry.ours_present = 1;
+            entry.ours_mode = side_e->mode;
+            memcpy(entry.ours_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
+        } else {
+            entry.theirs_present = 1;
+            entry.theirs_mode = side_e->mode;
+            memcpy(entry.theirs_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
+        }
+        if (read_blob_chunk_aware(git_dir, side_e->sha1, dst, &entry.conflict_content,
+                                  &entry.conflict_content_len) != 0) {
+            free(entry.path);
+            return -1;
+        }
+        return append_result_entry(out, cap, &entry);
+    }
+
+    /* LANDING_KEPT: Phase 49 sec 3.1. The other side's own path (l->src_path)
+       still differs from dst, so the marker labels get the ":path" suffix
+       (sec 4) regardless of clean/conflict -- discarded silently if clean. */
+    {
+        const sg_flat_entry *other_e = flat_find(is_ours ? theirs_flat : ours_flat, l->src_path);
+        char *own_label = compose_conflict_label(is_ours ? ours_label : theirs_label, dst);
+        char *other_label_c = compose_conflict_label(is_ours ? theirs_label : ours_label, l->src_path);
+        int conflict = 0;
+        unsigned int mode = 0;
+        unsigned char sha1[SG_SHA1_RAW_LEN];
+        unsigned char *conflict_content = NULL;
+        size_t conflict_content_len = 0;
+        int rc;
+
+        if (other_e == NULL || own_label == NULL || other_label_c == NULL) {
+            free(own_label);
+            free(other_label_c);
+            free(entry.path);
+            return -1;
+        }
+        rc = merge_blob_content(git_dir, dst, 1, base_e->mode, base_e->sha1, side_e->mode,
+                                side_e->sha1, other_e->mode, other_e->sha1,
+                                is_ours ? own_label : other_label_c,
+                                is_ours ? other_label_c : own_label, 7, &conflict, &mode, sha1,
+                                &conflict_content, &conflict_content_len);
+        free(own_label);
+        free(other_label_c);
+        if (rc != 0) {
+            free(entry.path);
+            return -1;
+        }
+        if (!conflict) {
+            entry.conflict = 0;
+            entry.deleted = 0;
+            entry.mode = mode;
+            memcpy(entry.sha1, sha1, SG_SHA1_RAW_LEN);
+            /* fill_conflict_sides' job, done by hand since there is no
+               triple here: Phase 20's stash touched-check needs the clean
+               ours side even on a path that only exists post-rename. */
+            entry.base_present = 1;
+            entry.base_mode = base_e->mode;
+            memcpy(entry.base_sha1, base_e->sha1, SG_SHA1_RAW_LEN);
+            entry.ours_present = 1;
+            entry.theirs_present = 1;
+            if (is_ours) {
+                entry.ours_mode = side_e->mode;
+                memcpy(entry.ours_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
+                entry.theirs_mode = other_e->mode;
+                memcpy(entry.theirs_sha1, other_e->sha1, SG_SHA1_RAW_LEN);
+            } else {
+                entry.theirs_mode = side_e->mode;
+                memcpy(entry.theirs_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
+                entry.ours_mode = other_e->mode;
+                memcpy(entry.ours_sha1, other_e->sha1, SG_SHA1_RAW_LEN);
+            }
+            return append_result_entry(out, cap, &entry);
+        }
+        if (is_ours) {
+            entry.ours_present = 1;
+            entry.ours_mode = side_e->mode;
+            memcpy(entry.ours_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
+            entry.theirs_present = 1;
+            entry.theirs_mode = other_e->mode;
+            memcpy(entry.theirs_sha1, other_e->sha1, SG_SHA1_RAW_LEN);
+        } else {
+            entry.theirs_present = 1;
+            entry.theirs_mode = side_e->mode;
+            memcpy(entry.theirs_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
+            entry.ours_present = 1;
+            entry.ours_mode = other_e->mode;
+            memcpy(entry.ours_sha1, other_e->sha1, SG_SHA1_RAW_LEN);
+        }
+        entry.conflict_content = conflict_content;
+        entry.conflict_content_len = conflict_content_len;
+        return append_result_entry(out, cap, &entry);
+    }
+}
+
+/* Resolves one landing (whichever kind) into a real, already-stored
+   (mode,sha1) pair, for use as one side of an outer add/add collision (Phase
+   49 sec 3.5/3.6). PLAIN and DELETED are already real tree objects, no work
+   needed; KEPT runs the inner merge via compute_kept_landing with
+   marker_size 8 (nested) and writes even a conflicting result to the store,
+   because it is about to become one side's content in the entry the outer
+   merge produces. */
+static int resolve_landing_for_collision(const char *git_dir, const sg_flat_list *base_flat,
+                                         const sg_flat_list *ours_flat,
+                                         const sg_flat_list *theirs_flat, const char *dst,
+                                         int is_ours, const landing *l, const char *ours_label,
+                                         const char *theirs_label, unsigned int *out_mode,
+                                         unsigned char out_sha1[SG_SHA1_RAW_LEN])
+{
+    const sg_flat_entry *side_e = flat_find(is_ours ? ours_flat : theirs_flat, dst);
+
+    if (side_e == NULL)
+        return -1;
+    if (l->kind != LANDING_KEPT) {
+        *out_mode = side_e->mode;
+        memcpy(out_sha1, side_e->sha1, SG_SHA1_RAW_LEN);
+        return 0;
+    }
+    {
+        const sg_flat_entry *base_e = flat_find(base_flat, l->src_path);
+        const sg_flat_entry *other_e = flat_find(is_ours ? theirs_flat : ours_flat, l->src_path);
+        char *own_label = compose_conflict_label(is_ours ? ours_label : theirs_label, dst);
+        char *other_label_c = compose_conflict_label(is_ours ? theirs_label : ours_label, l->src_path);
+        int conflict = 0;
+        int rc;
+
+        if (base_e == NULL || other_e == NULL || own_label == NULL || other_label_c == NULL) {
+            free(own_label);
+            free(other_label_c);
+            return -1;
+        }
+        rc = compute_kept_landing(git_dir, base_e, side_e->mode, side_e->sha1, other_e,
+                                  is_ours ? own_label : other_label_c,
+                                  is_ours ? other_label_c : own_label, 8, &conflict, out_mode,
+                                  out_sha1);
+        free(own_label);
+        free(other_label_c);
+        return rc;
+    }
+}
+
+/* Phase 49 sec 3.5/3.6: both sides want to land content at the same
+   destination. Builds a synthetic triple (base absent) around each side's
+   already-resolved (mode,sha1) landing and reuses process_path unchanged --
+   its ordinary add/add branch already produces exactly this shape (no
+   stage 1, stage 2/3 only on conflict, a plain clean entry when the two
+   landings happen to agree). No ":path" suffix: both sides' own path at
+   THIS comparison is the same dst (Phase 49 sec 4's rule falls out on its
+   own, not a special case). */
+static int emit_collision(const char *git_dir, const sg_flat_list *base_flat,
+                          const sg_flat_list *ours_flat, const sg_flat_list *theirs_flat,
+                          const char *dst, const contribution *c, const char *ours_label,
+                          const char *theirs_label, sg_merge_result *out, size_t *cap)
+{
+    sg_flat_entry synthetic_ours, synthetic_theirs;
+    triple t;
+    sg_merge_result_entry entry;
+
+    memset(&synthetic_ours, 0, sizeof(synthetic_ours));
+    memset(&synthetic_theirs, 0, sizeof(synthetic_theirs));
+    if (resolve_landing_for_collision(git_dir, base_flat, ours_flat, theirs_flat, dst, 1, &c->ours,
+                                      ours_label, theirs_label, &synthetic_ours.mode,
+                                      synthetic_ours.sha1) != 0)
+        return -1;
+    if (resolve_landing_for_collision(git_dir, base_flat, ours_flat, theirs_flat, dst, 0, &c->theirs,
+                                      ours_label, theirs_label, &synthetic_theirs.mode,
+                                      synthetic_theirs.sha1) != 0)
+        return -1;
+
+    memset(&t, 0, sizeof(t));
+    t.path = dst;
+    t.ours_present = 1;
+    t.ours_e = &synthetic_ours;
+    t.theirs_present = 1;
+    t.theirs_e = &synthetic_theirs;
+
+    if (process_path(git_dir, &t, ours_label, theirs_label, &entry) != 0)
+        return -1;
+    return append_result_entry(out, cap, &entry);
+}
+
+/* Phase 49 sec 3.3: both sides renamed p to the SAME name. Collapses to an
+   ordinary content merge at that destination via process_path, unwidened
+   (marker size 7) and unsuffixed (both sides' own path IS the destination).
+   Stage 1 (when conflicting) is process_path's own base_present path,
+   naturally relocated to the new name since t.path is the destination, not
+   p. */
+static int emit_same_destination(const char *git_dir, const sg_flat_list *base_flat,
+                                 const sg_flat_list *ours_flat, const sg_flat_list *theirs_flat,
+                                 const char *p, const char *dst, const char *ours_label,
+                                 const char *theirs_label, sg_merge_result *out, size_t *cap)
+{
+    const sg_flat_entry *base_e = flat_find(base_flat, p);
+    const sg_flat_entry *ours_e = flat_find(ours_flat, dst);
+    const sg_flat_entry *theirs_e = flat_find(theirs_flat, dst);
+    triple t;
+    sg_merge_result_entry entry;
+
+    if (base_e == NULL || ours_e == NULL || theirs_e == NULL)
+        return -1;
+    memset(&t, 0, sizeof(t));
+    t.path = dst;
+    t.base_present = 1;
+    t.base_e = base_e;
+    t.ours_present = 1;
+    t.ours_e = ours_e;
+    t.theirs_present = 1;
+    t.theirs_e = theirs_e;
+
+    if (process_path(git_dir, &t, ours_label, theirs_label, &entry) != 0)
+        return -1;
+    return append_result_entry(out, cap, &entry);
+}
+
+/* Phase 49 sec 3.4: both sides renamed p to DIFFERENT names -- rename/rename
+   "1 to 2". Always an unresolved conflict (the destination NAME itself is
+   ambiguous, independent of whether the content trivially merges), laid out
+   as three index-only paths: p keeps only a stage-1 entry and no working-tree
+   file at all (conflict_no_workdir_file), o_dst and t_dst each keep only
+   their own single stage but share the SAME freshly-written blob -- the
+   result of a marker_size-8 three-way merge of base[p]/ours[o_dst]/
+   theirs[t_dst], written to the store even when clean (the shared blob has
+   to exist as a real object regardless). Both marker labels get the ":path"
+   suffix (o_dst != t_dst by construction of this branch). Appends 3 entries. */
+static int emit_rename_rename_1to2(const char *git_dir, const sg_flat_list *base_flat,
+                                   const sg_flat_list *ours_flat, const sg_flat_list *theirs_flat,
+                                   const char *p, const char *o_dst, const char *t_dst,
+                                   const char *ours_label, const char *theirs_label,
+                                   sg_merge_result *out, size_t *cap)
+{
+    const sg_flat_entry *base_e = flat_find(base_flat, p);
+    const sg_flat_entry *ours_e = flat_find(ours_flat, o_dst);
+    const sg_flat_entry *theirs_e = flat_find(theirs_flat, t_dst);
+    char *ours_label_c = NULL;
+    char *theirs_label_c = NULL;
+    unsigned char *conflict_content = NULL;
+    size_t conflict_content_len = 0;
+    unsigned int merged_mode = 0;
+    unsigned char merged_sha1[SG_SHA1_RAW_LEN];
+    int conflict = 0;
+    int rc;
+    sg_merge_result_entry e_p, e_o, e_t;
+
+    if (base_e == NULL || ours_e == NULL || theirs_e == NULL)
+        return -1;
+    ours_label_c = compose_conflict_label(ours_label, o_dst);
+    theirs_label_c = compose_conflict_label(theirs_label, t_dst);
+    if (ours_label_c == NULL || theirs_label_c == NULL) {
+        free(ours_label_c);
+        free(theirs_label_c);
+        return -1;
+    }
+    rc = merge_blob_content(git_dir, p, 1, base_e->mode, base_e->sha1, ours_e->mode, ours_e->sha1,
+                            theirs_e->mode, theirs_e->sha1, ours_label_c, theirs_label_c, 8,
+                            &conflict, &merged_mode, merged_sha1, &conflict_content,
+                            &conflict_content_len);
+    free(ours_label_c);
+    free(theirs_label_c);
+    if (rc != 0)
+        return -1;
+    /* merge_blob_content's *out_mode is only ever meaningful on its CLEAN
+       path (its conflict branch leaves it untouched, since an ordinary
+       conflict entry has no single resolved mode), and every entry this
+       function builds is a conflict at the INDEX level regardless -- so the
+       mode is decided here, for both sub-cases at once.
+
+       MEASURED, and it is not "ours' own mode": with base 644, ours 644 and
+       theirs 755, real git writes 100755 at stage 2 AND at stage 3, and
+       leaves both working-tree files executable. The reversed fixture (ours
+       755, theirs 644) also gives 100755 at both stages. So both stages
+       carry the ORDINARY merged mode -- whichever side changed it away from
+       base wins -- and the two stages always agree, exactly as they already
+       do about the blob. Taking ours' mode passes the first fixture and
+       fails the second, which is why the pair is pinned together. */
+    if (ours_e->mode != base_e->mode)
+        merged_mode = ours_e->mode;
+    else if (theirs_e->mode != base_e->mode)
+        merged_mode = theirs_e->mode;
+    else
+        merged_mode = base_e->mode;
+    if (!conflict) {
+        /* merge_blob_content already stored the clean bytes as an object
+           (merged_sha1 is already valid) and, being an ordinary CLEAN
+           outcome, deliberately did NOT hand the bytes back in
+           conflict_content (NULL here) -- ordinary callers never need them,
+           they already have the sha1. This path is different: the content
+           merged cleanly, but rename/rename-1to2 is STILL an unresolved
+           conflict at the index level (see the function comment), so the
+           two entries below are built through the conflict branches, which
+           write conflict_content verbatim to the working tree -- there is
+           no stage-0 entry here for the ordinary non-conflict branch to
+           read the blob back through. Read the same object straight back
+           rather than re-deriving it. */
+        if (read_blob_chunk_aware(git_dir, merged_sha1, o_dst, &conflict_content,
+                                  &conflict_content_len) != 0)
+            return -1;
+    }
+
+    memset(&e_p, 0, sizeof(e_p));
+    e_p.path = strdup(p);
+    if (e_p.path == NULL)
+        return -1;
+    e_p.conflict = 1;
+    e_p.conflict_no_workdir_file = 1;
+    e_p.base_present = 1;
+    e_p.base_mode = base_e->mode;
+    memcpy(e_p.base_sha1, base_e->sha1, SG_SHA1_RAW_LEN);
+    if (append_result_entry(out, cap, &e_p) != 0) {
+        free(conflict_content);
+        return -1;
+    }
+
+    memset(&e_o, 0, sizeof(e_o));
+    e_o.path = strdup(o_dst);
+    if (e_o.path == NULL) {
+        free(conflict_content);
+        return -1;
+    }
+    e_o.conflict = 1;
+    e_o.ours_present = 1;
+    e_o.ours_mode = merged_mode;
+    memcpy(e_o.ours_sha1, merged_sha1, SG_SHA1_RAW_LEN);
+    if (conflict_content != NULL) {
+        e_o.conflict_content = malloc(conflict_content_len > 0 ? conflict_content_len : 1);
+        if (e_o.conflict_content == NULL) {
+            free(e_o.path);
+            free(conflict_content);
+            return -1;
+        }
+        memcpy(e_o.conflict_content, conflict_content, conflict_content_len);
+        e_o.conflict_content_len = conflict_content_len;
+    }
+    if (append_result_entry(out, cap, &e_o) != 0) {
+        free(conflict_content);
+        return -1;
+    }
+
+    memset(&e_t, 0, sizeof(e_t));
+    e_t.path = strdup(t_dst);
+    if (e_t.path == NULL) {
+        free(conflict_content);
+        return -1;
+    }
+    e_t.conflict = 1;
+    e_t.theirs_present = 1;
+    e_t.theirs_mode = merged_mode;
+    memcpy(e_t.theirs_sha1, merged_sha1, SG_SHA1_RAW_LEN);
+    e_t.conflict_content = conflict_content;
+    e_t.conflict_content_len = conflict_content_len;
+    return append_result_entry(out, cap, &e_t);
+}
+
+/* Pass one (classification) + pass two (resolution) of the rename-aware
+   pipeline described in the section comment above. Appends every entry it
+   produces directly to *out (growing *cap the same way the ordinary walk
+   does); the caller sorts *out by path afterward, since these entries land
+   at destinations that are not necessarily where the union walk's cursor
+   currently is. Returns 0 on success, -1 on error. */
+static int handle_renames(const char *git_dir, const sg_flat_list *base_flat,
+                          const sg_flat_list *ours_flat, const sg_flat_list *theirs_flat,
+                          const rename_map *ro, const rename_map *rt, const char *ours_label,
+                          const char *theirs_label, sg_merge_result *out, size_t *cap)
+{
+    const char **s_base = NULL;
+    size_t n_s_base = 0;
+    contribution_list contribs;
+    size_t i;
+    int rc = -1;
+
+    memset(&contribs, 0, sizeof(contribs));
+
+    s_base = calloc((ro->count + rt->count) > 0 ? ro->count + rt->count : 1, sizeof(*s_base));
+    if (s_base == NULL)
+        goto done;
+    for (i = 0; i < ro->count; i++)
+        s_base[n_s_base++] = ro->v[i].base_path;
+    for (i = 0; i < rt->count; i++) {
+        size_t j;
+        int dup = 0;
+
+        for (j = 0; j < n_s_base; j++) {
+            if (strcmp(s_base[j], rt->v[i].base_path) == 0) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup)
+            s_base[n_s_base++] = rt->v[i].base_path;
+    }
+
+    /* Pass one: classify every base source. Self-contained combos (both
+       sides renamed p, sec 3.3/3.4) are emitted immediately; the other four
+       combos register a contribution and are resolved in pass two, once
+       every source has been seen (a 2-to-1 collision needs both sides'
+       sources classified before either can be resolved). */
+    for (i = 0; i < n_s_base; i++) {
+        const char *p = s_base[i];
+        const char *o_dst = rename_map_dst(ro, p);
+        const char *t_dst = rename_map_dst(rt, p);
+        int o_kept = o_dst == NULL && flat_find(ours_flat, p) != NULL;
+        int t_kept = t_dst == NULL && flat_find(theirs_flat, p) != NULL;
+
+        if (o_dst != NULL && t_dst != NULL) {
+            if (strcmp(o_dst, t_dst) == 0) {
+                if (emit_same_destination(git_dir, base_flat, ours_flat, theirs_flat, p, o_dst,
+                                          ours_label, theirs_label, out, cap) != 0)
+                    goto done;
+            } else if (emit_rename_rename_1to2(git_dir, base_flat, ours_flat, theirs_flat, p, o_dst,
+                                              t_dst, ours_label, theirs_label, out, cap) != 0) {
+                goto done;
+            }
+            continue;
+        }
+        if (o_dst != NULL) {
+            contribution *c = contribution_find_or_add(&contribs, o_dst);
+
+            if (c == NULL)
+                goto done;
+            c->ours.kind = t_kept ? LANDING_KEPT : LANDING_DELETED;
+            c->ours.src_path = p;
+        }
+        if (t_dst != NULL) {
+            contribution *c = contribution_find_or_add(&contribs, t_dst);
+
+            if (c == NULL)
+                goto done;
+            c->theirs.kind = o_kept ? LANDING_KEPT : LANDING_DELETED;
+            c->theirs.src_path = p;
+        }
+    }
+
+    /* Fold in plain (non-rename) additions that happen to collide with a
+       rename destination registered above (Phase 49 sec 3.5) -- the other
+       side of a 2-to-1 collision (sec 3.6) is already present from pass one
+       and is never touched here. */
+    for (i = 0; i < contribs.count; i++) {
+        contribution *c = &contribs.v[i];
+
+        if (c->ours.kind == LANDING_NONE && flat_find(base_flat, c->dst) == NULL &&
+           flat_find(ours_flat, c->dst) != NULL) {
+            c->ours.kind = LANDING_PLAIN;
+            c->ours.src_path = NULL;
+        }
+        if (c->theirs.kind == LANDING_NONE && flat_find(base_flat, c->dst) == NULL &&
+           flat_find(theirs_flat, c->dst) != NULL) {
+            c->theirs.kind = LANDING_PLAIN;
+            c->theirs.src_path = NULL;
+        }
+    }
+
+    /* Pass two: resolve every destination exactly once. */
+    for (i = 0; i < contribs.count; i++) {
+        const contribution *c = &contribs.v[i];
+        int has_ours = c->ours.kind != LANDING_NONE;
+        int has_theirs = c->theirs.kind != LANDING_NONE;
+
+        if (has_ours && has_theirs) {
+            if (emit_collision(git_dir, base_flat, ours_flat, theirs_flat, c->dst, c, ours_label,
+                               theirs_label, out, cap) != 0)
+                goto done;
+        } else if (has_ours) {
+            if (emit_standalone_landing(git_dir, base_flat, ours_flat, theirs_flat, c->dst, 1,
+                                        &c->ours, ours_label, theirs_label, out, cap) != 0)
+                goto done;
+        } else if (has_theirs) {
+            if (emit_standalone_landing(git_dir, base_flat, ours_flat, theirs_flat, c->dst, 0,
+                                        &c->theirs, ours_label, theirs_label, out, cap) != 0)
+                goto done;
+        }
+    }
+    rc = 0;
+
+done:
+    free(s_base);
+    free(contribs.v);
+    return rc;
+}
+
 int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RAW_LEN],
                    const unsigned char ours_tree[SG_SHA1_RAW_LEN],
                    const unsigned char theirs_tree[SG_SHA1_RAW_LEN], const char *ours_label,
-                   const char *theirs_label, sg_merge_result *out)
+                   const char *theirs_label, int rename_score, sg_merge_result *out)
 {
     sg_flat_list base_flat, ours_flat, theirs_flat;
+    sg_diff_list ro_list, rt_list;
+    rename_map ro, rt;
+    int have_renames = 0;
     size_t bi = 0, oi = 0, ti = 0;
     size_t cap = 0;
     int rc = 0;
@@ -1008,6 +1889,10 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
     memset(&base_flat, 0, sizeof(base_flat));
     memset(&ours_flat, 0, sizeof(ours_flat));
     memset(&theirs_flat, 0, sizeof(theirs_flat));
+    memset(&ro_list, 0, sizeof(ro_list));
+    memset(&rt_list, 0, sizeof(rt_list));
+    memset(&ro, 0, sizeof(ro));
+    memset(&rt, 0, sizeof(rt));
 
     flatten_rc = sg_tree_flatten(git_dir, base_tree, &base_flat, bad_path);
     if (flatten_rc == -2) {
@@ -1042,6 +1927,30 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
         return -1;
     }
 
+    /* Phase 49: detect renames before the union walk, so the walk can skip
+       every path this pulls out for special handling (see the "Phase 49"
+       section comment above sg_merge_trees for the full shape). 0 disables
+       this outright and reproduces pre-Phase-49 behaviour byte for byte --
+       neither build_rename_map call runs, ro/rt stay empty, and
+       path_is_rename_consumed is always false. */
+    if (rename_score > 0) {
+        if (build_rename_map(git_dir, base_tree, ours_tree, rename_score, &ro_list, &ro) != 0) {
+            sg_flat_list_free(&base_flat);
+            sg_flat_list_free(&ours_flat);
+            sg_flat_list_free(&theirs_flat);
+            return -1;
+        }
+        if (build_rename_map(git_dir, base_tree, theirs_tree, rename_score, &rt_list, &rt) != 0) {
+            sg_diff_list_free(&ro_list);
+            rename_map_free(&ro);
+            sg_flat_list_free(&base_flat);
+            sg_flat_list_free(&ours_flat);
+            sg_flat_list_free(&theirs_flat);
+            return -1;
+        }
+        have_renames = 1;
+    }
+
     while (bi < base_flat.count || oi < ours_flat.count || ti < theirs_flat.count) {
         const char *bp = bi < base_flat.count ? base_flat.entries[bi].path : NULL;
         const char *op = oi < ours_flat.count ? ours_flat.entries[oi].path : NULL;
@@ -1049,6 +1958,7 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
         const char *path = min_path3(bp, op, tp);
         triple t;
         sg_merge_result_entry entry;
+        int consumed;
 
         memset(&t, 0, sizeof(t));
         t.path = path;
@@ -1067,6 +1977,10 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
             t.theirs_e = &theirs_flat.entries[ti];
             ti++;
         }
+
+        consumed = have_renames && path_is_rename_consumed(&ro, &rt, path);
+        if (consumed)
+            continue;
 
         if (process_path(git_dir, &t, ours_label, theirs_label, &entry) != 0) {
             rc = -1;
@@ -1090,6 +2004,17 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
         out->count++;
     }
 
+    if (rc == 0 && have_renames) {
+        rc = handle_renames(git_dir, &base_flat, &ours_flat, &theirs_flat, &ro, &rt, ours_label,
+                            theirs_label, out, &cap);
+    }
+    if (rc == 0 && out->count > 0)
+        qsort(out->entries, out->count, sizeof(*out->entries), result_entry_path_cmp);
+
+    sg_diff_list_free(&ro_list);
+    sg_diff_list_free(&rt_list);
+    rename_map_free(&ro);
+    rename_map_free(&rt);
     sg_flat_list_free(&base_flat);
     sg_flat_list_free(&ours_flat);
     sg_flat_list_free(&theirs_flat);
@@ -1216,8 +2141,19 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                                        : (e->theirs_present ? (int)(e->theirs_mode & 0777) : 0644);
             char **grown;
 
-            if (sg_write_file_mkdirs(abspath, e->conflict_content, e->conflict_content_len, mode) != 0)
-                fprintf(stderr, "sg: failed to write conflicted %s\n", sg_quote_path_delimited(e->path));
+            /* Phase 49: rename/rename-1to2's original path keeps only a
+               stage-1 index entry and has no working-tree file at all --
+               git leaves no file at the old name. sg_merge_entry_touches_ours
+               always answers 1 for a conflict, so the guard here is just the
+               remove() itself, same as the `deleted` branch below. */
+            if (e->conflict_no_workdir_file) {
+                if (remove(abspath) == 0)
+                    sg_prune_empty_parents(repo_root, e->path);
+            } else if (sg_write_file_mkdirs(abspath, e->conflict_content, e->conflict_content_len,
+                                            mode) != 0) {
+                fprintf(stderr, "sg: failed to write conflicted %s\n",
+                       sg_quote_path_delimited(e->path));
+            }
 
             if (e->base_present && add_stage_entry(index_out, e->path, 1, e->base_mode,
                                                    e->base_sha1) != 0)

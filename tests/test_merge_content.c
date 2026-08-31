@@ -45,7 +45,7 @@ static void test_only_ours_changed(void)
     int rc;
 
     rc = sg_merge_content(BASE, BASE_LEN, ours, sizeof(ours) - 1, BASE, BASE_LEN, "ours", "theirs",
-                          &out, &out_len);
+                          7, &out, &out_len);
     CHECK(rc == 0, "expected clean merge, got %d", rc);
     CHECK(out != NULL && out_len == sizeof(ours) - 1 && memcmp(out, ours, out_len) == 0,
          "result should equal ours exactly");
@@ -61,7 +61,7 @@ static void test_only_theirs_changed(void)
     int rc;
 
     rc = sg_merge_content(BASE, BASE_LEN, BASE, BASE_LEN, theirs, sizeof(theirs) - 1, "ours",
-                          "theirs", &out, &out_len);
+                          "theirs", 7, &out, &out_len);
     CHECK(rc == 0, "expected clean merge, got %d", rc);
     CHECK(out != NULL && out_len == sizeof(theirs) - 1 && memcmp(out, theirs, out_len) == 0,
          "result should equal theirs exactly");
@@ -79,7 +79,7 @@ static void test_both_changed_different_regions(void)
     int rc;
 
     rc = sg_merge_content(BASE, BASE_LEN, ours, sizeof(ours) - 1, theirs, sizeof(theirs) - 1,
-                          "ours", "theirs", &out, &out_len);
+                          "ours", "theirs", 7, &out, &out_len);
     CHECK(rc == 0, "expected clean auto-merge, got %d", rc);
     CHECK(out != NULL && out_len == sizeof(expected) - 1 && memcmp(out, expected, out_len) == 0,
          "result should contain both edits: got '%.*s'", (int)out_len, (const char *)out);
@@ -98,7 +98,7 @@ static void test_same_region_conflict(void)
     const char *s;
 
     rc = sg_merge_content(BASE, BASE_LEN, ours, sizeof(ours) - 1, theirs, sizeof(theirs) - 1,
-                          "ours-branch", "theirs-branch", &out, &out_len);
+                          "ours-branch", "theirs-branch", 7, &out, &out_len);
     CHECK(rc == 1, "expected a conflict, got %d", rc);
     CHECK(out != NULL, "conflict output should not be NULL");
     if (out == NULL)
@@ -137,7 +137,7 @@ static void test_both_changed_identically(void)
     int rc;
 
     rc = sg_merge_content(BASE, BASE_LEN, same, sizeof(same) - 1, same, sizeof(same) - 1, "ours",
-                          "theirs", &out, &out_len);
+                          "theirs", 7, &out, &out_len);
     CHECK(rc == 0, "identical edits on both sides should not conflict, got %d", rc);
     CHECK(out != NULL && out_len == sizeof(same) - 1 && memcmp(out, same, out_len) == 0,
          "result should equal the common edit");
@@ -155,7 +155,7 @@ static void test_binary_content_conflicts(void)
     int rc;
 
     rc = sg_merge_content(base_bin, sizeof(base_bin), ours_bin, sizeof(ours_bin), theirs_bin,
-                          sizeof(theirs_bin), "ours", "theirs", &out, &out_len);
+                          sizeof(theirs_bin), "ours", "theirs", 7, &out, &out_len);
     CHECK(rc == 1, "binary content must always be reported as a conflict, got %d", rc);
     free(out);
 }
@@ -176,7 +176,7 @@ static void test_anchor_newline_not_glued(void)
     int rc;
 
     rc = sg_merge_content(base, sizeof(base) - 1, ours, sizeof(ours) - 1, theirs,
-                          sizeof(theirs) - 1, "ours", "theirs", &out, &out_len);
+                          sizeof(theirs) - 1, "ours", "theirs", 7, &out, &out_len);
     CHECK(rc == 1, "expected the tail to conflict, got %d", rc);
     CHECK(out != NULL, "conflict output should not be NULL");
     if (out == NULL)
@@ -213,7 +213,7 @@ static void check_merge(const char *name, const unsigned char *base, size_t base
     unsigned char *out = NULL;
     size_t out_len = 0;
     int rc = sg_merge_content(base, base_len, ours, ours_len, theirs, theirs_len, "ours",
-                             "theirs", &out, &out_len);
+                             "theirs", 7, &out, &out_len);
 
     CHECK(rc == want_rc, "%s: expected rc %d, got %d", name, want_rc, rc);
     if (out == NULL) {

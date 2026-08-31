@@ -7718,3 +7718,112 @@ The phase does not touch `@{<date>}`, `@{upstream}`, or
 `sg reflog expire|delete`; those remain unimplemented and are listed here so
 the next reader does not mistake "Phase 17's gaps are closed" for "the
 reflog is complete".
+
+## Phase 49: rename detection in the three-way merge
+
+Phase 45 measured, and pinned on both sides, that `sg merge` had no rename
+detection: a history real git calls `CONFLICT (rename/rename)` merged cleanly
+under sg, keeping both renamed files. That was the top item on the "what
+actually blocks real use" list. This phase closes it.
+
+### 1. The oracle, measured before any code was written
+
+Every row below is from git 2.55.0 under `LC_ALL=C` with
+`-c advice.statusHints=true -c core.quotepath=false`, one throwaway repo per
+scenario, `master` = ours and `theirs` = the merged branch. Nothing here was
+recalled; the scenario scripts are reproducible.
+
+**The threshold is exactly `git diff`'s default 50%, and the comparison is
+`score >= 50%`.** Measured by bisecting how much of a 100-line file ours
+rewrites while renaming it, with theirs editing a line ours left alone:
+
+| lines rewritten | `git diff -M --name-status` | merge rc | outcome |
+|---|---|---|---|
+| 0 | `R100` | 0 | clean, edit follows the rename |
+| 10 / 20 / 30 / 40 / 45 | `R089` … `R053` | 0 | clean |
+| **48** | **`R050`** | **0** | clean |
+| **49** | **`D` + `A`** | **1** | `CONFLICT (modify/delete)` |
+| 50 … 90 | `D` + `A` | 1 | `CONFLICT (modify/delete)` |
+
+Both tools flip at the same K, so sg reuses `SG_SIMILARITY_DEFAULT` (30000 on
+git's 0..60000 scale) rather than introducing a second constant.
+
+**The surviving path is always the non-base name, and the stages move with
+it.** For a one-sided rename whose content also conflicts, all three stages
+sit at the NEW path -- stage 1 is *not* left at the old name:
+
+```
+$ git ls-files -s          # ours renamed a.txt -> b.txt, both edited line 5
+100644 4083766... 1  b.txt   (base blob)
+100644 f4cde8c... 2  b.txt   (ours)
+100644 3c00e2d... 3  b.txt   (theirs)
+```
+
+Measured identically with the rename on theirs' side instead; only
+`git status`'s extra `D  a.txt` row differs, and that is not a fourth index
+entry -- `a.txt` is simply absent from the index while HEAD still has it.
+
+**The one exception is rename/rename to two different names**, where the three
+stages live at three different paths (this is the shape Phase 45 built with
+real git to give `both deleted:` / `added by us:` / `added by them:` an
+oracle):
+
+```
+$ git status --porcelain=v1     $ git ls-files -s
+DD a.txt                        100644 <base> 1  a.txt
+AU b.txt                        100644 <M>    2  b.txt
+UA c.txt                        100644 <M>    3  c.txt
+```
+
+Note `<M>`: **stage 2 and stage 3 hold the same blob**, and it is the result of
+a real three-way content merge of (base, ours@b, theirs@c) -- when that merge
+conflicts, the stored blob *contains the conflict markers*. Both working-tree
+files get those same bytes. The old name has a stage-1 index entry and **no
+file in the working tree at all**, which is the one thing
+`sg_merge_result_entry` could not express before this phase.
+
+**Both sides renaming to the SAME name is not a rename/rename conflict at
+all** -- it collapses to an ordinary content merge at that path, with stage 1
+being the base blob relocated to the new name.
+
+**rename/delete leaves no conflict markers**: the renamed side's content sits
+at the new path verbatim, and the index carries stages 1+2 (ours renamed,
+`UD`) or 1+3 (theirs renamed, `DU`).
+
+**A rename destination that collides with an unrelated add degrades to
+add/add with no stage 1 at all** -- so does rename/rename 2to1 (two different
+sources renamed onto one name). This is a different index shape from a content
+conflict, not a variant of it, and it cannot be assembled by the same path.
+
+**The `:<path>` marker suffix is conditioned on the two sides' own paths
+differing from each other, not on "a rename happened."** Both sides renaming
+to the same name gets no suffix; when the suffix is present both sides carry
+one, each naming its own path (`<<<<<<< HEAD:b.txt` … `>>>>>>> theirs:a.txt`,
+measured in both directions).
+
+**The marker run is not always 7.** git widens it to 8 for rename/rename 1to2
+and for a rename whose destination collides; when those nest, the outer
+add/add stays 7 and the inner rename merge is 8, and it is the *inner*
+conflicted text that gets hashed into stage 2.
+
+### 2. What was deliberately left out
+
+- **Directory rename detection.** Measured: git's default is
+  `merge.directoryRenames=conflict`, which moves a file added under a
+  directory the other side renamed *and* reports
+  `CONFLICT (file location)`. `merge.directoryRenames=false` reproduces plain
+  path alignment exactly -- so sg's answer is byte-compatible with one
+  documented config value, and the divergence is exactly that wide.
+- **`-X find-renames=<n>` / `-X no-renames` / `merge.renames` /
+  `merge.renameLimit`.** sg reads no config and `sg merge` has no `-X`.
+  Measured for the record: `-X find-renames=<n>` and `-X rename-threshold=<n>`
+  are aliases and move the threshold in both directions;
+  `merge.renames` defaults to `diff.renames`; `renameLimit` gates only the
+  inexact pass (a 100% match is settled by the exact-id pass and ignores it);
+  and **`git merge --no-renames` does not exist** -- it exits 129, the
+  spelling is `-X no-renames`.
+- **git's stdout wording.** sg's merge messages were already a different
+  vocabulary entirely (`Merge made by '<x>' [<sha>] into '<y>'.`, and a
+  conflict list with `sg add` instructions), so `CONFLICT (rename/rename): ...`
+  and `Auto-merging <path>` are not reproduced. The dimensions this phase
+  holds to real git are exit code, working-tree bytes, and index stage layout.

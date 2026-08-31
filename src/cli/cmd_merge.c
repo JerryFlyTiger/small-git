@@ -13,6 +13,7 @@
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
+#include "sg/similarity.h"
 #include "sg/snapshot.h"
 #include "sg/status.h"
 #include "sg/tree_build.h"
@@ -225,7 +226,7 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
     sg_index_free(&idx);
 
     if (sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, ours_label, branch_arg,
-                       &result) != 0) {
+                       SG_SIMILARITY_DEFAULT, &result) != 0) {
         fprintf(stderr, "sg: an error occurred while merging\n");
         return 1;
     }
