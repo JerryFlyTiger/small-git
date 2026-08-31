@@ -93,7 +93,7 @@ int sg_status_diff_staged(const char *git_dir, const char *repo_root,
        object). Collapsing the two here is exactly the bug Phase 36 fixed --
        every caller that folded this into one message was printing a guess
        instead of the actual reason. */
-    trc = sg_diff_tree_index(git_dir, head_tree, idx, &dl, bad_path);
+    trc = sg_diff_tree_index(git_dir, head_tree, idx, &dl, bad_path, 0);
     if (trc != 0)
         return trc;
 

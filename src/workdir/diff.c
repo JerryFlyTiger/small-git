@@ -143,6 +143,9 @@ static int list_append(sg_diff_list *list, const char *path, const sg_diff_side 
     list->entries[list->count].ours = side_absent();
     list->entries[list->count].theirs = side_absent();
     list->entries[list->count].result = side_absent();
+    /* Overwritten by callers that append an unchanged row for -C -C's copy
+       source pool (Phase 51) -- see sg/diff.h's sg_diff_entry contract. */
+    list->entries[list->count].unchanged = 0;
     list->count++;
     return 0;
 }
@@ -201,6 +204,17 @@ void sg_diff_fill_combined_from_index(const sg_index *idx, sg_diff_list *list)
         sg_diff_entry *e = &list->entries[i];
         int stage;
         sg_diff_side ours = side_absent();
+
+        /* Phase 51: an unchanged row exists only to be offered to copy
+           detection as a source, and filling it here would make
+           sg_diff_entry_is_combined answer yes for it -- rename.c's three
+           source predicates all refuse a combined row, so the row would be
+           silently dropped from the source pool and the copy never found.
+           Measured: `sg diff -c -C -C <rev>` printed `A copy.txt` where real
+           git prints `C094 src.txt copy.txt`, while plain `-C -C` and plain
+           `-c` were each correct on their own. */
+        if (e->unchanged)
+            continue;
 
         /* Lowest stage present, not "stage 1" -- an add/add conflict has no
            stage 1 at all and git falls back to stage 2 there (SPEC section
@@ -315,7 +329,8 @@ static size_t index_group_end(const sg_index *idx, size_t i)
 }
 
 int sg_diff_trees(const char *git_dir, const unsigned char *old_tree,
-                  const unsigned char *new_tree, sg_diff_list *out, char *bad_path)
+                  const unsigned char *new_tree, sg_diff_list *out, char *bad_path,
+                  int include_unchanged)
 {
     sg_flat_list old_flat;
     sg_flat_list new_flat;
@@ -353,6 +368,12 @@ int sg_diff_trees(const char *git_dir, const unsigned char *old_tree,
                     rc = -1;
                     goto done;
                 }
+            } else if (include_unchanged) {
+                if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
+                    rc = -1;
+                    goto done;
+                }
+                out->entries[out->count - 1].unchanged = 1;
             }
             oi++;
             ni++;
@@ -387,7 +408,8 @@ done:
 }
 
 int sg_diff_tree_index(const char *git_dir, const unsigned char *old_tree,
-                       const sg_index *idx, sg_diff_list *out, char *bad_path)
+                       const sg_index *idx, sg_diff_list *out, char *bad_path,
+                       int include_unchanged)
 {
     sg_flat_list old_flat;
     size_t oi = 0;
@@ -439,6 +461,12 @@ int sg_diff_tree_index(const char *git_dir, const unsigned char *old_tree,
                         rc = -1;
                         goto done;
                     }
+                } else if (include_unchanged) {
+                    if (list_append(out, idx_path, &os, &ns) != 0) {
+                        rc = -1;
+                        goto done;
+                    }
+                    out->entries[out->count - 1].unchanged = 1;
                 }
             }
             oi++;
@@ -678,7 +706,8 @@ int sg_diff_index_workdir(const char *git_dir, const char *repo_root, const sg_i
 
 int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                          const unsigned char *old_tree, const sg_index *idx,
-                         sg_diff_list *out, char *bad_path, int combined)
+                         sg_diff_list *out, char *bad_path, int combined,
+                         int include_unchanged)
 {
     sg_flat_list old_flat;
     size_t oi = 0;
@@ -814,6 +843,19 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                             rc = -1;
                             goto done;
                         }
+                    } else if (include_unchanged) {
+                        /* SPEC section 2.3: only when still unchanged after
+                           the combined widening right above, which is why
+                           this sits after that block rather than testing
+                           blob_sides_differ directly -- must_append already
+                           folds in every reason this path is NOT a genuine
+                           unchanged row (a differing tree/workdir pair, or a
+                           differing index/workdir pair when combined is on). */
+                        if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
+                            rc = -1;
+                            goto done;
+                        }
+                        out->entries[out->count - 1].unchanged = 1;
                     }
                 }
             }

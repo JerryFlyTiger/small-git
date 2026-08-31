@@ -11343,6 +11343,22 @@ p33_cmp() {
         cmp -s "$WORKDIR/p33_sg.txt" "$WORKDIR/p33_git.txt"
 }
 
+# Same body as p33_cmp, "phase51:" prefix -- reserved for checks that assert
+# `-C -C` / `--find-copies-harder` actually WORKS. Phase 33's own position
+# was to reject that flag outright, so a check bearing its name that asserts
+# the opposite reads history backwards. Fixture variable names are reused
+# freely (P33_A, P33_C, etc.) -- those are just fixtures, not a claim about
+# which phase owns the assertion.
+p51_cmp() {
+    p51_dir="$1"
+    p51_label="$2"
+    shift 2
+    (cd "$p51_dir" && "$SG" diff "$@") > "$WORKDIR/p51_sg.txt" 2>/dev/null
+    (cd "$p51_dir" && git -c core.quotepath=false diff "$@") > "$WORKDIR/p51_git.txt" 2>/dev/null
+    check "phase51: sg diff $p51_label matches real git byte-for-byte" \
+        cmp -s "$WORKDIR/p51_sg.txt" "$WORKDIR/p51_git.txt"
+}
+
 # --- A: an untouched source plus a full copy -- plain -C finds nothing, only
 # -C -C (find-copies-harder) would, and sg does not implement that. ----------
 P33_A="$WORKDIR/p33_untouched_source"
@@ -11357,7 +11373,7 @@ check "phase33 oracle: real git's plain -C does NOT find a copy from an untouche
 check "phase33 oracle: and it prints no C-line at all" \
     sh -c "! (cd '$P33_A' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^C'"
 for p33_fmt in --name-status --stat --numstat --shortstat --name-only; do
-    p33_cmp "$P33_A" "--cached -C $p33_fmt (untouched source)" --cached -C "$p33_fmt"
+    p51_cmp "$P33_A" "--cached -C $p33_fmt (untouched source)" --cached -C "$p33_fmt"
 done
 p33_cmp "$P33_A" "--cached -C (patch, untouched source)" --cached -C
 
@@ -11383,7 +11399,7 @@ check "phase33 oracle: real git pairs the edited source with -C" \
 check "phase33 oracle: and the source row is STILL a plain modification" \
     sh -c "(cd '$P33_B' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^M[[:space:]]src.txt\$'"
 for p33_fmt in --name-status --stat --numstat --shortstat --name-only; do
-    p33_cmp "$P33_B" "--cached -C $p33_fmt (modified source stays, plus a copy)" --cached -C "$p33_fmt"
+    p51_cmp "$P33_B" "--cached -C $p33_fmt (modified source stays, plus a copy)" --cached -C "$p33_fmt"
 done
 p33_cmp "$P33_B" "--cached -C (patch, modified source stays, plus a copy)" --cached -C
 check "phase33: sg's patch prints copy from/copy to, not rename from/to" \
@@ -11404,7 +11420,7 @@ check "phase33 oracle: real git calls the first destination in path order a COPY
 check "phase33 oracle: and the second a RENAME" \
     sh -c "(cd '$P33_C' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^R100[[:space:]]src.txt[[:space:]]c2.txt\$'"
 for p33_fmt in --name-status --stat --numstat --shortstat --name-only; do
-    p33_cmp "$P33_C" "--cached -C $p33_fmt (one source, one copy, one rename)" --cached -C "$p33_fmt"
+    p51_cmp "$P33_C" "--cached -C $p33_fmt (one source, one copy, one rename)" --cached -C "$p33_fmt"
 done
 p33_cmp "$P33_C" "--cached -C (patch, one source, one copy, one rename)" --cached -C
 
@@ -11434,7 +11450,7 @@ check "phase33 oracle: and dir2/foo.txt (79%) is left a COPY from the same sourc
     sh -c "(cd '$P33_D' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^C079[[:space:]]dir1/foo.txt[[:space:]]dir2/foo.txt\$'"
 p33_cmp "$P33_D" "--cached --name-status (no -C: shortcut wins)" --cached --name-status
 for p33_fmt in --name-status --stat --numstat --shortstat --name-only; do
-    p33_cmp "$P33_D" "--cached -C $p33_fmt (shortcut skipped under -C)" --cached -C "$p33_fmt"
+    p51_cmp "$P33_D" "--cached -C $p33_fmt (shortcut skipped under -C)" --cached -C "$p33_fmt"
 done
 p33_cmp "$P33_D" "--cached -C (patch, shortcut skipped under -C)" --cached -C
 
@@ -11447,23 +11463,28 @@ check "phase33 oracle: real git rejects an unparsable -C value" \
 check "phase33: sg rejects it too" \
     sh -c "! (cd '$P33_C' && '$SG' diff --cached -Cabc) > /dev/null 2>&1"
 
-# --- -C -C / --find-copies-harder: a deliberate divergence from real git ---
-# sg does not implement find-copies-harder (it would need every UNCHANGED
-# path as a candidate source, which sg_diff_list never holds). Pin the
-# divergence explicitly rather than let it look like an accident: real git
-# accepts the flag, sg refuses it outright.
+# --- -C -C / --find-copies-harder: implemented as of Phase 51 -------------
+# Phase 33 used to pin this as a deliberate divergence (sg refused the flag
+# outright); Phase 51 implements it (see the "phase51:" group further down
+# for the full state-machine and fixture coverage). These two oracle lines
+# are kept from Phase 33 rather than deleted outright, per that phase's own
+# rule about not silently losing an oracle a check used to depend on.
 check "phase33 oracle: real git DOES accept -C -C" \
     sh -c "(cd '$P33_C' && LC_ALL=C git diff --cached -C -C --name-status) > /dev/null 2>&1"
-check "phase33: sg deliberately rejects -C -C" \
-    sh -c "! (cd '$P33_C' && '$SG' diff --cached -C -C) > /dev/null 2>$WORKDIR/p33_harder.txt"
-check "phase33: and names find-copies-harder in the error" \
-    grep -q "find-copies-harder" "$WORKDIR/p33_harder.txt"
 check "phase33 oracle: real git also accepts the long form --find-copies-harder" \
     sh -c "(cd '$P33_C' && LC_ALL=C git diff --cached --find-copies-harder --name-status) > /dev/null 2>&1"
-check "phase33: sg rejects the long form too" \
-    sh -c "! (cd '$P33_C' && '$SG' diff --cached --find-copies-harder) > /dev/null 2>$WORKDIR/p33_harder2.txt"
-check "phase33: and names find-copies-harder in that error too" \
-    grep -q "find-copies-harder" "$WORKDIR/p33_harder2.txt"
+check "phase51: sg now accepts -C -C too (P33_C, one source, one copy, one rename)" \
+    sh -c "(cd '$P33_C' && '$SG' diff --cached -C -C) > /dev/null 2>&1"
+check "phase51: and the long form --find-copies-harder" \
+    sh -c "(cd '$P33_C' && '$SG' diff --cached --find-copies-harder) > /dev/null 2>&1"
+p51_cmp "$P33_C" "--cached -C -C --name-status (P33_C under harder mode, unaffected: no unchanged file here)" \
+    --cached -C -C --name-status
+p51_cmp "$P33_A" "--cached -C -C --name-status (P33_A: an untouched source becomes a copy source)" \
+    --cached -C -C --name-status
+check "phase51 oracle: real git's -C -C DOES find the untouched-source copy" \
+    sh -c "(cd '$P33_A' && LC_ALL=C git diff --cached -C -C --name-status) | grep -q '^C100[[:space:]]src.txt[[:space:]]copy.txt\$'"
+check "phase51: sg's -C -C finds the copy off an untouched source (P33_A)" \
+    sh -c "(cd '$P33_A' && '$SG' diff --cached -C -C --name-status) | grep -q '^C100[[:space:]]src.txt[[:space:]]copy.txt\$'"
 
 # Two properties of copy mode that the fixtures above cannot see, because
 # something else in the pipeline happens to reach the same answer. Both were
@@ -11998,6 +12019,358 @@ check "phase34: \"* Unmerged path\" carries the RAW tab byte, not a quoted name"
     sh -c "grep -q \"^\* Unmerged path wei rd\$(printf '\\t')tab.txt\$\" '$WORKDIR/p34q_sg_cached.txt'"
 check "phase34 oracle: real git's \"* Unmerged path\" is unquoted too, even with core.quotepath=false unset" \
     sh -c "(cd '$P34_Q' && git diff --cached) | grep -q \"^\* Unmerged path wei rd\$(printf '\\t')tab.txt\$\""
+
+# --- Phase 51: `-C -C` / `--find-copies-harder` ---------------------------
+# git's find-copies-harder additionally offers every UNCHANGED path as a
+# copy source. The fixture below has exactly one such candidate: src.txt is
+# committed once and never touched again; dst.txt is a 94-of-100-line
+# truncation of it, staged as a brand new file. Measured (this machine, git
+# 2.55.0): that pair scores 93%, not the round "94%" the spec text uses as
+# a label -- the score is git's own delta-compression heuristic, not a
+# linear function of line count, and 93% is what actually comes out here.
+p51_mk_truncated() {
+    python3 -c "
+import sys
+open(sys.argv[1], 'w').write(''.join('A-%d\n' % i for i in range(1, int(sys.argv[2]) + 1)))
+" "$1" "$2"
+}
+
+P51="$WORKDIR/p51_copies_harder"
+(cd "$WORKDIR" && "$SG" init p51_copies_harder) > /dev/null 2>&1
+(cd "$P51" && git config user.email "a@b.c" && git config user.name "git user")
+p51_mk_truncated "$P51/src.txt" 100
+(cd "$P51" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+p51_mk_truncated "$P51/dst.txt" 94
+(cd "$P51" && "$SG" add .) > /dev/null 2>&1
+
+check "phase51 oracle: plain -C finds nothing from an untouched source" \
+    sh -c "(cd '$P51' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^A[[:space:]]dst.txt\$'"
+check "phase51: sg's plain -C agrees" \
+    sh -c "(cd '$P51' && '$SG' diff --cached -C --name-status) | grep -q '^A[[:space:]]dst.txt\$'"
+check "phase51 oracle: -C -C DOES find it, at 93%" \
+    sh -c "(cd '$P51' && LC_ALL=C git diff --cached -C -C --name-status) | grep -q '^C093[[:space:]]src.txt[[:space:]]dst.txt\$'"
+check "phase51: sg's -C -C finds the 93%% copy (P51 fixture)" \
+    sh -c "(cd '$P51' && '$SG' diff --cached -C -C --name-status) | grep -q '^C093[[:space:]]src.txt[[:space:]]dst.txt\$'"
+
+# Full-output cmp, patch and --stat -- the two formats most likely to show a
+# data-layer mistake (a stray unchanged row leaking into the rendered output,
+# or a wrong similarity-index line).
+p51_cmp "$P51" "--cached -C -C (patch, phase51 93%% copy)" --cached -C -C
+p51_cmp "$P51" "--cached -C -C --stat (phase51 93%% copy)" --cached -C -C --stat
+p51_cmp "$P51" "--cached --find-copies-harder --name-status (long form)" \
+    --cached --find-copies-harder --name-status
+
+# --- pathspec ordering (SPEC section 2.5): filtering runs BEFORE detection,
+# so a spec naming only the destination leaves the source filtered out with
+# nothing to pair against, one naming only the source leaves nothing to
+# print at all, and naming both finds the copy exactly as the unfiltered
+# case does.
+check "phase51 oracle: -- dst.txt alone reports a plain addition" \
+    sh -c "(cd '$P51' && LC_ALL=C git diff --cached -C -C --name-status -- dst.txt) | grep -q '^A[[:space:]]dst.txt\$'"
+check "phase51: sg agrees that -- dst.txt alone reports a plain addition" \
+    sh -c "(cd '$P51' && '$SG' diff --cached -C -C --name-status -- dst.txt) | grep -q '^A[[:space:]]dst.txt\$'"
+p51_src_only_git=$( (cd "$P51" && LC_ALL=C git diff --cached -C -C --name-status -- src.txt) )
+p51_src_only_sg=$( (cd "$P51" && "$SG" diff --cached -C -C --name-status -- src.txt) )
+check "phase51 oracle: -- src.txt alone prints nothing at all" \
+    test -z "$p51_src_only_git"
+check "phase51: sg agrees that -- src.txt alone prints nothing" \
+    test -z "$p51_src_only_sg"
+p51_cmp "$P51" "--cached -C -C --name-status -- src.txt dst.txt (both halves)" \
+    --cached -C -C --name-status -- src.txt dst.txt
+
+# --- one unchanged source, two destinations: BOTH copies, unlike a deleted
+# source (test_one_source_two_copies_gives_a_copy_then_a_rename's shape,
+# which gives one copy and one rename instead) --------------------------
+P51_TWO="$WORKDIR/p51_two_destinations"
+(cd "$WORKDIR" && "$SG" init p51_two_destinations) > /dev/null 2>&1
+(cd "$P51_TWO" && git config user.email "a@b.c" && git config user.name "git user")
+p51_mk_truncated "$P51_TWO/src.txt" 100
+(cd "$P51_TWO" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+cp "$P51_TWO/src.txt" "$P51_TWO/aaa.txt"
+cp "$P51_TWO/src.txt" "$P51_TWO/zzz.txt"
+(cd "$P51_TWO" && "$SG" add .) > /dev/null 2>&1
+check "phase51 oracle: aaa.txt is a 100% copy" \
+    sh -c "(cd '$P51_TWO' && LC_ALL=C git diff --cached -C -C --name-status) | grep -q '^C100[[:space:]]src.txt[[:space:]]aaa.txt\$'"
+check "phase51 oracle: zzz.txt is ALSO a 100% copy, not a rename" \
+    sh -c "(cd '$P51_TWO' && LC_ALL=C git diff --cached -C -C --name-status) | grep -q '^C100[[:space:]]src.txt[[:space:]]zzz.txt\$'"
+p51_cmp "$P51_TWO" "--cached -C -C --name-status (one unchanged source, two destinations)" \
+    --cached -C -C --name-status
+
+# --- a <rev> comparison (not just --cached) --------------------------------
+(cd "$P51" && "$SG" commit -m "add dst") > /dev/null 2>&1
+p51_cmp "$P51" "HEAD~1 HEAD -C -C --name-status (tree vs tree)" \
+    -C -C --name-status HEAD~1 HEAD
+
+# --- sg stash show -C -C / -u -C -C ----------------------------------------
+P51_STASH="$WORKDIR/p51_stash"
+(cd "$WORKDIR" && "$SG" init p51_stash) > /dev/null 2>&1
+(cd "$P51_STASH" && git config user.email "a@b.c" && git config user.name "git user")
+p51_mk_truncated "$P51_STASH/src.txt" 100
+(cd "$P51_STASH" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+p51_mk_truncated "$P51_STASH/dst.txt" 94
+(cd "$P51_STASH" && "$SG" add . && "$SG" stash) > /dev/null 2>&1
+check "phase51 oracle: git stash show -C -C finds the copy" \
+    sh -c "(cd '$P51_STASH' && LC_ALL=C git stash show -C -C --name-status) | grep -q '^C093[[:space:]]src.txt[[:space:]]dst.txt\$'"
+check "phase51: sg stash show -C -C agrees" \
+    sh -c "(cd '$P51_STASH' && '$SG' stash show -C -C --name-status) | grep -q '^C093[[:space:]]src.txt[[:space:]]dst.txt\$'"
+p51_mk_truncated "$P51_STASH/untracked.txt" 94
+(cd "$P51_STASH" && "$SG" stash -u) > /dev/null 2>&1
+check "phase51 oracle: git stash show -u -C -C finds a copy off the TRACKED unchanged file" \
+    sh -c "(cd '$P51_STASH' && LC_ALL=C git stash show -u -C -C --name-status) | grep -q '^C093[[:space:]]src.txt[[:space:]]untracked.txt\$'"
+check "phase51: sg stash show -u -C -C agrees" \
+    sh -c "(cd '$P51_STASH' && '$SG' stash show -u -C -C --name-status) | grep -q '^C093[[:space:]]src.txt[[:space:]]untracked.txt\$'"
+
+# --- --find-copies-harder=<anything> stays rejected, exit code diverges ----
+# (same family as the --patience/--minimal divergence already recorded in
+# CLAUDE.md: sg has no third exit code, git's own is 129.)
+check "phase51 oracle: real git rejects --find-copies-harder=50 with exit 129" \
+    sh -c "(cd '$P51' && LC_ALL=C git diff --cached --find-copies-harder=50) > /dev/null 2>&1; test \$? -eq 129"
+check "phase51: sg rejects it too, with exit 1 (this project's own convention)" \
+    sh -c "(cd '$P51' && '$SG' diff --cached --find-copies-harder=50) > /dev/null 2>&1; test \$? -eq 1"
+
+# --- Phase 51 cold read: matrix_pass/exact_pass read git's rename_used
+# counter (sg's `uses`) as a plain `used` boolean, letting a modification or
+# unchanged source outscore a genuine deletion for the SAME destination even
+# though real git resolves ordinary renames (deletion sources only) BEFORE
+# copies are considered at all. Fixed on master; these two witnesses were
+# measured against git 2.55.0 while diagnosing it.
+
+# Witness A (matrix_pass): a weak (58%) DELETED source competes against a
+# strong (96%) MODIFICATION source for one destination. git gives the
+# destination to the weaker deletion, not the stronger modification.
+P51_PRIO_A="$WORKDIR/p51_matrix_priority"
+(cd "$WORKDIR" && "$SG" init p51_matrix_priority) > /dev/null 2>&1
+(cd "$P51_PRIO_A" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "
+body = ['m-%d' % i for i in range(1, 41)]
+noise = ['n-%d' % i for i in range(1, 17)]
+open('$P51_PRIO_A/del.txt', 'w').write('\n'.join(body[:25] + noise) + '\n')
+open('$P51_PRIO_A/mod.txt', 'w').write('\n'.join(body) + '\n')
+"
+(cd "$P51_PRIO_A" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+python3 -c "
+body = ['m-%d' % i for i in range(1, 41)]
+open('$P51_PRIO_A/mod.txt', 'w').write('\n'.join(body) + '\nextra\n')
+open('$P51_PRIO_A/dest.txt', 'w').write('\n'.join(body) + '\nextra2\n')
+"
+rm "$P51_PRIO_A/del.txt"
+(cd "$P51_PRIO_A" && "$SG" add .) > /dev/null 2>&1
+check "phase51 oracle: git gives dest.txt to the weaker DELETION (58%), not the stronger modification (96%)" \
+    sh -c "(cd '$P51_PRIO_A' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^R058[[:space:]]del.txt[[:space:]]dest.txt\$'"
+check "phase51 oracle: and mod.txt stays an ordinary modification, never a copy source" \
+    sh -c "(cd '$P51_PRIO_A' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^M[[:space:]]mod.txt\$'"
+check "phase51: sg agrees on both" \
+    sh -c "(cd '$P51_PRIO_A' && '$SG' diff --cached -C --name-status) | grep -q '^R058[[:space:]]del.txt[[:space:]]dest.txt\$' && (cd '$P51_PRIO_A' && '$SG' diff --cached -C --name-status) | grep -q '^M[[:space:]]mod.txt\$'"
+p33_cmp "$P51_PRIO_A" "--cached -C --name-status (matrix priority: weak deletion beats strong modification)" \
+    --cached -C --name-status
+
+# Witness B (exact_pass), DISCRIMINATING direction: aaa_mod.txt (a
+# MODIFICATION, sorts first) and zzz_del.txt (a DELETION, sorts second) both
+# held "X"; zzz_del.txt is removed, aaa_mod.txt becomes "Y", dest.txt is
+# added as "X" -- an exact match for BOTH. git gives dest.txt to the
+# deletion despite the modification being examined first.
+P51_PRIO_B="$WORKDIR/p51_exact_priority"
+(cd "$WORKDIR" && "$SG" init p51_exact_priority) > /dev/null 2>&1
+(cd "$P51_PRIO_B" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'X\n' > "$P51_PRIO_B/aaa_mod.txt"
+printf 'X\n' > "$P51_PRIO_B/zzz_del.txt"
+(cd "$P51_PRIO_B" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+printf 'Y\n' > "$P51_PRIO_B/aaa_mod.txt"
+rm "$P51_PRIO_B/zzz_del.txt"
+printf 'X\n' > "$P51_PRIO_B/dest.txt"
+(cd "$P51_PRIO_B" && "$SG" add .) > /dev/null 2>&1
+check "phase51 oracle: git gives dest.txt to the DELETION even though the modification sorts first" \
+    sh -c "(cd '$P51_PRIO_B' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^R100[[:space:]]zzz_del.txt[[:space:]]dest.txt\$'"
+check "phase51: sg agrees that dest.txt goes to the deletion despite the modification sorting first" \
+    sh -c "(cd '$P51_PRIO_B' && '$SG' diff --cached -C --name-status) | grep -q '^R100[[:space:]]zzz_del.txt[[:space:]]dest.txt\$'"
+p33_cmp "$P51_PRIO_B" "--cached -C --name-status (exact-pass priority, discriminating direction)" \
+    --cached -C --name-status
+
+# Witness B's control, NON-discriminating direction (deletion sorts first):
+# both the pre-fix and the fixed code already agree here, since plain
+# iteration order alone hands the deletion the tie. Kept to guard the
+# ordinary case, not as evidence of the fix -- see the WARNING above.
+P51_PRIO_B_CTL="$WORKDIR/p51_exact_priority_ctl"
+(cd "$WORKDIR" && "$SG" init p51_exact_priority_ctl) > /dev/null 2>&1
+(cd "$P51_PRIO_B_CTL" && git config user.email "a@b.c" && git config user.name "git user")
+printf 'X\n' > "$P51_PRIO_B_CTL/aaa_del.txt"
+printf 'X\n' > "$P51_PRIO_B_CTL/zzz_mod.txt"
+(cd "$P51_PRIO_B_CTL" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+printf 'Y\n' > "$P51_PRIO_B_CTL/zzz_mod.txt"
+rm "$P51_PRIO_B_CTL/aaa_del.txt"
+printf 'X\n' > "$P51_PRIO_B_CTL/dest.txt"
+(cd "$P51_PRIO_B_CTL" && "$SG" add .) > /dev/null 2>&1
+check "phase51 oracle: control -- deletion sorted first, non-discriminating" \
+    sh -c "(cd '$P51_PRIO_B_CTL' && LC_ALL=C git diff --cached -C --name-status) | grep -q '^R100[[:space:]]aaa_del.txt[[:space:]]dest.txt\$'"
+check "phase51: sg agrees (control: deletion sorted first, non-discriminating)" \
+    sh -c "(cd '$P51_PRIO_B_CTL' && '$SG' diff --cached -C --name-status) | grep -q '^R100[[:space:]]aaa_del.txt[[:space:]]dest.txt\$'"
+p33_cmp "$P51_PRIO_B_CTL" "--cached -C --name-status (exact-pass priority, non-discriminating control)" \
+    --cached -C --name-status
+
+# --- Phase 51 round 3 (mutation-found interop gaps) ------------------------
+# Three shapes with no interop coverage at all before this round: mutating
+# the product code left every one of the 2219 checks above green. Shared
+# fixture: src.txt (100 lines) committed once and never touched again;
+# dst.txt is a 91-line truncation of it, scoring 90% -- built fresh per
+# group below since each needs a different comparison mode (two revs vs
+# tree-vs-workdir).
+
+# Gap 1: `--no-renames` must NOT reset the score, only the mode. Mutating
+# `cmd_diff.c`'s `--no-renames` branch to also zero `cli_score` left
+# interop fully green.
+P51_G1="$WORKDIR/p51_gap1_score_survives_no_renames"
+(cd "$WORKDIR" && "$SG" init p51_gap1_score_survives_no_renames) > /dev/null 2>&1
+(cd "$P51_G1" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "open('$P51_G1/src.txt', 'w').write(''.join('A-%d\n' % i for i in range(1, 101)))"
+(cd "$P51_G1" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+python3 -c "open('$P51_G1/dst.txt', 'w').write(''.join('A-%d\n' % i for i in range(1, 92)))"
+(cd "$P51_G1" && "$SG" add . && "$SG" commit -m "add dst") > /dev/null 2>&1
+check "phase51 oracle: -M95 --no-renames --find-copies-harder -- the 95%% threshold SURVIVES --no-renames and blocks the 90%% copy" \
+    sh -c "(cd '$P51_G1' && LC_ALL=C git diff -M95 --no-renames --find-copies-harder --name-status HEAD~1 HEAD) | grep -q '^A[[:space:]]dst.txt\$'"
+check "phase51: sg agrees that the 95%% threshold survives --no-renames and blocks the copy" \
+    sh -c "(cd '$P51_G1' && '$SG' diff -M95 --no-renames --find-copies-harder --name-status HEAD~1 HEAD) | grep -q '^A[[:space:]]dst.txt\$'"
+p51_cmp "$P51_G1" "-M95 --no-renames --find-copies-harder --name-status HEAD~1 HEAD (score survives --no-renames)" \
+    -M95 --no-renames --find-copies-harder --name-status HEAD~1 HEAD
+# Control: the SAME fixture with no -M95 at all -- --no-renames only cleared
+# the MODE, so --find-copies-harder still finds the 90% copy at the default
+# threshold. Without this control, gap 1's check alone cannot tell "the
+# score survived" apart from "--no-renames also canceled --find-copies-harder".
+check "phase51 oracle: control -- --no-renames --find-copies-harder alone (no -M95) still finds the 90%% copy at the default threshold" \
+    sh -c "(cd '$P51_G1' && LC_ALL=C git diff --no-renames --find-copies-harder --name-status HEAD~1 HEAD) | grep -q '^C090[[:space:]]src.txt[[:space:]]dst.txt\$'"
+check "phase51: sg agrees (control: --no-renames --find-copies-harder alone still finds the copy)" \
+    sh -c "(cd '$P51_G1' && '$SG' diff --no-renames --find-copies-harder --name-status HEAD~1 HEAD) | grep -q '^C090[[:space:]]src.txt[[:space:]]dst.txt\$'"
+p51_cmp "$P51_G1" "--no-renames --find-copies-harder --name-status HEAD~1 HEAD (control: harder survives, score is default)" \
+    --no-renames --find-copies-harder --name-status HEAD~1 HEAD
+
+# Gap 2: a bare `-C` RESETS the score to the default. Mutating cmd_diff.c's
+# bare-`-C` branch to no longer zero `cli_score` left interop fully green.
+P51_G2="$WORKDIR/p51_gap2_bare_c_resets_score"
+(cd "$WORKDIR" && "$SG" init p51_gap2_bare_c_resets_score) > /dev/null 2>&1
+(cd "$P51_G2" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "open('$P51_G2/src.txt', 'w').write(''.join('A-%d\n' % i for i in range(1, 101)))"
+(cd "$P51_G2" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+python3 -c "open('$P51_G2/dst.txt', 'w').write(''.join('A-%d\n' % i for i in range(1, 92)))"
+(cd "$P51_G2" && "$SG" add . && "$SG" commit -m "add dst") > /dev/null 2>&1
+check "phase51 oracle: -C95 -C -- the second, bare -C resets the threshold back to the default and finds the 90%% copy" \
+    sh -c "(cd '$P51_G2' && LC_ALL=C git diff -C95 -C --name-status HEAD~1 HEAD) | grep -q '^C090[[:space:]]src.txt[[:space:]]dst.txt\$'"
+check "phase51: sg agrees that the second, bare -C resets the threshold and finds the copy" \
+    sh -c "(cd '$P51_G2' && '$SG' diff -C95 -C --name-status HEAD~1 HEAD) | grep -q '^C090[[:space:]]src.txt[[:space:]]dst.txt\$'"
+p51_cmp "$P51_G2" "-C95 -C --name-status HEAD~1 HEAD (bare -C resets the score)" \
+    -C95 -C --name-status HEAD~1 HEAD
+# Control: reversed order -- -C95 comes AFTER the bare -C, so it is the one
+# that sticks and the 90% copy is blocked. Both directions are needed to
+# tell "does a bare -C reset the score" apart from "which -C wins".
+check "phase51 oracle: control -- -C -C95 (order reversed): the later 95%% threshold blocks the 90%% copy" \
+    sh -c "(cd '$P51_G2' && LC_ALL=C git diff -C -C95 --name-status HEAD~1 HEAD) | grep -q '^A[[:space:]]dst.txt\$'"
+check "phase51: sg agrees (control: -C -C95, order reversed, blocks the copy)" \
+    sh -c "(cd '$P51_G2' && '$SG' diff -C -C95 --name-status HEAD~1 HEAD) | grep -q '^A[[:space:]]dst.txt\$'"
+p51_cmp "$P51_G2" "-C -C95 --name-status HEAD~1 HEAD (control: later -C95 wins, no reset)" \
+    -C -C95 --name-status HEAD~1 HEAD
+
+# Gap 3: `sg diff <rev> -C -C` (tree vs workdir, no --cached, no second rev)
+# had no end-to-end check at all -- only tests/test_diff_list.c's unit test
+# covers sg_diff_tree_workdir's own include_unchanged parameter, which
+# cannot see whether cmd_diff.c's <rev>-mode call site actually threads
+# copies_harder through to it.
+P51_G3="$WORKDIR/p51_gap3_rev_mode"
+(cd "$WORKDIR" && "$SG" init p51_gap3_rev_mode) > /dev/null 2>&1
+(cd "$P51_G3" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "open('$P51_G3/src.txt', 'w').write(''.join('A-%d\n' % i for i in range(1, 101)))"
+(cd "$P51_G3" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+python3 -c "open('$P51_G3/dst.txt', 'w').write(''.join('A-%d\n' % i for i in range(1, 92)))"
+(cd "$P51_G3" && "$SG" add dst.txt) > /dev/null 2>&1
+check "phase51 oracle: sg diff -C -C HEAD (tree vs workdir) finds the 90%% copy" \
+    sh -c "(cd '$P51_G3' && LC_ALL=C git diff -C -C --name-status HEAD) | grep -q '^C090[[:space:]]src.txt[[:space:]]dst.txt\$'"
+check "phase51: sg agrees that -C -C HEAD (tree vs workdir) finds the copy" \
+    sh -c "(cd '$P51_G3' && '$SG' diff -C -C --name-status HEAD) | grep -q '^C090[[:space:]]src.txt[[:space:]]dst.txt\$'"
+p51_cmp "$P51_G3" "-C -C --name-status HEAD (tree vs workdir, rev mode)" \
+    -C -C --name-status HEAD
+# Control: plain -C on the same <rev>-mode fixture finds nothing, since
+# src.txt never changed and plain -C never offers an unchanged path as a
+# source -- without this, gap 3's check alone cannot tell "rev mode wired
+# up copies_harder" apart from "rev mode always finds this copy somehow".
+check "phase51 oracle: control -- plain -C HEAD (no harder) finds nothing" \
+    sh -c "(cd '$P51_G3' && LC_ALL=C git diff -C --name-status HEAD) | grep -q '^A[[:space:]]dst.txt\$'"
+check "phase51: sg agrees (control: plain -C HEAD, no harder, finds nothing)" \
+    sh -c "(cd '$P51_G3' && '$SG' diff -C --name-status HEAD) | grep -q '^A[[:space:]]dst.txt\$'"
+p33_cmp "$P51_G3" "-C --name-status HEAD (control: rev mode, no harder, finds nothing)" \
+    -C --name-status HEAD
+
+# --- Phase 51 round 4 (reviewer cold read): sg_diff_fill_combined_from_index
+# used to fill ours/theirs/result on an unchanged row too, which made
+# sg_diff_entry_is_combined answer yes for it -- rename.c's three source
+# predicates all refuse a combined row, so the unchanged row was silently
+# dropped from -C -C's own source pool and the copy went unfound. Only
+# observable when -c/--cc AND -C -C are BOTH given on a <rev>-mode diff with
+# no --cached (fixed in src/workdir/diff.c; this round adds the interop
+# pin, not the fix). Fixture: src.txt tracked and unchanged; other.txt
+# staged with an edit (so the combined-fill pass has a real combinable row
+# to walk, and -c has something to widen); copy.txt staged as a fresh
+# 93%-similar copy of src.txt.
+P51_G4="$WORKDIR/p51_gap4_combined_vs_unchanged"
+(cd "$WORKDIR" && "$SG" init p51_gap4_combined_vs_unchanged) > /dev/null 2>&1
+(cd "$P51_G4" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "open('$P51_G4/src.txt', 'w').write(''.join('A-%d\n' % i for i in range(1, 101)))"
+printf 'before\n' > "$P51_G4/other.txt"
+(cd "$P51_G4" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+printf 'after\n' > "$P51_G4/other.txt"
+(cd "$P51_G4" && "$SG" add other.txt) > /dev/null 2>&1
+python3 -c "open('$P51_G4/copy.txt', 'w').write(''.join('A-%d\n' % i for i in range(1, 95)))"
+(cd "$P51_G4" && "$SG" add copy.txt) > /dev/null 2>&1
+check "phase51 oracle: git diff -c -C -C HEAD finds the copy AND the combined row" \
+    sh -c "(cd '$P51_G4' && LC_ALL=C git diff -c -C -C --name-status HEAD) | grep -q '^C093[[:space:]]src.txt[[:space:]]copy.txt\$' && (cd '$P51_G4' && LC_ALL=C git diff -c -C -C --name-status HEAD) | grep -q '^MM[[:space:]]other.txt\$'"
+check "phase51: sg agrees that -c -C -C HEAD finds the copy AND the combined row" \
+    sh -c "(cd '$P51_G4' && '$SG' diff -c -C -C --name-status HEAD) | grep -q '^C093[[:space:]]src.txt[[:space:]]copy.txt\$' && (cd '$P51_G4' && '$SG' diff -c -C -C --name-status HEAD) | grep -q '^MM[[:space:]]other.txt\$'"
+p51_cmp "$P51_G4" "-c -C -C --name-status HEAD (combined fill must skip an unchanged row)" \
+    -c -C -C --name-status HEAD
+p51_cmp "$P51_G4" "-c -C -C HEAD (patch, combined fill must skip an unchanged row)" \
+    -c -C -C HEAD
+check "phase51 oracle: --cc -C -C HEAD is the same divergence under the other combined flag" \
+    sh -c "(cd '$P51_G4' && LC_ALL=C git diff --cc -C -C --name-status HEAD) | grep -q '^C093[[:space:]]src.txt[[:space:]]copy.txt\$'"
+check "phase51: sg agrees that --cc -C -C shows the same divergence" \
+    sh -c "(cd '$P51_G4' && '$SG' diff --cc -C -C --name-status HEAD) | grep -q '^C093[[:space:]]src.txt[[:space:]]copy.txt\$'"
+p51_cmp "$P51_G4" "--cc -C -C --name-status HEAD (same divergence, --cc spelling)" \
+    --cc -C -C --name-status HEAD
+# Controls: each flag ALONE on the identical fixture was correct even
+# before the fix -- only the COMBINATION exposed the bug, so both controls
+# are required to tell "the combination broke" apart from "one flag broke".
+check "phase51 oracle: control -- -C -C ALONE (no -c/--cc) still finds the copy" \
+    sh -c "(cd '$P51_G4' && LC_ALL=C git diff -C -C --name-status HEAD) | grep -q '^C093[[:space:]]src.txt[[:space:]]copy.txt\$'"
+check "phase51: sg agrees (control: -C -C alone, no -c/--cc, still finds the copy)" \
+    sh -c "(cd '$P51_G4' && '$SG' diff -C -C --name-status HEAD) | grep -q '^C093[[:space:]]src.txt[[:space:]]copy.txt\$'"
+p51_cmp "$P51_G4" "-C -C --name-status HEAD (control: -C -C alone, no combined)" \
+    -C -C --name-status HEAD
+check "phase51 oracle: control -- -c ALONE (no -C -C) is unaffected, copy.txt stays a plain addition" \
+    sh -c "(cd '$P51_G4' && LC_ALL=C git diff -c --name-status HEAD) | grep -q '^A[[:space:]]copy.txt\$'"
+check "phase51: sg agrees (control: -c alone, no -C -C, leaves copy.txt a plain addition)" \
+    sh -c "(cd '$P51_G4' && '$SG' diff -c --name-status HEAD) | grep -q '^A[[:space:]]copy.txt\$'"
+p33_cmp "$P51_G4" "-c --name-status HEAD (control: -c alone, no -C -C)" \
+    -c --name-status HEAD
+
+# --- Phase 51's own regression pin: a bare `sg diff` (NO flags at all)
+# still detects renames at the default threshold. Before this round, this
+# was only held up by Phase 29's exact-rename fixtures (an incidental
+# consequence, not a Phase 51 assertion of its own) -- the CLI's flag
+# parsing was rewritten into a state machine in this phase, and nothing
+# here directly pinned "no flags -> DETECT_RENAME with the default score",
+# as opposed to "no flags -> DETECT_NONE" (see section 1's own init-value
+# discussion in docs/DESIGN.md). An INEXACT rename (not just an exact one)
+# is used here on purpose, so this cannot be satisfied by the exact pass
+# alone.
+P51_BARE="$WORKDIR/p51_bare_diff_still_detects_renames"
+(cd "$WORKDIR" && "$SG" init p51_bare_diff_still_detects_renames) > /dev/null 2>&1
+(cd "$P51_BARE" && git config user.email "a@b.c" && git config user.name "git user")
+python3 -c "open('$P51_BARE/old.txt', 'w').write(''.join('L-%d\n' % i for i in range(1, 101)))"
+(cd "$P51_BARE" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+mv "$P51_BARE/old.txt" "$P51_BARE/new.txt"
+python3 -c "open('$P51_BARE/new.txt', 'w').write(''.join('L-%d\n' % i for i in range(1, 81)))"
+(cd "$P51_BARE" && "$SG" add .) > /dev/null 2>&1
+check "phase51 oracle: bare 'git diff --cached', no flags at all, still finds an inexact rename" \
+    sh -c "(cd '$P51_BARE' && LC_ALL=C git diff --cached --name-status) | grep -q '^R079[[:space:]]old.txt[[:space:]]new.txt\$'"
+check "phase51: sg agrees that a bare diff (no flags) still finds the inexact rename" \
+    sh -c "(cd '$P51_BARE' && '$SG' diff --cached --name-status) | grep -q '^R079[[:space:]]old.txt[[:space:]]new.txt\$'"
+p33_cmp "$P51_BARE" "--cached --name-status (bare sg diff, no flags, still detects renames)" \
+    --cached --name-status
 
 # --- Phase 36: a hand-crafted .git/index naming a path that escapes the
 # repository ("../secret.txt"), whose blob does NOT exist in the object

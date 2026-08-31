@@ -120,6 +120,21 @@ typedef struct {
     sg_diff_side ours;
     sg_diff_side theirs;
     sg_diff_side result;
+    /* Phase 51: 1 for a row that exists ONLY to be offered to
+       sg_diff_detect_renames as a `-C -C` copy source -- the path is
+       unchanged (old_side and new_side carry identical content and mode).
+       Such a row is never printed and never reaches any output format:
+       sg_diff_detect_renames strips every row still carrying this flag
+       before it returns, on every returning path (see its own header
+       comment). `kind` is meaningless on a row like this -- it is not part
+       of any sg_diff_kind-shaped enum in this struct, this note exists so a
+       future field added in that shape does not assume every row means
+       something by it; every existing `switch` stays exhaustive only
+       because these rows never escape. Only sg_diff_trees, sg_diff_tree_index
+       and sg_diff_tree_workdir ever set this (via their own
+       `include_unchanged` parameter); sg_diff_index_workdir never does, see
+       its own function comment for why. */
+    int unchanged;
 } sg_diff_entry;
 
 /* Whether a row should render as a combined diff instead of an ordinary
@@ -160,15 +175,26 @@ void sg_diff_list_free(sg_diff_list *list);
    may be NULL) are sg_tree_flatten's contract, propagated rather than
    flattened into -1 so the CLI can name the offending path. */
 
+/* `include_unchanged` (Phase 51, mandatory, no default -- same idiom as
+   sg_workdir_missing/rename_score/sg_diff_algorithm): when set, a path that
+   exists unchanged on both sides is appended anyway, with `unchanged = 1`,
+   at its natural position in the merge loop (the list stays sorted by path).
+   This is `-C -C`'s data-layer half: such a row is fuel for
+   sg_diff_detect_renames's copy-source pool and nothing else, and that
+   function strips it back out before returning. Passing 0 reproduces the
+   pre-Phase-51 behaviour exactly. An unmerged path is never unchanged. */
+
 /* tree vs tree -- `sg diff <rev> <rev>`. */
 int sg_diff_trees(const char *git_dir, const unsigned char *old_tree,
-                  const unsigned char *new_tree, sg_diff_list *out, char *bad_path);
+                  const unsigned char *new_tree, sg_diff_list *out, char *bad_path,
+                  int include_unchanged);
 
 /* tree vs index -- `sg diff --cached`. A path carrying stage 1/2/3 entries has
    no single staged blob to diff against and yields exactly one row, with
    `unmerged` set. Measured: `git diff --cached --name-status` prints "U". */
 int sg_diff_tree_index(const char *git_dir, const unsigned char *old_tree,
-                       const sg_index *idx, sg_diff_list *out, char *bad_path);
+                       const sg_index *idx, sg_diff_list *out, char *bad_path,
+                       int include_unchanged);
 
 /* index vs working tree -- plain `sg diff`. Never fails on a missing working
    tree file: that is a deletion, not an error.
@@ -203,7 +229,16 @@ int sg_diff_tree_index(const char *git_dir, const unsigned char *old_tree,
         working tree, emitted only when a stage-2 entry exists and its content
         differs from the file on disk. Writing the working tree back to exactly
         the stage-2 bytes makes this second row disappear, which is how the
-        stage was identified -- stage 1 and stage 3 both leave it in place. */
+        stage was identified -- stage 1 and stage 3 both leave it in place.
+
+   Phase 51: deliberately given NO `include_unchanged` parameter. Every path
+   in this comparison comes from the index, so a path is modified, unchanged,
+   or deleted -- never added -- and a copy needs an addition as its
+   destination. Measured against git 2.55.0: `git diff -C -C` on a
+   staged-then-edited file, and on an unchanged file that a modified file is
+   a 94% match of, both print only "M", never a "C" row. Giving this builder
+   a parameter it cannot use would put a fourth call site on the hook for
+   this feature's risk for no gain. */
 int sg_diff_index_workdir(const char *git_dir, const char *repo_root,
                           const sg_index *idx, sg_diff_list *out);
 
@@ -232,10 +267,16 @@ int sg_diff_index_workdir(const char *git_dir, const char *repo_root,
    though plain `git diff <rev>` on the same state prints nothing for it.
    Passing 0 reproduces the exact pre-Phase-40 behaviour; the caller still
    has to run sg_diff_fill_combined_from_index afterward to actually
-   populate ours/theirs/result on the rows this widening added. */
+   populate ours/theirs/result on the rows this widening added.
+
+   `include_unchanged` (Phase 51): an unchanged row is only emitted when the
+   path is not already being appended for some other reason -- in
+   particular, an unmerged path or a path whose working-tree file is missing
+   or unreadable is never unchanged, whatever `include_unchanged` says. */
 int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                          const unsigned char *old_tree, const sg_index *idx,
-                         sg_diff_list *out, char *bad_path, int combined);
+                         sg_diff_list *out, char *bad_path, int combined,
+                         int include_unchanged);
 
 /* Phase 40: a post-build pass over an sg_diff_tree_workdir list (`sg diff
    -c/--cc <rev>`, exactly one rev, no `--cached`) that fills in the three
@@ -247,7 +288,16 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
    sg_diff_detect_renames (a combined row must never be offered to rename/copy
    detection as a source or destination -- SPEC section 5).
 
-   Every entry in `list` is visited; a path with no index entry at all leaves
+   Every entry in `list` is visited EXCEPT a Phase 51 `unchanged` row, which
+   is skipped outright and keeps all three sides ABSENT. Filling one would
+   make sg_diff_entry_is_combined answer yes for it, and rename.c's three
+   source predicates all refuse a combined row -- the row would be dropped
+   from the copy-source pool and the copy silently never found. Measured:
+   `sg diff -c -C -C <rev>` printed `A copy.txt` where real git prints
+   `C094 src.txt copy.txt`, while plain `-C -C` and plain `-c` were each
+   correct on their own. Do not "simplify" the skip away.
+
+   Otherwise, a path with no index entry at all leaves
    `ours` ABSENT, which is exactly what makes sg_diff_entry_is_combined false
    and the row fall back to plain sg_diff_tree_workdir rendering. Cannot fail
    -- it only reads already-loaded index data, no I/O. */
@@ -308,15 +358,31 @@ int sg_diff_side_effective_id(const char *git_dir, const sg_diff_side *side,
    `detect_copies` is git's -C. It changes three things, all measured:
    a path that exists on BOTH sides becomes eligible as a source (so a copy
    can be found from a file that was merely edited); a source may be paired
-   more than once; and the same-file-name shortcut is skipped entirely. It
-   does NOT reach git's -C -C, which additionally offers every UNCHANGED path
-   as a source -- this list only ever holds paths that changed, so that mode
-   is rejected by the CLI rather than approximated.
+   more than once; and the same-file-name shortcut is skipped entirely.
+
+   Phase 51 (`-C -C` / `--find-copies-harder`): a row with `unchanged` set
+   (see sg_diff_entry) is registered as a source exactly like a modification
+   when `detect_copies` is on -- including the `uses = 1` that lets it be
+   claimed more than once -- because it already satisfies the same
+   "present on both sides" test a modification does. It is never a
+   destination (an unchanged row's old_side is never ABSENT) and never a
+   rename source (rename detection requires detect_copies off, at which
+   point an unchanged row is not registered as anything at all). Whether or
+   not any of this fires, THIS FUNCTION OWNS STRIPPING: every row still
+   carrying `unchanged` is removed before returning, on every returning path
+   that reports success -- including the `min_score <= 0` and
+   `nsrc == 0 || ndst == 0` early-outs -- so no caller needs to know the flag
+   exists. A caller that never passed `include_unchanged` to a builder never
+   sees a row with it set, so this is a no-op for every pre-Phase-51 call
+   site.
 
    A side whose content cannot be read is never paired -- the same failure
    direction as an unverified id: no rename, never an invented one.
 
-   Returns 0, or -1 on allocation failure with the list left untouched. */
+   Returns 0, or -1 on allocation failure with the list left untouched
+   (including any `unchanged` rows still in it -- stripping only happens on
+   the success path, matching this function's existing all-or-nothing
+   failure contract). */
 int sg_diff_detect_renames(const char *git_dir, const char *repo_root,
                            sg_diff_list *list, int min_score, int detect_copies);
 

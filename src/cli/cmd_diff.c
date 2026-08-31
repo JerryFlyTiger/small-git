@@ -19,8 +19,8 @@
 
 static const char USAGE[] =
     "usage: sg diff [--cached|--staged] [--stat[=<w>[,<n>]]|--numstat|--shortstat|--name-only|"
-    "--name-status] [-M[<n>]|-C[<n>]|--no-renames] [-c|--cc] [--histogram] [<rev> [<rev>]] [--] "
-    "[<path>...]\n";
+    "--name-status] [-M[<n>]|-C[<n>]|--find-copies-harder|--no-renames] [-c|--cc] [--histogram] "
+    "[<rev> [<rev>]] [--] [<path>...]\n";
 
 /* Resolves rev to a tree id via sg_rev_parse_commit + sg_commit_tree_of --
    the one path every rev argument in this command goes through, per
@@ -174,9 +174,37 @@ int sg_cmd_diff(int argc, char **argv)
     int dashdash = -1; /* index into pos[] where "--" split the line */
     /* git's -M default, 50%, on git's 0..SG_SIMILARITY_MAX scale rather than
        as a percentage -- see sg/similarity.h for why a percentage cannot hold
-       every threshold the -M grammar can ask for. 0 means --no-renames. */
-    int rename_score = SG_SIMILARITY_DEFAULT;
-    int detect_copies = 0; /* git's -C */
+       every threshold the -M grammar can ask for. 0 means --no-renames.
+       Computed after the argv loop from detect/cli_score/harder below, not
+       written to directly inside it. */
+    int rename_score;
+    int detect_copies; /* git's -C */
+    int copies_harder; /* git's -C -C / --find-copies-harder */
+    /* Phase 51: a faithful port of git's own CLI state machine (see
+       docs/DESIGN.md Phase 51 for the measured truth table this reproduces).
+       git keeps three things while parsing and resolves them ONLY after the
+       loop -- rename_score/detect_copies/copies_harder above cannot express
+       the interaction on their own (in particular "does a bare -C mean
+       'harder' this time" depends on whether COPY mode was already chosen,
+       and --no-renames must NOT reset harder or the score). `detect` and
+       `cli_score` are the two pieces of state the old two variables above
+       could not hold; `harder` doubles as copies_harder's staging area.
+
+       NOTE (not in the spec, decided here): init is DETECT_RENAME, not
+       DETECT_NONE. `git diff` with NO flags at all still detects renames
+       (diff.renames defaults to true, measured on this machine via `git
+       diff --no-index` on a rename pair with no -M: R100), and that default
+       predates this phase (rename_score already initialized to
+       SG_SIMILARITY_DEFAULT), pinned by Phase 29's interop fixtures that
+       run `sg diff --cached` with no -M at all. Section 1's own oracle table
+       cannot distinguish DETECT_NONE from DETECT_RENAME for its "no flag"
+       row: that fixture has only an addition and an unchanged file, no
+       deletion, so no rename pairing is possible either way -- the two
+       inits are observationally identical for every row in that table, and
+       DETECT_RENAME is the one that does not regress Phase 29. */
+    enum { DETECT_NONE, DETECT_RENAME, DETECT_COPY } detect = DETECT_RENAME;
+    int cli_score = 0; /* 0 means "use the default" */
+    int harder = 0;
     int rev_count;
     char bad_path[SG_PATH_MAX];
     int rc;
@@ -232,34 +260,34 @@ int sg_cmd_diff(int argc, char **argv)
         } else if (strcmp(a, "--name-status") == 0) {
             opts.format = SG_DIFF_FORMAT_NAME_STATUS;
         } else if (strcmp(a, "--no-renames") == 0) {
-            rename_score = 0;
-            detect_copies = 0;
-        } else if (strcmp(a, "--find-copies-harder") == 0 ||
-                  ((strncmp(a, "-C", 2) == 0 ||
-                    strncmp(a, "--find-copies", 13) == 0) && detect_copies)) {
-            /* git's -C -C. It additionally offers every UNCHANGED path as a
-               copy source, and sg_diff_list only ever holds paths that
-               changed -- so this is refused rather than quietly answered as
-               plain -C would answer it. Measured: git accepts it and finds
-               copies sg would miss, so approximating it would be a silently
-               wrong answer, which is the one failure direction this codebase
-               does not allow. */
-            fprintf(stderr, "sg: --find-copies-harder (-C -C) is not implemented; "
-                            "plain -C only finds copies whose source also changed\n");
-            free(pos);
-            return 1;
+            /* Leaves cli_score and harder alone -- see the "--no-renames
+               does NOT cancel --find-copies-harder" WARNING measured in
+               Phase 51. */
+            detect = DETECT_NONE;
+        } else if (strcmp(a, "--no-find-copies-harder") == 0) {
+            harder = 0;
+        } else if (strcmp(a, "--find-copies-harder") == 0) {
+            /* Touches neither cli_score nor detect on its own -- resolved
+               entirely after the loop, per the table. */
+            harder = 1;
         } else if (strcmp(a, "-C") == 0 || strcmp(a, "--find-copies") == 0) {
-            detect_copies = 1;
-            rename_score = SG_SIMILARITY_DEFAULT;
+            cli_score = 0;
+            if (detect == DETECT_COPY)
+                harder = 1;
+            else
+                detect = DETECT_COPY;
         } else if (strncmp(a, "-C", 2) == 0 || strncmp(a, "--find-copies=", 14) == 0) {
             const char *v = a[1] == 'C' ? a + 2 : a + strlen("--find-copies=");
 
-            if (sg_similarity_parse_score_arg(v, &rename_score) != 0) {
+            if (sg_similarity_parse_score_arg(v, &cli_score) != 0) {
                 fputs(USAGE, stderr);
                 free(pos);
                 return 1;
             }
-            detect_copies = 1;
+            if (detect == DETECT_COPY)
+                harder = 1;
+            else
+                detect = DETECT_COPY;
         } else if (strcmp(a, "--histogram") == 0) {
             /* git's other three algorithm spellings (--patience, --minimal,
                --diff-algorithm=<name>) are NOT implemented and fall through
@@ -285,22 +313,17 @@ int sg_cmd_diff(int argc, char **argv)
         } else if (strcmp(a, "-c") == 0) {
             opts.combined = 2; /* non-dense: "diff --combined" */
         } else if (strcmp(a, "-M") == 0 || strcmp(a, "--find-renames") == 0) {
-            rename_score = SG_SIMILARITY_DEFAULT;
-            /* -M turns copy detection back OFF. git keeps one mode field that
-               each flag overwrites, so the last one written wins: measured,
-               `git diff -C -M` finds renames only, while `-M -C` finds
-               copies. Leaving this out made -C sticky, which nothing caught
-               because no test combined the two. */
-            detect_copies = 0;
+            cli_score = 0;
+            detect = DETECT_RENAME;
         } else if (strncmp(a, "-M", 2) == 0 || strncmp(a, "--find-renames=", 15) == 0) {
             const char *v = a[1] == 'M' ? a + 2 : a + 15;
 
-            if (sg_similarity_parse_score_arg(v, &rename_score) != 0) {
+            if (sg_similarity_parse_score_arg(v, &cli_score) != 0) {
                 fputs(USAGE, stderr);
                 free(pos);
                 return 1;
             }
-            detect_copies = 0;
+            detect = DETECT_RENAME;
         } else if (a[0] == '-' && a[1] != '\0') {
             fputs(USAGE, stderr);
             free(pos);
@@ -309,6 +332,17 @@ int sg_cmd_diff(int argc, char **argv)
             pos[n_pos++] = argv[i];
         }
     }
+
+    /* Resolved after the loop, not inside it -- section 1's table is only
+       correct read this way (a bare `-C` means something different
+       depending on whether COPY mode was already chosen, and
+       --find-copies-harder can arrive before OR after the -C/-M that
+       "should" be affected by it). */
+    if (harder)
+        detect = DETECT_COPY;
+    rename_score = (detect == DETECT_NONE) ? 0 : (cli_score ? cli_score : SG_SIMILARITY_DEFAULT);
+    detect_copies = (detect == DETECT_COPY);
+    copies_harder = harder;
 
     git_dir = sg_require_git_dir();
     if (git_dir == NULL) {
@@ -375,7 +409,7 @@ int sg_cmd_diff(int argc, char **argv)
 
         if (resolve_rev_tree(git_dir, rev1, old_tree) != 0 || resolve_rev_tree(git_dir, rev2, new_tree) != 0)
             goto done;
-        rc = sg_diff_trees(git_dir, old_tree, new_tree, &list, bad_path);
+        rc = sg_diff_trees(git_dir, old_tree, new_tree, &list, bad_path, copies_harder);
     } else if (cached) {
         unsigned char tree_id[SG_SHA1_RAW_LEN];
         unsigned char *tree_ptr = NULL;
@@ -398,7 +432,7 @@ int sg_cmd_diff(int argc, char **argv)
             fprintf(stderr, "sg: failed to read index (corrupt?)\n");
             goto done;
         }
-        rc = sg_diff_tree_index(git_dir, tree_ptr, &idx, &list, bad_path);
+        rc = sg_diff_tree_index(git_dir, tree_ptr, &idx, &list, bad_path, copies_harder);
         sg_index_free(&idx);
     } else if (rev1 != NULL) {
         unsigned char tree_id[SG_SHA1_RAW_LEN];
@@ -411,8 +445,15 @@ int sg_cmd_diff(int argc, char **argv)
         }
         have_rev_idx = 1;
         rc = sg_diff_tree_workdir(git_dir, repo_root, tree_id, &rev_idx, &list, bad_path,
-                                  opts.combined != 0);
+                                  opts.combined != 0, copies_harder);
     } else {
+        /* sg_diff_index_workdir takes no include_unchanged parameter --
+           `-C -C` is a genuine no-op on this path (SPEC section 3.1,
+           measured against git 2.55.0), the same reason
+           sg_diff_index_workdir's own header comment gives for never
+           accepting the parameter at all: every path here comes from the
+           index, so there is no addition that could ever need a copy
+           source. */
         sg_index idx;
 
         if (sg_index_read(git_dir, &idx) != 0) {

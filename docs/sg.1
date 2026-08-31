@@ -356,7 +356,7 @@ being dropped silently.
 .B sg diff
 .RB [ --cached | --staged ]
 .RB [ --stat [= <width> [, <name-width> ]]| --numstat | --shortstat | --name-only | --name-status ]
-.RB [ -M [ <n> ]| -C [ <n> ]| --no-renames ]
+.RB [ -M [ <n> ]| -C [ <n> ]| --find-copies-harder | --no-renames ]
 .RB [ -c | --cc ]
 .RB [ --histogram ]
 .RI [ rev " [" rev ]]
@@ -583,29 +583,48 @@ appear in the middle of a path.
 .B --no-renames
 turns detection off and
 .BI -M <n>
-sets the threshold, which
+sets the threshold. Both exact and inexact (similarity-scored) renames are
+found; a move plus an edit is reported the same way git reports it, e.g.
+.BR R093 .
+.BI -C <n>
+finds copies as well: a source that is still present (edited or untouched)
+becomes eligible too, and may be paired more than once, each additional
+destination reported as a copy rather than a rename.
+.B --find-copies-harder
+(equivalently, a second
+.BR -C )
+widens the source pool further to every path that is completely UNCHANGED
+between the two sides being compared, at the cost of scanning every such
+path. It composes with
+.BI -C <n>
+the way git's own does: the threshold from whichever
+.B -M
+/
+.B -C
+came last still applies, and
+.B --no-renames
+turns detection off without clearing
+.BR --find-copies-harder 's
+own effect \(em a later
+.B -M
+or
+.B -C
+is what actually cancels it. Both
+.BI -M <n>
+and
+.BI -C <n>
+accept
 .I n
-must be a whole percentage from 1 to 100. git additionally accepts
-.BR -M0 ,
-.BR -M101 ,
-a fraction
-.RB ( -M0.5 )
-and a
-.RB \(dq % \(dq
-suffix; all four are refused here rather than accepted with a meaning that
-cannot be honoured while only exact renames are found.
-.PP
-Only exact renames are found. git also pairs files by similarity score, so a
-move plus an edit that git reports as
-.B R093
-is still a deletion and an addition here. Detection runs after any
+as either a whole percentage or, like git, a
+.RB \(dq % \(dq -suffixed
+percentage or a fraction, sharing the same grammar as
+.BR "git diff" .
+Detection runs after any
 .I path
 arguments have been applied, which is git's order: naming only one half of a
 rename leaves nothing to pair with, and the half that remains is reported as
-an ordinary addition or deletion. Renames are not shown by
-.BR "sg status" ,
-and copies are never detected \(em git does not detect them by default
-either.
+an ordinary addition or deletion. Renames and copies are not shown by
+.BR "sg status" .
 .SS branch
 .B sg branch
 .RB [ -d | --delete ]
@@ -1590,7 +1609,7 @@ side when comparing the two directly.
 .RB [ \-\-shortstat ]
 .RB [ \-\-name\-only ]
 .RB [ \-\-name\-status ]
-.RB [ -M [ <n> ]| \-\-no\-renames ]
+.RB [ -M [ <n> ]| -C [ <n> ]| \-\-find\-copies\-harder | \-\-no\-renames ]
 .RB [ \-\-histogram ]
 .RB [ -u | \-\-include\-untracked ]
 .RB [ \-\-only\-untracked ]
@@ -1755,6 +1774,9 @@ and so are the diff options
 .RB ( -M [ <n> ],
 .BR \-\-find\-renames [= <n> ],
 .BR \-\-no\-renames ,
+.RB -C [ <n> ],
+.BR \-\-find\-copies [= <n> ],
+.BR \-\-find\-copies\-harder ,
 .BR \-\-histogram ).
 .PP
 Giving a diff option that is not itself a format selector switches the

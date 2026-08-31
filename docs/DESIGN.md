@@ -8249,3 +8249,275 @@ toward git. The merge-commit vocabulary
 conflict list) is still sg's own, and interop still does not compare it --
 this phase changed one specific output that git and sg were free to make
 identical, not the command's whole voice.
+
+## Phase 51: `--find-copies-harder` (`-C -C`)
+
+Implements what Phase 33 refused outright: `-C -C` additionally offers
+every UNCHANGED path (present, identical, on both sides) as a copy source.
+Since `sg_diff_list` only ever held changed paths, this is a data-layer
+change (three builders gain a mandatory `include_unchanged` parameter and
+`sg_diff_entry` gains a `unchanged` field), not a CLI-only one.
+
+### 1. The CLI state machine
+
+git parses `-M`/`-C`/`--find-copies-harder`/`--no-renames` into three
+pieces of state and resolves them only AFTER the argv loop -- a bare `-C`
+means something different depending on whether COPY mode was already
+chosen, so an in-loop "last flag wins" cannot express it. `detect` (NONE/
+RENAME/COPY), `score` (0 = default), `harder` (bool), resolved as:
+
+```
+if (harder) detect = COPY;
+rename_score  = (detect == NONE) ? 0 : (score ? score : SG_SIMILARITY_DEFAULT);
+detect_copies = (detect == COPY);
+copies_harder = harder;
+```
+
+Measured against git 2.55.0 on a fixture whose only copy candidate is a
+94%-similar UNCHANGED source (present on both sides, untouched): both
+`cmd_diff.c` and `cmd_stash.c`'s `sg stash show` implement this table
+verbatim. Three results are worth calling out because they falsify simpler
+models: `--no-renames` does NOT cancel `--find-copies-harder` and does NOT
+reset the score (`--no-renames --find-copies-harder` still finds the copy
+at the default threshold); a bare `-C` RESETS the score to the default
+(`-C95 -C` finds a 90% copy, `-C -C95` does not); and `-C95 --no-renames -C`
+answers "not found" because `--no-renames` cleared `detect` to NONE first,
+so the following `-C` takes the `else` arm (`detect = COPY`) without ever
+setting `harder` -- a model that treats "a second `-C` anywhere" as harder
+gets exactly this one wrong.
+
+`--find-copies-harder=<anything>` stays rejected (git exits 129, sg exits 1
+via the ordinary unknown-flag path -- no special-case code needed, since the
+string does not match any of the specific flag branches and falls through).
+`--no-find-copies`/`--no-find-renames` are also out of scope, unchanged from
+before (git itself rejects them with exit 129).
+
+**Decision made here, not written in the spec handed to this phase's
+implementer:** `detect`'s initial value is `RENAME`, not `NONE`. `git diff`
+with NO flags at all still detects renames (`diff.renames` defaults to
+true, measured via `git diff --no-index` with no `-M`: prints `R100`), and
+sg's pre-Phase-51 code already matched this (`rename_score` was initialized
+to `SG_SIMILARITY_DEFAULT`, pinned by Phase 29's `--cached`-with-no-`-M`
+interop fixtures). The truth table above cannot distinguish `NONE` from
+`RENAME` as the init value for its own "no flag" row, because that fixture
+has only an addition and an unchanged file -- no deletion -- so no rename
+pairing is reachable either way regardless of which the code starts at.
+
+### 2. Data layer
+
+`sg_diff_entry.unchanged` marks a row that exists ONLY to be offered to
+`sg_diff_detect_renames` as a copy source; it is never printed and never
+reaches any output format. Three builders (`sg_diff_trees`,
+`sg_diff_tree_index`, `sg_diff_tree_workdir`) gained a mandatory
+`include_unchanged` parameter, same idiom as `sg_workdir_missing` -- no
+default, every pre-existing call site passes 0 to reproduce the exact old
+behaviour. `sg_diff_index_workdir` deliberately did NOT gain the parameter:
+every path in an index-vs-workdir comparison comes from the index, so there
+is no addition for a copy to land on (measured: `git diff -C -C` on a
+staged-then-edited or an unchanged-plus-modified fixture both print only
+`M`, never `C`).
+
+`sg_diff_detect_renames` needed almost no new classification logic: an
+unchanged row has both `old_side` and `new_side` non-ABSENT by
+construction, which already satisfies `is_modification`'s test -- the SAME
+predicate that already registers an ordinary modification as a copy source
+when `detect_copies` is on, `uses = 1` included. So an unchanged row is
+registered as a source exactly like a modification, for free. What DID need
+new code: the detector now owns STRIPPING every row still carrying
+`unchanged` before it returns, on every success path -- including the
+`min_score <= 0` and `nsrc == 0 || ndst == 0` early-outs, which is easy to
+forget because they return before the main pairing/compaction logic runs at
+all.
+
+### 3. A pre-existing bug this phase's fuzzer exposed, and fixed
+
+`tests/fuzz_rename.py --copies-harder` (a new mode: builds repos with
+UNCHANGED files alongside additions, oracle is real git only) originally
+measured 0.8%-1.7% mismatches per 120-round sample, all in the same shape:
+`sg` paired a destination with the BEST-SCORING candidate across the whole
+pool, while git paired it with a WORSE-scoring DELETION instead, leaving the
+better-scoring modification/unchanged candidate unpaired.
+
+**This was not new in Phase 51.** Reproduced with a genuine MODIFICATION
+source (not unchanged) under plain `-C`, no `-C -C` involved: a real git
+priority rule this phase's own code never touched was already broken.
+
+**Root cause**: sg was reading git's `rename_used` counter (`rename_cand`'s
+`uses` field, deliberately named to match) as if it were the plain boolean
+`used` flag, at two call sites in `src/workdir/rename.c`. `uses` starts at 0
+for a fresh deletion and is PRE-LOADED to 1 for a source that exists on both
+sides (a modification, or -- since Phase 51 -- an unchanged row), exactly
+because real git's own rename walk is two-phase: ordinary renames (deletion
+sources only) are resolved FIRST, and only THEN are copies (modification/
+unchanged sources) considered for whatever destinations are still
+unclaimed. Reading `used` instead of `uses` erases that distinction, since
+`used` starts at 0 for every FRESH source regardless of kind.
+
+**Fixed, three sites, all in `src/workdir/rename.c`:**
+
+1. `exact_pass`'s skip condition: `if (s->used && !detect_copies)` ->
+   `if (s->uses > 0 && !detect_copies)`. Behaviourally equivalent on its own
+   (no fresh source is ever both `used` and not `uses`-loaded at this exact
+   point), fixed for the sake of reading the right field, since the SAME
+   variable feeds the very next line.
+2. `exact_pass`'s tie-break score: `(s->used ? 0 : 1) + basename_same(...)`
+   -> `(s->uses > 0 ? 0 : 1) + basename_same(...)`. This is the one that
+   actually changes behaviour: a fresh modification/unchanged source used to
+   score the same "not yet used" 1 point as a fresh deletion, so ties broke
+   on iteration order (list/path order) alone -- letting a modification sort
+   ahead of a deletion in the source array win an exact match it should
+   have lost.
+3. `claim_from_matrix`'s rename-only-walk skip: `if (!copies &&
+   srcs[si].used)` -> `if (!copies && srcs[si].uses > 0)`. This is
+   `matrix_pass`'s half of the same bug: the "real renames only" first walk
+   must refuse EVERY modification/unchanged source outright, not just ones
+   already claimed within that same walk.
+
+**Two measured witness shapes, and a direction trap in the second one:**
+
+- **Witness A (`matrix_pass`)**: a DELETED source scoring 58% against a
+  destination (25 of a shared 40-line body plus 16 noise lines) competes
+  against a MODIFICATION source scoring 96% (the same 40-line body plus one
+  line, still present on both sides) for the SAME destination. git gives
+  the destination to the WEAKER deletion (`R058`), leaving the modification
+  an ordinary `M` -- never mind that it scored 38 points higher. Before the
+  fix, sg gave the destination to the modification instead (`C096`),
+  stranding the real deletion as a plain `D`.
+- **Witness B (`exact_pass`)**: two sources hold byte-identical content to
+  a new destination -- one a MODIFICATION (`aaa_mod.txt`, changes to
+  different content), one a DELETION (`zzz_del.txt`, removed). git gives
+  the destination to the deletion (`R100`) regardless of exact-match ties.
+  **The direction is load-bearing**: with the modification's path sorting
+  BEFORE the deletion's (`aaa_mod.txt` < `zzz_del.txt`), the pre-fix
+  iteration-order tie-break picked the modification first and got this
+  wrong; with the deletion sorting first (`aaa_del.txt` < `zzz_mod.txt`),
+  plain iteration order alone already handed the deletion the tie, so BOTH
+  the buggy and the fixed code give the same (correct) answer. A test
+  fixture built only in the second, non-discriminating direction would
+  report full coverage while verifying nothing -- this project's own
+  recorded lesson about fixtures that all point the same way. Both
+  directions are pinned, in `tests/test_rename.c` and in
+  `tests/interop.sh`'s `phase51:` group, with the non-discriminating one
+  explicitly labeled a control rather than evidence of the fix.
+
+**Practical impact, now closed**: `tests/fuzz_rename.py --copies-harder`
+re-measured at 0/120 across two seed ranges (`--seed 447700` and
+`--seed 900000`) after the fix. Phase 33's original interop fixtures and
+the default (non-`--copies-harder`) fuzzer mode never exercised this,
+because every fixture before Phase 51 was built with at most one
+"modification-shaped" source competing against deletions, and none of them
+were engineered to invert the priority -- `--copies-harder`'s wider
+candidate pool (both deleted AND unchanged sources vying for the same
+destination) is what made the collision common enough to surface in ~100
+rounds.
+
+### 4. Mutation round 3: two real interop gaps, one unobservable non-gap
+
+An 18-round directed mutation pass against `tests/interop.sh` (2219 checks
+at the time) found 10 caught immediately, one (`m3`) mathematically
+unobservable, two (`m6`/`m7`) that were actually caught but by the wrong
+tool (measured with `--interop`, when the guarding check was a unit test --
+`test_diff_list`/`test_rename` did go red on rebuild), and two genuine
+interop blind spots. All fixtures below are the same shape: `src.txt` (100
+lines) committed once and never touched again, `dst.txt` a 91-line
+truncation of it (90% similarity, measured against git 2.55.0).
+
+**Gap 1 -- `--no-renames` resetting the score.** Mutating `cmd_diff.c`'s
+`--no-renames` branch to also zero `cli_score` left every one of 2219
+checks green. Witness: `git diff -M95 --no-renames --find-copies-harder
+--name-status <c1> <c2>` prints `A dst.txt` -- the 95% threshold from `-M95`
+SURVIVES `--no-renames` (which only clears the mode, per the table in
+section 1) and blocks the 90% copy. Control, same fixture, no `-M95`:
+`--no-renames --find-copies-harder` alone still finds the copy at the
+default threshold (`C090`) -- without this control a fixture could not tell
+"the score survived" apart from "`--no-renames` also canceled
+`--find-copies-harder`".
+
+**Gap 2 -- a bare `-C` resetting the score to the default.** Mutating the
+bare-`-C` branch to no longer zero `cli_score` left interop green too.
+Witness: `-C95 -C` finds the 90% copy (`C090`) -- the second, bare `-C`
+resets the threshold. Control, reversed order: `-C -C95` finds nothing
+(`A`) -- the later `-C95` is the one that sticks. Both directions needed,
+same reasoning as section 1's own "does a bare `-C` reset" trap.
+
+**Gap 3 -- `sg diff <rev> -C -C` (tree vs workdir) had no end-to-end check
+at all.** `tests/test_diff_list.c` covers `sg_diff_tree_workdir`'s own
+`include_unchanged` parameter as a unit, but nothing verified that
+`cmd_diff.c`'s `<rev>`-mode call site (no `--cached`, no second rev)
+actually threads `copies_harder` through to it -- a hardcoded `0` there
+passed every existing check. Witness: `sg diff -C -C --name-status HEAD`
+(src.txt tracked and unchanged, dst.txt staged as a fresh addition,
+90% similar) finds `C090`. Control: plain `-C` on the same fixture finds
+nothing, since plain `-C` never offers an unchanged path as a source.
+
+All three groups are in `tests/interop.sh`'s `phase51:` group, each with a
+git-oracle line, an sg-agreement line, and a full-output `p33_cmp`. All
+three mutations were independently reproduced and confirmed to turn the new
+checks red before this round's edits (touch-rebuild-run against a scratch
+copy of the tree, not the working copy itself).
+
+**`m3`, recorded so nobody goes looking for a test that cannot exist**:
+mutating `exact_pass`'s `if (s->uses > 0 && !detect_copies)` (the first of
+the three `uses`-vs-`used` fixes) to read `s->used` instead stayed green
+everywhere, including a full rebuild of `test_rename`. This is not a
+coverage gap: the condition is short-circuited by `!detect_copies`, and
+when `detect_copies` is false, no source is EVER registered with a
+pre-loaded `uses` (only `is_deletion`/`is_addition` sources exist in that
+mode, both starting at `uses == 0`) -- so `s->uses > 0` and `s->used` are
+byte-for-byte equivalent at every point this branch can ever be reached.
+Writing a test for it would be asserting a property that is true by
+construction, not by this line of code.
+
+### 5. A reviewer cold read caught a fifth gap: combined-diff fill vs. unchanged rows
+
+`sg_diff_fill_combined_from_index` (`src/workdir/diff.c`) used to fill
+`ours`/`theirs`/`result` on EVERY row in the list unconditionally, including
+a Phase 51 `unchanged` row (the ones `sg_diff_tree_workdir`'s
+`include_unchanged` parameter appends purely as `-C -C`'s copy-source
+pool). Filling those three fields makes `sg_diff_entry_is_combined` answer
+true for the row, and all three of `rename.c`'s source predicates
+(`is_deletion`/`is_addition`/`is_modification`) refuse a combined row
+outright (Phase 40's own rule: a combined row must never be offered to
+rename/copy detection). So an unchanged row that happened to sit in a
+`<rev>`-mode diff alongside a genuinely combinable row was silently dropped
+from the source pool, and `-C -C` could not find the copy.
+
+**Only observable when `-c`/`--cc` AND `-C -C` are BOTH given**, on a
+`<rev>`-mode diff (no `--cached`) that also has at least one real combinable
+row (so `sg_diff_fill_combined_from_index` actually runs at all -- it is
+gated on `opts.combined != 0` in `cmd_diff.c`). Measured against git 2.55.0
+with `src.txt` tracked and unchanged, `copy.txt` staged as a fresh
+93%-similar copy of it, and `other.txt` staged with an edit (the genuinely
+combinable row): `sg diff -c -C -C --name-status HEAD` printed `MM
+other.txt` + `A copy.txt` before the fix, where git prints `MM other.txt` +
+`C093 src.txt copy.txt`; `--cc -C -C` showed the identical divergence.
+**Both controls on the same fixture were already correct before the fix**:
+`-C -C` alone (no `-c`/`--cc`) found the copy, and `-c` alone (no `-C -C`)
+correctly left `copy.txt` a plain addition -- only the COMBINATION of both
+flags exposed the bug, which is why both controls are pinned alongside the
+positive case in `tests/interop.sh`'s `phase51:` group (and a
+`tests/test_diff_combined_rev.c` unit test pins the same property directly:
+`sg_diff_fill_combined_from_index` must leave an `unchanged` row's `ours`
+ABSENT and never report it combined, with a genuinely combinable row in the
+same list as a positive control).
+
+Fix: `sg_diff_fill_combined_from_index`'s loop now skips a row with
+`unchanged` set before doing any of the stage-lookup work.
+
+### 6. Round 3's mutation pass also flagged two labeling issues, fixed here
+
+- **Every `p33_cmp`-generated check asserting `-C -C` / `--find-copies-harder`
+  actually WORKS was renamed to a `p51_cmp` helper (`phase51:` prefix)**.
+  Phase 33's own recorded position was to reject that flag outright; a
+  check bearing its name asserting the opposite reads project history
+  backwards. Checks about plain `-C` (including the round-2 `rename_used`
+  witnesses, which use `-C` but not `-C -C`) keep the `phase33:` name --
+  they are not about `-C -C` becoming available at all.
+- **A dedicated regression pin for "a bare `sg diff`, no flags at all,
+  still detects renames at the default threshold"** was added to the
+  `phase51:` group. Before this, that property was only held up
+  incidentally by Phase 29's pre-existing exact-rename fixtures, which
+  cannot distinguish `detect`'s init value being `RENAME` from `NONE` (see
+  section 1's own discussion) -- an INEXACT rename fixture closes that gap,
+  since only the exact pass would work under either init value on an exact
+  one.

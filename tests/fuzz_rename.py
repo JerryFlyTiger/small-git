@@ -223,6 +223,70 @@ def build_case(repo, rng):
     sg(["add", "."], repo)
 
 
+def build_case_copies_harder(repo, rng):
+    """Phase 51: like build_case, but keeps 1-3 of the committed files
+    UNTOUCHED (never deleted) alongside the ones that get removed -- exactly
+    the shape `--find-copies-harder` exists for, since plain -C only offers
+    a deleted or still-present-but-EDITED path as a source, never one that
+    never changed at all. Destinations are edited copies of either a
+    deleted source or one of the untouched keepers, so the fuzzer actually
+    exercises the wider source pool rather than reproducing build_case's
+    coverage under a different flag."""
+    os.makedirs(repo)
+    sg(["init", "."], repo)
+
+    used = set()
+    sources = []
+    for _ in range(rng.randrange(1, 4)):
+        p = rand_path(rng, used)
+        content = gen_content(rng)
+        full = os.path.join(repo, p)
+        if os.path.dirname(full):
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as fh:
+            fh.write(content)
+        sources.append((p, content))
+
+    keepers = []
+    for _ in range(rng.randrange(1, 4)):
+        p = rand_path(rng, used)
+        content = gen_content(rng)
+        full = os.path.join(repo, p)
+        if os.path.dirname(full):
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as fh:
+            fh.write(content)
+        keepers.append((p, content))
+
+    sg(["add"] + [p for p, _ in sources] + [p for p, _ in keepers], repo)
+    sg(["commit", "-m", "base"], repo)
+
+    for p, _ in sources:
+        os.remove(os.path.join(repo, p))
+    # keepers are deliberately NOT removed and NOT re-staged -- their working
+    # copy and the committed blob stay byte-identical, which is exactly what
+    # "unchanged" means to sg_diff_trees' include_unchanged parameter.
+
+    candidates = sources + keepers
+    for _ in range(rng.randrange(1, 4)):
+        if candidates and rng.random() < 0.7:
+            _, src_content = rng.choice(candidates)
+            content = edit_bytes(rng, src_content)
+        else:
+            content = gen_content(rng)
+        basename = None
+        if candidates and rng.random() < 0.4:
+            basename = os.path.basename(rng.choice(candidates)[0])
+        p = rand_path(rng, used, force_basename=basename)
+        full = os.path.join(repo, p)
+        if os.path.dirname(full):
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as fh:
+            fh.write(content)
+
+    sg(["add", "."], repo)
+
+
 def parse_name_status(output):
     """Returns a list of (status, old_path_or_None, path, score_or_None).
     For R/C rows `path` is the *destination*. For A/D/M rows `path` is the
@@ -330,6 +394,13 @@ def main():
             else:
                 max_failures = value
             del argv[i:i + 2]
+    # Phase 51: --find-copies-harder mode. A separate case builder (keeps
+    # some committed files untouched) and a fixed -C -C flag, rather than
+    # FLAG_CHOICES' rotation -- the whole point is exercising the wider
+    # source pool, which only fires under -C -C.
+    copies_harder = "--copies-harder" in argv
+    if copies_harder:
+        argv.remove("--copies-harder")
     iterations = int(argv[0]) if argv else 200
 
     root = tempfile.mkdtemp(prefix="sg_fuzz_rename_")
@@ -344,10 +415,13 @@ def main():
         seed = seed_base + i
         rng = random.Random(seed)
         repo = os.path.join(root, "r%d" % seed)
-        build_case(repo, rng)
-
-        flag = rng.choice(FLAG_CHOICES)
-        extra = list(flag) if flag else []
+        if copies_harder:
+            build_case_copies_harder(repo, rng)
+            extra = ["-C", "-C"]
+        else:
+            build_case(repo, rng)
+            flag = rng.choice(FLAG_CHOICES)
+            extra = list(flag) if flag else []
         want = run(GIT_DIFF + ["--cached", "--name-status"] + extra, repo)
         got = run([SG, "diff", "--cached", "--name-status"] + extra, repo)
 

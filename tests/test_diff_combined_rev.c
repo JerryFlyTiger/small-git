@@ -126,7 +126,7 @@ static const sg_diff_entry *run_combined(const char *git_dir, const char *repo_r
                                          const unsigned char *old_tree, sg_index *idx,
                                          sg_diff_list *list, const char *path)
 {
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, idx, list, NULL, 1) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, idx, list, NULL, 1, 0) == 0,
          "sg_diff_tree_workdir failed");
     sg_diff_fill_combined_from_index(idx, list);
     return find_entry(list, path);
@@ -349,7 +349,7 @@ static void test_combined_widens_inclusion_when_tree_equals_workdir(void)
     memset(&idx, 0, sizeof(idx));
     index_upsert_stage(&idx, "f.txt", 0, 0100644, id_index);
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list_plain, NULL, 0) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list_plain, NULL, 0, 0) == 0,
          "sg_diff_tree_workdir(combined=0) failed");
     CHECK(find_entry(&list_plain, "f.txt") == NULL,
          "combined=0 must reproduce the pre-Phase-40 omission (tree == workdir)");
@@ -425,7 +425,7 @@ static void test_reorder_combined_first_is_stable(void)
     index_upsert_stage(&idx, "e.txt", 0, 0100644, id_e);
     /* d.txt deliberately never gets write_workdir_file -- deleted from disk. */
 
-    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 1) == 0,
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 1, 0) == 0,
          "sg_diff_tree_workdir failed");
     sg_diff_fill_combined_from_index(&idx, &list);
     CHECK(list.count == 5, "expected 5 rows (a..e), got %zu", list.count);
@@ -456,6 +456,70 @@ static void test_reorder_combined_first_is_stable(void)
     free(git_dir);
 }
 
+/* Phase 51 cold read: sg_diff_fill_combined_from_index used to fill
+   ours/theirs/result unconditionally, including on an `unchanged` row
+   (Phase 51's -C -C copy-source pool). That makes sg_diff_entry_is_combined
+   answer true for it, and rename.c's three source predicates all refuse a
+   combined row -- so the row was silently dropped from -C -C's own source
+   pool. Fixed by skipping `unchanged` rows in the fill pass; this pins that
+   an unchanged row is never turned combined. */
+static void test_fill_combined_skips_unchanged_rows(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char old_tree[SG_SHA1_RAW_LEN];
+    unsigned char id_src[SG_SHA1_RAW_LEN];
+    unsigned char id_other_old[SG_SHA1_RAW_LEN], id_other_new[SG_SHA1_RAW_LEN];
+    tree_spec specs[] = {
+        {"other.txt", 0100644, "before\n"},
+        {"src.txt", 0100644, "steady state\n"},
+    };
+    sg_index idx;
+    sg_diff_list list;
+    const sg_diff_entry *e;
+
+    build_tree(git_dir, specs, 2, old_tree);
+    blob(git_dir, "before\n", id_other_old);
+    blob(git_dir, "after\n", id_other_new);
+    blob(git_dir, "steady state\n", id_src);
+
+    /* other.txt: staged AND worktree-edited -- genuinely combinable, kept
+       as a positive control so this test can tell "unchanged rows are
+       skipped" apart from "the fill pass stopped doing anything at all". */
+    write_workdir_file(repo_root, "other.txt", "after\n");
+    /* src.txt: untouched everywhere -- tree, index and working tree all
+       agree, which is exactly the shape sg_diff_tree_workdir's
+       include_unchanged parameter appends for -C -C's copy-source pool. */
+    write_workdir_file(repo_root, "src.txt", "steady state\n");
+
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_stage(&idx, "other.txt", 0, 0100644, id_other_new);
+    index_upsert_stage(&idx, "src.txt", 0, 0100644, id_src);
+
+    CHECK(sg_diff_tree_workdir(git_dir, repo_root, old_tree, &idx, &list, NULL, 1, 1) == 0,
+         "sg_diff_tree_workdir failed");
+    CHECK(list.count == 2, "other.txt (combinable) plus src.txt (unchanged), got %zu", list.count);
+
+    sg_diff_fill_combined_from_index(&idx, &list);
+
+    e = find_entry(&list, "src.txt");
+    CHECK(e != NULL && e->unchanged == 1, "src.txt is present and still flagged unchanged");
+    CHECK(e != NULL && !sg_diff_entry_is_combined(e),
+         "an unchanged row must never be reported as combined -- rename.c's source "
+         "predicates would silently refuse it and -C -C would never find the copy");
+    CHECK(e != NULL && e->ours.kind == SG_DIFF_SIDE_ABSENT,
+         "the fill pass must leave an unchanged row's ours ABSENT (skipped, not filled)");
+
+    e = find_entry(&list, "other.txt");
+    CHECK(e != NULL && sg_diff_entry_is_combined(e),
+         "the positive control: an ordinary combinable row is unaffected by the skip");
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_stage0_ordinary();
@@ -465,6 +529,7 @@ int main(void)
     test_worktree_deletion_not_combinable();
     test_combined_widens_inclusion_when_tree_equals_workdir();
     test_reorder_combined_first_is_stable();
+    test_fill_combined_skips_unchanged_rows();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
