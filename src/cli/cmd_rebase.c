@@ -12,6 +12,7 @@
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/similarity.h"
 #include "sg/snapshot.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
@@ -181,8 +182,8 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
         free(summary);
     }
 
-    if (sg_merge_trees(git_dir, base_tree, ours_tree, commit.tree, "HEAD", theirs_label, &result) !=
-       0) {
+    if (sg_merge_trees(git_dir, base_tree, ours_tree, commit.tree, "HEAD", theirs_label,
+                       SG_SIMILARITY_DEFAULT, &result) != 0) {
         sg_commit_free(&commit);
         return PICK_ERROR;
     }

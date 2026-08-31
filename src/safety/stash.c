@@ -11,6 +11,7 @@
 #include "sg/quote.h"
 #include "sg/reflog.h"
 #include "sg/refs.h"
+#include "sg/similarity.h"
 #include "sg/snapshot.h"
 #include "sg/status.h"
 #include "sg/tree_build.h"
@@ -1145,7 +1146,7 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
         return -1;
 
     if (sg_merge_trees(git_dir, trees.base_tree, ours_tree, trees.theirs_tree, "Updated upstream",
-                       "Stashed changes", &result) != 0)
+                       "Stashed changes", SG_SIMILARITY_DEFAULT, &result) != 0)
         return -1;
 
     {
@@ -1283,7 +1284,7 @@ int sg_stash_apply(const char *git_dir, const char *repo_root, size_t index, int
         return -1;
 
     if (sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, "Updated upstream", "Stashed changes",
-                       &result) != 0)
+                       SG_SIMILARITY_DEFAULT, &result) != 0)
         return -1;
 
     {

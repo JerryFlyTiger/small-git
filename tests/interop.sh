@@ -5540,10 +5540,13 @@ done
 #     -> a.txt has stage 2 only     (added by us)
 #     -> b.txt has stage 3 only     (added by them)
 #
-# The fixture has to be built by GIT, because sg's merge has no rename
-# detection and resolves the same history cleanly -- that divergence is
-# pinned at the bottom of this group rather than left implicit, since it is
-# the reason the oracle looks one-directional here.
+# The fixture is built by GIT here regardless: this group's first half is
+# about `sg status`'s LABEL/porcelain lookup tables, which need a real
+# conflicted index as input, and letting real git build that input keeps
+# this group independent of whatever sg's own merge does with the same
+# history. As of Phase 49 sg's merge is rename-aware too and produces the
+# identical shape -- that comparison is the second half of this group,
+# below the labels/porcelain checks.
 P45="$WORKDIR/p45_rename_rename"
 rm -rf "$P45"
 mkdir -p "$P45"
@@ -5585,11 +5588,16 @@ check "phase45: 'added by them:' names b.txt" \
 (cd "$P45" && LC_ALL=C git status --porcelain) 2>/dev/null | sort > "$WORKDIR/p45_gitp.txt"
 check "phase45: porcelain's DD / AU / UA match real git byte-for-byte" \
     cmp -s "$WORKDIR/p45_sgp.txt" "$WORKDIR/p45_gitp.txt"
-# The divergence that makes the fixture one-directional: sg's merge has no
-# rename detection, so the same history merges CLEANLY under sg. Pinned on
-# both sides -- if sg ever grows rename-aware merging this check turns red
-# and says so, instead of the phase45 fixture quietly starting to build
-# itself the other way.
+# Phase 49 closed the gap this group used to pin: sg's merge is now
+# rename-aware, so the same history conflicts under sg too, in the same
+# shape real git produced above ($P45) -- f.txt keeps only a stage-1 entry
+# and no working-tree file, a.txt and b.txt each get a single stage (2 and 3
+# respectively) carrying the SAME content, and MERGE_HEAD is left in place
+# for the user to resolve. This is no longer a divergence, so it is compared
+# against $P45's own real-git-built working tree rather than merely
+# asserted -- if a future change reopened the gap, the byte-for-byte content
+# check below would be the one to catch it, not just the file-existence
+# shape (which a content-blind "resolve arbitrarily" bug could satisfy too).
 P45SG="$WORKDIR/p45_sg_merge"
 rm -rf "$P45SG"
 (cd "$WORKDIR" && "$SG" init "$(basename "$P45SG")") > /dev/null 2>&1
@@ -5599,10 +5607,169 @@ printf 'base\ncontent\nhere\n' > "$P45SG/f.txt"
 (cd "$P45SG" && "$SG" switch topic) > /dev/null 2>&1
 (cd "$P45SG" && mv f.txt b.txt && "$SG" add b.txt f.txt && "$SG" commit -m theirs) > /dev/null 2>&1
 (cd "$P45SG" && "$SG" switch master && "$SG" merge topic) > /dev/null 2>&1
-check "phase45: sg's own merge resolves rename/rename cleanly (no rename detection -- divergence, pinned)" \
-    test ! -f "$P45SG/.git/MERGE_HEAD"
-check "phase45: and keeps both renamed files" \
+check "phase45: sg's own merge now conflicts too (rename-aware, Phase 49)" \
+    test -f "$P45SG/.git/MERGE_HEAD"
+check "phase45: sg keeps a.txt and b.txt, drops f.txt -- same shape as real git" \
     sh -c "test -f '$P45SG/a.txt' && test -f '$P45SG/b.txt' && test ! -f '$P45SG/f.txt'"
+check "phase45: sg's a.txt/b.txt content matches real git's post-merge content byte-for-byte" \
+    sh -c "cmp -s '$P45SG/a.txt' '$P45/a.txt' && cmp -s '$P45SG/b.txt' '$P45/b.txt'"
+(cd "$P45SG" && "$SG" status --porcelain) 2>/dev/null | awk '{print $1}' | sort > "$WORKDIR/p45sg_codes.txt"
+(cd "$P45" && LC_ALL=C git status --porcelain) 2>/dev/null | awk '{print $1}' | sort > "$WORKDIR/p45_codes.txt"
+check "phase45: sg's porcelain codes for the rename/rename conflict match real git's (DD/AU/UA)" \
+    cmp -s "$WORKDIR/p45sg_codes.txt" "$WORKDIR/p45_codes.txt"
+
+# --- Phase 49: rename detection in the three-way merge. Every shape below is
+# built TWICE from the same recipe -- once with sg, once with real git -- and
+# the two results are compared on the three dimensions this phase holds git
+# to: the merge's exit code, the index stage layout (mode + stage + path),
+# and the set of files left in the working tree. Blob IDS are deliberately
+# not compared: a conflicted blob embeds the ours label, and sg writes the
+# branch name where git writes HEAD (deliberate divergence #5), so those ids
+# necessarily differ. Content is cmp'd instead, but only for the shapes real
+# git leaves marker-free.
+#
+# git's stdout is NOT compared: sg's merge message vocabulary was already
+# entirely different before this phase (`Merge made by '<x>' [<sha>] into
+# '<y>'.` and an `sg add`-flavoured conflict list), so `CONFLICT
+# (rename/rename): ...` is out of scope, see docs/DESIGN.md Phase 49 sec 2.
+#
+# Directory rename detection is also out of scope there, which is why every
+# fixture below keeps all its paths in the repository root: a fixture that
+# renamed a directory would diverge for a documented reason and say nothing
+# about renames themselves.
+P49TOOL=""
+p49do() {
+    p49cmd="$1"
+    shift
+    case "$p49cmd" in
+        init)   if [ "$P49TOOL" = sg ]; then "$SG" init .; else LC_ALL=C git init -q -b master .; fi ;;
+        add)    if [ "$P49TOOL" = sg ]; then "$SG" add "$@"; else LC_ALL=C git add "$@"; fi ;;
+        commit) if [ "$P49TOOL" = sg ]; then "$SG" commit -m "$1"; else LC_ALL=C git commit -qm "$1"; fi ;;
+        branch) if [ "$P49TOOL" = sg ]; then "$SG" branch "$1"; else LC_ALL=C git branch "$1"; fi ;;
+        switch) if [ "$P49TOOL" = sg ]; then "$SG" switch "$1"; else LC_ALL=C git switch -q "$1"; fi ;;
+        merge)  if [ "$P49TOOL" = sg ]; then "$SG" merge "$1"; else LC_ALL=C git merge "$1"; fi ;;
+    esac
+}
+
+# $1 = sg|git, $2 = directory, $3 = shape. Leaves the merge's exit code in
+# "$2.rc" so a tool that refuses the merge outright cannot be mistaken for
+# one that merged it cleanly.
+p49_build() {
+    P49TOOL="$1"
+    p49dir="$2"
+    p49shape="$3"
+    rm -rf "$p49dir"
+    mkdir -p "$p49dir"
+    ( cd "$p49dir" &&
+      p49do init &&
+      printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n' > a.txt &&
+      p49do add a.txt && p49do commit base && p49do branch topic &&
+      case "$p49shape" in
+          oneside)
+              mv a.txt b.txt && p49do add b.txt a.txt && p49do commit ours &&
+              p49do switch topic &&
+              printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nTHEIRS8\n' > a.txt &&
+              p49do add a.txt && p49do commit theirs ;;
+          oneside_rev)
+              printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nOURS8\n' > a.txt &&
+              p49do add a.txt && p49do commit ours &&
+              p49do switch topic &&
+              mv a.txt b.txt && p49do add b.txt a.txt && p49do commit theirs ;;
+          rendel)
+              mv a.txt b.txt && p49do add b.txt a.txt && p49do commit ours &&
+              p49do switch topic &&
+              rm a.txt && p49do add a.txt && p49do commit theirs ;;
+          ren1to2)
+              mv a.txt b.txt &&
+              printf 'l1\nl2\nl3\nOURS4\nl5\nl6\nl7\nl8\n' > b.txt &&
+              p49do add b.txt a.txt && p49do commit ours &&
+              p49do switch topic &&
+              mv a.txt c.txt &&
+              printf 'l1\nl2\nl3\nTHEIRS4\nl5\nl6\nl7\nl8\n' > c.txt &&
+              p49do add c.txt a.txt && p49do commit theirs ;;
+          revconflict)
+              printf 'l1\nl2\nl3\nOURS4\nl5\nl6\nl7\nl8\n' > a.txt &&
+              p49do add a.txt && p49do commit ours &&
+              p49do switch topic &&
+              mv a.txt b.txt &&
+              printf 'l1\nl2\nl3\nTHEIRS4\nl5\nl6\nl7\nl8\n' > b.txt &&
+              p49do add b.txt a.txt && p49do commit theirs ;;
+          renadd)
+              mv a.txt b.txt && p49do add b.txt a.txt && p49do commit ours &&
+              p49do switch topic &&
+              printf 'unrelated1\nunrelated2\n' > b.txt &&
+              p49do add b.txt && p49do commit theirs ;;
+      esac &&
+      p49do switch master ) > /dev/null 2>&1
+    ( cd "$p49dir" && p49do merge topic ) > /dev/null 2>&1
+    echo $? > "$p49dir.rc"
+}
+
+# Real git reads sg's own index directly (v2, format-compatible), so both
+# snapshots come from the same oracle rather than from each tool's own
+# reporting.
+p49_snapshot() {
+    ( cd "$1" && LC_ALL=C git ls-files -s | awk '{print $1, $3, $4}' | sort ) > "$2.stages"
+    ( cd "$1" && find . -type f -not -path './.git/*' | sed 's|^\./||' | sort ) > "$2.files"
+}
+
+for p49shape in oneside oneside_rev rendel ren1to2 renadd revconflict; do
+    P49SG="$WORKDIR/p49_${p49shape}_sg"
+    P49GIT="$WORKDIR/p49_${p49shape}_git"
+    p49_build sg "$P49SG" "$p49shape"
+    p49_build git "$P49GIT" "$p49shape"
+    p49_snapshot "$P49SG" "$WORKDIR/p49_${p49shape}_sg"
+    p49_snapshot "$P49GIT" "$WORKDIR/p49_${p49shape}_git"
+    check "phase49: $p49shape -- sg's merge exit code matches real git's" \
+        cmp -s "$P49SG.rc" "$P49GIT.rc"
+    check "phase49: $p49shape -- sg's index stage layout matches real git's" \
+        cmp -s "$WORKDIR/p49_${p49shape}_sg.stages" "$WORKDIR/p49_${p49shape}_git.stages"
+    check "phase49: $p49shape -- sg's working-tree file set matches real git's" \
+        cmp -s "$WORKDIR/p49_${p49shape}_sg.files" "$WORKDIR/p49_${p49shape}_git.files"
+    # Every blob the index names must actually be in the object store. This
+    # is not a formality: rename/rename-1to2's conflicting sub-case wrote
+    # both stages from an UNINITIALIZED sha1 (merge_blob_content leaves
+    # *out_sha1 untouched on a conflict), so the index named objects that do
+    # not exist -- a corrupt repository that make/make test/interop/sanitize
+    # were all green for, because every other fixture's inner merge is clean.
+    ( cd "$P49SG" && LC_ALL=C git ls-files -s | awk '{print $2}' | sort -u |
+      while read -r p49h; do LC_ALL=C git cat-file -e "$p49h" || echo "MISSING $p49h"; done
+    ) > "$WORKDIR/p49_${p49shape}_missing.txt" 2>&1
+    check "phase49: $p49shape -- every index stage names an object sg actually wrote" \
+        test ! -s "$WORKDIR/p49_${p49shape}_missing.txt"
+done
+
+# Content, for the three shapes real git leaves marker-free (the two
+# one-sided renames merge cleanly, and rename/delete deliberately leaves the
+# surviving side's bytes verbatim). The other two carry conflict markers
+# whose ours label diverges by design, so they are covered by the stage/file
+# comparisons above instead.
+for p49shape in oneside oneside_rev rendel; do
+    check "phase49: $p49shape -- b.txt's bytes match real git's" \
+        cmp -s "$WORKDIR/p49_${p49shape}_sg/b.txt" "$WORKDIR/p49_${p49shape}_git/b.txt"
+done
+
+# WHICH side's text sits under WHICH marker label is a dimension none of the
+# comparisons above can see: a swap leaves the stage layout, the file set and
+# even the set of conflicting lines identical. It cost a second cold read to
+# find, because every fixture in this phase -- here, in the unit tests, and in
+# the fuzzer -- originally had OURS doing the renaming, and the swap only
+# shows when THEIRS renames. Only sg's ours label is normalized (it writes the
+# branch name where git writes HEAD, deliberate divergence #5); the `:path`
+# suffix and the marker width are left alone, since those are under test too.
+sed 's/^<<<<<<< master:/<<<<<<< HEAD:/' "$WORKDIR/p49_revconflict_sg/b.txt" \
+    > "$WORKDIR/p49_revconflict_sg_norm.txt" 2>/dev/null
+check "phase49: revconflict -- each side's text follows its OWN marker label" \
+    cmp -s "$WORKDIR/p49_revconflict_sg_norm.txt" "$WORKDIR/p49_revconflict_git/b.txt"
+
+# The rename really is what makes the one-sided cases work: with detection
+# off this same history is a modify/delete conflict leaving BOTH names in the
+# tree (measured, `git -c merge.renames=false`). Without this control the
+# three checks above would also pass for a tool that simply took ours.
+check "phase49: oneside -- the old name is gone, not left beside the new one" \
+    sh -c 'test ! -f "$0/a.txt" && test -f "$0/b.txt"' "$WORKDIR/p49_oneside_sg"
+check "phase49: oneside_rev -- the old name is gone on the theirs-rename side too" \
+    sh -c 'test ! -f "$0/a.txt" && test -f "$0/b.txt"' "$WORKDIR/p49_oneside_rev_sg"
 
 # --- Phase 44: `git stash show`'s implied -p. Measured, git 2.55.0: the
 # default is a diffstat, but any DIFF option that is not itself a format

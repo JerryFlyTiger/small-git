@@ -14,6 +14,7 @@
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/repo.h"
+#include "sg/similarity.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -146,7 +147,7 @@ static void test_untouched_path_stays_in_index(void)
     write_workdir_file(repo_root, "a.txt", "a1\n");
 
     /* ours == base: only theirs actually did anything. */
-    CHECK(sg_merge_trees(git_dir, base_tree, base_tree, theirs_tree, "ours", "theirs", &result) == 0,
+    CHECK(sg_merge_trees(git_dir, base_tree, base_tree, theirs_tree, "ours", "theirs", SG_SIMILARITY_DEFAULT, &result) == 0,
          "sg_merge_trees failed");
     CHECK(result.count == 2, "expected 2 entries in the merge result, got %zu", result.count);
 
@@ -214,7 +215,7 @@ static void test_equal_to_ours_not_rewritten(void)
        sense, so its resolved outcome trivially equals ours. */
     write_workdir_file(repo_root, "c.txt", "DIRTY-UNCOMMITTED\n");
 
-    CHECK(sg_merge_trees(git_dir, tree_id, tree_id, tree_id, "ours", "theirs", &result) == 0,
+    CHECK(sg_merge_trees(git_dir, tree_id, tree_id, tree_id, "ours", "theirs", SG_SIMILARITY_DEFAULT, &result) == 0,
          "sg_merge_trees failed");
     CHECK(sg_merge_result_apply(git_dir, repo_root, &result, &index_out, &conflict_paths,
                                 &conflict_count) == 0,
@@ -271,7 +272,7 @@ static void test_delete_equal_to_ours_does_not_remove_untracked(void)
     /* base has d.txt; ours (empty_tree) and theirs (empty_tree) both lack
        it -- a delete/delete-from-base agreement, resolved clean, not a
        conflict. */
-    CHECK(sg_merge_trees(git_dir, base_tree, empty_tree, empty_tree, "ours", "theirs", &result) == 0,
+    CHECK(sg_merge_trees(git_dir, base_tree, empty_tree, empty_tree, "ours", "theirs", SG_SIMILARITY_DEFAULT, &result) == 0,
          "sg_merge_trees failed");
     CHECK(result.count == 1 && result.entries[0].deleted && !result.entries[0].conflict,
          "expected a single clean 'deleted' entry for d.txt");
