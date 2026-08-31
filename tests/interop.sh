@@ -12926,13 +12926,21 @@ p50_ff_build() {
       p50do commit t1 &&
       p50do switch master ) > /dev/null 2>&1
     echo $? > "$p50dir.build_rc"
+    # The two ids this tool's own repo should name, read with real git
+    # BEFORE the merge moves master. Without this the header is only ever
+    # compared through the placeholder below, which cannot tell
+    # `<old>..<new>` from `<new>..<new>` -- so passing the wrong commit into
+    # the report would be invisible.
+    p50old=$( cd "$p50dir" && LC_ALL=C git rev-parse master 2>/dev/null | cut -c1-7 )
+    p50new=$( cd "$p50dir" && LC_ALL=C git rev-parse topic 2>/dev/null | cut -c1-7 )
+    echo "Updating $p50old..$p50new" > "$p50dir.expected_header"
     if [ "$1" = sg ]; then
-        ( cd "$p50dir" && "$SG" merge topic ) 2>/dev/null |
-            sed 's/^Updating [0-9a-f]\{7\}\.\.[0-9a-f]\{7\}$/Updating <old>..<new>/' > "$p50dir.out"
+        ( cd "$p50dir" && "$SG" merge topic ) 2>/dev/null > "$p50dir.rawout"
     else
-        ( cd "$p50dir" && LC_ALL=C git merge topic ) 2>/dev/null |
-            sed 's/^Updating [0-9a-f]\{7\}\.\.[0-9a-f]\{7\}$/Updating <old>..<new>/' > "$p50dir.out"
+        ( cd "$p50dir" && LC_ALL=C git merge topic ) 2>/dev/null > "$p50dir.rawout"
     fi
+    sed 's/^Updating [0-9a-f]\{7\}\.\.[0-9a-f]\{7\}$/Updating <old>..<new>/' \
+        "$p50dir.rawout" > "$p50dir.out"
 }
 
 P50_SG="$WORKDIR/p50_ff_sg"
@@ -12966,6 +12974,12 @@ check "phase50 oracle: precondition -- and its mode change line carries NO path"
     grep -q '^ mode change 100644 => 100755$' "$P50_GIT.out"
 check "phase50 oracle: precondition -- git's report really has the Updating header" \
     grep -q '^Updating <old>\.\.<new>$' "$P50_GIT.out"
+head -1 "$P50_GIT.rawout" > "$WORKDIR/p50_git_header.txt" 2>/dev/null
+head -1 "$P50_SG.rawout" > "$WORKDIR/p50_sg_header.txt" 2>/dev/null
+check "phase50 oracle: precondition -- git's Updating line names the two real commits" \
+    cmp -s "$WORKDIR/p50_git_header.txt" "$P50_GIT.expected_header"
+check "phase50: sg's Updating line names the two real commits too, not one twice" \
+    cmp -s "$WORKDIR/p50_sg_header.txt" "$P50_SG.expected_header"
 check "phase50: sg's fast-forward report matches real git's byte for byte" \
     cmp -s "$P50_SG.out" "$P50_GIT.out"
 
@@ -13013,7 +13027,10 @@ check "phase50: and prints nothing in sg either" \
 # block two conflicts from merging into one, and the distance it contributes
 # is its length in OURS' lines. Both halves are pinned, because a rule that
 # is merely too WIDE (nothing blocks) passes the first fixture and fails the
-# second. Only the ours label is normalized (deliberate divergence #5).
+# second. Only the OURS label is normalized (deliberate divergence #5): the
+# theirs label is left alone deliberately, because sg writes the argument as
+# typed and so already agrees with git for a plain branch name (Phase 43) --
+# normalizing it too would throw away a real comparison for nothing.
 p50_gap_build() {
     P50TOOL="$1"
     p50dir="$2"
@@ -13038,8 +13055,7 @@ p50_gap_build() {
     else
         ( cd "$p50dir" && LC_ALL=C git merge topic ) > /dev/null 2>&1
     fi
-    sed -e 's/^<<<<<<< master$/<<<<<<< HEAD/' -e 's/^>>>>>>> topic$/>>>>>>> theirs/' \
-        "$p50dir/f.txt" > "$p50dir.merged" 2>/dev/null
+    sed 's/^<<<<<<< master$/<<<<<<< HEAD/' "$p50dir/f.txt" > "$p50dir.merged" 2>/dev/null
 }
 
 # Gap of one identical line, a both-sides deletion, one identical line: git

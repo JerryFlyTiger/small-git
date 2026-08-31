@@ -8203,6 +8203,8 @@ Mutation round, and the one thing it caught that five green gates did not:
 | `simplify_conflicts` blocks on nothing | caught, `a resolved change blocks the merge` |
 | merged mode falls back to base's | caught, exactly the two `renmode` checks |
 | the `mode change` line always carries its path | **green** -> fixture extended, now caught |
+| the report is handed `theirs_commit` where `ours_commit` belongs | caught (both checks) |
+| the header prints the new id TWICE, diff untouched | **green** -> check added, now caught |
 
 The last row is the one worth recording. The rule that a `mode change` line
 drops its path when it follows a `rename` line for the same entry was
@@ -8216,6 +8218,30 @@ no number of extra checks over that fixture could have found it. A file that
 is both renamed and chmod'd was added, with two preconditions naming the
 pathless line explicitly, and the same mutation now turns the byte-for-byte
 comparison red.
+
+The last row came out of the cold read, and it is the same lesson wearing
+different clothes: **the NORMALIZATION was hiding it, not the fixture.** The
+two abbreviated ids have to be normalized away, since sg's and git's commits
+cannot share an id -- but rewriting the whole line to `Updating <old>..<new>`
+also erases the difference between `<old>..<new>` and `<new>..<new>`.
+
+Isolating that took two mutations, and the first one alone would have been
+read wrongly. Handing `do_fast_forward` the wrong commit outright is caught
+by the byte-for-byte check -- but **not for the reason it looks like**: the
+wrong commit is also what the diff is computed from, so the stat and summary
+block collapse to nothing and the check goes red over the missing BODY, not
+over the header. The header dimension itself was still unguarded. A second
+mutation confined to the header (print the new id twice, leave the diff
+alone) proves it: exactly one check red, and it is the new one -- the
+byte-for-byte comparison stays green.
+
+The fix is not less normalization but a second, narrower oracle: each tool's
+own two commit ids are read with `git rev-parse` BEFORE the merge moves
+master, and the raw header line is compared against them. A normalizer is a
+place where coverage goes to die quietly; the question to ask of one is
+always "what else did this erase", and the way to answer it is a mutation
+that touches ONLY the erased dimension -- a broader one gets caught for a
+neighbouring reason and reports the gap as covered.
 
 Not implemented, deliberately: nothing else about `sg merge`'s stdout moves
 toward git. The merge-commit vocabulary
