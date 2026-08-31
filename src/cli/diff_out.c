@@ -2024,23 +2024,82 @@ static int print_stat(const char *git_dir, const char *repo_root, const sg_diff_
 
 /* ---- dispatcher ---------------------------------------------------- */
 
+/* git's --summary block. Printed after the format's own output, never
+   instead of it -- see sg_diff_out_opts.summary for the measured line
+   shapes. Entries are walked in list order, which is path order, which is
+   the order the stat above it used. An unmerged row is skipped: --summary
+   describes tree-to-tree structure changes and the only caller diffs two
+   trees, where an unmerged row cannot arise. */
+static int print_extended_summary(const sg_diff_list *list)
+{
+    size_t i;
+
+    for (i = 0; i < list->count; i++) {
+        const sg_diff_entry *e = &list->entries[i];
+        int named_by_rename = 0;
+
+        if (e->unmerged)
+            continue;
+
+        if (e->old_path != NULL) {
+            char *disp = entry_display_name(e);
+
+            if (disp == NULL)
+                return -1;
+            printf(" %s %s (%d%%)\n", e->is_copy ? "copy" : "rename", disp, e->score);
+            free(disp);
+            named_by_rename = 1;
+        } else if (e->old_side.kind == SG_DIFF_SIDE_ABSENT) {
+            printf(" create mode %06o %s\n", e->new_side.mode, sg_quote_path(e->path));
+            continue;
+        } else if (e->new_side.kind == SG_DIFF_SIDE_ABSENT) {
+            printf(" delete mode %06o %s\n", e->old_side.mode, sg_quote_path(e->path));
+            continue;
+        }
+
+        /* A mode change on a surviving path. Both modes have to be known:
+           0 means "unknown" for a side that never carried one. */
+        if (e->old_side.kind != SG_DIFF_SIDE_ABSENT && e->new_side.kind != SG_DIFF_SIDE_ABSENT &&
+           e->old_side.mode != 0 && e->new_side.mode != 0 &&
+           e->old_side.mode != e->new_side.mode) {
+            if (named_by_rename)
+                printf(" mode change %06o => %06o\n", e->old_side.mode, e->new_side.mode);
+            else
+                printf(" mode change %06o => %06o %s\n", e->old_side.mode, e->new_side.mode,
+                       sg_quote_path(e->path));
+        }
+    }
+    return 0;
+}
+
 int sg_diff_print(const char *git_dir, const char *repo_root, const sg_diff_list *list,
                   const sg_diff_out_opts *opts)
 {
+    int rc;
+
     switch (opts->format) {
     case SG_DIFF_FORMAT_PATCH:
-        return print_patch(git_dir, repo_root, list, opts->combined, opts->algorithm);
+        rc = print_patch(git_dir, repo_root, list, opts->combined, opts->algorithm);
+        break;
     case SG_DIFF_FORMAT_STAT:
-        return print_stat(git_dir, repo_root, list, opts, 0);
+        rc = print_stat(git_dir, repo_root, list, opts, 0);
+        break;
     case SG_DIFF_FORMAT_SHORTSTAT:
-        return print_stat(git_dir, repo_root, list, opts, 1);
+        rc = print_stat(git_dir, repo_root, list, opts, 1);
+        break;
     case SG_DIFF_FORMAT_NUMSTAT:
-        return print_numstat(git_dir, repo_root, list, opts->combined, opts->algorithm);
+        rc = print_numstat(git_dir, repo_root, list, opts->combined, opts->algorithm);
+        break;
     case SG_DIFF_FORMAT_NAME_ONLY:
-        return print_name_only(list, opts->combined);
+        rc = print_name_only(list, opts->combined);
+        break;
     case SG_DIFF_FORMAT_NAME_STATUS:
-        return print_name_status(list, opts->combined);
+        rc = print_name_status(list, opts->combined);
+        break;
     default:
         return -1;
     }
+    if (rc != 0 || !opts->summary)
+        return rc;
+    return print_extended_summary(list);
 }

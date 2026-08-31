@@ -47,6 +47,25 @@ typedef struct {
        `git diff` is doing (measured), so src/workdir/merge.c hard-codes
        SG_DIFF_ALGO_HISTOGRAM instead of taking it from an option. */
     sg_diff_algorithm algorithm;
+    /* git's --summary block, printed AFTER the chosen format's own output
+       (Phase 50). The one caller is `sg merge`'s fast-forward report, which
+       is `git merge`'s own composition: measured against git 2.55.0, a
+       fast-forward prints exactly `git diff --stat --summary <old> <new>`
+       under its Updating/Fast-forward header. Four line shapes, all
+       measured:
+
+         create mode 100644 <path>
+         delete mode 100644 <path>
+         rename <compressed pair> (NN%)
+         mode change 100644 => 100755 <path>
+
+       The last one DROPS its path when it follows a rename line for the
+       same entry -- git has already named it one line up. `copy` replaces
+       `rename` when the row is a copy, though nothing in sg sets summary
+       and copy detection at once today.
+
+       Not a format: it composes with one, and only --stat is exercised. */
+    int summary;
 } sg_diff_out_opts;
 
 /* Every format except PATCH quotes paths with sg_quote_path -- measured

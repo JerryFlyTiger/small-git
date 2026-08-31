@@ -5653,7 +5653,14 @@ p49do() {
 
 # $1 = sg|git, $2 = directory, $3 = shape. Leaves the merge's exit code in
 # "$2.rc" so a tool that refuses the merge outright cannot be mistaken for
-# one that merged it cleanly.
+# one that merged it cleanly, and the BUILD's own exit code in "$2.build_rc".
+# The second one is not padding: the build is one long `&&` chain inside a
+# subshell, so a shape whose recipe dies halfway (a commit that stages
+# nothing, a mv against a file some earlier step never created) leaves a
+# half-built fixture and says nothing about it. Both tools then run the same
+# broken recipe, so the failure direction is "both sides are equally wrong,
+# therefore equal" -- every cmp below stays green over a fixture that never
+# tested what it names.
 p49_build() {
     P49TOOL="$1"
     p49dir="$2"
@@ -5699,8 +5706,21 @@ p49_build() {
               p49do switch topic &&
               printf 'unrelated1\nunrelated2\n' > b.txt &&
               p49do add b.txt && p49do commit theirs ;;
+          renmode)
+              mv a.txt b.txt && chmod +x b.txt &&
+              p49do add b.txt a.txt && p49do commit ours &&
+              p49do switch topic &&
+              printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nTHEIRS8\n' > a.txt &&
+              p49do add a.txt && p49do commit theirs ;;
+          renmode_rev)
+              printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nOURS8\n' > a.txt &&
+              p49do add a.txt && p49do commit ours &&
+              p49do switch topic &&
+              mv a.txt b.txt && chmod +x b.txt &&
+              p49do add b.txt a.txt && p49do commit theirs ;;
       esac &&
       p49do switch master ) > /dev/null 2>&1
+    echo $? > "$p49dir.build_rc"
     ( cd "$p49dir" && p49do merge topic ) > /dev/null 2>&1
     echo $? > "$p49dir.rc"
 }
@@ -5713,13 +5733,25 @@ p49_snapshot() {
     ( cd "$1" && find . -type f -not -path './.git/*' | sed 's|^\./||' | sort ) > "$2.files"
 }
 
-for p49shape in oneside oneside_rev rendel ren1to2 renadd revconflict; do
+printf '0\n' > "$WORKDIR/p49_zero.txt"
+
+# renmode/renmode_rev exist for the MODE column alone. Every other shape
+# here writes plain 644 files, so p49_snapshot's mode field never varies and
+# the merged-mode rules (a landing takes the non-base side's mode, in either
+# direction) were pinned by nothing at all -- a tool hard-coding 100644
+# passed the whole group. One side renames AND chmod +x's while the other
+# edits the content in place, once with ours renaming and once with theirs.
+for p49shape in oneside oneside_rev rendel ren1to2 renadd revconflict renmode renmode_rev; do
     P49SG="$WORKDIR/p49_${p49shape}_sg"
     P49GIT="$WORKDIR/p49_${p49shape}_git"
     p49_build sg "$P49SG" "$p49shape"
     p49_build git "$P49GIT" "$p49shape"
     p49_snapshot "$P49SG" "$WORKDIR/p49_${p49shape}_sg"
     p49_snapshot "$P49GIT" "$WORKDIR/p49_${p49shape}_git"
+    check "phase49 oracle: precondition -- sg's $p49shape fixture built cleanly" \
+        cmp -s "$P49SG.build_rc" "$WORKDIR/p49_zero.txt"
+    check "phase49 oracle: precondition -- git's $p49shape fixture built cleanly" \
+        cmp -s "$P49GIT.build_rc" "$WORKDIR/p49_zero.txt"
     check "phase49: $p49shape -- sg's merge exit code matches real git's" \
         cmp -s "$P49SG.rc" "$P49GIT.rc"
     check "phase49: $p49shape -- sg's index stage layout matches real git's" \
@@ -5744,9 +5776,20 @@ done
 # surviving side's bytes verbatim). The other two carry conflict markers
 # whose ours label diverges by design, so they are covered by the stage/file
 # comparisons above instead.
-for p49shape in oneside oneside_rev rendel; do
+for p49shape in oneside oneside_rev rendel renmode renmode_rev; do
     check "phase49: $p49shape -- b.txt's bytes match real git's" \
         cmp -s "$WORKDIR/p49_${p49shape}_sg/b.txt" "$WORKDIR/p49_${p49shape}_git/b.txt"
+done
+
+# The mode column has to be OBSERVED varying, not merely compared: if both
+# tools wrote 100644 the cmp above would still be green, and the shape would
+# be pinning nothing while looking like coverage. This asserts the oracle
+# itself moved the column, once per direction.
+for p49shape in renmode renmode_rev; do
+    check "phase49 oracle: precondition -- git's $p49shape result really is mode 100755" \
+        grep -q '^100755 0 b.txt$' "$WORKDIR/p49_${p49shape}_git.stages"
+    check "phase49: $p49shape -- sg's landing carries the executable bit too" \
+        grep -q '^100755 0 b.txt$' "$WORKDIR/p49_${p49shape}_sg.stages"
 done
 
 # WHICH side's text sits under WHICH marker label is a dimension none of the
@@ -12833,6 +12876,206 @@ check "phase48: and refusing it left HEAD where it was" \
 (cd "$P48_REV" && "$SG" switch --detach '@~2') > /dev/null 2>&1
 check "phase48: sg resolves @~2 the same as git's HEAD~2" \
     sh -c "test \"\$(git -C '$P48_REV' rev-parse HEAD)\" = '$P48_C1'"
+
+
+# --- Phase 50, part 1: `sg merge`'s fast-forward report. Measured against
+# git 2.55.0: a fast-forward prints `Updating <7hex>..<7hex>`, then
+# `Fast-forward`, then EXACTLY `git diff --stat --summary <old>..<new>` --
+# rename detection on (git diff's own default), and the four summary line
+# shapes below it. Only the two abbreviated ids are normalized away, because
+# sg's and git's commits differ in author/committer bytes and so cannot share
+# an id; everything else is cmp'd byte for byte.
+p50do() {
+    p50cmd="$1"
+    shift
+    case "$p50cmd" in
+        init)   if [ "$P50TOOL" = sg ]; then "$SG" init .; else LC_ALL=C git init -q -b master .; fi ;;
+        add)    if [ "$P50TOOL" = sg ]; then "$SG" add "$@"; else LC_ALL=C git add "$@"; fi ;;
+        commit) if [ "$P50TOOL" = sg ]; then "$SG" commit -m "$1"; else LC_ALL=C git commit -qm "$1"; fi ;;
+        branch) if [ "$P50TOOL" = sg ]; then "$SG" branch "$1"; else LC_ALL=C git branch "$1"; fi ;;
+        switch) if [ "$P50TOOL" = sg ]; then "$SG" switch "$1"; else LC_ALL=C git switch -q "$1"; fi ;;
+    esac
+}
+
+# $1 = sg|git, $2 = dir. Leaves the merge's stdout in "$2.out" with the two
+# abbreviated ids replaced, and the BUILD's exit code in "$2.build_rc" (same
+# reasoning as phase49's: a half-built fixture is identical on both sides and
+# every cmp below would stay green over it).
+p50_ff_build() {
+    P50TOOL="$1"
+    p50dir="$2"
+    rm -rf "$p50dir"
+    mkdir -p "$p50dir"
+    ( cd "$p50dir" &&
+      p50do init &&
+      printf 'k1\nk2\nk3\n' > keep.txt &&
+      printf 'g1\n' > gone.txt &&
+      { i=0; while [ $i -lt 30 ]; do printf 'line %02d with a decent amount of text on it\n' $i; i=$((i+1)); done; } > ren_src.txt &&
+      printf '#!/bin/sh\necho hi\n' > chmodme.sh &&
+      { i=0; while [ $i -lt 30 ]; do printf 'both renamed and chmodded, line %02d\n' $i; i=$((i+1)); done; } > mvchmod.sh &&
+      p50do add keep.txt gone.txt ren_src.txt chmodme.sh mvchmod.sh && p50do commit base &&
+      p50do branch topic && p50do switch topic &&
+      printf 'k1\nCHANGED\nk3\nk4\n' > keep.txt &&
+      rm gone.txt &&
+      mv ren_src.txt ren_dst.txt &&
+      printf 'a1\n' > added.txt &&
+      chmod +x chmodme.sh &&
+      mv mvchmod.sh mvchmod2.sh &&
+      chmod +x mvchmod2.sh &&
+      p50do add keep.txt gone.txt ren_src.txt ren_dst.txt added.txt chmodme.sh mvchmod.sh mvchmod2.sh &&
+      p50do commit t1 &&
+      p50do switch master ) > /dev/null 2>&1
+    echo $? > "$p50dir.build_rc"
+    # The two ids this tool's own repo should name, read with real git
+    # BEFORE the merge moves master. Without this the header is only ever
+    # compared through the placeholder below, which cannot tell
+    # `<old>..<new>` from `<new>..<new>` -- so passing the wrong commit into
+    # the report would be invisible.
+    p50old=$( cd "$p50dir" && LC_ALL=C git rev-parse master 2>/dev/null | cut -c1-7 )
+    p50new=$( cd "$p50dir" && LC_ALL=C git rev-parse topic 2>/dev/null | cut -c1-7 )
+    echo "Updating $p50old..$p50new" > "$p50dir.expected_header"
+    if [ "$1" = sg ]; then
+        ( cd "$p50dir" && "$SG" merge topic ) 2>/dev/null > "$p50dir.rawout"
+    else
+        ( cd "$p50dir" && LC_ALL=C git merge topic ) 2>/dev/null > "$p50dir.rawout"
+    fi
+    sed 's/^Updating [0-9a-f]\{7\}\.\.[0-9a-f]\{7\}$/Updating <old>..<new>/' \
+        "$p50dir.rawout" > "$p50dir.out"
+}
+
+P50_SG="$WORKDIR/p50_ff_sg"
+P50_GIT="$WORKDIR/p50_ff_git"
+p50_ff_build sg "$P50_SG"
+p50_ff_build git "$P50_GIT"
+printf '0\n' > "$WORKDIR/p50_zero.txt"
+check "phase50 oracle: precondition -- sg's fast-forward fixture built cleanly" \
+    cmp -s "$P50_SG.build_rc" "$WORKDIR/p50_zero.txt"
+check "phase50 oracle: precondition -- git's fast-forward fixture built cleanly" \
+    cmp -s "$P50_GIT.build_rc" "$WORKDIR/p50_zero.txt"
+# The fixture has to be PROVEN to reach all four summary shapes, or the cmp
+# below would pass just as happily over a fixture that reaches none of them.
+check "phase50 oracle: precondition -- git's report really has a create line" \
+    grep -q '^ create mode 100644 added\.txt$' "$P50_GIT.out"
+check "phase50 oracle: precondition -- git's report really has a delete line" \
+    grep -q '^ delete mode 100644 gone\.txt$' "$P50_GIT.out"
+check "phase50 oracle: precondition -- git's report really has a mode change line" \
+    grep -q '^ mode change 100644 => 100755 chmodme\.sh$' "$P50_GIT.out"
+check "phase50 oracle: precondition -- git's report really has a rename line" \
+    grep -q '^ rename ren_src\.txt => ren_dst\.txt (100%)$' "$P50_GIT.out"
+# The one summary shape that needs a single entry to be BOTH renamed AND
+# chmod'd: git drops the path from the mode-change line, because the rename
+# line one row up already named it. A fixture that renames one file and
+# chmods a DIFFERENT one reaches every other shape and misses this one
+# entirely -- measured, the mutation "always print the path" left all 2181
+# checks green before this pair existed.
+check "phase50 oracle: precondition -- git's report really has a rename+chmod pair" \
+    grep -q '^ rename mvchmod\.sh => mvchmod2\.sh (100%)$' "$P50_GIT.out"
+check "phase50 oracle: precondition -- and its mode change line carries NO path" \
+    grep -q '^ mode change 100644 => 100755$' "$P50_GIT.out"
+check "phase50 oracle: precondition -- git's report really has the Updating header" \
+    grep -q '^Updating <old>\.\.<new>$' "$P50_GIT.out"
+head -1 "$P50_GIT.rawout" > "$WORKDIR/p50_git_header.txt" 2>/dev/null
+head -1 "$P50_SG.rawout" > "$WORKDIR/p50_sg_header.txt" 2>/dev/null
+check "phase50 oracle: precondition -- git's Updating line names the two real commits" \
+    cmp -s "$WORKDIR/p50_git_header.txt" "$P50_GIT.expected_header"
+check "phase50: sg's Updating line names the two real commits too, not one twice" \
+    cmp -s "$WORKDIR/p50_sg_header.txt" "$P50_SG.expected_header"
+check "phase50: sg's fast-forward report matches real git's byte for byte" \
+    cmp -s "$P50_SG.out" "$P50_GIT.out"
+
+# An UNBORN HEAD fast-forwards SILENTLY -- measured: git prints nothing at
+# all, not even `Fast-forward`, while still moving HEAD. This is the one
+# fast-forward shape with no report, and it is easy to "fix" into printing a
+# header with a zero id.
+p50_unborn_build() {
+    P50TOOL="$1"
+    p50dir="$2"
+    rm -rf "$p50dir"
+    mkdir -p "$p50dir"
+    ( cd "$p50dir" &&
+      p50do init &&
+      printf 'a1\n' > a.txt &&
+      p50do add a.txt && p50do commit c1 && p50do branch topic ) > /dev/null 2>&1
+    # Put master back to unborn, with the working tree empty.
+    ( cd "$p50dir" &&
+      rm -f .git/refs/heads/master &&
+      printf 'ref: refs/heads/master\n' > .git/HEAD &&
+      rm -f .git/index a.txt ) > /dev/null 2>&1
+    if [ "$1" = sg ]; then
+        ( cd "$p50dir" && "$SG" merge topic ) > "$p50dir.out" 2>/dev/null
+    else
+        ( cd "$p50dir" && LC_ALL=C git merge topic ) > "$p50dir.out" 2>/dev/null
+    fi
+    echo $? > "$p50dir.rc"
+}
+
+P50U_SG="$WORKDIR/p50_unborn_sg"
+P50U_GIT="$WORKDIR/p50_unborn_git"
+p50_unborn_build sg "$P50U_SG"
+p50_unborn_build git "$P50U_GIT"
+check "phase50 oracle: precondition -- git's unborn fast-forward really succeeded" \
+    sh -c 'test "$(cat "$0")" = 0 && test -f "$1/a.txt"' "$P50U_GIT.rc" "$P50U_GIT"
+check "phase50: sg's unborn fast-forward also succeeds" \
+    sh -c 'test "$(cat "$0")" = 0 && test -f "$1/a.txt"' "$P50U_SG.rc" "$P50U_SG"
+check "phase50 oracle: an unborn fast-forward prints nothing at all in git" \
+    test ! -s "$P50U_GIT.out"
+check "phase50: and prints nothing in sg either" \
+    test ! -s "$P50U_SG.out"
+
+# --- Phase 50, part 2: the conflict-simplification gap rule. A span BOTH
+# sides changed the same way is agreement, not a resolution: it does not
+# block two conflicts from merging into one, and the distance it contributes
+# is its length in OURS' lines. Both halves are pinned, because a rule that
+# is merely too WIDE (nothing blocks) passes the first fixture and fails the
+# second. Only the OURS label is normalized (deliberate divergence #5): the
+# theirs label is left alone deliberately, because sg writes the argument as
+# typed and so already agrees with git for a plain branch name (Phase 43) --
+# normalizing it too would throw away a real comparison for nothing.
+p50_gap_build() {
+    P50TOOL="$1"
+    p50dir="$2"
+    p50base="$3"
+    p50ours="$4"
+    p50theirs="$5"
+    rm -rf "$p50dir"
+    mkdir -p "$p50dir"
+    ( cd "$p50dir" &&
+      p50do init &&
+      printf "$p50base" > f.txt &&
+      p50do add f.txt && p50do commit base && p50do branch topic &&
+      printf "$p50ours" > f.txt &&
+      p50do add f.txt && p50do commit ours &&
+      p50do switch topic &&
+      printf "$p50theirs" > f.txt &&
+      p50do add f.txt && p50do commit theirs &&
+      p50do switch master ) > /dev/null 2>&1
+    echo $? > "$p50dir.build_rc"
+    if [ "$1" = sg ]; then
+        ( cd "$p50dir" && "$SG" merge topic ) > /dev/null 2>&1
+    else
+        ( cd "$p50dir" && LC_ALL=C git merge topic ) > /dev/null 2>&1
+    fi
+    sed 's/^<<<<<<< master$/<<<<<<< HEAD/' "$p50dir/f.txt" > "$p50dir.merged" 2>/dev/null
+}
+
+# Gap of one identical line, a both-sides deletion, one identical line: git
+# prints ONE conflict. A "any changed span blocks" rule prints two.
+p50_gap_build sg  "$WORKDIR/p50_gapdel_sg"  'X\ng1\nD\ng2\nY\n' 'ourX\ng1\ng2\nourY\n' 'thrX\ng1\ng2\nthrY\n'
+p50_gap_build git "$WORKDIR/p50_gapdel_git" 'X\ng1\nD\ng2\nY\n' 'ourX\ng1\ng2\nourY\n' 'thrX\ng1\ng2\nthrY\n'
+check "phase50 oracle: precondition -- the both-sides-deletion gap fixture built cleanly" \
+    cmp -s "$WORKDIR/p50_gapdel_sg.build_rc" "$WORKDIR/p50_zero.txt"
+check "phase50 oracle: precondition -- git merges that one into a single conflict" \
+    sh -c 'test "$(grep -c "^<<<<<<<" "$0")" = 1' "$WORKDIR/p50_gapdel_git.merged"
+check "phase50: sg's both-sides-deletion gap merges exactly like git's" \
+    cmp -s "$WORKDIR/p50_gapdel_sg.merged" "$WORKDIR/p50_gapdel_git.merged"
+
+# The other half: an agreed line is still DISTANCE, so four of them split.
+p50_gap_build sg  "$WORKDIR/p50_gapmod_sg"  'X\ng1\nM\ng2\ng3\nY\n' 'ourX\ng1\nBOTH\ng2\ng3\nourY\n' 'thrX\ng1\nBOTH\ng2\ng3\nthrY\n'
+p50_gap_build git "$WORKDIR/p50_gapmod_git" 'X\ng1\nM\ng2\ng3\nY\n' 'ourX\ng1\nBOTH\ng2\ng3\nourY\n' 'thrX\ng1\nBOTH\ng2\ng3\nthrY\n'
+check "phase50 oracle: precondition -- git splits the 4-ours-line agreed gap into two" \
+    sh -c 'test "$(grep -c "^<<<<<<<" "$0")" = 2' "$WORKDIR/p50_gapmod_git.merged"
+check "phase50: sg splits that one into two conflicts as well" \
+    cmp -s "$WORKDIR/p50_gapmod_sg.merged" "$WORKDIR/p50_gapmod_git.merged"
 
 
 echo ""

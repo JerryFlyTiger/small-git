@@ -3,7 +3,7 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (2077 checks, using real `git` as
+git; this is guarded by `tests/interop.sh` (2185 checks, using real `git` as
 the oracle).
 
 On top of that there are two things real git does not have: `src/safety/`
@@ -17,7 +17,7 @@ section when needed, do not read the whole thing**).
 
 ```bash
 make                              # build/sg, with -g
-make test                         # 62 unit test binaries, any failure fails the whole thing
+make test                         # 64 unit test binaries, any failure fails the whole thing
 bash tests/interop.sh             # interop test against real git (needs a prior make)
 make sanitize                     # clean + rebuild with ASan/UBSan + run unit tests
 python3 tests/fuzz_ignore.py      # .gitignore consistency fuzzer (200 rounds by default)
@@ -48,7 +48,7 @@ these four things (the script's comments have the full WHY):
 - The line that prints "0 TUs recompiled" **does not give you a warning
   count**: make compiled nothing this run, so the 0 means "not measured", not
   "measured as zero". To actually measure, use `--rebuild`.
-- In the `make test` line's "N/62 ran", if N is less than 62 it means
+- In the `make test` line's "N/64 ran", if N is less than 64 it means
   **aborted partway through** (the Makefile stops at the first failing
   binary), not "the rest passed".
 - A non-zero exit code with zero FAIL lines still counts as FAIL: crashes,
@@ -91,7 +91,7 @@ ASan job. Two things about reading its row, both measured:
 - **A crashed binary yields exit code 0 and no summary line at all**, so
   reading the exit code alone would score a segfault as green. The gate
   therefore demands the `N leaks for M total leaked bytes` line from every
-  binary and reports `analyzed N/62`, the same "not measured != measured as
+  binary and reports `analyzed N/64`, the same "not measured != measured as
   zero" shape as the `make` and `make test` rows. Non-macOS is a `skip` row,
   never a silent pass.
 
@@ -408,7 +408,14 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   whole list dies, nobody even learns which file was broken.
 - **Printing a diff always goes through `sg_diff_print`**
   (`include/sg/diff_out.h`, Phase 25), six formats (patch/`--stat`/
-  `--numstat`/`--shortstat`/`--name-only`/`--name-status`). `sg diff` and
+  `--numstat`/`--shortstat`/`--name-only`/`--name-status`).
+  **`sg_diff_out_opts.summary` (Phase 50) is git's `--summary` block, and is
+  NOT a seventh format**: it composes with one, printing after that format's
+  own output. Its only caller is `sg merge`'s fast-forward report and only
+  `--stat` exercises it. Four measured line shapes (`create mode`,
+  `delete mode`, `rename <compressed pair> (NN%)`, `mode change`); the
+  rename line reuses `--stat`'s own compressed pairing column, so the two
+  cannot drift apart. `sg diff` and
   `sg stash show` share this one, do not write a second formatter.
   The patch body has been **byte-for-byte identical to real git** since Phase
   26 (the `index` line, `new file mode`/`deleted file mode`/`/dev/null`,
@@ -522,10 +529,28 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   WARNING: **two conflicts separated by at most 3 identical lines print as
   ONE conflict** (`SG_MERGE_CONFLICT_GAP`, git's
   `xdl_simplify_non_conflicts`; measured: 0-3 merge, 4 splits) -- **but a
-  one-sided change inside the gap blocks the merge however short it is**,
+  ONE-SIDED change inside the gap blocks the merge however short it is**,
   which is why regions carry a `REGION_RESOLVED` kind distinct from
   `REGION_SAME`. A distance-only rule passes the gap-3 test and fails the
   resolved-change one; both are in `tests/test_merge_content.c` as a pair.
+  WARNING: **the emphasis on ONE-SIDED is load-bearing (Phase 50): a span
+  BOTH sides changed the SAME way is `REGION_SAME`, not `REGION_RESOLVED`.**
+  It does not block, and it contributes its length **in OURS' lines** as
+  distance. Measured over 6 gap kinds x 7 widths, and one rule explains all
+  38 rows: both-deleted reaches a gap one wider than both-edited precisely
+  because a both-sided deletion is 0 ours lines long. This is also why the
+  gap is counted in ours' coordinates and not base's -- git's own
+  `xdl_simplify_non_conflicts` measures between `xdmerge_t`'s OURS fields.
+  `REGION_SAME` therefore means "identical on both sides", **never** "equal
+  to base": `refine_conflicts` has always hoisted agreed text out of a
+  conflict as `REGION_SAME` while it differs from base, and the classifier
+  was the one place that read it the other way (that was `--seed 9058`,
+  Phase 49's one known non-zero, and its recorded description called the
+  deletion one-sided when it is two-sided).
+  WARNING: the one-sided rows agree **trivially** below the threshold -- a
+  one-sided change leaves no anchor, so conflict/gap/conflict is already a
+  single span between sync points and never reaches the simplify pass. A
+  fixture at n <= 2 proves nothing about this rule.
   WARNING: **a conflict's two sides are diffed against EACH OTHER and what
   they agree on is hoisted out of the conflict** (git's
   `xdl_refine_conflict`), and this runs BEFORE simplification, not after --
@@ -1177,9 +1202,22 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   (measured: setting that to `trunk` still appends ` into trunk`); a detached
   HEAD gets ` into HEAD`. The conflict marker's theirs label is the argument
   as typed in every form. See Phase 43 of `docs/DESIGN.md` for the tables.
-  WARNING: **the fast-forward output is still a bare `Fast-forward`** where
-  git prints `Updating <a>..<b>` plus a diffstat -- a pre-existing divergence,
-  unrelated to which revisions are accepted, deliberately left alone.
+  **The fast-forward output matches git as of Phase 50**: `Updating
+  <7hex>..<7hex>`, `Fast-forward`, then exactly
+  `git diff --stat --summary <old> <new>` -- rename detection ON (git diff's
+  own default), byte-identical to git's, pinned in interop's `phase50` group.
+  WARNING: **an UNBORN HEAD prints NOTHING AT ALL**, not even
+  `Fast-forward`, while still moving HEAD (measured). That is the whole
+  reason `do_fast_forward` takes `ours_commit` as a pointer that is **NULL
+  when unborn** -- no separate flag, no zero-id sentinel. Printing a header
+  there is the obvious-looking "fix" and is wrong.
+  WARNING: **the `mode change` summary line DROPS its path when it follows a
+  `rename` line for the same entry** (git already named it one line up), and
+  an EMPTY diff prints the two header lines and nothing else -- an empty
+  `--stat` is empty, not " 0 files changed". Both measured.
+  The rest of `sg merge`'s stdout is still sg's own vocabulary and is still
+  not compared against git's; Phase 50 changed this one output, not the
+  command's voice.
 - **A user-supplied revision string always goes through
   `sg_rev_parse_commit`** (`include/sg/revparse.h`): `HEAD`/tag/branch/full
   40-hex/full `refs/...` path, plus `~N`/`^N`/`@{N}` (Phase 17, reflog index,
@@ -1248,6 +1286,25 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `base_tree` against `untracked_tree` -- the latter would report a phantom
   deletion for every path that exists only on the tracked side, printing the
   same path twice.
+- **`sg_stash_apply` and `sg_stash_apply_check_dirty` are two of the four
+  `sg_merge_trees` call sites, and until Phase 50 nothing covered their
+  rename behaviour at all** -- `fuzz_merge_rename.py` never runs `sg stash`,
+  and interop's only stash+rename group (Phase 31) exercises `sg stash
+  show`, which goes through `sg_diff_detect_renames`, a different code path.
+  `tests/test_stash_rename.c` covers two genuinely different dimensions:
+  the STASH'S OWN CONTENT containing a rename (needs detection to come out
+  right -- without it the edit and the rename are a modify/delete conflict),
+  and a staged rename sitting in the INDEX at apply time that the stash never
+  touches (never reaches the merge at all; it exercises the re-stage loop,
+  which has no concept of a rename and came out right by construction rather
+  than by design).
+  WARNING: **`sg_stash_apply_check_dirty`'s `rename_score` is measurably
+  unobservable, and that is not a coverage gap.** Setting it to 0 leaves the
+  function's full answer byte-identical across clean / dirty-at-destination /
+  dirty-at-source (measured with a probe against both builds). It only
+  reports which TOUCHED paths are dirty, and rename detection changes how a
+  path resolves, not which paths the merge touches. Do not go hunting for the
+  test; see Phase 50 of `docs/DESIGN.md` for the printed evidence.
 - **`sg stash push` writes `reset: moving to HEAD` to `logs/HEAD`** (Phase
   48), matching real git -- and the branch's own log gets nothing, which is
   Phase 17's rule 1 falling out rather than a special case. WARNING: **two
@@ -1525,7 +1582,7 @@ bumping the version, keep the man page in sync.
 
 ## Testing conventions
 
-- 62 independent unit test `.c` files, **no shared header, no test
+- 64 independent unit test `.c` files, **no shared header, no test
   framework**. Each file carries its own `static int failures = 0;` and a
   same-named `CHECK(cond, ...)` macro (prints `FAIL %s:%d` and
   `failures++` on failure, **does not abort**), and `main` ends with

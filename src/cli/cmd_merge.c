@@ -2,6 +2,8 @@
 
 #include "sg/apply.h"
 #include "sg/chunk.h"
+#include "sg/diff.h"
+#include "sg/diff_out.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -32,11 +34,69 @@ static const char *env_or(const char *name, const char *fallback)
     return (v != NULL && v[0] != '\0') ? v : fallback;
 }
 
+/* The report git prints after a fast-forward, measured against git 2.55.0:
+
+     Updating <7hex>..<7hex>
+     Fast-forward
+     <exactly `git diff --stat --summary <old> <new>`>
+
+   Rename detection is ON, because that is `git diff`'s own default and the
+   diffstat here is an ordinary one (measured: a renamed file shows as
+   `a => b | 0` plus a `rename` summary line, not as an add and a delete).
+   A tree pair that differs in nothing prints the two header lines and
+   nothing else -- an empty --stat is empty, not " 0 files changed".
+
+   None of this is fatal: the fast-forward itself has already happened and
+   been recorded by the time any of it runs, so a diff that cannot be built
+   costs the user the report, not the merge. */
+static void print_fast_forward_report(const char *git_dir, const char *repo_root,
+                                      const unsigned char ours_commit[SG_SHA1_RAW_LEN],
+                                      const unsigned char theirs_commit[SG_SHA1_RAW_LEN],
+                                      const unsigned char theirs_tree[SG_SHA1_RAW_LEN])
+{
+    char old_hex[SG_SHA1_HEX_LEN + 1];
+    char new_hex[SG_SHA1_HEX_LEN + 1];
+    unsigned char ours_tree[SG_SHA1_RAW_LEN];
+    char bad_path[SG_PATH_MAX];
+    sg_diff_list list;
+    sg_diff_out_opts opts;
+
+    sg_sha1_to_hex(ours_commit, old_hex);
+    sg_sha1_to_hex(theirs_commit, new_hex);
+    printf("Updating %.7s..%.7s\n", old_hex, new_hex);
+    printf("Fast-forward\n");
+
+    if (sg_commit_tree_of(git_dir, ours_commit, ours_tree) != 0)
+        return;
+    memset(&list, 0, sizeof(list));
+    if (sg_diff_trees(git_dir, ours_tree, theirs_tree, &list, bad_path) != 0) {
+        sg_diff_list_free(&list);
+        return;
+    }
+    if (sg_diff_detect_renames(git_dir, repo_root, &list, SG_SIMILARITY_DEFAULT, 0) != 0) {
+        sg_diff_list_free(&list);
+        return;
+    }
+    memset(&opts, 0, sizeof(opts));
+    opts.format = SG_DIFF_FORMAT_STAT;
+    opts.summary = 1;
+    sg_diff_print(git_dir, repo_root, &list, &opts);
+    sg_diff_list_free(&list);
+}
+
 /* current_branch may be NULL (detached HEAD): sg_ref_move_head then moves
    HEAD itself instead of a branch, leaving every branch ref untouched, same
-   as real git measured against a detached fast-forward merge. */
+   as real git measured against a detached fast-forward merge.
+
+   ours_commit is NULL when HEAD is UNBORN, and that case prints NOTHING AT
+   ALL -- not even `Fast-forward`. Measured against git 2.55.0: merging a
+   branch into a branch with no commits yet fast-forwards silently, rc 0,
+   empty stdout and empty stderr, with HEAD genuinely moved. It is not that
+   the header is skipped for want of an old id; git prints no report at all
+   there. */
 static int do_fast_forward(const char *git_dir, const char *repo_root, const char *current_branch,
-                           const char *branch_arg, const unsigned char theirs_commit[SG_SHA1_RAW_LEN],
+                           const char *branch_arg, const unsigned char *ours_commit,
+                           const unsigned char theirs_commit[SG_SHA1_RAW_LEN],
                            const unsigned char theirs_tree[SG_SHA1_RAW_LEN], int force)
 {
     char label[300];
@@ -58,7 +118,8 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
         return 1;
     }
 
-    printf("Fast-forward\n");
+    if (ours_commit != NULL)
+        print_fast_forward_report(git_dir, repo_root, ours_commit, theirs_commit, theirs_tree);
     return 0;
 }
 
@@ -578,8 +639,8 @@ int sg_cmd_merge(int argc, char **argv)
         if (!has_head) {
             /* current branch has no commits yet: fast-forwarding onto
                theirs is always safe, there is nothing of ours to lose */
-            rc = do_fast_forward(git_dir, repo_root, current_branch, branch_arg, theirs_commit,
-                                 theirs_tree, force);
+            rc = do_fast_forward(git_dir, repo_root, current_branch, branch_arg, NULL,
+                                 theirs_commit, theirs_tree, force);
             free(current_branch);
             free(git_dir);
             free(repo_root);
@@ -611,8 +672,8 @@ int sg_cmd_merge(int argc, char **argv)
         }
 
         if (memcmp(base_commit, ours_commit, SG_SHA1_RAW_LEN) == 0) {
-            rc = do_fast_forward(git_dir, repo_root, current_branch, branch_arg, theirs_commit,
-                                 theirs_tree, force);
+            rc = do_fast_forward(git_dir, repo_root, current_branch, branch_arg, ours_commit,
+                                 theirs_commit, theirs_tree, force);
             free(current_branch);
             free(git_dir);
             free(repo_root);
