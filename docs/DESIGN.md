@@ -8194,6 +8194,29 @@ their author/committer bytes. **Byte-identical**, summary lines included.
 interop pins that comparison, with five preconditions asserting git's own
 report really does reach all four summary shapes, plus the unborn pair.
 
+Mutation round, and the one thing it caught that five green gates did not:
+
+| mutation | result |
+|---|---|
+| classifier reverted to `REGION_RESOLVED` (unit) | caught, 3 of 4 new tests |
+| classifier reverted to `REGION_RESOLVED` (interop) | caught, the both-sides-deletion gap check |
+| `simplify_conflicts` blocks on nothing | caught, `a resolved change blocks the merge` |
+| merged mode falls back to base's | caught, exactly the two `renmode` checks |
+| the `mode change` line always carries its path | **green** -> fixture extended, now caught |
+
+The last row is the one worth recording. The rule that a `mode change` line
+drops its path when it follows a `rename` line for the same entry was
+implemented straight off a measurement, and then pinned by nothing: the
+fast-forward fixture renamed one file and chmod'd a **different** one, so it
+reached every other summary shape and never once produced the combination the
+rule is about. All 2181 checks stayed green under a mutation that always
+prints the path. This is the fixture-generator blind spot in its plainest
+form -- the shape was not rare in the fixture, it was **absent** from it, and
+no number of extra checks over that fixture could have found it. A file that
+is both renamed and chmod'd was added, with two preconditions naming the
+pathless line explicitly, and the same mutation now turns the byte-for-byte
+comparison red.
+
 Not implemented, deliberately: nothing else about `sg merge`'s stdout moves
 toward git. The merge-commit vocabulary
 (`Merge made by '<x>' [<sha>] into '<y>'.` and the `sg add`-flavoured

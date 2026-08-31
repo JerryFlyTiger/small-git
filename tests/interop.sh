@@ -12912,14 +12912,17 @@ p50_ff_build() {
       printf 'g1\n' > gone.txt &&
       { i=0; while [ $i -lt 30 ]; do printf 'line %02d with a decent amount of text on it\n' $i; i=$((i+1)); done; } > ren_src.txt &&
       printf '#!/bin/sh\necho hi\n' > chmodme.sh &&
-      p50do add keep.txt gone.txt ren_src.txt chmodme.sh && p50do commit base &&
+      { i=0; while [ $i -lt 30 ]; do printf 'both renamed and chmodded, line %02d\n' $i; i=$((i+1)); done; } > mvchmod.sh &&
+      p50do add keep.txt gone.txt ren_src.txt chmodme.sh mvchmod.sh && p50do commit base &&
       p50do branch topic && p50do switch topic &&
       printf 'k1\nCHANGED\nk3\nk4\n' > keep.txt &&
       rm gone.txt &&
       mv ren_src.txt ren_dst.txt &&
       printf 'a1\n' > added.txt &&
       chmod +x chmodme.sh &&
-      p50do add keep.txt gone.txt ren_src.txt ren_dst.txt added.txt chmodme.sh &&
+      mv mvchmod.sh mvchmod2.sh &&
+      chmod +x mvchmod2.sh &&
+      p50do add keep.txt gone.txt ren_src.txt ren_dst.txt added.txt chmodme.sh mvchmod.sh mvchmod2.sh &&
       p50do commit t1 &&
       p50do switch master ) > /dev/null 2>&1
     echo $? > "$p50dir.build_rc"
@@ -12951,6 +12954,16 @@ check "phase50 oracle: precondition -- git's report really has a mode change lin
     grep -q '^ mode change 100644 => 100755 chmodme\.sh$' "$P50_GIT.out"
 check "phase50 oracle: precondition -- git's report really has a rename line" \
     grep -q '^ rename ren_src\.txt => ren_dst\.txt (100%)$' "$P50_GIT.out"
+# The one summary shape that needs a single entry to be BOTH renamed AND
+# chmod'd: git drops the path from the mode-change line, because the rename
+# line one row up already named it. A fixture that renames one file and
+# chmods a DIFFERENT one reaches every other shape and misses this one
+# entirely -- measured, the mutation "always print the path" left all 2181
+# checks green before this pair existed.
+check "phase50 oracle: precondition -- git's report really has a rename+chmod pair" \
+    grep -q '^ rename mvchmod\.sh => mvchmod2\.sh (100%)$' "$P50_GIT.out"
+check "phase50 oracle: precondition -- and its mode change line carries NO path" \
+    grep -q '^ mode change 100644 => 100755$' "$P50_GIT.out"
 check "phase50 oracle: precondition -- git's report really has the Updating header" \
     grep -q '^Updating <old>\.\.<new>$' "$P50_GIT.out"
 check "phase50: sg's fast-forward report matches real git's byte for byte" \

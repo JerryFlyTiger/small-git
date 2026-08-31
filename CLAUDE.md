@@ -3,7 +3,7 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (2181 checks, using real `git` as
+git; this is guarded by `tests/interop.sh` (2183 checks, using real `git` as
 the oracle).
 
 On top of that there are two things real git does not have: `src/safety/`
