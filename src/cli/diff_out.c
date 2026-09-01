@@ -1135,7 +1135,13 @@ static void combine_dump(const combine_sline *sline, size_t cnt, const unsigned 
                          size_t result_len)
 {
     size_t lno = 0;
-    const unsigned char *result_end = result_data + result_len;
+    /* `result_data + result_len` is UNDEFINED when result_data is NULL, even
+       with result_len 0 -- and a merge's combined row CAN have no result
+       buffer at all (a path the merge deleted, whose hunk body a
+       tree-sourced row still prints). glibc's UBSan calls that "applying
+       zero offset to null pointer" and the CI job halts on it; macOS's
+       stayed silent, so this only ever showed up on Linux. */
+    const unsigned char *result_end = result_data != NULL ? result_data + result_len : NULL;
 
     for (;;) {
         size_t hunk_end;
@@ -1202,6 +1208,8 @@ static int render_combined_patch(const char *git_dir, const char *repo_root, con
     unsigned char ours_eff[SG_SHA1_RAW_LEN], theirs_eff[SG_SHA1_RAW_LEN];
     char ours_hex[SG_SHA1_HEX_LEN + 1], theirs_hex[SG_SHA1_HEX_LEN + 1];
     unsigned int result_mode;
+    int added; /* Phase 55b: added by the merge itself -- both parents ABSENT */
+    char result_hex[SG_SHA1_HEX_LEN + 1];
 
     rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->ours, &ours_data, &ours_len, &missing);
     if (rc == -2) {
@@ -1238,6 +1246,13 @@ static int render_combined_patch(const char *git_dir, const char *repo_root, con
     }
 
     deleted = e->result.kind == SG_DIFF_SIDE_ABSENT;
+    /* Phase 55b: a merge's own combined row (sg_diff_combined_from_trees)
+       can have BOTH parent sides ABSENT -- a path present in neither parent
+       that the merge itself added. Neither of the existing two producers
+       can reach this (sg_diff_entry_is_combined requires ours/theirs both
+       non-ABSENT for them), so this is unambiguous: it only ever fires for
+       a combined_row entry. */
+    added = e->ours.kind == SG_DIFF_SIDE_ABSENT && e->theirs.kind == SG_DIFF_SIDE_ABSENT;
     result_mode = deleted ? 0 : e->result.mode;
     /* git: mode_differs iff ANY parent's mode != the result's (0 for
        deleted) -- NOT "the two parents differ from each other". */
@@ -1254,11 +1269,24 @@ static int render_combined_patch(const char *git_dir, const char *repo_root, con
     theirs_hex[7] = '\0';
 
     printf("diff %s %s\n", dense ? "--cc" : "--combined", sg_quote_path(e->path));
-    /* The destination side is never a real object -- the working tree copy
-       is not in the object store -- so it is always "0000000", never
-       computed (PHASE34_ORACLE.md #3). */
-    printf("index %s,%s..0000000\n", ours_hex, theirs_hex);
-    if (mode_differs) {
+    /* The destination side is a real object only for a merge commit's own
+       combined row (Phase 55b, result.kind == BLOB, straight out of the
+       result tree) -- every other producer's result is the working tree
+       copy, which is never in the object store, so it stays "0000000"
+       (PHASE34_ORACLE.md #3). */
+    if (e->result.kind == SG_DIFF_SIDE_BLOB) {
+        unsigned char result_eff[SG_SHA1_RAW_LEN];
+
+        sg_diff_side_effective_id(git_dir, &e->result, result_eff);
+        sg_sha1_to_hex(result_eff, result_hex);
+        result_hex[7] = '\0';
+    } else {
+        strcpy(result_hex, "0000000");
+    }
+    printf("index %s,%s..%s\n", ours_hex, theirs_hex, result_hex);
+    if (added) {
+        printf("new file mode %06o\n", result_mode);
+    } else if (mode_differs) {
         if (deleted)
             printf("deleted file mode %06o,%06o\n", e->ours.mode, e->theirs.mode);
         else
@@ -1273,13 +1301,20 @@ static int render_combined_patch(const char *git_dir, const char *repo_root, con
         return 0;
     }
 
-    printf("--- %s\n", sg_quote_path_prefixed("a/", e->path));
+    printf("--- %s\n", added ? "/dev/null" : sg_quote_path_prefixed("a/", e->path));
     printf("+++ %s\n", deleted ? "/dev/null" : sg_quote_path_prefixed("b/", e->path));
 
-    if (deleted) {
+    if (deleted && !e->combined_row) {
         /* No hunk body at all for a deleted result -- PHASE34_ORACLE.md
            sample (E) / PHASE34_ALGO.md #7 (result_deleted skips
-           combine_diff and dump_sline both). */
+           combine_diff and dump_sline both). Measured only for producer 1's
+           shape (an unresolved conflict resolved by deleting the working
+           tree file): `git diff --cc` there prints "--- a/x" / "+++
+           /dev/null" and nothing else. Phase 55b's merge-commit combined
+           rows (combined_row) are a DIFFERENT producer and were measured to
+           differ here -- `git show <merge>` on a path both parents edited
+           and the merge deleted DOES print a hunk showing what each parent
+           removed, same shape as an ordinary deletion's hunk body. */
         free(ours_data);
         free(theirs_data);
         free(result_data);

@@ -309,15 +309,47 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   patch. `-s -p` prints a patch, `-p -s` prints nothing, `--stat -p` prints
   BOTH (all measured). Giving `-s` a fixed priority passes every single-flag
   case and gets `-s -p` backwards -- same shape as `-M`/`-C` and `-c`/`--cc`.
-  WARNING: **a MERGE commit is refused** (`exit 1`, nothing on stdout) --
-  `git show` renders a dense `diff --cc` and sg has no producer feeding its
-  Phase 34 combined renderer from parent TREES yet. Refusing has to LOOK
-  AHEAD through a tag chain (`target_is_merge`), because a tag's header is
-  printed before its target is read and sg otherwise wrote 82 bytes and then
-  exited 1. Pinned on both sides, so implementing it turns a check red.
-  **A fixture for that work must use a merge that CONFLICTED and was
-  resolved**: a clean merge's dense combined diff is empty, and this group's
-  precondition check caught exactly that mistake.
+  WARNING: **a merge is TWO row sets in one command** (Phase 55b). The dense
+  patch includes a path iff the result differs from **every** parent, with
+  the **MODE** compared as well as the id -- a file whose blob id equals
+  theirs' exactly is still included when only its mode differs, and renders
+  as a `mode a,b..c` line with no hunks. `--stat` is a completely different
+  set: measured byte-identical to `git diff --stat <parent1> <merge>`, so it
+  includes paths the dense rule excludes, and it stays the first-parent diff
+  at ANY parent count. Computing one set and rendering it both ways is wrong
+  for whichever it was not written for; interop names both halves.
+  WARNING: **a merge opens its diff section with a blank line even when the
+  dense set is EMPTY** (measured on a clean merge and a clean octopus: header,
+  blank, nothing else), where an ordinary commit with an empty diff prints no
+  blank at all. Returning early on "no rows" gets that wrong AND skips
+  `--stat`. The stat->patch blank is printed only when the patch itself will
+  produce output, and a merge prints **no `---` line** with `-p --stat` where
+  an ordinary commit does.
+  WARNING: **`sg_diff_entry.combined_row` exists because the ours/theirs/
+  result predicate cannot express these rows** -- a path added by the merge
+  has both parents ABSENT, one deleted by it has result ABSENT with nothing
+  unmerged. **Do not loosen `sg_diff_entry_is_combined` instead**; its
+  asymmetry is deliberate, measured and pinned (see the combined-diff notes
+  above). Adding that field required auditing every manual construction site
+  per the shared-struct rule.
+  WARNING: **an octopus is refused only when it actually needs rendering** --
+  `> 2` parents AND a non-empty dense set. A clean octopus prints header plus
+  the opening blank line, byte-identical to git, and its `--stat` works like
+  any other. **A fixture for the dense path must use a merge that CONFLICTED
+  and was resolved**: a clean merge's dense set is empty, and this group's
+  precondition caught exactly that mistake.
+- **git EXPANDS TABS in a commit message body, and sg must too** (Phase 55b,
+  `print_message_line` in `src/cli/commit_out.c`). `--expand-tabs=8` is the
+  medium format's default and **only** the medium format's: `--oneline` and
+  `%s` leave the tab alone (measured). The column is counted from the start
+  of the **message line**, NOT from the indented output column -- a line of
+  two tabs lands at output column 20, i.e. 16 expanded columns plus the
+  four-space indent.
+  WARNING: **this was a pre-existing `sg log` bug that Phase 54 missed while
+  pinning `sg log` byte-for-byte**, because no fixture had ever put a tab in
+  a commit message. It surfaced only because `git merge`'s own auto-generated
+  conflict message contains `#\tboth.txt`. A shape the fixtures cannot
+  produce is untested however many checks run over them.
   WARNING: **tree entry names are printed RAW here, and that matches git.**
   Measured on a crafted entry name containing an ESC byte: `git show <tree>`
   prints it raw with `core.quotepath` at its default, while

@@ -3,12 +3,15 @@
 #include "sg/chunk.h"
 #include "sg/commit_out.h"
 #include "sg/date.h"
+#include "sg/diff.h"
+#include "sg/diff_out.h"
 #include "sg/hash.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
+#include "sg/similarity.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
@@ -96,14 +99,62 @@ static void resolve_commit_out_opts(const show_flags *f, sg_commit_out_opts *o)
     }
 }
 
+/* Phase 55b: `sg show <merge>` renders a 2-parent merge (a dense combined
+   diff) but still refuses an OCTOPUS (>2 parents) merge whose combined diff
+   is non-empty -- the renderer is fixed at two parents, and there is no
+   N-way `diff --cc` here. A clean octopus (every path already agrees with
+   at least one parent, i.e. the combined row count is 0) is NOT refused:
+   git itself prints just the entry header for one, with no diff to render
+   at all, so there is nothing this command cannot do.
+
+   Returns 1 when the commit must be refused, 0 otherwise -- including
+   every case this cannot resolve (a corrupt tree, an OOM), the same
+   fail-open-to-the-ordinary-path convention target_is_merge documents
+   below: those get a better error message once the ordinary path actually
+   tries to read them. Returns 0 outright for a 2-or-fewer-parent commit,
+   since only an octopus can ever need refusing. */
+static int commit_needs_refusal(const char *git_dir, const sg_commit *commit)
+{
+    unsigned char (*parent_trees)[SG_SHA1_RAW_LEN];
+    size_t i;
+    size_t row_count = 0;
+    sg_diff_list list;
+    char bad_path[SG_PATH_MAX];
+    int refuse = 0;
+
+    if (commit->parent_count <= 2)
+        return 0;
+
+    parent_trees = malloc(commit->parent_count * sizeof(*parent_trees));
+    if (parent_trees == NULL)
+        return 0;
+
+    for (i = 0; i < commit->parent_count; i++) {
+        if (sg_commit_tree_of(git_dir, commit->parents[i], parent_trees[i]) != 0) {
+            free(parent_trees);
+            return 0;
+        }
+    }
+
+    bad_path[0] = '\0';
+    if (sg_diff_combined_from_trees(git_dir, parent_trees, commit->parent_count, commit->tree,
+                                    &list, &row_count, bad_path) == 0) {
+        refuse = row_count > 0;
+        sg_diff_list_free(&list);
+    }
+    free(parent_trees);
+    return refuse;
+}
+
 /* Follows a tag chain to the object it ultimately names and reports whether
-   that object is a merge commit. Exists only because merges are refused for
-   now: the tag header is printed before its target is ever read, so without
-   looking ahead, `sg show <tag-pointing-at-a-merge>` writes an entry to
-   stdout and THEN exits non-zero. A command that reports failure should not
-   have dirtied stdout on the way. Returns 1 for merge, 0 otherwise, and 0
-   for anything it cannot resolve -- the ordinary path reports those errors
-   with a better message than a look-ahead could. */
+   showing that object must be refused. Exists only because a refused merge
+   is refused before anything is printed for it: the tag header is printed
+   before its target is ever read, so without looking ahead, `sg show
+   <tag-pointing-at-a-refused-merge>` writes an entry to stdout and THEN
+   exits non-zero. A command that reports failure should not have dirtied
+   stdout on the way. Returns 1 when the target must be refused, 0
+   otherwise, and 0 for anything it cannot resolve -- the ordinary path
+   reports those errors with a better message than a look-ahead could. */
 static int target_is_merge(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
                            int hops)
 {
@@ -123,7 +174,7 @@ static int target_is_merge(const char *git_dir, const unsigned char id[SG_SHA1_R
             sg_commit commit;
 
             if (sg_commit_parse(content, content_len, &commit) == 0) {
-                answer = commit.parent_count > 1;
+                answer = commit_needs_refusal(git_dir, &commit);
                 sg_commit_free(&commit);
             }
             free(content);
@@ -145,6 +196,143 @@ static int target_is_merge(const char *git_dir, const unsigned char id[SG_SHA1_R
             free(content);
         }
     }
+    return 0;
+}
+
+/* The diff half of `sg show` on a genuine 2-parent merge -- everything
+   AFTER the entry header sg_commit_out_entry already printed (with patch
+   and stat forced off; see the SG_OBJ_COMMIT case in render_id). Not routed
+   through commit_out.c's print_commit_diff: that function's separator rules
+   (`---` when both --stat and -p are on, no blank line at all under
+   --oneline) are print_commit_diff's OWN measured rules for a first-parent
+   diff, and a merge's combined diff measures differently on both counts --
+   see the two WARNINGs below.
+
+   Returns 0, or -1 having printed a partial diff (the caller reports it). */
+static int render_merge_diff(const char *git_dir, const sg_commit *commit,
+                             const sg_commit_out_opts *o)
+{
+    unsigned char (*parent_trees)[SG_SHA1_RAW_LEN];
+    sg_diff_list combined_list;
+    size_t combined_row_count = 0;
+    size_t i;
+    char bad_path[SG_PATH_MAX];
+    sg_diff_out_opts opts;
+    int rc;
+
+    /* Takes any parent count, not just two. An octopus reaches here whenever
+       it was not refused, and the builder then leaves the row list empty
+       while still reporting the count -- which is exactly right, because
+       --stat is a FIRST-PARENT diff at any parent count (measured:
+       `git show --stat <octopus>` equals `git diff --stat <parent1>
+       <octopus>`), and only the dense patch needs two parents to render. */
+    parent_trees = malloc(commit->parent_count * sizeof(*parent_trees));
+    if (parent_trees == NULL)
+        return -1;
+    for (i = 0; i < commit->parent_count; i++) {
+        if (sg_commit_tree_of(git_dir, commit->parents[i], parent_trees[i]) != 0) {
+            free(parent_trees);
+            return -1;
+        }
+    }
+
+    bad_path[0] = '\0';
+    rc = sg_diff_combined_from_trees(git_dir, parent_trees, commit->parent_count,
+                                     commit->tree, &combined_list,
+                                     &combined_row_count, bad_path);
+    if (rc == -2) {
+        fprintf(stderr, "sg: tree contains an unsafe path '%s'\n", bad_path);
+        free(parent_trees);
+        return -1;
+    }
+    if (rc != 0) {
+        free(parent_trees);
+        return -1;
+    }
+
+    /* WARNING: a merge's diff section opens with this blank line WHENEVER a
+       diff was asked for, even when the dense combined row set is EMPTY --
+       measured on a clean 2-parent merge and on a clean octopus, where git
+       prints the header, this blank line, and nothing else. An ordinary
+       (non-merge) commit with an empty diff prints NO blank line at all
+       (measured too), so the two rules are genuinely different and an
+       early return on `combined_row_count == 0` gets the merge one wrong.
+       It also skipped --stat, which has its own row set entirely. */
+
+    /* WARNING: unlike commit_out.c's print_commit_diff, this blank line is
+       NOT conditioned on `!o->oneline` -- measured, both directions: `git
+       show --oneline <merge>` still prints a blank line before `diff --cc`,
+       where an ordinary (non-merge, first-parent) `--oneline` diff prints
+       none at all. Merge's separator rules are their own, not a special
+       case of the ordinary ones. */
+    printf("\n");
+
+    memset(&opts, 0, sizeof opts);
+    opts.algorithm = SG_DIFF_ALGO_MYERS;
+
+    if (o->stat) {
+        unsigned char stat_tree[SG_SHA1_RAW_LEN];
+        sg_diff_list stat_list;
+
+        /* WARNING: `git show --stat <merge>` is measured BYTE-IDENTICAL to
+           `git diff --stat <parent1> <merge>` -- a completely different row
+           set from the dense combined rule above (it includes a path like
+           `theirs_only.txt`, touched only by parent 2, that the dense rule
+           excludes because it still agrees with parent 1). Do not reuse
+           combined_list here. */
+        memcpy(stat_tree, parent_trees[0], SG_SHA1_RAW_LEN);
+        if (sg_diff_trees(git_dir, stat_tree, commit->tree, &stat_list, bad_path, 0) != 0) {
+            sg_diff_list_free(&combined_list);
+            free(parent_trees);
+            return -1;
+        }
+        /* git's own default since 2.9: diff.renames is on -- same call
+           commit_out.c's print_commit_diff makes for an ordinary commit,
+           and measured to hold here too (a rename across parent 1 and the
+           merge result collapses to a single "a => b" stat row). */
+        if (sg_diff_detect_renames(git_dir, NULL, &stat_list, SG_SIMILARITY_DEFAULT, 0) != 0) {
+            sg_diff_list_free(&stat_list);
+            sg_diff_list_free(&combined_list);
+            free(parent_trees);
+            return -1;
+        }
+        opts.format = SG_DIFF_FORMAT_STAT;
+        rc = sg_diff_print(git_dir, NULL, &stat_list, &opts);
+        sg_diff_list_free(&stat_list);
+        if (rc != 0) {
+            sg_diff_list_free(&combined_list);
+            free(parent_trees);
+            return -1;
+        }
+    }
+
+    if (o->patch) {
+        /* WARNING: measured -- with BOTH --stat and -p on a merge there is
+           NO `---` separator line, just this one blank line, unlike an
+           ordinary commit (print_commit_diff prints a literal "---\n"
+           there instead). */
+        /* ...and it belongs to a patch that exists: with an EMPTY combined
+           row set this separator would be a trailing blank line git does
+           not print (measured on a clean merge with -p --stat, whose stat
+           is non-empty -- a first-parent diff -- while its dense patch is
+           not). */
+        if (o->stat && combined_row_count > 0)
+            printf("\n");
+        opts.format = SG_DIFF_FORMAT_PATCH;
+        /* Dense (diff --cc), same as PATCH's ordinary default -- there is
+           no non-dense (-c/--combined) entry point into `sg show` at all,
+           so this is unconditional, not read off a CLI flag. */
+        opts.combined = 1;
+        rc = sg_diff_print(git_dir, NULL, &combined_list, &opts);
+        if (rc != 0) {
+            sg_diff_list_free(&combined_list);
+            free(parent_trees);
+            return -1;
+        }
+    }
+
+    sg_diff_list_free(&combined_list);
+    free(parent_trees);
     return 0;
 }
 
@@ -257,18 +445,43 @@ static int render_id(const char *git_dir, const char *display_arg,
         }
         free(content);
 
-        if (commit.parent_count > 1) {
-            fprintf(stderr, "sg: showing a merge commit is not supported yet\n");
-            sg_commit_free(&commit);
-            return -1;
+        resolve_commit_out_opts(flags, &o);
+
+        if (commit.parent_count > 2) {
+            /* Octopus: the renderer below is fixed at two parents, so this
+               is the one shape still refused outright -- but only when it
+               would actually need to print something (see
+               commit_needs_refusal's own comment). A clean octopus falls
+               straight through to the ordinary header-only print below,
+               with patch/stat forced off: there is no diff to attach, and
+               attaching print_commit_diff's own first-parent diff instead
+               would print something real git does not (measured). */
+            if (commit_needs_refusal(git_dir, &commit)) {
+                fprintf(stderr,
+                       "sg: showing an octopus merge with a non-empty combined diff is not "
+                       "supported yet\n");
+                sg_commit_free(&commit);
+                return -1;
+            }
         }
 
         if (entry_like && (nested || *shown))
             printf("\n");
-        resolve_commit_out_opts(flags, &o);
-        rc = sg_commit_out_entry(git_dir, id, &commit, &o);
+
+        if (commit.parent_count > 1) {
+            sg_commit_out_opts header_o = o;
+
+            header_o.patch = 0;
+            header_o.stat = 0;
+            rc = sg_commit_out_entry(git_dir, id, &commit, &header_o);
+            *shown = 1;
+            if (rc == 0 && (o.patch || o.stat))
+                rc = render_merge_diff(git_dir, &commit, &o);
+        } else {
+            rc = sg_commit_out_entry(git_dir, id, &commit, &o);
+            *shown = 1;
+        }
         sg_commit_free(&commit);
-        *shown = 1;
         if (rc != 0) {
             fprintf(stderr, "sg: cannot render this commit's diff\n");
             return -1;
@@ -288,7 +501,9 @@ static int render_id(const char *git_dir, const char *display_arg,
         free(content);
 
         if (target_is_merge(git_dir, tag.object, hops + 1)) {
-            fprintf(stderr, "sg: showing a merge commit is not supported yet\n");
+            fprintf(stderr,
+                   "sg: showing an octopus merge with a non-empty combined diff is not "
+                   "supported yet\n");
             sg_tag_free(&tag);
             return -1;
         }

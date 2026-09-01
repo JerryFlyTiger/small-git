@@ -13817,31 +13817,160 @@ check "phase55: a <rev>:<path> component that names a file, not a directory, fai
 check "phase55: sg show rejects a flag it does not implement" test $? = 1
 (cd "$P55" && "$SG" show HEAD:nosuchfile) > /dev/null 2>&1
 check "phase55: sg show <rev>:<missing path> fails" test $? = 1
-# DELIBERATE, TEMPORARY divergence: a merge needs a combined diff producer
-# that does not exist yet, so sg refuses rather than printing a plausible
-# first-parent diff. Pinned on BOTH sides so that implementing it turns this
-# check red and says so, instead of the refusal quietly becoming a wrong
-# answer or a crash.
-(cd "$P55" && LC_ALL=C git $P55_GIT_PINS show --no-decorate p55merged) > "$WORKDIR/p55_git_merge.txt" 2>&1
+# --- Phase 55b: merges. `git show <merge>` renders a DENSE combined diff --
+# a path is included iff the result differs from EVERY parent, with the MODE
+# counted, not just the blob id. This fixture carries one path per rule so a
+# wrong rule shows up as a named row rather than a vague byte mismatch.
+P55C="$WORKDIR/p55c_merge"
+mkdir -p "$P55C"
+(cd "$P55C" && LC_ALL=C git init -q .) > /dev/null 2>&1
+p55ccommit() {
+    ( cd "$P55C" &&
+      GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+      GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+      GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+      LC_ALL=C git commit -q "$@" ) > /dev/null 2>&1
+}
+for f in both ours_only theirs_only del mode same; do printf '%s\n' "$f" > "$P55C/$f.txt"; done
+(cd "$P55C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p55ccommit -m base
+P55C_BASE=$(cd "$P55C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+(cd "$P55C" && LC_ALL=C git checkout -qb p55cside) > /dev/null 2>&1
+printf 'both THEIRS\n' > "$P55C/both.txt"; printf 'theirs THEIRS\n' > "$P55C/theirs_only.txt"
+printf 'del THEIRS\n' > "$P55C/del.txt";   printf 'same BOTH\n' > "$P55C/same.txt"
+printf 'mode THEIRS\n' > "$P55C/mode.txt"
+(cd "$P55C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p55ccommit -m side
+(cd "$P55C" && LC_ALL=C git checkout -q master) > /dev/null 2>&1
+printf 'both OURS\n' > "$P55C/both.txt"; printf 'ours OURS\n' > "$P55C/ours_only.txt"
+printf 'del OURS\n' > "$P55C/del.txt";   printf 'same BOTH\n' > "$P55C/same.txt"
+chmod 755 "$P55C/mode.txt"
+(cd "$P55C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p55ccommit -m ours
+# Conflicts on both/del/mode; resolve each to a DIFFERENT shape: new text, a
+# deletion, and theirs' text kept at ours' mode (which is the row that proves
+# the rule counts the mode -- its blob id equals theirs' exactly).
+(cd "$P55C" && LC_ALL=C git merge --no-ff p55cside -m "merge side") > /dev/null 2>&1
+printf 'both RESOLVED\n' > "$P55C/both.txt"
+rm -f "$P55C/del.txt"
+printf 'mode THEIRS\n' > "$P55C/mode.txt"; chmod 755 "$P55C/mode.txt"
+printf 'brand new\n' > "$P55C/new.txt"
+(cd "$P55C" && LC_ALL=C git add -A && LC_ALL=C git rm -q --cached del.txt) > /dev/null 2>&1
+p55ccommit --no-edit
+P55C_MERGE=$(cd "$P55C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+# A CLEAN two-parent merge: every path matches one parent, so the dense set is
+# empty while the first-parent --stat is not.
+(cd "$P55C" && LC_ALL=C git checkout -qb p55cc1 "$P55C_BASE") > /dev/null 2>&1
+printf 'c1\n' > "$P55C/c1.txt"; (cd "$P55C" && LC_ALL=C git add c1.txt) > /dev/null 2>&1
+p55ccommit -m c1
+(cd "$P55C" && LC_ALL=C git checkout -qb p55cc2 "$P55C_BASE") > /dev/null 2>&1
+printf 'c2\n' > "$P55C/c2.txt"; (cd "$P55C" && LC_ALL=C git add c2.txt) > /dev/null 2>&1
+p55ccommit -m c2
+(cd "$P55C" && LC_ALL=C git checkout -q p55cc1 && LC_ALL=C git merge -q --no-ff p55cc2 -m "clean merge") > /dev/null 2>&1
+P55C_CLEAN=$(cd "$P55C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+# A clean OCTOPUS (three parents).
+(cd "$P55C" && LC_ALL=C git checkout -qb p55co1 "$P55C_BASE") > /dev/null 2>&1
+printf 'o1\n' > "$P55C/o1.txt"; (cd "$P55C" && LC_ALL=C git add o1.txt) > /dev/null 2>&1
+p55ccommit -m o1
+(cd "$P55C" && LC_ALL=C git checkout -qb p55co2 "$P55C_BASE") > /dev/null 2>&1
+printf 'o2\n' > "$P55C/o2.txt"; (cd "$P55C" && LC_ALL=C git add o2.txt) > /dev/null 2>&1
+p55ccommit -m o2
+(cd "$P55C" && LC_ALL=C git checkout -qb p55cobase "$P55C_BASE") > /dev/null 2>&1
+printf 'ob\n' > "$P55C/ob.txt"; (cd "$P55C" && LC_ALL=C git add ob.txt) > /dev/null 2>&1
+p55ccommit -m ob
+(cd "$P55C" && LC_ALL=C git merge --no-ff p55co1 p55co2 -m octopus) > /dev/null 2>&1
+P55C_OCTO=$(cd "$P55C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+p55c_cmp() {
+    p55ctag="$1"; shift
+    (cd "$P55C" && LC_ALL=C git $P55_GIT_PINS show --no-decorate "$@") \
+        > "$WORKDIR/p55c_git_$p55ctag.txt" 2>&1
+    (cd "$P55C" && "$SG" show "$@") > "$WORKDIR/p55c_sg_$p55ctag.txt" 2>&1
+}
+p55c_cmp merge "$P55C_MERGE"
+p55c_cmp mergestat --stat "$P55C_MERGE"
+p55c_cmp mergeboth -p --stat "$P55C_MERGE"
+p55c_cmp mergeoneline --oneline "$P55C_MERGE"
+p55c_cmp mergesuppress -s "$P55C_MERGE"
+p55c_cmp clean "$P55C_CLEAN"
+p55c_cmp cleanboth -p --stat "$P55C_CLEAN"
+p55c_cmp octo "$P55C_OCTO"
+p55c_cmp octostat --stat "$P55C_OCTO"
+
 check "phase55 oracle: precondition -- git renders that merge as a combined diff" \
-    sh -c 'grep -q "^diff --cc " "$0"' "$WORKDIR/p55_git_merge.txt"
-# stdout and stderr are captured SEPARATELY here on purpose: the claim is
-# "nothing on stdout", and folding stderr in with 2>&1 would test the
-# opposite of what it says. Note also that `test ! -s` on a file that was
-# never created passes, so the file has to be one this block really writes.
-(cd "$P55" && "$SG" show p55merged) > "$WORKDIR/p55_sg_merge_out.txt" 2> "$WORKDIR/p55_sg_merge_err.txt"
-check "phase55: sg show refuses a merge commit (combined diff not implemented)" test $? = 1
-check "phase55: ...printing nothing at all on stdout" \
-    test ! -s "$WORKDIR/p55_sg_merge_out.txt"
-check "phase55: ...and saying why on stderr" \
-    grep -q "merge" "$WORKDIR/p55_sg_merge_err.txt"
-# A TAG pointing at a merge is the case that catches a refusal emitted
-# halfway through an entry: the tag header is printed before the target is
-# read, so without looking ahead sg wrote 82 bytes and then exited 1.
-(cd "$P55" && "$SG" show -s p55mergetag) > "$WORKDIR/p55_sg_mergetag_out.txt" 2>/dev/null
-check "phase55: a tag pointing at a merge is refused too" test $? = 1
-check "phase55: ...without having already written the tag header to stdout" \
-    test ! -s "$WORKDIR/p55_sg_mergetag_out.txt"
+    sh -c 'grep -q "^diff --cc " "$0"' "$WORKDIR/p55c_git_merge.txt"
+check "phase55: sg show <merge> matches git's dense combined diff" \
+    cmp -s "$WORKDIR/p55c_sg_merge.txt" "$WORKDIR/p55c_git_merge.txt"
+check "phase55: sg show --stat <merge> matches git" \
+    cmp -s "$WORKDIR/p55c_sg_mergestat.txt" "$WORKDIR/p55c_git_mergestat.txt"
+check "phase55: sg show -p --stat <merge> matches git (no --- line for a merge)" \
+    cmp -s "$WORKDIR/p55c_sg_mergeboth.txt" "$WORKDIR/p55c_git_mergeboth.txt"
+check "phase55: sg show --oneline <merge> matches git" \
+    cmp -s "$WORKDIR/p55c_sg_mergeoneline.txt" "$WORKDIR/p55c_git_mergeoneline.txt"
+check "phase55: sg show -s <merge> matches git" \
+    cmp -s "$WORKDIR/p55c_sg_mergesuppress.txt" "$WORKDIR/p55c_git_mergesuppress.txt"
+# The two rules in one command, named separately so a regression says WHICH:
+# theirs_only.txt still agrees with parent 1, so the DENSE patch leaves it
+# out while --stat, a plain first-parent diff, includes it.
+check "phase55: the dense patch excludes a path that still equals one parent" \
+    sh -c '! grep -q "^diff --cc theirs_only.txt$" "$0"' "$WORKDIR/p55c_sg_merge.txt"
+check "phase55: ...while --stat, being a first-parent diff, includes it" \
+    sh -c 'grep -q "theirs_only.txt" "$0"' "$WORKDIR/p55c_sg_mergestat.txt"
+# mode.txt's blob id equals theirs' exactly; only its MODE differs. An
+# id-only density rule drops this row and passes every other check here.
+check "phase55: a row whose only difference from a parent is the MODE is included" \
+    sh -c 'grep -q "^diff --cc mode.txt$" "$0"' "$WORKDIR/p55c_sg_merge.txt"
+check "phase55: ...and renders as a mode line with no hunks" \
+    sh -c 'grep -q "^mode 100755,100644..100755$" "$0"' "$WORKDIR/p55c_sg_merge.txt"
+check "phase55: a path added by the merge itself renders as new file mode" \
+    sh -c 'grep -q "^new file mode 100644$" "$0"' "$WORKDIR/p55c_sg_merge.txt"
+check "phase55: a path deleted by the merge renders with both parents' modes" \
+    sh -c 'grep -q "^deleted file mode 100644,100644$" "$0"' "$WORKDIR/p55c_sg_merge.txt"
+# A clean merge's dense set is EMPTY, but the diff section still opens with a
+# blank line -- unlike an ordinary commit with an empty diff, which prints
+# none. Byte comparison is the assertion; -p --stat is here because its
+# stat->patch separator must NOT appear when the patch is empty.
+check "phase55: a clean merge (empty combined diff) matches git" \
+    cmp -s "$WORKDIR/p55c_sg_clean.txt" "$WORKDIR/p55c_git_clean.txt"
+check "phase55: ...and with -p --stat, no trailing separator for the empty patch" \
+    cmp -s "$WORKDIR/p55c_sg_cleanboth.txt" "$WORKDIR/p55c_git_cleanboth.txt"
+check "phase55: a clean octopus matches git (header and the open blank line)" \
+    cmp -s "$WORKDIR/p55c_sg_octo.txt" "$WORKDIR/p55c_git_octo.txt"
+check "phase55: --stat on an octopus is still the first-parent diff" \
+    cmp -s "$WORKDIR/p55c_sg_octostat.txt" "$WORKDIR/p55c_git_octostat.txt"
+# git EXPANDS TABS in a commit message body (--expand-tabs=8 is the medium
+# format's default) and counts the column from the MESSAGE line's own start,
+# not from the indented output column. This merge's auto-generated message
+# contains "#\tboth.txt". It was wrong for `sg log` too and went unnoticed
+# because no fixture had ever put a tab in a message -- so both commands are
+# checked, and --oneline is checked NOT to expand.
+check "phase55 oracle: precondition -- the fixture's message really contains a tab" \
+    sh -c 'LC_ALL=C git -C "$0" cat-file -p "$1" | grep -q "^#	"' "$P55C" "$P55C_MERGE"
+(cd "$P55C" && "$SG" log -1 "$P55C_MERGE") > "$WORKDIR/p55c_sg_logtab.txt" 2>&1
+(cd "$P55C" && LC_ALL=C git $P55_GIT_PINS log -1 $P54_LOG_FLAGS "$P55C_MERGE") \
+    > "$WORKDIR/p55c_git_logtab.txt" 2>&1
+check "phase55: sg log expands tabs in a message body exactly as git does" \
+    cmp -s "$WORKDIR/p55c_sg_logtab.txt" "$WORKDIR/p55c_git_logtab.txt"
+check "phase55: ...to the message line's own column, not the indented one" \
+    sh -c 'grep -q "^    #       both.txt$" "$0"' "$WORKDIR/p55c_sg_logtab.txt"
+# A SUBJECT containing a tab, because --oneline prints only the subject: the
+# merge fixture's tab is in the message BODY, so comparing its --oneline
+# output witnesses nothing about expansion. (That is what this check used to
+# do -- it duplicated the --oneline comparison above under a name claiming
+# something it could not test.)
+printf 'tabbed
+' > "$P55C/tabbed.txt"
+(cd "$P55C" && LC_ALL=C git add tabbed.txt) > /dev/null 2>&1
+p55ccommit -m "$(printf 'subject\twith a tab')"
+P55C_TABSUBJ=$(cd "$P55C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+p55c_cmp tabsubj --oneline "$P55C_TABSUBJ"
+p55c_cmp tabbody -s "$P55C_TABSUBJ"
+check "phase55 oracle: precondition -- that subject really contains a tab" \
+    sh -c 'LC_ALL=C git -C "$0" log -1 --format=%s "$1" | grep -q "subject	with"' "$P55C" "$P55C_TABSUBJ"
+check "phase55: --oneline does NOT expand tabs, it prints the subject raw" \
+    cmp -s "$WORKDIR/p55c_sg_tabsubj.txt" "$WORKDIR/p55c_git_tabsubj.txt"
+check "phase55: ...while the same subject in the medium format IS expanded" \
+    cmp -s "$WORKDIR/p55c_sg_tabbody.txt" "$WORKDIR/p55c_git_tabbody.txt"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

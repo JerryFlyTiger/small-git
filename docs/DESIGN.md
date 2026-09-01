@@ -9568,3 +9568,138 @@ more parents). sg's Phase 34 combined renderer is fixed at exactly two
 parents, so that case has to be either implemented or refused explicitly --
 and refusing it silently inside a general merge implementation is exactly the
 kind of gap this project pins rather than leaves.
+
+## Phase 55b: `sg show <merge>`
+
+Phase 55a refused merges. This implements them, and the refusal's pin did its
+job: turning it on turned exactly the five refusal checks red and said so.
+
+### 1. One command, two different row sets
+
+**The dense patch** includes a path iff the result differs from **every**
+parent, and "differs" compares the pair (mode, id), not the id alone:
+
+| path | ours | theirs | result | in the dense patch |
+|---|---|---|---|---|
+| `both.txt` | edited | edited differently | a third text | yes |
+| `del.txt` | edited | edited differently | deleted | yes |
+| `mode.txt` | 755, ours' text | 644, theirs' text | theirs' text at 755 | **yes** |
+| `new.txt` | absent | absent | added | yes |
+| `ours_only.txt` | edited | untouched | = ours | no |
+| `theirs_only.txt` | untouched | edited | = theirs | no |
+| `same.txt` | edited | edited identically | = both | no |
+
+`mode.txt` is the row that kills an id-only comparison: its blob id equals
+theirs' **exactly**, and it belongs in the output solely because the mode
+does not. It renders as a mode line with **no hunks at all**.
+
+**`--stat` is not that row set at all.** Measured by direct equality:
+`git show --stat <merge>` is byte-identical to
+`git diff --stat <parent1> <merge>` -- so it includes `theirs_only.txt`,
+which the dense rule excludes. The same holds at **any** parent count: an
+octopus's `--stat` is also just the first-parent diff. Interop names both
+halves separately (`theirs_only.txt` must be absent from the patch and
+present in the stat) so a regression says which rule broke.
+
+### 2. Separator rules, which differ from an ordinary commit's
+
+- A merge opens its diff section with a blank line **whenever a diff was
+  requested, even when the dense set is EMPTY** -- measured on a clean
+  2-parent merge and a clean octopus, where git prints the header, that blank
+  line, and nothing else. An ordinary commit with an empty diff prints no
+  blank line at all. The first implementation returned early on
+  `row_count == 0`, which got this wrong *and* skipped `--stat`, whose row
+  set is entirely different.
+- With `-p --stat` there is **no `---` line** for a merge, where an ordinary
+  commit prints one.
+- The stat->patch blank line is printed only when the patch will actually
+  produce output; otherwise it is a trailing blank git does not print.
+
+### 3. Why a new struct field was needed
+
+`sg_diff_entry_is_combined` answers yes only when ours and theirs are both
+non-ABSENT and (unmerged or result non-ABSENT). Tree-sourced merge rows break
+that in both directions -- `new.txt` has both parents ABSENT, `del.txt` has
+result ABSENT with nothing unmerged -- and CLAUDE.md records that predicate's
+asymmetry as deliberate, measured and pinned. So rather than loosen it,
+`sg_diff_entry` gained `combined_row`, set only by the new builder, and the
+predicate short-circuits on it. Per CLAUDE.md's rule about adding a field to
+a shared struct, every manual construction site was audited (all already
+`memset` first) and `make sanitize` was run.
+
+### 4. The octopus is answered, not refused, when it can be
+
+sg's combined renderer is fixed at two parents. But an octopus whose dense
+row set is **empty** needs no combined rendering at all: git prints the
+header and the opening blank line, which sg now reproduces byte-for-byte.
+And `--stat` is a first-parent diff at any parent count, so it works too.
+Only a `> 2`-parent merge with a non-empty dense set is refused. That is a
+narrower refusal than "octopus merges are unsupported", and it is the honest
+one.
+
+### 5. A pre-existing `sg log` bug, found by a merge's own message
+
+**git EXPANDS TABS in a commit message body.** `--expand-tabs=8` is the
+default for the medium format (and only there: `--oneline` and `%s` leave the
+tab alone, measured). The column is counted from the start of the **message
+line**, not from the indented output column -- a line of two tabs lands at
+output column 20, which is 16 expanded columns plus the four-space indent.
+
+sg printed the raw tab. This was wrong for `sg log` too, and Phase 54 pinned
+`sg log` byte-for-byte against real git without catching it, because **no
+fixture had ever put a tab in a commit message**. It surfaced here only
+because `git merge`'s own auto-generated conflict message contains
+`#\tboth.txt`. A fixture generator that never produces a shape cannot test
+it, however many checks run over its output -- the same lesson this project
+has recorded about rename directions and about `fuzz_merge.py`'s single
+filename.
+
+### 6. Verification, and a relayed report that was wrong
+
+16 merge cases and 54 non-merge cases compared byte-for-byte against real
+git, all identical. 21 new interop checks.
+
+The implementation was delegated with the measurements above, and the report
+came back saying every comparison was byte-identical. **The oracle said
+4/16.** Three real defects were in it: the empty-combined early return, the
+missing tab expansion, and the octopus falling through to a header with no
+diff section. This is the third time in this project that a relayed "all
+green" has been wrong, and the reason the main conversation reruns the gates
+itself.
+
+Mutations, each turning exactly the checks it should: the density rule
+ignoring the mode, the density rule dropped entirely, tab expansion off, tab
+columns counted from the indented column, and the stat->patch separator
+printed for an empty patch.
+
+### 7. The bug only CI could see
+
+All five local gates were green -- including a full interop run against a
+locally ASan/UBSan-built `sg`, which is not something the gates normally do
+-- and CI's ubuntu ASan job still failed six checks.
+
+The cause: `combine_dump` computed `result_data + result_len` where
+`result_data` can be **NULL**. `NULL + 0` is undefined behaviour, and this
+phase's rows are the first to reach it -- a path the merge DELETED has no
+result buffer, and unlike the index-stage producer this renderer was written
+for, a tree-sourced deleted row still prints a hunk body. glibc's UBSan
+reports it as "applying zero offset to null pointer"; macOS's says nothing.
+
+Two things about the SYMPTOM are worth keeping, because they made it
+diagnosable:
+
+- That job runs interop with `UBSAN_OPTIONS=halt_on_error=1`, so `sg`
+  **aborted part way through printing**. The failures were therefore six
+  checks reporting *missing* `mode`/`new file`/`deleted file` lines, while
+  `--stat`, `-s` and both clean-merge cases passed -- a shape that says
+  "stopped early", not "computed the wrong rows". Reading it as a density
+  bug would have sent the fix to the wrong file.
+- `interop.sh` folds stderr into the file it compares (`> f 2>&1`), so the
+  sanitizer's own message and stack were already sitting in the captured
+  output. One temporary `cat` of that file in CI turned a guessing game into
+  a file, a line number and a stack trace on the first try.
+
+Local ASan is not a substitute for CI's: the same binary flags different
+things on the two platforms, and this project's completion criteria say so
+already for gcc and for leak detection. Add "UB that only glibc's headers
+declare" to that list.
