@@ -9671,3 +9671,35 @@ Mutations, each turning exactly the checks it should: the density rule
 ignoring the mode, the density rule dropped entirely, tab expansion off, tab
 columns counted from the indented column, and the stat->patch separator
 printed for an empty patch.
+
+### 7. The bug only CI could see
+
+All five local gates were green -- including a full interop run against a
+locally ASan/UBSan-built `sg`, which is not something the gates normally do
+-- and CI's ubuntu ASan job still failed six checks.
+
+The cause: `combine_dump` computed `result_data + result_len` where
+`result_data` can be **NULL**. `NULL + 0` is undefined behaviour, and this
+phase's rows are the first to reach it -- a path the merge DELETED has no
+result buffer, and unlike the index-stage producer this renderer was written
+for, a tree-sourced deleted row still prints a hunk body. glibc's UBSan
+reports it as "applying zero offset to null pointer"; macOS's says nothing.
+
+Two things about the SYMPTOM are worth keeping, because they made it
+diagnosable:
+
+- That job runs interop with `UBSAN_OPTIONS=halt_on_error=1`, so `sg`
+  **aborted part way through printing**. The failures were therefore six
+  checks reporting *missing* `mode`/`new file`/`deleted file` lines, while
+  `--stat`, `-s` and both clean-merge cases passed -- a shape that says
+  "stopped early", not "computed the wrong rows". Reading it as a density
+  bug would have sent the fix to the wrong file.
+- `interop.sh` folds stderr into the file it compares (`> f 2>&1`), so the
+  sanitizer's own message and stack were already sitting in the captured
+  output. One temporary `cat` of that file in CI turned a guessing game into
+  a file, a line number and a stack trace on the first try.
+
+Local ASan is not a substitute for CI's: the same binary flags different
+things on the two platforms, and this project's completion criteria say so
+already for gcc and for leak detection. Add "UB that only glibc's headers
+declare" to that list.
