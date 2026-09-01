@@ -172,6 +172,80 @@ static void test_scan_direction_is_observable(void)
     free(b);
 }
 
+/* Phase 52: compact_one_side's histogram-only rerun (git's
+   xdl_change_compact, xdiffi.c:940-958). After sliding a changed group, if
+   its position or size moved AND the opposite group is non-empty, git reruns
+   Myers on just that pair of groups so newly-revealed matching lines fall
+   back to unchanged. Without this rerun sg's histogram output disagreed with
+   git's on this exact fixture (measured: sg gave a single 2-line replacement
+   covering both blank-line slots, git gives a single 1-line deletion).
+   old = "R\n\nR\n\n" (4 lines: R, blank, R, blank)
+   new = "R\nR\n\n" (3 lines: R, R, blank)
+   git's answer (both --histogram and --diff-algorithm=myers, measured with
+   `git diff --no-index`): delete the first blank line only. */
+static const unsigned char RECOMPACT_A[] = "R\n\nR\n\n";
+static const unsigned char RECOMPACT_B[] = "R\nR\n\n";
+
+static void test_histogram_recompact_rerun(void)
+{
+    size_t na = 0, nb = 0;
+    sg_diff_line *a = sg_diff_split_lines(RECOMPACT_A, sizeof(RECOMPACT_A) - 1, &na);
+    sg_diff_line *b = sg_diff_split_lines(RECOMPACT_B, sizeof(RECOMPACT_B) - 1, &nb);
+    sg_diff_script *s;
+    char got[256];
+
+    if (a == NULL || b == NULL)
+        exit(1);
+    s = sg_diff_build_script(a, na, b, nb, 1, SG_DIFF_ALGO_HISTOGRAM);
+    CHECK(s != NULL, "histogram script should build");
+    if (s != NULL) {
+        describe(s, got, sizeof(got));
+        /* delete a[1] (the first blank line) only -- the recompact rerun
+           output. A mutation removing the rerun gives "0,2,0,1;" instead,
+           a single group covering both blank-line slots. */
+        CHECK(strcmp(got, "1,1,1,0;") == 0, "histogram recompact alignment is '%s'", got);
+        sg_diff_script_free(s);
+    }
+    free(a);
+    free(b);
+}
+
+/* The recompact rerun is gated on `histogram` (compact_one_side's own
+   parameter): Myers must produce the exact same, unaffected answer on this
+   fixture, since a mutation that runs the rerun unconditionally for BOTH
+   algorithms would leave this test unable to tell the two apart. */
+/* NOT a witness for the `histogram` gate on the recompact rerun, despite how
+   the obvious name for it would read. Measured 2026-09-01: with that gate
+   removed -- so the rerun applies to Myers too -- this test stays green, and
+   so does every other named check, because git's Myers answer on this fixture
+   is the same one histogram gives. The gate was classified by fuzzing instead
+   (1500 Myers rounds across three seed ranges, 0 mismatches with it removed),
+   and is kept for faithfulness to git rather than because anything can see
+   it. What this test actually pins is narrower and still worth having: that
+   the Myers path returns git's answer on the very fixture the histogram fix
+   is built around, so a future change to the shared compaction code cannot
+   quietly move Myers while the histogram assertion stays green. */
+static void test_myers_answer_on_the_recompact_fixture(void)
+{
+    size_t na = 0, nb = 0;
+    sg_diff_line *a = sg_diff_split_lines(RECOMPACT_A, sizeof(RECOMPACT_A) - 1, &na);
+    sg_diff_line *b = sg_diff_split_lines(RECOMPACT_B, sizeof(RECOMPACT_B) - 1, &nb);
+    sg_diff_script *s;
+    char got[256];
+
+    if (a == NULL || b == NULL)
+        exit(1);
+    s = sg_diff_build_script(a, na, b, nb, 1, SG_DIFF_ALGO_MYERS);
+    CHECK(s != NULL, "myers script should build");
+    if (s != NULL) {
+        describe(s, got, sizeof(got));
+        CHECK(strcmp(got, "1,1,1,0;") == 0, "myers recompact-fixture alignment is '%s'", got);
+        sg_diff_script_free(s);
+    }
+    free(a);
+    free(b);
+}
+
 int main(void)
 {
     test_myers_alignment();
@@ -179,6 +253,8 @@ int main(void)
     test_identical_inputs();
     test_one_side_empty();
     test_scan_direction_is_observable();
+    test_histogram_recompact_rerun();
+    test_myers_answer_on_the_recompact_fixture();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

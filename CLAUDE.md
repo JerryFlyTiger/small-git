@@ -452,14 +452,40 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   cross-checked against git's `xdiff/xhistogram.c`; it deliberately does NOT
   trim or clean up records first (git guards `xdl_optimize_ctxs` off for
   histogram -- cleanup DISCARDS lines, and occurrence counts are exactly what
-  that algorithm decides on).
-  WARNING: **`sg diff --histogram` has a MEASURED ~0.9% divergence from `git
-  diff --histogram`** (5/500 and 4/500) and it is NOT understood: two
-  independent transcriptions of git's published algorithm agree with each
-  other and disagree with this machine's git on those cases. Read Phase 42 of
-  `docs/DESIGN.md` before touching the histogram code -- eight rule variants
-  were already measured against git and the faithful one scored best. `sg
-  merge` is unaffected (0/800 rounds).
+  that algorithm decides on). **The divergence from `xhistogram.c` itself is
+  and always was zero** -- see the next paragraph for why Phase 42's eight
+  rule variants, all searched inside the histogram algorithm, could never
+  have found the real cause.
+  **Phase 42's ~0.9% divergence (5/500 and 4/500) is fixed as of Phase 52,
+  root cause found and NOT in `xhistogram.c` at all.** The gap was in
+  `compact_one_side` (`src/util/diff_lcs.c`), the post-processing step that
+  runs AFTER either aligner produces its raw script, and it is a HISTOGRAM-
+  ONLY step git also has: `xdiffi.c`'s `xdl_change_compact` (git 2.55.0,
+  `xdiffi.c:940-958`) reruns Myers on a group's own pair of records whenever
+  sliding-compaction moves or resizes that group AND the opposite side's
+  matching group is non-empty -- newly-revealed matching lines then fall
+  back to unchanged. sg's `compact_one_side` slid groups but never reran
+  anything, so a slide that should have re-exposed a shared line instead
+  left it inside an oversized changed span. The port adds the same rerun,
+  gated on `histogram` (compact_one_side's own new parameter) and on the
+  group's start/end actually having moved. One adaptation was required:
+  git's rerun `memcpy`s the new changed-bits over the old, but sg's
+  `myers_diff` only ever SETS bits to 1 and never clears them, so the port
+  must `memset` both sides' changed ranges to 0 immediately before calling
+  it, or leftover 1-bits from the pre-rerun script survive the rerun.
+  New baseline, measured: `fuzz_diff.py 500 --histogram` is **0** across
+  three seed ranges (was 5/500, 4/500), `fuzz_diff.py 500` (Myers, which
+  never takes the `histogram` branch) is unaffected at **0**, and all of
+  `fuzz_merge.py`/`fuzz_merge_rename.py`/`fuzz_combined.py` stayed at their
+  existing 0 baselines. `tests/test_diff_histogram.c` pins the smallest
+  known fixture that distinguishes the two behaviours (old `"R\n\nR\n\n"` ->
+  new `"R\nR\n\n"`: git deletes only the first blank line; without the
+  rerun sg answered with a single two-line replacement instead), with a
+  companion assertion that the same fixture's Myers answer is unaffected by
+  the `histogram` gate. `tests/interop.sh`'s `phase52:` group cmp's full
+  `sg diff --histogram` / `sg diff` output against real git on the same
+  fixture. Read Phase 52 of `docs/DESIGN.md` for the exact git source
+  excerpt and why Phase 42's search never reached this code.
   WARNING: **`--patience`, `--minimal` and `--diff-algorithm=<name>` are
   rejected as unknown flags, not approximated** -- sg has two aligners and
   answering "patience" with one of them is a wrong answer wearing the right
@@ -471,8 +497,28 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `make test` **does not count**, run `python3 tests/fuzz_diff.py 500
   --max-failures 0` AND `python3 tests/fuzz_diff.py 500 --histogram
   --max-failures 0` (across a few different `--seed` values, not just the
-  default) and report both actual mismatch counts -- Myers should stay 0,
-  histogram should stay at or below its recorded ~0.9%.
+  default) and report both actual mismatch counts -- **both should now stay
+  at 0**, a non-zero histogram count is a regression, not an expected
+  residual.
+  WARNING: **a single-digit `fuzz_diff.py` mismatch count is not, by
+  itself, evidence of an algorithm divergence** -- `fuzz_diff.py` used to
+  conflate a real output mismatch with `sg` simply exiting non-zero (a
+  subprocess launch hiccup under load), and in `--max-failures 0` mode the
+  triggering round is discarded the instant the tally increments, leaving
+  no way to tell the two apart after the fact (fixed in Phase 52, see its
+  `docs/DESIGN.md` section 8 -- measured: one such phantom count vanished
+  on five reruns of the identical seed). Before reporting a nonzero count
+  as a regression, **rerun the same seed range once** and check the
+  `of which sg exited non-zero: N` line the script now prints; if N
+  accounts for the whole count, it is a flaky subprocess launch, not a
+  diff bug. Phase 52 also measured and recorded (`docs/DESIGN.md` section
+  7) that three of `compact_one_side`'s guard sub-conditions -- the
+  `histogram` gate itself, "did the group actually move", and "is the
+  opposite group non-empty" -- have no mutation witness on any fuzz input
+  found so far, and are kept anyway because each is a faithful copy of
+  git's own `xdl_change_compact` condition. **Do not go add a test for
+  those three speculatively**; they are recorded as measured-inert, not as
+  an open coverage gap.
 - **The three-way merge (`sg_merge_content`, `src/workdir/merge.c`) builds a
   region list and post-processes it, it does not append bytes as it
   classifies** (Phase 41). Order is fixed and is git's: sync-point

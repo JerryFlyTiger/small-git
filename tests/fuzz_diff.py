@@ -229,6 +229,7 @@ def main():
     root = tempfile.mkdtemp(prefix="sg_fuzz_diff_")
     failures = 0
     i = -1
+    crashes = 0
     for i in range(iterations):
         seed = seed_base + i
         rng = random.Random(seed)
@@ -241,6 +242,11 @@ def main():
             got = sg(["diff"] + flags, repo, check=False)
             # A non-zero exit from either side is itself a divergence worth
             # reporting: sg's diff exits 0 unless it could not read a blob.
+            # NOTE: this breaks out of the MODES loop on the first
+            # divergence, so the crash tally below is a conservative LOWER
+            # bound -- a seed whose first mode merely differs in stdout hides
+            # a later mode that would have exited non-zero. Pre-existing, not
+            # introduced with that tally.
             if want.stdout != got.stdout or got.returncode != 0:
                 mismatch = (label, want.stdout, got.stdout, got.stderr,
                             got.returncode)
@@ -252,9 +258,14 @@ def main():
 
         failures += 1
         label, want, got, err, rc = mismatch
+        if rc != 0:
+            crashes += 1
         if max_failures == 0:
             # Counting mode: the tally is the measurement, so keep neither the
-            # repo nor the output.
+            # repo nor the output -- except for a non-zero exit, which is
+            # counted separately (see the crashes tally below) because it is
+            # the one kind of "mismatch" that can be manufactured by the
+            # machine rather than by the code under test.
             shutil.rmtree(repo, ignore_errors=True)
             continue
         print("=== MISMATCH seed %d (%s) -- repo kept at %s" % (seed, label, repo))
@@ -273,6 +284,20 @@ def main():
 
     print("\nfuzz_diff: %d iterations from seed %d, %d mismatches"
           % (i + 1, seed_base, failures))
+    # Measured 2026-09-01: one iteration in roughly 2500 reported a mismatch
+    # that did not reproduce on five reruns of the same seed range. The cause
+    # is the `got.returncode != 0` arm above -- under heavy parallel load an
+    # sg subprocess can fail to start, and in counting mode the repo and the
+    # output are both discarded, so that phantom was indistinguishable from a
+    # real algorithmic divergence and left nothing to chase. The tally is this
+    # project's primary acceptance number for the diff aligners, so the two
+    # classes are now separated: `mismatches` may include machine noise, and
+    # `of which sg exited non-zero` is how much of it might be. A non-zero
+    # count there is not automatically a bug, but it is never to be reported
+    # as an algorithmic divergence without rerunning the same seed range.
+    if crashes:
+        print("  of which sg exited non-zero: %d -- rerun the same seed range "
+              "before calling any of these an algorithmic divergence" % crashes)
     if not failures:
         shutil.rmtree(root, ignore_errors=True)
     return 1 if failures else 0

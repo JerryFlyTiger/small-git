@@ -96,7 +96,20 @@ typedef enum {
         reconstruction from memory, NOT independently verified against
         git's source -- tests/fuzz_diff.py, which diffs sg's actual output
         against real git's, is the only judge of whether they are right.
-   Returns NULL only on allocation failure. */
+     3. HISTOGRAM ONLY (Phase 52): when step 1/2 actually moved a group and
+        the opposite file's matching group is non-empty, that pair of groups
+        is re-diffed with Myers and the newly-surfaced identical lines are
+        marked unchanged again. This is git's own step, in xdiffi.c's
+        xdl_change_compact, and NOT part of the histogram algorithm -- which
+        is exactly why Phase 42 could not find the ~1% divergence it causes
+        while searching inside the xhistogram.c port. Myers is excluded
+        because it already produces minimal edits, so a slid group cannot
+        yield a smaller diff; git's own comment concedes that is only true
+        "most of the time" without XDF_NEED_MINIMAL, which is why the
+        exclusion is kept even though no measurement can currently see it
+        (see docs/DESIGN.md Phase 52 item B section 7).
+   Returns NULL only on allocation failure -- step 3 adds a second, new way
+   for that to happen, since the re-diff allocates. */
 sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_diff_line *b, size_t nb,
                                     int indent_heuristic, sg_diff_algorithm algo);
 void sg_diff_script_free(sg_diff_script *script);
