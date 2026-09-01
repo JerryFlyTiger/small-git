@@ -1135,7 +1135,13 @@ static void combine_dump(const combine_sline *sline, size_t cnt, const unsigned 
                          size_t result_len)
 {
     size_t lno = 0;
-    const unsigned char *result_end = result_data + result_len;
+    /* `result_data + result_len` is UNDEFINED when result_data is NULL, even
+       with result_len 0 -- and a merge's combined row CAN have no result
+       buffer at all (a path the merge deleted, whose hunk body a
+       tree-sourced row still prints). glibc's UBSan calls that "applying
+       zero offset to null pointer" and the CI job halts on it; macOS's
+       stayed silent, so this only ever showed up on Linux. */
+    const unsigned char *result_end = result_data != NULL ? result_data + result_len : NULL;
 
     for (;;) {
         size_t hunk_end;
