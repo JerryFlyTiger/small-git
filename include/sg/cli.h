@@ -11,6 +11,7 @@ int sg_cmd_cat_file(int argc, char **argv);
 int sg_cmd_add(int argc, char **argv);
 int sg_cmd_commit(int argc, char **argv);
 int sg_cmd_log(int argc, char **argv);
+int sg_cmd_show(int argc, char **argv);
 int sg_cmd_status(int argc, char **argv);
 int sg_cmd_diff(int argc, char **argv);
 int sg_cmd_branch(int argc, char **argv);

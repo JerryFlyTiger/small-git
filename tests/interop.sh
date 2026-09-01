@@ -13661,6 +13661,188 @@ check "phase54: -p alone introduces the diff with no --- line" \
 (cd "$P54B" && "$SG" log --nosuchflag) > /dev/null 2>&1
 check "phase54: sg log rejects an unknown flag" test $? = 1
 
+# --- Phase 55: `sg show`. Measured: `git show <non-merge-commit>` is
+# byte-identical to `git log -1 -p` of it in every flag combination, which is
+# why the entry renderer is shared (src/cli/commit_out.c) rather than copied
+# -- the phase54 group above is what proves the extraction did not move
+# `sg log`'s output.
+#
+# This group's own subject is everything `show` does that `log` does not:
+# annotated tags, trees, blobs, <rev>:<path>, and the rules for several
+# objects in one invocation. Same pinned knobs as phase54, declared again
+# here rather than reused from 700 lines up.
+P55="$WORKDIR/p55_show"
+P55_GIT_PINS="-c core.abbrev=7"
+mkdir -p "$P55"
+(cd "$P55" && LC_ALL=C git init -q .) > /dev/null 2>&1
+p55commit() {
+    ( cd "$P55" &&
+      GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+      GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+      GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+      LC_ALL=C git commit -q --allow-empty -m "$1" ) > /dev/null 2>&1
+}
+printf 'one\ntwo\nthree\n' > "$P55/f.txt"
+(cd "$P55" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+p55commit "root commit"
+printf 'one\ntwo EDIT\nthree\n' > "$P55/f.txt"
+mkdir -p "$P55/d"
+printf 'inner\n' > "$P55/d/inner.txt"
+(cd "$P55" && LC_ALL=C git add -A) > /dev/null 2>&1
+p55commit "edit f and add a dir"
+( cd "$P55" &&
+  GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git tag -a v1 -m "tag message here" ) > /dev/null 2>&1
+(cd "$P55" && LC_ALL=C git tag lightweight HEAD~1) > /dev/null 2>&1
+# The merge lives on its own branch: if it were on the default branch, HEAD
+# would be a merge and every no-argument case below would exercise this
+# phase's deliberate gap instead of the thing it is checking.
+P55_BRANCH=$(cd "$P55" && LC_ALL=C git rev-parse --abbrev-ref HEAD 2>/dev/null)
+# The merge must CONFLICT and be resolved to something new. A clean merge's
+# dense combined diff is empty (measured), so a clean one would give git
+# nothing to render and the precondition below would -- correctly -- report
+# that this fixture exercises nothing. That is how this fixture got fixed.
+(cd "$P55" && LC_ALL=C git checkout -qb p55side HEAD~1) > /dev/null 2>&1
+printf 'one\ntwo SIDE\nthree\n' > "$P55/f.txt"
+printf 's\n' > "$P55/s.txt"
+(cd "$P55" && LC_ALL=C git add -A) > /dev/null 2>&1
+p55commit "side work"
+(cd "$P55" && LC_ALL=C git checkout -qb p55merged "$P55_BRANCH") > /dev/null 2>&1
+(cd "$P55" && LC_ALL=C git merge --no-ff p55side -m "merge side") > /dev/null 2>&1
+printf 'one\ntwo RESOLVED\nthree\n' > "$P55/f.txt"
+(cd "$P55" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+( cd "$P55" &&
+  GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git commit -q --no-edit ) > /dev/null 2>&1
+(cd "$P55" && LC_ALL=C git checkout -q "$P55_BRANCH") > /dev/null 2>&1
+P55_COMMIT=$(cd "$P55" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+P55_BLOB=$(cd "$P55" && LC_ALL=C git rev-parse HEAD:f.txt 2>/dev/null)
+P55_TREE=$(cd "$P55" && LC_ALL=C git rev-parse "HEAD^{tree}" 2>/dev/null)
+
+p55_cmp() {
+    p55tag="$1"; shift
+    (cd "$P55" && LC_ALL=C git $P55_GIT_PINS show --no-decorate "$@") \
+        > "$WORKDIR/p55_git_$p55tag.txt" 2>&1
+    (cd "$P55" && "$SG" show "$@") > "$WORKDIR/p55_sg_$p55tag.txt" 2>&1
+}
+p55_cmp plain "$P55_COMMIT"
+p55_cmp suppress -s "$P55_COMMIT"
+p55_cmp stat --stat "$P55_COMMIT"
+p55_cmp oneline --oneline "$P55_COMMIT"
+p55_cmp annotated v1
+p55_cmp light lightweight
+p55_cmp blobpath HEAD:f.txt
+p55_cmp blobsha "$P55_BLOB"
+p55_cmp treepath HEAD:
+p55_cmp subtree HEAD:d
+p55_cmp blobcommit "$P55_BLOB" "$P55_COMMIT"
+p55_cmp committree -s "$P55_COMMIT" "$P55_TREE"
+p55_cmp twice -s "$P55_COMMIT" "$P55_COMMIT"
+
+check "phase55 oracle: precondition -- v1 really is an annotated tag object" \
+    sh -c 'grep -q "^tag v1$" "$0"' "$WORKDIR/p55_git_annotated.txt"
+check "phase55: sg show <commit> matches git" \
+    cmp -s "$WORKDIR/p55_sg_plain.txt" "$WORKDIR/p55_git_plain.txt"
+check "phase55: sg show -s <commit> matches git" \
+    cmp -s "$WORKDIR/p55_sg_suppress.txt" "$WORKDIR/p55_git_suppress.txt"
+check "phase55: sg show --stat <commit> matches git" \
+    cmp -s "$WORKDIR/p55_sg_stat.txt" "$WORKDIR/p55_git_stat.txt"
+check "phase55: sg show --oneline <commit> matches git" \
+    cmp -s "$WORKDIR/p55_sg_oneline.txt" "$WORKDIR/p55_git_oneline.txt"
+# The tag's own message is NOT indented, unlike a commit's four spaces.
+check "phase55: sg show <annotated tag> matches git, tag header and all" \
+    cmp -s "$WORKDIR/p55_sg_annotated.txt" "$WORKDIR/p55_git_annotated.txt"
+check "phase55: sg show <lightweight tag> matches git" \
+    cmp -s "$WORKDIR/p55_sg_light.txt" "$WORKDIR/p55_git_light.txt"
+check "phase55: sg show <rev>:<path> prints the blob raw" \
+    cmp -s "$WORKDIR/p55_sg_blobpath.txt" "$WORKDIR/p55_git_blobpath.txt"
+check "phase55: sg show <blob sha> matches git" \
+    cmp -s "$WORKDIR/p55_sg_blobsha.txt" "$WORKDIR/p55_git_blobsha.txt"
+check "phase55: sg show <rev>: lists the tree like git, directories slashed" \
+    cmp -s "$WORKDIR/p55_sg_treepath.txt" "$WORKDIR/p55_git_treepath.txt"
+check "phase55: sg show <rev>:<dir> lists the subtree like git" \
+    cmp -s "$WORKDIR/p55_sg_subtree.txt" "$WORKDIR/p55_git_subtree.txt"
+# The separator between objects is STATEFUL, and these two are the head-on
+# pair that proves it: a blob neither emits nor arms it, everything else
+# arms it. One shared rule for both would pass one and fail the other.
+check "phase55: a blob before a commit gets NO blank line between them" \
+    cmp -s "$WORKDIR/p55_sg_blobcommit.txt" "$WORKDIR/p55_git_blobcommit.txt"
+check "phase55: a commit before a tree DOES get one" \
+    cmp -s "$WORKDIR/p55_sg_committree.txt" "$WORKDIR/p55_git_committree.txt"
+# The same commit named twice prints once -- git deduplicates commits across
+# the argument list, and nothing else.
+check "phase55: the same commit named twice prints once, like git" \
+    cmp -s "$WORKDIR/p55_sg_twice.txt" "$WORKDIR/p55_git_twice.txt"
+# Tags pointing at each target type. The blob one is the discriminator: a
+# tag's target takes a leading blank line, EXCEPT a blob, which takes none
+# (measured both ways). A rule of "nested always separates" passes treetag
+# and fails blobtag, which is why both are here.
+( cd "$P55" &&
+  GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C sh -c '
+    git tag -a p55blobtag -m "at a blob" $(git rev-parse HEAD:f.txt) &&
+    git tag -a p55treetag -m "at a tree" $(git rev-parse HEAD^{tree}) &&
+    git tag -a p55mergetag -m "at a merge" p55merged' ) > /dev/null 2>&1
+p55_cmp blobtag p55blobtag
+p55_cmp treetag p55treetag
+check "phase55: a tag pointing at a BLOB puts no blank line before it" \
+    cmp -s "$WORKDIR/p55_sg_blobtag.txt" "$WORKDIR/p55_git_blobtag.txt"
+check "phase55: a tag pointing at a TREE does put one" \
+    cmp -s "$WORKDIR/p55_sg_treetag.txt" "$WORKDIR/p55_git_treetag.txt"
+
+# -s / -p / --stat are LAST ONE WINS, not a fixed priority: -s clears what
+# came before, -p and --stat each set their own and accumulate. These two
+# collide head-on -- an implementation where -s always outranks the others
+# passes `-p -s` and fails `-s -p`.
+p55_cmp sp -s -p "$P55_COMMIT"
+p55_cmp ps -p -s "$P55_COMMIT"
+p55_cmp statp --stat -p "$P55_COMMIT"
+check "phase55: sg show -s -p prints the patch (the later flag wins)" \
+    cmp -s "$WORKDIR/p55_sg_sp.txt" "$WORKDIR/p55_git_sp.txt"
+check "phase55: sg show -p -s prints nothing but the entry" \
+    cmp -s "$WORKDIR/p55_sg_ps.txt" "$WORKDIR/p55_git_ps.txt"
+check "phase55: sg show --stat -p prints BOTH" \
+    cmp -s "$WORKDIR/p55_sg_statp.txt" "$WORKDIR/p55_git_statp.txt"
+
+(cd "$P55" && "$SG" show HEAD:f.txt/x) > /dev/null 2>&1
+check "phase55: a <rev>:<path> component that names a file, not a directory, fails" test $? = 1
+
+(cd "$P55" && "$SG" show --name-only "$P55_COMMIT") > /dev/null 2>&1
+check "phase55: sg show rejects a flag it does not implement" test $? = 1
+(cd "$P55" && "$SG" show HEAD:nosuchfile) > /dev/null 2>&1
+check "phase55: sg show <rev>:<missing path> fails" test $? = 1
+# DELIBERATE, TEMPORARY divergence: a merge needs a combined diff producer
+# that does not exist yet, so sg refuses rather than printing a plausible
+# first-parent diff. Pinned on BOTH sides so that implementing it turns this
+# check red and says so, instead of the refusal quietly becoming a wrong
+# answer or a crash.
+(cd "$P55" && LC_ALL=C git $P55_GIT_PINS show --no-decorate p55merged) > "$WORKDIR/p55_git_merge.txt" 2>&1
+check "phase55 oracle: precondition -- git renders that merge as a combined diff" \
+    sh -c 'grep -q "^diff --cc " "$0"' "$WORKDIR/p55_git_merge.txt"
+# stdout and stderr are captured SEPARATELY here on purpose: the claim is
+# "nothing on stdout", and folding stderr in with 2>&1 would test the
+# opposite of what it says. Note also that `test ! -s` on a file that was
+# never created passes, so the file has to be one this block really writes.
+(cd "$P55" && "$SG" show p55merged) > "$WORKDIR/p55_sg_merge_out.txt" 2> "$WORKDIR/p55_sg_merge_err.txt"
+check "phase55: sg show refuses a merge commit (combined diff not implemented)" test $? = 1
+check "phase55: ...printing nothing at all on stdout" \
+    test ! -s "$WORKDIR/p55_sg_merge_out.txt"
+check "phase55: ...and saying why on stderr" \
+    grep -q "merge" "$WORKDIR/p55_sg_merge_err.txt"
+# A TAG pointing at a merge is the case that catches a refusal emitted
+# halfway through an entry: the tag header is printed before the target is
+# read, so without looking ahead sg wrote 82 bytes and then exited 1.
+(cd "$P55" && "$SG" show -s p55mergetag) > "$WORKDIR/p55_sg_mergetag_out.txt" 2>/dev/null
+check "phase55: a tag pointing at a merge is refused too" test $? = 1
+check "phase55: ...without having already written the tag header to stdout" \
+    test ! -s "$WORKDIR/p55_sg_mergetag_out.txt"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

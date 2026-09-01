@@ -17,6 +17,7 @@ static const sg_command_info COMMANDS[] = {
     {"add", "add files to the index"},
     {"commit", "create a commit"},
     {"log", "show commit history"},
+    {"show", "show one or more objects (commits, tags, trees, blobs)"},
     {"status", "show the working directory status"},
     {"diff", "show changes (index/working dir/between revs), several formats"},
     {"branch", "list, create, or delete branches"},
@@ -76,6 +77,8 @@ int sg_cli_run(int argc, char **argv)
         return sg_cmd_commit(argc - 1, argv + 1);
     if (strcmp(argv[1], "log") == 0)
         return sg_cmd_log(argc - 1, argv + 1);
+    if (strcmp(argv[1], "show") == 0)
+        return sg_cmd_show(argc - 1, argv + 1);
     if (strcmp(argv[1], "status") == 0)
         return sg_cmd_status(argc - 1, argv + 1);
     if (strcmp(argv[1], "diff") == 0)

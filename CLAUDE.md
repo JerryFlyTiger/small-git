@@ -288,6 +288,42 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `--oneline`) while git's default `core.abbrev=auto` scales with object
   count; interop declares `core.abbrev=7` on git's side rather than
   pretending the two policies agree.
+- **`sg show` exists as of Phase 55** and shares `sg log`'s entry renderer:
+  `git show <non-merge-commit>` is byte-identical to `git log -1 -p` of it in
+  every flag combination (measured), so the renderer lives in
+  `src/cli/commit_out.c` (`sg_commit_out_entry`) and **neither command owns a
+  copy**. Phase 54's `phase54` interop group is what proves a change to it
+  did not move `sg log`.
+  WARNING: **the separator between several objects is STATEFUL, and a blob
+  is the exception**: everything else takes a leading blank line when
+  something was already shown or when it is a tag's target, while a blob
+  neither takes one nor arms the flag for the next object. Measured over
+  every ordered pair. A rule of "a tree never separates" holds only when the
+  tree comes first -- that was my spec's error, caught by the implementer.
+  WARNING: **only COMMITS are deduplicated across the argument list.**
+  `show <c> <c>` prints once, and so does an annotated plus a lightweight tag
+  of the same commit; but `show <tree> <tree>` prints twice, and
+  `show <tag> <tag>` prints the tag header twice with one commit under it.
+  WARNING: **`-s`/`-p`/`--stat` are LAST ONE WINS**: `-s` clears what came
+  before, `-p` and `--stat` set their own bits and accumulate, default is a
+  patch. `-s -p` prints a patch, `-p -s` prints nothing, `--stat -p` prints
+  BOTH (all measured). Giving `-s` a fixed priority passes every single-flag
+  case and gets `-s -p` backwards -- same shape as `-M`/`-C` and `-c`/`--cc`.
+  WARNING: **a MERGE commit is refused** (`exit 1`, nothing on stdout) --
+  `git show` renders a dense `diff --cc` and sg has no producer feeding its
+  Phase 34 combined renderer from parent TREES yet. Refusing has to LOOK
+  AHEAD through a tag chain (`target_is_merge`), because a tag's header is
+  printed before its target is read and sg otherwise wrote 82 bytes and then
+  exited 1. Pinned on both sides, so implementing it turns a check red.
+  **A fixture for that work must use a merge that CONFLICTED and was
+  resolved**: a clean merge's dense combined diff is empty, and this group's
+  precondition check caught exactly that mistake.
+  WARNING: **tree entry names are printed RAW here, and that matches git.**
+  Measured on a crafted entry name containing an ESC byte: `git show <tree>`
+  prints it raw with `core.quotepath` at its default, while
+  `git cat-file -p <tree>` on the same tree C-quotes it. git is inconsistent
+  between its own two commands and sg matches git in both -- do not "fix"
+  `cmd_show.c` to quote by analogy with `cmd_cat_file.c`.
 - **`sg log` takes `-n <count>` / `-<count>` / `--max-count=`, `--oneline`,
   `-p`/`--patch`, `--stat` and a single `<rev>`** (Phase 54). `-p`/`--stat`
   are reuse -- the commit's first-parent tree against its own, through
