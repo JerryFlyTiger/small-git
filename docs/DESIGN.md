@@ -9387,3 +9387,184 @@ blank line, turning rename detection off, giving `--oneline` a blank line
 before its diff, removing the empty-diff early return, reading `-n 0` as
 unlimited, and widening the abbreviation to 8. The full table is in the
 commit message; each turned exactly the checks it should have red.
+
+## Phase 55a: `sg show`
+
+`git show <non-merge-commit>` is **byte-identical to `git log -1 -p`** of that
+commit, measured across every flag combination (plain, `-p`, `--stat`,
+`-p --stat`, `--oneline`, `--oneline -p`, `--oneline -p --stat`, `-s`). So
+the entry renderer was extracted out of `cmd_log.c` into
+`src/cli/commit_out.c` and both commands call it; `sg show` grew no second
+copy. Phase 54's byte-for-byte `phase54` interop group is what proves the
+extraction moved nothing.
+
+What `show` does that `log` does not is everything below.
+
+### 1. The four object types
+
+| type | rendering |
+|---|---|
+| commit | exactly `log -1 -p` of it |
+| annotated tag | `tag <name>` / `Tagger:` / `Date:` (the same `sg_date_format_normal`), a blank line, the message **NOT indented**, then the object it points at |
+| tree | `tree <the argument AS TYPED>`, a blank line, one entry name per line in tree order, `/` appended to directories |
+| blob | the raw bytes, no header, no added newline |
+
+The tree header echoes the argument, not the resolved id: `sg show HEAD:`
+prints `tree HEAD:`, and a tag pointing at a tree prints the TAG's name
+(measured: `sg show treetag` prints `tree treetag`). Format flags do not
+change a tree or a blob.
+
+`<rev>:<path>` resolves by walking the commit's tree component by component;
+an empty right side means the commit's own tree.
+
+### 2. The separator between several objects is STATEFUL
+
+Measured across every ordered pair:
+
+| sequence | blank line between? |
+|---|---|
+| commit, commit | yes |
+| tree, commit | yes |
+| commit, tree | yes |
+| blob, commit | **no** |
+| commit, blob | **no** |
+| blob, blob | **no** |
+| tag -> its commit / tree / nested tag | yes |
+| tag -> its blob | **no** |
+
+One rule explains all of it: everything except a blob takes a leading blank
+line when something was already shown (or when it is a tag's target); a blob
+neither takes one nor arms the flag for the next object. My spec for this
+phase got it wrong in a way worth recording -- it said "a tree never prints a
+leading separator", which was true only of the orderings I had actually
+measured, where the tree happened to come first and there was nothing to
+separate from. **A rule derived from examples that all point one way is a
+guess.**
+
+The print deliberately lives inside each per-type branch rather than in one
+shared place before them, because a merge commit is refused (section 5) and
+refusing after emitting a blank line leaves stdout dirty for a command that
+reported failure.
+
+### 3. Commits are deduplicated across the argument list, and only commits
+
+Measured: `git show <c> <c>` prints that commit **once**, and so does
+`git show <annotated-tag> <lightweight-tag-of-the-same-commit>` in either
+order -- the second reference produces no output at all, not even a blank
+line. But `git show <tree> <tree>` prints the tree **twice**, and
+`git show <tag> <tag>` prints the tag header and message twice while the
+commit underneath appears once. So the dedup set holds commit ids only, and
+a tag's own header is not part of it.
+
+### 4. `-s`, `-p` and `--stat` are last-one-wins, not a priority order
+
+Measured over 11 combinations; one model explains all of them: **`-s` clears
+what came before it**, `-p` sets patch, `--stat` sets stat, the two format
+bits accumulate, and if none of the three appeared the default is a patch.
+
+| flags | patch | stat |
+|---|---|---|
+| `-s` | no | no |
+| `-s -p` | **yes** | no |
+| `-p -s` | no | no |
+| `-s --stat` | no | **yes** |
+| `--stat -s` | no | no |
+| `--stat -p` | yes | yes |
+| `-s -p --stat` | yes | yes |
+| `-p --stat -s` | no | no |
+
+Giving `-s` a fixed priority over the others -- the obvious reading, and what
+this was first implemented as -- passes every single-flag case and gets
+`-s -p` exactly backwards. This is the same shape CLAUDE.md already records
+for `-M`/`-C` and `-c`/`--cc`; interop pins `-s -p` and `-p -s` as a head-on
+pair.
+
+### 5. Merge commits are refused, deliberately and temporarily
+
+`git show <merge>` renders a dense combined diff (`diff --cc`) against all
+parents. sg has a combined-diff renderer (Phase 34) but no producer that
+feeds it from parent TREES -- its existing one reads index stages. Rather
+than print a plausible-looking first-parent diff, `sg show` refuses:
+`sg: showing a merge commit is not supported yet`, exit 1, **nothing on
+stdout**.
+
+The clean-stdout half needs a look-ahead, and a tag is what makes that
+visible: the tag header is printed before its target is ever read, so
+`sg show <tag-pointing-at-a-merge>` first wrote 82 bytes and then exited 1.
+`target_is_merge` follows the tag chain before anything is printed.
+
+Both halves are pinned in interop, and so is the divergence itself (a
+precondition check asserts git really does render that fixture as
+`diff --cc`), so implementing the producer turns a check red and says so.
+**Note for whoever does that**: the fixture's merge must CONFLICT and be
+resolved to something new. A clean merge's dense combined diff is empty, and
+the first version of this fixture was a clean merge -- the precondition
+caught it.
+
+### 6. What the cold review found, and what it got wrong
+
+Eight findings. Two were real bugs, three were real gaps I had never
+measured, one was refuted by measurement, and the extraction was verified
+equivalent.
+
+- **A leak, confirmed and fixed.** `<rev>:<path>` walking onto a non-tree
+  component (`HEAD:f.txt/x`, an ordinary typo) folded a successful
+  `sg_object_read` into the same branch as a failed one and never freed the
+  content buffer. Measured with macOS `leaks` against a 200 KB blob, before
+  and after: **1 leak for 212992 bytes -> 0 leaks for 0 bytes**. This is the
+  class `make sanitize` cannot see on macOS at all.
+- **The tag-target separator and the flag order**, both above, both real,
+  both measured against git afterwards.
+- **The tree-name quoting finding was wrong**, and the measurement is worth
+  keeping: `git show <tree>` prints a control byte in an entry name RAW,
+  with `core.quotepath` at its default or explicitly false -- while
+  `git cat-file -p <tree>` on the same tree prints it C-quoted. git is
+  inconsistent between its own two commands, and sg matches git in both
+  (`cmd_cat_file.c` quotes, `cmd_show.c` does not). "The codebase quotes
+  paths here, so this should too" was a reasonable-sounding inference from
+  CLAUDE.md's own rule, and the oracle says otherwise.
+- Left as recorded nits rather than changed: `resolve_object` re-reads an
+  object to learn its type and then `render_id` reads it again (up to three
+  full reads for a bare blob sha), and a missing chunk pointer under
+  `render_blob` reports a literal `<object>` placeholder instead of the
+  argument the user typed.
+
+### 7. The merge case (the next item), already measured
+
+The refusal in section 5 is the honest placeholder for a piece of work that
+turned out to be larger than "a `show` detail". These measurements are the
+spec for it, taken on a fixture whose merge conflicts in three files and
+resolves each differently:
+
+**The dense patch includes a path iff the result differs from EVERY parent,
+and "differs" includes the MODE.** Measured over six paths:
+
+| path | ours | theirs | result | included? |
+|---|---|---|---|---|
+| `both.txt` | edited | edited | a third text | yes |
+| `del.txt` | edited | edited | deleted | yes |
+| `mode.txt` | mode 755, ours' text | 644, theirs' text | theirs' text at 755 | **yes** |
+| `new.txt` | absent | absent | added | yes |
+| `ours_only.txt` | edited | untouched | = ours | no |
+| `theirs_only.txt` | untouched | edited | = theirs | no |
+| `same.txt` | edited | edited the SAME way | = both | no |
+
+`mode.txt` is the one that punishes an id-only comparison: its content id
+equals theirs' exactly, and it is included anyway because the mode does not.
+It renders as a mode-only row -- `mode 100755,100644..100755` with **no
+hunks at all**. `del.txt` renders `deleted file mode 100644,100644` with a
+two-parent `index` line ending in `..0000000`, and `new.txt` renders `new
+file mode` with `index 0000000,0000000..<id>`.
+
+**`--stat` on a merge is NOT dense, and is a different rule entirely.**
+Measured on the same commit: the dense patch names four paths, while
+`git show --stat` names five -- it adds `theirs_only.txt` and is exactly the
+diff against **parent 1**. So the two outputs of one command answer two
+different questions, and an implementation that computes one set of rows and
+renders it both ways will be wrong for whichever it was not written for.
+
+Not measured yet, and needed before implementing: an OCTOPUS merge (three or
+more parents). sg's Phase 34 combined renderer is fixed at exactly two
+parents, so that case has to be either implemented or refused explicitly --
+and refusing it silently inside a general merge implementation is exactly the
+kind of gap this project pins rather than leaves.
