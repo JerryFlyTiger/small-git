@@ -230,12 +230,17 @@ static int flatten_into(const char *git_dir, const unsigned char tree_id[SG_SHA1
     return rc;
 }
 
+/* Phase 52 observability hook: counts calls to sg_tree_flatten, nothing else.
+   See the header comment on sg_tree_flatten_test_count for the contract. */
+static size_t sg_tree_flatten_call_count = 0;
+
 int sg_tree_flatten(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW_LEN], sg_flat_list *out,
                     char *bad_path)
 {
     size_t cap = 0;
     int rc;
 
+    sg_tree_flatten_call_count++;
     out->entries = NULL;
     out->count = 0;
     rc = flatten_into(git_dir, tree_id, "", out, &cap, bad_path);
@@ -244,6 +249,16 @@ int sg_tree_flatten(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW
         return rc;
     }
     return 0;
+}
+
+size_t sg_tree_flatten_test_count(void)
+{
+    return sg_tree_flatten_call_count;
+}
+
+void sg_tree_flatten_test_reset(void)
+{
+    sg_tree_flatten_call_count = 0;
 }
 
 void sg_flat_list_free(sg_flat_list *list)

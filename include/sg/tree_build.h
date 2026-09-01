@@ -40,6 +40,16 @@ int sg_tree_flatten(const char *git_dir, const unsigned char tree_id[SG_SHA1_RAW
 
 void sg_flat_list_free(sg_flat_list *list);
 
+/* Phase 52 test hook: sg_tree_flatten_test_count returns how many times
+   sg_tree_flatten has been called (process lifetime, or since the last
+   reset); sg_tree_flatten_test_reset zeroes it. These exist purely for
+   observability -- to let a test prove a refactor actually removed redundant
+   flattening -- and nothing in src/ may branch on the count. Not
+   thread-safe: the counter is a plain file-scope size_t with no atomics or
+   locking. */
+size_t sg_tree_flatten_test_count(void);
+void sg_tree_flatten_test_reset(void);
+
 /* Builds a tree from the index's stage-0 entries exactly as they stand (no
    working-tree access, no re-hashing). Returns 0, or -1 on allocation
    failure, if sg_tree_build itself fails (e.g. a loose object write fails),

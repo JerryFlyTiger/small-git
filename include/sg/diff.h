@@ -8,6 +8,7 @@
 #include "sg/index.h"
 #include "sg/pathspec.h"
 #include "sg/similarity.h"
+#include "sg/tree_build.h"
 
 /* Building a list of changed paths, decoupled from where the two sides come
    from. Before this existed `sg diff` could only ever compare the index to the
@@ -188,6 +189,19 @@ void sg_diff_list_free(sg_diff_list *list);
 int sg_diff_trees(const char *git_dir, const unsigned char *old_tree,
                   const unsigned char *new_tree, sg_diff_list *out, char *bad_path,
                   int include_unchanged);
+
+/* Phase 52: sg_diff_trees' union-walk body, taking two already-flattened
+   sg_flat_list (see sg/tree_build.h) instead of two tree ids. Both lists are
+   BORROWED (this never frees them, the caller must keep them alive until it
+   returns) and NULL means "the empty tree", the same convention old_tree/
+   new_tree == NULL carries above. Exists so a caller that already flattened
+   both trees for another reason (sg_merge_trees, when rename detection is
+   on) does not pay for a second flatten just to diff them. Unlike
+   sg_diff_trees, bad_path is never this function's to fill -- a -2 from
+   flattening is the caller's own to report, since the caller did the
+   flattening itself. Returns 0 or -1, never -2. */
+int sg_diff_from_flat_lists(const sg_flat_list *old_flat, const sg_flat_list *new_flat,
+                            sg_diff_list *out, int include_unchanged);
 
 /* tree vs index -- `sg diff --cached`. A path carrying stage 1/2/3 entries has
    no single staged blob to diff against and yields exactly one row, with

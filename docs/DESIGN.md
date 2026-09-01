@@ -6816,6 +6816,19 @@ Gates: `make` 0 warnings over 63 TUs, `make test` 61/61, `interop.sh`
 
 ### 4. The residual, and why it is recorded rather than explained away
 
+**Superseded by Phase 52 -- the attribution below is WRONG, kept verbatim as
+the historical record of what was measured at the time, do not re-derive
+from it.** Phase 52 found the actual root cause: it is not in
+`xhistogram.c`/`try_lcs` at all, it is in `xdiffi.c`'s
+`xdl_change_compact`, a HISTOGRAM-ONLY post-processing rerun that runs after
+either aligner produces its raw script. sg's `compact_one_side` had no such
+rerun. Every experiment in this section searched inside the histogram
+algorithm itself (the take-condition, the count-update policy, a
+patience-diff hypothesis) and so structurally could not have found a gap
+that lives one layer downstream, in the shared compaction step. See Phase
+52 below for the fix, the exact git source location, and the corrected
+attribution of the `"R\n\nR\n\n"` example used below.
+
 **`sg diff --histogram` differs from `git diff --histogram` on about 0.9% of
 fuzz cases, and the port is NOT the obvious suspect.** Two independent
 transcriptions of git's published `xhistogram.c` -- the C written here and a
@@ -6838,6 +6851,15 @@ artifact of the harness skipping cases that fell back to Myers. A patience-diff
 hypothesis was tested and rejected (this git's histogram differs from its own
 patience in 124/400 cases).
 
+**Phase 52 correction**: the `"R\n\nR\n\n"` example above was never a
+`try_lcs` disagreement. `try_lcs` (both this port's and git's) produce the
+SAME raw histogram script for that input; the two answers diverge only
+after `xdl_change_compact`'s rerun runs (git) or does not run (sg, before
+Phase 52). The eight take-condition variants measured against a 400-case
+corpus were all searching the wrong function, which is also why none of
+them ever reached zero -- the actual defect could not be fixed by tuning
+`try_lcs` at all.
+
 So: the algorithm this machine's git calls "histogram" is not exactly the one
 its published source describes, and rather than tune sg toward an unexplained
 target, the divergence is measured, bounded, reproduced and left visible behind
@@ -6845,6 +6867,15 @@ an opt-in flag. **The path that matters is not affected**: `sg merge` agrees
 with `git merge` on 800 fuzz rounds. Whether that is because merge's fixtures
 do not reach the divergent shapes is unknown, which is why the histogram
 fuzzer mode is a standing gate and not a one-off measurement.
+**Phase 52 correction**: `xdl_change_compact`'s rerun is gated on the SAME
+`histogram` condition sg's merge already always requests, so the pre-Phase-52
+merge code path went through `compact_one_side` missing the same rerun `sg
+diff --histogram` was missing. Whether merge's 800 fuzz rounds simply never
+produced a slide+non-empty-opposite-group combination, or produced one that
+happened not to change the final merge result, was not re-investigated as
+part of Phase 52 -- re-running `fuzz_merge.py`/`fuzz_merge_rename.py` after
+the fix (both still 0) is the only new evidence, not a root-cause account of
+the old 0/800.
 
 ### 5. Scope decisions
 
@@ -8521,3 +8552,386 @@ Fix: `sg_diff_fill_combined_from_index`'s loop now skips a row with
   section 1's own discussion) -- an INEXACT rename fixture closes that gap,
   since only the exact pass would work under either init value on an exact
   one.
+
+## Phase 52 item A: collapse `sg_merge_trees`' repeated tree flattening
+
+`sg_merge_trees` used to flatten base/ours/theirs **seven** times whenever
+`rename_score > 0` (every one of its four call sites): three flattens up
+front, plus `build_rename_map`'s two calls to `sg_diff_trees` each
+re-flattening both of their own sides (base twice more, ours once, theirs
+once). Pure repeated work -- no correctness risk, and every flatten
+re-reads and re-parses every tree object at every directory level, since
+there is no object cache anywhere in the codebase. Phase 49's cold read
+raised it; Phases 50 and 51 both left it.
+
+### 1. Shape of the fix
+
+`sg_diff_trees` (`src/workdir/diff.c`) was split: its union-walk body is now
+`sg_diff_from_flat_lists`, a new public function taking two **borrowed**
+`const sg_flat_list *` (NULL meaning the empty tree, same convention
+`old_tree`/`new_tree == NULL` already carried). `sg_diff_trees` itself is
+now a thin wrapper: flatten both sides, delegate, free both. All 12
+pre-existing call sites are unchanged.
+
+`sg_merge_trees` already flattens base/ours/theirs once each up front
+(`base_flat`/`ours_flat`/`theirs_flat`); `build_rename_map` was changed to
+take two `const sg_flat_list *` instead of two tree ids, and to call
+`sg_diff_from_flat_lists` directly instead of `sg_diff_trees` -- so it no
+longer flattens anything itself. Its two call sites in `sg_merge_trees` now
+pass `&base_flat`/`&ours_flat` and `&base_flat`/`&theirs_flat`. Net effect:
+3 flattens total, with or without rename detection turned on. One
+consequence worth naming: `build_rename_map` can no longer produce
+`sg_tree_flatten`'s `-2` (bad path) on its own -- the caller already
+flattened these same trees before `build_rename_map` is ever reached, so a
+`-2` there is already reported and `sg_merge_trees` has already returned
+-1 by the time rename detection would run.
+
+### 2. Why this needed its own test, not just a green `make test`
+
+The merge RESULT is byte-identical before and after this change -- both
+`tests/test_merge_renames.c` (14 named shapes) and
+`tests/fuzz_merge_rename.py` assert only the result, so both stay green
+regardless of how many times the trees got flattened. A change nothing can
+observe is a change nobody can defend later, so a dedicated counter was
+added: `sg_tree_flatten_test_count()` / `sg_tree_flatten_test_reset()`
+(`include/sg/tree_build.h`), backed by a file-scope counter in
+`tree_build.c` incremented once per `sg_tree_flatten` call. Documented as a
+test-only hook: nothing in `src/` may branch on it, and it is not
+thread-safe.
+
+`tests/test_merge_flatten_count.c` runs `sg_merge_trees` on a 2-file
+fixture (an ordinary edit on each side, no renames present) and asserts the
+count is exactly **3**, once with `rename_score = SG_SIMILARITY_DEFAULT`
+and once with `rename_score = 0` -- pinning both paths separately, since
+`rename_score = 0` never calls `build_rename_map` at all and would stay
+green under a much clumsier bug. The exact number matters: `>= 1` or `< 7`
+would not go red if someone later reintroduced a redundant flatten.
+Proved capable of failing via `tests/mutate.sh`: inserting one spurious
+`sg_tree_flatten` call inside `build_rename_map` turned the count 3 -> 5
+and the test red, confirming the hook actually observes what it claims to.
+
+### 3. Measurements
+
+`bash tests/gates.sh --rebuild`: `make` 0 warnings (64 TUs recompiled),
+`make test` 65/65 binaries passed 0 warnings (65 recompiled, the new test
+file), interop 2253/2253 passed 0 skipped (M unchanged from Phase 51).
+`make sanitize`: 65/65 binaries, 0 sanitizer errors -- run because this
+moves ownership of heap-allocated `sg_flat_list`s across a new function
+boundary. `python3 tests/fuzz_merge.py 200` and `... --no-newline-edits`:
+0/200 both. `python3 tests/fuzz_merge_rename.py 150` across two unused seed
+ranges: 0/150 both, all eight rename shapes represented, seed 9058's old
+content-merge divergence (fixed in Phase 50) did not reappear.
+
+## Phase 52 item B: the histogram ~0.9% residual was in compaction, not in histogram
+
+Phase 42 recorded a ~0.9% divergence between `sg diff --histogram` and `git
+diff --histogram`, searched for it entirely inside the histogram algorithm
+(`try_lcs`'s take-condition, the count-update policy, a patience-diff
+hypothesis), found nothing conclusive, and left it as an understood-to-be-
+unexplained residual. The actual defect was one layer downstream, in code
+git and sg both run AFTER either aligner (Myers or histogram) produces its
+raw script -- which is exactly why nothing inside histogram's own logic
+could ever have explained it.
+
+### 1. Root cause
+
+git's `xdiffi.c` has a compaction pass, `xdl_change_compact`, that slides
+each changed group as far as it can move without changing what it
+represents (`group_slide_up`/`group_slide_down` in sg's port already
+existed and already matched this). What sg's `compact_one_side` did NOT
+have is the rerun at the end of that pass. Git's source, quoted exactly
+(git 2.55.0, `xdiffi.c:921-958`, inside `xdl_change_compact`):
+
+```c
+        /*
+         * If we merged change groups during shifting, the new
+         * combined group could now have matching lines in both files,
+         * even if the original separate groups did not. Re-diff the
+         * new group to find these matching lines to mark them as
+         * unchanged.
+         *
+         * Only do this if the corresponding group in the other file is
+         * non-empty, as it's trivial otherwise.
+         *
+         * Only do this for histogram diff as its LCS algorithm allows
+         * for this scenario. In contrast, patience diff finds LCS
+         * of unique lines that groups cannot be shifted across.
+         * Myer's diff (standalone or used as fall-back in patience
+         * diff) already finds minimal edits so it is not possible for
+         * shifted groups to result in a smaller diff. (Without
+         * XDF_NEED_MINIMAL, Myer's isn't technically guaranteed to be
+         * minimal, but it should be so most of the time)
+         */
+        if (go.end != go.start &&
+                        XDF_DIFF_ALG(flags) == XDF_HISTOGRAM_DIFF &&
+                        (g.start != g_orig.start ||
+                         g.end != g_orig.end)) {
+                xpparam_t xpp;
+                xdfenv_t xe;
+
+                memset(&xpp, 0, sizeof(xpp));
+                xpp.flags = flags & ~XDF_DIFF_ALGORITHM_MASK;
+
+                xe.xdf1 = *xdf;
+                xe.xdf2 = *xdfo;
+
+                if (xdl_fall_back_diff(&xe, &xpp,
+                                       g.start + 1, g.end - g.start,
+                                       go.start + 1, go.end - go.start)) {
+                        return -1;
+                }
+        }
+```
+
+git's own comment states the rationale directly: histogram's LCS algorithm
+can leave shiftable groups with newly-matching lines after a slide,
+patience cannot (its LCS is of unique lines, which by construction cannot
+be shifted across each other), and Myers is already minimal so a rerun
+after shifting could not find anything smaller. The condition matches sg's
+port exactly: opposite group non-empty, AND this group's start/end changed
+from its pre-slide position, AND histogram specifically. **It does not run
+for Myers or patience at all.** That is consistent with what Phase 42
+measured (`fuzz_diff.py 500`, Myers, stayed at 0/500 throughout): the
+missing piece was never on the Myers path to begin with. sg calls its
+existing `myers_diff` in place of git's `xdl_fall_back_diff` (which itself
+dispatches to Myers for this histogram-internal fallback) -- same
+operation, different name.
+
+### 2. Why Phase 42's search could not have found this
+
+Every experiment in Phase 42 section 4 varied something inside
+`try_lcs`/`xhistogram.c`'s own decision rules and re-ran the SAME
+`compact_one_side` (missing the rerun) afterward. Since the actual defect
+sits after `try_lcs` returns, no amount of tuning `try_lcs` could touch it
+-- the eight variants were all measuring noise around a real bug they could
+not reach. The one example Phase 42 wrote down by hand, `"R\n\nR\n\n"` ->
+`"R\nR\n\n"`, produces the SAME raw histogram script under both this port's
+`try_lcs` and git's (verified by re-running the pre-fix binary and
+confirming the two disagree only after `compact_one_side`'s sliding step,
+not before it) -- the divergence Phase 42 attributed to `try_lcs` never
+lived there.
+
+### 3. The fix
+
+`compact_one_side` (`src/util/diff_lcs.c`) gained an `int histogram`
+parameter and an `other_rec` parameter (the opposite side's own line
+records, needed to actually run `myers_diff` on the pair). Before the
+existing `next:` label, it now records `orig_start`/`orig_end` before the
+slide-up/slide-down loop runs, and after that loop:
+
+```c
+if (histogram && go.end != go.start && (g.start != orig_start || g.end != orig_end)) {
+    memset(changed + g.start, 0, (size_t)(g.end - g.start));
+    memset(other_changed + go.start, 0, (size_t)(go.end - go.start));
+    if (myers_diff(rec + g.start, (size_t)(g.end - g.start), other_rec + go.start,
+                   (size_t)(go.end - go.start), changed + g.start,
+                   other_changed + go.start) != 0)
+        return -1;
+}
+```
+
+**The `memset` calls are the one adaptation git's own code did not need.**
+Git's rerun `memcpy`s its own freshly computed changed-bit array over the
+old one, which is naturally a full overwrite. sg's `myers_diff` only ever
+SETS a changed bit to 1 (never clears one back to 0), because every other
+caller hands it an already-zeroed buffer. Calling it directly into the
+existing range without zeroing first would OR the rerun's answer onto the
+stale pre-rerun bits instead of replacing them, silently keeping some of
+the wrong shape. This is a difference in the two languages' library
+behaviour, not a deliberate divergence -- git's `xdl_recmatch` genuinely
+does a full overwrite too, sg is matching that, just via an explicit step
+its own `myers_diff` needs.
+
+`compact_one_side` now returns `int` (was `void`), and its two call sites
+in `sg_diff_build_script` check it and free+return `NULL` on failure (a
+`myers_diff` OOM), matching the fallibility convention every other
+allocation site in the file already follows. `sg_diff_build_script`'s two
+call sites pass `algo == SG_DIFF_ALGO_HISTOGRAM` as the new `histogram`
+argument -- this is the ONLY place that flag is threaded from.
+
+### 4. Why the gate on `histogram` needed its own test
+
+A rerun that fires unconditionally (dropping the `histogram` guard) would
+still pass every existing histogram fixture, because the rerun is a no-op
+whenever a group didn't move or the opposite side is empty, which is most
+groups most of the time. It would ALSO change Myers output on any input
+where a group happens to both move during sliding and have a non-empty
+opposite group -- an input `tests/test_diff_histogram.c`'s existing fixtures
+never construct, because they were written before this gate existed to
+guard.
+
+That was the intent behind giving the Myers test the SAME fixture as the
+histogram regression test: a mutation dropping the `histogram &&` guard was
+supposed to change the Myers answer on that exact input, so both tests would
+catch it from two different angles. **Measured 2026-09-01, and it does not
+work**: dropping the guard leaves `make test` and all 2256 interop checks
+green. The reason is stated two paragraphs down and points the other way --
+git's own Myers and histogram answers on this fixture are the SAME one, so
+applying the rerun to Myers here changes nothing to observe. A control whose
+two arms already agree is not a control. The test has been renamed
+`test_myers_answer_on_the_recompact_fixture` to say only what it pins, and
+the guard was classified by fuzzing instead (section 7).
+
+### 5. Test fixture and why it is minimal
+
+old = `"R\n\nR\n\n"` (4 lines: `R`, blank, `R`, blank), new = `"R\nR\n\n"`
+(3 lines: `R`, `R`, blank). Verified against real git via `git diff
+--no-index` (no repo/commit needed): both `git diff --histogram` and `git
+diff --diff-algorithm=myers` answer with a single one-line deletion (the
+first blank line). Before the fix, sg's histogram path answered with a
+single two-line replacement (`a_off=0,a_len=2,b_off=0,b_len=1`) covering
+both blank-line slots; sg's Myers path already answered
+`a_off=1,a_len=1,b_off=1,b_len=0`, matching git, both before and after the
+fix -- confirming the defect and the fix are both histogram-only, not a
+Myers regression risk. `tests/test_diff_histogram.c`'s
+`test_histogram_recompact_rerun`/`test_myers_answer_on_the_recompact_fixture`
+pin this pair of answers directly via `sg_diff_build_script`, and
+`tests/interop.sh`'s `phase52:` group does a full-output `cmp` of `sg diff
+--histogram`/`sg diff` against real git on the same fixture (plus an oracle
+precondition line confirming git's own two algorithms still agree with each
+other on it, so the check is not vacuously trivial).
+
+### 6. Measurements
+
+Reverting just this fix (restoring the pre-Phase-52 `src/util/diff_lcs.c`)
+and rebuilding: `test_diff_histogram` FAILs
+`test_histogram_recompact_rerun` with `histogram recompact alignment is
+'0,2,0,1;'` (the two-line-replacement answer), and `interop.sh`'s `phase52:
+sg diff --histogram matches git diff --histogram byte-for-byte on the
+recompact fixture` goes red while the Myers control check next to it stays
+green -- confirming both new checks are red for the intended reason and the
+Myers control is not a false negative.
+
+With the fix in place: `python3 tests/fuzz_diff.py 500 --histogram` is
+**0/500** across three seed ranges (0, 61000, 82000; was 5/500 and 4/500 at
+Phase 42's two seeds), `python3 tests/fuzz_diff.py 500` (Myers) is **0/500**
+at two seed ranges (0, 61000), `python3 tests/fuzz_merge.py 200` (default
+and `--no-newline-edits`), `python3 tests/fuzz_merge_rename.py 150`, and
+`python3 tests/fuzz_combined.py 200` are all **0**. `tests/interop.sh`:
+2256/2256 passed, 0 skipped (M grew from 2253 by the 3 new `phase52:`
+checks). `bash tests/gates.sh --rebuild --sanitize`: `make` 0 warnings over
+65 TUs, `make test` 65/65 with the modified/added test files recompiled,
+interop unchanged from the number above, `make sanitize` 65/65 with 0
+sanitizer errors.
+
+### 7. Mutation results on git's three sub-conditions -- none has a witness, and that is recorded, not left implicit
+
+The rerun's own presence and the `memset` calls are solidly witnessed:
+turning off the whole rerun turns `interop.sh`'s `phase52: sg diff
+--histogram matches git diff --histogram byte-for-byte on the recompact
+fixture` red AND `test_histogram_recompact_rerun` red (message
+`'0,2,0,1;'`, the pre-fix wrong answer); removing either `memset` call turns
+the same unit check red with the same message. But the condition guarding
+the rerun is `go.end != go.start && histogram && (g.start != orig_start ||
+g.end != orig_end)` -- three sub-conditions ANDed together -- and mutating
+each one individually (dropping it, i.e. always-true) stays green on every
+gate. Per this project's "three reasons a mutation can stay green" rule,
+each of the three was measured separately rather than lumped together, and
+all three land in the same bucket:
+
+1. **The `histogram` gate itself.** Dropping it (so the rerun also fires
+   for Myers) leaves `make test` and `interop.sh` green. Measured further:
+   `python3 tests/fuzz_diff.py 500` (Myers, with the mutation applied) is
+   **0/500** at seeds 0, 61000, and 93000, and `python3 tests/fuzz_diff.py
+   500 --histogram` (seed 0) is also **0/500**. So on every input this
+   project's fuzz corpus can produce, running the rerun unconditionally for
+   Myers changes nothing. git's own comment (quoted in section 1 above)
+   gives the reason: Myers already finds a minimal edit script, and a
+   rerun after sliding cannot find anything smaller -- but the SAME comment
+   admits "without `XDF_NEED_MINIMAL`, Myer's isn't technically guaranteed
+   to be minimal, but it should be so most of the time". That "most of the
+   time" is exactly why this is being recorded as **measured-inert, not a
+   coverage gap**: the gate is faithful to git and kept, but the input that
+   would make it observable is not known to exist, and none of this
+   project's fuzzers has produced one.
+2. **The "group actually moved" condition,
+   `g.start != orig_start || g.end != orig_end`.** Same shape: dropping it
+   (so the rerun fires even when sliding did nothing) stays green on
+   `make test` and `interop.sh`. `python3 tests/fuzz_diff.py 500
+   --histogram` at seeds 0, 61000, and 93000 is **0/500 each** (1500 rounds
+   total), and `python3 tests/fuzz_merge.py 200` is also **0**. Recorded as
+   **measured-inert, not a coverage gap**, same reasoning: rerunning Myers
+   on a pair of groups that did not move is redundant work whenever the
+   answer would already be a fixed point, and no fuzz round has produced a
+   case where it is not.
+3. **The "opposite group non-empty" condition, `go.end != go.start`.**
+   Same shape: dropping it (so the rerun also fires when the opposite
+   group is empty, feeding `myers_diff` a zero-length side) stays green on
+   `make test` and `interop.sh`. First fuzz pass, `python3 tests/fuzz_diff.py
+   500 --histogram --seed 93000`, showed **1/500** -- a real-looking
+   candidate witness. It was NOT one: five independent reruns of the exact
+   same command (same seed, same round count) all came back **0/500**.
+   This is not a case of the mutation being timing-sensitive -- reruns of a
+   pure-Python/subprocess diff comparison with a fixed seed should be
+   deterministic -- so the single non-zero run is attributed to
+   infrastructure flakiness (see section 8 immediately below, which is the
+   harness bug that produces exactly this shape of false positive) rather
+   than to the mutation having any real effect. Recorded as
+   **measured-inert, not a coverage gap**, same as the two above.
+
+**Do not go looking for a test that pins any of these three conditions --
+none exists, and after this measurement none should be added speculatively.**
+All three are being kept for the same reason: they are copied faithfully
+from git's own `xdl_change_compact`, each has a stated rationale in git's
+own source comment, and "faithful to git even where currently
+unobservable" is this project's own standing default for a ported
+algorithm (compare the Phase 42 handling of the histogram occurrence-count
+ceiling, which was kept for the same reason before this project even had a
+fuzzer that could exercise it). A future fuzzer with a wider input shape
+(e.g. one that specifically targets many small, interleaved changed
+regions so that sliding groups collide with empty neighbors) might someday
+turn one of these observable; until it does, these three are recorded as
+closed for now, not open.
+
+### 8. A harness bug found while measuring section 7: `fuzz_diff.py`
+conflated a real diff mismatch with `sg` crashing
+
+While chasing section 7's item 3 false positive, `tests/fuzz_diff.py`
+itself was found to have a pre-existing counting bug, now fixed. Its
+comparison was:
+
+```python
+if want.stdout != got.stdout or got.returncode != 0:
+    mismatch += 1
+```
+
+**A non-zero exit code from `sg` was counted as the same kind of mismatch
+as a byte-for-byte output disagreement**, and in `--max-failures 0`
+counting mode the harness discards the actual repo and output as soon as
+the tally is incremented (that mode exists precisely to run large round
+counts cheaply). So a single subprocess launch failure under load -- `sg`
+never even starting, a transient `fork`/`exec` hiccup, anything that makes
+the child process exit non-zero for a reason that has nothing to do with
+diff algorithm correctness -- produces a count that is **indistinguishable
+from a real algorithmic divergence, and leaves no trace to attribute it
+by**, because the round that triggered it is already gone by the time the
+tally is read. The `93000/1` result in section 7 item 3 is exactly this
+shape: a single anomalous count, on a mutation that produces no plausible
+mechanism for a real divergence (an empty-group Myers call is a
+no-op-shaped edge case, not a source of NEW disagreements), that then
+vanished on every repeat.
+
+**The fix**: the two causes are now tallied separately. A non-zero `sg`
+exit code is tracked in its own counter and printed as an extra summary
+line, `of which sg exited non-zero: N`, alongside the existing mismatch
+count -- so a future single-digit mismatch total is immediately
+distinguishable as "N of these were sg crashing, the rest are real
+content disagreements" rather than one undifferentiated number.
+**Verified the new branch actually fires** (not just added and trusted):
+a fake `sg` binary was substituted that unconditionally exits 1 for the
+`diff` subcommand, and 5/5 rounds against it were correctly attributed to
+the new "sg exited non-zero" counter rather than silently landing in the
+plain mismatch count. Reverting to the real `build/sg` returns the count to
+its normal 0.
+
+**Why this belongs in this project's measurement record rather than being
+just a script fix**: this project's completion criteria for the diff/merge
+alignment code are single-digit fuzz mismatch counts read directly as
+"algorithm agrees with git" or "algorithm disagrees with git" (see the top
+of this file's fuzzer conventions). A harness that can silently attribute
+an infrastructure hiccup to the algorithm under test undermines exactly
+that reading. Going forward, **a nonzero-but-small `fuzz_diff.py` mismatch
+count must be re-run across the same seed range before being reported as
+an algorithm divergence**, and the `of which sg exited non-zero` line
+checked first -- if it accounts for the whole count, the finding is a
+flaky subprocess launch, not a diff bug.

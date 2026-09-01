@@ -13450,6 +13450,26 @@ check "phase50 oracle: precondition -- git splits the 4-ours-line agreed gap int
 check "phase50: sg splits that one into two conflicts as well" \
     cmp -s "$WORKDIR/p50_gapmod_sg.merged" "$WORKDIR/p50_gapmod_git.merged"
 
+# --- Phase 52: compact_one_side's histogram-only rerun (git's
+# xdl_change_compact, xdiffi.c:940-958). Fixture found by hand (the same one
+# Phase 42's own writeup recorded as unexplained): old has a blank line
+# between two "R" lines duplicated, new removes the first one. Both git
+# algorithms agree the answer is a single one-line deletion; before the
+# rerun sg's histogram output disagreed (a single two-line replacement
+# instead), while sg's Myers path was already correct. This group is a
+# control pair: histogram is the case the fix targets, plain diff (Myers) is
+# unaffected and must stay unaffected.
+P52="$WORKDIR/p52_recompact"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P52")") > /dev/null 2>&1
+printf 'R\n\nR\n\n' > "$P52/f.txt"
+(cd "$P52" && "$SG" add f.txt && "$SG" commit -m base) > /dev/null 2>&1
+printf 'R\nR\n\n' > "$P52/f.txt"
+check "phase52 oracle: precondition -- git's histogram and Myers agree on this fixture" \
+    sh -c "(cd '$P52' && LC_ALL=C git diff --histogram > $WORKDIR/p52_gh.txt && LC_ALL=C git diff > $WORKDIR/p52_gm.txt && cmp -s $WORKDIR/p52_gh.txt $WORKDIR/p52_gm.txt)"
+check "phase52: sg diff --histogram matches git diff --histogram byte-for-byte on the recompact fixture" \
+    sh -c "(cd '$P52' && '$SG' diff --histogram) > $WORKDIR/p52_sh.txt; cmp -s $WORKDIR/p52_sh.txt $WORKDIR/p52_gh.txt"
+check "phase52: plain sg diff (Myers) still matches git's Myers default on the same fixture" \
+    sh -c "(cd '$P52' && '$SG' diff) > $WORKDIR/p52_sm.txt; cmp -s $WORKDIR/p52_sm.txt $WORKDIR/p52_gm.txt"
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

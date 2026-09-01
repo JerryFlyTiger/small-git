@@ -1296,20 +1296,24 @@ static int group_slide_up(const sg_diff_line *rec, unsigned char *changed, slide
    gap (avoiding splitting what was really one edit into a separate
    delete-then-add), and only fall back to the indent heuristic when no
    such alignment exists anywhere in range. */
-static void compact_one_side(const sg_diff_line *rec, long n, unsigned char *changed,
-                             const unsigned char *other_changed, long on, int indent_heuristic)
+static int compact_one_side(const sg_diff_line *rec, long n, unsigned char *changed,
+                            const sg_diff_line *other_rec, unsigned char *other_changed, long on,
+                            int indent_heuristic, int histogram)
 {
     slide_group g, go;
 
-    (void)on;
     group_init(changed, &g);
     group_init(other_changed, &go);
 
     for (;;) {
         long earliest_end, end_matching_other, groupsize;
+        long orig_start, orig_end;
 
         if (g.end == g.start)
             goto next;
+
+        orig_start = g.start;
+        orig_end = g.end;
 
         do {
             groupsize = g.end - g.start;
@@ -1365,11 +1369,21 @@ static void compact_one_side(const sg_diff_line *rec, long n, unsigned char *cha
             }
         }
 
+        if (histogram && go.end != go.start && (g.start != orig_start || g.end != orig_end)) {
+            memset(changed + g.start, 0, (size_t)(g.end - g.start));
+            memset(other_changed + go.start, 0, (size_t)(go.end - go.start));
+            if (myers_diff(rec + g.start, (size_t)(g.end - g.start), other_rec + go.start,
+                           (size_t)(go.end - go.start), changed + g.start,
+                           other_changed + go.start) != 0)
+                return -1;
+        }
+
     next:
         if (group_next(changed, n, &g) != 0)
             break;
         group_next(other_changed, on, &go);
     }
+    return 0;
 }
 
 /* Rebuilds the final paired sg_diff_group list from the two (now
@@ -1442,8 +1456,14 @@ sg_diff_script *sg_diff_build_script(const sg_diff_line *a, size_t na, const sg_
        bitmap as compact_one_side above just left it. Swapping this order
        changes output on any hunk where both sides have room to slide --
        matching git means matching the order, not just the algorithm. */
-    compact_one_side(a, (long)na, achanged, bchanged, (long)nb, indent_heuristic);
-    compact_one_side(b, (long)nb, bchanged, achanged, (long)na, indent_heuristic);
+    if (compact_one_side(a, (long)na, achanged, b, bchanged, (long)nb, indent_heuristic,
+                         algo == SG_DIFF_ALGO_HISTOGRAM) != 0 ||
+        compact_one_side(b, (long)nb, bchanged, a, achanged, (long)na, indent_heuristic,
+                         algo == SG_DIFF_ALGO_HISTOGRAM) != 0) {
+        free(achanged_buf);
+        free(bchanged_buf);
+        return NULL;
+    }
 
     final_gb.groups = NULL;
     final_gb.count = 0;
