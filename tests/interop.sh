@@ -13471,6 +13471,97 @@ check "phase52: sg diff --histogram matches git diff --histogram byte-for-byte o
 check "phase52: plain sg diff (Myers) still matches git's Myers default on the same fixture" \
     sh -c "(cd '$P52' && '$SG' diff) > $WORKDIR/p52_sm.txt; cmp -s $WORKDIR/p52_sm.txt $WORKDIR/p52_gm.txt"
 
+# --- Phase 54: `sg log`'s rendering had NO oracle at all before this group,
+# and it was wrong. It applied gmtime() to the stored epoch while still
+# printing the stored offset beside it, so every timestamp was off BY that
+# offset (eight hours on this machine) and contradicted itself in its own
+# output. It also zero-padded the day (git does not) and emitted a trailing
+# blank line. None of the pre-existing log checks could see any of it: they
+# assert exit codes, or scrape `head -1` for the sha.
+#
+# The oracle is `git log --first-parent`, not `git log`: sg's walk is
+# deliberately first-parent-only (Phase 2 scope), so on a repo containing a
+# merge the two commands legitimately visit different commit SETS. Comparing
+# against plain `git log` would fold that scope decision into every
+# rendering assertion. The scope boundary itself is pinned separately below.
+#
+# The fixture is built by GIT, not sg: the timezone axis is the whole point
+# and only git can set an author date (`sg commit` has no --date). Four
+# knobs were MEASURED to move git's output and are therefore pinned on the
+# command line rather than trusted: log.decorate (adds "(HEAD -> ...)" to
+# the commit line), core.abbrev (widens the Merge: line), log.date, and
+# format.pretty / log.abbrevCommit. LC_ALL=C follows this file's existing
+# convention; measured on this zh_TW machine, git does NOT translate the
+# Author:/Date: labels, so it is insurance, not the load-bearing pin.
+P54="$WORKDIR/p54_log"
+P54_GIT_PINS="-c core.abbrev=7"
+P54_LOG_FLAGS="--first-parent --pretty=medium --no-decorate --no-abbrev-commit --date=default"
+# A config as hostile as a real user's ~/.gitconfig, used only to prove the
+# pins above actually win. Deliberately listed BEFORE the pins, which is
+# where a config file's values effectively sit: later -c wins.
+P54_HOSTILE="-c log.decorate=full -c core.abbrev=12 -c log.date=iso -c format.pretty=oneline -c log.abbrevCommit=true"
+
+mkdir -p "$P54"
+(cd "$P54" && LC_ALL=C git init -q .) > /dev/null 2>&1
+p54commit() {
+    ( cd "$P54" &&
+      GIT_AUTHOR_DATE="$1" GIT_COMMITTER_DATE="$1" \
+      GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+      GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+      LC_ALL=C git commit -q --allow-empty --allow-empty-message -m "$2" ) > /dev/null 2>&1
+}
+# One commit per rendering axis: UTC, a positive offset that rolls the date
+# forward, a negative one, a HALF-HOUR one, a single-digit day (the padding
+# bug), a multi-line body whose middle line is blank, and an empty message
+# (which git renders with no message block AND no leading blank line).
+p54commit "@1700000000 +0000" "first commit"
+p54commit "@1700000000 +0800" "positive offset rolls the day"
+p54commit "@1700000000 -0500" "negative offset"
+p54commit "@1700000000 +0530" "half-hour offset"
+p54commit "@1725148800 +0000" "single digit day"
+p54commit "@1700000000 +0100" "body
+
+with a blank line
+and a third"
+p54commit "@1700000000 +0000" ""
+P54_BRANCH=$(cd "$P54" && LC_ALL=C git rev-parse --abbrev-ref HEAD 2>/dev/null)
+(cd "$P54" && LC_ALL=C git checkout -qb p54side HEAD~2) > /dev/null 2>&1
+p54commit "@1700000000 +0000" "on the side branch"
+(cd "$P54" && LC_ALL=C git checkout -q "$P54_BRANCH") > /dev/null 2>&1
+( cd "$P54" &&
+  GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git merge -q --no-ff p54side -m "merge the side branch" ) > /dev/null 2>&1
+
+(cd "$P54" && LC_ALL=C git $P54_GIT_PINS log $P54_LOG_FLAGS) > "$WORKDIR/p54_git.txt" 2>&1
+(cd "$P54" && LC_ALL=C git $P54_HOSTILE $P54_GIT_PINS log $P54_LOG_FLAGS) > "$WORKDIR/p54_git_hostile.txt" 2>&1
+(cd "$P54" && LC_ALL=C git log) > "$WORKDIR/p54_git_allparents.txt" 2>&1
+(cd "$P54" && "$SG" log) > "$WORKDIR/p54_sg.txt" 2>&1
+
+check "phase54 oracle: precondition -- the fixture has a merge commit to render" \
+    sh -c 'grep -q "^Merge: " "$0"' "$WORKDIR/p54_git.txt"
+check "phase54 oracle: precondition -- the pinned flags beat a hostile git config" \
+    cmp -s "$WORKDIR/p54_git.txt" "$WORKDIR/p54_git_hostile.txt"
+check "phase54: sg log matches git log --first-parent byte-for-byte" \
+    cmp -s "$WORKDIR/p54_sg.txt" "$WORKDIR/p54_git.txt"
+# Named separately from the cmp above so a regression in the arithmetic says
+# "the timezone" instead of handing over a whole-file diff.
+check "phase54: the Date line is the timestamp shifted INTO its stored offset" \
+    sh -c 'grep -q "^Date:   Wed Nov 15 06:13:20 2023 +0800$" "$0"' "$WORKDIR/p54_sg.txt"
+check "phase54: a half-hour offset shifts by thirty minutes too" \
+    sh -c 'grep -q "^Date:   Wed Nov 15 03:43:20 2023 +0530$" "$0"' "$WORKDIR/p54_sg.txt"
+check "phase54: the day of month is not zero-padded" \
+    sh -c 'grep -q "^Date:   Sun Sep 1 00:00:00 2024 +0000$" "$0"' "$WORKDIR/p54_sg.txt"
+check "phase54: sg log ends without a trailing blank line" \
+    sh -c 'test -n "$(tail -1 "$0")"' "$WORKDIR/p54_sg.txt"
+# The scope boundary is pinned on both sides: sg walks first-parent only, so
+# it must NOT match a full walk. If sg ever learns to walk every parent this
+# turns red and says so, instead of the rendering checks above silently
+# starting to compare a different set of commits.
+check "phase54: sg log deliberately differs from a full-history git log" \
+    sh -c '! cmp -s "$0" "$1"' "$WORKDIR/p54_sg.txt" "$WORKDIR/p54_git_allparents.txt"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

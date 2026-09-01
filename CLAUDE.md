@@ -251,6 +251,42 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `sg_read_file`, `sg_write_file_mkdirs`, `sg_hash_file_blob`). Go look for
   path utilities in `workdir.h`, not in `util/`, and do not write another
   copy.
+- **Rendering a commit timestamp for a human always goes through
+  `sg_date_format_normal`** (`include/sg/date.h`, Phase 54) -- git's
+  DATE_NORMAL, the `Date:` line of `git log` and `%ad`. It returns the whole
+  field including the offset, so no caller assembles half of it.
+  WARNING: **the clock shown is the epoch SHIFTED INTO the stored offset**,
+  not UTC and not the machine's local time. `sg log` used to render UTC while
+  printing the stored `+0800` beside it, so every date it ever showed was
+  wrong by the offset -- eight hours here -- and contradicted itself in its
+  own output. Nothing caught it because nothing had ever compared `sg log`
+  to `git log`; the pre-existing checks assert exit codes or scrape
+  `head -1` for the sha.
+  WARNING: **the day of month is NOT zero-padded** (`Jan 1`, not `Jan 01`),
+  and the weekday/month names come from git's own hard-coded English tables,
+  **not `strftime`'s `%a`/`%b`** -- those follow the locale, and one
+  `setlocale` call anywhere in the process would silently translate a format
+  whose entire job is to match git byte for byte.
+  WARNING: **`cmd_undo.c` has its own date formatter and must not be
+  converged onto this one.** `sg undo` has no real-git counterpart, so it has
+  no oracle; it deliberately prints local time in ISO form.
+  WARNING: **`sg log`'s oracle is `git log --first-parent`**, because sg's
+  walk is first-parent-only by Phase 2 scope -- against a full `git log` the
+  two legitimately visit different commit SETS. Interop pins the rendering
+  against `--first-parent` AND pins the scope boundary separately (sg's
+  output must NOT equal a full walk), so teaching sg to walk every parent
+  turns a check red by name instead of quietly changing what the rendering
+  checks compare. Four git config knobs were measured to move that oracle
+  (`log.decorate`, `core.abbrev`, `log.date`, `format.pretty` /
+  `log.abbrevCommit`) and are pinned on the command line, with a
+  precondition check proving the pins beat a hostile config.
+  WARNING: **an empty commit message prints no message block at all**, not
+  even the leading blank line, and entries are separated by one blank line
+  with **none after the last** -- so the separator goes BEFORE every entry
+  but the first. An empty-message entry in the middle is what distinguishes
+  the two models. Abbreviations in the `Merge:` line are hard-coded to 7
+  while git's default `core.abbrev=auto` scales with object count; that has
+  to be settled when `--oneline` lands.
 - **Joining `base/rel` always goes through `sg_path_join`**
   (`include/sg/workdir.h`, Phase 21), buffer size uses `SG_PATH_MAX` from the
   same header. **Do not write a raw
