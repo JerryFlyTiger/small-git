@@ -9528,3 +9528,43 @@ equivalent.
   full reads for a bare blob sha), and a missing chunk pointer under
   `render_blob` reports a literal `<object>` placeholder instead of the
   argument the user typed.
+
+### 7. The merge case (the next item), already measured
+
+The refusal in section 5 is the honest placeholder for a piece of work that
+turned out to be larger than "a `show` detail". These measurements are the
+spec for it, taken on a fixture whose merge conflicts in three files and
+resolves each differently:
+
+**The dense patch includes a path iff the result differs from EVERY parent,
+and "differs" includes the MODE.** Measured over six paths:
+
+| path | ours | theirs | result | included? |
+|---|---|---|---|---|
+| `both.txt` | edited | edited | a third text | yes |
+| `del.txt` | edited | edited | deleted | yes |
+| `mode.txt` | mode 755, ours' text | 644, theirs' text | theirs' text at 755 | **yes** |
+| `new.txt` | absent | absent | added | yes |
+| `ours_only.txt` | edited | untouched | = ours | no |
+| `theirs_only.txt` | untouched | edited | = theirs | no |
+| `same.txt` | edited | edited the SAME way | = both | no |
+
+`mode.txt` is the one that punishes an id-only comparison: its content id
+equals theirs' exactly, and it is included anyway because the mode does not.
+It renders as a mode-only row -- `mode 100755,100644..100755` with **no
+hunks at all**. `del.txt` renders `deleted file mode 100644,100644` with a
+two-parent `index` line ending in `..0000000`, and `new.txt` renders `new
+file mode` with `index 0000000,0000000..<id>`.
+
+**`--stat` on a merge is NOT dense, and is a different rule entirely.**
+Measured on the same commit: the dense patch names four paths, while
+`git show --stat` names five -- it adds `theirs_only.txt` and is exactly the
+diff against **parent 1**. So the two outputs of one command answer two
+different questions, and an implementation that computes one set of rows and
+renders it both ways will be wrong for whichever it was not written for.
+
+Not measured yet, and needed before implementing: an OCTOPUS merge (three or
+more parents). sg's Phase 34 combined renderer is fixed at exactly two
+parents, so that case has to be either implemented or refused explicitly --
+and refusing it silently inside a general merge implementation is exactly the
+kind of gap this project pins rather than leaves.
