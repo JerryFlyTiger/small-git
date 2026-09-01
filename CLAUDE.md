@@ -406,6 +406,35 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   builder must still put that path into the list as changed, letting the
   rendering layer print an actionable message with the path attached. If the
   whole list dies, nobody even learns which file was broken.
+- **When the caller ALREADY has both sides flattened, go through
+  `sg_diff_from_flat_lists`, not `sg_diff_trees`** (`include/sg/diff.h`,
+  Phase 52). `sg_diff_trees` flattens both of its tree ids itself and frees
+  both before returning, so a caller holding live `sg_flat_list`s pays for
+  the same walk twice. `sg_merge_trees` was doing exactly that: the main
+  union walk flattens base/ours/theirs, then `build_rename_map` called
+  `sg_diff_trees` twice, giving **seven** flattens of three trees where three
+  suffice, each one re-reading and re-inflating every tree object at every
+  directory level (there is no parsed-object cache anywhere).
+  `sg_diff_trees` deliberately KEPT its signature -- it has 12 call sites and
+  only one of them has a flat list to hand -- and is now a thin wrapper over
+  the new function. **The lists are BORROWED**: the new function neither
+  frees them nor outlives them, and it cannot report `-2`/`bad_path` because
+  the caller did the flattening and already had its chance to. That
+  borrowing is only safe because `list_append` makes its own strdup of every
+  path, which is the same reason `sg_diff_trees` could always free both flat
+  lists before returning its `sg_diff_list`.
+  WARNING: **nothing about this refactor is visible in any merge result**, so
+  `tests/test_merge_renames.c`'s 14 named shapes and `fuzz_merge_rename.py`
+  stay green whether or not it landed. `sg_tree_flatten` therefore counts its
+  calls behind a named test hook (`sg_tree_flatten_test_count` /
+  `_reset` in `include/sg/tree_build.h`, observability only -- **nothing in
+  `src/` may branch on it**, and it is not thread-safe), and
+  `tests/test_merge_flatten_count.c` asserts the count is **exactly 3**, for
+  `rename_score` default and for 0 separately. The exact number is the whole
+  point: `>= 1` or `< 7` would not catch a reintroduced flatten. Measured by
+  mutation -- one extra valid flatten reports "got 4", and removing the
+  counter increment reports "got 0".
+
 - **Printing a diff always goes through `sg_diff_print`**
   (`include/sg/diff_out.h`, Phase 25), six formats (patch/`--stat`/
   `--numstat`/`--shortstat`/`--name-only`/`--name-status`).
@@ -480,9 +509,31 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   existing 0 baselines. `tests/test_diff_histogram.c` pins the smallest
   known fixture that distinguishes the two behaviours (old `"R\n\nR\n\n"` ->
   new `"R\nR\n\n"`: git deletes only the first blank line; without the
-  rerun sg answered with a single two-line replacement instead), with a
-  companion assertion that the same fixture's Myers answer is unaffected by
-  the `histogram` gate. `tests/interop.sh`'s `phase52:` group cmp's full
+  rerun sg answered with a single two-line replacement instead).
+  WARNING: **three of git's own sub-conditions on that rerun have NO witness
+  and that is deliberate, measured, not a gap to fill**: the `histogram`
+  gate, the "group actually moved" clause, and the "opposite group
+  non-empty" clause. Each was removed and fuzzed (1500 Myers rounds for the
+  first, 1500 histogram rounds plus merge for the other two): 0 mismatches
+  every time. They are kept for faithfulness to git. **Do not go looking for
+  their tests, and do not write one on the assumption it must be possible.**
+  The companion Myers assertion beside the fixture is NOT such a witness --
+  it was added believing it guarded the `histogram` gate, and measurement
+  showed it cannot, because git's Myers and histogram answers on that
+  fixture are the same one. It has been renamed
+  `test_myers_answer_on_the_recompact_fixture` to claim only what it pins;
+  a control whose two arms already agree is not a control.
+  WARNING: **a single-digit `fuzz_diff.py` mismatch is not automatically an
+  algorithmic divergence.** That script counts a non-zero `sg` exit as a
+  mismatch, and in `--max-failures 0` mode discards the repo and the output,
+  so a subprocess that fails to start under load used to be
+  indistinguishable from a real one (measured: 1 phantom in ~2500 rounds,
+  which did not survive five reruns of the same seed range). Since Phase 52
+  it prints `of which sg exited non-zero: N` separately -- read that line,
+  and rerun the same seed range, before calling anything a divergence. The
+  count is a conservative LOWER bound (the MODES loop breaks at the first
+  differing mode), and the other fuzzers have not had this separation done.
+  `tests/interop.sh`'s `phase52:` group cmp's full
   `sg diff --histogram` / `sg diff` output against real git on the same
   fixture. Read Phase 52 of `docs/DESIGN.md` for the exact git source
   excerpt and why Phase 42's search never reached this code.
