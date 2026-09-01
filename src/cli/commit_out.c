@@ -10,6 +10,39 @@
 #include <stdio.h>
 #include <string.h>
 
+/* git EXPANDS TABS in the message body -- `--expand-tabs=8` is the default
+   for the medium format (and only for it: `--oneline` and `%s` leave the tab
+   alone, measured). The column is counted from the start of the MESSAGE
+   line, NOT from the indented output column: a line of two tabs comes out at
+   column 20, which is 16 expanded columns plus the four-space indent, and a
+   line of "1234567\tx" comes out with a single space. Getting this from the
+   output column instead would put the second one at a different stop.
+
+   Found by `sg show` on a merge whose auto-generated message contains
+   "#\tboth.txt"; it was wrong for `sg log` too, and had gone unnoticed
+   because no fixture had ever put a tab in a commit message. */
+static void print_message_line(const char *line, size_t len)
+{
+    size_t i;
+    size_t col = 0;
+
+    printf("    ");
+    for (i = 0; i < len; i++) {
+        if (line[i] == '\t') {
+            size_t stop = (col / 8 + 1) * 8;
+
+            while (col < stop) {
+                putchar(' ');
+                col++;
+            }
+        } else {
+            putchar(line[i]);
+            col++;
+        }
+    }
+    putchar('\n');
+}
+
 /* git indents EVERY message line by four spaces, a blank one included (it
    emits "    \n", measured), and prints the block -- leading blank line and
    all -- only when the message is non-empty: a commit with an empty message
@@ -25,10 +58,10 @@ static void print_message(const char *msg)
         const char *nl = strchr(p, '\n');
 
         if (nl == NULL) {
-            printf("    %s\n", p);
+            print_message_line(p, strlen(p));
             break;
         }
-        printf("    %.*s\n", (int)(nl - p), p);
+        print_message_line(p, (size_t)(nl - p));
         p = nl + 1;
     }
 }

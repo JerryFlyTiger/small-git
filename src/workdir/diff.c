@@ -146,6 +146,9 @@ static int list_append(sg_diff_list *list, const char *path, const sg_diff_side 
     /* Overwritten by callers that append an unchanged row for -C -C's copy
        source pool (Phase 51) -- see sg/diff.h's sg_diff_entry contract. */
     list->entries[list->count].unchanged = 0;
+    /* Overwritten only by sg_diff_combined_from_trees (Phase 55b) -- see
+       sg/diff.h's sg_diff_entry contract. */
+    list->entries[list->count].combined_row = 0;
     list->count++;
     return 0;
 }
@@ -189,6 +192,8 @@ static sg_diff_side side_workdir(const unsigned char id[SG_SHA1_RAW_LEN], unsign
 
 int sg_diff_entry_is_combined(const sg_diff_entry *e)
 {
+    if (e->combined_row)
+        return 1;
     if (e->ours.kind == SG_DIFF_SIDE_ABSENT || e->theirs.kind == SG_DIFF_SIDE_ABSENT)
         return 0;
     if (e->unmerged)
@@ -426,6 +431,165 @@ int sg_diff_trees(const char *git_dir, const unsigned char *old_tree,
 
     sg_flat_list_free(&old_flat);
     sg_flat_list_free(&new_flat);
+    return rc;
+}
+
+/* Finds `path`'s entry in a flat list (sorted by path) starting the linear
+   scan at *cursor, advancing *cursor past it. Every caller of this in
+   sg_diff_combined_from_trees visits paths in sorted order exactly once
+   each, so the whole union walk is O(paths * (parent_count + 1)) rather
+   than O(paths * (parent_count + 1) * log n). Returns the entry, or NULL if
+   this list has no entry for `path`. */
+static const sg_flat_entry *flat_advance_to(const sg_flat_list *list, size_t *cursor,
+                                            const char *path)
+{
+    while (*cursor < list->count && strcmp(list->entries[*cursor].path, path) < 0)
+        (*cursor)++;
+    if (*cursor < list->count && strcmp(list->entries[*cursor].path, path) == 0)
+        return &list->entries[*cursor];
+    return NULL;
+}
+
+int sg_diff_combined_from_trees(const char *git_dir,
+                                const unsigned char (*parent_trees)[SG_SHA1_RAW_LEN],
+                                size_t parent_count,
+                                const unsigned char result_tree[SG_SHA1_RAW_LEN],
+                                sg_diff_list *out, size_t *row_count, char *bad_path)
+{
+    sg_flat_list *parents;
+    sg_flat_list result_flat;
+    size_t *parent_cursor;
+    size_t result_cursor = 0;
+    size_t i;
+    int rc = 0;
+    int result_flattened = 0;
+
+    memset(out, 0, sizeof(*out));
+    *row_count = 0;
+
+    parents = calloc(parent_count, sizeof(*parents));
+    parent_cursor = calloc(parent_count, sizeof(*parent_cursor));
+    if (parents == NULL || parent_cursor == NULL) {
+        free(parents);
+        free(parent_cursor);
+        return -1;
+    }
+
+    for (i = 0; i < parent_count; i++) {
+        rc = sg_tree_flatten(git_dir, parent_trees[i], &parents[i], bad_path);
+        if (rc != 0)
+            goto done;
+    }
+    rc = sg_tree_flatten(git_dir, result_tree, &result_flat, bad_path);
+    if (rc != 0)
+        goto done;
+    result_flattened = 1;
+
+    for (;;) {
+        const char *min_path = NULL;
+
+        for (i = 0; i < parent_count; i++) {
+            size_t c = parent_cursor[i];
+
+            if (c < parents[i].count &&
+               (min_path == NULL || strcmp(parents[i].entries[c].path, min_path) < 0))
+                min_path = parents[i].entries[c].path;
+        }
+        if (result_cursor < result_flat.count &&
+           (min_path == NULL || strcmp(result_flat.entries[result_cursor].path, min_path) < 0))
+            min_path = result_flat.entries[result_cursor].path;
+        if (min_path == NULL)
+            break;
+
+        {
+            /* Own a copy: `min_path` currently points into one of the flat
+               lists we are about to advance cursors through below, and
+               list_append itself may reallocate `out->entries`, neither of
+               which may outlive the pointer. */
+            char path[SG_PATH_MAX];
+            const sg_flat_entry *result_e;
+            /* Captured for parent_count == 2's sake as the loop below walks
+               every parent anyway -- avoids a second lookup per parent. Only
+               meaningful once the loop has actually reached that index,
+               which "differs_from_all still 1" guarantees for every i (a
+               `break` on a match would short-circuit it, but that also
+               means the row is excluded and p0e/p1e are never used). */
+            const sg_flat_entry *p0e = NULL;
+            const sg_flat_entry *p1e = NULL;
+            int differs_from_all = 1;
+
+            if (strlen(min_path) >= sizeof(path)) {
+                rc = -1;
+                goto done;
+            }
+            strcpy(path, min_path);
+
+            result_e = flat_advance_to(&result_flat, &result_cursor, path);
+
+            for (i = 0; i < parent_count; i++) {
+                const sg_flat_entry *pe = flat_advance_to(&parents[i], &parent_cursor[i], path);
+                int equal;
+
+                if (i == 0)
+                    p0e = pe;
+                else if (i == 1)
+                    p1e = pe;
+
+                if (pe == NULL && result_e == NULL)
+                    equal = 1;
+                else if (pe == NULL || result_e == NULL)
+                    equal = 0;
+                else
+                    equal = pe->mode == result_e->mode &&
+                           memcmp(pe->sha1, result_e->sha1, SG_SHA1_RAW_LEN) == 0;
+                if (equal) {
+                    differs_from_all = 0;
+                    break;
+                }
+            }
+
+            if (differs_from_all) {
+                (*row_count)++;
+                if (parent_count == 2) {
+                    sg_diff_side p0_side = p0e != NULL ? side_blob(p0e->mode, p0e->sha1) : side_absent();
+                    sg_diff_side p1_side = p1e != NULL ? side_blob(p1e->mode, p1e->sha1) : side_absent();
+                    sg_diff_side result_side = result_e != NULL
+                                                    ? side_blob(result_e->mode, result_e->sha1)
+                                                    : side_absent();
+
+                    if (list_append(out, path, &p0_side, &result_side) != 0) {
+                        rc = -1;
+                        goto done;
+                    }
+                    out->entries[out->count - 1].ours = p0_side;
+                    out->entries[out->count - 1].theirs = p1_side;
+                    out->entries[out->count - 1].result = result_side;
+                    out->entries[out->count - 1].combined_row = 1;
+                }
+            }
+        }
+
+        for (i = 0; i < parent_count; i++) {
+            size_t c = parent_cursor[i];
+
+            if (c < parents[i].count && strcmp(parents[i].entries[c].path, min_path) == 0)
+                parent_cursor[i]++;
+        }
+        if (result_cursor < result_flat.count &&
+           strcmp(result_flat.entries[result_cursor].path, min_path) == 0)
+            result_cursor++;
+    }
+    rc = 0;
+
+done:
+    for (i = 0; i < parent_count; i++)
+        sg_flat_list_free(&parents[i]);
+    free(parents);
+    free(parent_cursor);
+    if (result_flattened)
+        sg_flat_list_free(&result_flat);
+    if (rc != 0)
+        sg_diff_list_free(out);
     return rc;
 }
 

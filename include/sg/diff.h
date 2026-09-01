@@ -136,6 +136,13 @@ typedef struct {
        `include_unchanged` parameter); sg_diff_index_workdir never does, see
        its own function comment for why. */
     int unchanged;
+    /* Phase 55b: this row is a merge commit's combined row, built from
+       parent trees rather than from index stages, so it is combined by
+       construction -- the ours/theirs/result shape rules above cannot
+       express "added in the merge" (both parents ABSENT) or "deleted in the
+       merge" (result ABSENT, nothing unmerged). Set only by
+       sg_diff_combined_from_trees. */
+    int combined_row;
 } sg_diff_entry;
 
 /* Whether a row should render as a combined diff instead of an ordinary
@@ -151,7 +158,17 @@ typedef struct {
    Phase 40 rev-mode pass (producer 2) does NOT -- git falls back to an
    ordinary "deleted file mode" row instead (SPEC section 3, fixture D).
    Collapsing the two into one unconditional rule breaks whichever side you
-   didn't measure last. */
+   didn't measure last.
+
+   Phase 55b's `combined_row` is checked FIRST and short-circuits the rest:
+   a merge commit's own combined rows (sg_diff_combined_from_trees) can have
+   BOTH ours and theirs ABSENT (a path added by the merge itself, present in
+   neither parent) or a deleted result with nothing unmerged (a path the
+   merge resolved by removing), neither of which the ours/theirs/unmerged/
+   result shape above can express. Do not loosen the ours/theirs/result
+   rule itself to cover these -- that rule is pinned on both sides by
+   interop for its own two producers; add a new shape instead, as this one
+   is. */
 int sg_diff_entry_is_combined(const sg_diff_entry *e);
 
 typedef struct {
@@ -202,6 +219,42 @@ int sg_diff_trees(const char *git_dir, const unsigned char *old_tree,
    flattening itself. Returns 0 or -1, never -2. */
 int sg_diff_from_flat_lists(const sg_flat_list *old_flat, const sg_flat_list *new_flat,
                             sg_diff_list *out, int include_unchanged);
+
+/* Phase 55b: the rows `git show <merge>` renders as `diff --cc`. Not one of
+   the four builders above -- it does not compare two sides, it compares
+   `parent_count` parent trees against one result tree, and a path is
+   included iff the result differs from EVERY parent (mode, id, or presence
+   -- "absent" differs from any present side). Measured against git 2.55.0:
+   a path whose content id equals one parent exactly but whose MODE does not
+   is still included (git's `mode 100755,100644..100755` row, no id-only
+   comparison suffices).
+
+   `parent_trees` is `parent_count` tree ids (parent 1 first, in commit
+   order), `result_tree` the merge commit's own tree.
+
+   `*row_count` is always set to how many paths qualify, for ANY
+   `parent_count` -- this is what lets a caller tell a clean octopus merge
+   (0) from one it cannot render (> 0) without needing `out` filled in.
+   `out` itself is only populated when `parent_count == 2`, because the
+   `diff --cc` renderer is fixed at two parents; for any other count `out`
+   is left an empty, zeroed list and only `*row_count` is meaningful.
+
+   For a two-parent row: `ours` = parent 1's side, `theirs` = parent 2's
+   side, `result` = the result's side (ABSENT where the path is missing from
+   the merge), `combined_row = 1`, `unmerged = 0`. `old_side`/`new_side` are
+   also filled, from parent 1 and the result respectively, so the entry
+   stays coherent for any code that reads those instead. Every side is
+   SG_DIFF_SIDE_BLOB (tree entry mode/id), built the same way sg_diff_trees
+   builds one.
+
+   Returns 0, -1, or -2 (a tree entry name fails sg_path_component_is_safe,
+   `bad_path` filled -- SG_PATH_MAX bytes, may be NULL) -- sg_tree_flatten's
+   own contract, propagated the same way sg_diff_trees propagates it. */
+int sg_diff_combined_from_trees(const char *git_dir,
+                                const unsigned char (*parent_trees)[SG_SHA1_RAW_LEN],
+                                size_t parent_count,
+                                const unsigned char result_tree[SG_SHA1_RAW_LEN],
+                                sg_diff_list *out, size_t *row_count, char *bad_path);
 
 /* tree vs index -- `sg diff --cached`. A path carrying stage 1/2/3 entries has
    no single staged blob to diff against and yields exactly one row, with
