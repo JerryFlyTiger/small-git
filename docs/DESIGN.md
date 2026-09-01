@@ -9303,3 +9303,87 @@ changes something other than the property under test is indistinguishable
 from a missing test**, and the tell was that the mutation had no plausible
 reason to be inert. Escaping the `$` on both sides turned it red
 immediately.
+
+## Phase 54 item B: `sg log`'s flags
+
+Before this, `sg log` took **no arguments at all** -- `usage: sg log`, with
+every flag rejected, including `<rev>`. It now takes `-n <count>`,
+`-<count>`, `--max-count=<count>`, `--oneline`, `-p`/`--patch`, `--stat`,
+and a single `<rev>`.
+
+`-p` and `--stat` are almost entirely reuse: the commit's diff is its first
+parent's tree against its own (the empty tree for a root commit), built with
+`sg_diff_trees` and rendered by `sg_diff_print`, which has been byte-exact
+against git since Phase 26. What had to be measured was not the diff, it was
+where the diff sits inside the entry.
+
+### 1. Composition, measured in all four combinations
+
+| entry format | flags | what introduces the diff |
+|---|---|---|
+| default | `-p` | one blank line |
+| default | `--stat` | one blank line |
+| default | `-p --stat` | a literal `---` line, then the stat, then a blank line, then the patch |
+| `--oneline` | any of them | nothing at all, and no `---` even with both |
+| either | the diff is EMPTY | nothing at all |
+
+The `---` line is the trap: a rule that always printed it would satisfy the
+`-p --stat` comparison and fail `-p` alone, which is why interop pins the
+negative separately (`-p` alone must contain no `---` line).
+
+The empty-diff row matters more than it looks, because an empty commit is
+easy to have in a fixture: git prints no separator, no blank line and no
+`---` for it, so the separators belong to the diff rather than to the entry.
+
+`--oneline` entries carry no blank line between them either, with or without
+a diff attached. An empty message renders as `<abbrev> ` -- the separating
+space is printed even when there is no subject to follow it.
+
+### 2. A merge DOES get a diff here, and that follows from Phase 2's scope
+
+Measured, both directions: plain `git log -p` prints **no** diff for a merge
+commit, while `git log --first-parent -p` prints the diff **against parent
+1**. sg's walk is first-parent-only, so it agrees with the second. The flag
+behaviour is therefore not an independent decision -- it falls out of the
+scope decision item A already pinned, which is exactly why the oracle for
+both items is the same `--first-parent` command.
+
+### 3. Rename detection is ON, because git's is
+
+`diff.renames` has defaulted to true since git 2.9, so `git log -p` prints
+`rename from`/`rename to` rather than a delete plus an add. `log`'s diff
+therefore runs `sg_diff_detect_renames` at `SG_SIMILARITY_DEFAULT`, and the
+interop fixture contains a rename-with-an-edit specifically so this is
+pinned -- with a precondition check asserting git itself calls that commit a
+rename, so the fixture cannot silently stop testing it.
+
+### 4. Deliberately not implemented
+
+- **`-- <pathspec>`**. Path-limited history is not a filter over the same
+  walk, it is git's history *simplification* (which commits are even
+  considered interesting once a path is named), and approximating it would
+  give a wrong answer wearing the right flag -- the same reasoning that
+  keeps `--patience` rejected rather than approximated (Phase 42).
+- `--graph`, `--format`/`--pretty=<fmt>`, `--date=<fmt>`, `--author=`/
+  `--grep=`, `--reverse`, `--all`. Each is a separate output or selection
+  language; none is approximated.
+- `-c`/`--cc` for merges: sg has combined-diff rendering (Phase 34) but
+  wiring it into log means walking more than the first parent, which is item
+  A's pinned scope boundary.
+
+All of these are rejected as unknown flags with the usage line and exit 1,
+never silently ignored.
+
+### 5. Acceptance
+
+16 flag combinations compared byte-for-byte against
+`git log --first-parent` on a fixture carrying an edit, a rename with an
+edit, an empty commit, a root commit and a merge: **16/16 identical**. Ten
+of them are pinned in interop, plus the `-n 0` pair (prints nothing, exits
+0), the `---`-only-with-both negative, and unknown-flag rejection.
+
+Every new rule was proven able to fail by mutation: collapsing `---` into a
+blank line, turning rename detection off, giving `--oneline` a blank line
+before its diff, removing the empty-diff early return, reading `-n 0` as
+unlimited, and widening the abbreviation to 8. The full table is in the
+commit message; each turned exactly the checks it should have red.

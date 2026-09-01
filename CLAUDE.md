@@ -284,9 +284,40 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   even the leading blank line, and entries are separated by one blank line
   with **none after the last** -- so the separator goes BEFORE every entry
   but the first. An empty-message entry in the middle is what distinguishes
-  the two models. Abbreviations in the `Merge:` line are hard-coded to 7
-  while git's default `core.abbrev=auto` scales with object count; that has
-  to be settled when `--oneline` lands.
+  the two models. Abbreviations are hard-coded to 7 (the `Merge:` line and
+  `--oneline`) while git's default `core.abbrev=auto` scales with object
+  count; interop declares `core.abbrev=7` on git's side rather than
+  pretending the two policies agree.
+- **`sg log` takes `-n <count>` / `-<count>` / `--max-count=`, `--oneline`,
+  `-p`/`--patch`, `--stat` and a single `<rev>`** (Phase 54). `-p`/`--stat`
+  are reuse -- the commit's first-parent tree against its own, through
+  `sg_diff_trees` + `sg_diff_print` -- so what needed measuring was where the
+  diff sits inside the entry, not the diff.
+  WARNING: **the `---` line appears ONLY when `-p` and `--stat` are both
+  on.** With `-p` alone git introduces the diff with a blank line, so a rule
+  that always printed `---` passes the combined check and fails the plain
+  one; interop pins the negative separately. `--oneline` introduces its diff
+  with **nothing**, and never prints `---`.
+  WARNING: **an EMPTY diff prints no separator at all** -- no blank line, no
+  `---`. The separators belong to the diff, not to the entry, and an empty
+  commit in a fixture is what makes the difference observable.
+  WARNING: **a merge DOES get a diff, against parent 1**, because sg's walk
+  is first-parent-only and that is what `git log --first-parent -p` does
+  (measured; plain `git log -p` prints nothing for a merge). This is not an
+  independent choice, it falls out of the scope boundary above.
+  WARNING: **rename detection is ON** at `SG_SIMILARITY_DEFAULT`, because
+  git's `diff.renames` has defaulted to true since 2.9 and `git log -p`
+  prints `rename from`/`rename to`. The interop fixture carries a
+  rename-with-an-edit plus a precondition asserting git itself calls it a
+  rename.
+  WARNING: **`-n 0` is a legal request for nothing**, not an error and not
+  "unlimited": git prints nothing and exits 0.
+  **Deliberately not implemented: `-- <pathspec>`** (path-limited history is
+  git's history SIMPLIFICATION, not a filter over the same walk -- the same
+  reason `--patience` is rejected rather than approximated), `--graph`,
+  `--format`/`--pretty`, `--date=`, `--author=`/`--grep=`, `--reverse`,
+  `--all`, and `-c`/`--cc`. All are rejected with the usage line and exit 1,
+  never silently ignored.
 - **Joining `base/rel` always goes through `sg_path_join`**
   (`include/sg/workdir.h`, Phase 21), buffer size uses `SG_PATH_MAX` from the
   same header. **Do not write a raw

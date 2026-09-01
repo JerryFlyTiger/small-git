@@ -13562,6 +13562,105 @@ check "phase54: sg log ends without a trailing blank line" \
 check "phase54: sg log deliberately differs from a full-history git log" \
     sh -c '! cmp -s "$0" "$1"' "$WORKDIR/p54_sg.txt" "$WORKDIR/p54_git_allparents.txt"
 
+# --- Phase 54b: `sg log`'s flags. Same oracle and the same pinned knobs as
+# the group above; a SECOND fixture because that one is all empty commits and
+# a flag group needs real content -- an edit, a rename with an edit (git's
+# diff.renames has defaulted to on since 2.9, so `git log -p` prints
+# `rename from`/`rename to` and sg must detect renames to match), an empty
+# commit, and a merge.
+#
+# The merge is the interesting row: plain `git log -p` prints NO diff for a
+# merge, while `git log --first-parent -p` prints the diff against parent 1
+# (measured, both directions). sg's walk IS first-parent-only, so it agrees
+# with the second -- the flag behaviour follows from the scope decision
+# rather than being a separate choice.
+P54B="$WORKDIR/p54b_flags"
+mkdir -p "$P54B"
+(cd "$P54B" && LC_ALL=C git init -q .) > /dev/null 2>&1
+p54bcommit() {
+    ( cd "$P54B" &&
+      GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+      GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+      GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+      LC_ALL=C git commit -q --allow-empty --allow-empty-message -m "$1" ) > /dev/null 2>&1
+}
+printf 'one\ntwo\nthree\n' > "$P54B/f.txt"
+(cd "$P54B" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+p54bcommit "root commit"
+printf 'one\ntwo CHANGED\nthree\n' > "$P54B/f.txt"
+(cd "$P54B" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+p54bcommit "edit f"
+mv "$P54B/f.txt" "$P54B/renamed.txt"
+printf 'four\n' >> "$P54B/renamed.txt"
+(cd "$P54B" && LC_ALL=C git add -A) > /dev/null 2>&1
+p54bcommit "rename with an edit"
+p54bcommit "an empty commit"
+P54B_BRANCH=$(cd "$P54B" && LC_ALL=C git rev-parse --abbrev-ref HEAD 2>/dev/null)
+(cd "$P54B" && LC_ALL=C git checkout -qb p54bside HEAD~2) > /dev/null 2>&1
+printf 's\n' > "$P54B/s.txt"
+(cd "$P54B" && LC_ALL=C git add s.txt) > /dev/null 2>&1
+p54bcommit "side work"
+(cd "$P54B" && LC_ALL=C git checkout -q "$P54B_BRANCH") > /dev/null 2>&1
+( cd "$P54B" &&
+  GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git merge -q --no-ff p54bside -m "merge side" ) > /dev/null 2>&1
+
+# $1 = tag, $2... = flags shared by both sides (--oneline included: git takes
+# it as a --pretty, sg as its own flag, and it is spelled the same).
+p54b_cmp() {
+    p54btag="$1"; shift
+    (cd "$P54B" && LC_ALL=C git $P54_GIT_PINS log $P54_LOG_FLAGS "$@") \
+        > "$WORKDIR/p54b_git_$p54btag.txt" 2>&1
+    (cd "$P54B" && "$SG" log "$@") > "$WORKDIR/p54b_sg_$p54btag.txt" 2>&1
+}
+p54b_cmp oneline --oneline
+p54b_cmp patch -p
+p54b_cmp stat --stat
+p54b_cmp patchstat -p --stat
+p54b_cmp onelinepatch --oneline -p
+p54b_cmp count -n 2
+p54b_cmp barecount -3
+p54b_cmp zero -n 0
+p54b_cmp rev HEAD~2
+p54b_cmp revpatch -p HEAD~1
+
+check "phase54 oracle: precondition -- the fixture's rename is one git reports as a rename" \
+    sh -c 'grep -q "^rename from " "$0"' "$WORKDIR/p54b_git_patch.txt"
+check "phase54: sg log --oneline matches git" \
+    cmp -s "$WORKDIR/p54b_sg_oneline.txt" "$WORKDIR/p54b_git_oneline.txt"
+check "phase54: sg log -p matches git (merge diffs against parent 1, renames detected)" \
+    cmp -s "$WORKDIR/p54b_sg_patch.txt" "$WORKDIR/p54b_git_patch.txt"
+check "phase54: sg log --stat matches git" \
+    cmp -s "$WORKDIR/p54b_sg_stat.txt" "$WORKDIR/p54b_git_stat.txt"
+check "phase54: sg log -p --stat matches git, including the --- separator" \
+    cmp -s "$WORKDIR/p54b_sg_patchstat.txt" "$WORKDIR/p54b_git_patchstat.txt"
+check "phase54: sg log --oneline -p matches git (no blank line before the diff)" \
+    cmp -s "$WORKDIR/p54b_sg_onelinepatch.txt" "$WORKDIR/p54b_git_onelinepatch.txt"
+check "phase54: sg log -n <count> matches git" \
+    cmp -s "$WORKDIR/p54b_sg_count.txt" "$WORKDIR/p54b_git_count.txt"
+check "phase54: sg log -<count> matches git" \
+    cmp -s "$WORKDIR/p54b_sg_barecount.txt" "$WORKDIR/p54b_git_barecount.txt"
+check "phase54: sg log <rev> matches git" \
+    cmp -s "$WORKDIR/p54b_sg_rev.txt" "$WORKDIR/p54b_git_rev.txt"
+check "phase54: sg log -p <rev> matches git" \
+    cmp -s "$WORKDIR/p54b_sg_revpatch.txt" "$WORKDIR/p54b_git_revpatch.txt"
+# -n 0 is a legal request for nothing, not an error: git prints nothing and
+# exits 0, so an implementation that treated 0 as "unlimited" would differ
+# only here.
+check "phase54: sg log -n 0 prints nothing" \
+    sh -c 'test ! -s "$0"' "$WORKDIR/p54b_sg_zero.txt"
+(cd "$P54B" && "$SG" log -n 0) > /dev/null 2>&1
+check "phase54: sg log -n 0 still exits 0" test $? = 0
+# The `---` line only appears when BOTH are on: with -p alone git introduces
+# the diff with a blank line instead, so a rule that always printed `---`
+# would pass the combined check and fail this one.
+check "phase54: -p alone introduces the diff with no --- line" \
+    sh -c '! grep -q "^---$" "$0"' "$WORKDIR/p54b_sg_patch.txt"
+(cd "$P54B" && "$SG" log --nosuchflag) > /dev/null 2>&1
+check "phase54: sg log rejects an unknown flag" test $? = 1
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
