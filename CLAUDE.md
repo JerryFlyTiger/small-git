@@ -251,6 +251,73 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `sg_read_file`, `sg_write_file_mkdirs`, `sg_hash_file_blob`). Go look for
   path utilities in `workdir.h`, not in `util/`, and do not write another
   copy.
+- **Rendering a commit timestamp for a human always goes through
+  `sg_date_format_normal`** (`include/sg/date.h`, Phase 54) -- git's
+  DATE_NORMAL, the `Date:` line of `git log` and `%ad`. It returns the whole
+  field including the offset, so no caller assembles half of it.
+  WARNING: **the clock shown is the epoch SHIFTED INTO the stored offset**,
+  not UTC and not the machine's local time. `sg log` used to render UTC while
+  printing the stored `+0800` beside it, so every date it ever showed was
+  wrong by the offset -- eight hours here -- and contradicted itself in its
+  own output. Nothing caught it because nothing had ever compared `sg log`
+  to `git log`; the pre-existing checks assert exit codes or scrape
+  `head -1` for the sha.
+  WARNING: **the day of month is NOT zero-padded** (`Jan 1`, not `Jan 01`),
+  and the weekday/month names come from git's own hard-coded English tables,
+  **not `strftime`'s `%a`/`%b`** -- those follow the locale, and one
+  `setlocale` call anywhere in the process would silently translate a format
+  whose entire job is to match git byte for byte.
+  WARNING: **`cmd_undo.c` has its own date formatter and must not be
+  converged onto this one.** `sg undo` has no real-git counterpart, so it has
+  no oracle; it deliberately prints local time in ISO form.
+  WARNING: **`sg log`'s oracle is `git log --first-parent`**, because sg's
+  walk is first-parent-only by Phase 2 scope -- against a full `git log` the
+  two legitimately visit different commit SETS. Interop pins the rendering
+  against `--first-parent` AND pins the scope boundary separately (sg's
+  output must NOT equal a full walk), so teaching sg to walk every parent
+  turns a check red by name instead of quietly changing what the rendering
+  checks compare. Four git config knobs were measured to move that oracle
+  (`log.decorate`, `core.abbrev`, `log.date`, `format.pretty` /
+  `log.abbrevCommit`) and are pinned on the command line, with a
+  precondition check proving the pins beat a hostile config.
+  WARNING: **an empty commit message prints no message block at all**, not
+  even the leading blank line, and entries are separated by one blank line
+  with **none after the last** -- so the separator goes BEFORE every entry
+  but the first. An empty-message entry in the middle is what distinguishes
+  the two models. Abbreviations are hard-coded to 7 (the `Merge:` line and
+  `--oneline`) while git's default `core.abbrev=auto` scales with object
+  count; interop declares `core.abbrev=7` on git's side rather than
+  pretending the two policies agree.
+- **`sg log` takes `-n <count>` / `-<count>` / `--max-count=`, `--oneline`,
+  `-p`/`--patch`, `--stat` and a single `<rev>`** (Phase 54). `-p`/`--stat`
+  are reuse -- the commit's first-parent tree against its own, through
+  `sg_diff_trees` + `sg_diff_print` -- so what needed measuring was where the
+  diff sits inside the entry, not the diff.
+  WARNING: **the `---` line appears ONLY when `-p` and `--stat` are both
+  on.** With `-p` alone git introduces the diff with a blank line, so a rule
+  that always printed `---` passes the combined check and fails the plain
+  one; interop pins the negative separately. `--oneline` introduces its diff
+  with **nothing**, and never prints `---`.
+  WARNING: **an EMPTY diff prints no separator at all** -- no blank line, no
+  `---`. The separators belong to the diff, not to the entry, and an empty
+  commit in a fixture is what makes the difference observable.
+  WARNING: **a merge DOES get a diff, against parent 1**, because sg's walk
+  is first-parent-only and that is what `git log --first-parent -p` does
+  (measured; plain `git log -p` prints nothing for a merge). This is not an
+  independent choice, it falls out of the scope boundary above.
+  WARNING: **rename detection is ON** at `SG_SIMILARITY_DEFAULT`, because
+  git's `diff.renames` has defaulted to true since 2.9 and `git log -p`
+  prints `rename from`/`rename to`. The interop fixture carries a
+  rename-with-an-edit plus a precondition asserting git itself calls it a
+  rename.
+  WARNING: **`-n 0` is a legal request for nothing**, not an error and not
+  "unlimited": git prints nothing and exits 0.
+  **Deliberately not implemented: `-- <pathspec>`** (path-limited history is
+  git's history SIMPLIFICATION, not a filter over the same walk -- the same
+  reason `--patience` is rejected rather than approximated), `--graph`,
+  `--format`/`--pretty`, `--date=`, `--author=`/`--grep=`, `--reverse`,
+  `--all`, and `-c`/`--cc`. All are rejected with the usage line and exit 1,
+  never silently ignored.
 - **Joining `base/rel` always goes through `sg_path_join`**
   (`include/sg/workdir.h`, Phase 21), buffer size uses `SG_PATH_MAX` from the
   same header. **Do not write a raw

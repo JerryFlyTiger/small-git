@@ -9144,3 +9144,246 @@ job -- **a fix found by review has, by construction, no test guarding it**,
 so each of the four was re-verified by reverse mutation (turn the fix back
 into the flawed version, confirm the number moves), not by rerunning a
 green suite.
+
+## Phase 54 item A: `sg log` had no oracle, and was eight hours wrong
+
+`sg log` existed since Phase 2 and nothing had ever compared its output to
+real git's. The pre-existing interop checks around it assert exit codes
+("sg log exits 0 on a real-git repo"), or scrape `head -1` for a sha. Four
+minutes of actually diffing the two outputs found four divergences, one of
+them a plain wrong answer.
+
+### 1. What was wrong
+
+| | sg printed | git prints |
+|---|---|---|
+| the clock | `gmtime(author_time)` -- **UTC** | `gmtime(author_time + offset)` |
+| the offset beside it | the stored one, e.g. `+0800` | the stored one |
+| day of month | `%d` via strftime, zero-padded (`Sep 01`) | unpadded (`Sep 1`) |
+| after a message | two newlines, so a trailing blank line | one blank line BETWEEN entries, none after the last |
+| weekday/month names | `strftime`'s `%a`/`%b`, locale-dependent | git's own hard-coded English tables |
+
+The first row is the real bug and it is self-contradicting: the timestamp
+was rendered in UTC while `+0800` was printed next to it, so every date
+`sg log` ever showed on this machine was eight hours early **and said so in
+its own output**. Measured: stored `1788258269 +0800`, git renders
+`Tue Sep 1 18:24:29 2026 +0800`, sg rendered `Tue Sep 01 10:24:29 2026
++0800`.
+
+The last row was latent rather than active: a C program is in the "C"
+locale until something calls `setlocale`, and nothing in sg does, so
+`%a`/`%b` happened to produce English. It is still wrong -- one
+`setlocale(LC_ALL, "")` anywhere in the process would have silently
+translated the output of a format whose whole job is to match git byte for
+byte. The port uses git's own tables instead of relying on that.
+
+### 2. The rule, measured
+
+`src/util/date.c`'s `sg_date_format_normal` is a pure byte-conversion
+function (same shape as `util/quote.c` and `util/wildmatch.c`), so the table
+below is a unit test rather than something only reachable through a
+subprocess. Every expectation came from real git 2.55.0 via
+`git log -1 --date=default --format=%ad` on a commit created with an
+explicit `GIT_AUTHOR_DATE`, never from sg:
+
+| stored | git renders | axis |
+|---|---|---|
+| `1700000000 +0000` | `Tue Nov 14 22:13:20 2023 +0000` | baseline |
+| `1700000000 +0800` | `Wed Nov 15 06:13:20 2023 +0800` | positive offset rolls the day |
+| `1700000000 -0500` | `Tue Nov 14 17:13:20 2023 -0500` | negative offset |
+| `1700000000 +0530` | `Wed Nov 15 03:43:20 2023 +0530` | half-hour offset |
+| `0 +0000` | `Thu Jan 1 00:00:00 1970 +0000` | epoch, single-digit day |
+| `3600 -0100` | `Thu Jan 1 00:00:00 1970 -0100` | shifts exactly onto zero |
+| `1751328000 -0700` | `Mon Jun 30 17:00:00 2025 -0700` | rolls back a day |
+
+The offset is **echoed verbatim, never recomputed**, so an offset git itself
+would not have written survives round-trip.
+
+### 3. Message and separator rules, measured
+
+- Every message line is indented four spaces, **including a blank one**:
+  a body of `line one\n\nline three\n` renders as
+  `    line one\n    \n    line three\n`. The indent is unconditional.
+- An **empty message prints no block at all** -- not even the leading blank
+  line. The entry is its header lines and nothing else.
+- Entries are separated by exactly one blank line, and there is **none after
+  the last**. The separator therefore belongs BEFORE every entry except the
+  first, not after each one. An empty-message entry in the middle proves
+  which of the two models git uses: it still gets the separator, so the
+  blank line cannot be part of the message block.
+- Keeping the separator in front also leaves `sg log`'s first line a bare
+  `commit <sha>`, which pre-existing interop checks parse with `head -1`.
+- The `Merge:` line already matched: git prints every parent, abbreviated,
+  space-separated.
+
+### 4. The oracle is `git log --first-parent`, and it is a scope decision
+
+sg's walk is deliberately first-parent-only (Phase 2 scope). On a repo
+containing a merge, `git log` and `sg log` therefore visit different commit
+SETS, and comparing against a full walk would fold that scope decision into
+every rendering assertion -- the cmp would be red for a reason that has
+nothing to do with rendering. The interop group compares against
+`git log --first-parent` and **pins the scope boundary separately**: one
+check asserts that sg's output does NOT equal a full-history `git log`. If
+sg ever learns to walk every parent, that check turns red and names itself
+instead of the rendering checks quietly starting to compare a different set.
+
+Four knobs were **measured** to move git's output and are pinned on the
+command line rather than trusted:
+
+| knob | what it does to the output |
+|---|---|
+| `log.decorate=full` | appends `(HEAD -> refs/heads/master)` to the commit line |
+| `core.abbrev=12` | widens the `Merge:` line's abbreviations |
+| `log.date=iso` | rewrites the Date line |
+| `format.pretty=oneline`, `log.abbrevCommit=true` | replace the format outright |
+
+The group carries a precondition check that runs the same oracle command
+with all five hostile settings applied BEFORE the pins -- which is where a
+user's `~/.gitconfig` effectively sits, since a later `-c` wins -- and
+cmp's it against the clean run. A pin that stopped working would otherwise
+show up as an unexplained failure in the byte comparison.
+
+`LC_ALL=C` follows this file's existing convention. Measured on this
+zh_TW-localized machine, git does **not** translate the `Author:`/`Date:`
+labels, so here it is insurance rather than the load-bearing pin.
+
+### 5. Deliberately not reproduced: git's own pre-epoch failure
+
+A commit whose timestamp plus offset is negative makes **real git fail**,
+not render differently. Measured on a hand-crafted but well-formed object
+(`author T <t@t> 100 -0100`, written with `git hash-object -t commit -w`):
+`git log -1 <sha>` exits **128** and prints only the `commit <sha>` line --
+no `Author:`, no `Date:`, no message. `3600 -0100` (which shifts to exactly
+zero) renders normally, so the boundary is at zero, not at the stored
+value.
+
+sg renders such a commit with the ordinary rule, giving a 1969 date. This
+is **not** added to the deliberate-divergence list and is not pinned in
+interop, for the same reason Phase 48's reflog-file case is not: reaching
+it requires hand-crafting an object, and pinning git's own error path would
+be pinning a git limitation rather than a format decision.
+
+### 6. Known limitation, deliberately left for the flag work
+
+Abbreviated shas in the `Merge:` line are hard-coded to 7. git's default is
+`core.abbrev=auto`, which **scales with the repository's object count**, so
+the two agree only on small repositories. The oracle pins `core.abbrev=7`
+rather than pretending otherwise. This has to be settled properly when
+`--oneline` lands, since that flag makes the abbreviation the primary
+output rather than a detail of one line.
+
+### 7. Verification: every new check proven able to fail
+
+| check | mutation | result |
+|---|---|---|
+| the measured date table | `time_sec + offset` -> `time_sec + 0` | red, 8 cases named, each printing git's answer |
+| the measured date table | day `%d` -> `%02d` | red, 7 cases named |
+| the byte comparison | separator suppressed | red |
+| the byte comparison | empty message prints its block anyway | red |
+| the byte comparison **and** "ends without a trailing blank line" | restore the old trailing newline after every entry | **both** red |
+| "the pinned flags beat a hostile git config" | drop the `--no-decorate` pin | red, and only that check |
+| "deliberately differs from a full-history git log" | capture the full walk with `--first-parent` too | red |
+
+The timezone and padding rules were mutated against the unit binary rather
+than interop, because that is the gate that guards them; the interop Date
+checks read the same function through a subprocess.
+
+Not witnessed, and deliberately: the "the fixture has a merge commit to
+render" precondition. Its failure mode is that the fixture stopped
+containing a merge, which the byte comparison would report anyway.
+
+One process note. The scope-boundary mutation came back GREEN on the first
+attempt and looked exactly like a blind spot. It was not: the perl
+replacement contained `$WORKDIR` unescaped, so perl interpolated an
+undefined variable and the mutation redirected the capture to a path that
+could not be written, instead of changing the command being captured. The
+check then compared against a missing file and passed. **A mutation that
+changes something other than the property under test is indistinguishable
+from a missing test**, and the tell was that the mutation had no plausible
+reason to be inert. Escaping the `$` on both sides turned it red
+immediately.
+
+## Phase 54 item B: `sg log`'s flags
+
+Before this, `sg log` took **no arguments at all** -- `usage: sg log`, with
+every flag rejected, including `<rev>`. It now takes `-n <count>`,
+`-<count>`, `--max-count=<count>`, `--oneline`, `-p`/`--patch`, `--stat`,
+and a single `<rev>`.
+
+`-p` and `--stat` are almost entirely reuse: the commit's diff is its first
+parent's tree against its own (the empty tree for a root commit), built with
+`sg_diff_trees` and rendered by `sg_diff_print`, which has been byte-exact
+against git since Phase 26. What had to be measured was not the diff, it was
+where the diff sits inside the entry.
+
+### 1. Composition, measured in all four combinations
+
+| entry format | flags | what introduces the diff |
+|---|---|---|
+| default | `-p` | one blank line |
+| default | `--stat` | one blank line |
+| default | `-p --stat` | a literal `---` line, then the stat, then a blank line, then the patch |
+| `--oneline` | any of them | nothing at all, and no `---` even with both |
+| either | the diff is EMPTY | nothing at all |
+
+The `---` line is the trap: a rule that always printed it would satisfy the
+`-p --stat` comparison and fail `-p` alone, which is why interop pins the
+negative separately (`-p` alone must contain no `---` line).
+
+The empty-diff row matters more than it looks, because an empty commit is
+easy to have in a fixture: git prints no separator, no blank line and no
+`---` for it, so the separators belong to the diff rather than to the entry.
+
+`--oneline` entries carry no blank line between them either, with or without
+a diff attached. An empty message renders as `<abbrev> ` -- the separating
+space is printed even when there is no subject to follow it.
+
+### 2. A merge DOES get a diff here, and that follows from Phase 2's scope
+
+Measured, both directions: plain `git log -p` prints **no** diff for a merge
+commit, while `git log --first-parent -p` prints the diff **against parent
+1**. sg's walk is first-parent-only, so it agrees with the second. The flag
+behaviour is therefore not an independent decision -- it falls out of the
+scope decision item A already pinned, which is exactly why the oracle for
+both items is the same `--first-parent` command.
+
+### 3. Rename detection is ON, because git's is
+
+`diff.renames` has defaulted to true since git 2.9, so `git log -p` prints
+`rename from`/`rename to` rather than a delete plus an add. `log`'s diff
+therefore runs `sg_diff_detect_renames` at `SG_SIMILARITY_DEFAULT`, and the
+interop fixture contains a rename-with-an-edit specifically so this is
+pinned -- with a precondition check asserting git itself calls that commit a
+rename, so the fixture cannot silently stop testing it.
+
+### 4. Deliberately not implemented
+
+- **`-- <pathspec>`**. Path-limited history is not a filter over the same
+  walk, it is git's history *simplification* (which commits are even
+  considered interesting once a path is named), and approximating it would
+  give a wrong answer wearing the right flag -- the same reasoning that
+  keeps `--patience` rejected rather than approximated (Phase 42).
+- `--graph`, `--format`/`--pretty=<fmt>`, `--date=<fmt>`, `--author=`/
+  `--grep=`, `--reverse`, `--all`. Each is a separate output or selection
+  language; none is approximated.
+- `-c`/`--cc` for merges: sg has combined-diff rendering (Phase 34) but
+  wiring it into log means walking more than the first parent, which is item
+  A's pinned scope boundary.
+
+All of these are rejected as unknown flags with the usage line and exit 1,
+never silently ignored.
+
+### 5. Acceptance
+
+16 flag combinations compared byte-for-byte against
+`git log --first-parent` on a fixture carrying an edit, a rename with an
+edit, an empty commit, a root commit and a merge: **16/16 identical**. Ten
+of them are pinned in interop, plus the `-n 0` pair (prints nothing, exits
+0), the `---`-only-with-both negative, and unknown-flag rejection.
+
+Every new rule was proven able to fail by mutation: collapsing `---` into a
+blank line, turning rename detection off, giving `--oneline` a blank line
+before its diff, removing the empty-diff early return, reading `-n 0` as
+unlimited, and widening the abbreviation to 8. The full table is in the
+commit message; each turned exactly the checks it should have red.

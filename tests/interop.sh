@@ -13471,6 +13471,196 @@ check "phase52: sg diff --histogram matches git diff --histogram byte-for-byte o
 check "phase52: plain sg diff (Myers) still matches git's Myers default on the same fixture" \
     sh -c "(cd '$P52' && '$SG' diff) > $WORKDIR/p52_sm.txt; cmp -s $WORKDIR/p52_sm.txt $WORKDIR/p52_gm.txt"
 
+# --- Phase 54: `sg log`'s rendering had NO oracle at all before this group,
+# and it was wrong. It applied gmtime() to the stored epoch while still
+# printing the stored offset beside it, so every timestamp was off BY that
+# offset (eight hours on this machine) and contradicted itself in its own
+# output. It also zero-padded the day (git does not) and emitted a trailing
+# blank line. None of the pre-existing log checks could see any of it: they
+# assert exit codes, or scrape `head -1` for the sha.
+#
+# The oracle is `git log --first-parent`, not `git log`: sg's walk is
+# deliberately first-parent-only (Phase 2 scope), so on a repo containing a
+# merge the two commands legitimately visit different commit SETS. Comparing
+# against plain `git log` would fold that scope decision into every
+# rendering assertion. The scope boundary itself is pinned separately below.
+#
+# The fixture is built by GIT, not sg: the timezone axis is the whole point
+# and only git can set an author date (`sg commit` has no --date). Four
+# knobs were MEASURED to move git's output and are therefore pinned on the
+# command line rather than trusted: log.decorate (adds "(HEAD -> ...)" to
+# the commit line), core.abbrev (widens the Merge: line), log.date, and
+# format.pretty / log.abbrevCommit. LC_ALL=C follows this file's existing
+# convention; measured on this zh_TW machine, git does NOT translate the
+# Author:/Date: labels, so it is insurance, not the load-bearing pin.
+P54="$WORKDIR/p54_log"
+P54_GIT_PINS="-c core.abbrev=7"
+P54_LOG_FLAGS="--first-parent --pretty=medium --no-decorate --no-abbrev-commit --date=default"
+# A config as hostile as a real user's ~/.gitconfig, used only to prove the
+# pins above actually win. Deliberately listed BEFORE the pins, which is
+# where a config file's values effectively sit: later -c wins.
+P54_HOSTILE="-c log.decorate=full -c core.abbrev=12 -c log.date=iso -c format.pretty=oneline -c log.abbrevCommit=true"
+
+mkdir -p "$P54"
+(cd "$P54" && LC_ALL=C git init -q .) > /dev/null 2>&1
+p54commit() {
+    ( cd "$P54" &&
+      GIT_AUTHOR_DATE="$1" GIT_COMMITTER_DATE="$1" \
+      GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+      GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+      LC_ALL=C git commit -q --allow-empty --allow-empty-message -m "$2" ) > /dev/null 2>&1
+}
+# One commit per rendering axis: UTC, a positive offset that rolls the date
+# forward, a negative one, a HALF-HOUR one, a single-digit day (the padding
+# bug), a multi-line body whose middle line is blank, and an empty message
+# (which git renders with no message block AND no leading blank line).
+p54commit "@1700000000 +0000" "first commit"
+p54commit "@1700000000 +0800" "positive offset rolls the day"
+p54commit "@1700000000 -0500" "negative offset"
+p54commit "@1700000000 +0530" "half-hour offset"
+p54commit "@1725148800 +0000" "single digit day"
+p54commit "@1700000000 +0100" "body
+
+with a blank line
+and a third"
+p54commit "@1700000000 +0000" ""
+P54_BRANCH=$(cd "$P54" && LC_ALL=C git rev-parse --abbrev-ref HEAD 2>/dev/null)
+(cd "$P54" && LC_ALL=C git checkout -qb p54side HEAD~2) > /dev/null 2>&1
+p54commit "@1700000000 +0000" "on the side branch"
+(cd "$P54" && LC_ALL=C git checkout -q "$P54_BRANCH") > /dev/null 2>&1
+( cd "$P54" &&
+  GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git merge -q --no-ff p54side -m "merge the side branch" ) > /dev/null 2>&1
+
+(cd "$P54" && LC_ALL=C git $P54_GIT_PINS log $P54_LOG_FLAGS) > "$WORKDIR/p54_git.txt" 2>&1
+(cd "$P54" && LC_ALL=C git $P54_HOSTILE $P54_GIT_PINS log $P54_LOG_FLAGS) > "$WORKDIR/p54_git_hostile.txt" 2>&1
+(cd "$P54" && LC_ALL=C git log) > "$WORKDIR/p54_git_allparents.txt" 2>&1
+(cd "$P54" && "$SG" log) > "$WORKDIR/p54_sg.txt" 2>&1
+
+check "phase54 oracle: precondition -- the fixture has a merge commit to render" \
+    sh -c 'grep -q "^Merge: " "$0"' "$WORKDIR/p54_git.txt"
+check "phase54 oracle: precondition -- the pinned flags beat a hostile git config" \
+    cmp -s "$WORKDIR/p54_git.txt" "$WORKDIR/p54_git_hostile.txt"
+check "phase54: sg log matches git log --first-parent byte-for-byte" \
+    cmp -s "$WORKDIR/p54_sg.txt" "$WORKDIR/p54_git.txt"
+# Named separately from the cmp above so a regression in the arithmetic says
+# "the timezone" instead of handing over a whole-file diff.
+check "phase54: the Date line is the timestamp shifted INTO its stored offset" \
+    sh -c 'grep -q "^Date:   Wed Nov 15 06:13:20 2023 +0800$" "$0"' "$WORKDIR/p54_sg.txt"
+check "phase54: a half-hour offset shifts by thirty minutes too" \
+    sh -c 'grep -q "^Date:   Wed Nov 15 03:43:20 2023 +0530$" "$0"' "$WORKDIR/p54_sg.txt"
+check "phase54: the day of month is not zero-padded" \
+    sh -c 'grep -q "^Date:   Sun Sep 1 00:00:00 2024 +0000$" "$0"' "$WORKDIR/p54_sg.txt"
+check "phase54: sg log ends without a trailing blank line" \
+    sh -c 'test -n "$(tail -1 "$0")"' "$WORKDIR/p54_sg.txt"
+# The scope boundary is pinned on both sides: sg walks first-parent only, so
+# it must NOT match a full walk. If sg ever learns to walk every parent this
+# turns red and says so, instead of the rendering checks above silently
+# starting to compare a different set of commits.
+check "phase54: sg log deliberately differs from a full-history git log" \
+    sh -c '! cmp -s "$0" "$1"' "$WORKDIR/p54_sg.txt" "$WORKDIR/p54_git_allparents.txt"
+
+# --- Phase 54b: `sg log`'s flags. Same oracle and the same pinned knobs as
+# the group above; a SECOND fixture because that one is all empty commits and
+# a flag group needs real content -- an edit, a rename with an edit (git's
+# diff.renames has defaulted to on since 2.9, so `git log -p` prints
+# `rename from`/`rename to` and sg must detect renames to match), an empty
+# commit, and a merge.
+#
+# The merge is the interesting row: plain `git log -p` prints NO diff for a
+# merge, while `git log --first-parent -p` prints the diff against parent 1
+# (measured, both directions). sg's walk IS first-parent-only, so it agrees
+# with the second -- the flag behaviour follows from the scope decision
+# rather than being a separate choice.
+P54B="$WORKDIR/p54b_flags"
+mkdir -p "$P54B"
+(cd "$P54B" && LC_ALL=C git init -q .) > /dev/null 2>&1
+p54bcommit() {
+    ( cd "$P54B" &&
+      GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+      GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+      GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+      LC_ALL=C git commit -q --allow-empty --allow-empty-message -m "$1" ) > /dev/null 2>&1
+}
+printf 'one\ntwo\nthree\n' > "$P54B/f.txt"
+(cd "$P54B" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+p54bcommit "root commit"
+printf 'one\ntwo CHANGED\nthree\n' > "$P54B/f.txt"
+(cd "$P54B" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+p54bcommit "edit f"
+mv "$P54B/f.txt" "$P54B/renamed.txt"
+printf 'four\n' >> "$P54B/renamed.txt"
+(cd "$P54B" && LC_ALL=C git add -A) > /dev/null 2>&1
+p54bcommit "rename with an edit"
+p54bcommit "an empty commit"
+P54B_BRANCH=$(cd "$P54B" && LC_ALL=C git rev-parse --abbrev-ref HEAD 2>/dev/null)
+(cd "$P54B" && LC_ALL=C git checkout -qb p54bside HEAD~2) > /dev/null 2>&1
+printf 's\n' > "$P54B/s.txt"
+(cd "$P54B" && LC_ALL=C git add s.txt) > /dev/null 2>&1
+p54bcommit "side work"
+(cd "$P54B" && LC_ALL=C git checkout -q "$P54B_BRANCH") > /dev/null 2>&1
+( cd "$P54B" &&
+  GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git merge -q --no-ff p54bside -m "merge side" ) > /dev/null 2>&1
+
+# $1 = tag, $2... = flags shared by both sides (--oneline included: git takes
+# it as a --pretty, sg as its own flag, and it is spelled the same).
+p54b_cmp() {
+    p54btag="$1"; shift
+    (cd "$P54B" && LC_ALL=C git $P54_GIT_PINS log $P54_LOG_FLAGS "$@") \
+        > "$WORKDIR/p54b_git_$p54btag.txt" 2>&1
+    (cd "$P54B" && "$SG" log "$@") > "$WORKDIR/p54b_sg_$p54btag.txt" 2>&1
+}
+p54b_cmp oneline --oneline
+p54b_cmp patch -p
+p54b_cmp stat --stat
+p54b_cmp patchstat -p --stat
+p54b_cmp onelinepatch --oneline -p
+p54b_cmp count -n 2
+p54b_cmp barecount -3
+p54b_cmp zero -n 0
+p54b_cmp rev HEAD~2
+p54b_cmp revpatch -p HEAD~1
+
+check "phase54 oracle: precondition -- the fixture's rename is one git reports as a rename" \
+    sh -c 'grep -q "^rename from " "$0"' "$WORKDIR/p54b_git_patch.txt"
+check "phase54: sg log --oneline matches git" \
+    cmp -s "$WORKDIR/p54b_sg_oneline.txt" "$WORKDIR/p54b_git_oneline.txt"
+check "phase54: sg log -p matches git (merge diffs against parent 1, renames detected)" \
+    cmp -s "$WORKDIR/p54b_sg_patch.txt" "$WORKDIR/p54b_git_patch.txt"
+check "phase54: sg log --stat matches git" \
+    cmp -s "$WORKDIR/p54b_sg_stat.txt" "$WORKDIR/p54b_git_stat.txt"
+check "phase54: sg log -p --stat matches git, including the --- separator" \
+    cmp -s "$WORKDIR/p54b_sg_patchstat.txt" "$WORKDIR/p54b_git_patchstat.txt"
+check "phase54: sg log --oneline -p matches git (no blank line before the diff)" \
+    cmp -s "$WORKDIR/p54b_sg_onelinepatch.txt" "$WORKDIR/p54b_git_onelinepatch.txt"
+check "phase54: sg log -n <count> matches git" \
+    cmp -s "$WORKDIR/p54b_sg_count.txt" "$WORKDIR/p54b_git_count.txt"
+check "phase54: sg log -<count> matches git" \
+    cmp -s "$WORKDIR/p54b_sg_barecount.txt" "$WORKDIR/p54b_git_barecount.txt"
+check "phase54: sg log <rev> matches git" \
+    cmp -s "$WORKDIR/p54b_sg_rev.txt" "$WORKDIR/p54b_git_rev.txt"
+check "phase54: sg log -p <rev> matches git" \
+    cmp -s "$WORKDIR/p54b_sg_revpatch.txt" "$WORKDIR/p54b_git_revpatch.txt"
+# -n 0 is a legal request for nothing, not an error: git prints nothing and
+# exits 0, so an implementation that treated 0 as "unlimited" would differ
+# only here.
+check "phase54: sg log -n 0 prints nothing" \
+    sh -c 'test ! -s "$0"' "$WORKDIR/p54b_sg_zero.txt"
+(cd "$P54B" && "$SG" log -n 0) > /dev/null 2>&1
+check "phase54: sg log -n 0 still exits 0" test $? = 0
+# The `---` line only appears when BOTH are on: with -p alone git introduces
+# the diff with a blank line instead, so a rule that always printed `---`
+# would pass the combined check and fail this one.
+check "phase54: -p alone introduces the diff with no --- line" \
+    sh -c '! grep -q "^---$" "$0"' "$WORKDIR/p54b_sg_patch.txt"
+(cd "$P54B" && "$SG" log --nosuchflag) > /dev/null 2>&1
+check "phase54: sg log rejects an unknown flag" test $? = 1
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
