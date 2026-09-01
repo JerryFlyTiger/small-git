@@ -13901,6 +13901,11 @@ check "phase55 oracle: precondition -- git renders that merge as a combined diff
     sh -c 'grep -q "^diff --cc " "$0"' "$WORKDIR/p55c_git_merge.txt"
 check "phase55: sg show <merge> matches git's dense combined diff" \
     cmp -s "$WORKDIR/p55c_sg_merge.txt" "$WORKDIR/p55c_git_merge.txt"
+# TEMPORARY (to be removed): dumps what sg actually produced, so a failure
+# that only reproduces under Linux UBSan shows its diagnostic in the CI log.
+echo "=== TEMP sg merge output ===" >&2
+cat "$WORKDIR/p55c_sg_merge.txt" >&2
+echo "=== TEMP end ===" >&2
 check "phase55: sg show --stat <merge> matches git" \
     cmp -s "$WORKDIR/p55c_sg_mergestat.txt" "$WORKDIR/p55c_git_mergestat.txt"
 check "phase55: sg show -p --stat <merge> matches git (no --- line for a merge)" \
