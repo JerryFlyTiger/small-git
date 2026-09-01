@@ -8935,3 +8935,212 @@ count must be re-run across the same seed range before being reported as
 an algorithm divergence**, and the `of which sg exited non-zero` line
 checked first -- if it accounts for the whole count, the finding is a
 flaky subprocess launch, not a diff bug.
+
+## Phase 53: the crash/divergence separation the other four fuzzers never got
+
+Phase 52 section 8 fixed one harness: `tests/fuzz_diff.py` had been counting
+a round in which `sg` merely exited non-zero as a mismatch, and in
+`--max-failures 0` counting mode it discards the repo and both outputs the
+instant the tally increments, so a subprocess that failed to start under
+load left a phantom "divergence" with nothing to chase (measured then:
+roughly 1 round in 2500, gone on five reruns of the same seed range). The
+fix was to count that class separately and print it on its own line.
+
+The same defect was still in the other four harnesses, and `fuzz_diff.py`'s
+own tally was still a lower bound. This phase closes both. **No `src/` file
+changed** -- this is entirely a change to what the measuring instruments
+report, which is why the acceptance evidence below is a forced-crash
+witness plus an unchanged control, not a fuzz count that could move.
+
+### 1. The discriminator is not "non-zero", it is per-harness
+
+Measured 2026-09-01 on this build: `sg merge` on a conflict exits **1**;
+`sg diff` on a conflicted repo exits **0**. Combined with this project's own
+convention that sg's exit code is only ever 0 or 1 (CLAUDE.md, "Code
+conventions"), that gives two different suspect classes, and using one rule
+for both would be wrong in both directions:
+
+| harness | sg's legitimate exits | suspect class | reported as |
+|---|---|---|---|
+| `fuzz_diff` | 0 | any non-zero | `of which sg exited non-zero: N` |
+| `fuzz_combined` | 0 | any non-zero | same line |
+| `fuzz_rename` | 0 | any non-zero | same line, indented under `other` |
+| `fuzz_merge` | 0 or 1 | **outside {0,1}** | its own `crash` category |
+| `fuzz_merge_rename` | 0 or 1 | **outside {0,1}** | its own `crash` category |
+
+Applying `fuzz_diff`'s "non-zero is suspect" rule to the merge harnesses
+would file every ordinary conflict as machine noise. Applying the merge
+harnesses' "outside {0,1}" rule to the diff harnesses would let the exact
+phantom Phase 52 measured (an `sg` that exits 1 without running) go on
+counting as an algorithmic divergence. A crash round still fails the run in
+all five -- a crash is not acceptable, it is just never a divergence.
+
+### 2. In the merge harnesses the old behaviour was mostly INVISIBLE
+
+Both merge harnesses derive their central fact from the exit code:
+`sg_conflict = sg_res.returncode != 0`. A crashed `sg` therefore does not
+merely get mislabelled, it gets *believed*: it is read as "sg says
+conflict", and when git also conflicted the two agree, so the round passes.
+
+Measured, by substituting a stand-in `sg` that runs the real merge and then
+exits 139, leaving stdout and the merged file untouched (5 rounds, seed 0):
+
+| harness | before Phase 53 | after |
+|---|---|---|
+| `fuzz_merge` | `rc mismatches: 2`, other 3 rounds **passed**; `5 produced a conflict` | `crash rounds: 5`, `rc: 0`, `0 produced a conflict` |
+| `fuzz_merge_rename` | `rc 1`, other 4 rounds **passed** | `crash 5`, `rc 0` |
+
+So the pre-Phase-53 answer to "did a crashing sg get noticed" was: 40% of
+the time, under the wrong name, and the rest of the time not at all. The
+`produced a conflict` denominator was inflated by the same reading, which
+is why the new check returns early with no conflict claim rather than
+falling through.
+
+**The check sits before the merged file is read, not after.** `fuzz_merge`
+reads `f.txt` from both trees immediately after the merge and returns a
+`setup` failure ("measures nothing") if either is missing. The exit status
+is unambiguous evidence; everything read afterwards is a downstream
+ARTIFACT of the crash, so the classification must be decided from the
+former. (Honest scope, since the first draft of this section overclaimed
+it: in `fuzz_merge`'s own fixture `f.txt` is a fixed filename no round
+renames or deletes, so whether a crash can actually leave it *missing*
+there was never verified and the shadowing is theoretical. In
+`fuzz_merge_rename`, where paths genuinely move, it is not.)
+`fuzz_merge_rename`'s check short-circuits its
+workdir/index comparisons for the same reason in the other direction: those
+would be comparing state a crashed merge never wrote, manufacturing derived
+noise on top of the crash.
+
+### 3. `fuzz_diff.py`: the tally asked the wrong question, in both directions
+
+Its mode loop (`worktree`, `--cached`) used to `break` at the first
+diverging mode, so the crash tally really answered "**did the first
+diverging mode exit non-zero**". That is wrong two ways, and only one of
+them is an undercount:
+
+- it never sees a crash in a later mode (the lower bound the old comment
+  admitted to); and, worse,
+- when the first diverging mode IS the crash and a later mode holds a
+  genuine `rc == 0` byte divergence, it **launders a real bug**: the round
+  is tallied under a line that tells the reader to rerun and dismiss it.
+
+The rule is therefore not "did any mode exit non-zero" either -- that fixes
+the first and makes the second worse. Every mode now runs, and a round is
+counted only when a non-zero exit is its **ONLY** evidence: `round_nonzero`
+records that some mode exited non-zero, `round_content` records that some
+mode disagreed on bytes **while exiting 0**, which is evidence no crash can
+manufacture. The reported and reproduced mismatch is still the first
+diverging mode, and it prints its own exit code, so a crash there stays
+visible either way.
+
+Measured, three stand-in `sg` binaries x three versions of the harness,
+6 rounds from seed 0 each. `old` is master, `mid` is this phase's first
+draft ("any mode exited non-zero"), `new` is what landed:
+
+| stand-in behaviour | old | mid | new |
+|---|---|---|---|
+| both modes exit 3, output correct (crash is the only evidence) | 6 | 6 | 6 |
+| worktree: extra line at rc 0; `--cached`: exit 3 | **0** | **6** | 0 |
+| worktree: exit 3; `--cached`: extra line at rc 0 | **6** | **6** | 0 |
+
+Row 1 is the control: the class the tally exists for is counted by all
+three, so the gate did not gut it. Row 2 is the regression the first draft
+introduced. **Row 3 is a laundering bug that was already on master** -- the
+old harness would have printed "of which sg exited non-zero: 6" for six
+rounds that each contained a real byte divergence.
+
+The same rule, and the same three-way check, was applied to the other two
+harnesses that expect exit 0:
+
+- `fuzz_combined` (one flag diverges on bytes at rc 0, another flag exits
+  3): old 0 / mid 4 / new 0 of 4 mismatching rounds. Its printed detail
+  shows only `bad[:2]` of up to 22 flags, so the genuine entry is easily
+  off-screen -- the reader would have had nothing to contradict the
+  caption.
+- `fuzz_rename` (same pairing, wrong similarity score, plus exit 3):
+  8 rounds, 5 of them holding a genuine `score` divergence. mid says 8
+  "might be noise", **new says 3** -- exactly the rounds with no score or
+  pairing evidence. Only the `score` half of that gate has a witness; a
+  `pairing` divergence coexisting with a non-zero exit could not be
+  manufactured through a stand-in binary, because reversing a rename's two
+  columns changes the path KEY and lands in the harness's `other` bucket
+  instead.
+
+### 4. What this phase deliberately did NOT do
+
+- **No `src/` change, and no new unit test.** The five harnesses are not
+  built by `make`; their witness is the forced-crash stand-in above, which
+  is the same technique Phase 52 section 8 used, and it is reproducible
+  from the stubs described here.
+- **`fuzz_ignore.py` is untouched.** It compares sg against git through a
+  different shape (it has no notion of a per-round mismatch tally to
+  contaminate) and is the one fuzzer wired into CI, so leaving it alone
+  keeps the CI job's meaning unchanged.
+- **The `rc` category in the two merge harnesses was kept.** It is a real
+  divergence class (sg and git genuinely disagreeing about whether the
+  merge conflicts); the crash category was carved out of it, not put in
+  its place.
+
+### 5. Acceptance: the control, measured
+
+A harness change cannot move a fuzz count, so the control is that it
+**didn't** -- all eight runs below use seed ranges no earlier phase used,
+against the real `build/sg`, and every new tally reads 0:
+
+| run | result |
+|---|---|
+| `fuzz_diff.py 500 --seed 71000` | 0 mismatches |
+| `fuzz_diff.py 500 --histogram --seed 72000` | 0 mismatches |
+| `fuzz_combined.py 150 --seed 73000` | 102 conflicts, 0 mismatched |
+| `fuzz_rename.py 120 --seed 74000` | 0 / 120 any-mismatch |
+| `fuzz_rename.py 120 --copies-harder --seed 75000` | 0 / 120 any-mismatch |
+| `fuzz_merge.py 200 --seed 76000` | 129 conflicts, 0 rc / label / body, **crash 0** |
+| `fuzz_merge.py 200 --no-newline-edits --seed 77000` | 108 conflicts, all 0, **crash 0** |
+| `fuzz_merge_rename.py 150 --seed 78000` | 0 / 150, **crash 0** |
+
+The three "sg exited non-zero" lines are gated on a non-zero count, so
+their absence from this output is itself the assertion.
+
+One process note worth keeping, because it is the failure direction this
+project keeps re-learning: the first attempt at this control run produced
+an empty result under every heading and an exit code of 0. The loop had
+been written as `for c in "fuzz_diff.py 500 --seed ..."` with `python3
+tests/$c` -- **zsh does not word-split an unquoted parameter**, so python
+was handed the whole string as one filename and never ran a single round.
+Eight blank stanzas look exactly like eight clean runs; only opening the
+raw log showed the `No such file or directory` lines. Same shape as the
+`M`-shrinking and `bash -n` warnings in CLAUDE.md: the tooling's failure
+direction is always "already verified".
+
+### 6. What the cold read changed
+
+The first draft of this phase passed all four gates, the forced-crash
+witnesses of sections 2-3, and an eight-run control -- and still had the
+laundering defect in section 3's row 2, which it had *introduced*. It was
+caught by handing the diff to a reviewer whose instructions were to refute
+it. Four things came back and all four were acted on:
+
+1. The laundering above (`fuzz_diff`, and the same shape in
+   `fuzz_combined` and `fuzz_rename`). Fixed as described.
+2. **git's exit code was being folded into the same `{0,1}` rule.** The
+   convention "only ever 0 or 1" is *sg's*, and CLAUDE.md states it as
+   such; real git legitimately exits 128 on its own fatal errors. Calling
+   that a "crash" tells the reader to rerun and dismiss a round whose
+   ORACLE never answered. Both merge harnesses now split it: sg out of
+   range is `crash`, git out of range is `setup`, whose existing printed
+   meaning ("these measure nothing -- fix first") is exactly right.
+3. The `f.txt`-unwritten overclaim, corrected in section 2.
+4. A comment in `fuzz_combined.py` that borrowed `fuzz_diff.py`'s measured
+   ~1-in-2500 phantom RATE for a harness where only the MECHANISM is
+   shared. Reworded.
+
+The reviewer also noted that `fuzz_merge.py` prints its `crash rounds` row
+unconditionally while the other four gate theirs behind a non-zero count.
+Left as is: it matches that file's own `rc`/`label`/`body` rows, which are
+also unconditional.
+
+This is the project's own recorded rule about review-round fixes doing its
+job -- **a fix found by review has, by construction, no test guarding it**,
+so each of the four was re-verified by reverse mutation (turn the fix back
+into the flawed version, confirm the number moves), not by rerunning a
+green suite.

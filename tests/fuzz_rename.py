@@ -408,6 +408,7 @@ def main():
     rounds_with_score = 0
     rounds_with_other = 0
     rounds_with_any = 0
+    rounds_with_nonzero = 0
     score_diffs = collections.Counter()
     detail_printed = 0
     i = -1
@@ -424,9 +425,18 @@ def main():
             extra = list(flag) if flag else []
         want = run(GIT_DIFF + ["--cached", "--name-status"] + extra, repo)
         got = run([SG, "diff", "--cached", "--name-status"] + extra, repo)
-
         pairing, score, other, detail = compare_outputs(
             want.stdout, got.stdout, want.returncode, got.returncode, score_diffs)
+
+        # sg's diff exits 0 unless it could not read a blob (same rationale
+        # as fuzz_diff.py's 2026-09-01 note), so a non-zero exit here is the
+        # machine-noise class -- but only when it is the round's ONLY
+        # evidence.  A round that ALSO disagreed on the pairing or the score
+        # is a real divergence that happened to exit non-zero too, and
+        # telling the reader to rerun and dismiss it would be worse than not
+        # counting at all.
+        if got.returncode != 0 and pairing == 0 and score == 0:
+            rounds_with_nonzero += 1
 
         if pairing == 0 and score == 0 and other == 0:
             shutil.rmtree(repo, ignore_errors=True)
@@ -471,6 +481,10 @@ def main():
         print("  rounds with other mismatch:   %5d / %-5d (%5.1f%%)  "
               "(exit code, or a divergence outside pairing/score)"
               % (rounds_with_other, total, 100.0 * rounds_with_other / total))
+        if rounds_with_nonzero:
+            print("    of which sg exited non-zero: %d -- rerun the same "
+                  "seed range before calling any of these an algorithmic "
+                  "divergence" % rounds_with_nonzero)
     if score_diffs:
         print("  score diff (sg - git) distribution, top entries:")
         for diff, count in score_diffs.most_common(10):

@@ -530,9 +530,45 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   indistinguishable from a real one (measured: 1 phantom in ~2500 rounds,
   which did not survive five reruns of the same seed range). Since Phase 52
   it prints `of which sg exited non-zero: N` separately -- read that line,
-  and rerun the same seed range, before calling anything a divergence. The
-  count is a conservative LOWER bound (the MODES loop breaks at the first
-  differing mode), and the other fuzzers have not had this separation done.
+  and rerun the same seed range, before calling anything a divergence.
+  **Since Phase 53 all five fuzzers make this separation, and the count is
+  no longer a lower bound** -- `fuzz_diff.py`'s mode loop runs every mode
+  instead of stopping at the first divergence (it still reports and
+  reproduces the first one), so a later mode's non-zero exit is counted too.
+  The wording differs per harness because the discriminator does. Where sg
+  is expected to exit 0 (`fuzz_diff`, `fuzz_combined`, `fuzz_rename`) the
+  suspect class is any non-zero exit, printed as `of which sg exited
+  non-zero: N`. Where non-zero is a legitimate answer -- `fuzz_merge` and
+  `fuzz_merge_rename`, where a conflict IS exit 1 -- the suspect class is an
+  exit status **outside {0,1}**, which by this project's own exit-code
+  convention is not an answer sg can give, and it is its own `crash`
+  category rather than an `rc` divergence. **A crash round still fails the
+  run**, it is just never an algorithmic divergence.
+  WARNING: **all five count a round only when the exit status is its ONLY
+  evidence.** A round that ALSO disagreed on bytes (or, in `fuzz_rename`,
+  on the pairing or the score) while exiting 0 is a real divergence that
+  happened to crash somewhere too, and offering it under a line that says
+  "rerun before calling this a divergence" is strictly worse than not
+  counting it: it invites the reader to dismiss a genuine bug. Measured in
+  Phase 53 -- master itself laundered six of six rounds this way when the
+  crashing mode sorted first, and this phase's own first draft laundered
+  the mirrored case as well; `fuzz_rename` went from calling 8 of 8 rounds
+  suspect to calling 3, the 5 excluded being exactly those holding a real
+  score divergence.
+  WARNING: **git's exit code is NOT held to the {0,1} rule** -- that
+  convention is sg's own, and real git exits 128 on its own fatal errors.
+  Both merge harnesses classify a git exit outside {0,1} as `setup` ("these
+  measure nothing -- fix first"), never as a crash, because what it says is
+  that the ORACLE did not answer.
+  WARNING: **in the two merge harnesses this was not merely mislabelled, it
+  was mostly INVISIBLE.** Measured in Phase 53 by forcing `sg merge` to exit
+  139 while leaving its output untouched: over 5 rounds the pre-Phase-53
+  `fuzz_merge` reported `2 rc mismatches` and scored the other 3 as passes,
+  and `fuzz_merge_rename` reported `1 rc` and passed 4 -- a crash agreeing
+  with a git that also conflicted looks exactly like agreement. The check
+  therefore sits **before** the merged file is read, not after: a crash is
+  precisely the case that can leave the file unwritten, which the later
+  guard would file as a setup failure ("measures nothing") instead.
   `tests/interop.sh`'s `phase52:` group cmp's full
   `sg diff --histogram` / `sg diff` output against real git on the same
   fixture. Read Phase 52 of `docs/DESIGN.md` for the exact git source

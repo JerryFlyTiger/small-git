@@ -237,20 +237,33 @@ def main():
         build_case(repo, rng)
 
         mismatch = None
+        round_nonzero = False
+        round_content = False
+        # NOTE: this deliberately does NOT stop at the first diverging mode,
+        # and the crash tally below asks a sharper question than "did the
+        # first diverging mode exit non-zero".  Both halves matter, and the
+        # second is the one that bites: if the FIRST diverging mode is the
+        # crash and a LATER mode holds a genuine rc==0 output divergence,
+        # stopping early would file the whole round under "might be machine
+        # noise" and invite the reader to dismiss a real bug.  So every mode
+        # always runs; `round_nonzero` records that some mode exited
+        # non-zero, `round_content` records that some mode disagreed on
+        # bytes WHILE exiting 0, which is evidence no crash can manufacture.
+        # Only the REPORTED/reproduced mismatch is still the first diverging
+        # mode -- it prints its own exit code, so a crash there stays visible
+        # to the reader either way.
         for label, flags in MODES:
             want = run(GIT_DIFF + flags, repo)
             got = sg(["diff"] + flags, repo, check=False)
+            if got.returncode != 0:
+                round_nonzero = True
+            elif want.stdout != got.stdout:
+                round_content = True
             # A non-zero exit from either side is itself a divergence worth
             # reporting: sg's diff exits 0 unless it could not read a blob.
-            # NOTE: this breaks out of the MODES loop on the first
-            # divergence, so the crash tally below is a conservative LOWER
-            # bound -- a seed whose first mode merely differs in stdout hides
-            # a later mode that would have exited non-zero. Pre-existing, not
-            # introduced with that tally.
-            if want.stdout != got.stdout or got.returncode != 0:
+            if mismatch is None and (want.stdout != got.stdout or got.returncode != 0):
                 mismatch = (label, want.stdout, got.stdout, got.stderr,
                             got.returncode)
-                break
 
         if mismatch is None:
             shutil.rmtree(repo, ignore_errors=True)
@@ -258,7 +271,11 @@ def main():
 
         failures += 1
         label, want, got, err, rc = mismatch
-        if rc != 0:
+        # Counted only when a non-zero exit is the round's ONLY evidence.  A
+        # round that also disagreed on bytes at rc==0 is a real divergence
+        # that happened to crash somewhere too, and must never be offered to
+        # the reader as something to rerun and dismiss.
+        if round_nonzero and not round_content:
             crashes += 1
         if max_failures == 0:
             # Counting mode: the tally is the measurement, so keep neither the

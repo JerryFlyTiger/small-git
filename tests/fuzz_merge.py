@@ -261,6 +261,32 @@ def one_round(rng, keep_dir, index, newline_edits=True):
         sg_res = sg(repo, "merge", "topic")
         git_res = git(gitcopy, "merge", "topic")
 
+        # Classified from the exit status alone, before anything downstream
+        # reads the merged file. By this project's own convention (CLAUDE.md,
+        # "Code conventions") sg's exit code is only ever 0 or 1, so anything
+        # else -- a signal death, an abort, a failed exec -- is not an answer
+        # sg can give. Without this, `sg_conflict = rc != 0` reads a crash as
+        # "sg says conflict" and lets it wear the `rc` category's clothes:
+        # agreeing silently with a conflicting git on a file sg never wrote,
+        # or reporting as an ordinary semantic mismatch against a clean one.
+        # The ordering is deliberate -- the exit status is unambiguous
+        # evidence, while everything read below is a downstream ARTIFACT of
+        # the crash, and the `f.txt missing` check in particular would file
+        # the round as "measures nothing" instead of naming the crash. (In
+        # this harness f.txt is a fixed filename no round renames or deletes,
+        # so that shadowing is theoretical here; in fuzz_merge_rename.py,
+        # where paths do move, it is not.)
+        #
+        # git's side is NOT called a crash: git legitimately exits 128 on its
+        # own fatal errors, which says the ORACLE failed to answer, i.e. the
+        # round measures nothing -- that is what `setup` already means here.
+        if sg_res.returncode not in (0, 1):
+            return "crash", ("sg exited outside {0,1}: sg rc=%d, git rc=%d"
+                             % (sg_res.returncode, git_res.returncode)), None
+        if git_res.returncode not in (0, 1):
+            return "setup", ("git exited outside {0,1} (rc=%d): the oracle "
+                             "did not answer" % git_res.returncode), None
+
         sg_text = read_file(repo)
         git_text = read_file(gitcopy)
         if sg_text is None or git_text is None:
@@ -502,7 +528,7 @@ def main():
     if args.keep:
         os.makedirs(args.keep, exist_ok=True)
 
-    counts = {"rc": 0, "label": 0, "body": 0, "setup": 0}
+    counts = {"rc": 0, "label": 0, "body": 0, "setup": 0, "crash": 0}
     conflicted = 0
     for i in range(args.rounds):
         rng = random.Random(args.seed + i)
@@ -532,6 +558,12 @@ def main():
     print("  rc mismatches:    %d" % counts["rc"])
     print("  label mismatches: %d" % counts["label"])
     print("  body mismatches:  %d" % counts["body"])
+    # A crash is exit status outside {0,1} on either side -- not an answer sg
+    # (or git) can give by this project's own convention, so it is not an
+    # algorithmic divergence and must not be read as one; it still fails the
+    # run (counted into `total` below) because a crash is not acceptable.
+    print("  crash rounds:     %d  (exit status outside {0,1} -- not an "
+          "answer sg can give; rerun the same seed range)" % counts["crash"])
     if counts["setup"]:
         print("  setup failures:   %d  (these measure nothing -- fix first)"
               % counts["setup"])

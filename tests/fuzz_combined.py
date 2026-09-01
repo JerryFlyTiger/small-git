@@ -191,7 +191,7 @@ def main():
     rounds = int(argv[0]) if argv else 150
 
     tmp = tempfile.mkdtemp(prefix="sg_fuzz_cc_")
-    conflicts = mismatches = 0
+    conflicts = mismatches = nonzero = 0
     i = -1
     try:
         for i in range(rounds):
@@ -203,6 +203,20 @@ def main():
             conflicts += 1
             if bad:
                 mismatches += 1
+                # `sg diff` on a conflicted repo exits 0 (measured), so a
+                # non-zero `src` here is not an answer sg gives.  The
+                # MECHANISM is the one fuzz_diff.py measured on 2026-09-01 --
+                # an sg subprocess failing to start under load -- but its
+                # ~1-in-2500 RATE was measured there, not here, and does not
+                # transfer.  Counted only when a non-zero exit is the round's
+                # ONLY evidence: a flag that disagreed on BYTES is a real
+                # rendering divergence no crash can manufacture, and a round
+                # holding one must not be offered to the reader as something
+                # to rerun and dismiss (`bad` prints only its first two
+                # entries, so the genuine one can easily be off-screen).
+                if (any(src != 0 for _fl, _go, _so, _grc, src in bad)
+                        and not any(go != so for _fl, go, so, _grc, _src in bad)):
+                    nonzero += 1
                 print("=== seed %d: %d flag(s) mismatched  (reproduce: "
                       "python3 tests/fuzz_combined.py 1 --seed %d)"
                       % (seed, len(bad), seed))
@@ -218,6 +232,9 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
     print("\nfuzz_combined: %d rounds, %d produced a conflict, %d mismatched"
           % (i + 1, conflicts, mismatches))
+    if nonzero:
+        print("  of which sg exited non-zero: %d -- rerun the same seed range "
+              "before calling any of these an algorithmic divergence" % nonzero)
     return 1 if mismatches else 0
 
 
