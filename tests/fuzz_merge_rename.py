@@ -548,6 +548,26 @@ def one_round(rng, keep_dir, index, seed, verbose):
 
         sg_conflict = sg_res.returncode != 0
         git_conflict = git_res.returncode != 0
+        # By this project's own convention (CLAUDE.md, "Code conventions")
+        # sg's exit code is only ever 0 or 1 -- reading anything else as
+        # "sg says conflict" lets a crash wear the `rc` category's clothes,
+        # and the workdir/index comparisons below would then be comparing
+        # state a crashed merge never wrote, manufacturing derived noise on
+        # top of it. So this is checked first and short-circuits the rest.
+        # git exiting outside {0,1} is NOT a crash: git legitimately exits
+        # 128 on its own fatal errors, which means the oracle did not answer
+        # and the round measures nothing -- `setup`'s existing meaning.
+        if git_res.returncode not in (0, 1):
+            return "setup", ("git exited outside {0,1} (rc=%d): the oracle "
+                             "did not answer" % git_res.returncode), shape, False
+        if sg_res.returncode not in (0, 1):
+            mismatches.append(("crash", "sg exited outside {0,1}: sg rc=%d, "
+                                "git rc=%d" % (sg_res.returncode, git_res.returncode)))
+            if keep_dir:
+                dest = save_case(keep_dir, index, seed, shape, base_files, ours_files,
+                                  theirs_files, sg_res, git_res, {}, {}, mismatches)
+                mismatches = [(k, "%s (case saved to %s)" % (d, dest)) for k, d in mismatches]
+            return mismatches, None, shape, False
         if sg_conflict != git_conflict:
             mismatches.append(("rc", "sg conflict=%s (rc=%d) git conflict=%s (rc=%d)"
                                 % (sg_conflict, sg_res.returncode,
@@ -686,11 +706,19 @@ def main():
     print()
     print("mismatch categories (a round can hit more than one):")
     for kind in ("rc", "workdir_paths", "workdir_content", "index_paths",
-                 "index_content"):
+                 "index_content", "crash"):
         print("  %-16s %4d" % (kind, category_counts.get(kind, 0)))
     if setup_failures:
         print("  setup failures:  %4d  (these measure nothing -- fix first)"
               % setup_failures)
+    # A crash is exit status outside {0,1} on either side -- not an answer sg
+    # (or git) can give by this project's own convention -- so it is machine
+    # noise or a real crash, never an algorithmic divergence, and it must not
+    # be read as one.
+    if category_counts.get("crash", 0):
+        print("  of which crash rounds: %d -- rerun the same seed range "
+              "before calling any of these an algorithmic divergence"
+              % category_counts["crash"])
     print()
     if dirrename_rounds:
         print("attributed to the directory-rename divergence (not counted): %d"
