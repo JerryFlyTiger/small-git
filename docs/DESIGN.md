@@ -8521,3 +8521,72 @@ Fix: `sg_diff_fill_combined_from_index`'s loop now skips a row with
   section 1's own discussion) -- an INEXACT rename fixture closes that gap,
   since only the exact pass would work under either init value on an exact
   one.
+
+## Phase 52 item A: collapse `sg_merge_trees`' repeated tree flattening
+
+`sg_merge_trees` used to flatten base/ours/theirs **seven** times whenever
+`rename_score > 0` (every one of its four call sites): three flattens up
+front, plus `build_rename_map`'s two calls to `sg_diff_trees` each
+re-flattening both of their own sides (base twice more, ours once, theirs
+once). Pure repeated work -- no correctness risk, and every flatten
+re-reads and re-parses every tree object at every directory level, since
+there is no object cache anywhere in the codebase. Phase 49's cold read
+raised it; Phases 50 and 51 both left it.
+
+### 1. Shape of the fix
+
+`sg_diff_trees` (`src/workdir/diff.c`) was split: its union-walk body is now
+`sg_diff_from_flat_lists`, a new public function taking two **borrowed**
+`const sg_flat_list *` (NULL meaning the empty tree, same convention
+`old_tree`/`new_tree == NULL` already carried). `sg_diff_trees` itself is
+now a thin wrapper: flatten both sides, delegate, free both. All 12
+pre-existing call sites are unchanged.
+
+`sg_merge_trees` already flattens base/ours/theirs once each up front
+(`base_flat`/`ours_flat`/`theirs_flat`); `build_rename_map` was changed to
+take two `const sg_flat_list *` instead of two tree ids, and to call
+`sg_diff_from_flat_lists` directly instead of `sg_diff_trees` -- so it no
+longer flattens anything itself. Its two call sites in `sg_merge_trees` now
+pass `&base_flat`/`&ours_flat` and `&base_flat`/`&theirs_flat`. Net effect:
+3 flattens total, with or without rename detection turned on. One
+consequence worth naming: `build_rename_map` can no longer produce
+`sg_tree_flatten`'s `-2` (bad path) on its own -- the caller already
+flattened these same trees before `build_rename_map` is ever reached, so a
+`-2` there is already reported and `sg_merge_trees` has already returned
+-1 by the time rename detection would run.
+
+### 2. Why this needed its own test, not just a green `make test`
+
+The merge RESULT is byte-identical before and after this change -- both
+`tests/test_merge_renames.c` (14 named shapes) and
+`tests/fuzz_merge_rename.py` assert only the result, so both stay green
+regardless of how many times the trees got flattened. A change nothing can
+observe is a change nobody can defend later, so a dedicated counter was
+added: `sg_tree_flatten_test_count()` / `sg_tree_flatten_test_reset()`
+(`include/sg/tree_build.h`), backed by a file-scope counter in
+`tree_build.c` incremented once per `sg_tree_flatten` call. Documented as a
+test-only hook: nothing in `src/` may branch on it, and it is not
+thread-safe.
+
+`tests/test_merge_flatten_count.c` runs `sg_merge_trees` on a 2-file
+fixture (an ordinary edit on each side, no renames present) and asserts the
+count is exactly **3**, once with `rename_score = SG_SIMILARITY_DEFAULT`
+and once with `rename_score = 0` -- pinning both paths separately, since
+`rename_score = 0` never calls `build_rename_map` at all and would stay
+green under a much clumsier bug. The exact number matters: `>= 1` or `< 7`
+would not go red if someone later reintroduced a redundant flatten.
+Proved capable of failing via `tests/mutate.sh`: inserting one spurious
+`sg_tree_flatten` call inside `build_rename_map` turned the count 3 -> 5
+and the test red, confirming the hook actually observes what it claims to.
+
+### 3. Measurements
+
+`bash tests/gates.sh --rebuild`: `make` 0 warnings (64 TUs recompiled),
+`make test` 65/65 binaries passed 0 warnings (65 recompiled, the new test
+file), interop 2253/2253 passed 0 skipped (M unchanged from Phase 51).
+`make sanitize`: 65/65 binaries, 0 sanitizer errors -- run because this
+moves ownership of heap-allocated `sg_flat_list`s across a new function
+boundary. `python3 tests/fuzz_merge.py 200` and `... --no-newline-edits`:
+0/200 both. `python3 tests/fuzz_merge_rename.py 150` across two unused seed
+ranges: 0/150 both, all eight rename shapes represented, seed 9058's old
+content-merge divergence (fixed in Phase 50) did not reappear.

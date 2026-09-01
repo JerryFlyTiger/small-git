@@ -1120,26 +1120,22 @@ typedef struct {
    correctly if that default is ever revisited). *list_out is kept alive
    alongside *map_out (whose pairs borrow strings out of it) and must be
    freed with sg_diff_list_free once the caller is done with the map.
-   Returns 0 on success, -1 on error (already reported to stderr for a -2
-   from sg_diff_trees, matching how the plain sg_tree_flatten calls above
-   report the same failure). */
-static int build_rename_map(const char *git_dir, const unsigned char base_tree[SG_SHA1_RAW_LEN],
-                            const unsigned char side_tree[SG_SHA1_RAW_LEN], int rename_score,
+   base_flat/side_flat are Phase 52's already-flattened trees, borrowed from
+   sg_merge_trees -- this function does not flatten anything itself, so it
+   can never see sg_tree_flatten's -2 (the caller flattened these trees
+   already and reported that failure itself, before build_rename_map is ever
+   called). Returns 0 on success, -1 on error. */
+static int build_rename_map(const char *git_dir, const sg_flat_list *base_flat,
+                            const sg_flat_list *side_flat, int rename_score,
                             sg_diff_list *list_out, rename_map *map_out)
 {
-    char bad_path[SG_PATH_MAX];
     int rc;
     size_t i;
 
     memset(list_out, 0, sizeof(*list_out));
     memset(map_out, 0, sizeof(*map_out));
 
-    rc = sg_diff_trees(git_dir, base_tree, side_tree, list_out, bad_path, 0);
-    if (rc == -2) {
-        fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
-               sg_quote_path_delimited(bad_path));
-        return -1;
-    }
+    rc = sg_diff_from_flat_lists(base_flat, side_flat, list_out, 0);
     if (rc != 0)
         return -1;
 
@@ -2055,13 +2051,13 @@ int sg_merge_trees(const char *git_dir, const unsigned char base_tree[SG_SHA1_RA
        neither build_rename_map call runs, ro/rt stay empty, and
        path_is_rename_consumed is always false. */
     if (rename_score > 0) {
-        if (build_rename_map(git_dir, base_tree, ours_tree, rename_score, &ro_list, &ro) != 0) {
+        if (build_rename_map(git_dir, &base_flat, &ours_flat, rename_score, &ro_list, &ro) != 0) {
             sg_flat_list_free(&base_flat);
             sg_flat_list_free(&ours_flat);
             sg_flat_list_free(&theirs_flat);
             return -1;
         }
-        if (build_rename_map(git_dir, base_tree, theirs_tree, rename_score, &rt_list, &rt) != 0) {
+        if (build_rename_map(git_dir, &base_flat, &theirs_flat, rename_score, &rt_list, &rt) != 0) {
             sg_diff_list_free(&ro_list);
             rename_map_free(&ro);
             sg_flat_list_free(&base_flat);

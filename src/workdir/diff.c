@@ -328,17 +328,90 @@ static size_t index_group_end(const sg_index *idx, size_t i)
     return j;
 }
 
+/* Phase 52: the union-walk body of sg_diff_trees, extracted so a caller that
+   already has both trees flattened (sg_merge_trees' build_rename_map, as of
+   this phase) does not have to pay for a redundant re-flatten. old_flat/
+   new_flat are BORROWED -- this function never frees them, the caller must
+   keep them alive until it returns -- and NULL means "the empty tree",
+   exactly as old_tree/new_tree == NULL means to sg_diff_trees itself. Unlike
+   sg_diff_trees, this can never return -2: whoever flattened the trees
+   already owns reporting that failure, bad_path is not this function's to
+   fill. Returns 0 or -1. */
+int sg_diff_from_flat_lists(const sg_flat_list *old_flat, const sg_flat_list *new_flat,
+                            sg_diff_list *out, int include_unchanged)
+{
+    static const sg_flat_list empty_flat = { NULL, 0 };
+    const sg_flat_list *ol = old_flat != NULL ? old_flat : &empty_flat;
+    const sg_flat_list *nl = new_flat != NULL ? new_flat : &empty_flat;
+    size_t oi = 0;
+    size_t ni = 0;
+    int rc;
+
+    memset(out, 0, sizeof(*out));
+
+    while (oi < ol->count || ni < nl->count) {
+        int cmp;
+
+        if (oi >= ol->count)
+            cmp = 1;
+        else if (ni >= nl->count)
+            cmp = -1;
+        else
+            cmp = strcmp(ol->entries[oi].path, nl->entries[ni].path);
+
+        if (cmp == 0) {
+            sg_diff_side os = side_blob(ol->entries[oi].mode, ol->entries[oi].sha1);
+            sg_diff_side ns = side_blob(nl->entries[ni].mode, nl->entries[ni].sha1);
+
+            if (blob_sides_differ(&os, &ns)) {
+                if (list_append(out, ol->entries[oi].path, &os, &ns) != 0) {
+                    rc = -1;
+                    goto done;
+                }
+            } else if (include_unchanged) {
+                if (list_append(out, ol->entries[oi].path, &os, &ns) != 0) {
+                    rc = -1;
+                    goto done;
+                }
+                out->entries[out->count - 1].unchanged = 1;
+            }
+            oi++;
+            ni++;
+        } else if (cmp < 0) {
+            sg_diff_side os = side_blob(ol->entries[oi].mode, ol->entries[oi].sha1);
+            sg_diff_side ns = side_absent();
+
+            if (list_append(out, ol->entries[oi].path, &os, &ns) != 0) {
+                rc = -1;
+                goto done;
+            }
+            oi++;
+        } else {
+            sg_diff_side os = side_absent();
+            sg_diff_side ns = side_blob(nl->entries[ni].mode, nl->entries[ni].sha1);
+
+            if (list_append(out, nl->entries[ni].path, &os, &ns) != 0) {
+                rc = -1;
+                goto done;
+            }
+            ni++;
+        }
+    }
+    rc = 0;
+
+done:
+    if (rc != 0)
+        sg_diff_list_free(out);
+    return rc;
+}
+
 int sg_diff_trees(const char *git_dir, const unsigned char *old_tree,
                   const unsigned char *new_tree, sg_diff_list *out, char *bad_path,
                   int include_unchanged)
 {
     sg_flat_list old_flat;
     sg_flat_list new_flat;
-    size_t oi = 0;
-    size_t ni = 0;
     int rc;
-
-    memset(out, 0, sizeof(*out));
 
     rc = flatten_or_empty(git_dir, old_tree, &old_flat, bad_path);
     if (rc != 0)
@@ -349,61 +422,10 @@ int sg_diff_trees(const char *git_dir, const unsigned char *old_tree,
         return rc;
     }
 
-    while (oi < old_flat.count || ni < new_flat.count) {
-        int cmp;
+    rc = sg_diff_from_flat_lists(&old_flat, &new_flat, out, include_unchanged);
 
-        if (oi >= old_flat.count)
-            cmp = 1;
-        else if (ni >= new_flat.count)
-            cmp = -1;
-        else
-            cmp = strcmp(old_flat.entries[oi].path, new_flat.entries[ni].path);
-
-        if (cmp == 0) {
-            sg_diff_side os = side_blob(old_flat.entries[oi].mode, old_flat.entries[oi].sha1);
-            sg_diff_side ns = side_blob(new_flat.entries[ni].mode, new_flat.entries[ni].sha1);
-
-            if (blob_sides_differ(&os, &ns)) {
-                if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
-                    rc = -1;
-                    goto done;
-                }
-            } else if (include_unchanged) {
-                if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
-                    rc = -1;
-                    goto done;
-                }
-                out->entries[out->count - 1].unchanged = 1;
-            }
-            oi++;
-            ni++;
-        } else if (cmp < 0) {
-            sg_diff_side os = side_blob(old_flat.entries[oi].mode, old_flat.entries[oi].sha1);
-            sg_diff_side ns = side_absent();
-
-            if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
-                rc = -1;
-                goto done;
-            }
-            oi++;
-        } else {
-            sg_diff_side os = side_absent();
-            sg_diff_side ns = side_blob(new_flat.entries[ni].mode, new_flat.entries[ni].sha1);
-
-            if (list_append(out, new_flat.entries[ni].path, &os, &ns) != 0) {
-                rc = -1;
-                goto done;
-            }
-            ni++;
-        }
-    }
-    rc = 0;
-
-done:
     sg_flat_list_free(&old_flat);
     sg_flat_list_free(&new_flat);
-    if (rc != 0)
-        sg_diff_list_free(out);
     return rc;
 }
 
