@@ -10315,3 +10315,146 @@ All items in this section were verified with their own reverse mutation
 (the fix undone, the specific named check confirmed red) -- see the commit
 history for the exact `tests/mutate.sh` invocations; none are summarized
 away here as "should be caught", each one was.
+
+## Phase 57b: `sg revert`
+
+### 1. What was already generic, and what actually needed writing
+
+Phase 57a built the replay engine (`src/cli/pick.c`) parameterised by
+`sg_seq_kind` from the start -- `sg_seq_kind kind` selects which tree plays
+base/ours/theirs (spec section 3.1), whether the new commit's author is
+copied from the picked commit or drawn fresh from the environment (section
+3.2), the revert-only message construction of section 4
+(`build_revert_message`/`build_revert_subject_line`), and the reflog
+vocabulary of section 3.3. Every gate site (`apply.c`, `cmd_reset.c`,
+`cmd_merge.c`, `cmd_switch.c`, `cmd_commit.c`, `cmd_stash.c` x2,
+`cmd_rebase.c`'s own start gate, `cmd_undo.c`'s clearing exception) already
+asks `sg_sequencer_kind_in_progress` and branches on the answer to print
+"cherry-pick" or "revert", and `cmd_status.c`'s banner already prints
+"cherry-picking"/"reverting" and the matching `sg cherry-pick`/`sg revert`
+hint lines. All of that was written and unit-tested in Phase 57a, in
+anticipation of this phase, specifically so that the revert-message rules
+(spec section 4, all four measured shapes) had somewhere real to be
+exercised from the very first commit that touched them.
+
+What Phase 57b actually added: `src/cli/cmd_revert.c` (a byte-for-byte
+parallel shell to `cmd_cherry_pick.c`, differing only in usage text and
+which `sg_seq_kind` it passes down), the `sg_cmd_revert` registration in
+`include/sg/cli.h`/`src/cli/cli.c`, `tests/test_revert_message.c`, the
+`phase57b:` interop group, and this section plus the `.SS revert` man page
+section.
+
+### 2. `tests/test_revert_message.c` -- the 7-row Reapply table
+
+All 7 rows of spec section 4.3 (4 positive, 3 negative) plus 4.1's plain
+wrap and 4.2's merge form are asserted as **exact byte strings**, not
+`strstr` substring checks -- a wrapping rule that inserts one stray space
+would still pass a substring check. Each row is driven through the real
+`sg_pick_start` entry point (not a direct call to the static
+`build_revert_subject_line`, which is file-local to `pick.c` and stays
+that way -- exposing it just for a test would be a second public surface
+for logic the black-box test can already reach). Proven to go red for the
+right reason: mutating the Reapply prefix comparison from `strncmp` to
+`strncasecmp` turns exactly the case-insensitivity negative control
+(`revert "lower"` -> should stay `Revert "revert "lower""`) red and nothing
+else (`tests/mutate.sh`).
+
+The 4.2 (merge) fixture needed one property that is easy to get backwards
+when hand-building a merge commit for a test: reverting `-m 1` of a real
+merge is a NO-OP unless the merge's own tree differs from BOTH the
+selected parent's tree and the current-HEAD tree in a way that survives the
+three-way merge's "ours == base -> take theirs" shortcut. Concretely: HEAD
+must equal the merge commit `M` itself (so `ours == base` trivially), and
+`M`'s tree must differ from parent 1's tree (so `theirs != base`, giving a
+real, non-empty change to assert on). A tempting simpler construction --
+"let `M`'s tree equal parent 1's tree, representing an unmodified carry-
+forward" -- makes `theirs == base` too and the revert reports EMPTY, which
+proves nothing about the message. This was found by reasoning through the
+three-way merge arithmetic before writing the fixture, not by a red test.
+
+### 3. `phase57b:` interop group -- why commit-object comparison had to
+### become message-only comparison
+
+Phase 57a's own `phase57:` group could byte-compare cherry-picked commit
+OBJECTS between sg and git (minus the committer line) because cherry-pick's
+author fields are copied verbatim from the picked commit -- two independent
+runs (one per tool, from the same starting fixture) therefore produce
+identical author lines by construction, not by luck. Revert's author does
+NOT come from anywhere copyable (spec 3.2: author AND committer both come
+from the environment + the real clock), so two independently-run reverts
+necessarily disagree on the author line even when everything else about
+the revert is correct -- this is the SAME whole-project limitation
+`P57_CLEAN`'s own comment already names for the committer line (`sg` never
+reads `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`, `cmd_commit.c` and `pick.c`
+both call `time(NULL)` unconditionally), just now visible in a field that
+used to be safe to compare.
+
+The fix is not to relax the comparison generally, it is to compare the
+right THING: spec section 8.2 asks for the revert MESSAGE compared
+byte-for-byte, not the whole commit object, and the message text has no
+timestamp dependency at all. `phase57b:`'s message checks therefore extract
+`git log -1 --format=%B` from each side and `cmp` only that.
+
+One further trap this raised, and had to be fixed once found: the 4.3
+Reapply fixture originally had EACH TOOL independently revert-of-the-revert
+(build root+edit, copy to `-sg`/`-git`, each side reverts HEAD, then each
+side reverts ITS OWN resulting revert commit again). Because the first
+revert's commit id differs between the two copies (same author-clock
+reason as above), the SECOND revert's message -- `This reverts commit
+<id-of-the-first-revert-commit>.` -- necessarily embeds two different ids,
+and the check misreports a real formatting bug as present when there is
+none. The fix: build the shared "Revert commit" ONCE with real git (pinned
+`GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`, same as every other shared-object
+fixture in this phase), THEN copy that single object into fresh `-sg`/
+`-git` directories before each tool reverts it a second time. This is the
+same "build once with git, copy twice" technique `P57_CLEAN` already uses
+for cherry-pick's clean case, applied one level deeper because this
+fixture needs the shared object to be a REVERT commit, which only exists
+after a first revert has already run.
+
+The reflog asymmetry (direct revert: `revert: <subject>`; `--continue`:
+bare `commit: <subject>`, no `(cherry-pick)`-style suffix) is pinned as a
+head-on pair against Phase 57a's `commit (cherry-pick): <subject>` check,
+per spec 3.3's explicit instruction -- both wordings were independently
+re-measured against real git 2.55.0 while writing this group, not just
+carried over from the spec.
+
+### 4. Escape hatches, verified against a REAL git-paused revert
+
+Phase 57a's dead-end regression (state real git wrote, or state half-
+written by a failed write, defeating all four escape hatches because they
+depended on the state being parseable) was fixed generically in the shared
+engine and is therefore inherited by revert automatically -- but "the
+engine is shared" is not the same claim as "the test coverage is shared"
+(this project's own recorded lesson: shared functions do not share tests,
+call sites can still short-circuit around a fix). This was checked by hand
+against a real `git revert` pause (not just the shared unit/interop
+suite): a two-commit `git revert` paused on a conflict, then
+`sg revert --continue` and `sg revert --skip` both correctly refuse,
+naming `--abort` (never `--continue`/`--skip`, which would fail
+identically on git's 7-hex todo); `sg status` prints the "You are currently
+reverting commit <7hex>." banner reading `REVERT_HEAD` directly,
+independent of whether `sequencer/todo` parses; `sg revert --quit` clears
+both `REVERT_HEAD` and `sequencer/` on existence alone; and
+`sg revert --abort` recovers correctly, restoring `HEAD` to the exact
+commit git's own `sequencer/head` named and removing the paused state.
+All five outcomes matched spec section 5b's cherry-pick findings exactly,
+confirming this really is inherited behaviour rather than something that
+happened to look right.
+
+### 5. A found-and-fixed pre-existing docs bug
+
+While extending the `docs/sg.1` `FILES` entry for
+`CHERRY_PICK_HEAD`/`MERGE_MSG`/`sequencer/` to also cover `REVERT_HEAD`,
+its existing text ("so a real git binary can inspect or finish a pick sg
+left paused, **and vice versa**") was found to directly contradict spec
+section 5b's own explicit instruction ("Cross-tool resumption is
+one-directional ... Do not write 'and vice versa' anywhere") -- a
+pre-existing Phase 57a documentation bug, not something this phase
+introduced, caught only because this phase had to touch the same
+paragraph for an unrelated reason (adding `REVERT_HEAD`). Fixed in the same
+edit: the paragraph now states the real, asymmetric claim (git can inspect,
+finish, or abort a pick/revert sg paused; sg can only `--abort`/`--quit`,
+never `--continue`/`--skip`, one git itself paused, and explains why --
+git's todo ids are its own abbreviated 7-hex, which sg has no
+abbreviated-object-name resolution to read back).

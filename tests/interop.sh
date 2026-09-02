@@ -14716,6 +14716,308 @@ p57_gate_undo_rc=$?
 check "phase57 gate site: cmd_undo.c is the sole exception and clears the paused cherry-pick state" \
     sh -c 'test "$0" = 0 && test ! -f "$1/.git/CHERRY_PICK_HEAD"' "$p57_gate_undo_rc" "$P57_GATE_UNDO"
 
+# --- Phase 57b: `sg revert` ------------------------------------------------
+# Message comparisons here use ONLY `git log -1 --format=%B` (the message),
+# never a full `cat-file -p` diff: unlike cherry-pick's commit (whose author
+# fields are copied verbatim from the picked commit, so both copies agree
+# byte for byte by construction), revert's author/committer are freshly
+# stamped from the environment + the real clock (spec 3.2), same as sg's
+# own `commit` -- CLAUDE.md's existing GIT_COMMITTER_DATE warning applies
+# here too, and now to the AUTHOR line as well since revert's author is no
+# longer copied from anywhere. The message text has no such dependency and
+# is exactly what spec section 4 measured.
+
+# P57B_MSG: a root commit plus one edit, for 4.1 (plain wrap) and, by
+# reverting the resulting revert commit, 4.3's Reapply rule (its subject
+# begins with the literal `Revert "`).
+P57B_MSG="$WORKDIR/p57b_msg"
+mkdir -p "$P57B_MSG"
+(cd "$P57B_MSG" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+printf 'line1\nline2\nline3\n' > "$P57B_MSG/r.txt"
+(cd "$P57B_MSG" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_MSG" "root"
+printf 'line1\nCHANGED\nline3\n' > "$P57B_MSG/r.txt"
+(cd "$P57B_MSG" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_MSG" "an edit"
+
+rm -rf "$P57B_MSG-sg" "$P57B_MSG-git"
+cp -R "$P57B_MSG" "$P57B_MSG-sg"
+cp -R "$P57B_MSG" "$P57B_MSG-git"
+
+(cd "$P57B_MSG-sg" && "$SG" revert --no-edit HEAD) > "$P57B_MSG-sg.out1" 2>&1
+p57b_msg_sg_rc1=$?
+(cd "$P57B_MSG-git" && LC_ALL=C git revert --no-edit HEAD) > "$P57B_MSG-git.out1" 2>&1
+p57b_msg_git_rc1=$?
+check "phase57b oracle: precondition -- git's clean revert really succeeded" \
+    test "$p57b_msg_git_rc1" = 0
+check "phase57b: sg's clean revert also succeeds (rc=0)" test "$p57b_msg_sg_rc1" = 0
+
+(cd "$P57B_MSG-sg" && LC_ALL=C git log -1 --format=%B HEAD) > "$P57B_MSG-sg.msg1" 2>/dev/null
+(cd "$P57B_MSG-git" && LC_ALL=C git log -1 --format=%B HEAD) > "$P57B_MSG-git.msg1" 2>/dev/null
+check "phase57b: sg revert's message (4.1, plain wrap) matches git's byte-for-byte" \
+    cmp -s "$P57B_MSG-sg.msg1" "$P57B_MSG-git.msg1"
+
+# 4.3's Reapply rule: revert a commit whose OWN subject already begins
+# "Revert \"". That commit is built with real git (pinned dates) directly
+# in P57B_MSG -- one shared object, THEN copied into fresh -sg/-git dirs --
+# rather than having each tool independently revert-of-the-revert: sg never
+# honors GIT_AUTHOR_DATE (same whole-project limitation the section-header
+# comment above already names), so two independently-built "Revert commit"
+# parents would carry two different ids, and the embedded
+# "This reverts commit <id>." line would then differ for a reason that has
+# nothing to do with the Reapply rule under test.
+p57_commit_shared() {
+    # Like p57_commit, but with -c core.editor=true so a plain `git revert`
+    # (no --no-edit) still commits non-interactively, keeping the message
+    # git itself generated verbatim (--no-edit + -m would require message
+    # text this helper does not have).
+    ( cd "$1" && GIT_AUTHOR_DATE="$P57_DATE" GIT_COMMITTER_DATE="$P57_DATE" \
+      LC_ALL=C git -c core.editor=true revert --no-edit "$2" ) > /dev/null 2>&1
+}
+p57_commit_shared "$P57B_MSG" HEAD
+P57B_MSG_REVERT_HEAD=$(cd "$P57B_MSG" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+check "phase57b oracle: precondition -- the shared 'Revert commit' subject really begins 'Revert \"'" \
+    sh -c 'test "$(LC_ALL=C git -C "$0" log -1 --format=%s)" = "Revert \"an edit\""' "$P57B_MSG"
+
+rm -rf "$P57B_MSG-sg2" "$P57B_MSG-git2"
+cp -R "$P57B_MSG" "$P57B_MSG-sg2"
+cp -R "$P57B_MSG" "$P57B_MSG-git2"
+
+(cd "$P57B_MSG-sg2" && "$SG" revert --no-edit HEAD) > "$P57B_MSG-sg2.out" 2>&1
+p57b_msg_sg_rc2=$?
+(cd "$P57B_MSG-git2" && LC_ALL=C git revert --no-edit HEAD) > "$P57B_MSG-git2.out" 2>&1
+p57b_msg_git_rc2=$?
+check "phase57b oracle: precondition -- git's revert-of-a-revert also succeeds cleanly" \
+    test "$p57b_msg_git_rc2" = 0
+check "phase57b: sg's revert-of-a-revert also succeeds (rc=0)" test "$p57b_msg_sg_rc2" = 0
+
+(cd "$P57B_MSG-sg2" && LC_ALL=C git log -1 --format=%B HEAD) > "$P57B_MSG-sg2.msg" 2>/dev/null
+(cd "$P57B_MSG-git2" && LC_ALL=C git log -1 --format=%B HEAD) > "$P57B_MSG-git2.msg" 2>/dev/null
+check "phase57b oracle: precondition -- git's own reapply subject really begins 'Reapply \"'" \
+    sh -c 'head -1 "$0" | grep -q "^Reapply \""' "$P57B_MSG-git2.msg"
+check "phase57b: sg revert's message (4.3, Reapply) matches git's byte-for-byte" \
+    cmp -s "$P57B_MSG-sg2.msg" "$P57B_MSG-git2.msg"
+
+# P57B_MERGE: a real merge commit, for 4.2 (merge + -m, the literal
+# "reversing\nchanges made to" line break, not wrapping).
+P57B_MERGE="$WORKDIR/p57b_merge"
+mkdir -p "$P57B_MERGE"
+(cd "$P57B_MERGE" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+printf 'base\n' > "$P57B_MERGE/r.txt"
+(cd "$P57B_MERGE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_MERGE" "root"
+(cd "$P57B_MERGE" && LC_ALL=C git branch p57bside) > /dev/null 2>&1
+(cd "$P57B_MERGE" && LC_ALL=C git switch -q p57bside) > /dev/null 2>&1
+printf 'base\nSIDE\n' > "$P57B_MERGE/r.txt"
+(cd "$P57B_MERGE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_MERGE" "side change"
+(cd "$P57B_MERGE" && LC_ALL=C git switch -q master) > /dev/null 2>&1
+printf 'other\n' > "$P57B_MERGE/other.txt"
+(cd "$P57B_MERGE" && LC_ALL=C git add other.txt) > /dev/null 2>&1
+p57_commit "$P57B_MERGE" "unrelated master commit"
+( cd "$P57B_MERGE" && GIT_AUTHOR_DATE="$P57_DATE" GIT_COMMITTER_DATE="$P57_DATE" \
+  LC_ALL=C git merge -q --no-edit p57bside ) > /dev/null 2>&1
+
+rm -rf "$P57B_MERGE-sg" "$P57B_MERGE-git"
+cp -R "$P57B_MERGE" "$P57B_MERGE-sg"
+cp -R "$P57B_MERGE" "$P57B_MERGE-git"
+
+(cd "$P57B_MERGE-sg" && "$SG" revert --no-edit -m 1 HEAD) > "$P57B_MERGE-sg.out" 2>&1
+p57b_merge_sg_rc=$?
+(cd "$P57B_MERGE-git" && LC_ALL=C git revert --no-edit -m 1 HEAD) > "$P57B_MERGE-git.out" 2>&1
+p57b_merge_git_rc=$?
+check "phase57b oracle: precondition -- git's revert -m 1 of the merge succeeds cleanly" \
+    test "$p57b_merge_git_rc" = 0
+check "phase57b: sg's revert -m 1 of the merge also succeeds (rc=0)" test "$p57b_merge_sg_rc" = 0
+
+(cd "$P57B_MERGE-sg" && LC_ALL=C git log -1 --format=%B HEAD) > "$P57B_MERGE-sg.msg" 2>/dev/null
+(cd "$P57B_MERGE-git" && LC_ALL=C git log -1 --format=%B HEAD) > "$P57B_MERGE-git.msg" 2>/dev/null
+check "phase57b oracle: precondition -- git's own merge-revert message really has a literal line break after 'reversing'" \
+    sh -c 'sed -n "4p" "$0" | grep -qx "changes made to [0-9a-f]\{40\}\."' "$P57B_MERGE-git.msg"
+check "phase57b: sg revert -m 1's message (4.2, merge) matches git's byte-for-byte" \
+    cmp -s "$P57B_MERGE-sg.msg" "$P57B_MERGE-git.msg"
+
+# Reflog: direct revert is "revert: <subject>"; --continue is bare
+# "commit: <subject>" with NO "(cherry-pick)"-style suffix at all -- the
+# asymmetry spec 3.3 measured against real git and requires pinned as a
+# head-on pair against phase57's "commit (cherry-pick): <subject>" check.
+P57B_CONFLICT="$WORKDIR/p57b_conflict"
+mkdir -p "$P57B_CONFLICT"
+(cd "$P57B_CONFLICT" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+printf 'line1\nline2\nline3\n' > "$P57B_CONFLICT/r.txt"
+(cd "$P57B_CONFLICT" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_CONFLICT" "root"
+printf 'line1\nEDIT1\nline3\n' > "$P57B_CONFLICT/r.txt"
+(cd "$P57B_CONFLICT" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_CONFLICT" "edit1"
+P57B_CONFLICT_EDIT1=$(cd "$P57B_CONFLICT" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+printf 'line1\nEDIT2\nline3\n' > "$P57B_CONFLICT/r.txt"
+(cd "$P57B_CONFLICT" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_CONFLICT" "edit2"
+
+rm -rf "$P57B_CONFLICT-sg" "$P57B_CONFLICT-git"
+cp -R "$P57B_CONFLICT" "$P57B_CONFLICT-sg"
+cp -R "$P57B_CONFLICT" "$P57B_CONFLICT-git"
+
+(cd "$P57B_CONFLICT-sg" && "$SG" revert --no-edit "$P57B_CONFLICT_EDIT1") \
+    > "$P57B_CONFLICT-sg.out" 2>&1
+(cd "$P57B_CONFLICT-git" && LC_ALL=C git revert --no-edit "$P57B_CONFLICT_EDIT1") \
+    > "$P57B_CONFLICT-git.out" 2>&1
+
+check "phase57b oracle: precondition -- git's revert really stopped on a conflict" \
+    sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_CONFLICT-git"
+check "phase57b: sg's revert stops on the same conflict" \
+    sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_CONFLICT-sg"
+check "phase57b: REVERT_HEAD holds the same commit id on both sides" \
+    cmp -s "$P57B_CONFLICT-sg/.git/REVERT_HEAD" "$P57B_CONFLICT-git/.git/REVERT_HEAD"
+check "phase57b: sg's MERGE_MSG matches git's byte-for-byte (message + # Conflicts: block)" \
+    cmp -s "$P57B_CONFLICT-sg/.git/MERGE_MSG" "$P57B_CONFLICT-git/.git/MERGE_MSG"
+
+# Direct-apply reflog message: "revert: <subject>" (spec 3.3). Single
+# commit, so no sequencer/ directory on either side (spec 2.3) --
+# --continue below works off REVERT_HEAD alone.
+check "phase57b: single-commit sg revert conflict creates no sequencer/ directory" \
+    sh -c 'test ! -d "$0/.git/sequencer"' "$P57B_CONFLICT-sg"
+check "phase57b oracle: precondition -- single-commit git revert conflict creates no sequencer/ dir either" \
+    sh -c 'test ! -d "$0/.git/sequencer"' "$P57B_CONFLICT-git"
+
+printf 'line1\nRESOLVED\nline3\n' > "$P57B_CONFLICT-sg/r.txt"
+(cd "$P57B_CONFLICT-sg" && "$SG" add r.txt) > /dev/null 2>&1
+(cd "$P57B_CONFLICT-sg" && "$SG" revert --continue --no-edit) > /dev/null 2>&1
+(cd "$P57B_CONFLICT-sg" && LC_ALL=C git reflog -1 --format=%gs HEAD) > "$P57B_CONFLICT-sg.reflog" 2>/dev/null
+check "phase57b: --continue's reflog message is bare 'commit: <subject>', no (cherry-pick)-style suffix" \
+    sh -c 'test "$(cat "$0")" = "commit: Revert \"edit1\""' "$P57B_CONFLICT-sg.reflog"
+check "phase57b: ...and it is NOT the cherry-pick wording (head-on asymmetry pin)" \
+    sh -c '! grep -q "(cherry-pick)" "$0"' "$P57B_CONFLICT-sg.reflog"
+
+printf 'line1\nRESOLVED\nline3\n' > "$P57B_CONFLICT-git/r.txt"
+(cd "$P57B_CONFLICT-git" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+(cd "$P57B_CONFLICT-git" && LC_ALL=C git -c core.editor=true revert --continue) > /dev/null 2>&1
+(cd "$P57B_CONFLICT-git" && LC_ALL=C git reflog -1 --format=%gs HEAD) > "$P57B_CONFLICT-git.reflog" 2>/dev/null
+check "phase57b oracle: precondition -- git's own --continue reflog is likewise bare 'commit: <subject>'" \
+    sh -c 'test "$(cat "$0")" = "commit: Revert \"edit1\""' "$P57B_CONFLICT-git.reflog"
+
+# Direct-apply wording: reuse "$P57B_MSG-sg" right after its FIRST (direct,
+# non-continue) revert above -- a fresh sibling copy would need to be built
+# from before the shared "Revert commit" step, which would just be this
+# same state under a new name.
+(cd "$P57B_MSG-sg" && LC_ALL=C git reflog -1 --format=%gs HEAD) > "$P57B_MSG-sg.reflog1" 2>/dev/null
+check "phase57b: direct revert's reflog message is 'revert: <subject>'" \
+    sh -c 'test "$(cat "$0")" = "revert: Revert \"an edit\""' "$P57B_MSG-sg.reflog1"
+
+# sequencer/todo verb is 'revert' (spec 2.3), full 40-hex on sg vs git's
+# 7-hex -- the same deliberate divergence pinned for cherry-pick's 'pick'.
+P57B_MULTI="$WORKDIR/p57b_multi"
+mkdir -p "$P57B_MULTI"
+(cd "$P57B_MULTI" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+printf 'line1\nline2\nline3\n' > "$P57B_MULTI/r.txt"
+(cd "$P57B_MULTI" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_MULTI" "root"
+printf 'line1\nEDIT1\nline3\n' > "$P57B_MULTI/r.txt"
+(cd "$P57B_MULTI" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_MULTI" "edit1"
+P57B_MULTI_EDIT1=$(cd "$P57B_MULTI" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+printf 'extra\n' > "$P57B_MULTI/extra.txt"
+(cd "$P57B_MULTI" && LC_ALL=C git add extra.txt) > /dev/null 2>&1
+p57_commit "$P57B_MULTI" "add extra.txt"
+P57B_MULTI_EXTRA=$(cd "$P57B_MULTI" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+printf 'line1\nEDIT2\nline3\n' > "$P57B_MULTI/r.txt"
+(cd "$P57B_MULTI" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_MULTI" "edit2"
+
+rm -rf "$P57B_MULTI-sg" "$P57B_MULTI-git"
+cp -R "$P57B_MULTI" "$P57B_MULTI-sg"
+cp -R "$P57B_MULTI" "$P57B_MULTI-git"
+(cd "$P57B_MULTI-sg" && "$SG" revert --no-edit "$P57B_MULTI_EDIT1" "$P57B_MULTI_EXTRA") \
+    > /dev/null 2>&1
+(cd "$P57B_MULTI-git" && LC_ALL=C git revert --no-edit "$P57B_MULTI_EDIT1" "$P57B_MULTI_EXTRA") \
+    > /dev/null 2>&1
+
+check "phase57b oracle: precondition -- git's multi-commit revert also stopped, leaving both in sequencer/todo" \
+    sh -c 'test -f "$0/.git/sequencer/todo" && test $(wc -l < "$0/.git/sequencer/todo") = 2' \
+    "$P57B_MULTI-git"
+check "phase57b: sg's sequencer/todo also has both entries left" \
+    sh -c 'test -f "$0/.git/sequencer/todo" && test $(wc -l < "$0/.git/sequencer/todo") = 2' \
+    "$P57B_MULTI-sg"
+check "phase57b: git's todo lines start with the verb 'revert' and a 7-hex id" \
+    sh -c "grep -qE '^revert [0-9a-f]{7} ' \"\$0\"" "$P57B_MULTI-git/.git/sequencer/todo"
+check "phase57b: sg's todo lines start with the verb 'revert' and a 40-hex id (the deliberate divergence)" \
+    sh -c "grep -qE '^revert [0-9a-f]{40} ' \"\$0\"" "$P57B_MULTI-sg/.git/sequencer/todo"
+check "phase57b: real git accepts sg's full-hex todo field as a valid object id" \
+    sh -c "cd \"\$0\" && LC_ALL=C git rev-parse --verify \"\$(awk '{print \$2}' .git/sequencer/todo | head -1)\" >/dev/null 2>&1" \
+    "$P57B_MULTI-sg"
+
+# --abort restores the pre-revert state on both sides; --quit leaves the
+# conflicted index in place (spec section 5).
+P57B_ABORT="$WORKDIR/p57b_abort"
+rm -rf "$P57B_ABORT"
+cp -R "$P57B_CONFLICT" "$P57B_ABORT"
+P57B_ABORT_PRE=$(cd "$P57B_ABORT" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+(cd "$P57B_ABORT" && "$SG" revert --no-edit "$P57B_CONFLICT_EDIT1") > /dev/null 2>&1
+(cd "$P57B_ABORT" && "$SG" revert --abort) > "$P57B_ABORT.out" 2>&1
+p57b_abort_rc=$?
+check "phase57b: sg revert --abort restores master to its pre-revert commit" \
+    sh -c "test \"\$0\" = 0 && test \"\$(cd \"\$1\" && LC_ALL=C git rev-parse HEAD)\" = \"\$2\"" \
+    "$p57b_abort_rc" "$P57B_ABORT" "$P57B_ABORT_PRE"
+check "phase57b: --abort leaves no REVERT_HEAD behind" \
+    sh -c 'test ! -f "$0/.git/REVERT_HEAD"' "$P57B_ABORT"
+
+P57B_QUIT="$WORKDIR/p57b_quit"
+rm -rf "$P57B_QUIT"
+cp -R "$P57B_CONFLICT" "$P57B_QUIT"
+(cd "$P57B_QUIT" && "$SG" revert --no-edit "$P57B_CONFLICT_EDIT1") > /dev/null 2>&1
+(cd "$P57B_QUIT" && "$SG" revert --quit) > "$P57B_QUIT.out" 2>&1
+p57b_quit_rc=$?
+(cd "$P57B_QUIT" && "$SG" status --porcelain) > "$P57B_QUIT.porcelain" 2>&1
+check "phase57b: sg revert --quit leaves REVERT_HEAD/MERGE_MSG gone but the conflicted index in place" \
+    sh -c 'test "$0" = 0 && test ! -f "$1/.git/REVERT_HEAD" && ! grep -qv "^UU " "$2"' \
+    "$p57b_quit_rc" "$P57B_QUIT" "$P57B_QUIT.porcelain"
+
+# sg status's revert banner (spec section 7's "reverting" wording), same
+# phase38 skeleton technique as phase57's cherry-pick banner check.
+P57B_STATUS_SG="$WORKDIR/p57b_status_sg"
+P57B_STATUS_GIT="$WORKDIR/p57b_status_git"
+rm -rf "$P57B_STATUS_SG" "$P57B_STATUS_GIT"
+cp -R "$P57B_CONFLICT" "$P57B_STATUS_SG"
+cp -R "$P57B_CONFLICT" "$P57B_STATUS_GIT"
+(cd "$P57B_STATUS_SG" && "$SG" revert --no-edit "$P57B_CONFLICT_EDIT1") > /dev/null 2>&1
+(cd "$P57B_STATUS_GIT" && LC_ALL=C git revert --no-edit "$P57B_CONFLICT_EDIT1") > /dev/null 2>&1
+
+(cd "$P57B_STATUS_SG" && "$SG" status) > "$P57B_STATUS_SG.raw" 2>&1
+(cd "$P57B_STATUS_GIT" && LC_ALL=C git $P38_GIT_FLAGS status) > "$P57B_STATUS_GIT.raw" 2>&1
+p57_status_skeleton "$P57B_STATUS_SG.raw" "$P57B_STATUS_SG.sk"
+p57_status_skeleton "$P57B_STATUS_GIT.raw" "$P57B_STATUS_GIT.sk"
+check "phase57b oracle: precondition -- git's status names the revert (not cherry-pick) as in progress" \
+    sh -c 'grep -q "currently reverting" "$0"' "$P57B_STATUS_GIT.raw"
+check "phase57b: sg status's revert banner matches git's skeleton byte-for-byte" \
+    cmp -s "$P57B_STATUS_SG.sk" "$P57B_STATUS_GIT.sk"
+
+# Divergence 5 (spec section 6, last paragraph) applies to revert too: `sg
+# commit` is refused while a revert is stopped, `git commit` completes it.
+P57B_COMMIT_SG="$WORKDIR/p57b_commit_sg"
+rm -rf "$P57B_COMMIT_SG"
+cp -R "$P57B_CONFLICT" "$P57B_COMMIT_SG"
+(cd "$P57B_COMMIT_SG" && "$SG" revert --no-edit "$P57B_CONFLICT_EDIT1") > /dev/null 2>&1
+printf 'line1\nRESOLVED\nline3\n' > "$P57B_COMMIT_SG/r.txt"
+(cd "$P57B_COMMIT_SG" && "$SG" add r.txt) > /dev/null 2>&1
+(cd "$P57B_COMMIT_SG" && "$SG" commit -m "should be refused") > "$P57B_COMMIT_SG.out" 2>&1
+p57b_commit_sg_rc=$?
+check "phase57b: sg commit is refused while a revert is stopped (divergence 5)" \
+    test "$p57b_commit_sg_rc" = 1
+check "phase57b: ...and the revert state survives the refusal" \
+    sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_COMMIT_SG"
+
+P57B_COMMIT_GIT="$WORKDIR/p57b_commit_git"
+rm -rf "$P57B_COMMIT_GIT"
+cp -R "$P57B_CONFLICT" "$P57B_COMMIT_GIT"
+(cd "$P57B_COMMIT_GIT" && LC_ALL=C git revert --no-edit "$P57B_CONFLICT_EDIT1") > /dev/null 2>&1
+printf 'line1\nRESOLVED\nline3\n' > "$P57B_COMMIT_GIT/r.txt"
+(cd "$P57B_COMMIT_GIT" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+(cd "$P57B_COMMIT_GIT" && LC_ALL=C git -c core.editor=true commit) > "$P57B_COMMIT_GIT.out" 2>&1
+p57b_commit_git_rc=$?
+check "phase57b oracle: precondition -- git commit completes the revert instead" \
+    sh -c "test \"\$0\" = 0 && test ! -f \"\$1/.git/REVERT_HEAD\"" "$p57b_commit_git_rc" "$P57B_COMMIT_GIT"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

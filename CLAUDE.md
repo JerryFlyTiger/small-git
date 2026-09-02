@@ -1781,9 +1781,23 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 - **`sg cherry-pick` exists as of Phase 57** (`include/sg/sequencer.h` +
   `src/safety/sequencer.c` for the on-disk state, `include/sg/pick.h` +
   `src/cli/pick.c` for the shared replay engine, `src/cli/cmd_cherry_pick.c`
-  as a thin argument-parsing shell). `sg revert` (Phase 57b) shares this
+  as a thin argument-parsing shell). `sg revert` (Phase 57b,
+  `src/cli/cmd_revert.c`, byte-for-byte parallel to `cmd_cherry_pick.c`
+  except for usage text and which `sg_seq_kind` it passes down) shares this
   same engine via the `sg_seq_kind` parameter -- see `include/sg/pick.h`'s
-  own header comment before touching either command.
+  own header comment before touching either command. Revert's own message
+  rules (section 4.3's 7-row Reapply table below) are unit-tested in
+  `tests/test_revert_message.c` as exact byte strings, not `strstr`
+  substring checks, driven through the real `sg_pick_start` entry point
+  rather than by exposing `pick.c`'s file-local message builders.
+  WARNING (found while extending the `docs/sg.1` `FILES` entry for
+  `REVERT_HEAD` in Phase 57b): the entry's prose had ALREADY drifted from
+  the "one-directional, no 'vice versa'" rule two paragraphs below, despite
+  that rule being written down correctly right here in the same commit that
+  introduced the drift -- CLAUDE.md being right is not evidence the other
+  docs agree with it. Fixed in the same edit; if `docs/sg.1`'s `FILES`
+  section is touched again, re-check it against this same paragraph rather
+  than assuming it was already correct.
   WARNING: **the state format deliberately MIRRORS git's own** (`CHERRY_
   PICK_HEAD`/`REVERT_HEAD`/`MERGE_MSG`/`sequencer/{head,abort-safety,todo}`,
   directly under `git_dir`) -- the OPPOSITE decision from `sg-rebase/`,
