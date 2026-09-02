@@ -3,6 +3,7 @@
 #include "sg/hash.h"
 #include "sg/merge.h"
 #include "sg/repo.h"
+#include "sg/revparse.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,18 +21,20 @@ int sg_cmd_merge_base(int argc, char **argv)
         fprintf(stderr, "usage: sg merge-base <commit-a> <commit-b>\n");
         return 1;
     }
-    if (sg_hex_to_sha1(argv[1], a) != 0) {
-        fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[1]);
-        return 1;
-    }
-    if (sg_hex_to_sha1(argv[2], b) != 0) {
-        fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[2]);
-        return 1;
-    }
-
     git_dir = sg_require_git_dir();
     if (git_dir == NULL)
         return 1;
+
+    if (sg_rev_parse_commit(git_dir, argv[1], a) != 0) {
+        fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[1]);
+        free(git_dir);
+        return 1;
+    }
+    if (sg_rev_parse_commit(git_dir, argv[2], b) != 0) {
+        fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[2]);
+        free(git_dir);
+        return 1;
+    }
 
     rc = sg_merge_base(git_dir, a, b, out);
     free(git_dir);

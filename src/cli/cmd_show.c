@@ -555,174 +555,39 @@ static int render_id(const char *git_dir, const char *display_arg,
     }
 }
 
-/* Splits `arg` at the first ':' and resolves the left side as a commit, then
-   walks its tree component by component to find the entry named by the
-   right side (an empty right side means the commit's own tree). Returns 0
-   with *id_out and *type_out filled in, or -1 having already printed the
-   "path does not exist" message. */
-static int resolve_rev_path(const char *git_dir, const char *arg, const char *colon,
-                            unsigned char id_out[SG_SHA1_RAW_LEN], sg_obj_type *type_out)
-{
-    char rev[SG_PATH_MAX];
-    unsigned char commit_id[SG_SHA1_RAW_LEN];
-    unsigned char tree_id[SG_SHA1_RAW_LEN];
-    const char *path;
-    size_t rev_len = (size_t)(colon - arg);
-
-    if (rev_len >= sizeof(rev)) {
-        fprintf(stderr, "sg: not a valid object name '%s'\n", arg);
-        return -1;
-    }
-    memcpy(rev, arg, rev_len);
-    rev[rev_len] = '\0';
-    path = colon + 1;
-
-    if (sg_rev_parse_commit(git_dir, rev, commit_id) != 0) {
-        fprintf(stderr, "sg: not a valid object name '%s'\n", arg);
-        return -1;
-    }
-    if (sg_commit_tree_of(git_dir, commit_id, tree_id) != 0) {
-        fprintf(stderr, "sg: not a valid object name '%s'\n", arg);
-        return -1;
-    }
-
-    if (path[0] == '\0') {
-        memcpy(id_out, tree_id, SG_SHA1_RAW_LEN);
-        *type_out = SG_OBJ_TREE;
-        return 0;
-    }
-
-    {
-        char pathbuf[SG_PATH_MAX];
-        char *saveptr = NULL;
-        char *comp;
-        unsigned char cur_id[SG_SHA1_RAW_LEN];
-
-        if (strlen(path) >= sizeof(pathbuf)) {
-            fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", path, rev);
-            return -1;
-        }
-        strcpy(pathbuf, path);
-        memcpy(cur_id, tree_id, SG_SHA1_RAW_LEN);
-
-        for (comp = strtok_r(pathbuf, "/", &saveptr); comp != NULL;
-            comp = strtok_r(NULL, "/", &saveptr)) {
-            unsigned char *content;
-            size_t content_len;
-            sg_obj_type type;
-            sg_tree tree;
-            size_t i;
-            int found = 0;
-
-            if (sg_object_read(git_dir, cur_id, &type, &content, &content_len) != 0) {
-                fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", path, rev);
-                return -1;
-            }
-            /* A SUCCESSFUL read of a non-tree still owns `content`: reached
-               whenever a middle component names a file rather than a
-               directory (`HEAD:f.txt/x`, an ordinary typo), so folding this
-               into the condition above leaked the whole decompressed blob. */
-            if (type != SG_OBJ_TREE) {
-                free(content);
-                fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", path, rev);
-                return -1;
-            }
-            if (sg_tree_parse(content, content_len, &tree) != 0) {
-                free(content);
-                fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", path, rev);
-                return -1;
-            }
-            free(content);
-
-            for (i = 0; i < tree.count; i++) {
-                if (strcmp(tree.entries[i].name, comp) == 0) {
-                    memcpy(cur_id, tree.entries[i].sha1, SG_SHA1_RAW_LEN);
-                    found = 1;
-                    break;
-                }
-            }
-            sg_tree_free(&tree);
-
-            if (!found) {
-                fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", path, rev);
-                return -1;
-            }
-        }
-
-        {
-            unsigned char *content;
-            size_t content_len;
-
-            if (sg_object_read(git_dir, cur_id, type_out, &content, &content_len) != 0) {
-                fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", path, rev);
-                return -1;
-            }
-            free(content);
-        }
-        memcpy(id_out, cur_id, SG_SHA1_RAW_LEN);
-        return 0;
-    }
-}
-
-/* Resolves `arg` to an object id/type per the three-step order documented
-   in cmd_show.c's header: <rev>:<path>, a full 40-hex object id, otherwise
-   a revision name (with tags deliberately left unpeeled). Returns 0 with
-   *id_out and *type_out filled in, -1 having already printed a diagnostic. */
+/* Resolves `arg` to an object id/type via the shared sg_rev_parse_object
+   (see revparse.h for the exact grammar and order). Returns 0 with *id_out
+   and *type_out filled in, -1 having already printed a diagnostic. */
 static int resolve_object(const char *git_dir, const char *arg,
                           unsigned char id_out[SG_SHA1_RAW_LEN], sg_obj_type *type_out)
 {
-    const char *colon = strchr(arg, ':');
-    char ref_path[SG_PATH_MAX];
+    char bad_path[SG_PATH_MAX];
+    int rc;
 
-    if (colon != NULL)
-        return resolve_rev_path(git_dir, arg, colon, id_out, type_out);
-
-    if (strlen(arg) == SG_SHA1_HEX_LEN && sg_hex_to_sha1(arg, id_out) == 0) {
-        unsigned char *content;
-        size_t content_len;
-
-        if (sg_object_read(git_dir, id_out, type_out, &content, &content_len) != 0) {
-            fprintf(stderr, "sg: not a valid object name '%s'\n", arg);
-            return -1;
-        }
-        free(content);
+    bad_path[0] = '\0';
+    rc = sg_rev_parse_object(git_dir, arg, id_out, type_out, bad_path, sizeof(bad_path));
+    if (rc == 0)
         return 0;
+    /* A well-formed id whose object cannot be read is missing or corrupt,
+       NOT an invalid name -- interop pins this wording, because naming the
+       wrong problem sends the reader to the wrong place (the fixture is a
+       packed REF_DELTA whose base object is gone). */
+    if (rc == -3) {
+        fprintf(stderr, "sg: object '%s' not found or corrupt\n", arg);
+        return -1;
     }
+    if (rc == -2) {
+        const char *colon = strchr(arg, ':');
+        char rev[SG_PATH_MAX];
+        size_t rev_len = colon != NULL ? (size_t)(colon - arg) : 0;
 
-    /* A tag must not be peeled: resolve to a ref path and read the id it
-       names directly (whatever object that turns out to be), only falling
-       back to sg_rev_parse_commit (which does peel, and understands
-       ~/^/@{N} suffixes) when the name isn't a ref at all. */
-    if (sg_rev_parse_ref_path(git_dir, arg, ref_path, sizeof(ref_path)) == 0) {
-        int rc;
-
-        /* HEAD is a symref, not a raw-oid file -- same special case
-           sg_rev_parse_commit's own caller makes (revparse.c), for the
-           same reason: sg_ref_read_path would try to hex-decode the
-           "ref: ..." line and fail. */
-        if (strcmp(ref_path, "HEAD") == 0)
-            rc = sg_ref_resolve_head(git_dir, id_out);
-        else
-            rc = sg_ref_read_path(git_dir, ref_path, id_out);
-
-        if (rc == 0) {
-            unsigned char *content;
-            size_t content_len;
-
-            if (sg_object_read(git_dir, id_out, type_out, &content, &content_len) != 0) {
-                fprintf(stderr, "sg: not a valid object name '%s'\n", arg);
-                return -1;
-            }
-            free(content);
-            return 0;
-        }
+        if (rev_len >= sizeof(rev))
+            rev_len = sizeof(rev) - 1;
+        memcpy(rev, arg, rev_len);
+        rev[rev_len] = '\0';
+        fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", bad_path, rev);
+        return -1;
     }
-
-    if (sg_rev_parse_commit(git_dir, arg, id_out) == 0) {
-        *type_out = SG_OBJ_COMMIT;
-        return 0;
-    }
-
     fprintf(stderr, "sg: not a valid object name '%s'\n", arg);
     return -1;
 }

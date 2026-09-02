@@ -13972,6 +13972,90 @@ check "phase55: --oneline does NOT expand tabs, it prints the subject raw" \
 check "phase55: ...while the same subject in the medium format IS expanded" \
     cmp -s "$WORKDIR/p55c_sg_tabbody.txt" "$WORKDIR/p55c_git_tabbody.txt"
 
+# --- Phase 56: `sg cat-file` and `sg merge-base` used to accept ONLY a full
+# 40-hex id -- `sg cat-file -p HEAD` and `sg merge-base HEAD topic` both
+# failed, against CLAUDE.md's own rule that a user-supplied revision goes
+# through the revparse layer. `sg show`'s Phase 55a resolver moved into
+# storage/revparse.c as sg_rev_parse_object and all three now share it.
+#
+# The two commands differ in ONE respect that must not be unified: cat-file
+# does NOT peel an annotated tag (`-t v1` says `tag`), while merge-base does
+# (`merge-base v1 topic` answers with a commit). Both are pinned below.
+P56="$WORKDIR/p56_revargs"
+mkdir -p "$P56"
+(cd "$P56" && LC_ALL=C git init -q .) > /dev/null 2>&1
+printf 'one\n' > "$P56/f.txt"
+mkdir -p "$P56/d"; printf 'inner\n' > "$P56/d/inner.txt"
+(cd "$P56" && LC_ALL=C git add -A) > /dev/null 2>&1
+( cd "$P56" && GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git commit -q -m first ) > /dev/null 2>&1
+(cd "$P56" && LC_ALL=C git branch p56topic && LC_ALL=C git tag p56light) > /dev/null 2>&1
+( cd "$P56" && GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git tag -a p56ann -m annotated ) > /dev/null 2>&1
+printf 'two\n' > "$P56/f.txt"
+(cd "$P56" && LC_ALL=C git add -A) > /dev/null 2>&1
+( cd "$P56" && GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git commit -q -m second ) > /dev/null 2>&1
+
+p56_cmp() {
+    p56tag="$1"; shift
+    (cd "$P56" && LC_ALL=C git "$@") > "$WORKDIR/p56_git_$p56tag.txt" 2>&1
+    (cd "$P56" && "$SG" "$@") > "$WORKDIR/p56_sg_$p56tag.txt" 2>&1
+}
+p56_cmp head cat-file -p HEAD
+p56_cmp headt cat-file -t HEAD
+p56_cmp branch cat-file -p p56topic
+p56_cmp prev cat-file -p HEAD~1
+p56_cmp annt cat-file -t p56ann
+p56_cmp annp cat-file -p p56ann
+p56_cmp lightt cat-file -t p56light
+p56_cmp blobpath cat-file -p HEAD:f.txt
+p56_cmp treepath cat-file -t HEAD:d
+p56_cmp mb merge-base HEAD p56topic
+p56_cmp mbann merge-base p56ann p56topic
+p56_cmp mbtilde merge-base HEAD~1 p56topic
+
+check "phase56: sg cat-file -p HEAD matches git" \
+    cmp -s "$WORKDIR/p56_sg_head.txt" "$WORKDIR/p56_git_head.txt"
+check "phase56: sg cat-file -t HEAD matches git" \
+    cmp -s "$WORKDIR/p56_sg_headt.txt" "$WORKDIR/p56_git_headt.txt"
+check "phase56: sg cat-file takes a branch name" \
+    cmp -s "$WORKDIR/p56_sg_branch.txt" "$WORKDIR/p56_git_branch.txt"
+check "phase56: sg cat-file takes a ~N suffix" \
+    cmp -s "$WORKDIR/p56_sg_prev.txt" "$WORKDIR/p56_git_prev.txt"
+check "phase56: sg cat-file takes <rev>:<path> for a blob" \
+    cmp -s "$WORKDIR/p56_sg_blobpath.txt" "$WORKDIR/p56_git_blobpath.txt"
+check "phase56: sg cat-file takes <rev>:<path> for a tree" \
+    cmp -s "$WORKDIR/p56_sg_treepath.txt" "$WORKDIR/p56_git_treepath.txt"
+# The head-on pair: the same annotated tag, unpeeled by one command and
+# peeled by the other. One shared rule for both fails whichever it is not.
+check "phase56: cat-file does NOT peel an annotated tag (-t says tag)" \
+    cmp -s "$WORKDIR/p56_sg_annt.txt" "$WORKDIR/p56_git_annt.txt"
+check "phase56: ...and -p prints the tag object, not the commit" \
+    cmp -s "$WORKDIR/p56_sg_annp.txt" "$WORKDIR/p56_git_annp.txt"
+check "phase56: ...while merge-base DOES peel the same tag" \
+    cmp -s "$WORKDIR/p56_sg_mbann.txt" "$WORKDIR/p56_git_mbann.txt"
+check "phase56: a lightweight tag names the commit directly" \
+    cmp -s "$WORKDIR/p56_sg_lightt.txt" "$WORKDIR/p56_git_lightt.txt"
+check "phase56: sg merge-base HEAD <branch> matches git" \
+    cmp -s "$WORKDIR/p56_sg_mb.txt" "$WORKDIR/p56_git_mb.txt"
+check "phase56: sg merge-base takes a ~N suffix" \
+    cmp -s "$WORKDIR/p56_sg_mbtilde.txt" "$WORKDIR/p56_git_mbtilde.txt"
+# ^{tree}/^{commit} peel syntax is NOT implemented and must be refused, never
+# misparsed into something else (git accepts it and exits 0; sg exits 1,
+# which is this project's existing exit-code divergence).
+(cd "$P56" && LC_ALL=C git cat-file -t "HEAD^{tree}") > /dev/null 2>&1
+check "phase56 oracle: precondition -- git really does accept ^{tree}" test $? = 0
+(cd "$P56" && "$SG" cat-file -t "HEAD^{tree}") > "$WORKDIR/p56_sg_peel.txt" 2>/dev/null
+check "phase56: sg refuses ^{tree} rather than misparsing it" test $? = 1
+check "phase56: ...printing nothing on stdout" test ! -s "$WORKDIR/p56_sg_peel.txt"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

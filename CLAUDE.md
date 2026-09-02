@@ -1538,6 +1538,32 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   The rest of `sg merge`'s stdout is still sg's own vocabulary and is still
   not compared against git's; Phase 50 changed this one output, not the
   command's voice.
+- **Resolving an OBJECT name (any type, tag NOT peeled) goes through
+  `sg_rev_parse_object`** (`include/sg/revparse.h`, Phase 56): a 40-hex id, a
+  ref (HEAD/branch/tag), anything `sg_rev_parse_commit`'s grammar accepts, or
+  `<rev>:<path>`. `sg show`, `sg cat-file` and `sg log`'s siblings share it --
+  those were **exactly the three files** that printed "not a valid object
+  id/name", and it was converged before a third copy set in.
+  WARNING: **`cat-file` does NOT peel an annotated tag while `merge-base`
+  DOES** (both measured: `cat-file -t v1` says `tag` and `-p v1` prints the
+  tag object's body; `merge-base v1 topic` answers with a commit). That is
+  why one takes `sg_rev_parse_object` and the other `sg_rev_parse_commit`.
+  Interop pins both against the same tag as a head-on pair -- a single shared
+  rule fails whichever half it was not written for.
+  WARNING: **`^{tree}` / `^{commit}` peel syntax is NOT implemented** and is
+  refused, never approximated. The rejection is clean by construction, not by
+  accident: the base scan stops at the first `~`/`^`/`@{` and the suffix must
+  then be all decimal digits, so `{tree}` fails to parse rather than being
+  read as `^0`. git accepts it and exits 0; sg exits 1 (the existing
+  exit-code divergence). Pinned on both sides.
+  WARNING: **-3 is not -1.** A well-formed 40-hex whose object cannot be read
+  is MISSING OR CORRUPT, not an invalid name -- the resolver must read an
+  object to learn its type, so a failed read looks like a failed resolve
+  unless it is distinguished. Sharing the resolver regressed this once and an
+  interop check from an earlier phase caught it by pinning the WORDING (a
+  packed REF_DELTA whose base is gone must say "not found or corrupt", so the
+  reader looks at the pack and not at their own typing). An error message is
+  part of the interface.
 - **A user-supplied revision string always goes through
   `sg_rev_parse_commit`** (`include/sg/revparse.h`): `HEAD`/tag/branch/full
   40-hex/full `refs/...` path, plus `~N`/`^N`/`@{N}` (Phase 17, reflog index,

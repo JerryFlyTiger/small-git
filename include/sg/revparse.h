@@ -1,7 +1,10 @@
 #ifndef SG_REVPARSE_H
 #define SG_REVPARSE_H
 
+#include <stddef.h>
+
 #include "sg/hash.h"
+#include "sg/object.h"
 
 /* Resolves a revision expression to a commit id.
 
@@ -98,5 +101,39 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
    (truncation, i.e. out_size too small, is a failure, not a silent cut), -1
    if name matches nothing. */
 int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size_t out_size);
+
+/* Resolves any object name -- a full 40-hex id, a ref (HEAD, branch, tag),
+   anything sg_rev_parse_commit's grammar accepts, or <rev>:<path> -- to the
+   object it names. An annotated tag is NOT peeled: unlike sg_rev_parse_commit,
+   which exists specifically to resolve to a commit and therefore always peels,
+   this function is for commands (`sg cat-file`, `sg show`) that need to
+   report on whatever object the name literally denotes, tag included.
+   `<rev>:<path>` resolves <rev> via sg_rev_parse_commit (which does peel --
+   there is no way to name an annotated tag's own tree/blob via this syntax
+   any more than git offers one), then walks its tree component by component;
+   an empty <path> means the commit's own tree.
+
+   Resolution order for a name with no ':': full 40-hex id, then a ref path
+   (HEAD/tag/branch, tried via sg_rev_parse_ref_path, unpeeled), then
+   sg_rev_parse_commit's full grammar (~/^/@{N} suffixes, which does peel and
+   only ever yields a commit).
+
+   Peel syntax (`^{tree}`, `^{commit}`, `^{blob}`) is NOT supported anywhere
+   in this project; an argument using it is rejected outright as "not a
+   valid object name", the same as any other unrecognized rev.
+
+   Returns 0 with *id_out and *type_out filled in; -1 if `arg` does not name any
+   object; -2 if <rev> resolved but <path> does not exist inside its tree,
+   with `bad_path` (a buffer of size `bad_path_size`) filled with the <path>
+   half of `arg` (truncation is a hard failure, folded into -1 instead, same
+   as -1's "malformed" case). Prints nothing to stderr -- the caller (CLI
+   layer) is responsible for any diagnostic, matching sg_rev_parse_commit's
+   own convention.
+   Returns -3 when `arg` is a well-formed 40-hex id whose object cannot be
+   read: the name is valid, the object is missing or corrupt, and saying
+   "not a valid object name" for it would name the wrong problem. */
+int sg_rev_parse_object(const char *git_dir, const char *arg,
+                        unsigned char id_out[SG_SHA1_RAW_LEN], sg_obj_type *type_out,
+                        char *bad_path, size_t bad_path_size);
 
 #endif

@@ -9703,3 +9703,84 @@ Local ASan is not a substitute for CI's: the same binary flags different
 things on the two platforms, and this project's completion criteria say so
 already for gcc and for leak detection. Add "UB that only glibc's headers
 declare" to that list.
+
+## Phase 56: revision arguments for `cat-file` and `merge-base`
+
+Both commands took **only a full 40-hex id**. Measured against git 2.55.0,
+which accepts all of these:
+
+```
+sg merge-base HEAD topic    -> sg: 'HEAD' is not a valid object id
+sg cat-file -p HEAD         -> sg: not a valid object name 'HEAD'
+sg cat-file -p master       -> same
+sg cat-file -p v1           -> same
+```
+
+That also broke CLAUDE.md's own rule that a user-supplied revision goes
+through the revparse layer.
+
+### 1. Converged rather than copied
+
+`sg show` already resolved every one of these correctly -- Phase 55a built
+that resolver a week earlier in this same session. Exactly three files in the
+codebase printed "not a valid object id/name": `cmd_cat_file.c`,
+`cmd_merge_base.c` and `cmd_show.c`. So the fix was to move `sg show`'s
+resolver down into `src/storage/revparse.c` as **`sg_rev_parse_object`** and
+have all three share it -- **before a third copy appeared**, which is the
+shape this project's "known duplication" list exists to prevent. The moved
+code also stopped printing: diagnostics live at the call sites now, per the
+layering convention that lower layers stay quiet.
+
+### 2. The two commands differ about peeling, and must not be unified
+
+Measured, on a repo where `v1` is an annotated tag:
+
+| | `cat-file` | `merge-base` |
+|---|---|---|
+| annotated tag | **does NOT peel** -- `-t v1` says `tag`, `-p v1` prints the tag object's own body | **peels** -- `merge-base v1 topic` answers with a commit |
+
+So `cat-file` takes the unpeeled `sg_rev_parse_object` while `merge-base`
+takes `sg_rev_parse_commit`, which peels by definition. Interop pins the two
+against the same tag as a head-on pair: one shared rule fails whichever half
+it was not written for.
+
+### 3. `^{tree}` is refused, not approximated
+
+`git cat-file -t 'HEAD^{tree}'` works; sg has no `^{...}` peel syntax
+anywhere and this phase did not add it. Verified the rejection is clean
+rather than accidental: `sg_rev_parse_commit` scans the base up to the first
+`~`/`^`/`@{`, then requires the suffix run to be all decimal digits, so
+`{tree}` fails to parse and the whole call returns -1 -- it never silently
+reads `^{tree}` as `^0`. Pinned on both sides (git accepts and exits 0, sg
+refuses with exit 1 and nothing on stdout).
+
+### 4. A diagnostic regression the existing suite caught
+
+Sharing the resolver initially made `cat-file` report a well-formed 40-hex
+whose object cannot be read as "not a valid object name" -- because the
+resolver must read an object to learn its type, and a failed read looked like
+a failed resolve. An interop check from an earlier phase turned red:
+
+```
+FAIL: REF_DELTA with an unresolvable base: reports it as not found rather
+      than emitting content
+```
+
+That check exists because a packed REF_DELTA whose base object is missing is
+a **corrupt object**, not a bad name, and telling the user the name is
+invalid sends them to look at their own typing instead of at the pack. The
+fix gives `sg_rev_parse_object` a third failure code, `-3`, meaning "the
+name is a well-formed object id, the object could not be read", which both
+callers turn back into the original wording. The lesson is not the code, it
+is that **an error message is part of the interface**: this regression
+changed no exit code and no output on any success path, and only a check
+that pinned the wording could see it.
+
+### 5. Verification
+
+52 oracle comparisons against real git (`-t`/`-s`/`-p` over commit, tree,
+blob, annotated tag, lightweight tag, branch, `HEAD`, `~N`, `<rev>:<path>`
+and raw ids of each type; `merge-base` over the same set), all identical,
+plus the refusal cases where sg's exit 1 stands in for git's 128/129.
+`sg show`'s own 54 + 16 oracle cases were re-run to prove the extraction
+moved nothing. 15 new interop checks.
