@@ -4,6 +4,7 @@
 #include "sg/hash.h"
 #include "sg/rebase.h"
 #include "sg/repo.h"
+#include "sg/sequencer.h"
 #include "sg/snapshot.h"
 #include "sg/workdir.h"
 
@@ -80,6 +81,7 @@ int sg_cmd_undo(int argc, char **argv)
         int apply_rc;
         int rc = 0;
         int rebase_in_progress;
+        sg_seq_kind seq_kind;
 
         n = strtol(num_arg, &end, 10);
         if (*end != '\0' || end == num_arg || n <= 0) {
@@ -129,6 +131,20 @@ int sg_cmd_undo(int argc, char **argv)
             fprintf(stderr, "sg: note: undo will give up the current in-progress rebase"
                            " (the working directory will be restored to the snapshot, no need to also run sg rebase --abort)\n");
 
+        /* Same reasoning, same sole exception, for the third subsystem with
+           its own recoverable sequencer state -- see CLAUDE.md's rebase-gate
+           list, cmd_undo.c is the one caller allowed to clear it directly. */
+        seq_kind = sg_sequencer_kind_in_progress(git_dir);
+        if (seq_kind != 0) {
+            const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+
+            fprintf(stderr,
+                   "sg: note: undo will give up the current in-progress %s"
+                   " (the working directory will be restored to the snapshot, no need to also run "
+                   "sg %s --abort)\n",
+                   op, op);
+        }
+
         snprintf(label, sizeof(label), "undo (restore snapshot #%ld)", n);
         apply_rc = sg_safe_apply_tree(git_dir, repo_root, tree_id, label, force);
         if (apply_rc == 1) {
@@ -143,6 +159,17 @@ int sg_cmd_undo(int argc, char **argv)
                     fprintf(stderr, "sg: warning: failed to clear the in-progress rebase state\n");
                 else
                     fprintf(stderr, "sg: the in-progress rebase has been given up (working directory restored to the snapshot)\n");
+            }
+            if (seq_kind != 0) {
+                const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+
+                if (sg_sequencer_state_remove(git_dir) != 0)
+                    fprintf(stderr, "sg: warning: failed to clear the in-progress %s state\n", op);
+                else
+                    fprintf(stderr,
+                           "sg: the in-progress %s has been given up (working directory restored "
+                           "to the snapshot)\n",
+                           op);
             }
         }
 

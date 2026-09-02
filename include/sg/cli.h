@@ -30,6 +30,8 @@ int sg_cmd_push(int argc, char **argv);
 int sg_cmd_chunk_info(int argc, char **argv);
 int sg_cmd_stash(int argc, char **argv);
 int sg_cmd_reflog(int argc, char **argv);
+int sg_cmd_cherry_pick(int argc, char **argv);
+int sg_cmd_revert(int argc, char **argv);
 
 int sg_cli_run(int argc, char **argv);
 

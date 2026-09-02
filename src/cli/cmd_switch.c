@@ -9,6 +9,7 @@
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
+#include "sg/sequencer.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
@@ -113,6 +114,24 @@ int sg_cmd_switch(int argc, char **argv)
         free(git_dir);
         free(repo_root);
         return 1;
+    }
+
+    /* Same shape as the rebase gate above, for the third subsystem that
+       leaves its own recoverable state behind a conflict. */
+    {
+        sg_seq_kind seq_kind = sg_sequencer_kind_in_progress(git_dir);
+
+        if (seq_kind != 0) {
+            const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+
+            fprintf(stderr,
+                   "sg: a %s is in progress, cannot switch branches\n"
+                   "Finish it first (sg %s --continue) or run sg %s --abort to give up\n",
+                   op, op, op);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
     }
 
     /* Same shape as the rebase gate above, one subsystem over. Measured

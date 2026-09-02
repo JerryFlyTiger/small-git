@@ -12,6 +12,7 @@
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/sequencer.h"
 #include "sg/similarity.h"
 #include "sg/snapshot.h"
 #include "sg/tree_build.h"
@@ -480,6 +481,33 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         fprintf(stderr,
                "sg: an unfinished merge is in progress\n"
                "Finish it first, or run sg merge --abort to give up\n");
+        return 1;
+    }
+
+    /* A review found this gap the hard way: section 6 of the Phase 57 spec
+       said "every existing call site of sg_rebase_state_exists OUTSIDE
+       cmd_rebase.c/safety/rebase.c" needs this same check -- carving out
+       rebase's OWN start gate by name, which is exactly backwards, since
+       the start gate is precisely where a competing state needs to be
+       refused. Without this, `sg rebase <upstream>` while a cherry-pick/
+       revert is paused on a conflict started cleanly, and rebase's own
+       conflict markers overwrote the user's still-unresolved cherry-pick
+       conflict content in the working directory -- CHERRY_PICK_HEAD was
+       never cleared, so `sg status` went on to print two mutually
+       contradictory banners at once. `sg_require_clean_workdir` cannot
+       catch this on its own: by this project's existing convention it does
+       not look at unmerged (stage 1/2/3) entries at all (every OTHER source
+       of an unresolved conflict already had its own dedicated gate ahead of
+       it, so the gap was never exercised until cherry-pick added a new one
+       that didn't). */
+    if (sg_sequencer_kind_in_progress(git_dir) != 0) {
+        sg_seq_kind seq_kind = sg_sequencer_kind_in_progress(git_dir);
+        const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+
+        fprintf(stderr,
+               "sg: a %s is currently in progress, cannot rebase\n"
+               "Finish it first (sg %s --continue) or run sg %s --abort to give up\n",
+               op, op, op);
         return 1;
     }
 

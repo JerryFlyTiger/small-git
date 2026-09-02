@@ -1275,6 +1275,208 @@ line \(em matching real git. Refuses to start on top of an in-progress merge,
 and refuses ordinary
 .B commit
 while a rebase is in progress.
+.SS cherry-pick
+.B sg cherry-pick
+.RB [ -n | --no-commit ]
+.RB [ -m
+.IR parent-number ]
+.I commit\fR...
+.br
+.B sg cherry-pick --continue
+.br
+.B sg cherry-pick --skip
+.br
+.B sg cherry-pick --abort
+.br
+.B sg cherry-pick --quit
+.PP
+Replays each
+.I commit
+in the order given, one at a time, on top of whatever
+.B HEAD
+names (the current branch, or
+.B HEAD
+itself when detached), the same three-way merge as
+.BR merge / rebase
+with
+.IR commit \(cq s
+own parent tree as the base. The new commit's author (name, email, date) is
+copied verbatim from the picked commit; only the committer reflects
+here-and-now. For a
+.I commit
+with more than one parent,
+.B -m
+.I parent-number
+selects which parent (1-based) to diff against; without it a merge commit
+is refused.
+.B -n
+(or
+.BR --no-commit )
+stages the result without committing, and is only accepted with exactly one
+.IR commit .
+.B --no-edit
+is accepted as a no-op (\c
+.B sg
+never opens an editor); \c
+.BR -e / --edit
+and every other option real git's cherry-pick has that
+.B sg
+does not implement
+.RB ( -x ", " -s / --signoff ", " -S ", " --ff ", " --allow-empty ", "
+.BR --allow-empty-message ", " --keep-redundant-commits ", " --empty= ", "
+.BR --cleanup= ", " --strategy ", " -X ", " --rerere-autoupdate ", " --reference )
+are rejected with the usage line rather than silently ignored or
+approximated. A range argument
+.RI ( A..B )
+is likewise rejected, not expanded.
+.PP
+A conflicting or already-applied (empty) pick pauses the whole sequence:
+conflict markers and stage 1/2/3 index entries are left for the former,
+nothing is written for the latter beyond the paused state, and in both
+cases
+.B .git/CHERRY_PICK_HEAD
+plus
+.B .git/MERGE_MSG
+are written (see
+.BR FILES ).
+Picking more than one commit additionally records the remaining sequence
+under
+.BR .git/sequencer/ ,
+in the exact layout and file names real git uses \(em unlike
+.BR .git/sg-rebase/ ,
+which is deliberately incompatible, this state is meant to be readable (and
+finishable) by a real
+.B git
+binary too. Resolve a conflict with
+.BR "sg add <file>..." ,
+then
+.BR "sg cherry-pick --continue" ;
+.B --skip
+takes an automatic safety snapshot, discards the paused commit, and
+continues with the rest;
+.B --abort
+takes a safety snapshot, restores the working directory and
+.B HEAD
+(or the current branch) to their state before the whole sequence started,
+and refuses if
+.B HEAD
+has moved since the pick stopped;
+.B --quit
+removes the paused state and touches nothing else, leaving the conflicted
+index and working directory exactly as they were.
+.PP
+Refuses to start if the working directory is not clean, or if a merge,
+rebase, or another cherry-pick/revert is already in progress. Ordinary
+.B sg commit
+is refused while a cherry-pick is paused (real git allows it and finishes
+the pick instead \(em a deliberate divergence, see
+.BR CAVEATS );
+use
+.B --continue
+instead.
+.SS revert
+.B sg revert
+.RB [ -n | --no-commit ]
+.RB [ -m
+.IR parent-number ]
+.RB [ --no-edit ]
+.I commit\fR...
+.br
+.B sg revert --continue
+.br
+.B sg revert --skip
+.br
+.B sg revert --abort
+.br
+.B sg revert --quit
+.PP
+Applies the inverse of each
+.I commit
+in the order given, one at a time, on top of whatever
+.B HEAD
+names \(em the same replay engine as
+.BR cherry-pick ,
+with the base and target trees swapped: the picked commit's own tree is the
+merge base, and its parent's tree is what
+.B HEAD
+is merged against. Unlike
+.BR cherry-pick ,
+the new commit's author
+.I and
+committer both come from the environment/here-and-now (real git authors a
+revert as the current user, it does not copy the reverted commit's
+author).
+.B -m
+.I parent-number
+selects a merge's parent the same way
+.B cherry-pick
+does; without it a merge commit is refused.
+.B -n
+(or
+.BR --no-commit )
+stages the result without committing, and is only accepted with exactly one
+.IR commit .
+.B --no-edit
+is accepted as a no-op
+.RB ( sg
+never opens an editor to let the generated message be changed); every
+option
+.B cherry-pick
+does not implement is rejected here too, for the same reason.
+.PP
+The generated commit message follows git's own wording exactly: a plain
+revert wraps the reverted commit's subject as
+.RB \(dq Revert\ \(dq \fIsubject\fP \(dq ,
+followed by a blank line and
+.RB \(dq "This\ reverts\ commit" \ \fIid\fP\(dq .
+Reverting with
+.B -m
+adds
+.RB \(dq ,\ reversing\c
+\fR\(rsn\fPchanges\ made\ to\c
+\fR \fIparent-id\fP\(dq
+after the id \(em the line break there is literal, not wrapping. If the
+subject being reverted already begins with the exact eight bytes
+.RB \(dq Revert\ \(rq\c
+\fR\(dq
+(no closing-quote or balance check), that prefix is replaced with
+.RB \(dq Reapply\ \(rq\c
+\fR\(dq
+and the rest of the subject is kept verbatim, matching git's own
+already-reverted-a-revert wording.
+.PP
+Conflict/empty-pick pausing, the
+.B .git/sequencer/
+state for a multi-commit sequence, and
+.BR --continue / --skip / --abort / --quit
+all work exactly as documented under
+.BR cherry-pick ,
+substituting
+.B .git/REVERT_HEAD
+for
+.BR .git/CHERRY_PICK_HEAD .
+One wording differs: a direct revert's reflog entry reads
+.RB \(dq revert:\ \(dq\c
+\fIsubject\fP, but a revert resumed via
+.B --continue
+logs a bare
+.RB \(dq commit:\ \(dq\c
+\fIsubject\fP with
+.I no
+.RB \(dq (cherry-pick) \(dq -style
+suffix \(em both wordings were measured against real git, and the
+asymmetry is intentional, not a naming inconsistency between the two
+commands.
+.PP
+Refuses to start if the working directory is not clean, or if a merge,
+rebase, or another cherry-pick/revert is already in progress. Ordinary
+.B sg commit
+is refused while a revert is paused, for the same reason and with the same
+divergence from real git as
+.BR cherry-pick ;
+use
+.B --continue
+instead.
 .SS clone
 .B sg clone
 .I url
@@ -2337,6 +2539,60 @@ todo list). Present only while a rebase is paused or running; removed
 automatically when the rebase finishes, is skipped to completion, or is
 aborted. Not intended to be edited by hand \(em use
 .BR "sg rebase --continue|--skip|--abort" .
+.TP
+.B .git/CHERRY_PICK_HEAD \fR/\fP.git/REVERT_HEAD \fR, \fP.git/MERGE_MSG \fR, \fP.git/sequencer/
+Holds the on-disk state of a paused
+.B "sg cherry-pick"
+(the first of the pair,
+.BR CHERRY_PICK_HEAD )
+or a paused
+.B "sg revert"
+(the second,
+.BR REVERT_HEAD ;
+exactly one of the two exists at a time):
+it names the stopped commit, and
+.B MERGE_MSG
+holds the message it would have produced (with a
+.B "# Conflicts:"
+block appended when the pause was a conflict, not an empty pick). Picking
+or reverting more than one commit at once additionally creates
+.BR .git/sequencer/ ,
+listing the remaining commits still to replay
+.RB ( pick
+or
+.B revert
+lines, matching which command is running). Unlike
+.BR .git/sg-rebase/ ,
+this layout deliberately matches real git's own file names and format
+exactly (only the id field width of
+.B sequencer/todo
+differs, 40 hex characters instead of git's abbreviated 7, since
+.B sg
+has no abbreviated-object-name resolution to read a short one back with),
+so a real
+.B git
+binary can inspect, finish, or abort a pick/revert
+.B sg
+left paused. The reverse direction is more limited: a real
+.B git
+binary's own todo entries use its abbreviated 7-hex ids, which
+.B sg
+cannot resolve back to an object, so
+.B sg
+can
+.B --abort
+or
+.B --quit
+a pick/revert
+.B git
+left paused (both read only the two full-40-hex
+.B sequencer/
+files git also writes in full) but cannot
+.BR --continue / --skip
+it. Present only while a cherry-pick or revert is paused; removed when it
+finishes, is skipped to completion, or is aborted. Not intended to be
+edited by hand \(em use
+.BR "sg cherry-pick --continue|--skip|--abort|--quit" " or " "sg revert --continue|--skip|--abort|--quit" .
 .TP
 .B refs/stash \fR(and\fP .git/logs/refs/stash\fR)\fP
 Where

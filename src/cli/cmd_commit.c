@@ -9,6 +9,7 @@
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/sequencer.h"
 #include "sg/tree_build.h"
 
 #include <stdio.h>
@@ -109,6 +110,28 @@ int sg_cmd_commit(int argc, char **argv)
                "sg: a rebase is currently in progress, cannot commit directly\n"
                "Resolve conflicts and `sg add <file>...`, then run `sg rebase --continue`, "
                "or run `sg rebase --abort` to give up\n");
+        free(git_dir);
+        free(cleaned_message);
+        return 1;
+    }
+
+    /* Deliberate divergence #5 from real git (CLAUDE.md): real git lets
+       `git commit` finish a stopped cherry-pick/revert (it even consumes
+       the rest of the todo). sg refuses instead -- cmd_commit.c decides
+       "is this a merge commit" purely from sg_merge_head_exists and has no
+       way to restore the picked commit's author, so a `sg commit` here
+       would either silently drop the picked commit's author or (worse)
+       silently produce a wrong-author, possibly wrong-parented commit. */
+    if (sg_sequencer_kind_in_progress(git_dir) != 0) {
+        const char *op = sg_sequencer_kind_in_progress(git_dir) == SG_SEQ_CHERRY_PICK
+                             ? "cherry-pick"
+                             : "revert";
+
+        fprintf(stderr,
+               "sg: a %s is currently in progress, cannot commit directly\n"
+               "Resolve conflicts and `sg add <file>...`, then run `sg %s --continue`, "
+               "or run `sg %s --abort` to give up\n",
+               op, op, op);
         free(git_dir);
         free(cleaned_message);
         return 1;

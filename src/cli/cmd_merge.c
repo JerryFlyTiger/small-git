@@ -15,6 +15,7 @@
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
+#include "sg/sequencer.h"
 #include "sg/similarity.h"
 #include "sg/snapshot.h"
 #include "sg/status.h"
@@ -578,6 +579,26 @@ int sg_cmd_merge(int argc, char **argv)
             free(git_dir);
             free(repo_root);
             return 1;
+        }
+
+        /* Same reasoning as the rebase gate directly above, for the third
+           subsystem that advances the branch/HEAD commit-by-commit: a
+           stopped cherry-pick/revert has its own conflict resolution work
+           in progress, and starting a merge on top of it would trample it. */
+        {
+            sg_seq_kind seq_kind = sg_sequencer_kind_in_progress(git_dir);
+
+            if (seq_kind != 0) {
+                const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+
+                fprintf(stderr,
+                       "sg: a %s is currently in progress\n"
+                       "Finish it first (sg %s --continue) or run sg %s --abort to give up\n",
+                       op, op, op);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
         }
 
         /* Real git merges fine on a detached HEAD (measured, git 2.55.0):

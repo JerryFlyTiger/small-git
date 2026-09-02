@@ -9,6 +9,7 @@
 #include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/refs.h"
+#include "sg/sequencer.h"
 #include "sg/snapshot.h"
 #include "sg/status.h"
 #include "sg/tree_build.h"
@@ -330,7 +331,8 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
        it here would silently discard the conflict resolution work (or the
        whole rebase sequence) in progress. */
     dirty = !staged_ok || !unstaged_ok || staged.count > 0 || unstaged.count > 0 ||
-        sg_index_has_unmerged(&idx) || sg_rebase_state_exists(git_dir);
+        sg_index_has_unmerged(&idx) || sg_rebase_state_exists(git_dir) ||
+        sg_sequencer_kind_in_progress(git_dir) != 0;
 
     if (dirty) {
         strbuf msg = {0};
@@ -363,6 +365,21 @@ int sg_safe_apply_tree(const char *git_dir, const char *repo_root,
             strbuf_append(&msg, "sg: a rebase is in progress; continuing will overwrite the "
                           "conflict resolution content in the working directory\n"
                           "sg: to end this rebase, use `sg rebase --abort`\n");
+        {
+            sg_seq_kind seq_kind = sg_sequencer_kind_in_progress(git_dir);
+
+            if (seq_kind != 0) {
+                const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+
+                strbuf_append(&msg, "sg: a ");
+                strbuf_append(&msg, op);
+                strbuf_append(&msg, " is in progress; continuing will overwrite the "
+                              "conflict resolution content in the working directory\n"
+                              "sg: to end it, use `sg ");
+                strbuf_append(&msg, op);
+                strbuf_append(&msg, " --abort`\n");
+            }
+        }
 
         confirmed = sg_confirm_dangerous(msg.buf != NULL ? msg.buf : "", force);
         free(msg.buf);

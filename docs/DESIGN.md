@@ -9784,3 +9784,775 @@ and raw ids of each type; `merge-base` over the same set), all identical,
 plus the refusal cases where sg's exit 1 stands in for git's 128/129.
 `sg show`'s own 54 + 16 oracle cases were re-run to prove the extraction
 moved nothing. 15 new interop checks.
+
+## Phase 57: `sg cherry-pick`
+
+### 1. The measured shapes (all against real git 2.55.0)
+
+`MERGE_MSG`'s format, byte for byte, on a two-path conflict:
+
+```
+topic B two conflicts
+
+# Conflicts:
+#	f.txt
+#	g.txt
+```
+
+The blank line before `# Conflicts:` is real, the `#\t` is a literal
+hash-tab, and paths are in the merge result's own path-sorted order, never
+quoted (this is git's own on-disk format, not sg's user-facing output). An
+empty-result stop (the change is already upstream) writes the message alone,
+with no `# Conflicts:` block at all.
+
+The reflog wording has one asymmetry that is easy to get backwards:
+
+| situation | message |
+|---|---|
+| cherry-pick applied directly | `cherry-pick: <subject of the new commit>` |
+| cherry-pick finished by `--continue` | `commit (cherry-pick): <subject>` |
+
+git tags a resumed cherry-pick with `(cherry-pick)`; a plain `sg commit`
+made after `git commit`'s own historical merge-continue machinery would not
+carry that tag at all -- the `(cherry-pick)` suffix is cherry-pick-specific,
+not a generic "this finished a paused sequence" marker.
+
+**`--abort` and `--skip` do NOT use cherry-pick-specific reflog wording at
+all -- both are, underneath, a plain `reset --hard`, and log exactly what
+`git reset --hard` logs**: `reset: moving to <40hex>`, nothing else. This
+was measured after an earlier draft of this phase's own spec *invented*
+`cherry-pick (abort): returning to <hex>` here without checking real git
+first -- a genuine spec error, not a coding one, caught by a one-off oracle
+harness (`oracle57.py`) run directly against real git 2.55.0. `--skip`'s
+"reset" target is wherever HEAD already is (a no-op: nothing moves), and
+the two asymmetric reflog rules this project already relies on elsewhere
+(a named ref's own log suppresses a no-op, `logs/HEAD` never does) produce
+exactly this shape for free through `sg_ref_move_head` -- no hand-written
+reflog line is needed for either subcommand, just a ref-move call with the
+target equal to the CURRENT value. **This is the opposite convention from
+`sg rebase --abort`**, which uses its own `rebase (abort): returning to
+...` wording -- do not "unify" the two: rebase's abort genuinely is not a
+plain reset in real git either (rebase moves through a detached-HEAD replay
+sg-rebase's own sequencer owns), so the two commands legitimately differ
+here, and interop's `phase57` group pins both wordings so a future
+"harmonizing" edit turns a check red by name.
+
+**`--quit` with NOTHING in progress exits 0 and prints nothing at all** --
+also measured, and also different from what an earlier draft of this spec
+claimed (that all four subcommands exit 1 there). `--continue`/`--skip`/
+`--abort` all DO refuse with `sg: no cherry-pick in progress` and exit 1
+when nothing is stopped; `--quit`'s own job is "remove the paused state if
+there is one", so a repository with no paused state has ALREADY reached the
+state `--quit` asks for, and refusing would report an error for a request
+that already trivially succeeded.
+
+`sequencer/todo`'s shape, single-commit vs multi-commit: a single conflicting
+`git cherry-pick <c>` writes `CHERRY_PICK_HEAD` + `MERGE_MSG` and creates
+**no** `sequencer/` directory at all -- `--continue`/`--abort` work off
+`CHERRY_PICK_HEAD` alone. Only `git cherry-pick <a> <b> ...` (more than one
+commit) creates `sequencer/head` (orig HEAD), `sequencer/abort-safety` (HEAD
+at the moment of the stop) and `sequencer/todo`. `todo`'s first line is
+always the commit currently stopped on -- unlike sg's own `sg-rebase/`,
+where `current` is removed from `todo` once set, cherry-pick's todo keeps it
+as `todo[0]`.
+
+### 2. Why the state format mirrors git's, and `sg-rebase/` deliberately does not
+
+This project's stated goal is disk-format compatibility with real git. Two
+prior features already had to choose a side of that line:
+
+- **Loose/pack objects, index v2, refs, the pkt-line protocol**: sg's format
+  IS git's format, because these are things a real `git` binary must be able
+  to read off disk without knowing sg exists.
+- **`sg-rebase/`**: sg's own incompatible namespace, because a rebase in this
+  project replays through a fundamentally different mechanism (permanently
+  detached HEAD, its own reflog vocabulary) than git's `rebase-merge/`
+  directory, and a half-matching directory there would make a real git binary
+  **misinterpret** state that means something different to it.
+
+Cherry-pick's on-disk state falls on the first side of that line, not the
+second: it is small, fully understood (five files, three of them optional),
+and -- critically -- **the mechanism sg uses to advance (`sg_ref_move_head`,
+moving the current branch/HEAD by one commit per pick) is the same mechanism
+git uses**. There is no semantic mismatch to protect against, so mirroring
+git's own file names and format costs nothing and buys real
+interoperability: a real `git cherry-pick --continue` can finish a sequence
+`sg` left paused, and vice versa.
+
+### 3. The full-hex `sequencer/todo` divergence
+
+git abbreviates the id field to 7 hex characters; sg writes the full 40.
+This is deliberate, not an oversight: **sg has no abbreviated-object-name
+resolution anywhere in this project** (a design choice recorded since
+Phase 17 -- `sg_rev_parse_commit`'s own header comment says so explicitly).
+Writing a 7-hex id would produce a `sequencer/todo` that sg itself could not
+read back on its own `--continue`. Writing the full 40 keeps the file
+readable by BOTH tools: real git's own todo-line parser accepts any
+length-4-or-more hex prefix, so a 40-hex field parses there exactly as a
+7-hex one would. The compatibility direction that actually matters --
+"whatever sg writes, something can read back" -- is preserved; the direction
+that would require new functionality (sg resolving an abbreviated id someone
+else wrote) is not attempted. Pinned on both sides in interop's `phase57`
+group: git's own field is asserted to be 7 characters, sg's 40, and sg's
+40-hex field is asserted to be a valid id `git rev-parse --verify` accepts.
+
+### 4. Why `--continue` re-derives its message from `MERGE_MSG`, not from `-m`
+
+Section 1 of the spec forbids writing `sequencer/opts` (the only option this
+phase could need to persist, `-m`, is rejected outright for anything but a
+single commit). That looks like a problem: a revert's message construction
+(section 6 below) needs to know the mainline parent's hex to render "This
+reverts commit X, reversing changes made to Y" -- and if `-m` is never
+persisted, how does `--continue` reconstruct that after a conflict?
+
+The answer is that it doesn't reconstruct anything: `MERGE_MSG` was already
+written, in full, at the moment the sequence stopped (`write_stop` in
+`src/cli/pick.c`, computed the exact same way for cherry-pick and revert via
+`attempt_one`'s `out->message`). `--continue` just reads it back and strips
+the `\n# Conflicts:\n...` tail if present (`read_message_from_merge_msg`),
+recovering byte-for-byte the same message the picked commit would have used
+had it applied cleanly the first time. This is also exactly what real git
+itself does: `MERGE_MSG` IS the finalize step's source of truth, not a
+side-channel for humans only. No second code path, and no need to persist
+`-m` anywhere.
+
+### 5. Why `rebase_pick_one` was not converged with this engine
+
+`cmd_rebase.c`'s `rebase_pick_one` is the closest existing shape (a
+three-way merge with `base = C's parent tree`, same conflict-marker
+convention) and was read carefully before writing `src/cli/pick.c` -- but
+deliberately not shared or refactored. Three concrete differences make a
+shared implementation actively wrong for at least one caller:
+
+- **Ref-moving model.** Rebase runs permanently detached and moves the
+  branch exactly once, at the very end (`finish_rebase`); cherry-pick moves
+  the current branch (or HEAD, if detached) once **per commit**, immediately
+  (`sg_ref_move_head` inside `run_todo`'s loop). Threading both shapes
+  through one function would need a mode flag at every call site rather than
+  removing one.
+- **Reflog vocabulary.** `rebase (pick): ...` / `rebase (continue): ...`
+  vs. `cherry-pick: ...` / `commit (cherry-pick): ...` -- different strings,
+  different conditions for which one applies (see section 1 above).
+- **State directory.** `sg-rebase/` (sg's own incompatible format, always
+  present for the whole rebase) vs. `CHERRY_PICK_HEAD`/`sequencer/` (git's
+  format, `sequencer/` only for more than one commit) -- see section 2.
+
+A converge attempt here would put two commands' correctness on one shared
+change with no oracle for the seam between them (rebase's own interop group
+predates this phase and says nothing about cherry-pick's shape). Recording
+the three differences here is cheaper than a shared abstraction that would
+need three special cases to reproduce them.
+
+### 6. `revert`'s message rules (implemented, CLI not yet wired -- Phase 57b)
+
+The engine (`sg_pick_start`/`_continue`/`_skip`/`_abort`/`_quit` in
+`src/cli/pick.c`) is parameterized by `sg_seq_kind` and already handles
+`SG_SEQ_REVERT` correctly end to end (`tests/test_pick_engine.c`'s
+`test_revert_author_from_environment` exercises it directly through the
+engine API) -- what Phase 57a does not add is the `sg revert` CLI shell
+itself, the `Reapply`/`Revert` message-construction unit tests, the interop
+coverage of revert's three message shapes, and the revert-specific
+`docs/DESIGN.md`/man-page prose. That is Phase 57b's scope, on the same
+branch, as its own commit.
+
+### 7. Why `sg commit` is blocked during a stopped pick (divergence #5)
+
+Real git lets `git commit` finish a stopped cherry-pick or revert (it reads
+`CHERRY_PICK_HEAD`/`MERGE_MSG` and even continues the rest of the todo).
+sg refuses instead. The reason is concrete, not merely conservative:
+`cmd_commit.c` decides "is this a merge commit" purely from
+`sg_merge_head_exists`, and it has no code path to restore a picked commit's
+author fields (`sg_pick`'s whole reason to copy them verbatim) or to advance
+`sequencer/todo` afterward. A `sg commit` that silently produced a
+wrong-author, un-advanced-sequence commit would be strictly worse than a
+refusal naming `--continue`. Pinned on both sides in interop's `phase57`
+group (git: exit 0, the pick completes and the state is cleared; sg: exit 1,
+the state survives) and recorded as divergence #5 in CLAUDE.md's list.
+
+### 8. Verification
+
+`tests/test_sequencer_state.c` (11 checks: single-commit vs multi-commit
+shape, `MERGE_MSG`'s two formats, five separate malformed-field rejections
+including the todo[0]-vs-current consistency check, `_remove` idempotence)
+and `tests/test_pick_engine.c` (4 scenarios: clean pick advances the branch
+and copies the picked commit's author/message verbatim; a conflict leaves
+stage 1/2/3 plus every state file; an already-applied pick is detected and
+does not move the branch; a revert's author/committer come from the
+environment, never from the reverted commit). Both mutation-tested via
+`tests/mutate.sh`: the todo[0]-vs-current guard was initially a genuine
+blind spot (0 tests turned red when it was removed) until a directed test
+was added for exactly that shape; the empty-tree and conflict-stage guards
+were both caught on the first attempt.
+
+Interop's `phase57` group (97 checks after the review round below): the commit object produced by a
+clean cherry-pick, byte-identical to git's on the author/tree/parent/message
+lines (the committer line is excluded from that comparison by construction,
+see section 9 below for why); the two cherry-pick reflog messages including
+the `--continue` asymmetry; `CHERRY_PICK_HEAD`/`MERGE_MSG` byte-identical to
+git's after a conflict; `sequencer/todo`'s line count/verb/id-width shape
+including the deliberate 7-vs-40 divergence; the single-commit "no
+`sequencer/` at all" shape on both sides; `sg status`'s banner in both the
+conflicts-remain and all-fixed states via the phase38 skeleton technique;
+the closing-line suppression; `--abort` restoring the pre-pick state and
+`--quit` leaving the conflicted index in place, both compared against git's
+own behaviour; every deliberately-unimplemented flag rejected with the usage
+line while git accepts it; and divergence #5 (`sg commit` refused / `git
+commit` completes the pick).
+
+### 9. Why two independently-built fixtures could not be diffed byte-for-byte
+
+Phase 50's fast-forward interop group rebuilds its fixture **twice**, once
+through each tool, and diffs the results -- that only works because every
+commit in that fixture is built with `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`
+pinned, and both `git commit` and (critically) whatever built the sg side
+honour those variables. `sg commit` does **not**: `cmd_commit.c` always uses
+`time(NULL)`, with no environment override at all. Two independently-built
+fixtures would therefore disagree on every commit's timestamp, and cherry-
+pick's new commit copies its author fields (including the timestamp)
+verbatim from the picked commit -- so the very field the comparison cares
+about most would differ for a reason that has nothing to do with cherry-pick.
+Phase 57's fixtures are instead built **once**, entirely with real git
+(pinned dates), then `cp -R`'d into a `-sg` and a `-git` copy immediately
+before the operation under test runs. Both copies start from bit-identical
+objects, so sg's cherry-pick copies the exact same pinned author time git's
+own cherry-pick does, and the two resulting commits agree on everything
+except the committer line by construction, not by luck.
+
+### 10. A one-off oracle harness found a real bug and three spec errors
+
+After the first green board, a second, independently-written harness
+(`oracle57.py`, not part of the repository -- a throwaway comparison tool)
+ran a wider matrix directly against real git 2.55.0: 12 scenarios, 7-8
+probes each, every probe read with real git only (never with sg), the
+committer line and any tool-created commit's id normalized out exactly the
+way `p_commit`/`p_graph` are described above. A control run (both copies
+driven by real git, to prove the harness could actually go red) scored
+143/143; the first real run against sg scored 84/92 on the cherry-pick-only
+subset. Seven of those eight probe mismatches were fixed; the eighth is
+recorded below as a known, out-of-scope residual.
+
+**1. A real bug: `--continue`'s message gained an extra trailing blank
+line.** `read_message_from_merge_msg` (section 4 above) stripped the
+`"\n# Conflicts:\n..."` tail one byte too short -- it truncated at
+`marker + 1` (keeping the blank SEPARATOR line, spec 2.2's format is
+`<message ending in \n>\n# Conflicts:\n...`) instead of at `marker` itself.
+A `--continue`'d commit's message therefore came out as `"<message>\n\n"`
+where git produces `"<message>\n"` -- **a different message means a
+different object id**, so this was not a cosmetic difference, the commit
+`sg cherry-pick --continue` built was not the commit git would have built
+for the identical conflict. Fixed by truncating at `marker` (one byte
+earlier). Both a unit test (`tests/test_pick_engine.c`'s
+`test_continue_message_has_no_extra_blank_line`, which resolves a real
+conflict and asserts the finished commit's message equals the picked
+commit's message byte for byte) and an interop check
+(`$P57_CONFLICT-sg.commit1` vs `$P57_CONFLICT-git.commit1`, both with the
+committer line stripped) guard this now; both were reverse-mutated (the
+fix un-applied) and confirmed to turn red by name, per this project's rule
+that a review-found fix needs its own failing-first witness.
+
+**2/3. Two spec errors, not coding errors: `--abort` and `--skip` invent
+wording real git does not use.** An earlier draft of this phase's spec
+wrote `cherry-pick (abort): returning to <hex>` for `--abort` without
+checking real git first. Measured: both `--abort` and `--skip` are,
+underneath, a plain `reset --hard`, and log exactly what `git reset --hard`
+logs: `reset: moving to <40hex>`, nothing cherry-pick-specific at all.
+`--skip`'s target is wherever HEAD already is (a no-op -- nothing moves),
+which is precisely the shape CLAUDE.md's two asymmetric reflog rules
+already describe (a named ref's own log suppresses a no-op update;
+`logs/HEAD` never does), so the fix for both subcommands is a single
+`sg_ref_move_head` call with the target equal to the CURRENT value --
+no hand-written reflog line needed. See section 1's addition above for the
+full writeup, including why this is the OPPOSITE convention from
+`sg rebase --abort` (which correctly keeps its own wording) and must not be
+"unified" with it.
+
+**4. A third spec error: `--quit` with nothing in progress was specified as
+exit 1 for all four subcommands.** Measured: `--continue`/`--skip`/
+`--abort` do refuse with exit 1 when nothing is stopped, but `--quit`
+exits 0 and prints **nothing at all** -- its own job ("remove the paused
+state if there is one") is already satisfied by a clean repository, so
+refusing would report an error for a request that already trivially
+succeeded. Fixed by giving `sg_pick_quit` its own early check
+(`sg_sequencer_kind_in_progress(git_dir) == 0` returns 0 immediately,
+bypassing `require_state`'s refusal-and-message path entirely) before
+falling through to the shared kind-mismatch/removal logic for the case
+where something IS in progress.
+
+**5. A genuine spec gap: `-n` (`--no-commit`) on a clean pick writes
+`MERGE_MSG` but nothing else.** Not previously specified at all. Measured:
+`git cherry-pick -n <clean commit>` leaves `MERGE_MSG` behind (just the
+message, no `# Conflicts:` block -- there was no conflict) but writes
+neither `CHERRY_PICK_HEAD` nor `sequencer/`, so `sg_sequencer_kind_in_progress`
+must still answer 0 for it; an ordinary clean pick with no `-n` writes no
+`MERGE_MSG` at all. Fixed in `run_todo`'s `ATTEMPT_CLEAN_NO_COMMIT` branch:
+call `sg_sequencer_write_merge_msg` alone (no accompanying
+`sg_sequencer_state_write`), which is exactly the asymmetry needed.
+
+**6. Confirmed deliberate, left unchanged: `sequencer/todo`'s 7-vs-40 hex
+width.** This is section 3's divergence, re-confirmed by the same harness
+run rather than newly discovered.
+
+**7 (residual, out of Phase 57's scope, not fixed): `cp-skip`'s reflog
+message still mismatches on the embedded hex, wording aside.** `--skip`'s
+"reset" target (fix #3 above) is wherever HEAD currently is -- for a
+multi-commit sequence that already advanced past one clean pick before
+stopping, that target is a commit **sg itself created** during the same
+invocation, not a commit shared with the fixture. Exactly like the
+`p_commit` probe's committer-line-stripping (section 9), this commit's id
+differs between the git-run copy and the sg-run copy for a reason that has
+nothing to do with cherry-pick: `cmd_commit.c` (and `pick.c`, which follows
+its convention) always uses `time(NULL)` for the committer timestamp, never
+honouring `GIT_COMMITTER_DATE` -- a whole-project limitation that predates
+this phase and touches every commit-creating code path, not something
+Phase 57 introduced or can fix by itself. Unlike `p_commit`, the oracle's
+`p_reflog` probe has no equivalent normalization for a hex id embedded
+inside reflog MESSAGE TEXT, so this one probe reports a byte difference
+that is not a logic bug: verified directly (a debug script dumping both
+sides' "topic A" pick commit objects) that tree/parent/author/message are
+byte-identical between the two, and only the committer TIME differs (git's
+is the pinned `1700000000`, sg's is the real wall clock). Interop's own
+`phase57` group pins `--skip`'s reflog WORDING only (`^reset: moving to
+[0-9a-f]\{40\}$`), not the hex, for exactly this reason -- widening sg's
+commit-creation code to honour `GIT_COMMITTER_DATE` project-wide is a
+real, separate piece of work with its own blast radius (every existing
+interop check that already treats sg's committer time as "irrelevant, will
+differ" would need re-auditing), and is out of scope here.
+
+**Addendum**: the one-off `oracle57.py` harness (not part of this
+repository) was later updated on the reviewing side to normalize any
+40-hex substring in its own `p_reflog` probe to a placeholder, the same
+treatment `p_commit`/`p_graph` already gave the committer line and parent
+ids -- this residual was exactly the gap that missed. With that harness
+change, `cp-skip`'s reflog probe now matches cleanly (verified: `oracle57.py
+cp-` reads 91/92, with only item 6's deliberate divergence left). No sg
+code changed for this -- the fix lived entirely in the probe.
+
+### 11. Escape hatches must not need a parseable state (spec 5b), and three more bugs a review found on top
+
+A second measurement round, done directly against a real git binary, found
+a dead end matching the shape CLAUDE.md already documents for
+`sg_merge_head_read` as a gate predicate -- except this time it was the
+**escape hatches themselves**, not a gate, that depended on a full parse.
+
+**The dead end.** On a repository where real git had paused a two-commit
+cherry-pick, every one of `sg cherry-pick --continue`/`--skip`/`--quit`/
+`--abort` refused, all four with the identical `sg: cherry-pick state is
+corrupt, run sg cherry-pick --abort to clean up` -- advice naming one of
+the four commands that had just failed for the same reason. Root cause:
+`sg_sequencer_state_read`'s contract is all-or-nothing (every field,
+including `sequencer/todo`, must parse or the whole read fails), and at the
+time all four subcommands went through it via a shared `require_state`
+helper. git's own `sequencer/todo` holds **abbreviated 7-hex ids** (the
+divergence section 3 documents), which sg's fixed-40-hex parser cannot read
+at all -- so the read failed and every subcommand refused. **The trigger is
+not git-specific**: any damaged `sequencer/todo` reaches the identical dead
+end -- a partial write, or a full disk during this phase's own per-step
+persistence. `sg switch`/`commit`/`merge` were all correctly blocked at the
+same time (they ask `sg_sequencer_kind_in_progress`, existence only, never
+parseability), so the repository had literally no exit short of
+hand-deleting `.git` files.
+
+**The fix, three pieces:**
+
+- `sg_sequencer_abort_target` (`include/sg/sequencer.h` /
+  `src/safety/sequencer.c`) reads only `sequencer/head` and
+  `sequencer/abort-safety` -- never `sequencer/todo` -- both a plain full
+  40-hex line in EITHER tool's writing. `sg_pick_abort` now uses this
+  instead of a full state read, and as a direct consequence can recover a
+  sequence a REAL GIT binary paused, something it could not do before.
+- `sg_pick_quit` now parses NOTHING: existence
+  (`sg_sequencer_kind_in_progress`) decides whether to act, and removal is
+  plain remove()-by-name. It also stopped checking that the paused kind
+  matches the invoked subcommand -- `sg cherry-pick --quit` now clears a
+  paused REVERT too, because the entire point of this subcommand is that no
+  input, including "the wrong command name", can make it fail.
+- `sg_sequencer_current_commit` gives `sg status`'s banner the same
+  treatment: it reads just `CHERRY_PICK_HEAD`/`REVERT_HEAD`'s own hex line,
+  independent of `sequencer/`'s existence or parseability, and the banner
+  prints on EXISTENCE alone, degrading to a detail-free `You are currently
+  cherry-picking.` if even that fails. Measured symptom of the bug this
+  fixes: the hint line `(use "sg cherry-pick --abort" to cancel...)`
+  printed while the banner line `You are currently cherry-picking commit
+  <7hex>.` above it vanished entirely -- the identical banner/other-half
+  disagreement as Phase 38's bug A, one layer up.
+
+`--continue`/`--skip` still need a readable todo for their actual job and
+may still refuse on one, but the refusal message now names `--abort` --
+which, after the fix above, genuinely works on the same input, rather than
+another command failing identically. Interop's `phase57` group gained a
+whole new class of check for this (`P57_GITPAUSED` and its five derived
+copies): unlike every other check in the group, which builds TWO copies and
+diffs their outputs, this class builds ONE repository, pauses it with real
+git, and asserts sg's escape hatches still work on it.
+
+**Bug A: `-m` silently dropped by `--continue`/`--skip`, itself another
+instance of the same dead end.** `run_todo`'s two call sites inside
+`sg_pick_continue`/`sg_pick_skip` pass `mainline=0` unconditionally. Given
+`sg cherry-pick -m 1 MG1 MG2` (both merge commits): MG1 conflicts and
+stops; `--continue` finishes MG1 correctly (it re-derives everything from
+the current index, not from `mainline`); processing then reaches MG2 with
+`mainline` silently reset to 0, and MG2 -- a genuine merge commit -- is
+refused with "is a merge but no -m option was given", even though the user
+did supply one. **This was a spec error, not a coding error**: an earlier
+draft claimed "`--continue` builds the commit from the index and does not
+re-run the merge, so it does not need to remember mainline" -- true for the
+commit CURRENTLY being finished, false for whatever is still left in the
+todo. The fix follows `-n`'s own precedent exactly: **reject `-m` outright
+whenever more than one commit is requested**
+(`sg: -m is only supported with a single commit`, exit 1), rather than
+attempting to persist mainline across a stop (which would need a
+`sequencer/opts`-shaped second on-disk format this phase does not open).
+This closes the hole completely, not approximately: a single-commit `-m`
+pick's `state.todo_count` is exactly 1 after a conflict, so
+`sg_pick_continue`/`sg_pick_skip` never call `run_todo` for it at all (they
+take the "nothing left, remove state" branch directly) -- the
+`mainline=0` those two functions pass is therefore provably unreachable
+whenever it would have mattered, not merely unlikely to matter.
+
+**Bug A's other half: the real invariant is "abort_safety on disk must
+equal the real current HEAD after ANY exit from the todo loop", and the
+error path was the one that broke it.** `run_todo`'s three exit shapes are
+conflict, empty-result, and internal error (I/O, OOM, a corrupt object);
+only the first two called `write_stop` (which re-reads HEAD fresh and
+writes it as `abort_safety`). The error branch printed a message and
+returned, leaving whatever `abort_safety` was already on disk -- stale,
+whenever earlier todo entries in the SAME call had already committed
+cleanly before the failing one was reached (this can happen on a fresh
+multi-commit start, and -- now that Bug A's fix makes multi-item
+`--continue`/`--skip` resumes the ONLY way to reach `run_todo` with
+`has_sequence` true and existing progress -- on every resumed sequence
+too). The consequence is the identical dead end as spec 5b, reached a
+different way: `--abort` compares the stale `abort_safety` against the
+now-advanced real HEAD, finds them different, and refuses with "HEAD has
+moved since the pick stopped" -- even though the pick's OWN machinery is
+what moved it. Fixed by extracting the state-only half of `write_stop` into
+`write_stop_state` (state files only, no `MERGE_MSG` -- an error has no
+message worth writing) and calling it from the `ATTEMPT_ERROR` branch too,
+gated on `has_sequence` (a single-commit, `has_sequence == 0` pick's only
+possible error is at `idx == 0`, before this call could have moved HEAD at
+all, so there is nothing stale to refresh there). Verified directly: a unit
+test corrupts a to-be-picked commit's OWN loose object file (simulating any
+mid-sequence I/O failure, not specifically the mainline path, which bug A's
+first fix closes entirely) after a prior todo entry has already committed,
+and asserts both that `abort_safety` on disk matches the real HEAD
+afterward and that `--abort` itself subsequently succeeds.
+
+**Bug B: `sg rebase <upstream>` could start cleanly over a paused
+cherry-pick/revert, silently clobbering it.** `do_rebase_start` checked
+only `sg_rebase_state_exists`/`sg_merge_head_exists` -- **this project's
+own spec, section 6, explicitly carved rebase's start gate out of the
+convergence list** ("every existing call site of `sg_rebase_state_exists`
+OUTSIDE `cmd_rebase.c`/`safety/rebase.c`"), which is backwards: the START
+gate is precisely where a competing state needs to be refused. Reproduced
+directly: pause a cherry-pick on a conflict, then `sg rebase topic` runs
+with no resistance at all, writes its OWN conflict markers into the working
+directory (overwriting the user's still-unresolved cherry-pick conflict
+content), and never clears `CHERRY_PICK_HEAD` -- so `sg status` afterward
+printed two mutually contradictory in-progress banners at once. This is
+also why `sg_require_clean_workdir` (the merge/rebase/pick start gate all
+three commands share) could not have caught it on its own: by this
+project's existing, unrelated-to-cherry-pick convention it has never looked
+at unmerged (stage 1/2/3) index entries -- every OTHER source of an
+unresolved conflict already had its own dedicated start gate ahead of it,
+so this particular gap in `sg_require_clean_workdir` was never exercised
+until cherry-pick added a new conflict source that had no such gate of its
+own. **A new input form breaking code no one touched, the same shape
+CLAUDE.md's own module notes warn about elsewhere.** Fixed by adding the
+same `sg_sequencer_kind_in_progress` check `do_rebase_start` was missing,
+in the same place (before any side effect) as switch/merge/stash already
+have it. `cmd_status.c`'s own comment claiming "a cherry-pick/revert and a
+rebase can never both be in progress at once" was FALSE for a while,
+through a full green board -- it is now annotated with a WARNING explaining
+why it was wrong and what keeps it true going forward, so a third
+paused-state type added later does not silently repeat this.
+
+**Bug C: the entire gate-convergence list had zero coverage from the "call
+the OTHER command" direction, and that is exactly how Bug B slipped past a
+careful code read.** Only `cmd_commit.c`'s divergence 5 had an interop
+check that actually ran the competing command; the other five files
+(`apply.c`, `cmd_reset.c`, `cmd_merge.c`, `cmd_switch.c`, `cmd_stash.c`) had
+been read carefully and judged correctly converged, which is precisely how
+a MISSING sixth site (rebase's own start gate) went unnoticed -- reading
+code proves what is there, not what is absent. Fixed with one interop check
+per site (not one check covering several at once, so a future regression
+turns a specifically-named check red): `sg reset --hard` for `apply.c`'s
+own dirty-workdir confirmation (the one site not already preceded by an
+earlier explicit gate elsewhere), `sg reset --soft`, `sg merge`,
+`sg switch`, `sg rebase`, `sg stash apply`, `sg stash push` (a WARNING, not
+a refusal -- pinned as succeeding with a warning, not failing), and
+`sg undo` (the documented sole exception, pinned as actually CLEARING the
+paused state). Two measured traps while writing these:
+`sg_index_has_unmerged` is checked BEFORE the cherry-pick-specific gate in
+both of `cmd_stash.c`'s call sites, so an UNRESOLVED conflict hits that
+older, shared refusal first and never reaches the gate this phase added at
+all -- the fixture for both `stash apply` and `stash push` has to resolve
+and stage the cherry-pick's own conflict first, which is also exactly the
+state `sg_sequencer_kind_in_progress` still correctly calls "in progress".
+And `cmd_switch.c`'s own gate mutated to always-false stayed GREEN under a
+plain `switch <branch>` check, because `switch` never writes anything
+(including a `-c`-created branch, which is deliberately deferred until
+`sg_safe_apply_tree` succeeds) until AFTER `apply.c`'s own dirty check
+would ALSO have refused -- the two gates are only distinguishable by
+`--force`, which bypasses a CONFIRMATION (`apply.c`'s) but not an
+UNCONDITIONAL refusal (`cmd_switch.c`'s own), the identical reasoning this
+project's existing MERGE_HEAD comment in `cmd_switch.c` already gives for
+why its own gate cannot be removed in favor of relying on `apply.c` alone.
+
+**Item D1: "CHERRY_PICK_HEAD wins if both files somehow exist" was
+documented in a header comment and never tested.** Added directly (write
+both files by hand, assert `sg_sequencer_kind_in_progress` returns
+`SG_SEQ_CHERRY_PICK`); reverse-mutated by swapping the two `if` blocks'
+order, confirmed red.
+
+**Item D2, recorded and deliberately NOT changed: `read_hex_file` accepts a
+40-hex-character file with no trailing newline.** This is the SAME
+leniency `src/safety/rebase.c`'s own `read_hex_file` already has (a
+pre-existing, cross-module convention, not something this phase
+introduced), so tightening it here alone would make the two sibling state
+formats disagree about strictness for no reason connected to Phase 57.
+
+All items in this section were verified with their own reverse mutation
+(the fix undone, the specific named check confirmed red) -- see the commit
+history for the exact `tests/mutate.sh` invocations; none are summarized
+away here as "should be caught", each one was.
+
+## Phase 57b: `sg revert`
+
+### 1. What was already generic, and what actually needed writing
+
+Phase 57a built the replay engine (`src/cli/pick.c`) parameterised by
+`sg_seq_kind` from the start -- `sg_seq_kind kind` selects which tree plays
+base/ours/theirs (spec section 3.1), whether the new commit's author is
+copied from the picked commit or drawn fresh from the environment (section
+3.2), the revert-only message construction of section 4
+(`build_revert_message`/`build_revert_subject_line`), and the reflog
+vocabulary of section 3.3. Every gate site (`apply.c`, `cmd_reset.c`,
+`cmd_merge.c`, `cmd_switch.c`, `cmd_commit.c`, `cmd_stash.c` x2,
+`cmd_rebase.c`'s own start gate, `cmd_undo.c`'s clearing exception) already
+asks `sg_sequencer_kind_in_progress` and branches on the answer to print
+"cherry-pick" or "revert", and `cmd_status.c`'s banner already prints
+"cherry-picking"/"reverting" and the matching `sg cherry-pick`/`sg revert`
+hint lines. All of that was written and unit-tested in Phase 57a, in
+anticipation of this phase, specifically so that the revert-message rules
+(spec section 4, all four measured shapes) had somewhere real to be
+exercised from the very first commit that touched them.
+
+What Phase 57b actually added: `src/cli/cmd_revert.c` (a byte-for-byte
+parallel shell to `cmd_cherry_pick.c`, differing only in usage text and
+which `sg_seq_kind` it passes down), the `sg_cmd_revert` registration in
+`include/sg/cli.h`/`src/cli/cli.c`, `tests/test_revert_message.c`, the
+`phase57b:` interop group, and this section plus the `.SS revert` man page
+section.
+
+### 2. `tests/test_revert_message.c` -- the 7-row Reapply table
+
+All 7 rows of spec section 4.3 (4 positive, 3 negative) plus 4.1's plain
+wrap and 4.2's merge form are asserted as **exact byte strings**, not
+`strstr` substring checks -- a wrapping rule that inserts one stray space
+would still pass a substring check. Each row is driven through the real
+`sg_pick_start` entry point (not a direct call to the static
+`build_revert_subject_line`, which is file-local to `pick.c` and stays
+that way -- exposing it just for a test would be a second public surface
+for logic the black-box test can already reach). Proven to go red for the
+right reason: mutating the Reapply prefix comparison from `strncmp` to
+`strncasecmp` turns exactly the case-insensitivity negative control
+(`revert "lower"` -> should stay `Revert "revert "lower""`) red and nothing
+else (`tests/mutate.sh`).
+
+The 4.2 (merge) fixture needed one property that is easy to get backwards
+when hand-building a merge commit for a test: reverting `-m 1` of a real
+merge is a NO-OP unless the merge's own tree differs from BOTH the
+selected parent's tree and the current-HEAD tree in a way that survives the
+three-way merge's "ours == base -> take theirs" shortcut. Concretely: HEAD
+must equal the merge commit `M` itself (so `ours == base` trivially), and
+`M`'s tree must differ from parent 1's tree (so `theirs != base`, giving a
+real, non-empty change to assert on). A tempting simpler construction --
+"let `M`'s tree equal parent 1's tree, representing an unmodified carry-
+forward" -- makes `theirs == base` too and the revert reports EMPTY, which
+proves nothing about the message. This was found by reasoning through the
+three-way merge arithmetic before writing the fixture, not by a red test.
+
+### 3. `phase57b:` interop group -- why commit-object comparison had to
+### become message-only comparison
+
+Phase 57a's own `phase57:` group could byte-compare cherry-picked commit
+OBJECTS between sg and git (minus the committer line) because cherry-pick's
+author fields are copied verbatim from the picked commit -- two independent
+runs (one per tool, from the same starting fixture) therefore produce
+identical author lines by construction, not by luck. Revert's author does
+NOT come from anywhere copyable (spec 3.2: author AND committer both come
+from the environment + the real clock), so two independently-run reverts
+necessarily disagree on the author line even when everything else about
+the revert is correct -- this is the SAME whole-project limitation
+`P57_CLEAN`'s own comment already names for the committer line (`sg` never
+reads `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`, `cmd_commit.c` and `pick.c`
+both call `time(NULL)` unconditionally), just now visible in a field that
+used to be safe to compare.
+
+The fix is not to relax the comparison generally, it is to compare the
+right THING: spec section 8.2 asks for the revert MESSAGE compared
+byte-for-byte, not the whole commit object, and the message text has no
+timestamp dependency at all. `phase57b:`'s message checks therefore extract
+`git log -1 --format=%B` from each side and `cmp` only that.
+
+One further trap this raised, and had to be fixed once found: the 4.3
+Reapply fixture originally had EACH TOOL independently revert-of-the-revert
+(build root+edit, copy to `-sg`/`-git`, each side reverts HEAD, then each
+side reverts ITS OWN resulting revert commit again). Because the first
+revert's commit id differs between the two copies (same author-clock
+reason as above), the SECOND revert's message -- `This reverts commit
+<id-of-the-first-revert-commit>.` -- necessarily embeds two different ids,
+and the check misreports a real formatting bug as present when there is
+none. The fix: build the shared "Revert commit" ONCE with real git (pinned
+`GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`, same as every other shared-object
+fixture in this phase), THEN copy that single object into fresh `-sg`/
+`-git` directories before each tool reverts it a second time. This is the
+same "build once with git, copy twice" technique `P57_CLEAN` already uses
+for cherry-pick's clean case, applied one level deeper because this
+fixture needs the shared object to be a REVERT commit, which only exists
+after a first revert has already run.
+
+The reflog asymmetry (direct revert: `revert: <subject>`; `--continue`:
+bare `commit: <subject>`, no `(cherry-pick)`-style suffix) is pinned as a
+head-on pair against Phase 57a's `commit (cherry-pick): <subject>` check,
+per spec 3.3's explicit instruction -- both wordings were independently
+re-measured against real git 2.55.0 while writing this group, not just
+carried over from the spec.
+
+### 4. Escape hatches, verified against a REAL git-paused revert
+
+Phase 57a's dead-end regression (state real git wrote, or state half-
+written by a failed write, defeating all four escape hatches because they
+depended on the state being parseable) was fixed generically in the shared
+engine and is therefore inherited by revert automatically -- but "the
+engine is shared" is not the same claim as "the test coverage is shared"
+(this project's own recorded lesson: shared functions do not share tests,
+call sites can still short-circuit around a fix). This was checked by hand
+against a real `git revert` pause (not just the shared unit/interop
+suite): a two-commit `git revert` paused on a conflict, then
+`sg revert --continue` and `sg revert --skip` both correctly refuse,
+naming `--abort` (never `--continue`/`--skip`, which would fail
+identically on git's 7-hex todo); `sg status` prints the "You are currently
+reverting commit <7hex>." banner reading `REVERT_HEAD` directly,
+independent of whether `sequencer/todo` parses; `sg revert --quit` clears
+both `REVERT_HEAD` and `sequencer/` on existence alone; and
+`sg revert --abort` recovers correctly, restoring `HEAD` to the exact
+commit git's own `sequencer/head` named and removing the paused state.
+All five outcomes matched spec section 5b's cherry-pick findings exactly,
+confirming this really is inherited behaviour rather than something that
+happened to look right.
+
+### 5. A found-and-fixed pre-existing docs bug
+
+While extending the `docs/sg.1` `FILES` entry for
+`CHERRY_PICK_HEAD`/`MERGE_MSG`/`sequencer/` to also cover `REVERT_HEAD`,
+its existing text ("so a real git binary can inspect or finish a pick sg
+left paused, **and vice versa**") was found to directly contradict spec
+section 5b's own explicit instruction ("Cross-tool resumption is
+one-directional ... Do not write 'and vice versa' anywhere") -- a
+pre-existing Phase 57a documentation bug, not something this phase
+introduced, caught only because this phase had to touch the same
+paragraph for an unrelated reason (adding `REVERT_HEAD`). Fixed in the same
+edit: the paragraph now states the real, asymmetric claim (git can inspect,
+finish, or abort a pick/revert sg paused; sg can only `--abort`/`--quit`,
+never `--continue`/`--skip`, one git itself paused, and explains why --
+git's todo ids are its own abbreviated 7-hex, which sg has no
+abbreviated-object-name resolution to read back).
+
+### 6. Review round 2: a found-and-fixed live bug, plus four coverage gaps
+
+A cold review of the committed Phase 57b diff found no live bug in the
+revert message/author logic itself -- every line was traced and confirmed
+correct. All five items below are either genuine coverage gaps (57a wrote
+the revert branch of shared code, but 57b was the first thing to actually
+exercise it, and most of those branches had no witness) or, for item 1,
+a bug the new coverage itself exposed while being written.
+
+**Item 1a (real bug, fixed): the conflict marker's "theirs" label was
+truncated past 300 bytes.** `attempt_one`'s `theirs_label` (`src/cli/
+pick.c`) was a fixed `char[300]` filled with `snprintf` -- no overflow, but
+a silent truncation once `<7hex> (<subject>)` exceeded that width. Measured
+against real git 2.55.0 (subject lengths 20/300/400 bytes, cherry-pick to a
+conflict, read the `>>>>>>>` line): git never truncates. Fixed by measuring
+the needed length first and `malloc`ing, the same idiom `build_revert_
+message` already used. Verified against real git at all three lengths
+after the fix: byte-identical.
+
+**Item 1b (a SECOND real bug, found by the interop check item 1a's fix
+required, not part of the original review): revert's conflict marker is
+missing git's "parent of " prefix entirely.** Real git's `theirs` label
+for a `git revert` conflict is `parent of <7hex> (<subject>)`, not the bare
+`<7hex> (<subject>)` cherry-pick uses -- measured on both a single-parent
+revert and a `-m 1` merge revert, the prefix is present in both. sg's
+`theirs_label` construction was shared verbatim between the two commands
+and had never had `kind` threaded into it at all, so `sg revert` produced
+cherry-pick's label shape for every conflict it ever raised, and nothing
+had caught this because no check before this round ever `cmp`'d the marker
+line's bytes for a revert conflict -- the pre-existing `REVERT_HEAD`/
+`MERGE_MSG` checks don't touch the working-tree file's conflict markers at
+all. Fixed in the same edit as item 1a (`kind == SG_SEQ_REVERT` selects an
+extra `"parent of "` prefix baked into the same `snprintf(NULL, 0, ...)` +
+`malloc` construction). Interop's new byte-for-byte marker-line check
+(originally written only to prove item 1a) is what caught this; it would
+have caught it even without item 1a ever existing, which is the whole
+argument for measuring the actual bytes instead of only the length.
+
+**Item 2 (coverage gap, no bug): `sg_pick_continue`'s revert-author branch
+had no witness.** `attempt_one` (the direct-apply path) and `sg_pick_
+continue` (the resume path) are two SEPARATE, independently-written
+`if (kind == SG_SEQ_CHERRY_PICK)` branches building the same commit's
+author fields -- sharing a kind parameter does not share a code path, let
+alone a test. `test_revert_author_from_environment` only ever drove the
+first; `test_revert_continue_author_from_environment` (new) drives a
+revert through a real conflict, resolves it, and asserts the `--continue`'d
+commit's author is the environment fallback, not the reverted commit's
+-- both as a positive assertion (matches `env_or`'s own fallback values)
+and a negative one (does not match the reverted commit's author), so a
+mutation substituting a third, wrong value is still caught. Reverse-mutated
+(`if (kind == SG_SEQ_CHERRY_PICK)` -> `if (1)` at this specific site, not
+`attempt_one`'s): confirmed red on all three assertions.
+
+**Item 3 (coverage gap, no bug): 7 of 8 gate sites had only ever been
+proven against a paused CHERRY-PICK, never a paused REVERT.** The predicate
+(`sg_sequencer_kind_in_progress`) and the message-naming branch
+(`seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert"`) are
+per-site, so cherry-pick coverage says nothing about whether a given site's
+own branch correctly names "revert". `phase57b:`'s new gate-site block
+pauses a revert (not a cherry-pick) and checks each of `apply.c`'s
+dirty-workdir confirmation (via `reset --hard`), `cmd_reset.c`'s
+`--soft`, `cmd_merge.c`, `cmd_switch.c --force`, `cmd_rebase.c`,
+`cmd_stash.c`'s apply/pop gate, and `cmd_stash.c`'s push-time warning --
+seven separate named checks, not one shared assertion. Each was reverse-
+mutated INDIVIDUALLY (its own `"cherry-pick"`-hardcoding, not `/g` across
+the whole file, per the project's own "do not smear per-site results
+together" rule), and each turned exactly its own named check red and no
+others. `cmd_commit.c`'s gate (divergence 5) already had revert coverage
+from the original 57b commit and needed no new check; `cmd_undo.c`'s
+clearing exception was out of this round's scope.
+
+**Item 4 (coverage gap, no bug): the spec-5b escape-hatch fix had no
+revert-specific interop witness against a REAL git-paused revert.** 57a's
+own two named checks (cherry-pick `--quit` clears a git-paused sequence;
+`--abort` recovers one) only ever drove a cherry-pick. `phase57b:` already
+built exactly the needed fixture for its `sequencer/todo` verb check
+(`$P57B_MULTI-git`, a real two-commit `git revert` paused by real git,
+never touched by sg) -- reused rather than rebuilt. New checks confirm
+`sg revert --quit` clears it unconditionally, `sg revert --abort` restores
+`master` to the exact commit git's own `sequencer/head` named,
+`sg revert --continue` still refuses (git's 7-hex todo is genuinely
+unreadable) but names `--abort`, never `--continue`/`--skip` (which fail
+identically), and `sg status` still prints the "You are currently
+reverting commit <7hex>." banner from `REVERT_HEAD` alone, independent of
+whether `sequencer/todo` parses.
+
+**Item 5 (coverage gap, no bug, confirmed by static trace before
+writing): the 4.3 Reapply rule's 7 rows never touched the 8-byte boundary
+itself.** All 7 were either well past 8 bytes or an obvious non-match.
+Three boundary rows were added and MATCHED the statically-traced
+expectation on the first run, with no source change required: the subject
+being exactly the 8-byte prefix `Revert "` and nothing else (produces
+`Reapply "` with nothing following the opening quote -- still no
+closing-quote check, matching the existing rule); a subject shorter than 8
+bytes (`Rev`, falls through to plain wrapping because `strncmp`'s own
+length guard cannot match); and the empty subject (also falls through,
+wraps to `Revert ""`).

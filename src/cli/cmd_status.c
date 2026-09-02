@@ -10,6 +10,7 @@
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/sequencer.h"
 #include "sg/status.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
@@ -248,7 +249,7 @@ static size_t count_unmerged(const sg_index *idx, const sg_pathspec *ps)
    filter for itself, or an unmerged path would leak through unfiltered
    while every other section respects the pathspec. */
 static void print_unmerged(const sg_index *idx, const sg_pathspec *ps, int rebase_in_progress,
-                           size_t count)
+                           sg_seq_kind seq_kind, size_t count)
 {
     size_t i;
 
@@ -259,6 +260,10 @@ static void print_unmerged(const sg_index *idx, const sg_pathspec *ps, int rebas
     printf("  (use \"sg add <file>...\" to mark resolution)\n");
     if (rebase_in_progress)
         printf("  (use \"sg rebase --abort\" to check out the original branch)\n");
+    else if (seq_kind == SG_SEQ_CHERRY_PICK)
+        printf("  (use \"sg cherry-pick --abort\" to cancel the cherry-pick operation)\n");
+    else if (seq_kind == SG_SEQ_REVERT)
+        printf("  (use \"sg revert --abort\" to cancel the revert operation)\n");
     else
         printf("  (use \"sg merge --abort\" to abort the merge)\n");
     for (i = 0; i < idx->count; i++) {
@@ -550,6 +555,7 @@ int sg_cmd_status(int argc, char **argv)
     size_t ignored_count = 0;
     size_t unmerged_count;
     int merge_in_progress = 0;
+    sg_seq_kind seq_kind;
     size_t i;
     int arg_i;
     char **pos;
@@ -680,6 +686,16 @@ int sg_cmd_status(int argc, char **argv)
        Phase 38). */
     unmerged_count = count_unmerged(&idx, &pathspec);
 
+    /* Existence, not parseability -- same convention as sg_merge_head_exists
+       (a corrupt CHERRY_PICK_HEAD/REVERT_HEAD still counts as "in
+       progress"). Computed once here so the banner below, the closing-line
+       suppression (Phase 38's Bug E), and print_unmerged's hint line all
+       agree on whether a cherry-pick/revert is in progress -- the same
+       reason unmerged_count above is computed exactly once. `git status
+       --porcelain` shows nothing about this (measured), so seq_kind is
+       never consulted in the porcelain branch below. */
+    seq_kind = sg_sequencer_kind_in_progress(git_dir);
+
     if (opts.porcelain) {
         if (opts.branch)
             print_porcelain_branch_header(git_dir, branch);
@@ -699,6 +715,67 @@ int sg_cmd_status(int argc, char **argv)
             printf("%s\n", detached);
         else
             printf("Not currently on any branch.\n");
+    }
+
+    if (!opts.porcelain && seq_kind != 0) {
+        /* Phase 57 spec section 7, measured byte-for-byte against real git
+           2.55.0. Printed BEFORE the rebase block -- a cherry-pick/revert
+           and a rebase can never both be in progress at once (each start
+           gate refuses if the other is already running), so there is no
+           real ordering question here, only the spec's stated order.
+           WARNING: this claim was FALSE for a while, through a full green
+           board -- `sg rebase <upstream>`'s own start gate
+           (do_rebase_start, cmd_rebase.c) checked only
+           sg_rebase_state_exists/sg_merge_head_exists until a review found
+           it would start cleanly over a paused cherry-pick/revert,
+           clobbering the unresolved conflict content with rebase's own and
+           leaving CHERRY_PICK_HEAD uncleared -- exactly the "both in
+           progress" state this comment claims cannot happen.
+           do_rebase_start now also checks sg_sequencer_kind_in_progress, so
+           the claim holds again; a third paused-state type would need the
+           same wiring in its own start gate, or this assumption breaks
+           silently a second time.
+
+           Spec section 5b: the banner is printed on EXISTENCE (seq_kind !=
+           0, already established above), never gated on whether the full
+           sequencer state parses -- a damaged sequencer/todo must not make
+           this whole block disappear along with the hint lines below it
+           (the measured symptom of getting this wrong: the "(use ... to
+           cancel...)" hint printed while "You are currently cherry-picking
+           commit <7hex>." vanished entirely, the same banner/other-half
+           disagreement as Phase 38's bug A). The 7-hex comes from
+           sg_sequencer_current_commit, which reads only CHERRY_PICK_HEAD/
+           REVERT_HEAD's own single hex line -- independent of sequencer/'s
+           existence or parseability -- so it degrades gracefully on its
+           own if even THAT is malformed, rather than needing the caller to
+           duplicate the fallback. */
+        const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+        const char *verb = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-picking" : "reverting";
+        unsigned char current[SG_SHA1_RAW_LEN];
+        sg_seq_kind current_kind;
+
+        if (sg_sequencer_current_commit(git_dir, &current_kind, current) == 0) {
+            char hex[SG_SHA1_HEX_LEN + 1];
+            char short_sha[8];
+
+            sg_sha1_to_hex(current, hex);
+            memcpy(short_sha, hex, 7);
+            short_sha[7] = '\0';
+            printf("You are currently %s commit %s.\n", verb, short_sha);
+        } else {
+            /* CHERRY_PICK_HEAD/REVERT_HEAD itself is malformed (rare --
+               its own format is a single hex line, as simple as it gets).
+               Degrade to a detail-free line rather than omitting the
+               banner entirely. */
+            printf("You are currently %s.\n", verb);
+        }
+        if (unmerged_count > 0)
+            printf("  (fix conflicts and run \"sg %s --continue\")\n", op);
+        else
+            printf("  (all conflicts fixed: run \"sg %s --continue\")\n", op);
+        printf("  (use \"sg %s --skip\" to skip this patch)\n", op);
+        printf("  (use \"sg %s --abort\" to cancel the %s operation)\n", op, op);
+        printf("\n");
     }
 
     if (!opts.porcelain) {
@@ -868,7 +945,7 @@ int sg_cmd_status(int argc, char **argv)
         if (opts.ignored)
             print_porcelain_paths("!! ", ignored, ignored_count);
     } else {
-        print_unmerged(&idx, &pathspec, sg_rebase_state_exists(git_dir), unmerged_count);
+        print_unmerged(&idx, &pathspec, sg_rebase_state_exists(git_dir), seq_kind, unmerged_count);
 
         print_section("Changes to be committed:", staged_hints, 1, &staged);
         print_section("Changes not staged for commit:", unstaged_hints, 2, &unstaged);
@@ -880,7 +957,8 @@ int sg_cmd_status(int argc, char **argv)
                 printf("\t%s\n", sg_quote_path(untracked[i]));
             printf("\n");
         } else if (opts.u_mode == STATUS_U_NO &&
-                  (staged.count > 0 || (merge_in_progress && unmerged_count == 0))) {
+                  (staged.count > 0 ||
+                   ((merge_in_progress || seq_kind != 0) && unmerged_count == 0))) {
             /* Real git prints this exactly where "Untracked files:" would
                have gone, only when something is already staged -- with
                nothing staged, the single-line summary below covers it
@@ -913,8 +991,14 @@ int sg_cmd_status(int argc, char **argv)
            entries), git prints NO closing summary line at all -- not even
            in the -uno branch. When unmerged paths remain instead ("You have
            unmerged paths."), the closing line prints as usual (row 1 of the
-           priority table below), which sg already got right. */
-        if (merge_in_progress && unmerged_count == 0) {
+           priority table below), which sg already got right.
+
+           Phase 57 extends this same rule to a stopped cherry-pick/revert:
+           the banner above prints "(all conflicts fixed: run ...)" in
+           exactly this state, and the same shape holds for the identical
+           reason -- the in-progress banner already told the user what to
+           do next, so the closing line disappears. */
+        if ((merge_in_progress || seq_kind != 0) && unmerged_count == 0) {
             /* no closing line */
         } else if (opts.u_mode == STATUS_U_NO) {
             /* -uno never learns whether untracked files exist, so its
