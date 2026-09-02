@@ -114,11 +114,71 @@ static void test_tag_parse_rejects_malformed(void)
          "expected rejection of a tag with an unrecognized type field");
 }
 
+/* Phase 61: sg_tag_parse must skip unknown trailing headers up to the first
+   blank line, same rule and same reasoning as sg_commit_parse. */
+static void test_tag_unknown_header(void)
+{
+    const char *raw = "object 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "type commit\n"
+                       "tag v1\n"
+                       "tagger A <a@example.com> 1700000000 +0000\n"
+                       "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+                       " fakefakefake\n"
+                       " -----END PGP SIGNATURE-----\n"
+                       "\n"
+                       "signed tag message\n";
+    sg_tag parsed;
+    int rc = sg_tag_parse((const unsigned char *)raw, strlen(raw), &parsed);
+
+    CHECK(rc == 0, "tag with gpgsig header should parse, got %d", rc);
+    if (rc == 0) {
+        CHECK(strcmp(parsed.tag_name, "v1") == 0, "tag_name %s", parsed.tag_name);
+        CHECK(strcmp(parsed.tagger_name, "A") == 0, "tagger_name %s", parsed.tagger_name);
+        CHECK(strcmp(parsed.message, "signed tag message\n") == 0, "message %s", parsed.message);
+        sg_tag_free(&parsed);
+    }
+}
+
+/* Negative rows, same reasoning as sg_commit_parse's: real git refuses to
+   create these, so tolerating unknown TRAILING headers must not relax the
+   ORDER of the known ones. */
+static void test_tag_unknown_header_before_object_fails(void)
+{
+    const char *raw = "gpgsig fake\n"
+                       "object 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "type commit\n"
+                       "tag v1\n"
+                       "tagger A <a@example.com> 1700000000 +0000\n"
+                       "\n"
+                       "msg\n";
+    sg_tag parsed;
+
+    CHECK(sg_tag_parse((const unsigned char *)raw, strlen(raw), &parsed) != 0,
+         "a header before object must still fail to parse");
+}
+
+static void test_tag_missing_tagger_fails(void)
+{
+    const char *raw = "object 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "type commit\n"
+                       "tag v1\n"
+                       "gpgsig fake\n"
+                       "\n"
+                       "msg\n";
+    sg_tag parsed;
+
+    CHECK(sg_tag_parse((const unsigned char *)raw, strlen(raw), &parsed) != 0,
+         "a tag missing tagger must still fail to parse");
+}
+
 int main(void)
 {
     test_tag_vector();
     test_tag_roundtrip();
     test_tag_parse_rejects_malformed();
+    test_tag_unknown_header();
+    test_tag_unknown_header_before_object_fails();
+    test_tag_missing_tagger_fails();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

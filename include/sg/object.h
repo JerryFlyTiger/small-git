@@ -91,6 +91,14 @@ typedef struct {
     long long committer_time;
     char committer_tz[8];
     char *message; /* malloc'd, owned */
+    /* Raw bytes of any unknown trailing headers (e.g. "gpgsig", "encoding"),
+       verbatim including their own trailing newlines but NOT the blank line
+       that ends the header section -- malloc'd, owned, "" (not NULL) when
+       there were none. sg_commit_parse fills this in (Phase 61) purely so
+       `--pretty=raw` can reproduce it byte for byte; sg_commit_serialize
+       does not read it back out, sg never re-signs or otherwise re-emits a
+       header it did not itself understand. */
+    char *extra_headers;
 } sg_commit;
 
 int sg_commit_serialize(const sg_commit *commit, unsigned char **out, size_t *out_len);
@@ -121,6 +129,15 @@ typedef struct {
     long long tagger_time;
     char tagger_tz[8];
     char *message;
+    /* Same field, same rule as sg_commit's own -- see its comment. Note it
+       is currently write-only from a rendering point of view: measured
+       against real git 2.55.0, `git show`'s tag header (Tagger:/Date:/
+       message) never reprints a tag's own unknown headers even under
+       `--pretty=raw` (that flag only reaches the COMMIT nested underneath),
+       so nothing in sg currently reads this field back out either. It is
+       still captured, for the same "shared struct" and future-caller
+       reasons sg_commit's is. */
+    char *extra_headers;
 } sg_tag;
 
 int sg_tag_serialize(const sg_tag *tag, unsigned char **out, size_t *out_len);

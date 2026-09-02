@@ -198,9 +198,31 @@ int sg_commit_parse(const unsigned char *content, size_t content_len, sg_commit 
         goto fail;
     p = line_end + 1;
 
-    if (p >= end || *p != '\n')
-        goto fail;
-    p++;
+    /* Unknown trailing headers (e.g. "gpgsig", "encoding") are skipped over
+       but their raw bytes are kept verbatim in out->extra_headers -- git
+       accepts arbitrarily many of these after the known ones, continuation
+       lines included, and the blank line that ends the header section is
+       what terminates them, not the leading space of a continuation line.
+       See docs/DESIGN.md Phase 61: the only current reader is
+       `--pretty=raw`, which reproduces this block byte for byte. */
+    {
+        const char *header_start = p;
+
+        while (p < end && *p != '\n') {
+            line_end = find_eol(p, end);
+            if (line_end == NULL)
+                goto fail;
+            p = line_end + 1;
+        }
+
+        if (p >= end || *p != '\n')
+            goto fail;
+
+        out->extra_headers = dup_range(header_start, (size_t)(p - header_start));
+        if (out->extra_headers == NULL)
+            goto fail;
+        p++;
+    }
 
     out->message = dup_range(p, (size_t)(end - p));
     if (out->message == NULL)
@@ -221,5 +243,6 @@ void sg_commit_free(sg_commit *commit)
     free(commit->committer_name);
     free(commit->committer_email);
     free(commit->message);
+    free(commit->extra_headers);
     memset(commit, 0, sizeof(*commit));
 }

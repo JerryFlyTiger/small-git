@@ -335,6 +335,125 @@ static void test_parse_size_mismatch(void)
     }
 }
 
+/* Phase 61: sg_commit_parse must skip unknown trailing headers (e.g.
+   "gpgsig", the header GitHub's web UI stamps on every merge/squash commit
+   it creates) up to the first blank line, rather than rejecting the whole
+   object. Rule measured against real git 2.55.0: continuation lines need no
+   special handling, only the blank line ends the header section. */
+static void test_commit_unknown_header_gpgsig(void)
+{
+    const char *raw = "tree 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "author A <a@example.com> 1700000000 +0000\n"
+                       "committer A <a@example.com> 1700000000 +0000\n"
+                       "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+                       " fakefakefake\n"
+                       " -----END PGP SIGNATURE-----\n"
+                       "\n"
+                       "signed commit message\n";
+    sg_commit parsed;
+    int rc = sg_commit_parse((const unsigned char *)raw, strlen(raw), &parsed);
+
+    CHECK(rc == 0, "commit with gpgsig header should parse, got %d", rc);
+    if (rc == 0) {
+        CHECK(strcmp(parsed.author_name, "A") == 0, "author_name %s", parsed.author_name);
+        CHECK(strcmp(parsed.committer_name, "A") == 0, "committer_name %s",
+             parsed.committer_name);
+        CHECK(strcmp(parsed.message, "signed commit message\n") == 0, "message %s",
+             parsed.message);
+        sg_commit_free(&parsed);
+    }
+}
+
+/* An unknown header with no value at all ("foo\n"), immediately followed by
+   an empty message, is accepted -- measured against real git. */
+static void test_commit_unknown_header_no_value(void)
+{
+    const char *raw = "tree 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "author A <a@example.com> 1700000000 +0000\n"
+                       "committer A <a@example.com> 1700000000 +0000\n"
+                       "foo\n"
+                       "\n";
+    sg_commit parsed;
+    int rc = sg_commit_parse((const unsigned char *)raw, strlen(raw), &parsed);
+
+    CHECK(rc == 0, "commit with valueless unknown header should parse, got %d", rc);
+    if (rc == 0) {
+        CHECK(strcmp(parsed.message, "") == 0, "expected empty message, got %s", parsed.message);
+        sg_commit_free(&parsed);
+    }
+}
+
+/* The blank line wins over an unknown header's own continuation lines:
+   measured against real git, "foo l1\n\n l2\n\nsubj" gives the message
+   " l2\n\nsubj" (whose own subject line is "l2") -- headers end at the
+   FIRST blank line, full stop, regardless of the leading space on what
+   follows. */
+static void test_commit_unknown_header_blank_line_wins(void)
+{
+    const char *raw = "tree 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "author A <a@example.com> 1700000000 +0000\n"
+                       "committer A <a@example.com> 1700000000 +0000\n"
+                       "foo l1\n"
+                       "\n"
+                       " l2\n"
+                       "\n"
+                       "subj";
+    sg_commit parsed;
+    int rc = sg_commit_parse((const unsigned char *)raw, strlen(raw), &parsed);
+
+    CHECK(rc == 0, "commit should parse, got %d", rc);
+    if (rc == 0) {
+        CHECK(strcmp(parsed.message, " l2\n\nsubj") == 0, "expected blank-line-wins message, got %s",
+             parsed.message);
+        sg_commit_free(&parsed);
+    }
+}
+
+/* Negative rows from Phase 61's spec: real git itself refuses to create
+   these objects (fsck: missingTree / missingAuthor / missingCommitter), so
+   sg must keep rejecting them -- tolerating unknown TRAILING headers must
+   not relax the ORDER of the known ones, nor make committer optional. */
+static void test_commit_unknown_header_before_tree_fails(void)
+{
+    const char *raw = "gpgsig fake\n"
+                       "tree 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "author A <a@example.com> 1700000000 +0000\n"
+                       "committer A <a@example.com> 1700000000 +0000\n"
+                       "\n"
+                       "msg\n";
+    sg_commit parsed;
+
+    CHECK(sg_commit_parse((const unsigned char *)raw, strlen(raw), &parsed) != 0,
+         "a header before tree must still fail to parse");
+}
+
+static void test_commit_unknown_header_before_author_fails(void)
+{
+    const char *raw = "tree 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "gpgsig fake\n"
+                       "author A <a@example.com> 1700000000 +0000\n"
+                       "committer A <a@example.com> 1700000000 +0000\n"
+                       "\n"
+                       "msg\n";
+    sg_commit parsed;
+
+    CHECK(sg_commit_parse((const unsigned char *)raw, strlen(raw), &parsed) != 0,
+         "a header before author must still fail to parse");
+}
+
+static void test_commit_missing_committer_fails(void)
+{
+    const char *raw = "tree 3e8e527c1dd03f20265760d7c4aee5c70ba791c2\n"
+                       "author A <a@example.com> 1700000000 +0000\n"
+                       "gpgsig fake\n"
+                       "\n"
+                       "msg\n";
+    sg_commit parsed;
+
+    CHECK(sg_commit_parse((const unsigned char *)raw, strlen(raw), &parsed) != 0,
+         "a commit missing committer must still fail to parse");
+}
+
 int main(void)
 {
     test_blob_vectors();
@@ -345,6 +464,12 @@ int main(void)
     test_message_cleanup();
     test_parse_header();
     test_parse_size_mismatch();
+    test_commit_unknown_header_gpgsig();
+    test_commit_unknown_header_no_value();
+    test_commit_unknown_header_blank_line_wins();
+    test_commit_unknown_header_before_tree_fails();
+    test_commit_unknown_header_before_author_fails();
+    test_commit_missing_committer_fails();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
