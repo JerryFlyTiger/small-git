@@ -1186,14 +1186,40 @@ static int do_rebase_abort(const char *git_dir, const char *repo_root)
     return 0;
 }
 
+/* Phase 58: the escape hatch for state --continue/--skip/--abort cannot
+   parse. It parses nothing itself -- sg_rebase_state_exists (stat-only)
+   decides, sg_rebase_state_remove (plain remove()-by-name) does the work
+   -- same shape and same reasoning as Phase 57's sg_pick_quit (src/cli/
+   pick.c): --continue and --skip need a readable state to do their real
+   job, and --abort additionally needs two 40-hex fields read in full,
+   so when any of those three fields is damaged all three refuse (measured
+   against real git 2.55.0, which refuses identically) and --quit is what
+   is left. It must not move HEAD and must not touch the index/working
+   tree -- measured: a healthy paused rebase's conflicted path is still
+   conflicted after `git rebase --quit`, and HEAD stays at the detached
+   replay position rather than returning to the original branch. */
+static int do_rebase_quit(const char *git_dir)
+{
+    if (!sg_rebase_state_exists(git_dir)) {
+        fprintf(stderr, "sg: no rebase is in progress\n");
+        return 1;
+    }
+    if (sg_rebase_state_remove(git_dir) != 0) {
+        fprintf(stderr, "sg: warning: could not fully remove the rebase state\n");
+        return 1;
+    }
+    return 0;
+}
+
 int sg_cmd_rebase(int argc, char **argv)
 {
     static const char usage[] =
         "usage: sg rebase <upstream>\n"
         "       sg rebase --continue\n"
         "       sg rebase --abort\n"
-        "       sg rebase --skip\n";
-    int continue_flag = 0, abort_flag = 0, skip_flag = 0;
+        "       sg rebase --skip\n"
+        "       sg rebase --quit\n";
+    int continue_flag = 0, abort_flag = 0, skip_flag = 0, quit_flag = 0;
     const char *upstream_arg = NULL;
     char *git_dir;
     char *repo_root;
@@ -1208,6 +1234,8 @@ int sg_cmd_rebase(int argc, char **argv)
             abort_flag = 1;
         } else if (strcmp(argv[i], "--skip") == 0) {
             skip_flag = 1;
+        } else if (strcmp(argv[i], "--quit") == 0) {
+            quit_flag = 1;
         } else if (upstream_arg == NULL) {
             upstream_arg = argv[i];
         } else {
@@ -1216,7 +1244,8 @@ int sg_cmd_rebase(int argc, char **argv)
         }
     }
 
-    mode_count = continue_flag + abort_flag + skip_flag + (upstream_arg != NULL ? 1 : 0);
+    mode_count = continue_flag + abort_flag + skip_flag + quit_flag +
+                (upstream_arg != NULL ? 1 : 0);
     if (mode_count != 1) {
         fputs(usage, stderr);
         return 1;
@@ -1238,6 +1267,8 @@ int sg_cmd_rebase(int argc, char **argv)
         rc = do_rebase_abort(git_dir, repo_root);
     else if (skip_flag)
         rc = do_rebase_skip(git_dir, repo_root);
+    else if (quit_flag)
+        rc = do_rebase_quit(git_dir);
     else
         rc = do_rebase_start(git_dir, repo_root, upstream_arg);
 

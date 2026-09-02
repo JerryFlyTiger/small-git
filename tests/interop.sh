@@ -15208,6 +15208,231 @@ p57b_commit_git_rc=$?
 check "phase57b oracle: precondition -- git commit completes the revert instead" \
     sh -c "test \"\$0\" = 0 && test ! -f \"\$1/.git/REVERT_HEAD\"" "$p57b_commit_git_rc" "$P57B_COMMIT_GIT"
 
+# ============================================================
+# Phase 58: sg rebase --quit, and the status banner surviving a damaged
+# rebase state. See SPEC58.md sections 1-4: real git's own --abort/--skip/
+# --continue refuse identically on a damaged rebase-merge/onto, so --quit
+# is the fix, not loosening those three; and git's status still prints its
+# rebase block on a damaged state while sg's used to vanish entirely.
+# ============================================================
+p58_commit() {
+    (cd "$1" && LC_ALL=C git -c core.editor=true commit -q -m "$2") > /dev/null 2>&1
+}
+
+# P58_PAUSED: a genuine conflicting rebase, paused mid-flight, built with sg
+# (sg-rebase/ has no real-git counterpart to copy byte-for-byte, so this
+# fixture is sg's own -- same technique phase4c already used).
+P58_PAUSED="$WORKDIR/p58_paused"
+mkdir -p "$P58_PAUSED"
+(cd "$WORKDIR" && "$SG" init p58_paused) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P58_PAUSED/c.txt"
+(cd "$P58_PAUSED" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P58_PAUSED" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P58_PAUSED/c.txt"
+(cd "$P58_PAUSED" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P58_PAUSED" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P58_PAUSED/c.txt"
+(cd "$P58_PAUSED" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P58_PAUSED" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+(cd "$P58_PAUSED" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+check "phase58: precondition -- sg-rebase/ present after the paused rebase" \
+    test -d "$P58_PAUSED/.git/sg-rebase"
+
+# --- head-on pair: on a state damaged the same way, --abort still refuses
+# (matching git) AND --quit clears it. Both halves in one fixture, so a
+# future "fix" that loosens abort turns a check red by name (spec 5). ---
+P58_DAMAGED="$WORKDIR/p58_damaged"
+rm -rf "$P58_DAMAGED"
+cp -R "$P58_PAUSED" "$P58_DAMAGED"
+printf 'garbage' > "$P58_DAMAGED/.git/sg-rebase/onto"
+
+P58_HEAD_BEFORE_QUIT=$(cd "$P58_DAMAGED" && LC_ALL=C git rev-parse HEAD)
+(cd "$P58_DAMAGED" && "$SG" rebase --abort < /dev/null) > "$P58_DAMAGED.abort.out" 2>&1
+p58_damaged_abort_rc=$?
+check "phase58: sg rebase --abort still refuses on a damaged state (matches git)" \
+    test "$p58_damaged_abort_rc" != 0
+check "phase58: ...and the damaged state survives the refusal" \
+    test -d "$P58_DAMAGED/.git/sg-rebase"
+
+(cd "$P58_DAMAGED" && "$SG" rebase --quit < /dev/null) > "$P58_DAMAGED.quit.out" 2>&1
+p58_damaged_quit_rc=$?
+check "phase58: sg rebase --quit exits 0 on the same damaged state" \
+    test "$p58_damaged_quit_rc" = 0
+check "phase58: sg rebase --quit prints nothing" \
+    sh -c 'test ! -s "$0"' "$P58_DAMAGED.quit.out"
+check "phase58: sg rebase --quit removes the state directory" \
+    test ! -d "$P58_DAMAGED/.git/sg-rebase"
+P58_HEAD_AFTER_QUIT=$(cd "$P58_DAMAGED" && LC_ALL=C git rev-parse HEAD)
+check "phase58: --quit does not move HEAD" \
+    test "$P58_HEAD_BEFORE_QUIT" = "$P58_HEAD_AFTER_QUIT"
+
+# --- after --quit, switch/commit are no longer blocked (spec 5). --force
+# is needed here because the conflict this rebase paused on left c.txt at
+# UU -- a SEPARATE dirty-worktree gate that --quit deliberately does not
+# clear (spec 3: "the index and working tree are untouched"). --force
+# bypasses only that confirmation, never the rebase gate itself
+# (cmd_switch.c: the rebase check is unconditional, before --force is even
+# read), so this isolates "is the REBASE gate still blocking" precisely. ---
+(cd "$P58_DAMAGED" && "$SG" switch master --force < /dev/null) > "$P58_DAMAGED.switch.out" 2>&1
+check "phase58: sg switch is no longer blocked after --quit" \
+    test $? = 0
+
+P58_COMMIT_REPO="$WORKDIR/p58_commit_repo"
+rm -rf "$P58_COMMIT_REPO"
+cp -R "$P58_PAUSED" "$P58_COMMIT_REPO"
+printf 'garbage' > "$P58_COMMIT_REPO/.git/sg-rebase/onto"
+(cd "$P58_COMMIT_REPO" && "$SG" rebase --quit < /dev/null) > /dev/null 2>&1
+printf 'resolved1\norig2\n' > "$P58_COMMIT_REPO/c.txt"
+(cd "$P58_COMMIT_REPO" && "$SG" add c.txt) > /dev/null 2>&1
+(cd "$P58_COMMIT_REPO" && "$SG" commit -m "resolved by hand" < /dev/null) > "$P58_COMMIT_REPO.commit.out" 2>&1
+check "phase58: sg commit is no longer blocked after --quit" \
+    test $? = 0
+
+# --- a healthy paused rebase: --quit leaves HEAD untouched and the
+# conflicted index still conflicted, compared against real git's own
+# --quit on the same fixture (spec 3). ---
+P58_HEALTHY_SG="$WORKDIR/p58_healthy_sg"
+P58_HEALTHY_GIT="$WORKDIR/p58_healthy_git"
+rm -rf "$P58_HEALTHY_SG" "$P58_HEALTHY_GIT"
+mkdir -p "$P58_HEALTHY_SG" "$P58_HEALTHY_GIT"
+(cd "$WORKDIR" && LC_ALL=C git init -q -b master p58_healthy_git) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P58_HEALTHY_GIT/c.txt"
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git add c.txt) > /dev/null 2>&1
+p58_commit "$P58_HEALTHY_GIT" "base"
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git branch feature) > /dev/null 2>&1
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git switch -q feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P58_HEALTHY_GIT/c.txt"
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git add c.txt) > /dev/null 2>&1
+p58_commit "$P58_HEALTHY_GIT" "feature change"
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git switch -q master) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P58_HEALTHY_GIT/c.txt"
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git add c.txt) > /dev/null 2>&1
+p58_commit "$P58_HEALTHY_GIT" "master change"
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git switch -q feature) > /dev/null 2>&1
+
+# The sg-side history is built through sg itself (sg-rebase's fixture
+# cannot be shared with git's rebase-merge/, same reasoning as P58_PAUSED
+# above) -- both sides use the same commit content and messages so their
+# conflict shapes match.
+rm -rf "$P58_HEALTHY_SG"
+mkdir -p "$P58_HEALTHY_SG"
+(cd "$WORKDIR" && "$SG" init p58_healthy_sg) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P58_HEALTHY_SG/c.txt"
+(cd "$P58_HEALTHY_SG" && "$SG" add c.txt && "$SG" commit -m "base") > /dev/null 2>&1
+(cd "$P58_HEALTHY_SG" && "$SG" switch -c feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P58_HEALTHY_SG/c.txt"
+(cd "$P58_HEALTHY_SG" && "$SG" add c.txt && "$SG" commit -m "feature change") > /dev/null 2>&1
+(cd "$P58_HEALTHY_SG" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P58_HEALTHY_SG/c.txt"
+(cd "$P58_HEALTHY_SG" && "$SG" add c.txt && "$SG" commit -m "master change") > /dev/null 2>&1
+(cd "$P58_HEALTHY_SG" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
+
+P58_HEALTHY_SG_HEAD_BEFORE=$(cd "$P58_HEALTHY_SG" && LC_ALL=C git rev-parse HEAD)
+P58_HEALTHY_GIT_HEAD_BEFORE=$(cd "$P58_HEALTHY_GIT" && LC_ALL=C git rev-parse HEAD)
+(cd "$P58_HEALTHY_SG" && "$SG" rebase master < /dev/null) > /dev/null 2>&1
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git rebase master) > /dev/null 2>&1
+check "phase58 oracle: precondition -- git's own rebase paused on the same conflict" \
+    test -d "$P58_HEALTHY_GIT/.git/rebase-merge"
+P58_HEALTHY_SG_HEAD_PAUSED=$(cd "$P58_HEALTHY_SG" && LC_ALL=C git rev-parse HEAD)
+P58_HEALTHY_GIT_HEAD_PAUSED=$(cd "$P58_HEALTHY_GIT" && LC_ALL=C git rev-parse HEAD)
+(cd "$P58_HEALTHY_SG" && "$SG" status --porcelain) > "$P58_HEALTHY_SG.porcelain.before" 2>&1
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git status --porcelain) > "$P58_HEALTHY_GIT.porcelain.before" 2>&1
+
+(cd "$P58_HEALTHY_SG" && "$SG" rebase --quit < /dev/null) > /dev/null 2>&1
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git rebase --quit) > /dev/null 2>&1
+P58_HEALTHY_SG_HEAD_AFTER=$(cd "$P58_HEALTHY_SG" && LC_ALL=C git rev-parse HEAD)
+P58_HEALTHY_GIT_HEAD_AFTER=$(cd "$P58_HEALTHY_GIT" && LC_ALL=C git rev-parse HEAD)
+check "phase58 oracle: precondition -- real git's --quit does not move HEAD either" \
+    test "$P58_HEALTHY_GIT_HEAD_PAUSED" = "$P58_HEALTHY_GIT_HEAD_AFTER"
+check "phase58: sg rebase --quit does not move HEAD (matches git)" \
+    test "$P58_HEALTHY_SG_HEAD_PAUSED" = "$P58_HEALTHY_SG_HEAD_AFTER"
+check "phase58: neither side returned HEAD to the original branch tip" \
+    sh -c 'test "$0" != "$1"' "$P58_HEALTHY_SG_HEAD_AFTER" "$P58_HEALTHY_SG_HEAD_BEFORE"
+
+(cd "$P58_HEALTHY_SG" && "$SG" status --porcelain) > "$P58_HEALTHY_SG.porcelain.after" 2>&1
+(cd "$P58_HEALTHY_GIT" && LC_ALL=C git status --porcelain) > "$P58_HEALTHY_GIT.porcelain.after" 2>&1
+check "phase58 oracle: precondition -- git's index is still UU before --quit" \
+    grep -q "^UU c.txt" "$P58_HEALTHY_GIT.porcelain.before"
+check "phase58: sg's index is still UU before --quit" \
+    grep -q "^UU c.txt" "$P58_HEALTHY_SG.porcelain.before"
+check "phase58 oracle: precondition -- git's index is STILL UU after --quit (untouched)" \
+    grep -q "^UU c.txt" "$P58_HEALTHY_GIT.porcelain.after"
+check "phase58: sg's index is STILL UU after --quit (untouched, matches git)" \
+    grep -q "^UU c.txt" "$P58_HEALTHY_SG.porcelain.after"
+check "phase58: sg-rebase/ is gone after --quit on a healthy pause" \
+    test ! -d "$P58_HEALTHY_SG/.git/sg-rebase"
+
+# --- sg status still prints its banner on a damaged state, and the hint
+# names --quit (spec 4) ---
+P58_STATUS="$WORKDIR/p58_status"
+rm -rf "$P58_STATUS"
+cp -R "$P58_PAUSED" "$P58_STATUS"
+printf 'garbage' > "$P58_STATUS/.git/sg-rebase/onto"
+(cd "$P58_STATUS" && "$SG" status) > "$P58_STATUS.out" 2>&1
+check "phase58: sg status still prints a rebase banner on a damaged state" \
+    sh -c 'grep -q "currently rebasing" "$0"' "$P58_STATUS.out"
+# Scoped to just the REBASE banner block (from "currently rebasing" to the
+# blank line that ends it) -- this fixture's rebase paused on a genuine
+# conflict, so the SEPARATE "Unmerged paths" section below the banner
+# legitimately still names --abort (pre-existing, unrelated to this phase);
+# checking the whole file would make these checks fail for a reason this
+# phase never touched.
+sed -n '/currently rebasing/,/^$/p' "$P58_STATUS.out" > "$P58_STATUS.banner"
+check "phase58: the degraded hint names --quit" \
+    sh -c 'grep -q -- "--quit" "$0"' "$P58_STATUS.banner"
+check "phase58: the degraded hint does NOT name --continue" \
+    sh -c '! grep -q -- "--continue" "$0"' "$P58_STATUS.banner"
+check "phase58: the degraded hint does NOT name --skip" \
+    sh -c '! grep -q -- "--skip" "$0"' "$P58_STATUS.banner"
+check "phase58: the degraded hint does NOT name --abort" \
+    sh -c '! grep -q -- "--abort" "$0"' "$P58_STATUS.banner"
+
+P58_STATUS_GIT="$WORKDIR/p58_status_git_oracle"
+rm -rf "$P58_STATUS_GIT"
+mkdir -p "$P58_STATUS_GIT"
+(cd "$WORKDIR" && LC_ALL=C git init -q -b master p58_status_git_oracle) > /dev/null 2>&1
+printf 'orig1\norig2\n' > "$P58_STATUS_GIT/c.txt"
+(cd "$P58_STATUS_GIT" && LC_ALL=C git add c.txt) > /dev/null 2>&1
+p58_commit "$P58_STATUS_GIT" "base"
+(cd "$P58_STATUS_GIT" && LC_ALL=C git branch feature) > /dev/null 2>&1
+(cd "$P58_STATUS_GIT" && LC_ALL=C git switch -q feature) > /dev/null 2>&1
+printf 'feature1\norig2\n' > "$P58_STATUS_GIT/c.txt"
+(cd "$P58_STATUS_GIT" && LC_ALL=C git add c.txt) > /dev/null 2>&1
+p58_commit "$P58_STATUS_GIT" "feature change"
+(cd "$P58_STATUS_GIT" && LC_ALL=C git switch -q master) > /dev/null 2>&1
+printf 'master1\norig2\n' > "$P58_STATUS_GIT/c.txt"
+(cd "$P58_STATUS_GIT" && LC_ALL=C git add c.txt) > /dev/null 2>&1
+p58_commit "$P58_STATUS_GIT" "master change"
+(cd "$P58_STATUS_GIT" && LC_ALL=C git switch -q feature) > /dev/null 2>&1
+(cd "$P58_STATUS_GIT" && LC_ALL=C git rebase master) > /dev/null 2>&1
+printf 'garbage' > "$P58_STATUS_GIT/.git/rebase-merge/onto"
+(cd "$P58_STATUS_GIT" && LC_ALL=C git $P38_GIT_FLAGS status) > "$P58_STATUS_GIT.out" 2>&1
+check "phase58 oracle: precondition -- real git also still prints a rebase banner on a damaged state" \
+    sh -c 'grep -q "currently rebasing" "$0"' "$P58_STATUS_GIT.out"
+
+# --- exit-code-zero-ness for --quit with nothing in progress, both sides ---
+P58_CLEAN="$WORKDIR/p58_clean"
+rm -rf "$P58_CLEAN"
+(cd "$WORKDIR" && "$SG" init p58_clean) > /dev/null 2>&1
+printf 'hello\n' > "$P58_CLEAN/f.txt"
+(cd "$P58_CLEAN" && "$SG" add f.txt && "$SG" commit -m "init") > /dev/null 2>&1
+(cd "$P58_CLEAN" && "$SG" rebase --quit < /dev/null) > "$P58_CLEAN.sg.out" 2>&1
+p58_clean_sg_rc=$?
+check "phase58: sg rebase --quit with nothing in progress exits 1 with a clear message" \
+    sh -c 'test "$0" = 1 && grep -q "no rebase is in progress" "$1"' "$p58_clean_sg_rc" "$P58_CLEAN.sg.out"
+
+P58_CLEAN_GIT="$WORKDIR/p58_clean_git"
+rm -rf "$P58_CLEAN_GIT"
+mkdir -p "$P58_CLEAN_GIT"
+(cd "$WORKDIR" && LC_ALL=C git init -q -b master p58_clean_git) > /dev/null 2>&1
+printf 'hello\n' > "$P58_CLEAN_GIT/f.txt"
+(cd "$P58_CLEAN_GIT" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+p58_commit "$P58_CLEAN_GIT" "init"
+(cd "$P58_CLEAN_GIT" && LC_ALL=C git rebase --quit) > /dev/null 2>&1
+p58_clean_git_rc=$?
+check "phase58 oracle: precondition -- real git rebase --quit with nothing in progress also exits non-zero" \
+    test "$p58_clean_git_rc" != 0
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

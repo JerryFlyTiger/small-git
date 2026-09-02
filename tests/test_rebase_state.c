@@ -1,5 +1,6 @@
 #include "sg/rebase.h"
 
+#include "sg/cli.h"
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/repo.h"
@@ -370,6 +371,120 @@ static void test_corrupt_current_malformed_rejected(void)
     free(git_dir);
 }
 
+/* ==================== Phase 58: sg rebase --quit ====================
+   do_rebase_quit (src/cli/cmd_rebase.c) is a thin wrapper: on existence, do
+   plain removal; nothing is parsed. That is exactly sg_rebase_state_exists
+   + sg_rebase_state_remove, so exercising those two directly proves the same
+   thing do_rebase_quit's body proves, without needing a CLI-level export.
+   The one property that genuinely needs the CLI entry point -- exit code 1
+   with nothing in progress -- is exercised through sg_cmd_rebase itself
+   (declared in sg/cli.h), via chdir into the repo root the same way
+   tests/test_reflog_messages.c already drives other sg_cmd_* entry
+   points. */
+
+static char *repo_root_of(const char *git_dir)
+{
+    /* git_dir is always "<root>/.git" here (make_tmp_repo's own
+       construction), so strip the fixed suffix rather than re-deriving it
+       another way. */
+    size_t len = strlen(git_dir);
+    char *root;
+
+    CHECK(len > 5 && strcmp(git_dir + len - 5, "/.git") == 0,
+         "git_dir must end in /.git for this helper to work (got %s)", git_dir);
+    root = malloc(len - 5 + 1);
+    if (root == NULL)
+        return NULL;
+    memcpy(root, git_dir, len - 5);
+    root[len - 5] = '\0';
+    return root;
+}
+
+static void test_quit_removes_state_even_when_read_rejects_it(void)
+{
+    char *git_dir = make_tmp_repo();
+    char path[4096];
+    sg_rebase_state st;
+
+    snprintf(path, sizeof(path), "%s/sg-rebase", git_dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/sg-rebase/onto", git_dir);
+    write_raw_file(path, "not-valid-hex\n");
+    snprintf(path, sizeof(path), "%s/sg-rebase/orig-head", git_dir);
+    write_raw_file(path, "0000000000000000000000000000000000000000\n");
+    snprintf(path, sizeof(path), "%s/sg-rebase/orig-branch", git_dir);
+    write_raw_file(path, "master\n");
+    snprintf(path, sizeof(path), "%s/sg-rebase/todo", git_dir);
+    write_raw_file(path, "");
+
+    CHECK(sg_rebase_state_exists(git_dir) == 1, "the damaged state still exists");
+    CHECK(sg_rebase_state_read(git_dir, &st) == -1,
+         "precondition -- read must reject this state, same as test_corrupt_onto_rejected");
+
+    /* --quit's entire job on this input: exists() said yes, so remove(). */
+    CHECK(sg_rebase_state_remove(git_dir) == 0,
+         "removal must succeed even though the state could not be parsed");
+    CHECK(sg_rebase_state_exists(git_dir) == 0, "the state must be gone after removal");
+
+    free(git_dir);
+}
+
+static void test_quit_removes_every_state_file(void)
+{
+    char *git_dir = make_tmp_repo();
+    sg_rebase_state st;
+    unsigned char onto[SG_SHA1_RAW_LEN], orig_head[SG_SHA1_RAW_LEN], c1[SG_SHA1_RAW_LEN];
+    char path[4096];
+    struct stat sb;
+
+    make_commit(git_dir, "onto", NULL, 0, onto);
+    make_commit(git_dir, "orig-head", NULL, 0, orig_head);
+    make_commit(git_dir, "c1", NULL, 0, c1);
+
+    memset(&st, 0, sizeof(st));
+    memcpy(st.onto, onto, SG_SHA1_RAW_LEN);
+    memcpy(st.orig_head, orig_head, SG_SHA1_RAW_LEN);
+    st.orig_branch = strdup("feature");
+    st.todo = malloc(sizeof(*st.todo));
+    memcpy(st.todo[0], c1, SG_SHA1_RAW_LEN);
+    st.todo_count = 1;
+    memcpy(st.current, c1, SG_SHA1_RAW_LEN);
+    st.has_current = 1;
+    CHECK(sg_rebase_state_write(git_dir, &st) == 0, "a healthy, fully-populated state should write");
+    free(st.orig_branch);
+    free(st.todo);
+
+    CHECK(sg_rebase_state_remove(git_dir) == 0, "remove should succeed on a healthy state too");
+    CHECK(sg_rebase_state_exists(git_dir) == 0, "the state directory itself must be gone");
+    snprintf(path, sizeof(path), "%s/sg-rebase", git_dir);
+    CHECK(stat(path, &sb) != 0, "sg-rebase/ must not merely be empty, it must not exist at all");
+
+    free(git_dir);
+}
+
+static void test_quit_with_no_rebase_exits_1(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *root = repo_root_of(git_dir);
+    char *argv[] = {"rebase", "--quit"};
+    char cwd[4096];
+
+    CHECK(root != NULL, "repo_root_of allocation should succeed");
+    CHECK(getcwd(cwd, sizeof(cwd)) != NULL, "getcwd should succeed");
+    CHECK(sg_rebase_state_exists(git_dir) == 0, "precondition -- no rebase is in progress");
+
+    if (root != NULL && chdir(root) == 0) {
+        CHECK(sg_cmd_rebase(2, argv) == 1,
+             "sg rebase --quit with nothing in progress must exit 1");
+        CHECK(chdir(cwd) == 0, "chdir back should succeed");
+    } else {
+        CHECK(0, "chdir into the repo root failed, cannot exercise the CLI entry point");
+    }
+
+    free(root);
+    free(git_dir);
+}
+
 /* ==================== commit-list computation ==================== */
 
 /* X -> A -> B -> C (linear): rebasing onto X should replay A, B, C in that
@@ -464,6 +579,9 @@ int main(void)
     test_corrupt_todo_line_length_rejected();
     test_corrupt_orig_branch_dotdot_rejected();
     test_corrupt_current_malformed_rejected();
+    test_quit_removes_state_even_when_read_rejects_it();
+    test_quit_removes_every_state_file();
+    test_quit_with_no_rebase_exits_1();
     test_compute_todo_linear();
     test_compute_todo_empty_when_base_is_head();
     test_compute_todo_rejects_merge_commit();
