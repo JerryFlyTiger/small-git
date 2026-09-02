@@ -11,6 +11,7 @@
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
+#include "sg/sequencer.h"
 #include "sg/snapshot.h"
 #include "sg/workdir.h"
 
@@ -144,6 +145,18 @@ int sg_cmd_reset(int argc, char **argv)
             free(git_dir);
             free(repo_root);
             return 1;
+        }
+        {
+            sg_seq_kind seq_kind = sg_sequencer_kind_in_progress(git_dir);
+
+            if (seq_kind != 0) {
+                fprintf(stderr, "sg: a %s is in progress, cannot do a soft reset\n",
+                       seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert");
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
         }
 
         /* Neither the index nor the working directory is touched: nothing

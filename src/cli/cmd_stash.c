@@ -12,6 +12,7 @@
 #include "sg/rebase.h"
 #include "sg/pathspec.h"
 #include "sg/repo.h"
+#include "sg/sequencer.h"
 #include "sg/stash.h"
 #include "sg/workdir.h"
 
@@ -181,6 +182,19 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
     if (sg_rebase_state_exists(git_dir)) {
         fprintf(stderr, "sg: a rebase is currently in progress; this stash push will reset the working directory and "
                         "index back to HEAD, after which `sg rebase --continue` may skip the current commit as a result\n");
+    }
+    {
+        sg_seq_kind seq_kind = sg_sequencer_kind_in_progress(git_dir);
+
+        if (seq_kind != 0) {
+            const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+
+            fprintf(stderr,
+                   "sg: a %s is currently in progress; this stash push will reset the working "
+                   "directory and index back to HEAD, after which `sg %s --continue` may consider "
+                   "the current commit already applied as a result\n",
+                   op, op);
+        }
     }
 
     rc = sg_stash_push(git_dir, repo_root, &opts, commit_id, bad_path);
@@ -856,6 +870,24 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
         free(git_dir);
         free(repo_root);
         return 1;
+    }
+
+    /* Same divergence, same reasoning, for the third subsystem with its own
+       recoverable state behind a conflict. */
+    {
+        sg_seq_kind seq_kind = sg_sequencer_kind_in_progress(git_dir);
+
+        if (seq_kind != 0) {
+            const char *op = seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert";
+
+            fprintf(stderr,
+                   "sg: a %s is currently in progress, cannot stash %s\n"
+                   "Finish it first (sg %s --continue) or run sg %s --abort to give up\n",
+                   op, cmd_name, op, op);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
     }
 
     if (sg_stash_list_read(git_dir, &list) != 0) {

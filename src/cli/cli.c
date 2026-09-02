@@ -36,6 +36,7 @@ static const sg_command_info COMMANDS[] = {
     {"chunk-info", "show chunk-storage diagnostics for a file/object"},
     {"stash", "stash working directory and index changes for later restore"},
     {"reflog", "show a ref's update history"},
+    {"cherry-pick", "apply the changes introduced by existing commits"},
 };
 #define COMMANDS_COUNT (sizeof(COMMANDS) / sizeof(COMMANDS[0]))
 
@@ -115,6 +116,8 @@ int sg_cli_run(int argc, char **argv)
         return sg_cmd_stash(argc - 1, argv + 1);
     if (strcmp(argv[1], "reflog") == 0)
         return sg_cmd_reflog(argc - 1, argv + 1);
+    if (strcmp(argv[1], "cherry-pick") == 0)
+        return sg_cmd_cherry_pick(argc - 1, argv + 1);
 
     {
         size_t i;
