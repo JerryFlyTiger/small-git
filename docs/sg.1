@@ -243,6 +243,114 @@ line listing all of its parents). There is no
 path filtering, or any other
 .B "git log"
 option.
+.SS show
+.B sg show
+.RB [ -s ]
+.RB [ -p | --patch ]
+.RB [ --stat ]
+.RB [ --name-only | --name-status ]
+.RB [ --oneline ]
+.RI [ object ...]
+.PP
+Shows one or more objects: a commit (the default entry format, shared with
+.BR "sg log" ), an annotated tag (its own header and message, followed by the
+object it points at), a tree (its entry listing, directories suffixed with
+.BR / ), a blob (its raw content), or
+.RI < rev >: <path>
+(the blob or tree at that path). With no arguments, shows
+.BR HEAD .
+The same commit is never printed twice in one invocation, even when named
+twice or reached both directly and through a tag; every other object type
+is printed once per argument.
+.PP
+For a commit,
+.B -p
+(or
+.BR --patch ", the default when no format flag is given)" ,
+.BR --stat ", " --name-only " and " --name-status
+select how its diff against the first parent is rendered (the empty tree,
+for a root commit), the same four machine formats
+.B "sg diff"
+uses.
+.B --oneline
+prints
+.RI "<abbrev> " subject
+instead of the full header block.
+.B -s
+suppresses the diff entirely, printing only the header.
+.PP
+These five flags are not simply \(dqlast one wins\(dq:
+.B -s
+clears every one of the other four, while
+.BR -p / --stat
+each set their own bit and also cancel a previous
+.BR -s ,
+and
+.BR --name-only / --name-status
+each set their own bit without cancelling
+.BR -s .
+So
+.B "-s -p"
+prints a patch (the
+.B -p
+cancels
+.BR -s ),
+.B "-p -s"
+prints nothing but the header, and
+.B "--name-only -s"
+also prints nothing but the header (bit-for-bit: 16 flag combinations were
+measured against real git 2.55.0 to pin this exact model, since it is not
+guessable from a single flag at a time).
+.B --name-only
+and
+.B --name-status
+may not both be given, and neither may combine with
+.B -s
+unless a later
+.B -p / --stat / --name-only / --name-status
+overrides it \(em `sg show -s --name-only` is an error, but
+`sg show --name-only -s -p` is not (the
+.B -s
+already cleared
+.B --name-only
+before
+.B -p
+set its own bit).
+.PP
+A merge commit's diff is rendered against parent 1's tree as a combined diff
+(git's
+.BR "diff --cc" ),
+the same restriction
+.B "sg log -p"
+has: only a two-parent merge can render a
+.B -p
+patch, and an octopus (more than two parents) whose combined diff would be
+non-empty is refused outright.
+.B --stat
+has no such restriction \(em it is always a first-parent diff, at any parent
+count.
+.BR --name-only " and " --name-status
+also have no such restriction: an octopus's dense row set (the same set
+.B -p
+would use) is rendered with one status letter
+.I per parent
+(so a three-parent merge might print
+.BR MMM ,
+not just
+.BR MM ),
+never refused. This dense row set differs from
+.BR --stat 's
+first-parent set \(em a path can appear in one and not the other.
+.PP
+Real git always writes
+.B HEAD
+as the \(dqours\(dq label of a merge conflict's markers and message;
+.B sg
+writes the current branch's name instead (falling back to
+.B HEAD
+when detached), which is a deliberate, measured divergence \(em see
+.B CAVEATS
+below.
 .SS status
 .B sg status
 .RB [ -s | --short | --porcelain ]

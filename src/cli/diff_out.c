@@ -1593,6 +1593,30 @@ static int print_name_only(const sg_diff_list *list, int combined)
     return 0;
 }
 
+/* One combined-diff status letter for a merge-commit's own dense row
+   (Phase 59, sg_diff_entry.combined_row): 'A' when this parent lacked the
+   path, 'D' when the parent had it but the merge result does not, 'M'
+   otherwise -- section 4.1's rule, measured against a real N-column merge.
+
+   Only ever called for combined_row rows. The other two combinable
+   producers (a live conflict via sg_diff_index_workdir, and Phase 40's
+   sg_diff_fill_combined_from_index rev-mode pass) keep the pre-existing
+   literal "MM" right below, unconditionally -- regression-pinned, because
+   real git prints "MM" for those even when the working-tree result was
+   DELETED (measured: `git diff -c --name-status` on an unresolved,
+   since-deleted conflict still prints "MM", not "DD"), a shape this rule
+   would otherwise answer wrong for. combined_row is the first producer
+   whose ours/theirs can actually be ABSENT or whose result being ABSENT is
+   meant to read as a real deletion rather than "conflict, unresolved". */
+static char combined_letter(const sg_diff_side *parent_side, const sg_diff_side *result_side)
+{
+    if (parent_side->kind == SG_DIFF_SIDE_ABSENT)
+        return 'A';
+    if (result_side->kind == SG_DIFF_SIDE_ABSENT)
+        return 'D';
+    return 'M';
+}
+
 static int print_name_status(const sg_diff_list *list, int combined)
 {
     size_t i;
@@ -1617,11 +1641,19 @@ static int print_name_status(const sg_diff_list *list, int combined)
                   sg_quote_path(e->path));
             continue;
         }
-        /* Combinable + -c/--cc: one row, two status letters (one per
-           parent) -- measured "MM" in every shape tested
-           (PHASE34_ORACLE.md #2), never any other two-letter combination. */
+        /* Combinable + -c/--cc: one row, one status letter per side.
+           combined_row (Phase 59, a merge commit's own dense row) computes
+           the letters from ours/theirs/result; the two pre-existing
+           producers keep the literal "MM" measured in every shape tested
+           before this phase (PHASE34_ORACLE.md #2), never any other
+           two-letter combination -- see combined_letter's own comment for
+           why those two must NOT be routed through the computed rule. */
         if (combined != 0 && combinable(e)) {
-            printf("MM\t%s\n", sg_quote_path(e->path));
+            if (e->combined_row)
+                printf("%c%c\t%s\n", combined_letter(&e->ours, &e->result),
+                      combined_letter(&e->theirs, &e->result), sg_quote_path(e->path));
+            else
+                printf("MM\t%s\n", sg_quote_path(e->path));
             if (has_companion_row(list, i))
                 skip_next = 1;
             continue;

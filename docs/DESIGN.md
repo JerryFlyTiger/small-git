@@ -10697,3 +10697,283 @@ property plus one CLI-level exit-1-with-nothing-in-progress test, since
 `do_rebase_quit` itself is a two-line wrapper over functions the existing
 tests already cover directly), `tests/interop.sh`'s new `phase58:` group,
 and `docs/sg.1`.
+
+## Phase 59: `sg show --name-only` and `--name-status`
+
+### 1. The flag model is not "-s clears, the rest OR" -- one more bit was hiding
+
+The spec's own prose ("`-s` clears all five, the other four each set their
+own bit and OR together") turns out to be one bit too coarse: it predicts
+`-s --name-only` and `-s -p --name-only` answer the same way, and measured
+against real git 2.55.0 they do not (the first errors, the second prints
+names). Sixteen combinations were re-probed directly against real git (not
+recalled) to find the missing rule: **`-p`/`--stat` also clear `no_output`
+when they fire, `--name-only`/`--name-status` do NOT**. Only with that
+detail does a single model explain all sixteen rows -- `-s -p --name-only`
+clears `no_output` at the `-p` step, so by the time `--name-only` sets its
+own bit, `no_output` is already gone and only `name_only` is left standing
+in the three-way exclusivity set. `CLAUDE.md`'s bullet documents the refined
+rule now, not the spec's original approximation.
+
+### 2. Merge names/status needed a THIRD data path, not two
+
+`sg_diff_combined_from_trees`'s `out` list is populated only at
+`parent_count == 2` (Phase 55b's own restriction: the `diff --cc` renderer
+it exists for is fixed at two sides). Section 4.1 requires an octopus's
+non-empty dense set to print one status letter **per parent**, which cannot
+fit `sg_diff_entry`'s fixed `ours`/`theirs` shape at all. Given this
+phase's budget excluded `include/sg/diff.h` and `src/workdir/diff.c`, the
+N-parent case (`render_octopus_names`, `src/cli/cmd_show.c`) is a
+self-contained duplicate of `sg_diff_combined_from_trees`'s union-walk rule
+(flatten every parent tree plus the result tree, a path qualifies iff it
+differs -- mode AND id -- from every parent), not an extension of the
+original. The two-parent case still reuses the original list plus
+`sg_diff_print`, unchanged.
+
+### 3. The "MM" hardcode was correct until this phase, and had to become computed WITHOUT drifting
+
+`diff_out.c`'s `print_name_status` printed a literal `"MM"` for every
+combinable row. That was provably right for both PRE-EXISTING producers
+(a live conflict; Phase 40's rev-mode pass) -- neither's `ours`/`theirs` can
+ever be ABSENT, so neither letter could ever be anything but `M`. A merge
+commit's own dense row (`combined_row`, Phase 55b) is the first producer
+whose sides genuinely vary, so the letters now come from a real per-side
+rule (`combined_letter`: ABSENT parent -> `A`, present parent but ABSENT
+result -> `D`, else `M`) -- but **only for `combined_row` rows**.
+Measured before writing a line of code (git 2.55.0, both a modify/modify
+and an add/add unresolved conflict, `-c` and `--cc`): real git still prints
+literal `MM` even when the deleted-result shape would make the naive
+per-side rule answer `DD`. Applying the new rule unconditionally would have
+been a silent regression with a green `make test` and a green interop run
+(neither of the two pre-existing producers happens to reach the
+deleted-result shape in their own fixtures) -- it was only caught because
+the regression was measured and pinned as its own named interop check
+(`tests/interop.sh`'s `phase59:` group) before the code was written, not
+after.
+
+### 4. A redundant guard, found by mutation, not by reasoning
+
+The first implementation of `resolve_commit_out_opts` (`cmd_show.c`) zeroed
+`o->patch`/`o->stat` whenever a name format was requested, believing this
+was the enforcement point for "NAME suppresses PATCH/STAT". A directed
+mutation neutralizing exactly that zeroing (`tests/mutate.sh`) left `make
+test` **fully green** -- a genuine blind spot, not a false negative: both
+render paths (`commit_out.c`'s `print_commit_diff` and `cmd_show.c`'s
+`render_merge_diff`) already check `o->name_only`/`o->name_status` FIRST
+and dispatch the name format unconditionally, so a stale nonzero
+`o->patch`/`o->stat` is never read once a name format is active. Per
+CLAUDE.md's three-way classification of a green mutation ("genuine blind
+spot" / "redundant guard" / "mathematically unobservable"), this was the
+middle one: the real defense line was one layer down. The dead zeroing was
+removed (`resolve_commit_out_opts` now just copies the flags through
+unconditionally) and the SAME mutation idea re-targeted at the renderer's
+own `if (o->name_only || o->name_status)` check instead, which did turn
+eight rows of `test_flag_model_table` red -- confirming the renderer, not
+the resolver, is where this rule actually lives.
+
+### 5. A shared-struct bug in code this phase never touched
+
+`sg_commit_out_opts` gained two new fields (`name_only`, `name_status`).
+`cmd_log.c` builds this struct by assigning fields one at a time
+(`o.oneline = 0; o.patch = 0; o.stat = 0;`, no `memset`) and was not
+updated -- the two new fields were left as uninitialized stack garbage.
+`print_commit_diff` checks `o->name_only || o->name_status` **first**, so
+whenever the garbage bit happened to be nonzero, `sg log -p`/`--stat` would
+silently render nothing or the wrong format instead of a patch. `make`,
+`make test` and the unit test suite all stayed green (nothing in this
+project probes uninitialized stack memory); only a full `bash
+tests/interop.sh` run surfaced it, as ten unrelated `phase54`/`phase55`
+`sg log` checks turning red with no code in `cmd_log.c` having changed at
+all. This is exactly the shape CLAUDE.md's Phase 29 note warns about
+("adding a field to a shared struct... search for every instance that is
+**not** built through a construction function") -- `cmd_show.c`'s own two
+construction sites were already safe (one goes entirely through
+`resolve_commit_out_opts`, the other copies the whole struct with
+`header_o = o`), so this project's existing convention of auditing
+non-factory construction sites would have caught it without needing the
+interop run at all, had it been followed at write time rather than found by
+the gate afterward.
+
+### 6. Verification
+
+Four gates: `make` (0 warnings, 71 TUs), `make test` (70/70 binaries),
+`bash tests/interop.sh` (2582/2582 passed, 0 skipped, including 28 new
+`phase59:` checks), `make sanitize` (70/70 binaries, 0 sanitizer errors).
+
+Four reverse mutations, each caught by exactly the check(s) it should be:
+the computed combined-diff letters reverted to the literal `"MM"` (caught
+by `test_show`'s `test_merge_two_parent_letters`, three assertions red);
+the flag-suppression enforcement point neutralized (caught by eight rows of
+`test_show`'s `test_flag_model_table`, after the redundant-guard finding
+above moved the mutation target to where the rule actually lives); the
+`-s`-clears-name-bits rule dropped (caught by four rows of the same table);
+and the merge diff section's unconditional opening blank line reverted to
+`--oneline`-conditioned (caught by both the pre-existing `phase55: sg show
+--oneline <merge> matches git` check and this phase's own `phase59: sg show
+--oneline --name-status <merge> DOES print a blank line before the list`).
+
+Files touched: `src/cli/cmd_show.c` (the flag model, `resolve_commit_out_opts`,
+`render_merge_diff`'s name-mode branch, `render_octopus_names`),
+`src/cli/commit_out.c` and `include/sg/commit_out.h` (the shared
+`sg_commit_out_opts` struct and `print_commit_diff`'s name-format branch),
+`src/cli/diff_out.c` (`combined_letter`, `print_name_status`'s combined
+branch), `src/cli/cmd_log.c` (the shared-struct initialization fix, item 5
+above -- outside this phase's originally declared budget, but required to
+keep `sg log` correct), `tests/test_show.c` (new), `tests/interop.sh`'s new
+`phase59:` group plus one pre-existing `phase55:` check's flag changed from
+`--name-only` to `--numstat` (the old check asserted `sg show --name-only`
+was rejected, which this phase makes no longer true), `docs/sg.1`'s new
+`.SS show` section (there was none before this phase, despite `sg show`
+existing since Phase 55a).
+
+### 7. Round 2: an external 159-probe oracle found two more bugs
+
+The main conversation ran an independent oracle harness (159 real-git-built
+fixtures, sg read-only so object ids agree on both sides, full-output `cmp`)
+against the round-1 implementation above: **154/159**, control group (real
+git vs itself) 159/159, pre-Phase-59 build 62/159 -- so the harness's own
+discriminating power was established before trusting its 5 mismatches.
+
+**Bug 1 (introduced this phase): the `---` separator ignored name formats.**
+`commit_out.c`'s separator line still read `o->stat && o->patch` alone (the
+Phase 54 rule, predating name formats) to decide between a blank line and a
+literal `---`. Once `resolve_commit_out_opts` stopped zeroing `o->patch`/
+`o->stat` under a name format (item 4's redundant-guard fix, same phase),
+those two could legitimately both be nonzero AT THE SAME TIME as
+`o->name_only`/`o->name_status` (e.g. `-p --name-only --stat`), and the
+separator line never learned to check for that. Fixed by adding
+`&& !o->name_only && !o->name_status` to the condition -- NAME wins the
+separator decision the same way it already wins which `sg_diff_print`
+format gets called two lines below. All four of the oracle's `---`
+mismatches were this one bug (two fixtures x two flag orderings).
+
+**Bug 2 (pre-existing since Phase 55b, not this phase's fault): `--stat`/
+`-s` on an octopus were refused too broadly.** `render_id`'s refusal check
+was `commit.parent_count > 2 && !(o.name_only || o.name_status)` --
+correct for whether the DENSE PATCH renderer's two-parent limit applies,
+wrong as a gate for the whole command: `--stat` is a first-parent diff at
+ANY parent count (CLAUDE.md already said so, two lines above the bug), and
+`-s` prints no diff at all, so neither should ever be refused regardless of
+the dense set. Real git 2.55.0 measured directly: `git show --stat
+<non-clean-dense octopus>` and `git show -s <same>` both exit 0. Fixed by
+adding `&& o.patch` to the direct-commit condition, and mirroring the same
+"would the dense patch actually be requested" derivation
+(`f->patch || !f->format_seen`) into `target_is_merge`'s tag-lookahead path
+for consistency (that path only had `names_mode` threaded through it
+before, from round 1 -- it needed the same `wants_patch` half added or the
+same bug would still be reachable through `sg show <tag pointing at the
+octopus>`, just never through a bare commit id).
+
+This bug had **zero fixtures anywhere in this project** before this phase,
+for a structural reason: real git's own octopus merge strategy refuses
+outright the instant it hits the SAME kind of conflict a fixture like this
+needs, so `sg merge`/`git merge` can never produce a `> 2`-parent commit
+whose dense set is non-empty. Phase 59's own fixture for the `MMM` letter
+case (section 2 above) is built with `git commit-tree` precisely to work
+around that limitation -- three independently-committed single-parent
+branches off a shared base, plus a hand-picked result tree that differs
+from all three -- and it is the first fixture in the project's history that
+could even ask the question "is `--stat` refused here". This is the same
+"a shape the fixture generator cannot produce is untested however many
+checks run over it" lesson CLAUDE.md already records for `sg log`'s tab
+expansion and for `fuzz_merge.py`'s single filename -- except this time the
+generator in question is git's own merge machinery, not a project fixture.
+
+Both bugs were reverse-mutated individually against `--interop`: reverting
+the `---` condition to `o->stat && o->patch` (dropping the two new
+clauses) turned red exactly `phase59: sg show -p --name-only --stat prints
+an ordinary blank line, never ---` and its `--stat --name-status -p`
+sibling, nothing else; reverting the refusal condition to drop `o.patch`
+turned red exactly `phase59: sg show --stat <3-parent merge, non-empty
+dense set> is NOT refused, matches git` and its `-s` sibling, nothing
+else.
+
+Updated gate numbers after both fixes: `make` (0 warnings), `make test`
+(70/70), `bash tests/interop.sh` (2587/2587 passed, 0 skipped -- 5 more
+than round 1's 2582, the two `---`-separator checks plus the two
+`--stat`/`-s`-on-octopus checks plus one new precondition), `make
+sanitize` (70/70, 0 sanitizer errors), and the external oracle at
+**159/159**.
+
+Files touched beyond round 1: `src/cli/commit_out.c` (the `---` condition),
+`src/cli/cmd_show.c` (the refusal condition in `render_id` and the mirrored
+derivation in `target_is_merge`'s call site), `tests/interop.sh` (5 more
+`phase59:` checks), `CLAUDE.md`'s `sg show` bullet (corrected the claim
+that a non-clean octopus's `--stat` "works like any other" -- it did not,
+until this round).
+
+### 8. Round 3: closing the oracle's blind spots surfaced one more matrix gap
+
+The coordinator closed two gaps in the verification apparatus itself
+(not in `sg`): the octopus dense-patch refusal is a DELIBERATE divergence
+from real git (sg refuses a `> 2`-parent combined patch outright; git
+renders one), and round 2's oracle only pinned sg's half of it -- the
+"real git DOES render the patch sg refuses" precondition was added so a
+future git behavior change would turn something red instead of the two
+sides silently agreeing again with nothing watching. Separately, the
+oracle's coverage was extended to a path Phase 59 round 2 had *written*
+(`target_is_merge`'s `wants_patch` derivation, added to fix round 2's bug
+2) but never had a fixture reaching it: an annotated tag pointing at the
+`commit-tree`-built octopus. That new coverage immediately found a third
+bug -- not in the code either round of this phase touched, but adjacent to
+where round 2 was already looking.
+
+**Bug 3 (pre-existing since Phase 55a, not any round of this phase's
+fault): `--oneline` on an annotated tag dropped two things it should not
+have.** Measured against real git 2.55.0 (reproduced identically on a
+pre-Phase-59 build, so not a regression): `git show --oneline
+<annotated tag>` prints `tag v1`, one blank line, the tag message, and then
+the target commit's own `--oneline` header directly -- with **no
+`Tagger:`/`Date:` lines at all**, and **no blank line** between the message
+and the commit header (both measured together, on `--oneline`,
+`--oneline -s`, and `--oneline --stat`; a bare `-s` with no `--oneline`
+keeps both, unaffected). Phase 55a's writeup claimed 50 flag combinations
+compared byte-for-byte against real git; none of them happened to combine
+`--oneline` with an annotated tag target, so this shape went unwritten in
+any fixture for four phases. Same lesson this file already records twice
+for `sg log`'s tab expansion and for round 2's octopus fixture: a shape no
+generator can produce stays untested no matter how many checks run over
+the shapes it can.
+
+Two small, tightly-scoped fixes in `cmd_show.c`'s `render_id`:
+
+- The `SG_OBJ_TAG` case wraps its `Tagger:`/`Date:` `printf`s in
+  `if (!flags->oneline)`. The message printing is unchanged (the single
+  blank line before it is identical in both cases, confirmed byte-for-byte).
+- The `SG_OBJ_COMMIT` case's leading-blank-line condition gained one more
+  clause: `!(nested && flags->oneline)`. `nested` is 1 *only* when the
+  commit being rendered is a tag's target (the sole caller passing
+  `nested = 1`), so this clause can only ever fire in exactly the
+  tag-then-oneline-commit shape -- it cannot affect a bare `sg show
+  --oneline <commit>` (nested = 0 there) or a non-oneline tag-then-commit
+  (unaffected, `flags->oneline` = 0). This is technically a one-line change
+  inside the COMMIT case rather than the TAG case, but it is the narrowest
+  expression of "the tag's own --oneline rendering choice reaches its
+  target's leading separator" available without threading a new parameter
+  through `sg_commit_out_entry`/`print_commit_diff` (which the coordinator
+  asked to leave untouched, and which this change does not touch).
+
+Reverse-mutated: forcing the `Tagger:`/`Date:` block to always print
+(`if (!flags->oneline)` -> `if (1)`) turned red exactly the three new
+`phase59:` checks (`--oneline`, `--oneline -s`, `--oneline --stat` on the
+annotated tag) and nothing else -- confirming both the fix and that the
+negative control (`sg show <annotated tag>` with no `--oneline` still
+prints `Tagger:`) is a real, load-bearing assertion rather than a
+tautology.
+
+Updated numbers: external oracle **167/169 matched, 2 deliberate
+divergences, 0 mismatches** (up from round 2's 159/159 once the harness
+grew the 10 new octopus-related probes -- the coordinator's two additions
+above account for the 2 deliberate-divergence entries plus the 3 that
+found bug 3, and 5 more oracle probes derived from the same fixtures found
+no further mismatches). `bash tests/interop.sh`: 2593/2593 passed, 0
+skipped (6 more than round 2's 2587: 3 byte-exact `--oneline`-on-tag
+comparisons, 1 negative-control check, 1 oracle-side precondition for that
+control, and 1 precondition for the coordinator's own divergence-pin
+addition). `make`/`make test`/`make sanitize` unaffected, still fully
+green.
+
+Files touched beyond round 2: `src/cli/cmd_show.c` (the two `render_id`
+changes above), `tests/interop.sh` (6 more `phase59:` checks, reusing the
+existing `v1` annotated-tag fixture from the `phase55:` group rather than
+building a new one).
