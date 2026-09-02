@@ -15865,8 +15865,9 @@ check "phase60: sg log -2 --pretty=format:plain -p matches git (entry+diff+entry
 # bare --format is an error.
 check "phase60: --pretty=Oneline resolves the builtin (case-insensitive)" \
     sh -c "(cd '$P60' && '$SG' show --pretty=Oneline -s '$P60_HEAD') | grep -q '^[0-9a-f]\{40\} second subject\$'"
-check "phase60: --pretty=oneline%H is NOT the oneline builtin (whole-string match, not prefix)" \
-    sh -c "(cd '$P60' && '$SG' show --pretty=oneline%H -s '$P60_HEAD') 2>&1 | grep -q 'not supported yet'"
+p60_cmp "onelineH" --pretty=oneline%H -s "$P60_HEAD"
+check "phase60b: --pretty=oneline%H is NOT the oneline builtin (whole-string match, not prefix) -- byte-exact against git now that %H expands" \
+    cmp -s "$WORKDIR/p60_sg_onelineH.txt" "$WORKDIR/p60_git_onelineH.txt"
 check "phase60: --pretty=abc (matches nothing) is rejected" \
     sh -c "! (cd '$P60' && '$SG' show --pretty=abc -s '$P60_HEAD') > /dev/null 2>&1"
 check "phase60 oracle: precondition -- real git also rejects --pretty=abc" \
@@ -15879,6 +15880,173 @@ check "phase60: bare --format (no '=') is an error, exit non-zero" \
     sh -c "! (cd '$P60' && '$SG' show --format -s '$P60_HEAD') > /dev/null 2>&1"
 check "phase60 oracle: precondition -- real git also rejects bare --format" \
     sh -c "! (cd '$P60' && LC_ALL=C git show --format -s '$P60_HEAD') > /dev/null 2>&1"
+
+# --- Phase 60b: --format placeholder expansion (spec section 5), reusing
+# the P60 fixture (P60_ROOT has no parents, P60_HEAD has one, P60_MERGE has
+# two). One combined format string exercises every table entry from section
+# 5.1 at once, run against all three commit shapes so %P/%p's 0/1/2-parent
+# cases and %b/%B's body/no-body cases are both covered.
+P60B_FMT='%H|%h|%T|%t|%P|%p|%an|%ae|%al|%ad|%aD|%at|%ai|%aI|%as|%cn|%ce|%cl|%cd|%cD|%ct|%ci|%cI|%cs|%s|%f|%n%%b:%b%%B:%B%%x41'
+for p60brev in ROOT HEAD MERGE; do
+    eval p60brevid=\$P60_$p60brev
+    p60_cmp "b_all_$p60brev" --pretty="format:$P60B_FMT" "$p60brevid"
+    check "phase60b: sg show --pretty=format:<every table placeholder> matches git ($p60brev)" \
+        cmp -s "$WORKDIR/p60_sg_b_all_$p60brev.txt" "$WORKDIR/p60_git_b_all_$p60brev.txt"
+done
+
+# format:/tformat: trailing-newline rule, actually exercised through a real
+# placeholder this time (section 4's own fixtures used only literal text).
+p60_cmp "b_format_h" --pretty="format:%h" "$P60_HEAD"
+check "phase60b: --pretty=format:%h matches git (no trailing newline)" \
+    cmp -s "$WORKDIR/p60_sg_b_format_h.txt" "$WORKDIR/p60_git_b_format_h.txt"
+p60_cmp "b_tformat_h" --pretty="tformat:%h" "$P60_HEAD"
+check "phase60b: --pretty=tformat:%h matches git (one trailing newline)" \
+    cmp -s "$WORKDIR/p60_sg_b_tformat_h.txt" "$WORKDIR/p60_git_b_tformat_h.txt"
+
+# %f run-collapsing (section 5.2): a subject with several different kinds of
+# punctuation run back to back, measured against real git directly rather
+# than against sg's own unit-test expectation.
+printf 'base\nsecond\nthird\n' > "$P60/f.txt"
+(cd "$P60" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+p60commit -m "  weird...subject   with../;  runs  "
+P60_WEIRD=$(cd "$P60" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+p60_cmp "b_f_weird" --pretty="format:%f" "$P60_WEIRD"
+check "phase60b: %f run-collapsing matches git on a subject full of punctuation runs" \
+    cmp -s "$WORKDIR/p60_sg_b_f_weird.txt" "$WORKDIR/p60_git_b_f_weird.txt"
+
+# --- mid-review correction (measured directly against real git 2.55.0,
+# not in the original spec's tables): %s folds a multi-line subject with no
+# blank line into one space-joined line, and the SAME rule governs the
+# oneline/reference builtins and legacy --oneline (fold_subject in
+# commit_out.c, one function, four of these five call sites) -- but NOT
+# `short`, which prints the first paragraph verbatim, one physical line at
+# a time (first_paragraph_span). Built via the plumbing layer (write-tree +
+# commit-tree) so the fixture's leading space on continuation lines and its
+# lack of a blank line are exact, and so this commit does not need to
+# become any branch's tip.
+P60_FOLD_MSG="$WORKDIR/p60_fold_msg.txt"
+printf 'l1
+ l2
+ l3
+
+body
+' > "$P60_FOLD_MSG"
+P60_FOLD_TREE=$(cd "$P60" && LC_ALL=C git write-tree 2>/dev/null)
+P60_FOLD=$( cd "$P60" &&
+  GIT_AUTHOR_NAME="A U Thor" GIT_AUTHOR_EMAIL="author@example.com" \
+  GIT_AUTHOR_DATE="2023-11-14T12:00:00 +0000" \
+  GIT_COMMITTER_NAME="C O Mitter" GIT_COMMITTER_EMAIL="committer@example.com" \
+  GIT_COMMITTER_DATE="2023-11-17T12:00:00 +0000" \
+  LC_ALL=C git commit-tree "$P60_FOLD_TREE" -p "$P60_HEAD" -F "$P60_FOLD_MSG" 2>/dev/null )
+
+check "phase60b oracle: precondition -- real git folds this fixture's subject into one line under %s" \
+    sh -c "test \"\$(cd '$P60' && LC_ALL=C git show -s --format=%s '$P60_FOLD')\" = 'l1  l2  l3'"
+
+p60_cmp "fold_s" --format=%s -s "$P60_FOLD"
+check "phase60b: %s folds a multi-line subject with no blank line, matching git" \
+    cmp -s "$WORKDIR/p60_sg_fold_s.txt" "$WORKDIR/p60_git_fold_s.txt"
+
+p60_cmp "fold_oneline" --pretty=oneline -s "$P60_FOLD"
+check "phase60b: --pretty=oneline folds the subject too, matching git" \
+    cmp -s "$WORKDIR/p60_sg_fold_oneline.txt" "$WORKDIR/p60_git_fold_oneline.txt"
+
+p60_cmp "fold_reference" --pretty=reference -s "$P60_FOLD"
+check "phase60b: --pretty=reference folds the subject too, matching git" \
+    cmp -s "$WORKDIR/p60_sg_fold_reference.txt" "$WORKDIR/p60_git_fold_reference.txt"
+
+p60_cmp "fold_short" --pretty=short -s "$P60_FOLD"
+check "phase60b: --pretty=short does NOT fold -- prints each physical line verbatim, matching git" \
+    cmp -s "$WORKDIR/p60_sg_fold_short.txt" "$WORKDIR/p60_git_fold_short.txt"
+
+(cd "$P60" && LC_ALL=C git $P60_GIT_PINS log --no-decorate --oneline -1 "$P60_FOLD") > "$WORKDIR/p60_git_fold_legacy.txt" 2>&1
+(cd "$P60" && "$SG" log --oneline -1 "$P60_FOLD") > "$WORKDIR/p60_sg_fold_legacy.txt" 2>&1
+check "phase60b: legacy --oneline folds the subject too, matching git" \
+    cmp -s "$WORKDIR/p60_sg_fold_legacy.txt" "$WORKDIR/p60_git_fold_legacy.txt"
+
+# --- Phase 60c: message BLOCK rendering (medium/full/fuller/raw's
+# print_message, not the subject-only sites above). git's own porcelain
+# commit path strips every one of these shapes before the object ever
+# reaches the store (leading/trailing blank lines, per-line trailing
+# whitespace), which is exactly why no earlier fixture in this file, built
+# through ordinary commits, ever exercised them -- these are built with
+# `git hash-object -t commit -w --stdin` directly against a raw commit byte
+# stream, bypassing that cleanup entirely.
+P60C_TREE=$(cd "$P60" && LC_ALL=C git write-tree 2>/dev/null)
+p60c_raw_commit() {
+    printf 'tree %s\nauthor A U Thor <author@example.com> 1700000000 +0000\ncommitter C O Mitter <committer@example.com> 1700000100 +0000\n\n%s' \
+        "$P60C_TREE" "$1" | (cd "$P60" && LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+}
+
+P60C_LEADING=$(p60c_raw_commit $'\nsubject here\n\nbody\n')
+P60C_TRAILING=$(p60c_raw_commit $'subj\n\nbody\n\n\n')
+P60C_BODY_WS=$(p60c_raw_commit $'subj\n\nbody trailing   \nsecond   \n')
+P60C_SUBJECT_WS=$(p60c_raw_commit $'subj   \n\nbody\n')
+P60C_MIDDLE_BLANK=$(p60c_raw_commit $'subj\n\n\nbody\n')
+
+check "phase60c oracle: precondition -- real git strips the leading blank line under --pretty=medium (line 5 is the subject, not a blank)" \
+    sh -c "(cd '$P60' && LC_ALL=C git log -1 --pretty=medium '$P60C_LEADING') | sed -n '5p' | grep -q 'subject here'"
+
+p60_cmp "c_leading" --pretty=medium -s "$P60C_LEADING"
+check "phase60c: a message starting with a blank line -- the leading blank is skipped entirely, matching git" \
+    cmp -s "$WORKDIR/p60_sg_c_leading.txt" "$WORKDIR/p60_git_c_leading.txt"
+
+p60_cmp "c_trailing" --pretty=medium -s "$P60C_TRAILING"
+check "phase60c: a message ending with blank lines -- they are skipped entirely, matching git" \
+    cmp -s "$WORKDIR/p60_sg_c_trailing.txt" "$WORKDIR/p60_git_c_trailing.txt"
+
+p60_cmp "c_body_ws" --pretty=medium -s "$P60C_BODY_WS"
+check "phase60c: trailing whitespace on a BODY line is stripped, matching git" \
+    cmp -s "$WORKDIR/p60_sg_c_body_ws.txt" "$WORKDIR/p60_git_c_body_ws.txt"
+
+p60_cmp "c_subject_ws" --pretty=medium -s "$P60C_SUBJECT_WS"
+check "phase60c: trailing whitespace on the SUBJECT line is stripped, matching git" \
+    cmp -s "$WORKDIR/p60_sg_c_subject_ws.txt" "$WORKDIR/p60_git_c_subject_ws.txt"
+
+p60_cmp "c_middle_blank" --pretty=medium -s "$P60C_MIDDLE_BLANK"
+check "phase60c: a blank line in the MIDDLE of the message is preserved (not squeezed), matching git" \
+    cmp -s "$WORKDIR/p60_sg_c_middle_blank.txt" "$WORKDIR/p60_git_c_middle_blank.txt"
+
+# Sweep the other three affected formats for one variant (the fix is one
+# shared function, print_message -- this proves the blast radius covers all
+# four, not just medium).
+for p60cfmt in full fuller raw; do
+    p60_cmp "c_leading_$p60cfmt" --pretty=$p60cfmt -s "$P60C_LEADING"
+    check "phase60c: --pretty=$p60cfmt also skips a leading blank line, matching git" \
+        cmp -s "$WORKDIR/p60_sg_c_leading_$p60cfmt.txt" "$WORKDIR/p60_git_c_leading_$p60cfmt.txt"
+done
+
+# Reverse control: %B is the raw message, completely unaffected by any of
+# the above -- this is a RENDERING rule, not a message-content rule.
+check "phase60c: precondition -- the trailing-blank fixture really differs from its own %B output under --pretty=medium" \
+    sh -c "test \"\$(cd '$P60' && '$SG' show --pretty=medium -s '$P60C_TRAILING')\" != \"\$(cd '$P60' && '$SG' show --format=%B -s '$P60C_TRAILING')\""
+p60_cmp "c_trailing_B" --format=%B -s "$P60C_TRAILING"
+# %f had the same leading-blank bug as the message block and was fixed with it
+# (main conversation, after the implementer flagged it).  The second check is
+# the control that keeps the fix honest: %f must still take only the FIRST
+# PHYSICAL line, never the folded paragraph %s uses -- a "fix" that routed %f
+# through fold_subject would pass the first check and fail this one.
+P60C_FOLDED=$(p60c_raw_commit $'first line   \n  continued\n\nbody\n')
+check "phase60c oracle: precondition -- git's %f on a leading-blank message is non-empty" \
+    sh -c "(cd '$P60' && LC_ALL=C git log -1 --format=%f '$P60C_LEADING') | grep -q ."
+p60_cmp "c_f_leading" --format=%f -s "$P60C_LEADING"
+check "phase60c: %f skips leading blank lines too, matching git" \
+    cmp -s "$WORKDIR/p60_sg_c_f_leading.txt" "$WORKDIR/p60_git_c_f_leading.txt"
+p60_cmp "c_f_folded" --format=%f -s "$P60C_FOLDED"
+check "phase60c: ...but %f still takes only the first PHYSICAL line, never %s's folded paragraph" \
+    cmp -s "$WORKDIR/p60_sg_c_f_folded.txt" "$WORKDIR/p60_git_c_f_folded.txt"
+
+check "phase60c: %B is unaffected -- returns the raw message verbatim, blank lines and all, matching git" \
+    cmp -s "$WORKDIR/p60_sg_c_trailing_B.txt" "$WORKDIR/p60_git_c_trailing_B.txt"
+
+# --- section 5.3: everything outside the table is rejected -- git accepts
+# every one of these (prints something, exits 0), sg refuses all of them
+# (exit 1). Both sides pinned, per the spec's "pin BOTH sides" instruction.
+for p60bad in '%z' '%ar' '%d' '%C(red)' '100%'; do
+    check "phase60b oracle: precondition -- real git accepts --pretty=format:$p60bad (exits 0)" \
+        sh -c "(cd '$P60' && LC_ALL=C git show --pretty=\"format:$p60bad\" -s '$P60_HEAD') > /dev/null 2>&1"
+    check "phase60b: sg show --pretty=format:$p60bad is rejected -- deliberate divergence, section 5.3" \
+        sh -c "! (cd '$P60' && '$SG' show --pretty=\"format:$p60bad\" -s '$P60_HEAD') > /dev/null 2>&1"
+done
 
 # --- Phase 61: sg_commit_parse/sg_tag_parse tolerate unknown trailing
 # headers -- "gpgsig" is the one GitHub's web UI stamps on every merge/

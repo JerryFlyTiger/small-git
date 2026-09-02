@@ -17,20 +17,27 @@ static const char USAGE[] =
     "[--pretty[=<fmt>]|--format=<fmt>] [-p|--patch] [--stat] [<rev>]\n";
 
 /* Phase 60: parses the value of --pretty/--format (raw is the text after
-   `=`, or the literal "medium" for a bare --pretty) and rejects a
-   FORMAT/TFORMAT user_format containing `%` -- placeholder expansion is
-   Phase 60b, not yet wired up. Returns 0 with *out filled, or -1 having
-   already printed a diagnostic and exit code decided by the caller. */
+   `=`, or the literal "medium" for a bare --pretty). As of Phase 60b, a
+   FORMAT/TFORMAT user_format's placeholders are validated against
+   sg_pretty_validate_format's table up front -- section 5.3 of the Phase
+   60 spec, a deliberate divergence from real git, which prints an
+   unrecognized placeholder literally instead of refusing. Returns 0 with
+   *out filled, or -1 having already printed a diagnostic and exit code
+   decided by the caller. */
 static int resolve_pretty_arg(const char *raw, sg_pretty_format *out)
 {
     if (sg_pretty_parse(raw, out) != 0) {
         fprintf(stderr, "sg: invalid --pretty format: %s\n", raw);
         return -1;
     }
-    if ((out->kind == SG_PRETTY_FORMAT || out->kind == SG_PRETTY_TFORMAT) &&
-       strchr(out->user_format, '%') != NULL) {
-        fprintf(stderr, "sg: --pretty format placeholders are not supported yet\n");
-        return -1;
+    if (out->kind == SG_PRETTY_FORMAT || out->kind == SG_PRETTY_TFORMAT) {
+        const char *bad = NULL;
+        size_t bad_len = 0;
+
+        if (sg_pretty_validate_format(out->user_format, &bad, &bad_len) != 0) {
+            fprintf(stderr, "sg: unsupported --pretty placeholder '%.*s'\n", (int)bad_len, bad);
+            return -1;
+        }
     }
     return 0;
 }

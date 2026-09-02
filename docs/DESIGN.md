@@ -11229,6 +11229,356 @@ mismatched** -- the control run (`CONTROL=1 SG=$(which git)`, git compared
 against itself) reports 212/212, confirming the harness's own zero-mismatch
 baseline before trusting sg's 206/212+6-pending reading.
 
+## Phase 60b: `--format` placeholder expansion for `sg log`/`sg show`
+
+Phase 60a implemented the grammar and the seven builtins but rejected any
+FORMAT/TFORMAT string that actually contained a `%` ("not supported yet").
+Phase 60b wires up expansion, sections 4-5 of the spec.
+
+Fixture (spec section 5.1's own numbers, all measured against real git
+2.55.0): author `A U Thor <author@example.com>` at `1700000000 +0800`,
+committer `C O Mitter <committer@example.com>` at `1700000100 +0900`.
+
+**Placeholder table** (`decode_placeholder` in `commit_out.c`, a single
+token-recognition function shared by validation and rendering so the two
+sets can never drift apart -- see CLAUDE.md's own Phase 29 warning about
+"seven branches is how the eighth format gets forgotten", already true once
+for this file's tag-header table):
+
+| group | placeholders |
+|---|---|
+| ids | `%H %h %T %t %P %p` |
+| author | `%an %ae %al %ad %aD %at %ai %aI %as` |
+| committer | `%cn %ce %cl %cd %cD %ct %ci %cI %cs` |
+| message | `%s %f %b %B` |
+| literal | `%n %% %xNN` |
+
+**Six date renderings, not one.** `%ad`/`%cd` reuse Phase 60a's
+`sg_date_format_normal`, `%as`/`%cs` reuse `sg_date_format_short`. Three new
+functions in `date.c`/`date.h`:
+
+| placeholder | function | output on the fixture |
+|---|---|---|
+| `%aD` | `sg_date_format_rfc2822` | `Wed, 15 Nov 2023 06:13:20 +0800` |
+| `%ai` | `sg_date_format_iso` | `2023-11-15 06:13:20 +0800` |
+| `%aI` | `sg_date_format_iso_strict` | `2023-11-15T06:13:20+08:00` |
+| `%at` | (no function -- raw epoch) | `1700000000` |
+
+Measured, not assumed, before writing any of these:
+- RFC2822's day of month is **NOT** zero-padded (`git commit-tree`'d fixture
+  at day 4: `"Sat, 4 Nov 2023"`, not `"Sat, 04 ..."`) -- the same rule
+  `sg_date_format_normal` already follows, so RFC2822 differs from ISO only
+  in field order/separators, not in padding policy.
+- ISO's date half IS zero-padded (`YYYY-MM-DD`, always), unlike RFC2822.
+- **`%aI`/`%cI`'s zero offset is a genuine trap, found only because the
+  interop fixture happens to use `+0000`/`-0000` for its own author/
+  committer dates** (a holdover from Phase 60a's fixture, not chosen for
+  this purpose): real git renders a zero offset as a literal `"Z"`, never
+  `"+00:00"`/`"-00:00"`, for EITHER sign. Every hand-probed offset before
+  wiring the interop fixture in (`+0800`, `+0530`, `-1100`) was non-zero, so
+  the colon-insertion code shipped once already "measured correct" and only
+  turned out wrong when the existing P60 fixture's own `+0000` dates ran
+  through the new combined-placeholder interop check. Fixed by special-
+  casing an all-zero `HHMM` before the colon-insertion branch in
+  `sg_date_format_iso_strict`.
+
+**`%f`'s algorithm** (`sanitize_subject` in `commit_out.c`) was reverse-
+engineered from real git's *observed* behavior, not from memory of
+`pretty.c`'s source (an initial recollection of `format_sanitized_subject`,
+including `@` as a title character and dot-to-underscore conversion, was
+measurably wrong for this git version and abandoned in favor of direct
+probing). The rule that reproduces all 10 spec rows plus 15 additional
+hand-probed ones (leading/trailing dot vs dash, mixed dot+dash runs, `_`/`@`
+handling, double-leading-dot collapse):
+
+A byte is TITLE iff alnum, `.`, or `_` (`@` is deliberately NOT title,
+despite the recollected git source claiming it is -- git's own title-char
+set evidently changed across versions, or the recollection was simply
+wrong; only the measured behavior on 2.55.0 matters here). A title byte is
+copied as-is; a run of consecutive `.` bytes collapses to one `.`
+(`sanitize_subject`'s own inner `while`); a run of non-title bytes
+(including each byte of a multi-byte UTF-8 character, none of which test
+alnum in the C locale) collapses to a single `-`, emitted lazily right
+before the next title byte -- so a non-title run at the very end of the
+string, with no title byte after it, emits nothing at all. After that:
+leading `-` bytes are stripped (repeatedly), but a leading `.` survives;
+trailing `-` and `.` bytes are BOTH stripped.
+
+The leading-strip asymmetry is the one easy to get backwards, and is not in
+the spec's own 10-row table (that table has no leading-punctuation row at
+all): `".leading"` -> `".leading"` (dot survives) but `"-leading"` ->
+`"leading"` (dash stripped). Traced to git's own two-tier structure: `.` is
+a title character processed inline with no deferred emission, so a leading
+dot is written to the output immediately with nothing before it to strip;
+`-` (like every other non-title byte) only ever reaches the output through
+the "emit one pending dash right before the next title byte" mechanism, so
+a leading dash run always produces exactly one synthetic `-` at buffer
+position 0, and the leading-strip step exists specifically to remove that
+one synthetic byte. There is no equivalent synthetic-dot production path,
+which is why the strip step only ever needs to run on `-`.
+
+**`%b`/`%B`.** `%B` is the raw message, unconditionally. `%b`
+(`print_body`) finds the first `"\n\n"`, skips past it, and then skips any
+FURTHER immediately-following `\n` bytes -- probed with a message
+containing two consecutive blank lines after the subject (`"subject\n\n\n
+body\n"`): real git's `%b` starts directly at `"body"`, with no leftover
+blank line, which a naive "skip exactly the first `\n\n`" implementation
+would not reproduce. A message with no blank line anywhere gives `%b` an
+empty string.
+
+**`%s` FOLDS a multi-line subject, and this went through a two-round
+correction.** Round 1 (before this file's own coordinator independently
+re-measured) shipped `%s` on the same "first physical line" rule as `%f`,
+flagged as a deliberate scope cut. Round 2's re-measurement found the cut
+was wrong, and measured the actual rule precisely across 8 rows plus 2
+further probes: skip leading BLANK lines (empty or all spaces/tabs), then
+join every line up to (not including) the next blank line with a single
+space -- each line's own TRAILING whitespace stripped first, a
+continuation line's LEADING whitespace preserved. A message with no blank
+line anywhere folds ALL of it into one line
+(`"l1\nl2\nl3\n"` -> `"l1 l2 l3"`, `%b` for the same message is empty).
+
+**Five call sites, ONE function** (`fold_subject` in `commit_out.c`): `%s`
+(`expand_user_format`'s `PH_SUBJECT`), the `oneline`/`reference` builtins
+(`print_pretty_oneline` via `print_subject`, `print_pretty_reference`), and
+legacy `--oneline` (also via `print_subject`). Each row was verified
+against real git via `git commit-tree` plumbing (not `git commit`, which a
+subagent-level guard blocks for a different, unrelated reason) both by
+hand and in `tests/interop.sh`'s new fixture.
+
+**`short` is the ONE exception, and this was the round-1 premise's biggest
+gap: it was assumed to share the bug, and direct measurement disproved
+that.** `git log --pretty=short` on a message whose first paragraph spans 3
+lines prints 3 SEPARATE indented lines, not one folded line -- `short` is
+subject-only (no body, Phase 60a's own finding still holds) but does NOT
+fold. It goes through a second, sibling function, `first_paragraph_span`:
+same leading-blank-skip and same "up to the next blank line" boundary as
+`fold_subject`, but instead of joining lines with a space it hands the
+VERBATIM span (as a NUL-terminated copy) to the existing, unmodified
+`print_message` -- reusing its per-line rendering rather than duplicating
+it. `%f`/`%b`/`%B` needed no change at all; they were already correct
+(verified they stay on their own separate, un-folded rules).
+
+**Two FURTHER, deeper bugs were found while re-measuring this and are
+deliberately NOT fixed, only flagged** (`CLAUDE.md`'s `sg log` entry has
+the same note): both live in `print_message`/`print_message_line`, shared
+by `medium`/`full`/`fuller`/`raw`'s WHOLE-message body printing, not just
+the subject -- (1) a message that STARTS with a blank line still gets that
+leading blank line rendered as an indented empty line, where real git
+suppresses it; (2) trailing whitespace on ANY body line (not just the
+subject) is preserved verbatim by sg where real git strips it per line.
+Both predate Phase 60 entirely, are unexercised by every existing interop
+fixture (none has a leading-blank or trailing-whitespace message), and
+fixing either is a materially larger, riskier change than the subject-only
+fix here (every multi-line commit message any of those four formats has
+ever rendered, not just its first line) -- explicitly out of scope for this
+round, per the correction's own "don't expand scope further" instruction.
+
+**Section 5.3's rejection** (`sg_pretty_validate_format`) is validated once
+per invocation, at the CLI layer, before any commit is rendered -- same
+call site Phase 60a's blanket `%`-rejection used, just replaced with a real
+per-sequence check. `decode_placeholder` returns the offending span's
+length so the caller can name it (`sg: unsupported --pretty placeholder
+'%z'`). Measured, both sides pinned in interop's `phase60b` group: real git
+accepts `%z`/`%ar`/`%d`/`%C(red)`/a lone trailing `%` and exits 0 (printing
+the sequence literally or as empty, depending which); sg refuses all five,
+exit 1.
+
+Testing: `tests/test_pretty_format.c` (new) covers the six date renderings
+against the fixture timestamp, all ten `%f` rows, `%at`/`%P`/`%p` end to
+end through `sg_commit_out_entry` with stdout redirected via `dup2` (there
+is no test-only export for the file-local `sanitize_subject`/
+`expand_user_format`, unlike e.g. `sg_tree_flatten_test_count` -- the
+public renderer is the only seam available), and
+`sg_pretty_validate_format`'s accept/reject boundary against every table
+entry plus the five 5.3 witnesses. `tests/interop.sh`'s `phase60b:` group
+reuses the existing P60 fixture (root/head/merge, 0/1/2 parents) with one
+combined format string exercising every table placeholder at once per
+commit shape, plus dedicated checks for the format:/tformat: trailing-
+newline rule through a REAL placeholder (`%h`, not the literal text Phase
+60a's own fixtures used), the `%f` run-collapsing rule against a
+punctuation-heavy subject, and the five 5.3 rejections. The previously-
+existing `phase60: --pretty=oneline%H is NOT the oneline builtin` check
+used to assert the literal string `"not supported yet"`; it now asserts a
+byte-exact `cmp` against real git, since `%H` is now a real placeholder
+rather than a rejected one.
+
+Numbers, round 1 (before the `%s` folding correction): `bash tests/gates.sh
+--rebuild`: interop **2687/2687** passed (34 more than Phase 60a's 2653),
+`make` 0 warnings on a full rebuild, `make test` 72/72 binaries (the new
+`test_pretty_format`). `make sanitize`: 72/72 binaries, 0 sanitizer errors.
+External oracles: `oracle60.py` **212/212 matched, 0 pending**; `oracle61.py`
+**29/31 matched, 2 deliberate divergences, 0 pending**.
+
+Numbers, round 2 (the `%s` folding fix -- `fold_subject`/
+`first_paragraph_span` added, five call sites rewired, `%aI`'s zero-offset
+"Z" fix from round 1 unaffected): `bash tests/gates.sh --rebuild
+--sanitize`: `make` 0 warnings (71 TUs recompiled), `make test` 72/72
+binaries 0 warnings, interop **2693/2693** passed 0 skipped (6 more than
+round 1's 2687: 5 named fold-behavior checks -- `%s`/oneline/reference/
+legacy-`--oneline` folding plus `short` NOT folding -- and 1 precondition),
+`make sanitize` 72/72 binaries 0 sanitizer errors. External oracles, rerun
+against the coordinator's own updated fixture (a folded-subject commit
+added to `oracle60.py`): `oracle60.py` **213/213 matched, 0 pending** (up
+from 212/212 -- the new row was the folding gap, now closed), control run
+(`CONTROL=1 SG=$(which git)`) **213/213**; `oracle61.py` unaffected at
+**29/31 matched, 2 deliberate divergences, 0 pending**.
+
+Reverse mutation, run once by the implementer per the coordinator's own
+request (this round only -- CLAUDE.md's standing rule that `tests/
+mutate.sh` is normally reserved for the main conversation still applies to
+every OTHER mutation in this project): `have_line = 1;` in `fold_subject`'s
+collect loop followed by an inserted `break;`, reverting the function to
+"take only the first physical line" -- i.e. exactly the round-1 behavior
+being corrected. Caught by 4 named `phase60b:` interop checks (`%s` folds,
+`--pretty=oneline` folds, `--pretty=reference` folds, legacy `--oneline`
+folds -- interop 2689/2693) and by `test_subject_folding` in
+`test_pretty_format.c` (20 of its assertions, spanning 6 of the 8 rows --
+rows 3 and 7, the single-line-subject cases, are indistinguishable under
+this mutation by construction, since "first line only" and "folded" agree
+when there is only one line). `test_short_does_not_fold` and the
+`phase60b: --pretty=short does NOT fold` interop check both stayed GREEN
+under this mutation, confirming `short`'s separate `first_paragraph_span`
+code path is untouched by it -- the mutation's blast radius is exactly the
+four sites that share `fold_subject`, matching the fix's own claim.
+
+Earlier candidates from round 1 (still valid, not re-run this round): the
+`%f` dot-collapse `while` loop in `sanitize_subject` (should turn red the
+`a...b`/`unicode café test` rows in `test_pretty_format.c` and the
+`phase60b: %f run-collapsing` interop check); and the FORMAT/TFORMAT
+trailing-`\n` `putchar('\n')` in `sg_commit_out_entry`'s `SG_PRETTY_TFORMAT`
+case (should turn red the `phase60b: --pretty=tformat:%h matches git`
+interop check specifically, leaving the sibling `format:%h` check green).
+
+## Phase 60c: `print_message` (medium/full/fuller/raw's whole-message body)
+
+A separate commit from Phase 60b, found as a byproduct of that phase's own
+review: `print_message` (`commit_out.c`, shared by `medium`/`full`/`fuller`/
+`raw`) was missing three rules real git applies to the WHOLE message body,
+not just the subject line Phase 60b's `fold_subject` touches.
+
+**Why this stayed hidden through every earlier phase.** All three shapes --
+a leading blank line, a trailing blank line, per-line trailing whitespace --
+are exactly what `git commit`'s own message cleanup (`commit.cleanup`,
+default `strip` for an interactive/`-m` commit) removes before the object
+is ever written. Every fixture in this project that built a commit through
+ordinary porcelain (`git commit -m`/`-F`, `sg commit`) therefore had these
+shapes silently sanded off at creation time, regardless of what was typed.
+The only way to observe the actual rendering rule is to construct the raw
+commit object directly and hand it to `git hash-object -t commit -w
+--stdin` (or `git commit-tree`, which shares the same "no cleanup" property
+but was avoided here per the coordinator's explicit request to use
+`hash-object`), bypassing cleanup entirely -- interop's `phase60c:` group
+does exactly this via a `p60c_raw_commit` helper.
+
+**The three rules, all measured against real git 2.55.0:**
+
+1. **Leading blank lines are skipped entirely** -- not rendered even as
+   `    \n`. A "blank" line is empty OR entirely spaces/tabs (the SAME test
+   `fold_subject`/`first_paragraph_span` already used, now factored into
+   one shared `line_is_blank(p, end)` -- three independently-written
+   inline copies of this exact loop converged into one function while
+   touching this file for Phase 60c, per this project's own "converge
+   opportunistically when you touch it" convention).
+2. **Trailing blank lines are skipped entirely.** Measured:
+   `"subj\n\nbody\n\n\n"` renders byte-identical to
+   `"subj\n\nbody\n"` under every one of the four formats.
+3. **Every line's own trailing whitespace is stripped before indenting** --
+   not just the subject, every body line too, and independent of
+   `expand_tabs` (measured directly on `raw`/`short`, neither of which
+   expands tabs at all, both still strip trailing whitespace from a message
+   line that has none).
+
+**A blank line in the MIDDLE is the rule these three could easily be
+mis-generalized into breaking, and is pinned separately.** Measured: TWO
+consecutive middle blank lines render as TWO separate `    \n` lines, not
+squeezed into one (ruling out a `strbuf_stripspace`-style dedup, which this
+project's own earlier design notes half-recalled and which real git does
+NOT apply here). The implementation needs no special case for this: a
+middle blank/whitespace-only line's content, run through the exact same
+trailing-whitespace-strip every line gets, is simply empty, so it prints as
+`    ` + nothing + `\n` on its own by construction. The only lines that
+need active SKIPPING (never printed at all) are a leading RUN and a
+trailing RUN of blank lines, which `print_message` implements by buffering
+each blank-line run as it's encountered and flushing it lazily -- printed
+in full right before the next non-blank line, or silently discarded if the
+run instead reaches the end of the string unflushed (a trailing run).
+
+**Order of tab-expansion vs. trailing-whitespace-stripping was measured,
+not assumed, and found to commute** -- both orders were tried by hand and
+produce byte-identical output on every probed fixture, including a line
+whose trailing content is a tab (`"a\tb   \n"`) and a line ending purely
+in tabs. The reason is structural, not coincidental: the stripped suffix is
+always a run of pure whitespace bytes, and stripping it can only ever
+shorten the line from the end, which cannot change the column position (and
+therefore the expansion) of any tab earlier in the same line. The
+implementation strips first (`print_message_line_stripped`, a thin wrapper
+that trims then calls the unchanged `print_message_line`), purely because
+that ordering was simpler to write, not because the other order was found
+to differ.
+
+**`%B` is unaffected, confirmed by a reverse-control interop check** (the
+`phase60c: %B is unaffected` check plus its own precondition proving the
+fixture's `--pretty=medium` output genuinely differs from its `%B` output --
+a control that already agreed would prove nothing). This is a rendering
+rule, living entirely in `print_message`; it does not touch
+`sg_commit_parse`, `sg_commit_out_entry`'s `SG_PRETTY_RAW` case (which
+still calls `print_message` for the indented block, unaffected, since raw's
+own `author`/`committer`/`tree`/`parent` header lines are printed
+separately before ever reaching it), or `expand_user_format`'s `PH_RAW_BODY`
+case.
+
+**A further, smaller finding, explicitly OUT OF SCOPE this round and not
+fixed:** `%f`'s own first-line lookup (`print_sanitized_subject`) does NOT
+skip leading blank lines the way `fold_subject`/`first_paragraph_span`/
+`print_message` all now do -- measured: `%f` on
+`"\nsubject here\n\nbody\n"` returns `""` (empty, since it naively takes
+the message's literal first line, which is blank) where real git returns
+`"subject-here"` (it skips the leading blank line first, THEN sanitizes the
+first non-blank line). This is a different function from all three touched
+this round, was not named in the coordinator's own instructions, and its
+fix is a small, separate, one-function change -- flagged here per this
+project's own convention of never silently leaving a found bug
+undocumented, left for a future round rather than expanding this one's
+scope.
+
+Testing: `tests/test_pretty_format.c` gained `test_message_block_rendering`
+(all three rules plus the middle-blank-preservation control plus the `%B`
+reverse-control, via `--pretty=medium` as the representative format).
+`tests/interop.sh`'s new `phase60c:` group builds five raw commits directly
+via `git hash-object -t commit -w --stdin` (leading blank, trailing blanks,
+body trailing whitespace, subject trailing whitespace, middle blank
+preserved), one named `cmp` check per variant against `--pretty=medium`,
+a sweep of the same leading-blank fixture across `full`/`fuller`/`raw` to
+prove the fix's blast radius covers all four affected formats and not just
+`medium`, and the `%B` reverse-control pair described above.
+
+Numbers: `bash tests/gates.sh --rebuild --sanitize`: `make` 0 warnings,
+`make test` 72/72 binaries, interop **2704/2704** passed 0 skipped (11 more
+than Phase 60b's 2693: 10 named `phase60c:` checks plus 1 precondition),
+`make sanitize` 72/72 binaries 0 sanitizer errors. External oracles
+(unaffected by this phase, rerun to confirm): `oracle60.py` **213/213
+matched, 0 pending**; `oracle61.py` **29/31 matched, 2 deliberate
+divergences, 0 pending**.
+
+Reverse mutation, run once by the implementer per the coordinator's own
+request: `pending_blanks++;` (the buffering step that defers printing a
+blank line until it's known NOT to be part of a trailing run) mutated to
+`printf("    \n");` -- print every blank line immediately, unbuffered,
+which reintroduces the OLD bug for BOTH middle blanks (no longer batched,
+though this alone is not visible) AND, far more broadly, for the
+message-terminating phantom empty "line" that the per-`\n` line-splitting
+loop produces for virtually EVERY commit message, since almost every
+message ends in a single trailing `\n` -- unbuffered, that final
+zero-length line prints as an extra `    \n` on every one of them. Caught
+**71 named checks**, not a narrow set: every `phase60`/`phase60c`/`phase61`
+check that exercises `medium`/`full`/`fuller`/`raw` rendering on any real
+commit message turned red, because virtually all of them end in `\n`. This
+is a stronger, more foundational result than anticipated going in -- it
+demonstrates the buffered-discard mechanism is load-bearing for the entire
+message-rendering surface this project has, not merely for the exotic
+multi-blank-line shapes the fix was written to handle.
+
 ## Phase 61: tolerate unknown commit/tag headers
 
 Bug fix, not a feature: `sg_commit_parse`/`sg_tag_parse` accepted exactly

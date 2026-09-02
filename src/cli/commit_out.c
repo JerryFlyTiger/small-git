@@ -8,6 +8,7 @@
 #include "sg/workdir.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ASCII-only case fold, deliberately not strcasecmp -- same reasoning as
@@ -81,6 +82,515 @@ int sg_pretty_parse(const char *arg, sg_pretty_format *out)
     return -1;
 }
 
+/* Phase 60b: the placeholder table, section 5.1 of the spec. One token per
+   recognized `%`-sequence; decode_placeholder is the single place that
+   knows the grammar, shared by the validator (sg_pretty_validate_format)
+   and the renderer (expand_user_format) so the two can never drift apart --
+   CLAUDE.md's Phase 60a note about "seven branches is how the eighth format
+   gets forgotten" applies here just as much as it did to the tag header
+   table. */
+typedef enum {
+    PH_HASH_FULL, PH_HASH_ABBR, PH_TREE_FULL, PH_TREE_ABBR,
+    PH_PARENTS_FULL, PH_PARENTS_ABBR,
+    PH_A_NAME, PH_A_EMAIL, PH_A_LOCAL, PH_A_DATE, PH_A_DATE_RFC2822,
+    PH_A_DATE_UNIX, PH_A_DATE_ISO, PH_A_DATE_ISO_STRICT, PH_A_DATE_SHORT,
+    PH_C_NAME, PH_C_EMAIL, PH_C_LOCAL, PH_C_DATE, PH_C_DATE_RFC2822,
+    PH_C_DATE_UNIX, PH_C_DATE_ISO, PH_C_DATE_ISO_STRICT, PH_C_DATE_SHORT,
+    PH_SUBJECT, PH_SANITIZED_SUBJECT, PH_BODY, PH_RAW_BODY,
+    PH_NEWLINE, PH_PERCENT, PH_HEX_BYTE
+} sg_ph_kind;
+
+typedef struct {
+    sg_ph_kind kind;
+    size_t consumed;      /* total bytes consumed, including the leading '%' */
+    unsigned char hexval; /* only meaningful for PH_HEX_BYTE */
+} sg_ph_token;
+
+/* %a<c>/%c<c> share the same ten-way suffix table -- author and committer
+   differ only in which struct fields feed the renderer, never in which
+   suffix letters are legal. */
+static const struct {
+    char c;
+    sg_ph_kind author_kind;
+    sg_ph_kind committer_kind;
+} PH_DATE_SUFFIX[] = {
+    { 'n', PH_A_NAME, PH_C_NAME },
+    { 'e', PH_A_EMAIL, PH_C_EMAIL },
+    { 'l', PH_A_LOCAL, PH_C_LOCAL },
+    { 'd', PH_A_DATE, PH_C_DATE },
+    { 'D', PH_A_DATE_RFC2822, PH_C_DATE_RFC2822 },
+    { 't', PH_A_DATE_UNIX, PH_C_DATE_UNIX },
+    { 'i', PH_A_DATE_ISO, PH_C_DATE_ISO },
+    { 'I', PH_A_DATE_ISO_STRICT, PH_C_DATE_ISO_STRICT },
+    { 's', PH_A_DATE_SHORT, PH_C_DATE_SHORT },
+};
+
+/* Single-char placeholders reached only when the char after `%` is none of
+   'a'/'c'/'n'/'x'/'%' -- no ambiguity with %at/%ct etc, those are always
+   consumed by the 'a'/'c' branch first. */
+static const struct {
+    char c;
+    sg_ph_kind kind;
+} PH_SINGLE[] = {
+    { 'H', PH_HASH_FULL }, { 'h', PH_HASH_ABBR },
+    { 'T', PH_TREE_FULL }, { 't', PH_TREE_ABBR },
+    { 'P', PH_PARENTS_FULL }, { 'p', PH_PARENTS_ABBR },
+    { 's', PH_SUBJECT }, { 'f', PH_SANITIZED_SUBJECT },
+    { 'b', PH_BODY }, { 'B', PH_RAW_BODY },
+};
+
+static int ph_hex_digit(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* p[0] must be '%'. On success fills *tok and returns 0. On failure returns
+   -1 and fills *bad_len with how many bytes (starting at p, '%' included)
+   name the offending placeholder for an error message -- e.g. 1 for a
+   trailing lone '%', 3 for "%ar" (unrecognized suffix after %a), 2 for an
+   unrecognized single char like "%z". */
+static int decode_placeholder(const char *p, sg_ph_token *tok, size_t *bad_len)
+{
+    char c1 = p[1];
+    size_t i;
+
+    if (c1 == '\0') {
+        *bad_len = 1;
+        return -1;
+    }
+    if (c1 == '%') {
+        tok->kind = PH_PERCENT;
+        tok->consumed = 2;
+        return 0;
+    }
+    if (c1 == 'n') {
+        tok->kind = PH_NEWLINE;
+        tok->consumed = 2;
+        return 0;
+    }
+    if (c1 == 'x') {
+        int h1, h2;
+
+        h1 = p[2] == '\0' ? -1 : ph_hex_digit(p[2]);
+        if (h1 < 0) {
+            *bad_len = 2;
+            return -1;
+        }
+        h2 = p[3] == '\0' ? -1 : ph_hex_digit(p[3]);
+        if (h2 < 0) {
+            *bad_len = 3;
+            return -1;
+        }
+        tok->kind = PH_HEX_BYTE;
+        tok->hexval = (unsigned char)(h1 * 16 + h2);
+        tok->consumed = 4;
+        return 0;
+    }
+    if (c1 == 'a' || c1 == 'c') {
+        char c2 = p[2];
+
+        if (c2 == '\0') {
+            *bad_len = 2;
+            return -1;
+        }
+        for (i = 0; i < sizeof(PH_DATE_SUFFIX) / sizeof(PH_DATE_SUFFIX[0]); i++) {
+            if (PH_DATE_SUFFIX[i].c == c2) {
+                tok->kind = c1 == 'a' ? PH_DATE_SUFFIX[i].author_kind : PH_DATE_SUFFIX[i].committer_kind;
+                tok->consumed = 3;
+                return 0;
+            }
+        }
+        *bad_len = 3;
+        return -1;
+    }
+    for (i = 0; i < sizeof(PH_SINGLE) / sizeof(PH_SINGLE[0]); i++) {
+        if (PH_SINGLE[i].c == c1) {
+            tok->kind = PH_SINGLE[i].kind;
+            tok->consumed = 2;
+            return 0;
+        }
+    }
+    *bad_len = 2;
+    return -1;
+}
+
+int sg_pretty_validate_format(const char *fmt, const char **bad, size_t *bad_len)
+{
+    const char *p = fmt;
+
+    if (fmt == NULL)
+        return 0;
+    while (*p != '\0') {
+        if (*p == '%') {
+            sg_ph_token tok;
+            size_t blen = 0;
+
+            if (decode_placeholder(p, &tok, &blen) != 0) {
+                if (bad != NULL)
+                    *bad = p;
+                if (bad_len != NULL)
+                    *bad_len = blen;
+                return -1;
+            }
+            p += tok.consumed;
+        } else {
+            p++;
+        }
+    }
+    return 0;
+}
+
+/* Prints id's 40-hex, or its 7-hex abbreviation (SG_COMMIT_OUT_ABBREV) when
+   abbrev is nonzero. Shared by %H/%h, %T/%t, and each entry of %P/%p. */
+static void print_id_hex(const unsigned char id[SG_SHA1_RAW_LEN], int abbrev)
+{
+    char hex[SG_SHA1_HEX_LEN + 1];
+
+    sg_sha1_to_hex(id, hex);
+    if (abbrev)
+        printf("%.*s", SG_COMMIT_OUT_ABBREV, hex);
+    else
+        fputs(hex, stdout);
+}
+
+/* %P/%p: every parent, space separated -- measured on a 2-parent merge. A
+   root commit's parent_count is 0, so this prints nothing at all (not even
+   a lone separator), matching the empty %P/%p real git prints for it. */
+static void print_parents(const sg_commit *commit, int abbrev)
+{
+    size_t i;
+
+    for (i = 0; i < commit->parent_count; i++) {
+        if (i > 0)
+            putchar(' ');
+        print_id_hex(commit->parents[i], abbrev);
+    }
+}
+
+/* %al/%cl: the email's local part, before the first '@'. An email with no
+   '@' at all (malformed, should not occur in practice) prints whole. */
+static void print_email_local(const char *email)
+{
+    const char *at = strchr(email, '@');
+
+    if (at == NULL)
+        fputs(email, stdout);
+    else
+        printf("%.*s", (int)(at - email), email);
+}
+
+typedef int (*date_fmt_fn)(long long, const char *, char *, size_t);
+
+/* Shared by all ten of the non-%at date placeholders -- SG_DATE_NORMAL_MAX
+   (64) is the largest of the four render buffers this project defines, so
+   reusing it for all of them is always big enough. On a formatting failure
+   this prints nothing, the same empty-string fallback the legacy/builtin
+   date fields already use. */
+static void print_date_field(long long t, const char *tz, date_fmt_fn fn)
+{
+    char buf[SG_DATE_NORMAL_MAX];
+
+    if (fn(t, tz, buf, sizeof buf) != 0)
+        buf[0] = '\0';
+    fputs(buf, stdout);
+}
+
+/* A line (given as [p, end), never including its own '\n') is BLANK if it
+   is empty or consists entirely of spaces/tabs. This single test is shared
+   by fold_subject, first_paragraph_span, and print_message -- all three
+   need to answer "is this line blank" and all three were independently
+   re-deriving it before this was factored out. */
+static int line_is_blank(const char *p, const char *end)
+{
+    for (; p < end; p++) {
+        if (*p != ' ' && *p != '\t')
+            return 0;
+    }
+    return 1;
+}
+
+/* git's "subject" extraction -- shared by %s, the oneline/short/reference
+   builtins, and legacy --oneline (five sites, one function; measured
+   against real git 2.55.0, section: docs/DESIGN.md's Phase 60b entry has
+   the full table). NOT the same rule as %f/%b -- see sanitize_subject's
+   and print_body's own comments for why those two stay separate.
+
+   Algorithm: skip leading BLANK lines (a line is blank if it is empty or
+   consists entirely of spaces/tabs), then join every following line up to
+   (not including) the next blank line with a single space -- each line's
+   own TRAILING whitespace is stripped before joining, but a continuation
+   line's LEADING whitespace survives untouched. A message with no blank
+   line anywhere folds its ENTIRE remaining content into one line (measured:
+   "l1\nl2\nl3\n" with no blank line gives "l1 l2 l3", and %b for that
+   same message is empty -- there is no body left once every line joined
+   the subject).
+
+   Writes into `out` (caller-owned, must be at least strlen(msg) bytes --
+   each line's own newline is replaced by exactly one joining space and
+   trailing-whitespace stripping only shrinks the result, so the output can
+   never be longer than the input) and returns the written length, NOT
+   NUL-terminated on its own, same convention as sanitize_subject. msg ==
+   NULL, or a message consisting only of blank lines, writes nothing and
+   returns 0. */
+static size_t fold_subject(const char *msg, char *out)
+{
+    const char *p;
+    size_t oi = 0;
+    int have_line = 0;
+
+    if (msg == NULL)
+        return 0;
+    p = msg;
+
+    /* Skip leading blank lines. */
+    for (;;) {
+        const char *eol = strchr(p, '\n');
+        const char *line_end = eol != NULL ? eol : p + strlen(p);
+
+        if (!line_is_blank(p, line_end))
+            break;
+        if (eol == NULL)
+            return 0; /* the whole message is blank lines */
+        p = eol + 1;
+    }
+
+    /* Collect lines until the next blank line (or the end of the string). */
+    for (;;) {
+        const char *eol = strchr(p, '\n');
+        const char *line_end = eol != NULL ? eol : p + strlen(p);
+        const char *trim_end = line_end;
+
+        if (line_is_blank(p, line_end))
+            break;
+
+        while (trim_end > p && (trim_end[-1] == ' ' || trim_end[-1] == '\t'))
+            trim_end--;
+
+        if (have_line)
+            out[oi++] = ' ';
+        memcpy(out + oi, p, (size_t)(trim_end - p));
+        oi += (size_t)(trim_end - p);
+        have_line = 1;
+
+        if (eol == NULL)
+            break;
+        p = eol + 1;
+    }
+
+    return oi;
+}
+
+/* Mallocs a buffer sized to fit, folds msg into it via fold_subject, and
+   returns the buffer (caller-owned, free() when done) with *out_len set to
+   the written length. Returns NULL (and *out_len = 0) for a NULL/empty msg
+   or on allocation failure -- callers treat NULL the same as "0-length". */
+static char *fold_subject_alloc(const char *msg, size_t *out_len)
+{
+    char *buf;
+
+    *out_len = 0;
+    if (msg == NULL || *msg == '\0')
+        return NULL;
+    buf = malloc(strlen(msg));
+    if (buf == NULL)
+        return NULL;
+    *out_len = fold_subject(msg, buf);
+    return buf;
+}
+
+/* %s -- the folded subject, written with no trailing newline. */
+static void print_folded_subject(const char *msg)
+{
+    size_t len;
+    char *buf = fold_subject_alloc(msg, &len);
+
+    if (buf != NULL) {
+        fwrite(buf, 1, len, stdout);
+        free(buf);
+    }
+}
+
+/* %f -- the message's first line, sanitized the way git's own
+   filename-safe subject sanitizer does (measured against real git 2.55.0
+   directly, section 5.2 of the Phase 60 spec has the ten pinned rows): a
+   byte is TITLE (alnum, '.', or '_' -- '@' is deliberately NOT title,
+   measured, despite an older git comment saying otherwise) and copied
+   as-is, with a run of consecutive '.' bytes collapsed to a single '.'; a
+   run of non-title bytes (including each byte of a multi-byte UTF-8
+   character, since none of them test alnum) collapses to a single '-',
+   emitted lazily right before the next title byte -- a run at the very end
+   of the string, with no following title byte, therefore emits nothing at
+   all. Finally, leading '-' bytes are stripped (but NOT a leading '.' --
+   measured: ".leading" keeps its dot, "-leading" loses its dash), and
+   trailing '-'/'.' bytes are both stripped. Writes into `out`
+   (caller-owned, must be at least `len` bytes -- the output can never be
+   longer than the input) and returns the written length. */
+static size_t sanitize_subject(const char *subject, size_t len, char *out)
+{
+    size_t oi = 0;
+    size_t i;
+    int pending_dash = 0;
+
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)subject[i];
+        int is_title = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || c == '.' || c == '_';
+
+        if (is_title) {
+            if (pending_dash) {
+                out[oi++] = '-';
+                pending_dash = 0;
+            }
+            out[oi++] = (char)c;
+            if (c == '.') {
+                while (i + 1 < len && subject[i + 1] == '.')
+                    i++;
+            }
+        } else {
+            pending_dash = 1;
+        }
+    }
+
+    {
+        size_t start = 0;
+
+        while (start < oi && out[start] == '-')
+            start++;
+        if (start > 0) {
+            memmove(out, out + start, oi - start);
+            oi -= start;
+        }
+    }
+    while (oi > 0 && (out[oi - 1] == '-' || out[oi - 1] == '.'))
+        oi--;
+
+    return oi;
+}
+
+static void print_sanitized_subject(const char *msg)
+{
+    const char *nl;
+    size_t len;
+    char *buf;
+
+    if (msg == NULL || *msg == '\0')
+        return;
+    /* %f skips leading blank lines exactly as %s does -- measured against
+       real git on a message starting with a blank line, where %f is
+       `subject-here` and not empty.  What %f does NOT share with %s is the
+       FOLDING: it takes only the first physical line of the paragraph
+       (measured: `first line   \n  continued` gives `first-line`), which is
+       why this walks past blank lines by hand instead of calling
+       fold_subject. */
+    for (;;) {
+        const char *eol = strchr(msg, '\n');
+        const char *stop = eol == NULL ? msg + strlen(msg) : eol;
+
+        if (!line_is_blank(msg, stop))
+            break;
+        if (eol == NULL)
+            return;
+        msg = eol + 1;
+    }
+    nl = strchr(msg, '\n');
+    len = nl == NULL ? strlen(msg) : (size_t)(nl - msg);
+    if (len == 0)
+        return;
+    buf = malloc(len);
+    if (buf == NULL)
+        return;
+    fwrite(buf, 1, sanitize_subject(msg, len, buf), stdout);
+    free(buf);
+}
+
+/* %b -- everything after the first blank line, with any further blank
+   lines immediately following it also skipped (measured: "subject\n\n\n
+   body\n" prints body with no leading blank line at all, not one). A
+   message with no blank line anywhere prints nothing. */
+static void print_body(const char *msg)
+{
+    const char *p;
+
+    if (msg == NULL)
+        return;
+    p = strstr(msg, "\n\n");
+    if (p == NULL)
+        return;
+    p += 2;
+    while (*p == '\n')
+        p++;
+    fputs(p, stdout);
+}
+
+/* Expands a FORMAT/TFORMAT user_format's placeholders against one commit.
+   Every `%`-sequence has already been validated by
+   sg_pretty_validate_format (cmd_log.c's/cmd_show.c's resolve_pretty_arg,
+   called once per invocation before any commit is ever rendered), so
+   decode_placeholder cannot fail here in practice -- the fallback branch
+   below (print the sequence literally) exists only so this function stays
+   safe if that precondition is ever violated, it is not a second policy. */
+static void expand_user_format(const char *fmt, const char *hex, const sg_commit *commit)
+{
+    const char *p = fmt;
+
+    while (*p != '\0') {
+        sg_ph_token tok;
+        size_t blen;
+
+        if (*p != '%') {
+            putchar(*p);
+            p++;
+            continue;
+        }
+        if (decode_placeholder(p, &tok, &blen) != 0) {
+            fwrite(p, 1, blen, stdout);
+            p += blen;
+            continue;
+        }
+        switch (tok.kind) {
+        case PH_HASH_FULL: fputs(hex, stdout); break;
+        case PH_HASH_ABBR: printf("%.*s", SG_COMMIT_OUT_ABBREV, hex); break;
+        case PH_TREE_FULL: print_id_hex(commit->tree, 0); break;
+        case PH_TREE_ABBR: print_id_hex(commit->tree, 1); break;
+        case PH_PARENTS_FULL: print_parents(commit, 0); break;
+        case PH_PARENTS_ABBR: print_parents(commit, 1); break;
+        case PH_A_NAME: fputs(commit->author_name, stdout); break;
+        case PH_A_EMAIL: fputs(commit->author_email, stdout); break;
+        case PH_A_LOCAL: print_email_local(commit->author_email); break;
+        case PH_A_DATE: print_date_field(commit->author_time, commit->author_tz, sg_date_format_normal); break;
+        case PH_A_DATE_RFC2822: print_date_field(commit->author_time, commit->author_tz, sg_date_format_rfc2822); break;
+        case PH_A_DATE_UNIX: printf("%lld", commit->author_time); break;
+        case PH_A_DATE_ISO: print_date_field(commit->author_time, commit->author_tz, sg_date_format_iso); break;
+        case PH_A_DATE_ISO_STRICT: print_date_field(commit->author_time, commit->author_tz, sg_date_format_iso_strict); break;
+        case PH_A_DATE_SHORT: print_date_field(commit->author_time, commit->author_tz, sg_date_format_short); break;
+        case PH_C_NAME: fputs(commit->committer_name, stdout); break;
+        case PH_C_EMAIL: fputs(commit->committer_email, stdout); break;
+        case PH_C_LOCAL: print_email_local(commit->committer_email); break;
+        case PH_C_DATE: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_normal); break;
+        case PH_C_DATE_RFC2822: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_rfc2822); break;
+        case PH_C_DATE_UNIX: printf("%lld", commit->committer_time); break;
+        case PH_C_DATE_ISO: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_iso); break;
+        case PH_C_DATE_ISO_STRICT: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_iso_strict); break;
+        case PH_C_DATE_SHORT: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_short); break;
+        case PH_SUBJECT: print_folded_subject(commit->message); break;
+        case PH_SANITIZED_SUBJECT: print_sanitized_subject(commit->message); break;
+        case PH_BODY: print_body(commit->message); break;
+        case PH_RAW_BODY: if (commit->message != NULL) fputs(commit->message, stdout); break;
+        case PH_NEWLINE: putchar('\n'); break;
+        case PH_PERCENT: putchar('%'); break;
+        case PH_HEX_BYTE: putchar((int)tok.hexval); break;
+        default: break;
+        }
+        p += tok.consumed;
+    }
+}
+
 /* git EXPANDS TABS in the message body for medium/full/fuller (measured in
    Phase 60 -- CLAUDE.md's earlier "only medium" note undersold this: `git
    log --pretty=full`/`fuller` on a message containing a tab also expand it,
@@ -117,65 +627,204 @@ static void print_message_line(const char *line, size_t len, int expand_tabs)
     putchar('\n');
 }
 
-/* git indents EVERY message line by four spaces, a blank one included (it
-   emits "    \n", measured), and prints the block -- leading blank line and
-   all -- only when the message is non-empty: a commit with an empty message
-   renders as its header lines and nothing else. */
+/* Prints one line's content with its own TRAILING whitespace stripped
+   first (spaces and tabs), then handed to print_message_line for
+   tab-expansion/indent -- see print_message's own comment for the measured
+   evidence. Tab-expansion and trailing-whitespace-stripping are measured to
+   commute (the stripped suffix is always pure whitespace regardless of
+   whether it is stripped before or after any earlier tab in the same line
+   is expanded to columns, since expansion of one character never touches
+   another character's identity), and BOTH happen unconditionally --
+   trailing-whitespace stripping does NOT depend on expand_tabs (measured on
+   `raw`/`short`, neither of which expands tabs, both still strip trailing
+   whitespace). */
+static void print_message_line_stripped(const char *p, const char *line_end, int expand_tabs)
+{
+    const char *trim_end = line_end;
+
+    while (trim_end > p && (trim_end[-1] == ' ' || trim_end[-1] == '\t'))
+        trim_end--;
+    print_message_line(p, (size_t)(trim_end - p), expand_tabs);
+}
+
+/* git indents EVERY message line by four spaces, prints the block only
+   when the message has any non-blank content at all (a commit whose
+   message is empty, or consists ENTIRELY of blank lines, renders as its
+   header lines and nothing else), and applies THREE further rules this
+   file used to get wrong for anything but the simplest fixtures (found
+   during Phase 60c's review, all measured against real git 2.55.0 via
+   `git hash-object -t commit -w --stdin` -- `git commit`'s own message
+   cleanup would silently erase every one of these shapes before they ever
+   reached the object store, which is exactly why no earlier fixture built
+   through porcelain ever exercised them):
+
+   1. Leading blank lines (empty OR all-whitespace, line_is_blank's test)
+      are skipped ENTIRELY -- not rendered even as "    \n".
+   2. Trailing blank lines are likewise skipped entirely (measured:
+      "subj\n\nbody\n\n\n" renders identically to "subj\n\nbody\n").
+   3. A BLANK line in the MIDDLE is preserved, and every one of them,
+      individually -- measured: two consecutive middle blank lines render
+      as TWO separate "    \n" lines, not squeezed into one. This falls out
+      naturally below: a middle blank line's content, after being run
+      through the SAME per-line trailing-whitespace-strip every other line
+      gets, is simply empty, so it prints as "    " + nothing + "\n" without
+      needing a special case -- the only lines that need SKIPPING (not
+      printing) are the leading and trailing RUNS.
+
+   %B is completely unaffected by any of this -- it is the raw message,
+   unconditionally verbatim; this is a RENDERING rule, not a message-content
+   rule, so it lives here and nowhere near sg_commit_parse or the %B case of
+   expand_user_format. */
 static void print_message(const char *msg, int expand_tabs)
 {
-    const char *p = msg;
+    const char *p;
+    size_t pending_blanks;
 
     if (msg == NULL || *msg == '\0')
         return;
-    printf("\n");
-    while (*p != '\0') {
-        const char *nl = strchr(p, '\n');
+    p = msg;
 
-        if (nl == NULL) {
-            print_message_line(p, strlen(p), expand_tabs);
+    /* Skip leading blank lines entirely. */
+    for (;;) {
+        const char *eol = strchr(p, '\n');
+        const char *line_end = eol != NULL ? eol : p + strlen(p);
+
+        if (!line_is_blank(p, line_end))
             break;
+        if (eol == NULL)
+            return; /* the whole message is blank lines -- print nothing */
+        p = eol + 1;
+    }
+
+    /* From here on there is guaranteed to be at least one non-blank line
+       ahead, so the message's own leading blank-line separator is always
+       printed exactly once. */
+    printf("\n");
+
+    /* Blank lines are buffered (never printed immediately) and flushed
+       lazily right before the next NON-blank line -- a run that reaches
+       the end of the string without ever being followed by a non-blank
+       line is a trailing run and is discarded unprinted. */
+    pending_blanks = 0;
+    for (;;) {
+        const char *eol = strchr(p, '\n');
+        const char *line_end = eol != NULL ? eol : p + strlen(p);
+
+        if (line_is_blank(p, line_end)) {
+            pending_blanks++;
+        } else {
+            while (pending_blanks > 0) {
+                printf("    \n");
+                pending_blanks--;
+            }
+            print_message_line_stripped(p, line_end, expand_tabs);
         }
-        print_message_line(p, (size_t)(nl - p), expand_tabs);
-        p = nl + 1;
+        if (eol == NULL)
+            break;
+        p = eol + 1;
     }
 }
 
-/* --oneline's second field is the message's FIRST line, and the separating
-   space is printed even when there is no first line at all: measured, an
-   empty message renders as "<abbrev> " with a trailing space. */
+/* --oneline's second field is the message's FOLDED subject (fold_subject
+   above), and the separating space is printed even when there is no
+   subject at all: measured, an empty message renders as "<abbrev> " with a
+   trailing space. */
 static void print_subject(const char *msg)
 {
-    const char *nl;
-
-    if (msg == NULL) {
-        printf("\n");
-        return;
-    }
-    nl = strchr(msg, '\n');
-    if (nl == NULL)
-        printf("%s\n", msg);
-    else
-        printf("%.*s\n", (int)(nl - msg), msg);
+    print_folded_subject(msg);
+    putchar('\n');
 }
 
-/* short/reference print the SUBJECT ONLY, never the body -- measured
-   (Phase 60a's oracle matrix): `short` looked like it was byte-exact when
-   tested only against body-less fixtures, but a real body ("body first")
-   showed up verbatim underneath it, which git never does. Reuses
-   print_message_line's blank-line + four-space-indent shape (so a `raw`-
-   or `medium`-shaped consumer sees the same left margin), just stops after
-   the first line instead of walking the rest of the message. */
+/* Locates the message's "first paragraph", VERBATIM (no folding) -- skip
+   leading blank lines (same blank-line test as fold_subject: empty or all
+   spaces/tabs), then the paragraph is everything up to (excluding) the
+   next blank line or the end of the string. `short` uses this, NOT
+   fold_subject: measured against real git 2.55.0, `short` prints SUBJECT
+   ONLY (no body -- Phase 60a's own finding), but unlike %s/oneline/
+   reference/legacy --oneline (which all fold multi-line subjects into one
+   space-joined line, see fold_subject's own comment) it prints each
+   physical line of the first paragraph on its OWN line, unchanged --
+   confirmed with `git log --pretty=short` on a message whose first
+   paragraph spans 3 lines: git prints 3 separate indented lines, not one
+   folded line. `short` is therefore the one site of this family that does
+   NOT go through fold_subject.
+   Sets *out_start (borrowed, into msg) and *out_len to the paragraph's
+   span; both are NULL/0 for a NULL msg or a message that is entirely
+   blank lines. */
+static void first_paragraph_span(const char *msg, const char **out_start, size_t *out_len)
+{
+    const char *p;
+    const char *para_start;
+    const char *para_end;
+
+    *out_start = NULL;
+    *out_len = 0;
+    if (msg == NULL)
+        return;
+    p = msg;
+
+    /* Skip leading blank lines. */
+    for (;;) {
+        const char *eol = strchr(p, '\n');
+        const char *line_end = eol != NULL ? eol : p + strlen(p);
+
+        if (!line_is_blank(p, line_end))
+            break;
+        if (eol == NULL)
+            return; /* the whole message is blank lines */
+        p = eol + 1;
+    }
+    para_start = p;
+    para_end = para_start;
+
+    /* Walk lines until the next blank line (or the end of the string),
+       tracking only each confirmed non-blank line's OWN content end --
+       never speculatively advancing past a trailing '\n' before knowing
+       whether a further line exists, which is what would otherwise fold a
+       message with no blank line at all into including a phantom trailing
+       empty line. */
+    for (;;) {
+        const char *eol = strchr(p, '\n');
+        const char *line_end = eol != NULL ? eol : p + strlen(p);
+
+        if (line_is_blank(p, line_end))
+            break;
+        para_end = line_end;
+        if (eol == NULL)
+            break;
+        p = eol + 1;
+    }
+
+    *out_start = para_start;
+    *out_len = (size_t)(para_end - para_start);
+}
+
+/* short prints the SUBJECT ONLY, never the body -- measured (Phase 60a's
+   oracle matrix): `short` looked like it was byte-exact when tested only
+   against body-less fixtures, but a real body ("body first") showed up
+   verbatim underneath it, which git never does. Reuses print_message's own
+   blank-line + four-space-indent-per-line shape (so a `raw`- or
+   `medium`-shaped consumer sees the same left margin) by handing it a
+   NUL-terminated copy of just the first-paragraph span -- print_message
+   itself needs no changes, it already prints each line of whatever it is
+   given, and first_paragraph_span is what bounds "whatever it is given" to
+   the first paragraph. */
 static void print_message_subject_only(const char *msg, int expand_tabs)
 {
-    const char *nl;
+    const char *start;
     size_t len;
+    char *buf;
 
-    if (msg == NULL || *msg == '\0')
+    first_paragraph_span(msg, &start, &len);
+    if (start == NULL)
         return;
-    nl = strchr(msg, '\n');
-    len = nl == NULL ? strlen(msg) : (size_t)(nl - msg);
-    printf("\n");
-    print_message_line(msg, len, expand_tabs);
+    buf = malloc(len + 1);
+    if (buf == NULL)
+        return;
+    memcpy(buf, start, len);
+    buf[len] = '\0';
+    print_message(buf, expand_tabs);
+    free(buf);
 }
 
 /* "Merge: <7hex> <7hex> ..." -- shared by short/medium/full/fuller (all
@@ -289,25 +938,22 @@ static void print_pretty_reference(const unsigned char id[SG_SHA1_RAW_LEN],
 {
     char hex7[SG_SHA1_HEX_LEN + 1];
     char short_date[SG_DATE_SHORT_MAX];
-    const char *msg = commit->message;
-    const char *nl;
-    int subject_len;
+    size_t subject_len;
+    char *subject_buf;
 
     sg_sha1_to_hex(id, hex7);
-    if (msg == NULL) {
-        subject_len = 0;
-        msg = "";
-    } else {
-        nl = strchr(msg, '\n');
-        subject_len = nl == NULL ? (int)strlen(msg) : (int)(nl - msg);
-    }
+    /* As of Phase 60b, the FOLDED subject (fold_subject above), not just
+       the first physical line. */
+    subject_buf = fold_subject_alloc(commit->message, &subject_len);
     /* `reference` uses the AUTHOR date (short form, "YYYY-MM-DD"), NOT the
        committer's -- measured with a fixture whose two dates fall on
        different days. */
     if (sg_date_format_short(commit->author_time, commit->author_tz,
                              short_date, sizeof(short_date)) != 0)
         short_date[0] = '\0';
-    printf("%.*s (%.*s, %s)\n", SG_COMMIT_OUT_ABBREV, hex7, subject_len, msg, short_date);
+    printf("%.*s (%.*s, %s)\n", SG_COMMIT_OUT_ABBREV, hex7, (int)subject_len,
+          subject_buf != NULL ? subject_buf : "", short_date);
+    free(subject_buf);
 }
 
 /* The commit's own diff: first parent's tree against its own, or the empty
@@ -459,17 +1105,17 @@ int sg_commit_out_entry(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
             break;
         case SG_PRETTY_FORMAT:
             /* No terminator -- the entry text is exactly opts->pretty->
-               user_format, byte for byte (round 2 wires up placeholder
-               expansion; the CLI layer has already rejected a `%` in this
-               string before this function is ever reached, see this
+               user_format with every placeholder expanded, byte for byte.
+               The CLI layer has already validated every `%`-sequence in
+               this string before this function is ever reached (see this
                function's own header-comment precondition). */
-            fputs(opts->pretty->user_format, stdout);
+            expand_user_format(opts->pretty->user_format, hex, commit);
             break;
         case SG_PRETTY_TFORMAT:
             /* Always terminates with exactly one '\n' -- this is what makes
                tformat: differ byte-for-byte from format: on the exact same
                literal string (measured: "plain" -> "plain" vs "plain\n"). */
-            fputs(opts->pretty->user_format, stdout);
+            expand_user_format(opts->pretty->user_format, hex, commit);
             putchar('\n');
             break;
         case SG_PRETTY_LEGACY:

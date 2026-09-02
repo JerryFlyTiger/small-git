@@ -43,4 +43,38 @@ int sg_date_format_normal(long long time_sec, const char *tz,
 int sg_date_format_short(long long time_sec, const char *tz,
                          char *out, size_t out_size);
 
+/* Longest string sg_date_format_rfc2822 can produce, including the NUL. */
+#define SG_DATE_RFC2822_MAX 48
+
+/* Renders `%aD`/`%cD`: "Wed, 15 Nov 2023 06:13:20 +0800" -- git's RFC2822
+   date format. Same SHIFTED-INTO-`tz` wall clock and hard-coded English
+   weekday/month tables as sg_date_format_normal; the day of month is NOT
+   zero-padded either (measured: day 4 renders "Sat, 4 Nov 2023", not
+   "Sat, 04 ..."). Returns 0 on success, -1 on the same failures
+   sg_date_format_normal has. */
+int sg_date_format_rfc2822(long long time_sec, const char *tz,
+                           char *out, size_t out_size);
+
+/* Longest string sg_date_format_iso/_strict can produce, including the NUL. */
+#define SG_DATE_ISO_MAX 32
+
+/* Renders `%ai`/`%ci`: "2023-11-15 06:13:20 +0800" (a space between the date
+   and time halves, `tz` echoed verbatim as stored, same shifted wall clock).
+   Returns 0 on success, -1 on the same failures sg_date_format_normal has. */
+int sg_date_format_iso(long long time_sec, const char *tz,
+                       char *out, size_t out_size);
+
+/* Renders `%aI`/`%cI`: "2023-11-15T06:13:20+08:00" -- a literal 'T'
+   separator and the timezone written with a colon between hours and
+   minutes. The colon form is only inserted when `tz` has the expected
+   "+HHMM"/"-HHMM" shape (5 bytes, sign + 4 digits); anything else is echoed
+   verbatim with no colon inserted, the same "never recomputed" rule
+   sg_date_format_normal documents for a malformed tz. A ZERO offset is a
+   further exception on top of that (measured against real git 2.55.0):
+   "+0000" and "-0000" both render as a literal "Z", never "+00:00" or
+   "-00:00". Returns 0 on success, -1 on the same failures
+   sg_date_format_normal has. */
+int sg_date_format_iso_strict(long long time_sec, const char *tz,
+                              char *out, size_t out_size);
+
 #endif /* SG_DATE_H */

@@ -58,18 +58,25 @@ typedef struct {
 /* Mirrors cmd_log.c's own resolve_pretty_arg (not shared via a header --
    each command's diagnostic differs only in the exit convention, and
    there's no third caller to justify extracting a fourth file for two
-   nearly-identical wrappers around sg_pretty_parse). Returns 0 with *out
-   filled, or -1 having already printed a diagnostic. */
+   nearly-identical wrappers around sg_pretty_parse). As of Phase 60b, a
+   FORMAT/TFORMAT user_format's placeholders are validated against
+   sg_pretty_validate_format's table up front -- section 5.3 of the Phase
+   60 spec. Returns 0 with *out filled, or -1 having already printed a
+   diagnostic. */
 static int resolve_pretty_arg(const char *raw, sg_pretty_format *out)
 {
     if (sg_pretty_parse(raw, out) != 0) {
         fprintf(stderr, "sg: invalid --pretty format: %s\n", raw);
         return -1;
     }
-    if ((out->kind == SG_PRETTY_FORMAT || out->kind == SG_PRETTY_TFORMAT) &&
-       strchr(out->user_format, '%') != NULL) {
-        fprintf(stderr, "sg: --pretty format placeholders are not supported yet\n");
-        return -1;
+    if (out->kind == SG_PRETTY_FORMAT || out->kind == SG_PRETTY_TFORMAT) {
+        const char *bad = NULL;
+        size_t bad_len = 0;
+
+        if (sg_pretty_validate_format(out->user_format, &bad, &bad_len) != 0) {
+            fprintf(stderr, "sg: unsupported --pretty placeholder '%.*s'\n", (int)bad_len, bad);
+            return -1;
+        }
     }
     return 0;
 }

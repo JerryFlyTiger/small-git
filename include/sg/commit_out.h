@@ -15,12 +15,13 @@
    case-SENSITIVE "format:"/"tformat:" prefixes, "contains a %" -> tformat,
    otherwise an error) lives in sg_pretty_parse, CLAUDE.md's `sg log` entry
    has the full table. SG_PRETTY_FORMAT/_TFORMAT are recognized by the
-   grammar as of Phase 60a, but a user_format actually CONTAINING a `%`
-   placeholder is rejected at render time with "not supported yet" --
-   placeholder expansion is Phase 60b. A literal string with no `%` (e.g.
-   `format:plain`) already renders correctly this phase, which is also how
-   the format:/tformat: trailing-newline and separator rules below are
-   exercised without waiting for Phase 60b. */
+   grammar as of Phase 60a; as of Phase 60b a user_format's placeholders
+   (section 5.1's table: ids, author/committer name/email/local-part/six
+   date renderings, %s/%f/%b/%B, %n/%%/%xNN) are fully expanded --
+   sg_pretty_validate_format rejects anything outside that table up front,
+   once per invocation, before any commit is ever rendered (a deliberate
+   divergence from real git, which prints an unrecognized placeholder
+   literally instead of refusing). */
 typedef enum {
     SG_PRETTY_LEGACY = 0, /* opts->oneline decides oneline vs medium, unchanged */
     SG_PRETTY_ONELINE,    /* builtin `oneline`: full 40-hex, no dates */
@@ -51,6 +52,20 @@ typedef struct {
    *out filled in, or -1 having printed nothing (the caller reports its own
    "invalid --pretty format" usage error, matching its own USAGE string). */
 int sg_pretty_parse(const char *arg, sg_pretty_format *out);
+
+/* Phase 60b: validates every `%`-sequence in a FORMAT/TFORMAT user_format
+   against the placeholder table in CLAUDE.md's `sg log` Phase 60 entry
+   (section 5.1 of the spec) -- ids, author/committer name/email/local-part/
+   six date renderings, %s/%f/%b/%B, %n/%%/%xNN. This is a deliberate
+   divergence from real git (section 5.3): git prints an unrecognized
+   placeholder literally or renders a recognized-but-contextless one as
+   empty, sg refuses the whole invocation instead. Returns 0 if every
+   sequence is recognized, or -1 with *bad set to a borrowed pointer into
+   fmt at the start of the offending sequence (including its leading `%`)
+   and *bad_len to its length -- NOT NUL-terminated on its own, the caller
+   must print it as "%.*s". A fmt with no `%` at all trivially returns 0.
+   bad/bad_len may be NULL if the caller does not want to report it. */
+int sg_pretty_validate_format(const char *fmt, const char **bad, size_t *bad_len);
 
 typedef struct {
     int oneline; /* "<abbrev> <subject>" header instead of the full block --
@@ -99,13 +114,13 @@ typedef struct {
    Returns 0, or -1 having printed a partial entry (the caller decides how
    to report that -- see cmd_log.c's and cmd_show.c's own error messages).
 
-   PRECONDITION: if opts->pretty selects SG_PRETTY_FORMAT/_TFORMAT, its
-   user_format must NOT contain a `%` -- placeholder expansion is Phase 60b.
-   The CLI layer rejects a `%`-bearing user_format up front, once per
+   PRECONDITION: if opts->pretty selects SG_PRETTY_FORMAT/_TFORMAT, every
+   `%`-sequence in its user_format must already be one sg_pretty_validate_
+   format accepts. The CLI layer validates it up front, once per
    invocation, before ever calling this function (see cmd_log.c's/
-   cmd_show.c's own "not supported yet" check) -- this function does not
-   re-check, so a caller bypassing that gate gets `%h` etc. printed
-   literally rather than expanded. */
+   cmd_show.c's own resolve_pretty_arg) -- this function does not re-check,
+   so a caller bypassing that gate gets an unrecognized `%`-sequence printed
+   literally instead of rejected. */
 int sg_commit_out_entry(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
                         const sg_commit *commit, const sg_commit_out_opts *opts);
 
