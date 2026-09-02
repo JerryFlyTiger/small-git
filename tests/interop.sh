@@ -15711,6 +15711,175 @@ check "phase59: an add/add conflict's -c --name-status still prints MM, not AA (
 p59_cmp_conflict "$P59D_ADDADD" "-c --name-status (add/add)" -c --name-status
 p59_cmp_conflict "$P59D_ADDADD" "--cc --name-status (add/add)" --cc --name-status
 
+# --- Phase 60a: --pretty=<name>/format:<str>/tformat:<str> and
+# --format=<...> for `sg log`/`sg show` -- the seven builtins (section 3),
+# the argument grammar (section 2), and the separator model (section 4).
+# Placeholder expansion (section 5) is Phase 60b and is NOT exercised here;
+# every fixture below uses either a builtin name or a literal format:/
+# tformat: string with no '%' in it, which already renders in this phase.
+P60="$WORKDIR/p60_pretty"
+mkdir -p "$P60"
+(cd "$WORKDIR" && LC_ALL=C git init -q -b master p60_pretty) > /dev/null 2>&1
+P60_GIT_PINS="-c core.abbrev=7"
+p60commit() {
+    ( cd "$P60" &&
+      GIT_AUTHOR_NAME="A U Thor" GIT_AUTHOR_EMAIL="author@example.com" \
+      GIT_AUTHOR_DATE="2023-11-14T12:00:00 +0000" \
+      GIT_COMMITTER_NAME="C O Mitter" GIT_COMMITTER_EMAIL="committer@example.com" \
+      GIT_COMMITTER_DATE="2023-11-17T12:00:00 +0000" \
+      LC_ALL=C git commit -q "$@" ) > /dev/null 2>&1
+}
+
+printf 'base\n' > "$P60/f.txt"
+(cd "$P60" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+# A body on the root commit -- oracle round 2's own finding: `short` was
+# printing the whole body where git prints subject only, and no PRE-existing
+# fixture in this group ever gave a commit a body to catch it.
+p60commit -m root -m "body first line"
+P60_ROOT=$(cd "$P60" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+printf 'base\nsecond\n' > "$P60/f.txt"
+(cd "$P60" && LC_ALL=C git add f.txt) > /dev/null 2>&1
+p60commit -m "second subject"
+P60_HEAD=$(cd "$P60" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+(cd "$P60" && LC_ALL=C git checkout -qb p60side "$P60_ROOT") > /dev/null 2>&1
+printf 'other\n' > "$P60/g.txt"
+(cd "$P60" && LC_ALL=C git add g.txt) > /dev/null 2>&1
+p60commit -m "other branch commit"
+P60_SIDE=$(cd "$P60" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+(cd "$P60" && LC_ALL=C git checkout -q master) > /dev/null 2>&1
+( cd "$P60" &&
+  GIT_AUTHOR_NAME="A U Thor" GIT_AUTHOR_EMAIL="author@example.com" \
+  GIT_AUTHOR_DATE="2023-11-14T12:00:00 +0000" \
+  GIT_COMMITTER_NAME="C O Mitter" GIT_COMMITTER_EMAIL="committer@example.com" \
+  GIT_COMMITTER_DATE="2023-11-17T12:00:00 +0000" \
+  LC_ALL=C git merge -q --no-edit "$P60_SIDE" -m "merge commit" ) > /dev/null 2>&1
+P60_MERGE=$(cd "$P60" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+# An annotated tag on the merge commit -- oracle round 2's own finding: the
+# tag header (Tagger:/Date:/TaggerDate:/the blank line before the target)
+# follows a DIFFERENT rule per builtin, not just --oneline.
+( cd "$P60" &&
+  GIT_AUTHOR_NAME="A U Thor" GIT_AUTHOR_EMAIL="author@example.com" \
+  GIT_AUTHOR_DATE="2023-11-14T12:00:00 +0000" \
+  GIT_COMMITTER_NAME="C O Mitter" GIT_COMMITTER_EMAIL="committer@example.com" \
+  GIT_COMMITTER_DATE="2023-11-17T12:00:00 +0000" \
+  LC_ALL=C git tag -a v1 -m "tag message" "$P60_MERGE" ) > /dev/null 2>&1
+
+check "phase60 oracle: precondition -- the merge fixture really has 2 parents" \
+    sh -c "test \$(cd '$P60' && LC_ALL=C git show -s --pretty=%P '$P60_MERGE' | wc -w) -eq 2"
+check "phase60 oracle: precondition -- author date (Nov 14) and committer date (Nov 17) fall on different days" \
+    sh -c "test \$(cd '$P60' && LC_ALL=C git show -s --pretty=%as '$P60_HEAD') != \$(cd '$P60' && LC_ALL=C git show -s --pretty=%cs '$P60_HEAD')"
+
+p60_cmp() {
+    p60tag="$1"; shift
+    (cd "$P60" && LC_ALL=C git $P60_GIT_PINS show --no-decorate "$@") > "$WORKDIR/p60_git_$p60tag.txt" 2>&1
+    (cd "$P60" && "$SG" show "$@") > "$WORKDIR/p60_sg_$p60tag.txt" 2>&1
+}
+
+# --- section 3: the seven builtins, on a non-merge, a merge, and a root
+# commit -- byte-exact against real git.
+for p60fmt in oneline short medium full fuller raw reference; do
+    p60_cmp "builtin_${p60fmt}_head" --pretty=$p60fmt "$P60_HEAD"
+    check "phase60: sg show --pretty=$p60fmt matches git (non-merge)" \
+        cmp -s "$WORKDIR/p60_sg_builtin_${p60fmt}_head.txt" "$WORKDIR/p60_git_builtin_${p60fmt}_head.txt"
+
+    p60_cmp "builtin_${p60fmt}_merge" --pretty=$p60fmt "$P60_MERGE"
+    check "phase60: sg show --pretty=$p60fmt matches git (merge)" \
+        cmp -s "$WORKDIR/p60_sg_builtin_${p60fmt}_merge.txt" "$WORKDIR/p60_git_builtin_${p60fmt}_merge.txt"
+
+    p60_cmp "builtin_${p60fmt}_root" --pretty=$p60fmt "$P60_ROOT"
+    check "phase60: sg show --pretty=$p60fmt matches git (root commit)" \
+        cmp -s "$WORKDIR/p60_sg_builtin_${p60fmt}_root.txt" "$WORKDIR/p60_git_builtin_${p60fmt}_root.txt"
+done
+
+check "phase60: --format=<name> is accepted the same way as --pretty=<name>" \
+    sh -c "(cd '$P60' && '$SG' show --format=oneline -s '$P60_HEAD') | grep -q 'second subject'"
+
+check "phase60: sg show --pretty=short prints SUBJECT ONLY, not the body" \
+    sh -c "! (cd '$P60' && '$SG' show --pretty=short -s '$P60_ROOT') | grep -q 'body first line'"
+check "phase60 oracle: precondition -- real git also omits the body under --pretty=short" \
+    sh -c "! (cd '$P60' && LC_ALL=C git show --pretty=short -s '$P60_ROOT') | grep -q 'body first line'"
+check "phase60 oracle: precondition -- the root commit really does carry a body" \
+    sh -c "(cd '$P60' && LC_ALL=C git show --pretty=raw -s '$P60_ROOT') | grep -q 'body first line'"
+
+# --- annotated tag header, one named check per builtin (section 3's oracle
+# round 2 finding): oneline/reference omit Tagger:/blank-before-target,
+# only medium/fuller show a date line, fuller pads to 12 columns.
+for p60fmt in oneline short medium full fuller raw reference; do
+    p60_cmp "tag_${p60fmt}" --pretty=$p60fmt v1
+    check "phase60: sg show --pretty=$p60fmt matches git on an annotated tag" \
+        cmp -s "$WORKDIR/p60_sg_tag_${p60fmt}.txt" "$WORKDIR/p60_git_tag_${p60fmt}.txt"
+done
+
+# --- section 4: the separator matrix, entry format x {-p, --stat,
+# --name-status}, for `sg show`.
+for p60entry in "format:plain" "tformat:plain" "oneline"; do
+    for p60diffflag in "-p" "--stat" "--name-status"; do
+        p60safe=$(printf '%s_%s' "$p60entry" "$p60diffflag" | tr -c 'A-Za-z0-9' '_')
+        p60_cmp "sep_$p60safe" --pretty="$p60entry" $p60diffflag "$P60_HEAD"
+        check "phase60: sg show --pretty=$p60entry $p60diffflag separator matches git" \
+            cmp -s "$WORKDIR/p60_sg_sep_$p60safe.txt" "$WORKDIR/p60_git_sep_$p60safe.txt"
+    done
+done
+# the stat+patch "---" separator, section 4's cross-reference to Phase 54's
+# rule -- exercised for format:/tformat: as well as a builtin, since the
+# spec calls out that a user format must be measured separately.
+for p60entry in "format:plain" "tformat:plain" "oneline"; do
+    p60safe=$(printf '%s' "$p60entry" | tr -c 'A-Za-z0-9' '_')
+    p60_cmp "statpatch_$p60safe" --pretty="$p60entry" --stat -p "$P60_HEAD"
+    check "phase60: sg show --pretty=$p60entry --stat -p matches git (--- rule)" \
+        cmp -s "$WORKDIR/p60_sg_statpatch_$p60safe.txt" "$WORKDIR/p60_git_statpatch_$p60safe.txt"
+done
+
+# --- section 4: between-entry behavior for `sg log -2` -- format: joins
+# with a single '\n' and no trailing newline, tformat:/oneline terminate
+# each entry with none between, other builtins keep today's blank line.
+p60log_cmp() {
+    p60tag="$1"; shift
+    (cd "$P60" && LC_ALL=C git $P60_GIT_PINS log --no-decorate "$@") > "$WORKDIR/p60_git_log_$p60tag.txt" 2>&1
+    (cd "$P60" && "$SG" log "$@") > "$WORKDIR/p60_sg_log_$p60tag.txt" 2>&1
+}
+for p60entry in "format:plain" "tformat:plain" "oneline" "medium" "reference"; do
+    p60safe=$(printf '%s' "$p60entry" | tr -c 'A-Za-z0-9' '_')
+    p60log_cmp "$p60safe" -2 --pretty="$p60entry" "$P60_HEAD"
+    check "phase60: sg log -2 --pretty=$p60entry between-entry separator matches git" \
+        cmp -s "$WORKDIR/p60_sg_log_$p60safe.txt" "$WORKDIR/p60_git_log_$p60safe.txt"
+done
+# reference joins the no-separator set between LOG ENTRIES even though its
+# own entry-diff separator (an ordinary blank line) does not -- oracle round
+# 2's finding, exercised at -3 (more than 2 entries) to rule out an
+# off-by-one that only a 2-entry fixture could hide.
+p60log_cmp "reference3" -3 --pretty=reference "$P60_HEAD"
+check "phase60: sg log -3 --pretty=reference between-entry separator matches git" \
+    cmp -s "$WORKDIR/p60_sg_log_reference3.txt" "$WORKDIR/p60_git_log_reference3.txt"
+p60log_cmp "format_plain_p" -2 --pretty="format:plain" -p "$P60_HEAD"
+check "phase60: sg log -2 --pretty=format:plain -p matches git (entry+diff+entry+diff join)" \
+    cmp -s "$WORKDIR/p60_sg_log_format_plain_p.txt" "$WORKDIR/p60_git_log_format_plain_p.txt"
+
+# --- section 2: grammar. Case-insensitive builtin lookup, format:/tformat:
+# case sensitivity, "contains a %" -> tformat (not yet expandable -- sg
+# rejects it, see below), and rule 5's error. Bare --pretty means medium,
+# bare --format is an error.
+check "phase60: --pretty=Oneline resolves the builtin (case-insensitive)" \
+    sh -c "(cd '$P60' && '$SG' show --pretty=Oneline -s '$P60_HEAD') | grep -q '^[0-9a-f]\{40\} second subject\$'"
+check "phase60: --pretty=oneline%H is NOT the oneline builtin (whole-string match, not prefix)" \
+    sh -c "(cd '$P60' && '$SG' show --pretty=oneline%H -s '$P60_HEAD') 2>&1 | grep -q 'not supported yet'"
+check "phase60: --pretty=abc (matches nothing) is rejected" \
+    sh -c "! (cd '$P60' && '$SG' show --pretty=abc -s '$P60_HEAD') > /dev/null 2>&1"
+check "phase60 oracle: precondition -- real git also rejects --pretty=abc" \
+    sh -c "! (cd '$P60' && LC_ALL=C git show --pretty=abc -s '$P60_HEAD') > /dev/null 2>&1"
+(cd "$P60" && LC_ALL=C git $P60_GIT_PINS show --no-decorate --pretty -s "$P60_HEAD") > "$WORKDIR/p60_git_bare_pretty.txt" 2>&1
+(cd "$P60" && "$SG" show --pretty -s "$P60_HEAD") > "$WORKDIR/p60_sg_bare_pretty.txt" 2>&1
+check "phase60: bare --pretty (no '=') means medium" \
+    cmp -s "$WORKDIR/p60_sg_bare_pretty.txt" "$WORKDIR/p60_git_bare_pretty.txt"
+check "phase60: bare --format (no '=') is an error, exit non-zero" \
+    sh -c "! (cd '$P60' && '$SG' show --format -s '$P60_HEAD') > /dev/null 2>&1"
+check "phase60 oracle: precondition -- real git also rejects bare --format" \
+    sh -c "! (cd '$P60' && LC_ALL=C git show --format -s '$P60_HEAD') > /dev/null 2>&1"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

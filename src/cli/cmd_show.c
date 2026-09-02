@@ -22,7 +22,7 @@
 
 static const char USAGE[] =
     "usage: sg show [-s] [-p|--patch] [--stat] [--name-only] [--name-status] "
-    "[--oneline] [<object>...]\n";
+    "[--oneline] [--pretty[=<fmt>]|--format=<fmt>] [<object>...]\n";
 
 /* Phase 59 spec section 2: five bits, NOT Phase 55a's "last one wins" over
    just {patch, stat}. Measured over 29 flag combinations, and one detail
@@ -43,7 +43,36 @@ typedef struct {
     int name_only;
     int name_status;
     int no_output; /* -s, and only while nothing since has cleared it */
+    /* Phase 60: --pretty/--format. Deliberately NOT one of the format_seen
+       bits above -- measured, `git show --pretty=oneline` with no other
+       flag still defaults to printing a patch, and `-s` still suppresses it
+       exactly as it would without --pretty. pretty_set tells
+       resolve_commit_out_opts whether to hand out a pointer to `pretty`;
+       `pretty` itself lives here (not on sg_cmd_show's stack as a bare
+       local) so its address stays valid for as long as `flags` does, which
+       is the entire render loop. */
+    int pretty_set;
+    sg_pretty_format pretty;
 } show_flags;
+
+/* Mirrors cmd_log.c's own resolve_pretty_arg (not shared via a header --
+   each command's diagnostic differs only in the exit convention, and
+   there's no third caller to justify extracting a fourth file for two
+   nearly-identical wrappers around sg_pretty_parse). Returns 0 with *out
+   filled, or -1 having already printed a diagnostic. */
+static int resolve_pretty_arg(const char *raw, sg_pretty_format *out)
+{
+    if (sg_pretty_parse(raw, out) != 0) {
+        fprintf(stderr, "sg: invalid --pretty format: %s\n", raw);
+        return -1;
+    }
+    if ((out->kind == SG_PRETTY_FORMAT || out->kind == SG_PRETTY_TFORMAT) &&
+       strchr(out->user_format, '%') != NULL) {
+        fprintf(stderr, "sg: --pretty format placeholders are not supported yet\n");
+        return -1;
+    }
+    return 0;
+}
 
 /* Same bound sg_rev_parse_commit's own tag-peeling loop uses, for the same
    reason: a self-referential or cyclic chain of tag objects must fail
@@ -109,6 +138,12 @@ static void resolve_commit_out_opts(const show_flags *f, sg_commit_out_opts *o)
     o->name_status = f->name_status;
     o->patch = f->patch;
     o->stat = f->stat;
+    /* Phase 60: --pretty/--format, borrowed from `flags` itself (see
+       show_flags's own comment on why `pretty` lives there rather than on
+       some caller's stack frame) -- deliberately NOT part of format_seen
+       below, measured (`git show --pretty=oneline` alone still defaults to
+       a patch). */
+    o->pretty = f->pretty_set ? &f->pretty : NULL;
     /* Default is a patch -- measured, and differs from `sg stash show`,
        whose default is --stat. --oneline does NOT count as a format
        selector here: `git show --oneline` still prints the patch. */
@@ -130,6 +165,99 @@ static void resolve_commit_out_opts(const show_flags *f, sg_commit_out_opts *o)
        guarantees at most one of {name_only, name_status, no_output}
        survives to here, so there is no simultaneous-both-set case to
        arbitrate. */
+}
+
+/* Phase 60a oracle round 2: an ANNOTATED TAG's header follows a DIFFERENT
+   rule per builtin -- not just oneline. Measured against real git 2.55.0,
+   all seven rows (fixture: an annotated tag on a merge commit):
+
+     format     Tagger:   date line          blank before target
+     oneline    no        no                 no
+     short      yes       no                 yes
+     medium     yes       Date:              yes
+     full       yes       no                 yes
+     fuller     yes       TaggerDate: (12)   yes
+     raw        yes       no                 yes
+     reference  yes       no                 no
+
+   The pattern (deliberately captured as data, not seven `if`s, so a future
+   format only has to add one table row): a date line appears ONLY for
+   medium/fuller (the same two that show a date line on a COMMIT header),
+   and the post-message blank line before the target is suppressed ONLY for
+   oneline/reference (the same two whose ENTRY rendering carries no
+   separator elsewhere in this file). fuller additionally right-pads each
+   label to a 12-column field and calls the date line "TaggerDate:", same
+   as its commit-header counterpart. */
+typedef struct {
+    int show_tagger;
+    int show_date;      /* Date:/TaggerDate: line */
+    int fuller_pad;      /* pad label to 12 cols, use "TaggerDate:" */
+    int blank_before_target;
+} tag_header_shape;
+
+/* Legacy --oneline (no --pretty at all) reuses the builtin oneline row, and
+   legacy medium (neither --oneline nor --pretty) reuses the builtin medium
+   row -- both are the pre-Phase-60 behavior, unchanged. */
+static tag_header_shape resolve_tag_header_shape(const show_flags *f)
+{
+    sg_pretty_kind kind;
+    tag_header_shape s;
+
+    if (f->pretty_set)
+        kind = f->pretty.kind;
+    else
+        kind = f->oneline ? SG_PRETTY_ONELINE : SG_PRETTY_MEDIUM;
+
+    s.show_tagger = 1;
+    s.show_date = 0;
+    s.fuller_pad = 0;
+    s.blank_before_target = 1;
+
+    switch (kind) {
+    case SG_PRETTY_ONELINE:
+        s.show_tagger = 0;
+        s.blank_before_target = 0;
+        break;
+    case SG_PRETTY_REFERENCE:
+        s.blank_before_target = 0;
+        break;
+    case SG_PRETTY_MEDIUM:
+        s.show_date = 1;
+        break;
+    case SG_PRETTY_FULLER:
+        s.show_date = 1;
+        s.fuller_pad = 1;
+        break;
+    case SG_PRETTY_SHORT:
+    case SG_PRETTY_FULL:
+    case SG_PRETTY_RAW:
+    case SG_PRETTY_FORMAT:
+    case SG_PRETTY_TFORMAT:
+    case SG_PRETTY_LEGACY:
+    default:
+        /* short/full/raw's measured row, and the fallback for a user
+           format (FORMAT/TFORMAT) pointing at a tag -- untested by the
+           Phase 60a oracle (that is 60b's placeholder-rendering territory),
+           kept at this shape rather than guessed further. */
+        break;
+    }
+    return s;
+}
+
+/* True when a NESTED target (immediately following an annotated tag) must
+   NOT get its leading blank line. Phase 59 measured this for legacy
+   --oneline; Phase 60a's oracle additionally measured it for the
+   `reference` builtin (both oneline and reference tag headers omit the
+   blank line described in tag_header_shape's own comment above; every
+   other one of the seven builtins does not). Kept as its own predicate
+   (mirroring resolve_tag_header_shape's blank_before_target, but callable
+   from the COMMIT/TAG/TREE cases below, which do not have a
+   tag_header_shape in hand -- only the tag case does). */
+static int nested_target_suppresses_blank(const show_flags *f)
+{
+    if (f->pretty_set)
+        return f->pretty.kind == SG_PRETTY_ONELINE || f->pretty.kind == SG_PRETTY_REFERENCE;
+    return f->oneline;
 }
 
 /* Phase 55b: `sg show <merge>` renders a 2-parent merge (a dense combined
@@ -710,9 +838,13 @@ static int render_id(const char *git_dir, const char *display_arg,
            commit header that follows it (measured; the same fixture without
            --oneline DOES get the blank line, so this is not a general
            --oneline rule, only a tag-then-oneline-commit one). Scoped as
-           tightly as the condition can express: `nested && flags->oneline`
-           can only ever be true immediately below an annotated tag. */
-        if (entry_like && (nested || *shown) && !(nested && flags->oneline))
+           tightly as the condition can express: nested_target_suppresses_blank(flags)
+           can only ever be true immediately below an annotated tag.
+
+           Phase 60a: the builtin `reference` format joins legacy --oneline
+           here too -- see nested_target_suppresses_blank's own comment and
+           tag_header_shape's truth table just above resolve_commit_out_opts. */
+        if (entry_like && (nested || *shown) && !(nested && nested_target_suppresses_blank(flags)))
             printf("\n");
 
         if (commit.parent_count > 1) {
@@ -783,11 +915,28 @@ static int render_id(const char *git_dir, const char *display_arg,
            55a bug, not introduced by Phase 59: the 50 flag combinations
            that phase claimed to have pinned byte-for-byte never actually
            combined --oneline with an annotated tag target. Same old/new
-           behavior reproduced on a pre-Phase-59 build, confirming this. */
-        printf("tag %s\n", tag.tag_name);
-        if (!flags->oneline) {
-            printf("Tagger: %s <%s>\n", tag.tagger_name, tag.tagger_email);
-            printf("Date:   %s\n", timebuf);
+           behavior reproduced on a pre-Phase-59 build, confirming this.
+
+           Phase 60a: every one of the seven --pretty builtins has its OWN
+           row of this table, not just oneline -- see resolve_tag_header_shape's
+           own comment for the measured truth table and the reasoning for
+           keeping it data-driven rather than one `if` per format. */
+        {
+            tag_header_shape shape = resolve_tag_header_shape(flags);
+
+            printf("tag %s\n", tag.tag_name);
+            if (shape.show_tagger) {
+                if (shape.fuller_pad)
+                    printf("%-12s%s <%s>\n", "Tagger:", tag.tagger_name, tag.tagger_email);
+                else
+                    printf("Tagger: %s <%s>\n", tag.tagger_name, tag.tagger_email);
+            }
+            if (shape.show_date) {
+                if (shape.fuller_pad)
+                    printf("%-12s%s\n", "TaggerDate:", timebuf);
+                else
+                    printf("Date:   %s\n", timebuf);
+            }
         }
         if (tag.message != NULL && tag.message[0] != '\0')
             printf("\n%s", tag.message);
@@ -884,11 +1033,27 @@ int sg_cmd_show(int argc, char **argv)
     flags.name_status = 0;
     flags.no_output = 0;
     flags.format_seen = 0;
+    flags.pretty_set = 0;
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
 
-        if (strcmp(a, "-s") == 0) {
+        if (strcmp(a, "--pretty") == 0) {
+            /* Bare --pretty (no '=') is legal and means medium -- measured
+               asymmetry with bare --format below, CLAUDE.md's `sg log`
+               grammar section has the full table (shared with `sg show`). */
+            if (resolve_pretty_arg("medium", &flags.pretty) != 0)
+                return 1;
+            flags.pretty_set = 1;
+        } else if (strncmp(a, "--pretty=", 9) == 0) {
+            if (resolve_pretty_arg(a + 9, &flags.pretty) != 0)
+                return 1;
+            flags.pretty_set = 1;
+        } else if (strncmp(a, "--format=", 9) == 0) {
+            if (resolve_pretty_arg(a + 9, &flags.pretty) != 0)
+                return 1;
+            flags.pretty_set = 1;
+        } else if (strcmp(a, "-s") == 0) {
             /* -s CLEARS every one of the five bits, then sets no_output --
                see show_flags's own comment for the full model and why an
                explicit format request (-p/--stat, but NOT --name-only/

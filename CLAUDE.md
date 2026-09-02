@@ -293,7 +293,10 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   every flag combination (measured), so the renderer lives in
   `src/cli/commit_out.c` (`sg_commit_out_entry`) and **neither command owns a
   copy**. Phase 54's `phase54` interop group is what proves a change to it
-  did not move `sg log`.
+  did not move `sg log`. **`--pretty`/`--format` (Phase 60a) are also shared
+  this way** -- see the dedicated `--pretty=<name>` bullet under `sg log`
+  below for the grammar, the seven builtins and the separator model; both
+  commands go through the exact same `sg_pretty_parse` + `sg_commit_out_entry`.
   WARNING: **`--oneline` changes an ANNOTATED TAG's header, not just the
   commit's** (Phase 59, measured): it drops the `Tagger:` and `Date:` lines
   entirely, and drops the blank line between the tag message and the commit
@@ -471,10 +474,126 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   **Deliberately not implemented: `-- <pathspec>`** (path-limited history is
   git's history SIMPLIFICATION, not a filter over the same walk -- the same
   reason `--patience` is rejected rather than approximated), `--graph`,
-  `--format`/`--pretty`, `--date=`, `--author=`/`--grep=`, `--reverse`,
-  `--all`, and `-c`/`--cc`. All are rejected with the usage line and exit 1,
-  never silently ignored.
-- **Joining `base/rel` always goes through `sg_path_join`**
+  `--date=`, `--author=`/`--grep=`, `--reverse`, `--all`, and `-c`/`--cc`.
+  All are rejected with the usage line and exit 1, never silently ignored.
+  **`--pretty`/`--format` are implemented as of Phase 60a** (see the
+  dedicated bullet below) -- this list used to include them, they are gone
+  from it now that they exist rather than marked "fixed" in place, same
+  convention this file uses everywhere else for a closed gap.
+- **`--pretty=<name>` / `--format=<...>` select the entry's rendering,
+  shared verbatim between `sg log` and `sg show`** (Phase 60a,
+  `sg_pretty_parse` in `src/cli/commit_out.c`; `include/sg/commit_out.h`).
+  **The grammar is five ordered rules, and the ordering is load-bearing,
+  all measured against real git 2.55.0** (given the text after `=`, or the
+  literal `"medium"` for a bare `--pretty` with no `=`):
+  1. begins with the literal lowercase `format:` -> FORMAT (separator) mode.
+  2. begins with the literal lowercase `tformat:` -> TFORMAT (terminator) mode.
+  3. **case-insensitively** equals a builtin name -> that builtin.
+  4. contains a `%` anywhere -> TFORMAT mode, the whole string is the format.
+  5. otherwise -> error, exit 1 (git: 128, `fatal: invalid --pretty format: x`).
+
+  WARNING: **rules 1-2 are case-SENSITIVE while rule 3 is case-INSENSITIVE**
+  -- `--pretty=Oneline` resolves the builtin, but `--pretty=FORMAT:%H`
+  misses rule 1 entirely and falls through to rule 4, printing the literal
+  `FORMAT:` before the hash. The case fold is a hand-rolled ASCII-only
+  compare, not `strcasecmp` -- same reasoning as `sg_path_component_is_safe`
+  in `workdir.h`: locale-dependent folding has no business anywhere near an
+  ASCII identifier table.
+  WARNING: **rule 3 requires the WHOLE string to equal a builtin name, not a
+  prefix** -- `--pretty=oneline%H` is NOT the oneline builtin, it falls to
+  rule 4 (literal `oneline` then the hash).
+  WARNING: **a bare `--format=<str>` with neither a builtin name, a
+  `format:`/`tformat:` prefix, nor a `%` anywhere is REJECTED, the same as
+  `--pretty=<str>` would be** -- `--format=plain` is a rule-5 error on both
+  tools, measured; there is no separate "assume format: mode" fallback for
+  `--format=`.
+  **Placeholder expansion (the `%H`/`%an`/etc. table) is Phase 60b, not
+  implemented yet.** The grammar already classifies FORMAT/TFORMAT mode
+  correctly this phase (so a literal string with no `%`, e.g.
+  `format:plain`, already renders), but any string that actually contains a
+  `%` is rejected with "not supported yet", exit 1, at the CLI layer before
+  `sg_commit_out_entry` is ever called -- see that function's own
+  precondition comment.
+  **Bare `--pretty` (no `=`) means `medium`; bare `--format` (no `=`) is a
+  usage error** -- a measured asymmetry, reproduce it rather than "fixing"
+  it into a symmetric pair.
+  **The separator model (section 4 of the Phase 60 spec, `docs/DESIGN.md`'s
+  Phase 60a section has the full byte-level derivation) reduces to ONE rule
+  change, not a kind-by-kind dispatch**: `commit_out.c`'s existing blank-
+  line-or-`---`-before-the-diff print (unchanged since Phase 54) is skipped
+  only when `!o->oneline` -- Phase 60a's only change is widening that
+  exemption to also cover builtin `SG_PRETTY_ONELINE`. `format:`'s entries
+  simply never emit their own trailing newline, so the SAME separator bytes
+  that read as a blank line after every other kind's self-terminated entry
+  read as a single line break (or a `---` stuck directly onto the entry
+  text with no line break at all) after `format:`'s bare text -- this is
+  not a second rule, it falls out of `format:` entries having no terminator.
+  WARNING: **between LOG ENTRIES this is NOT the same rule as
+  entry-to-diff**, and needed independent measurement: `tformat:` entries
+  self-terminate and get NOTHING extra between them (opposite of its
+  entry-diff behavior, where it DOES get the blank line); `format:` entries
+  get exactly one `\n` printed before each entry but the first, with none
+  after the last (same as every builtin except `oneline`, which like
+  `tformat:` gets nothing between entries either).
+  WARNING: **`render_merge_diff` (`cmd_show.c`'s merge-specific diff
+  renderer) needed NO code changes for any of this** -- it already prints
+  its leading blank line unconditionally regardless of `o->oneline` (a
+  pre-existing, documented divergence: `git show --oneline <merge>` still
+  gets a blank line before `diff --cc`), which is coincidentally already
+  format-kind-agnostic; measured against a 2-parent merge with all three of
+  `format:`/`tformat:`/builtin `oneline`, zero mismatches with zero changes
+  to that function.
+  **`reference` uses the AUTHOR date, not the committer's** -- measured
+  with a fixture whose author date (Nov 14) and committer date (Nov 17)
+  fall three days apart (an ordinary ~100-second author/committer gap can
+  land on the same calendar day depending on time zone, and would not have
+  distinguished the two). The short `YYYY-MM-DD` form is a new function,
+  `sg_date_format_short` (`include/sg/date.h`), sharing `sg_date_format_normal`'s
+  shift-into-`tz` step via a factored `shift_tm` rather than a second,
+  independently-drifting implementation of the offset rule.
+  WARNING: **tab expansion is NOT "medium only"** -- an earlier note here
+  (written when only `oneline`/`medium` existed) undersold this: measured
+  directly, `full` and `fuller` also expand tabs to columns of 8, `short`
+  and `raw` do not, matching git's own "`cmit_fmt >= CMIT_FMT_MEDIUM`"
+  grouping. `oneline`'s subject line and `raw`'s message block leave a tab
+  raw.
+  **`sg_commit_out_opts` gained exactly one field for this**, `const
+  sg_pretty_format *pretty` (NULL means the pre-Phase-60 legacy path,
+  decided by the existing `oneline` bool) -- per this file's own Phase 29
+  shared-struct warning (Phase 59 broke `sg log -p` silently by adding two
+  bool fields to this exact struct without auditing every construction
+  site). All three construction sites were re-audited: `cmd_log.c` sets
+  `o.pretty = NULL;` explicitly; `cmd_show.c`'s `resolve_commit_out_opts`
+  derives it from a new `show_flags` field (storage kept ON `show_flags`
+  itself, not a bare local, so the borrowed pointer outlives the whole
+  render loop); the third site (`cmd_show.c`'s `header_o = o;` merge-header
+  copy) needed no change, being a whole-struct copy.
+  WARNING: **an ANNOTATED TAG's header follows a DIFFERENT rule per
+  builtin, not just `--oneline`** (found by a 212-probe external oracle,
+  round 2): `Tagger:`/`TaggerDate:` etc. is table-driven in
+  `resolve_tag_header_shape` (`cmd_show.c`) -- a date line (`Date:` or,
+  padded, `TaggerDate:`) appears ONLY for medium/fuller, the same two that
+  show a date on a COMMIT header; the blank line between the tag message
+  and its target is suppressed ONLY for oneline/reference. Phase 59's fix
+  branched directly on `flags->oneline`, so `--pretty=oneline` (which does
+  not set that bool) never reached it, and the other five builtins had
+  never been measured against a tag at all -- **always build a tag fixture
+  when adding a new commit-header format**, a commit-only fixture cannot
+  see this dimension.
+  WARNING: **`short` is SUBJECT-ONLY, same as `reference`** -- it does NOT
+  print the message body. Every Phase 60a-round-1 fixture happened to use a
+  one-line commit message, so `print_message(commit->message, 0)` (the full
+  body) looked byte-exact by coincidence; a body-bearing fixture is what
+  makes this observable. Use `print_message_subject_only`.
+  WARNING: **`reference` needs a SEPARATE rule for between-LOG-ENTRIES**,
+  independent of its entry-diff rule: `git log -N --pretty=reference`
+  prints entries back to back with NO blank line, while `git show
+  --pretty=reference -p` on one entry still gets the ordinary blank line
+  before its diff. These are two different separators measured
+  independently -- `cmd_log.c`'s `suppress_join` needed `SG_PRETTY_REFERENCE`
+  added to its OR-chain; `commit_out.c`'s `print_commit_diff` (the
+  entry-diff separator) is correctly untouched.
+- **Joining `base/rel` always goes through `sg_path_join`**- **Joining `base/rel` always goes through `sg_path_join`**
   (`include/sg/workdir.h`, Phase 21), buffer size uses `SG_PATH_MAX` from the
   same header. **Do not write a raw
   `snprintf(buf, sizeof buf, "%s/%s", ...)`**: a truncated path usually still

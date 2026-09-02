@@ -225,24 +225,60 @@ Use
 to discard the broken merge state.
 .SS log
 .B sg log
+.RB [ -n <count> | -<count> | --max-count= <count> ]
+.RB [ --oneline ]
+.RB [ --pretty [= <fmt> ]| --format= <fmt> ]
+.RB [ -p | --patch ]
+.RB [ --stat ]
+.RI [ rev ]
 .PP
 Prints the commit history starting at
-.BR HEAD ,
-one commit per entry (hash, author, date, message), in the familiar
+.B HEAD
+(or
+.IR rev ,
+if given), one commit per entry, in the familiar
 .B "git log"
-default format. Takes no arguments or flags.
+default format.
 .B "sg log"
 walks
 .B first-parent only
 \(em when a merge commit is encountered its other parents are not
 themselves visited (though the commit is flagged with a
 .B Merge:
-line listing all of its parents). There is no
-.BR --oneline ,
+line listing all of its parents, in the default format).
+.BI -n " count"
+(also
+.BI - count
+and
+.BI --max-count= count )
+limits how many entries are shown;
+.B "-n 0"
+is legal and prints nothing.
+.B --oneline
+prints
+.RI "<abbrev> " subject
+instead of the full header block.
+.B -p
+(or
+.BR --patch )
+and
+.B --stat
+attach each entry's own diff against its first parent (the empty tree for a
+root commit), the same rendering
+.B "sg show"
+uses. There is no
 .BR --graph ,
 path filtering, or any other
 .B "git log"
 option.
+.PP
+.B --pretty
+and
+.B --format
+select the entry's rendering; see
+.B "sg show"
+below for the full grammar and the seven built-in format names \(em both
+commands share the same renderer and the same rules.
 .SS show
 .B sg show
 .RB [ -s ]
@@ -250,6 +286,7 @@ option.
 .RB [ --stat ]
 .RB [ --name-only | --name-status ]
 .RB [ --oneline ]
+.RB [ --pretty [= <fmt> ]| --format= <fmt> ]
 .RI [ object ...]
 .PP
 Shows one or more objects: a commit (the default entry format, shared with
@@ -341,6 +378,66 @@ not just
 never refused. This dense row set differs from
 .BR --stat 's
 first-parent set \(em a path can appear in one and not the other.
+.PP
+.B --pretty
+and
+.B --format
+select the entry's rendering, shared with
+.BR "sg log" .
+The value is one of the seven built-in names
+.BR oneline ", " short ", " medium " (the default), " full ", " fuller ", "
+.BR raw " and " reference ,
+matched case-insensitively; or
+.BI format: str
+/
+.BI tformat: str
+for a user format string (case-sensitive prefixes); or a bare string
+containing a
+.B %
+placeholder, which is treated the same as
+.BI tformat: str .
+Placeholder expansion itself (the
+.B %H
+/
+.B %an
+/ etc. table) is not yet implemented \(em only a literal string with no
+.B %
+in it can be given this way today.
+.B --pretty
+with no
+.RI = fmt
+means
+.BR medium ;
+bare
+.B --format
+with no
+.RI = fmt
+is a usage error.
+.B oneline
+prints the full 40-hex id (unlike
+.BR --oneline ,
+which abbreviates); the two flags are independent of each other.
+Between an entry and its own diff,
+.B oneline
+and
+.BI format: str
+add no separator at all, while
+.BI tformat: str
+and every other built-in add the usual blank line (or
+.B ---
+when both
+.B --stat
+and
+.B -p
+are given). Between entries in
+.BR "sg log" ,
+.BI format: str
+joins with a single newline and adds none after the last entry;
+.BI tformat: str
+and
+.B oneline
+terminate each entry with nothing extra between them; every other built-in
+keeps the usual blank line between entries.
 .PP
 Real git always writes
 .B HEAD

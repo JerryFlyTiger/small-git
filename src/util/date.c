@@ -38,18 +38,15 @@ static int parse_tz(const char *tz, long *out)
     return 0;
 }
 
-int sg_date_format_normal(long long time_sec, const char *tz,
-                          char *out, size_t out_size)
+/* Shared by sg_date_format_normal and sg_date_format_short: shifts
+   time_sec into tz and fills *tmv. Returns 0, or -1 on the same overflow/
+   invalid-conversion failures both callers report. */
+static int shift_tm(long long time_sec, const char *tz, struct tm *tmv)
 {
     long offset = 0;
     long long shifted;
     time_t t;
-    struct tm tmv;
-    int written;
 
-    if (out == NULL || out_size == 0)
-        return -1;
-    out[0] = '\0';
     if (tz == NULL)
         tz = "+0000";
     if (parse_tz(tz, &offset) != 0)
@@ -59,9 +56,25 @@ int sg_date_format_normal(long long time_sec, const char *tz,
     t = (time_t)shifted;
     if ((long long)t != shifted)
         return -1;
-    if (gmtime_r(&t, &tmv) == NULL)
+    if (gmtime_r(&t, tmv) == NULL)
         return -1;
-    if (tmv.tm_wday < 0 || tmv.tm_wday > 6 || tmv.tm_mon < 0 || tmv.tm_mon > 11)
+    if (tmv->tm_wday < 0 || tmv->tm_wday > 6 || tmv->tm_mon < 0 || tmv->tm_mon > 11)
+        return -1;
+    return 0;
+}
+
+int sg_date_format_normal(long long time_sec, const char *tz,
+                          char *out, size_t out_size)
+{
+    struct tm tmv;
+    int written;
+
+    if (out == NULL || out_size == 0)
+        return -1;
+    out[0] = '\0';
+    if (tz == NULL)
+        tz = "+0000";
+    if (shift_tm(time_sec, tz, &tmv) != 0)
         return -1;
 
     /* Day of month with %d, not %02d: git pads neither. */
@@ -69,6 +82,27 @@ int sg_date_format_normal(long long time_sec, const char *tz,
                        WDAY[tmv.tm_wday], MON[tmv.tm_mon], tmv.tm_mday,
                        tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
                        tmv.tm_year + 1900, tz);
+    if (written < 0 || (size_t)written >= out_size) {
+        out[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
+int sg_date_format_short(long long time_sec, const char *tz,
+                         char *out, size_t out_size)
+{
+    struct tm tmv;
+    int written;
+
+    if (out == NULL || out_size == 0)
+        return -1;
+    out[0] = '\0';
+    if (shift_tm(time_sec, tz, &tmv) != 0)
+        return -1;
+
+    written = snprintf(out, out_size, "%04d-%02d-%02d",
+                       tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday);
     if (written < 0 || (size_t)written >= out_size) {
         out[0] = '\0';
         return -1;
