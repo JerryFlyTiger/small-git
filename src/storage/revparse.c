@@ -395,3 +395,163 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
     memcpy(commit_id_out, id, SG_SHA1_RAW_LEN);
     return 0;
 }
+
+/* Splits `arg` at `colon` and resolves the left side as a commit (peeling,
+   via sg_rev_parse_commit), then walks its tree component by component to
+   find the entry named by the right side (an empty right side means the
+   commit's own tree). Returns 0 with *id_out and *type_out filled in; -1 if
+   `rev` itself does not resolve or is too long; -2 if `rev` resolved but
+   `path` does not exist inside its tree, with bad_path filled with `path`
+   (truncation of `path` into bad_path is folded into -1, not -2, matching
+   the header's "truncation is a hard failure" note). Prints nothing. */
+static int resolve_rev_path(const char *git_dir, const char *arg, const char *colon,
+                            unsigned char id_out[SG_SHA1_RAW_LEN], sg_obj_type *type_out,
+                            char *bad_path, size_t bad_path_size)
+{
+    char rev[SG_PATH_MAX];
+    unsigned char commit_id[SG_SHA1_RAW_LEN];
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    const char *path;
+    size_t rev_len = (size_t)(colon - arg);
+
+    if (rev_len >= sizeof(rev))
+        return -1;
+    memcpy(rev, arg, rev_len);
+    rev[rev_len] = '\0';
+    path = colon + 1;
+
+    if (sg_rev_parse_commit(git_dir, rev, commit_id) != 0)
+        return -1;
+    if (sg_commit_tree_of(git_dir, commit_id, tree_id) != 0)
+        return -1;
+
+    if (path[0] == '\0') {
+        memcpy(id_out, tree_id, SG_SHA1_RAW_LEN);
+        *type_out = SG_OBJ_TREE;
+        return 0;
+    }
+
+    if (strlen(path) >= bad_path_size)
+        return -1;
+    strcpy(bad_path, path);
+
+    {
+        char pathbuf[SG_PATH_MAX];
+        char *saveptr = NULL;
+        char *comp;
+        unsigned char cur_id[SG_SHA1_RAW_LEN];
+
+        if (strlen(path) >= sizeof(pathbuf))
+            return -2;
+        strcpy(pathbuf, path);
+        memcpy(cur_id, tree_id, SG_SHA1_RAW_LEN);
+
+        for (comp = strtok_r(pathbuf, "/", &saveptr); comp != NULL;
+            comp = strtok_r(NULL, "/", &saveptr)) {
+            unsigned char *content;
+            size_t content_len;
+            sg_obj_type type;
+            sg_tree tree;
+            size_t i;
+            int found = 0;
+
+            if (sg_object_read(git_dir, cur_id, &type, &content, &content_len) != 0)
+                return -2;
+            /* A SUCCESSFUL read of a non-tree still owns `content`: reached
+               whenever a middle component names a file rather than a
+               directory (`HEAD:f.txt/x`, an ordinary typo), so folding this
+               into the condition above leaked the whole decompressed blob. */
+            if (type != SG_OBJ_TREE) {
+                free(content);
+                return -2;
+            }
+            if (sg_tree_parse(content, content_len, &tree) != 0) {
+                free(content);
+                return -2;
+            }
+            free(content);
+
+            for (i = 0; i < tree.count; i++) {
+                if (strcmp(tree.entries[i].name, comp) == 0) {
+                    memcpy(cur_id, tree.entries[i].sha1, SG_SHA1_RAW_LEN);
+                    found = 1;
+                    break;
+                }
+            }
+            sg_tree_free(&tree);
+
+            if (!found)
+                return -2;
+        }
+
+        {
+            unsigned char *content;
+            size_t content_len;
+
+            if (sg_object_read(git_dir, cur_id, type_out, &content, &content_len) != 0)
+                return -2;
+            free(content);
+        }
+        memcpy(id_out, cur_id, SG_SHA1_RAW_LEN);
+        return 0;
+    }
+}
+
+int sg_rev_parse_object(const char *git_dir, const char *arg,
+                        unsigned char id_out[SG_SHA1_RAW_LEN], sg_obj_type *type_out,
+                        char *bad_path, size_t bad_path_size)
+{
+    const char *colon = strchr(arg, ':');
+    char ref_path[SG_PATH_MAX];
+
+    if (colon != NULL)
+        return resolve_rev_path(git_dir, arg, colon, id_out, type_out, bad_path, bad_path_size);
+
+    if (strlen(arg) == SG_SHA1_HEX_LEN && sg_hex_to_sha1(arg, id_out) == 0) {
+        unsigned char *content;
+        size_t content_len;
+
+        /* -3, not -1: the argument IS a well-formed object id, so calling it
+           "not a valid object name" would name the wrong problem -- the
+           object is missing or unreadable (a packed REF_DELTA whose base is
+           gone, say). interop pins that distinction. */
+        if (sg_object_read(git_dir, id_out, type_out, &content, &content_len) != 0)
+            return -3;
+        free(content);
+        return 0;
+    }
+
+    /* A tag must not be peeled: resolve to a ref path and read the id it
+       names directly (whatever object that turns out to be), only falling
+       back to sg_rev_parse_commit (which does peel, and understands
+       ~/^/@{N} suffixes) when the name isn't a ref at all. */
+    if (sg_rev_parse_ref_path(git_dir, arg, ref_path, sizeof(ref_path)) == 0) {
+        int rc;
+
+        /* HEAD is a symref, not a raw-oid file -- same special case
+           sg_rev_parse_commit's own caller makes above, for the same
+           reason: sg_ref_read_path would try to hex-decode the
+           "ref: ..." line and fail. */
+        if (strcmp(ref_path, "HEAD") == 0)
+            rc = sg_ref_resolve_head(git_dir, id_out);
+        else
+            rc = sg_ref_read_path(git_dir, ref_path, id_out);
+
+        if (rc == 0) {
+            unsigned char *content;
+            size_t content_len;
+
+            if (sg_object_read(git_dir, id_out, type_out, &content, &content_len) != 0)
+                return -1;
+            free(content);
+            return 0;
+        }
+    }
+
+    if (sg_rev_parse_commit(git_dir, arg, id_out) == 0) {
+        *type_out = SG_OBJ_COMMIT;
+        return 0;
+    }
+
+    return -1;
+}

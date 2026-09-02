@@ -6,6 +6,8 @@
 #include "sg/object.h"
 #include "sg/quote.h"
 #include "sg/repo.h"
+#include "sg/revparse.h"
+#include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,15 +75,48 @@ int sg_cmd_cat_file(int argc, char **argv)
         return 1;
     }
 
-    if (strlen(hex_arg) != SG_SHA1_HEX_LEN || sg_hex_to_sha1(hex_arg, id) != 0) {
-        fprintf(stderr, "sg: not a valid object name '%s'\n", hex_arg);
-        return 1;
-    }
-
     git_dir = sg_require_git_dir();
     if (git_dir == NULL)
         return 1;
 
+    {
+        char bad_path[SG_PATH_MAX];
+        int resolve_rc;
+
+        bad_path[0] = '\0';
+        resolve_rc = sg_rev_parse_object(git_dir, hex_arg, id, &type, bad_path, sizeof(bad_path));
+        /* A well-formed id whose object cannot be read is missing or
+           corrupt, NOT an invalid name -- interop pins the wording,
+           because naming the wrong problem sends the reader to the
+           wrong place (a packed REF_DELTA with a vanished base). */
+        if (resolve_rc == -3) {
+            fprintf(stderr, "sg: object '%s' not found or corrupt\n", hex_arg);
+            free(git_dir);
+            return 1;
+        }
+        if (resolve_rc == -2) {
+            const char *colon = strchr(hex_arg, ':');
+            char rev[SG_PATH_MAX];
+            size_t rev_len = colon != NULL ? (size_t)(colon - hex_arg) : 0;
+
+            if (rev_len >= sizeof(rev))
+                rev_len = sizeof(rev) - 1;
+            memcpy(rev, hex_arg, rev_len);
+            rev[rev_len] = '\0';
+            fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", bad_path, rev);
+            free(git_dir);
+            return 1;
+        }
+        if (resolve_rc != 0) {
+            fprintf(stderr, "sg: not a valid object name '%s'\n", hex_arg);
+            free(git_dir);
+            return 1;
+        }
+    }
+
+    /* sg_rev_parse_object only resolves the id/type, it does not hand back
+       the object's decompressed bytes -- read those separately, the same
+       object it just proved exists. */
     if (sg_object_read(git_dir, id, &type, &content, &content_len) != 0) {
         fprintf(stderr, "sg: object '%s' not found or corrupt\n", hex_arg);
         free(git_dir);
