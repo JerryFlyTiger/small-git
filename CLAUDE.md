@@ -2071,6 +2071,54 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   WARNING: **the deliberate divergence list gained a fifth entry**: `sg
   commit` is blocked while a cherry-pick/revert is stopped where real git
   lets it finish the pick. See the numbered list below.
+- **`sg rebase --quit` exists as of Phase 58** -- the same escape-hatch
+  shape as `sg_pick_quit` above, ported to rebase because rebase had the
+  exact same dead end: with `.git/sg-rebase/current`, `onto`, or
+  `orig-branch` damaged, all three of `--continue`/`--skip`/`--abort`
+  refuse (two of the three messages name `--abort`, which had itself just
+  failed for the same reason), while `sg switch`/`sg commit` stay blocked
+  (both gate on `sg_rebase_state_exists`, existence only), leaving no exit
+  but hand-editing files under `.git/sg-rebase/`. Measured against real git
+  2.55.0 first: `git rebase --abort`/`--skip`/`--continue` refuse
+  IDENTICALLY on the same damaged `rebase-merge/onto`, and `git rebase
+  --quit` is real git's own way out. **This is why the fix is a new
+  subcommand, not loosened behavior on the existing three** -- loosening
+  any of `--abort`/`--skip`/`--continue` would be sg inventing behavior
+  real git does not have, the exact mistake Phase 57's own spec made twice
+  (see the reflog-wording and exit-code WARNINGs above). `do_rebase_quit`
+  (`src/cli/cmd_rebase.c`) is a five-line wrapper, same discipline as
+  `sg_pick_quit`: it parses nothing, `sg_rebase_state_exists` (stat-only)
+  decides, `sg_rebase_state_remove` (plain `remove()`-by-name) does the
+  work, and nothing about it reads `onto`/`current`/`orig-branch`/`todo`.
+  WARNING: **`--quit` does not move HEAD and does not touch the index or
+  working tree** -- measured on a healthy paused rebase: HEAD stays
+  detached exactly where the pause left it (never returned to the original
+  branch), and a conflicted `UU` path is still `UU` afterward. Confusing
+  this with cherry-pick's `--abort` (which DOES restore things) or with
+  rebase's OWN `--abort` (which also restores) is the easy mistake -- among
+  rebase's four subcommands, `--quit` is the only one that changes nothing
+  but the state directory's existence.
+  WARNING: **`sg status`'s rebase banner had the identical "vanishes on a
+  damaged state" bug Phase 57 already fixed once for cherry-pick/revert**,
+  this being the second time the same bug shape appeared in this codebase.
+  `cmd_status.c` used to gate the whole rebase block on
+  `sg_rebase_state_exists(...) && sg_rebase_state_read(...) == 0`; measured
+  against real git, `git status` on a damaged `rebase-merge/onto` still
+  prints its whole block, echoing back the value it could not resolve. The
+  fix enters on existence alone and degrades to the detail-free `You are
+  currently rebasing.` line (already used elsewhere for a NULL
+  `orig_branch`) plus a hint naming `--quit` specifically -- never
+  `--continue`/`--skip`/`--abort`, all three known to fail on this exact
+  state (Phase 57's rule, needed a second time: an error must never name a
+  command that fails on the same input). See Phase 58 in `docs/DESIGN.md`
+  for the two fixture traps this uncovered while writing the interop
+  group: the SEPARATE "Unmerged paths" section legitimately still names
+  `--abort` on a real-conflict fixture (unrelated to this fix, and grepping
+  whole-output for `--abort` would have failed for the wrong reason), and
+  `sg switch`'s rebase gate is not the same gate as its dirty-worktree
+  confirmation (`--force` bypasses only the latter), so proving `--quit`
+  actually unblocks `switch` needs `--force` on a fixture whose conflict
+  genuinely left the working tree dirty.
 
 ## Deliberate divergences from real git
 

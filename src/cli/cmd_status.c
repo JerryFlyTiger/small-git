@@ -778,10 +778,25 @@ int sg_cmd_status(int argc, char **argv)
         printf("\n");
     }
 
-    if (!opts.porcelain) {
+    if (!opts.porcelain && sg_rebase_state_exists(git_dir)) {
+        /* Phase 58 spec section 4, measured against real git 2.55.0: with
+           rebase-merge/onto (etc.) damaged, `git status` still prints the
+           whole block, echoing back the value it could not resolve. sg
+           validates before storing, so it cannot echo an unparsed value the
+           same way -- but the property interop pins is "a banner is printed
+           at all", not the exact wording, so entering this block on
+           EXISTENCE (not existence-and-parseable, the bug this phase
+           fixes) is what matters. On a read failure, degrade to the
+           detail-free line cmd_status.c already uses when orig_branch is
+           NULL, skip the "(N commits left)" line (there is nothing to
+           count), and point the hint at --quit -- the one subcommand that
+           parses nothing and is guaranteed to work on this state (Phase
+           57's rule: an error must never name a command that fails on the
+           same input, so --continue/--skip/--abort must NOT be named
+           here). */
         sg_rebase_state rstate;
 
-        if (sg_rebase_state_exists(git_dir) && sg_rebase_state_read(git_dir, &rstate) == 0) {
+        if (sg_rebase_state_read(git_dir, &rstate) == 0) {
             char onto_hex[SG_SHA1_HEX_LEN + 1];
             char onto_short[8];
             size_t remaining = rstate.todo_count + (rstate.has_current ? 1 : 0);
@@ -802,8 +817,15 @@ int sg_cmd_status(int argc, char **argv)
             }
             printf("\n");
             sg_rebase_state_free(&rstate);
+        } else {
+            printf("You are currently rebasing.\n");
+            printf("  (the rebase state cannot be read; use \"sg rebase --quit\" to discard "
+                  "it)\n");
+            printf("\n");
         }
+    }
 
+    if (!opts.porcelain) {
         /* Existence, not parseability: real git reports a corrupt MERGE_HEAD
            as an ongoing merge in `status` just like a well-formed one
            (measured, 2.55.0), and status must agree with the gates in

@@ -906,6 +906,7 @@ also leaves a paused rebase's on-disk state alone here. No mode of
 .B reset
 ends a rebase; only
 .BR "sg rebase --abort" ,
+.BR "sg rebase --quit" ,
 a run that completes, or
 .B "sg undo"
 does.
@@ -1219,6 +1220,8 @@ history), this is reported as an error rather than picking one arbitrarily.
 .B sg rebase --skip
 .br
 .B sg rebase --abort
+.br
+.B sg rebase --quit
 .PP
 Replays the commits unique to the current branch (since its merge base with
 .IR upstream )
@@ -1228,8 +1231,9 @@ tip, then moves the current branch to point at the result. Exactly one of
 .IR upstream ,
 .BR --continue ,
 .BR --skip ,
+.BR --abort ,
 or
-.B --abort
+.B --quit
 must be given.
 .PP
 If
@@ -1255,6 +1259,22 @@ discards the conflicting commit entirely and continues with the next one.
 .B --abort
 restores the original branch tip and working directory, discarding all
 progress made so far.
+.B --quit
+removes the paused state and touches nothing else \(em it does not move
+.BR HEAD ,
+does not return to the original branch, and does not touch the index or
+working directory, leaving a conflicted path exactly as it was.
+Unlike
+.BR --continue ,
+.BR --skip ,
+and
+.BR --abort ,
+which all require the state under
+.B .git/sg-rebase/
+to parse and refuse identically to real git when it does not,
+.B --quit
+parses nothing and is the only one of the four guaranteed to work on a
+damaged state; use it as the escape hatch when the other three refuse.
 .PP
 Rebase state is stored under
 .B .git/sg-rebase/

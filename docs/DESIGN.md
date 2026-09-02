@@ -10556,3 +10556,144 @@ closing-quote check, matching the existing rule); a subject shorter than 8
 bytes (`Rev`, falls through to plain wrapping because `strncmp`'s own
 length guard cannot match); and the empty subject (also falls through,
 wraps to `Revert ""`).
+
+## Phase 58: `sg rebase --quit`, and the status banner that must survive a
+damaged rebase state
+
+Measured against real git 2.55.0, with `.git/rebase-merge/onto` (git) /
+`.git/sg-rebase/onto` (sg) set to `garbage`:
+
+```
+sg rebase --abort     rc=1  "rebase state is corrupt, cannot abort safely; please check .git/sg-rebase/ by hand"
+sg rebase --skip      rc=1  "rebase state is corrupt, run sg rebase --abort to clean up"
+sg rebase --continue  rc=1  "rebase state is corrupt, run sg rebase --abort to clean up"
+```
+
+```
+git rebase --abort     rc=1  state kept  "error: invalid onto: 'garbage'"
+git rebase --skip      rc=1  state kept  "error: invalid onto: 'garbage'"
+git rebase --continue  rc=1  state kept
+git rebase --quit      rc=0  state REMOVED
+```
+
+git's own three parsing subcommands fail exactly the same way sg's do, and
+`--quit` is real git's own escape hatch. This is the same dead-end shape
+Phase 57 fixed for cherry-pick/revert (`sg_pick_quit`), still open for
+rebase until this phase: with `git_dir/sg-rebase/current`, `onto`, or
+`orig-branch` damaged, all three of sg's subcommands refuse, while
+`sg switch`/`sg commit` stay blocked (both gate on `sg_rebase_state_exists`,
+a stat-only check), leaving no exit but hand-editing files under
+`.git/sg-rebase/`. Damaging `todo` alone does NOT dead-end -- `--abort` and
+`--skip` still succeed on that field; the three above are the reachable
+causes.
+
+**Because git's own `--abort`/`--skip`/`--continue` fail identically, the
+fix is to add the subcommand sg is missing, not to loosen the existing
+three.** Loosening any of them would be sg inventing behaviour real git
+does not have -- precisely the mistake Phase 57's own spec made twice
+(inventing reflog wording and an exit code where git already had an
+answer). `sg rebase --quit` is therefore implemented exactly like Phase
+57's `sg_pick_quit` (`src/cli/pick.c`): it parses nothing. Existence
+(`sg_rebase_state_exists`, the same stat-only check every gate in this
+project already uses) is the only question asked, and removal
+(`sg_rebase_state_remove`, plain `remove()`-by-name, already existed for
+the healthy-state case) is the only action taken. `do_rebase_quit`
+(`src/cli/cmd_rebase.c`) is a five-line wrapper for exactly this reason --
+adding a read anywhere in it reintroduces the exact dead end this phase
+exists to close (proven by reverse mutation, see below).
+
+Measured semantics of a real, healthy pause: `git rebase --quit` exits 0,
+prints nothing, removes the state directory and nothing else, leaves HEAD
+exactly where the pause left it (detached at the replay position, NOT
+returned to the original branch), and leaves the index/working tree
+untouched (a conflicted `UU` path is still `UU` afterward). `sg rebase
+--quit` matches all four, pinned against real git on the same fixture in
+`tests/interop.sh`'s `phase58:` group. With nothing in progress, `sg`
+exits 1 with `no rebase is in progress` (real git exits 128; this
+project's own 0/1-only convention, already used identically by
+`--continue`/`--skip`/`--abort`, applies here too -- interop compares only
+whether the exit code is zero, never the number, same as every other
+exit-code divergence in this codebase).
+
+**`sg status`'s rebase banner had the same "vanishes on a damaged state"
+bug Phase 57 already fixed once for cherry-pick/revert, and this phase is
+the second occurrence of exactly that bug in the same codebase.** Measured:
+with `rebase-merge/onto` set to `garbage`, `git status` still prints its
+whole rebase block, echoing back the value it could not resolve
+(`interactive rebase in progress; onto garbage` /
+`You are currently rebasing branch 'topic' on 'garbage'`). `cmd_status.c`
+used to guard the whole block on `sg_rebase_state_exists(...) &&
+sg_rebase_state_read(...) == 0`, so on a damaged state the banner
+disappeared entirely while the gates above kept blocking every command --
+status telling the user everything is fine while nothing works, the same
+banner/other-half disagreement Phase 38's bug A and Phase 57 both hit.
+
+The fix enters the block on existence alone; on a read failure it prints
+the detail-free `You are currently rebasing.` line `cmd_status.c` already
+uses when `orig_branch` is NULL, skips the "(N commits left)" line (there
+is nothing to count without a parsed `todo`), and points the hint at
+`--quit` rather than any of the three subcommands that are known to fail
+on this exact state (Phase 57's rule, restated here because this phase
+needed it again: an error must never name a command that fails on the
+same input). sg cannot echo the unparsed value the way git does -- sg
+validates every field before ever storing it, so there is no raw
+`garbage` string sitting anywhere to echo back -- but the property interop
+actually pins is "a banner is printed at all", which is git's property and
+is what the fix restores; the exact wording is sg's own.
+
+One fixture-construction trap, found while writing the interop group: the
+"unmerged paths" section of `sg status` (a *separate* block, printed below
+the rebase banner, driven by `sg_index_has_unmerged`) legitimately still
+names `--abort` on a fixture whose rebase actually paused on a real
+content conflict -- that block's own hint has nothing to do with this
+phase and was never touched. Grepping the WHOLE status output for
+`--abort`, `--skip`, `--continue` therefore fails for a reason unrelated
+to the fix; the interop checks scope themselves to just the banner block
+(`sed -n '/currently rebasing/,/^$/p'`) before asserting which flags are
+and are not named.
+
+Another fixture trap, found the same way: `sg switch`'s rebase gate
+(`sg_rebase_state_exists`, checked unconditionally before `--force` is
+even read) is a *different* gate from the ordinary dirty-worktree
+confirmation `--force` bypasses. A fixture built by actually pausing on a
+conflict leaves the working tree genuinely dirty (`UU`), so `sg switch
+<branch>` without `--force` still refuses post-`--quit` for a completely
+unrelated reason (the dirty-worktree gate, which `--quit` deliberately
+does NOT clear -- see the "index/working tree untouched" rule above), and
+that would have made "switch is unblocked after --quit" look false when
+it is actually true. `--force` isolates the question correctly: it
+bypasses only the dirty-worktree confirmation, never the rebase gate, so
+`sg switch <branch> --force` succeeding after `--quit` (and refusing
+identically before it, on the damaged-state fixture) is what the interop
+check actually asserts.
+
+**Reverse mutations** (`tests/mutate.sh ... --interop`), each run
+individually, each caught by its own named check and no others:
+removing the `--quit` dispatch arm from `sg_cmd_rebase`'s `if`/`else if`
+chain turned red every `phase58:` check that depends on `--quit` actually
+running (`sg rebase --quit exits 0 on the same damaged state`, `... prints
+nothing`, `... removes the state directory`, `sg switch is no longer
+blocked after --quit`, `sg commit is no longer blocked after --quit`,
+`sg-rebase/ is gone after --quit on a healthy pause`, and `sg rebase
+--quit with nothing in progress exits 1 with a clear message` -- the last
+one because control fell through to `do_rebase_start` with a NULL
+`upstream_arg` instead); adding an `sg_rebase_state_read` probe inside
+`do_rebase_quit` before the removal turned red exactly the checks that
+exercise the DAMAGED-state case (`... exits 0 on the same damaged state`,
+`... prints nothing`, `... removes the state directory`, and both
+now-longer-blocked checks) while leaving the nothing-in-progress and
+healthy-pause checks green, precisely because those two fixtures were
+never damaged in the first place; and restoring `cmd_status.c`'s guard to
+`sg_rebase_state_exists(...) && sg_rebase_state_read(...) == 0` turned red
+exactly the two banner-content checks (`sg status still prints a rebase
+banner on a damaged state`, `the degraded hint names --quit`) and nothing
+else.
+
+Files touched: `src/cli/cmd_rebase.c` (`do_rebase_quit`, the new
+dispatch arm, and the usage string), `src/cli/cmd_status.c` (the rebase
+banner block re-scoped to enter on existence), `tests/test_rebase_state.c`
+(three new tests exercising the library-level removal-despite-corruption
+property plus one CLI-level exit-1-with-nothing-in-progress test, since
+`do_rebase_quit` itself is a two-line wrapper over functions the existing
+tests already cover directly), `tests/interop.sh`'s new `phase58:` group,
+and `docs/sg.1`.
