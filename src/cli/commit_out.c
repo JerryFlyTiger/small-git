@@ -129,27 +129,49 @@ static int print_commit_diff(const char *git_dir, const sg_commit *commit,
     /* Measured, all four combinations: in the default format the diff is
        introduced by a blank line, except when --stat and -p are BOTH on, in
        which case git prints a literal `---` line instead. --oneline
-       introduces neither, and never prints `---`. */
+       introduces neither, and never prints `---`.
+
+       WARNING (found by a 159-probe oracle, Phase 59 round 2): the `---`
+       rule is NOT just "stat && patch" -- o->stat/o->patch are no longer
+       forced to 0 when a name format is active (see sg/commit_out.h's own
+       WARNING on that point, and cmd_show.c's resolve_commit_out_opts,
+       which stopped zeroing them once the redundant-guard mutation showed
+       the renderer was the real enforcement point). So a caller reaching
+       here with --name-only/--name-status can still have o->stat and
+       o->patch both nonzero underneath (e.g. `-p --name-only --stat`), and
+       NAME must win the separator decision the same way it already wins
+       which sg_diff_print format gets called below -- an ordinary blank
+       line, never `---`. */
     if (!o->oneline)
-        printf(o->stat && o->patch ? "---\n" : "\n");
+        printf((o->stat && o->patch && !o->name_only && !o->name_status) ? "---\n" : "\n");
 
     memset(&opts, 0, sizeof opts);
     opts.algorithm = SG_DIFF_ALGO_MYERS;
-    if (o->stat) {
-        opts.format = SG_DIFF_FORMAT_STAT;
-        /* repo_root is NULL deliberately: a tree-vs-tree list is entirely
-           SG_DIFF_SIDE_BLOB, and that branch of sg_diff_side_read never
-           touches it (the same invariant Phase 49's merge rename detection
-           relies on). */
+    if (o->name_only || o->name_status) {
+        /* Section 3 of the Phase 59 spec: same blank-line rule as patch/
+           stat above (already printed), same empty-diff-prints-nothing
+           rule (already handled above), just a different sg_diff_print
+           format -- reuses the same rename-detected `list`. */
+        opts.format = o->name_status ? SG_DIFF_FORMAT_NAME_STATUS : SG_DIFF_FORMAT_NAME_ONLY;
         if (sg_diff_print(git_dir, NULL, &list, &opts) != 0)
             rc = -1;
-    }
-    if (rc == 0 && o->patch) {
-        if (o->stat)
-            printf("\n");
-        opts.format = SG_DIFF_FORMAT_PATCH;
-        if (sg_diff_print(git_dir, NULL, &list, &opts) != 0)
-            rc = -1;
+    } else {
+        if (o->stat) {
+            opts.format = SG_DIFF_FORMAT_STAT;
+            /* repo_root is NULL deliberately: a tree-vs-tree list is entirely
+               SG_DIFF_SIDE_BLOB, and that branch of sg_diff_side_read never
+               touches it (the same invariant Phase 49's merge rename detection
+               relies on). */
+            if (sg_diff_print(git_dir, NULL, &list, &opts) != 0)
+                rc = -1;
+        }
+        if (rc == 0 && o->patch) {
+            if (o->stat)
+                printf("\n");
+            opts.format = SG_DIFF_FORMAT_PATCH;
+            if (sg_diff_print(git_dir, NULL, &list, &opts) != 0)
+                rc = -1;
+        }
     }
 
     sg_diff_list_free(&list);
@@ -200,7 +222,8 @@ int sg_commit_out_entry(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
         print_message(commit->message);
     }
 
-    if ((opts->patch || opts->stat) && print_commit_diff(git_dir, commit, opts) != 0)
+    if ((opts->patch || opts->stat || opts->name_only || opts->name_status) &&
+       print_commit_diff(git_dir, commit, opts) != 0)
         return -1;
 
     return 0;

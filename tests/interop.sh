@@ -13758,6 +13758,29 @@ check "phase55: sg show <annotated tag> matches git, tag header and all" \
     cmp -s "$WORKDIR/p55_sg_annotated.txt" "$WORKDIR/p55_git_annotated.txt"
 check "phase55: sg show <lightweight tag> matches git" \
     cmp -s "$WORKDIR/p55_sg_light.txt" "$WORKDIR/p55_git_light.txt"
+
+# --- Phase 59 round 3 (oracle-caught): --oneline on an annotated tag drops
+# Tagger:/Date: AND the blank line before the nested commit -- a
+# pre-existing Phase 55a bug (the 50 combinations that phase claimed to
+# have pinned byte-for-byte never actually combined --oneline with an
+# annotated tag). Same old/new behavior reproduced on a pre-Phase-59 build,
+# so this is not a Phase 59 regression, just a matrix gap Phase 59's own
+# oracle probing finally covered.
+p55_cmp tagoneline --oneline v1
+p55_cmp tagonelinesuppress --oneline -s v1
+p55_cmp tagonelinestat --oneline --stat v1
+check "phase59: sg show --oneline <annotated tag> matches git (no Tagger:/Date:, no blank line before the commit)" \
+    cmp -s "$WORKDIR/p55_sg_tagoneline.txt" "$WORKDIR/p55_git_tagoneline.txt"
+check "phase59: sg show --oneline -s <annotated tag> matches git" \
+    cmp -s "$WORKDIR/p55_sg_tagonelinesuppress.txt" "$WORKDIR/p55_git_tagonelinesuppress.txt"
+check "phase59: sg show --oneline --stat <annotated tag> matches git" \
+    cmp -s "$WORKDIR/p55_sg_tagonelinestat.txt" "$WORKDIR/p55_git_tagonelinestat.txt"
+# Reverse control: WITHOUT --oneline, Tagger: must still be there -- the
+# fix must not have deleted it unconditionally.
+check "phase59: sg show <annotated tag> (no --oneline) still prints Tagger:" \
+    sh -c 'grep -q "^Tagger: " "$0"' "$WORKDIR/p55_sg_annotated.txt"
+check "phase59 oracle: precondition -- real git's own <annotated tag> (no --oneline) also prints Tagger:" \
+    sh -c 'grep -q "^Tagger: " "$0"' "$WORKDIR/p55_git_annotated.txt"
 check "phase55: sg show <rev>:<path> prints the blob raw" \
     cmp -s "$WORKDIR/p55_sg_blobpath.txt" "$WORKDIR/p55_git_blobpath.txt"
 check "phase55: sg show <blob sha> matches git" \
@@ -13813,7 +13836,7 @@ check "phase55: sg show --stat -p prints BOTH" \
 (cd "$P55" && "$SG" show HEAD:f.txt/x) > /dev/null 2>&1
 check "phase55: a <rev>:<path> component that names a file, not a directory, fails" test $? = 1
 
-(cd "$P55" && "$SG" show --name-only "$P55_COMMIT") > /dev/null 2>&1
+(cd "$P55" && "$SG" show --numstat "$P55_COMMIT") > /dev/null 2>&1
 check "phase55: sg show rejects a flag it does not implement" test $? = 1
 (cd "$P55" && "$SG" show HEAD:nosuchfile) > /dev/null 2>&1
 check "phase55: sg show <rev>:<missing path> fails" test $? = 1
@@ -15432,6 +15455,261 @@ p58_commit "$P58_CLEAN_GIT" "init"
 p58_clean_git_rc=$?
 check "phase58 oracle: precondition -- real git rebase --quit with nothing in progress also exits non-zero" \
     test "$p58_clean_git_rc" != 0
+
+# --- Phase 59: `sg show --name-only`/`--name-status`. Non-merge byte-exact
+# shapes (section 3), the merge dense-set row rule (section 4/4.1, including
+# an N-parent octopus's "one letter per parent"), and the section 4.2
+# regression pin proving diff_out.c's combined-diff printer still prints the
+# literal "MM" for the two PRE-EXISTING combinable producers now that a
+# THIRD one (a merge commit's own dense row) needs computed letters.
+P59_GIT_PINS="-c core.abbrev=7"
+
+# --- non-merge: A/M/D/R rows, --name-only, --oneline (no blank line), an
+# empty commit (header only, no blank line), and a root commit (every path A).
+P59="$WORKDIR/p59_names"
+mkdir -p "$P59"
+(cd "$P59" && LC_ALL=C git init -q .) > /dev/null 2>&1
+p59commit() {
+    ( cd "$P59" &&
+      GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+      GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+      GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+      LC_ALL=C git commit -q "$@" ) > /dev/null 2>&1
+}
+printf 'b1\n' > "$P59/both.txt"
+printf 'd1\n' > "$P59/del.txt"
+printf 'm1\n' > "$P59/mod.txt"
+printf 'r1\n' > "$P59/ren.txt"
+(cd "$P59" && LC_ALL=C git add -A) > /dev/null 2>&1
+p59commit -m root
+P59_ROOT=$(cd "$P59" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+printf 'new\n' > "$P59/addm.txt"
+printf 'b2\n' > "$P59/both.txt"
+rm -f "$P59/del.txt"
+printf 'm2\n' > "$P59/mod.txt"
+(cd "$P59" && mv ren.txt renamed.txt) > /dev/null 2>&1
+(cd "$P59" && LC_ALL=C git add -A) > /dev/null 2>&1
+p59commit -m head
+P59_HEAD=$(cd "$P59" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+p59commit --allow-empty -m empty
+P59_EMPTY=$(cd "$P59" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+p59_cmp() {
+    p59tag="$1"; shift
+    (cd "$P59" && LC_ALL=C git $P59_GIT_PINS show --no-decorate "$@") \
+        > "$WORKDIR/p59_git_$p59tag.txt" 2>&1
+    (cd "$P59" && "$SG" show "$@") > "$WORKDIR/p59_sg_$p59tag.txt" 2>&1
+}
+p59_cmp namestatus --name-status "$P59_HEAD"
+p59_cmp nameonly --name-only "$P59_HEAD"
+p59_cmp namestatusoneline --oneline --name-status "$P59_HEAD"
+p59_cmp namestatusroot --name-status "$P59_ROOT"
+p59_cmp namestatusempty --name-status "$P59_EMPTY"
+
+check "phase59 oracle: precondition -- git detects ren.txt -> renamed.txt as an exact rename" \
+    sh -c 'grep -q "^R100" "$0"' "$WORKDIR/p59_git_namestatus.txt"
+check "phase59: sg show --name-status matches git byte-for-byte (A/M/D/R rows)" \
+    cmp -s "$WORKDIR/p59_sg_namestatus.txt" "$WORKDIR/p59_git_namestatus.txt"
+check "phase59: sg show --name-only matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p59_sg_nameonly.txt" "$WORKDIR/p59_git_nameonly.txt"
+check "phase59: sg show --oneline --name-status has NO blank line before the list (non-merge)" \
+    cmp -s "$WORKDIR/p59_sg_namestatusoneline.txt" "$WORKDIR/p59_git_namestatusoneline.txt"
+check "phase59: sg show --name-status <root commit> lists every path as A" \
+    cmp -s "$WORKDIR/p59_sg_namestatusroot.txt" "$WORKDIR/p59_git_namestatusroot.txt"
+check "phase59: sg show --name-status <empty commit> prints header only, no blank line" \
+    cmp -s "$WORKDIR/p59_sg_namestatusempty.txt" "$WORKDIR/p59_git_namestatusempty.txt"
+
+# --- round 2 (oracle-caught) bug 1: the `---` separator must NOT appear
+# when a name format is active, even though patch/stat may still be
+# nonzero underneath (see commit_out.c's WARNING). Both orderings, both a
+# plain --name-only and a --name-status.
+p59_cmp namesep1 -p --name-only --stat "$P59_HEAD"
+p59_cmp namesep2 --stat --name-status -p "$P59_HEAD"
+check "phase59: sg show -p --name-only --stat prints an ordinary blank line, never ---" \
+    cmp -s "$WORKDIR/p59_sg_namesep1.txt" "$WORKDIR/p59_git_namesep1.txt"
+check "phase59: sg show --stat --name-status -p prints an ordinary blank line, never ---" \
+    cmp -s "$WORKDIR/p59_sg_namesep2.txt" "$WORKDIR/p59_git_namesep2.txt"
+
+# --- merges: the dense set (not --stat's set), and an N-parent (3) octopus
+# whose non-empty dense set needs one status letter PER PARENT.
+P59C="$WORKDIR/p59c_mergenames"
+mkdir -p "$P59C"
+(cd "$P59C" && LC_ALL=C git init -q .) > /dev/null 2>&1
+p59ccommit() {
+    ( cd "$P59C" &&
+      GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+      GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+      GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+      LC_ALL=C git commit -q "$@" ) > /dev/null 2>&1
+}
+for f in both ours_only theirs_only del; do printf '%s\n' "$f" > "$P59C/$f.txt"; done
+(cd "$P59C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p59ccommit -m base
+P59C_BASE=$(cd "$P59C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+(cd "$P59C" && LC_ALL=C git checkout -qb p59cside) > /dev/null 2>&1
+printf 'both THEIRS\n' > "$P59C/both.txt"; printf 'theirs THEIRS\n' > "$P59C/theirs_only.txt"
+printf 'del THEIRS\n' > "$P59C/del.txt"
+(cd "$P59C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p59ccommit -m side
+(cd "$P59C" && LC_ALL=C git checkout -q master) > /dev/null 2>&1
+printf 'both OURS\n' > "$P59C/both.txt"; printf 'ours OURS\n' > "$P59C/ours_only.txt"
+printf 'del OURS\n' > "$P59C/del.txt"
+(cd "$P59C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p59ccommit -m ours
+(cd "$P59C" && LC_ALL=C git merge --no-ff p59cside -m "merge side") > /dev/null 2>&1
+printf 'both RESOLVED\n' > "$P59C/both.txt"
+rm -f "$P59C/del.txt"
+(cd "$P59C" && LC_ALL=C git add -A && LC_ALL=C git rm -q --cached del.txt) > /dev/null 2>&1
+p59ccommit --no-edit
+P59C_MERGE=$(cd "$P59C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+p59c_cmp() {
+    p59ctag="$1"; shift
+    (cd "$P59C" && LC_ALL=C git $P59_GIT_PINS show --no-decorate "$@") \
+        > "$WORKDIR/p59c_git_$p59ctag.txt" 2>&1
+    (cd "$P59C" && "$SG" show "$@") > "$WORKDIR/p59c_sg_$p59ctag.txt" 2>&1
+}
+p59c_cmp namestatus --name-status "$P59C_MERGE"
+p59c_cmp nameonly --name-only "$P59C_MERGE"
+p59c_cmp namestatusoneline --oneline --name-status "$P59C_MERGE"
+p59c_cmp stat --stat "$P59C_MERGE"
+
+check "phase59 oracle: precondition -- the merge's dense set has fewer non-blank lines than its --stat set" \
+    sh -c 'test "$(grep -c . "$0")" -lt "$(grep -c . "$1")"' \
+    "$WORKDIR/p59c_git_namestatus.txt" "$WORKDIR/p59c_git_stat.txt"
+check "phase59: sg show --name-status <merge> matches git's DENSE set, not --stat's set" \
+    cmp -s "$WORKDIR/p59c_sg_namestatus.txt" "$WORKDIR/p59c_git_namestatus.txt"
+check "phase59: sg show --name-only <merge> matches git" \
+    cmp -s "$WORKDIR/p59c_sg_nameonly.txt" "$WORKDIR/p59c_git_nameonly.txt"
+check "phase59: sg show --oneline --name-status <merge> DOES print a blank line before the list" \
+    cmp -s "$WORKDIR/p59c_sg_namestatusoneline.txt" "$WORKDIR/p59c_git_namestatusoneline.txt"
+
+# 3-parent octopus, built via plumbing (not `git merge`, which would either
+# refuse or resolve the conflict on its own) so the merge TREE is guaranteed
+# to differ from all three parents at both.txt -- a non-empty dense set.
+(cd "$P59C" && LC_ALL=C git checkout -qb p59co1 "$P59C_BASE") > /dev/null 2>&1
+printf 'both O1\n' > "$P59C/both.txt"
+(cd "$P59C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p59ccommit -m o1
+P59CO1=$(cd "$P59C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+(cd "$P59C" && LC_ALL=C git checkout -qb p59co2 "$P59C_BASE") > /dev/null 2>&1
+printf 'both O2\n' > "$P59C/both.txt"
+(cd "$P59C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p59ccommit -m o2
+P59CO2=$(cd "$P59C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+(cd "$P59C" && LC_ALL=C git checkout -qb p59co3 "$P59C_BASE") > /dev/null 2>&1
+printf 'both O3\n' > "$P59C/both.txt"
+(cd "$P59C" && LC_ALL=C git add -A) > /dev/null 2>&1
+p59ccommit -m o3
+P59CO3=$(cd "$P59C" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+(cd "$P59C" && LC_ALL=C git checkout -qf p59co1) > /dev/null 2>&1
+printf 'both RESULT\n' > "$P59C/both.txt"
+(cd "$P59C" && LC_ALL=C git add both.txt) > /dev/null 2>&1
+P59CO_TREE=$(cd "$P59C" && LC_ALL=C git write-tree 2>/dev/null)
+P59CO_MERGE=$( cd "$P59C" &&
+  GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+  GIT_AUTHOR_NAME="Ann" GIT_AUTHOR_EMAIL="ann@example.com" \
+  GIT_COMMITTER_NAME="Ann" GIT_COMMITTER_EMAIL="ann@example.com" \
+  LC_ALL=C git commit-tree "$P59CO_TREE" -p "$P59CO1" -p "$P59CO2" -p "$P59CO3" \
+    -m "octopus merge" 2>/dev/null )
+(cd "$P59C" && LC_ALL=C git checkout -qf master) > /dev/null 2>&1
+
+p59c_cmp octomms --name-status "$P59CO_MERGE"
+p59c_cmp octomno --name-only "$P59CO_MERGE"
+# --- round 2 (oracle-caught) bug 2: --stat (and -s) on an octopus whose
+# DENSE set is non-empty must NOT be refused -- the refusal exists only to
+# protect the fixed-at-2-parents combined PATCH renderer, and neither
+# --stat (a first-parent diff at any parent count) nor -s (no diff at all)
+# ever reaches it. Pre-existing since Phase 55b; unreachable by any fixture
+# an ordinary `sg merge`/`git merge` can build (a real octopus merge tool
+# refuses on the same conflict a fixture like this needs), which is why it
+# took this phase's commit-tree-built octopus to become observable.
+p59c_cmp octostat --stat "$P59CO_MERGE"
+p59c_cmp octosuppress -s "$P59CO_MERGE"
+
+check "phase59 oracle: precondition -- git renders one status letter per parent (MMM)" \
+    sh -c 'grep -q "^MMM[[:space:]]both.txt$" "$0"' "$WORKDIR/p59c_git_octomms.txt"
+check "phase59 oracle: precondition -- git's --stat on this octopus exits 0 (its dense set being non-empty does not block --stat)" \
+    sh -c "(cd '$P59C' && LC_ALL=C git \$P59_GIT_PINS show --stat --no-decorate '$P59CO_MERGE') > /dev/null 2>&1"
+check "phase59: sg show --stat <3-parent merge, non-empty dense set> is NOT refused, matches git" \
+    cmp -s "$WORKDIR/p59c_sg_octostat.txt" "$WORKDIR/p59c_git_octostat.txt"
+check "phase59: sg show -s <3-parent merge, non-empty dense set> is NOT refused, matches git" \
+    cmp -s "$WORKDIR/p59c_sg_octosuppress.txt" "$WORKDIR/p59c_git_octosuppress.txt"
+check "phase59: sg show --name-status <3-parent merge> matches git's MMM row" \
+    cmp -s "$WORKDIR/p59c_sg_octomms.txt" "$WORKDIR/p59c_git_octomms.txt"
+check "phase59: sg show --name-only <3-parent merge> matches git" \
+    cmp -s "$WORKDIR/p59c_sg_octomno.txt" "$WORKDIR/p59c_git_octomno.txt"
+check "phase59: --name-only/--name-status do NOT refuse an octopus with a non-empty dense set" \
+    sh -c '! grep -q "not supported yet" "$0"' "$WORKDIR/p59c_sg_octomms.txt"
+(cd "$P59C" && "$SG" show "$P59CO_MERGE") > "$WORKDIR/p59c_sg_octoplain.txt" 2>&1
+p59_octoplain_rc=$?
+check "phase59: ...but the plain (patch) format still refuses that same octopus, unchanged from Phase 55b" \
+    sh -c 'test "$0" = 1' "$p59_octoplain_rc"
+# The other half of that divergence.  Without it, only sg's side is pinned:
+# git quietly changing its mind about rendering an N-way combined patch would
+# leave the two silently agreeing again with nothing red to say so, which is
+# exactly what CLAUDE.md's deliberate-divergence list exists to prevent.
+check "phase59 oracle: precondition -- real git DOES render the patch sg refuses there (the divergence has two sides)" \
+    sh -c "(cd '$P59C' && LC_ALL=C git \$P59_GIT_PINS show --no-decorate '$P59CO_MERGE') > /dev/null 2>&1"
+
+# --- section 2: every error row compared on exit-code-zero-ness ----------
+p59err() {
+    p59etag="$1"; shift
+    (cd "$P59" && LC_ALL=C git $P59_GIT_PINS show "$@" "$P59_HEAD") \
+        > /dev/null 2>"$WORKDIR/p59_giterr_$p59etag.txt"
+    p59_git_rc=$?
+    (cd "$P59" && "$SG" show "$@" "$P59_HEAD") > /dev/null 2>"$WORKDIR/p59_sgerr_$p59etag.txt"
+    p59_sg_rc=$?
+    check "phase59: sg show $* exit-code-zero-ness matches git" \
+        sh -c 'if [ "$0" = 0 ]; then test "$1" = 0; else test "$1" != 0; fi' \
+        "$p59_git_rc" "$p59_sg_rc"
+}
+p59err combo1 -s --name-only
+p59err combo2 -s --name-status
+p59err combo3 --name-only --name-status
+p59err combo4 --name-status --name-only
+p59err combo5 --name-only -s
+p59err combo6 --name-only -p
+
+# --- section 4.2: the regression pin -- the two PRE-EXISTING combinable
+# producers (a live conflict via sg_diff_index_workdir) must still print the
+# literal "MM", never a computed letter, now that a third producer (a merge
+# commit's own dense row) needs real per-side letters. Reuses P34_A (already
+# built above by p34_mkconflict) for modify/modify, and builds a fresh
+# add/add fixture the same way.
+check "phase59: a modify/modify conflict's -c --name-status still prints MM (regression pin)" \
+    sh -c "(cd '$P34_A' && '$SG' diff -c --name-status) | grep -q '^MM[[:space:]]f.txt\$'"
+p59_cmp_conflict() {
+    p59cf_dir="$1"; p59cf_label="$2"; shift 2
+    (cd "$p59cf_dir" && "$SG" diff "$@") > "$WORKDIR/p59cf_sg.txt" 2>/dev/null
+    (cd "$p59cf_dir" && LC_ALL=C git -c core.quotepath=false diff "$@") > "$WORKDIR/p59cf_git.txt" 2>/dev/null
+    check "phase59: sg diff $p59cf_label matches real git byte-for-byte (regression pin)" \
+        cmp -s "$WORKDIR/p59cf_sg.txt" "$WORKDIR/p59cf_git.txt"
+}
+p59_cmp_conflict "$P34_A" "-c --name-status (modify/modify)" -c --name-status
+p59_cmp_conflict "$P34_A" "--cc --name-status (modify/modify)" --cc --name-status
+
+P59D_ADDADD="$WORKDIR/p59d_addadd"
+mkdir -p "$P59D_ADDADD"
+(cd "$WORKDIR" && "$SG" init p59d_addadd) > /dev/null 2>&1
+printf 'root\n' > "$P59D_ADDADD/root.txt"
+(cd "$P59D_ADDADD" && "$SG" add root.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P59D_ADDADD" && "$SG" switch -c side) > /dev/null 2>&1
+printf 'theirs\n' > "$P59D_ADDADD/new.txt"
+(cd "$P59D_ADDADD" && "$SG" add new.txt && "$SG" commit -m side_add) > /dev/null 2>&1
+(cd "$P59D_ADDADD" && "$SG" switch master < /dev/null) > /dev/null 2>&1
+printf 'ours\n' > "$P59D_ADDADD/new.txt"
+(cd "$P59D_ADDADD" && "$SG" add new.txt && "$SG" commit -m ours_add) > /dev/null 2>&1
+(cd "$P59D_ADDADD" && "$SG" merge side < /dev/null) > /dev/null 2>&1
+
+check "phase59 oracle: precondition -- real git recognizes the sg-made add/add conflict as AA" \
+    sh -c "(cd '$P59D_ADDADD' && git status --porcelain) | grep -q '^AA new.txt\$'"
+check "phase59: an add/add conflict's -c --name-status still prints MM, not AA (regression pin)" \
+    sh -c "(cd '$P59D_ADDADD' && '$SG' diff -c --name-status) | grep -q '^MM[[:space:]]new.txt\$'"
+p59_cmp_conflict "$P59D_ADDADD" "-c --name-status (add/add)" -c --name-status
+p59_cmp_conflict "$P59D_ADDADD" "--cc --name-status (add/add)" --cc --name-status
 
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"

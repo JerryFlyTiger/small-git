@@ -47,6 +47,16 @@ int sg_cmd_log(int argc, char **argv)
     o.oneline = 0;
     o.patch = 0;
     o.stat = 0;
+    /* Phase 59 added name_only/name_status to this shared struct
+       (sg_commit_out_opts) -- `sg log` does not implement either flag, but
+       print_commit_diff now checks them FIRST, before patch/stat, so
+       leaving these as uninitialized stack garbage would route every `sg
+       log -p`/`--stat` call down the wrong branch whenever the garbage bit
+       happened to be nonzero (CLAUDE.md's Phase 29 shared-struct warning:
+       search every construction site that assigns fields one at a time
+       rather than through a single factory). */
+    o.name_only = 0;
+    o.name_status = 0;
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];

@@ -8,10 +8,12 @@
 #include "sg/hash.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
+#include "sg/quote.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
 #include "sg/similarity.h"
+#include "sg/tree_build.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
@@ -19,13 +21,28 @@
 #include <string.h>
 
 static const char USAGE[] =
-    "usage: sg show [-s] [-p|--patch] [--stat] [--oneline] [<object>...]\n";
+    "usage: sg show [-s] [-p|--patch] [--stat] [--name-only] [--name-status] "
+    "[--oneline] [<object>...]\n";
 
+/* Phase 59 spec section 2: five bits, NOT Phase 55a's "last one wins" over
+   just {patch, stat}. Measured over 29 flag combinations, and one detail
+   the spec's prose glosses over turned out to be load-bearing (found by
+   probing real git directly, since two of the spec's own example rows --
+   "-s --name-only" errors, but "-s -p --name-only" does NOT -- are
+   otherwise unreconcilable): `-s` clears every bit below and then sets
+   no_output; `-p`/`--stat` each set their own bit AND clear no_output (an
+   explicit format request cancels "no output"); `--name-only`/
+   `--name-status` each set their own bit and do NOT touch no_output or one
+   another's bit. All 16 of the spec's falsifying rows were reproduced
+   against real git 2.55.0 with this exact rule and none other. */
 typedef struct {
-    int format_seen; /* -s, -p or --stat appeared at all */
+    int format_seen; /* any of -s/-p/--stat/--name-only/--name-status seen */
     int oneline;
     int patch;
     int stat;
+    int name_only;
+    int name_status;
+    int no_output; /* -s, and only while nothing since has cleared it */
 } show_flags;
 
 /* Same bound sg_rev_parse_commit's own tag-peeling loop uses, for the same
@@ -88,6 +105,8 @@ static int seen_add(seen_ids *s, const unsigned char id[SG_SHA1_RAW_LEN])
 static void resolve_commit_out_opts(const show_flags *f, sg_commit_out_opts *o)
 {
     o->oneline = f->oneline;
+    o->name_only = f->name_only;
+    o->name_status = f->name_status;
     o->patch = f->patch;
     o->stat = f->stat;
     /* Default is a patch -- measured, and differs from `sg stash show`,
@@ -97,6 +116,20 @@ static void resolve_commit_out_opts(const show_flags *f, sg_commit_out_opts *o)
         o->patch = 1;
         o->stat = 0;
     }
+    /* Section 2: NAME or NAME_STATUS suppresses PATCH and STAT entirely, in
+       either order. This is deliberately NOT done by zeroing o->patch/
+       o->stat here -- both render paths (commit_out.c's print_commit_diff
+       and this file's render_merge_diff) already check o->name_only/
+       o->name_status FIRST and dispatch the name format instead, ignoring
+       patch/stat's value entirely, so a second zeroing here would be a
+       redundant guard one layer above the real one (measured by mutation:
+       breaking this exact suppression left every check green, because
+       nothing downstream ever reads a stale o->patch/o->stat once a name
+       format is active). no_output does NOT suppress patch/stat (`-s -p`
+       still prints a patch) -- the argv loop's own error check already
+       guarantees at most one of {name_only, name_status, no_output}
+       survives to here, so there is no simultaneous-both-set case to
+       arbitrate. */
 }
 
 /* Phase 55b: `sg show <merge>` renders a 2-parent merge (a dense combined
@@ -156,7 +189,7 @@ static int commit_needs_refusal(const char *git_dir, const sg_commit *commit)
    otherwise, and 0 for anything it cannot resolve -- the ordinary path
    reports those errors with a better message than a look-ahead could. */
 static int target_is_merge(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
-                           int hops)
+                           int hops, int check_refusal)
 {
     unsigned char cur[SG_SHA1_RAW_LEN];
     int i;
@@ -173,6 +206,18 @@ static int target_is_merge(const char *git_dir, const unsigned char id[SG_SHA1_R
         if (type == SG_OBJ_COMMIT) {
             sg_commit commit;
 
+            /* check_refusal is precomputed by the caller from show_flags,
+               mirroring render_id's own "commit.parent_count > 2 && o.patch
+               && !(o.name_only || o.name_status)" gate exactly (Phase 59
+               round 2): --name-only/--name-status never refuse an octopus
+               at all (they route through render_octopus_names, not the
+               fixed-at-2-parents dense renderer this refusal protects), and
+               neither does any request that would not actually render the
+               dense PATCH (a bare --stat, or -s). */
+            if (!check_refusal) {
+                free(content);
+                return 0;
+            }
             if (sg_commit_parse(content, content_len, &commit) == 0) {
                 answer = commit_needs_refusal(git_dir, &commit);
                 sg_commit_free(&commit);
@@ -197,6 +242,149 @@ static int target_is_merge(const char *git_dir, const unsigned char id[SG_SHA1_R
         }
     }
     return 0;
+}
+
+/* --name-only/--name-status for a merge whose parent count is NOT two
+   (Phase 59 section 4.1): sg_diff_combined_from_trees's `out` list is only
+   ever populated at parent_count == 2 (the diff --cc renderer it exists for
+   needs exactly two sides), so for any other count this walks every parent
+   tree plus the result tree directly instead, duplicating that function's
+   "differs from every parent" union-walk rule (mode AND id both compared)
+   rather than extending it -- extending it is out of this phase's budget
+   (workdir/diff.c is not one of the files this phase may touch), and the
+   two rules must stay identical, which is why the comments here explicitly
+   mirror sg_diff_combined_from_trees's own.
+
+   One status letter per parent: 'A' when the path is absent from that
+   parent, 'D' when present there but absent from the result, 'M'
+   otherwise -- measured against a real N-column merge (section 4.1's
+   table). --name-only prints the path once regardless of parent count.
+
+   Returns 0, -1, or -2 with bad_path filled (SG_PATH_MAX bytes) --
+   sg_tree_flatten's own contract, propagated the same way
+   sg_diff_combined_from_trees propagates it. */
+static int render_octopus_names(const char *git_dir,
+                                const unsigned char (*parent_trees)[SG_SHA1_RAW_LEN],
+                                size_t parent_count, const unsigned char result_tree[SG_SHA1_RAW_LEN],
+                                int name_status, char *bad_path)
+{
+    sg_flat_list *parents;
+    size_t *parent_cursor;
+    const sg_flat_entry **parent_entry;
+    sg_flat_list result_flat;
+    size_t result_cursor = 0;
+    size_t i;
+    int rc = 0;
+    int result_flattened = 0;
+
+    parents = calloc(parent_count, sizeof(*parents));
+    parent_cursor = calloc(parent_count, sizeof(*parent_cursor));
+    parent_entry = calloc(parent_count, sizeof(*parent_entry));
+    if (parents == NULL || parent_cursor == NULL || parent_entry == NULL) {
+        free(parents);
+        free(parent_cursor);
+        free(parent_entry);
+        return -1;
+    }
+
+    for (i = 0; i < parent_count; i++) {
+        rc = sg_tree_flatten(git_dir, parent_trees[i], &parents[i], bad_path);
+        if (rc != 0)
+            goto done;
+    }
+    rc = sg_tree_flatten(git_dir, result_tree, &result_flat, bad_path);
+    if (rc != 0)
+        goto done;
+    result_flattened = 1;
+
+    for (;;) {
+        const char *min_path = NULL;
+        const sg_flat_entry *result_e;
+        int differs_from_all = 1;
+        char path[SG_PATH_MAX];
+
+        for (i = 0; i < parent_count; i++) {
+            size_t c = parent_cursor[i];
+
+            if (c < parents[i].count &&
+               (min_path == NULL || strcmp(parents[i].entries[c].path, min_path) < 0))
+                min_path = parents[i].entries[c].path;
+        }
+        if (result_cursor < result_flat.count &&
+           (min_path == NULL || strcmp(result_flat.entries[result_cursor].path, min_path) < 0))
+            min_path = result_flat.entries[result_cursor].path;
+        if (min_path == NULL)
+            break;
+
+        if (strlen(min_path) >= sizeof(path)) {
+            rc = -1;
+            goto done;
+        }
+        strcpy(path, min_path);
+
+        result_e = (result_cursor < result_flat.count &&
+                   strcmp(result_flat.entries[result_cursor].path, path) == 0)
+                       ? &result_flat.entries[result_cursor]
+                       : NULL;
+
+        for (i = 0; i < parent_count; i++) {
+            size_t c = parent_cursor[i];
+            const sg_flat_entry *pe = (c < parents[i].count &&
+                                       strcmp(parents[i].entries[c].path, path) == 0)
+                                          ? &parents[i].entries[c]
+                                          : NULL;
+            int equal;
+
+            parent_entry[i] = pe;
+            if (pe == NULL && result_e == NULL)
+                equal = 1;
+            else if (pe == NULL || result_e == NULL)
+                equal = 0;
+            else
+                equal = pe->mode == result_e->mode &&
+                       memcmp(pe->sha1, result_e->sha1, SG_SHA1_RAW_LEN) == 0;
+            if (equal) {
+                differs_from_all = 0;
+                break;
+            }
+        }
+
+        if (differs_from_all) {
+            if (name_status) {
+                for (i = 0; i < parent_count; i++) {
+                    char letter = parent_entry[i] == NULL
+                                      ? 'A'
+                                      : (result_e == NULL ? 'D' : 'M');
+
+                    putchar(letter);
+                }
+                printf("\t%s\n", sg_quote_path(path));
+            } else {
+                printf("%s\n", sg_quote_path(path));
+            }
+        }
+
+        for (i = 0; i < parent_count; i++) {
+            size_t c = parent_cursor[i];
+
+            if (c < parents[i].count && strcmp(parents[i].entries[c].path, min_path) == 0)
+                parent_cursor[i]++;
+        }
+        if (result_cursor < result_flat.count &&
+           strcmp(result_flat.entries[result_cursor].path, min_path) == 0)
+            result_cursor++;
+    }
+    rc = 0;
+
+done:
+    for (i = 0; i < parent_count; i++)
+        sg_flat_list_free(&parents[i]);
+    free(parents);
+    free(parent_cursor);
+    free(parent_entry);
+    if (result_flattened)
+        sg_flat_list_free(&result_flat);
+    return rc;
 }
 
 /* The diff half of `sg show` on a genuine 2-parent merge -- everything
@@ -269,6 +457,39 @@ static int render_merge_diff(const char *git_dir, const sg_commit *commit,
 
     memset(&opts, 0, sizeof opts);
     opts.algorithm = SG_DIFF_ALGO_MYERS;
+
+    if (o->name_only || o->name_status) {
+        /* section 4/4.1: attaches to the DENSE branch, not --stat's
+           first-parent row set. resolve_commit_out_opts already guarantees
+           o->stat and o->patch are both 0 whenever this fires. */
+        if (commit->parent_count == 2) {
+            opts.format = o->name_status ? SG_DIFF_FORMAT_NAME_STATUS : SG_DIFF_FORMAT_NAME_ONLY;
+            /* Dense, same reasoning as the patch branch below: there is no
+               non-dense entry point into `sg show` at all. */
+            opts.combined = 1;
+            rc = sg_diff_print(git_dir, NULL, &combined_list, &opts);
+        } else {
+            /* combined_list is empty here (sg_diff_combined_from_trees only
+               fills `out` at parent_count == 2), so the dense set has to be
+               recomputed from the parent trees directly -- see
+               render_octopus_names's own comment for why this cannot reuse
+               that function's `out`. */
+            rc = render_octopus_names(git_dir, parent_trees, commit->parent_count, commit->tree,
+                                      o->name_status, bad_path);
+            if (rc == -2) {
+                fprintf(stderr, "sg: tree contains an unsafe path '%s'\n", bad_path);
+                rc = -1;
+            }
+        }
+        if (rc != 0) {
+            sg_diff_list_free(&combined_list);
+            free(parent_trees);
+            return -1;
+        }
+        sg_diff_list_free(&combined_list);
+        free(parent_trees);
+        return 0;
+    }
 
     if (o->stat) {
         unsigned char stat_tree[SG_SHA1_RAW_LEN];
@@ -447,15 +668,31 @@ static int render_id(const char *git_dir, const char *display_arg,
 
         resolve_commit_out_opts(flags, &o);
 
-        if (commit.parent_count > 2) {
-            /* Octopus: the renderer below is fixed at two parents, so this
-               is the one shape still refused outright -- but only when it
-               would actually need to print something (see
-               commit_needs_refusal's own comment). A clean octopus falls
-               straight through to the ordinary header-only print below,
-               with patch/stat forced off: there is no diff to attach, and
-               attaching print_commit_diff's own first-parent diff instead
-               would print something real git does not (measured). */
+        /* Octopus: the DENSE PATCH renderer is fixed at two parents, so
+           only rendering that patch is refused -- and only when it would
+           actually produce something (see commit_needs_refusal's own
+           comment). Found by a 159-probe oracle (Phase 59 round 2): this
+           used to fire on ANY output request at all (`o.patch` was not
+           part of the condition), which wrongly refused `--stat` too --
+           `--stat` never touches the dense set, it is a first-parent diff
+           at any parent count (CLAUDE.md says exactly this, and used to
+           get the octopus case wrong right next to saying it). The same
+           bug also blocked plain `-s` (header only, no diff at all) on
+           this shape, real git 2.55.0 measured to accept both. Pre-existing
+           since Phase 55b -- unreachable by any fixture an ordinary `sg
+           merge`/`git merge` can build (a real octopus merge tool refuses
+           on the same conflict), so it needed a `commit-tree`-built
+           fixture to ever become observable at all.
+           `o.name_only`/`o.name_status` still bypass this entirely (Phase
+           59 section 4.1): they carry one status letter per parent instead
+           of being pinned at two, routing through render_octopus_names
+           rather than the fixed-2-parent combined_list path, at any parent
+           count -- checked here even though `o.patch` might ALSO be
+           nonzero (e.g. `-p --name-only --stat`, where a stale `o.patch`
+           survives resolve_commit_out_opts because that function no longer
+           zeroes it, see its own comment), because name mode always wins
+           regardless of what else was asked for. */
+        if (commit.parent_count > 2 && o.patch && !(o.name_only || o.name_status)) {
             if (commit_needs_refusal(git_dir, &commit)) {
                 fprintf(stderr,
                        "sg: showing an octopus merge with a non-empty combined diff is not "
@@ -465,7 +702,17 @@ static int render_id(const char *git_dir, const char *display_arg,
             }
         }
 
-        if (entry_like && (nested || *shown))
+        /* WARNING: nested is ONLY ever 1 here when this commit is a tag's
+           target (the sole caller that passes nested=1) -- Phase 55a's
+           "everything but a blob takes a leading blank line" rule holds
+           except for exactly this one case: real git's --oneline prints NO
+           blank line between an annotated tag's message and the oneline
+           commit header that follows it (measured; the same fixture without
+           --oneline DOES get the blank line, so this is not a general
+           --oneline rule, only a tag-then-oneline-commit one). Scoped as
+           tightly as the condition can express: `nested && flags->oneline`
+           can only ever be true immediately below an annotated tag. */
+        if (entry_like && (nested || *shown) && !(nested && flags->oneline))
             printf("\n");
 
         if (commit.parent_count > 1) {
@@ -473,9 +720,11 @@ static int render_id(const char *git_dir, const char *display_arg,
 
             header_o.patch = 0;
             header_o.stat = 0;
+            header_o.name_only = 0;
+            header_o.name_status = 0;
             rc = sg_commit_out_entry(git_dir, id, &commit, &header_o);
             *shown = 1;
-            if (rc == 0 && (o.patch || o.stat))
+            if (rc == 0 && (o.patch || o.stat || o.name_only || o.name_status))
                 rc = render_merge_diff(git_dir, &commit, &o);
         } else {
             rc = sg_commit_out_entry(git_dir, id, &commit, &o);
@@ -500,12 +749,22 @@ static int render_id(const char *git_dir, const char *display_arg,
         }
         free(content);
 
-        if (target_is_merge(git_dir, tag.object, hops + 1)) {
-            fprintf(stderr,
-                   "sg: showing an octopus merge with a non-empty combined diff is not "
-                   "supported yet\n");
-            sg_tag_free(&tag);
-            return -1;
+        /* Mirrors resolve_commit_out_opts' own "wants_patch" derivation
+           (Phase 59 round 2): a bare --stat or -s never asks for the dense
+           patch, so a tag pointing at a non-empty-dense octopus must not be
+           refused on their account either. */
+        {
+            int p59_wants_patch = flags->patch || !flags->format_seen;
+            int p59_check_refusal =
+                p59_wants_patch && !(flags->name_only || flags->name_status);
+
+            if (target_is_merge(git_dir, tag.object, hops + 1, p59_check_refusal)) {
+                fprintf(stderr,
+                       "sg: showing an octopus merge with a non-empty combined diff is not "
+                       "supported yet\n");
+                sg_tag_free(&tag);
+                return -1;
+            }
         }
 
         if (sg_date_format_normal(tag.tagger_time, tag.tagger_tz, timebuf, sizeof(timebuf)) != 0)
@@ -515,10 +774,21 @@ static int render_id(const char *git_dir, const char *display_arg,
             printf("\n");
 
         /* Unlike a commit's message, a tag's message is NOT indented four
-           spaces (measured). */
+           spaces (measured).
+
+           WARNING: **--oneline drops the Tagger:/Date: lines entirely**
+           (measured against real git 2.55.0: `git show --oneline
+           <annotated tag>` prints "tag v1", a blank line, then the message,
+           with NO Tagger:/Date: lines in between) -- a pre-existing Phase
+           55a bug, not introduced by Phase 59: the 50 flag combinations
+           that phase claimed to have pinned byte-for-byte never actually
+           combined --oneline with an annotated tag target. Same old/new
+           behavior reproduced on a pre-Phase-59 build, confirming this. */
         printf("tag %s\n", tag.tag_name);
-        printf("Tagger: %s <%s>\n", tag.tagger_name, tag.tagger_email);
-        printf("Date:   %s\n", timebuf);
+        if (!flags->oneline) {
+            printf("Tagger: %s <%s>\n", tag.tagger_name, tag.tagger_email);
+            printf("Date:   %s\n", timebuf);
+        }
         if (tag.message != NULL && tag.message[0] != '\0')
             printf("\n%s", tag.message);
         *shown = 1;
@@ -610,28 +880,38 @@ int sg_cmd_show(int argc, char **argv)
     flags.oneline = 0;
     flags.patch = 0;
     flags.stat = 0;
+    flags.name_only = 0;
+    flags.name_status = 0;
+    flags.no_output = 0;
     flags.format_seen = 0;
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
 
         if (strcmp(a, "-s") == 0) {
-            /* -s CLEARS what came before rather than outranking it, and -p
-               and --stat each set their own bit and accumulate. Measured
-               over 11 combinations, and one model explains all of them:
-               `-s -p` prints a patch while `-p -s` prints nothing, `-s
-               --stat` prints a stat while `--stat -s` prints nothing, and
-               `--stat -p` prints BOTH. Giving -s a fixed priority passes
-               every single-flag case and gets `-s -p` backwards -- the same
-               last-one-wins shape CLAUDE.md records for -M/-C and -c/--cc. */
+            /* -s CLEARS every one of the five bits, then sets no_output --
+               see show_flags's own comment for the full model and why an
+               explicit format request (-p/--stat, but NOT --name-only/
+               --name-status) also clears no_output below. */
             flags.patch = 0;
             flags.stat = 0;
+            flags.name_only = 0;
+            flags.name_status = 0;
+            flags.no_output = 1;
             flags.format_seen = 1;
         } else if (strcmp(a, "-p") == 0 || strcmp(a, "--patch") == 0) {
             flags.patch = 1;
+            flags.no_output = 0;
             flags.format_seen = 1;
         } else if (strcmp(a, "--stat") == 0) {
             flags.stat = 1;
+            flags.no_output = 0;
+            flags.format_seen = 1;
+        } else if (strcmp(a, "--name-only") == 0) {
+            flags.name_only = 1;
+            flags.format_seen = 1;
+        } else if (strcmp(a, "--name-status") == 0) {
+            flags.name_status = 1;
             flags.format_seen = 1;
         } else if (strcmp(a, "--oneline") == 0) {
             flags.oneline = 1;
@@ -645,6 +925,18 @@ int sg_cmd_show(int argc, char **argv)
             }
             objects[object_count++] = a;
         }
+    }
+
+    /* Section 2: more than one of {--name-only, --name-status, -s} surviving
+       to here is an error -- git: "fatal: options '--name-only',
+       '--name-status', '--check', and '-s' cannot be used together" (exit
+       128, not one of --check since sg has no --check). sg keeps this
+       project's own exit-0/1 convention (see CLAUDE.md's divergence #3) and
+       prints the usage line, same as any other rejected flag combination
+       here. */
+    if (flags.name_only + flags.name_status + flags.no_output > 1) {
+        fprintf(stderr, "%s", USAGE);
+        return 1;
     }
 
     git_dir = sg_require_git_dir();

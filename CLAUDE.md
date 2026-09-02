@@ -294,6 +294,17 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `src/cli/commit_out.c` (`sg_commit_out_entry`) and **neither command owns a
   copy**. Phase 54's `phase54` interop group is what proves a change to it
   did not move `sg log`.
+  WARNING: **`--oneline` changes an ANNOTATED TAG's header, not just the
+  commit's** (Phase 59, measured): it drops the `Tagger:` and `Date:` lines
+  entirely, and drops the blank line between the tag message and the commit
+  line below it. Without `--oneline` all three are printed, and that half was
+  always right -- the suppression is `--oneline`-only, so a fix that removes
+  those lines unconditionally passes the new checks and breaks the old ones.
+  This was a PRE-EXISTING bug from Phase 55a, which pinned 50 `sg show`
+  combinations byte-for-byte and simply never combined `--oneline` with an
+  annotated tag; it surfaced in Phase 59 only because a new fixture put a tag
+  on an octopus. Interop pins the three `--oneline` forms plus a negative
+  control asserting `Tagger:` survives without it.
   WARNING: **the separator between several objects is STATEFUL, and a blob
   is the exception**: everything else takes a leading blank line when
   something was already shown or when it is a tag's target, while a blob
@@ -333,11 +344,88 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   above). Adding that field required auditing every manual construction site
   per the shared-struct rule.
   WARNING: **an octopus is refused only when it actually needs rendering** --
-  `> 2` parents AND a non-empty dense set. A clean octopus prints header plus
-  the opening blank line, byte-identical to git, and its `--stat` works like
-  any other. **A fixture for the dense path must use a merge that CONFLICTED
+  `> 2` parents, a non-empty dense set, AND a request that actually renders
+  the dense PATCH. **A clean octopus prints header plus the opening blank
+  line, byte-identical to git, and its `--stat` works like any other -- and
+  so does a NON-clean octopus's `--stat` (or `-s`)**, which was a real bug
+  from Phase 55b until Phase 59 round 2: the refusal used to fire on ANY
+  output request at all for a `> 2`-parent commit with a non-empty dense
+  set, not just a request for the dense patch itself, so `sg show --stat
+  <non-clean octopus>` and `sg show -s <non-clean octopus>` were both
+  wrongly refused even though neither ever touches the dense set (`--stat`
+  is a first-parent diff at any parent count, `-s` prints no diff at all --
+  this file said so two lines up and got the octopus case wrong right next
+  to saying it). The guard is now `commit.parent_count > 2 && o.patch &&
+  !(o.name_only || o.name_status)`, in both `render_id`'s direct check and
+  `target_is_merge`'s tag-lookahead mirror of it (`cmd_show.c`). This bug
+  was unreachable by any fixture an ordinary `sg merge`/`git merge` could
+  build -- a real octopus merge tool refuses outright on the same conflict
+  such a fixture needs -- so it stayed invisible until a `commit-tree`-built
+  fixture (three independent single-parent branches, a hand-picked result
+  tree differing from all three) made the non-clean-octopus shape
+  constructible at all; see Phase 59's DESIGN.md entry for the fixture.
+  **A fixture for the dense path must use a merge that CONFLICTED
   and was resolved**: a clean merge's dense set is empty, and this group's
   precondition caught exactly that mistake.
+  WARNING: **`--name-only`/`--name-status` exist as of Phase 59, and the
+  five-flag model is NOT "`-s` clears, the other four OR together"** -- that
+  prose is one bit too coarse, measured directly against real git 2.55.0
+  over 16 combinations: `-p`/`--stat` clear `no_output` when they fire
+  (an explicit format request cancels "no output"), `--name-only`/
+  `--name-status` do NOT. Only with that detail does one model explain both
+  `-s --name-only` (ERROR: `no_output` and `name_only` both survive) and
+  `-s -p --name-only` (prints names, no error: `-p` cleared `no_output`
+  before `--name-only` ever set its own bit). `--name-only`/`--name-status`
+  suppress PATCH/STAT entirely, in either order, when either is active.
+  WARNING: **the octopus refusal above does NOT apply to `--name-only`/
+  `--name-status`** -- they carry one status letter PER PARENT instead of
+  being fixed at two sides (`MMM` for three parents, not `MM`), so a
+  non-empty dense set is answered, never refused, at any parent count. The
+  2-parent case reuses `sg_diff_combined_from_trees`'s `out` list plus
+  `sg_diff_print`; parent counts other than 2 go through a SEPARATE,
+  self-contained union-walk (`render_octopus_names`, `cmd_show.c`) that
+  duplicates (does not extend) that function's "differs from every parent"
+  rule, because `out` is only ever populated at `parent_count == 2` and this
+  phase's budget excluded `workdir/diff.c`.
+  WARNING: **`diff_out.c`'s `print_name_status` used to hardcode the literal
+  `"MM"` for every combinable row, and that was CORRECT until Phase 59** --
+  neither pre-existing producer (a live conflict; Phase 40's rev-mode pass)
+  can ever have an ABSENT `ours`/`theirs`, so neither letter could be
+  anything but `M`. A merge commit's own dense row (`combined_row`) is the
+  first producer whose sides genuinely vary, so its letters are now computed
+  (`combined_letter`: ABSENT parent -> `A`, present parent but ABSENT
+  result -> `D`, else `M`) -- **but only for `combined_row` rows**. Measured
+  against real git (both a modify/modify and an add/add unresolved
+  conflict, `-c` and `--cc`): git still prints literal `MM` even when the
+  result is DELETED, a shape the computed rule would answer `DD` for.
+  Applying the computed rule to the two pre-existing producers is a silent
+  regression no existing check would have caught; it is pinned by name in
+  `tests/interop.sh`'s `phase59:` group specifically because it was
+  measured and written down BEFORE the code, not found after.
+  WARNING: **suppressing PATCH/STAT when a name format is active belongs in
+  the RENDERER, not in `cmd_show.c`'s flag resolver** -- a directed mutation
+  (`tests/mutate.sh`) neutralizing a `resolve_commit_out_opts` line that
+  zeroed `o->patch`/`o->stat` left `make test` fully green, because both
+  render paths (`commit_out.c`'s `print_commit_diff`,
+  `cmd_show.c`'s `render_merge_diff`) already check `o->name_only`/
+  `o->name_status` FIRST and dispatch the name format regardless of
+  `o->patch`/`o->stat`'s value -- a redundant guard one layer above the
+  real one (CLAUDE.md's own three-way mutation classification: this was
+  neither a blind spot nor unobservable, the defense line was just one
+  layer down). The resolver now copies the five flags through
+  unconditionally; do not re-add the zeroing.
+  WARNING: **that same "patch/stat may be nonzero underneath a name
+  format" fact bit a SECOND place, found by an external 159-probe oracle,
+  not by this project's own gates.** `commit_out.c`'s `---`-vs-blank-line
+  separator rule was still reading `o->stat && o->patch` alone (Phase 54's
+  original rule, from before name formats existed) to decide the
+  separator, so `sg show -p --name-only --stat` printed a `---` line where
+  git prints a blank one -- `make test`, `bash tests/interop.sh` and
+  `make sanitize` were all green for this, because no existing fixture
+  combined a name format with BOTH `-p` and `--stat` at once. The rule is
+  now `o->stat && o->patch && !o->name_only && !o->name_status`: NAME
+  wins the separator decision the same way it already wins which
+  `sg_diff_print` format gets called two lines below it.
 - **git EXPANDS TABS in a commit message body, and sg must too** (Phase 55b,
   `print_message_line` in `src/cli/commit_out.c`). `--expand-tabs=8` is the
   medium format's default and **only** the medium format's: `--oneline` and
