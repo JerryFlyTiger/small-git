@@ -416,6 +416,93 @@ static void test_continue_message_has_no_extra_blank_line(void)
 }
 
 
+/* ==================== revert's --continue author must ALSO come from the
+   environment, not the reverted commit (review finding, Phase 57b) ====
+   The direct-apply case (test_revert_author_from_environment above) only
+   exercises attempt_one's kind branch; sg_pick_continue builds the finished
+   commit through a COMPLETELY SEPARATE code path (it cannot re-run
+   attempt_one -- the conflict has already been resolved by hand), and had
+   its own, independently-written kind branch making the same choice. A
+   review found this second branch had never been exercised: mutating its
+   `if (kind == SG_SEQ_CHERRY_PICK)` to `if (1)` (always copy the reverted
+   commit's author) left `make test` and `interop.sh` both fully green. */
+static void test_revert_continue_author_from_environment(void)
+{
+    char *repo_root;
+    char *git_dir = make_tmp_repo(&repo_root);
+    unsigned char root[SG_SHA1_RAW_LEN], edit1[SG_SHA1_RAW_LEN], edit2[SG_SHA1_RAW_LEN];
+    sg_pick_opts opts;
+    int rc;
+
+    build_commit(git_dir, repo_root, "master", "line1\nline2\nline3\n", NULL, "A", "a@example.com",
+                "root\n", 0, root);
+    build_commit(git_dir, repo_root, "master", "line1\nEDIT1\nline3\n", root, "Someone Else",
+                "someone@example.com", "edit1\n", 0, edit1);
+    build_commit(git_dir, repo_root, "master", "line1\nEDIT2\nline3\n", edit1, "A", "a@example.com",
+                "edit2\n", 1, edit2);
+
+    memset(&opts, 0, sizeof(opts));
+    rc = sg_pick_start(git_dir, repo_root, SG_SEQ_REVERT, (unsigned char (*)[SG_SHA1_RAW_LEN])edit1, 1,
+                       &opts);
+    CHECK(rc == 1, "reverting edit1 while HEAD is edit2 should conflict, got rc=%d", rc);
+    CHECK(sg_sequencer_kind_in_progress(git_dir) == SG_SEQ_REVERT,
+         "REVERT_HEAD should be present after the conflict");
+
+    /* Resolve the conflict: write a resolved blob and stage it at stage 0. */
+    {
+        unsigned char resolved_blob[SG_SHA1_RAW_LEN];
+        sg_index idx;
+        sg_index_entry e;
+        static const char resolved[] = "line1\nRESOLVED\nline3\n";
+
+        CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, resolved, strlen(resolved), resolved_blob) == 0,
+             "write resolved blob");
+        CHECK(sg_index_read(git_dir, &idx) == 0, "read index after conflict");
+        CHECK(sg_index_remove_all_stages(&idx, "f.txt") > 0, "remove conflicted stages");
+        memset(&e, 0, sizeof(e));
+        e.mode = 0100644;
+        memcpy(e.sha1, resolved_blob, SG_SHA1_RAW_LEN);
+        e.path = (char *)"f.txt";
+        CHECK(sg_index_upsert(&idx, &e) == 0, "stage resolved f.txt");
+        CHECK(sg_index_write(git_dir, &idx) == 0, "write resolved index");
+        sg_index_free(&idx);
+    }
+
+    rc = sg_pick_continue(git_dir, repo_root, SG_SEQ_REVERT);
+    CHECK(rc == 0, "--continue should finish the revert, got rc=%d", rc);
+
+    {
+        unsigned char master_after[SG_SHA1_RAW_LEN];
+        sg_obj_type type;
+        unsigned char *content;
+        size_t content_len;
+        sg_commit c;
+
+        CHECK(sg_ref_read_branch(git_dir, "master", master_after) == 0, "read master after continue");
+        CHECK(sg_object_read(git_dir, master_after, &type, &content, &content_len) == 0 &&
+                 type == SG_OBJ_COMMIT,
+             "the finished commit should be readable");
+        CHECK(sg_commit_parse(content, content_len, &c) == 0, "the finished commit should parse");
+        /* Positive assertion, not just "not equal to X": the author must be
+           the same env-derived fallback attempt_one's own else-branch uses
+           (env_or("GIT_AUTHOR_NAME", "small_git")), so a mutation that
+           substitutes some OTHER wrong value still gets caught. */
+        CHECK(strcmp(c.author_name, "small_git") == 0,
+             "--continue'd revert's author must come from the environment fallback, not edit1's "
+             "author 'Someone Else'; got '%s'", c.author_name);
+        CHECK(strcmp(c.author_email, "sg@localhost") == 0,
+             "--continue'd revert's author email must come from the environment fallback, not "
+             "edit1's 'someone@example.com'; got '%s'", c.author_email);
+        CHECK(strcmp(c.author_name, "Someone Else") != 0,
+             "--continue'd revert's author must NOT be copied from the reverted commit (edit1)");
+        free(content);
+        sg_commit_free(&c);
+    }
+
+    free(git_dir);
+    free(repo_root);
+}
+
 /* ==================== a second review round: escape hatches must not need
    a parseable state (Phase 57 spec section 5b) ==================== */
 
@@ -788,6 +875,7 @@ int main(void)
     test_conflict_leaves_stages_and_state();
     test_empty_pick_detected();
     test_revert_author_from_environment();
+    test_revert_continue_author_from_environment();
     test_continue_message_has_no_extra_blank_line();
     test_quit_parses_nothing_and_clears_corrupted_state();
     test_abort_never_reads_sequencer_todo();

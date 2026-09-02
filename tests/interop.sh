@@ -14837,6 +14837,51 @@ check "phase57b oracle: precondition -- git's own merge-revert message really ha
 check "phase57b: sg revert -m 1's message (4.2, merge) matches git's byte-for-byte" \
     cmp -s "$P57B_MERGE-sg.msg" "$P57B_MERGE-git.msg"
 
+# Item 1 (review finding): the conflict marker's "theirs" label
+# (">>>>>>> <7hex> (<subject>)") used to be built into a fixed 300-byte
+# buffer with snprintf -- no overflow, but a SILENT truncation of anything
+# past that width. This is bytes written into the user's own file, so it
+# is a byte-fidelity divergence, not a cosmetic one. Measured against real
+# git (subject lengths 20/300/400): git never truncates. Fixture: revert a
+# commit whose subject is 320 bytes, onto a conflicting HEAD, and cmp the
+# ">>>>>>>" line itself.
+P57B_LONGLABEL="$WORKDIR/p57b_longlabel"
+mkdir -p "$P57B_LONGLABEL"
+(cd "$P57B_LONGLABEL" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+printf 'line1
+line2
+line3
+' > "$P57B_LONGLABEL/r.txt"
+(cd "$P57B_LONGLABEL" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_LONGLABEL" "root"
+(cd "$P57B_LONGLABEL" && LC_ALL=C git branch p57blong) > /dev/null 2>&1
+(cd "$P57B_LONGLABEL" && LC_ALL=C git switch -q p57blong) > /dev/null 2>&1
+printf 'line1
+FEATURE
+line3
+' > "$P57B_LONGLABEL/r.txt"
+(cd "$P57B_LONGLABEL" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+P57B_LONG_SUBJECT=$(python3 -c 'print("x" * 320)')
+p57_commit "$P57B_LONGLABEL" "$P57B_LONG_SUBJECT"
+P57B_LONGLABEL_FEAT=$(cd "$P57B_LONGLABEL" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+(cd "$P57B_LONGLABEL" && LC_ALL=C git switch -q master) > /dev/null 2>&1
+printf 'line1
+MASTER
+line3
+' > "$P57B_LONGLABEL/r.txt"
+(cd "$P57B_LONGLABEL" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p57_commit "$P57B_LONGLABEL" "master edit"
+
+rm -rf "$P57B_LONGLABEL-sg" "$P57B_LONGLABEL-git"
+cp -R "$P57B_LONGLABEL" "$P57B_LONGLABEL-sg"
+cp -R "$P57B_LONGLABEL" "$P57B_LONGLABEL-git"
+(cd "$P57B_LONGLABEL-sg" && "$SG" revert --no-edit "$P57B_LONGLABEL_FEAT") > /dev/null 2>&1
+(cd "$P57B_LONGLABEL-git" && LC_ALL=C git revert --no-edit "$P57B_LONGLABEL_FEAT") > /dev/null 2>&1
+grep -m1 '^>>>>>>>' "$P57B_LONGLABEL-sg/r.txt" > "$P57B_LONGLABEL-sg.markerline" 2>/dev/null
+grep -m1 '^>>>>>>>' "$P57B_LONGLABEL-git/r.txt" > "$P57B_LONGLABEL-git.markerline" 2>/dev/null
+check "phase57b oracle: precondition -- git's conflict marker line for a 320-byte subject is longer than 300 bytes (not truncated)"     sh -c 'test $(wc -c < "$0") -gt 300' "$P57B_LONGLABEL-git.markerline"
+check "phase57b: sg's conflict marker (theirs label) matches git's byte-for-byte, no silent truncation"     cmp -s "$P57B_LONGLABEL-sg.markerline" "$P57B_LONGLABEL-git.markerline"
+
 # Reflog: direct revert is "revert: <subject>"; --continue is bare
 # "commit: <subject>" with NO "(cherry-pick)"-style suffix at all -- the
 # asymmetry spec 3.3 measured against real git and requires pinned as a
@@ -14847,6 +14892,7 @@ mkdir -p "$P57B_CONFLICT"
 printf 'line1\nline2\nline3\n' > "$P57B_CONFLICT/r.txt"
 (cd "$P57B_CONFLICT" && LC_ALL=C git add r.txt) > /dev/null 2>&1
 p57_commit "$P57B_CONFLICT" "root"
+(cd "$P57B_CONFLICT" && LC_ALL=C git branch p57bother) > /dev/null 2>&1
 printf 'line1\nEDIT1\nline3\n' > "$P57B_CONFLICT/r.txt"
 (cd "$P57B_CONFLICT" && LC_ALL=C git add r.txt) > /dev/null 2>&1
 p57_commit "$P57B_CONFLICT" "edit1"
@@ -14924,6 +14970,7 @@ P57B_MULTI_EXTRA=$(cd "$P57B_MULTI" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
 printf 'line1\nEDIT2\nline3\n' > "$P57B_MULTI/r.txt"
 (cd "$P57B_MULTI" && LC_ALL=C git add r.txt) > /dev/null 2>&1
 p57_commit "$P57B_MULTI" "edit2"
+P57B_MULTI_PRE_MASTER=$(cd "$P57B_MULTI" && LC_ALL=C git rev-parse master 2>/dev/null)
 
 rm -rf "$P57B_MULTI-sg" "$P57B_MULTI-git"
 cp -R "$P57B_MULTI" "$P57B_MULTI-sg"
@@ -14946,6 +14993,49 @@ check "phase57b: sg's todo lines start with the verb 'revert' and a 40-hex id (t
 check "phase57b: real git accepts sg's full-hex todo field as a valid object id" \
     sh -c "cd \"\$0\" && LC_ALL=C git rev-parse --verify \"\$(awk '{print \$2}' .git/sequencer/todo | head -1)\" >/dev/null 2>&1" \
     "$P57B_MULTI-sg"
+
+# Item 4 (review finding): 57a's spec 5b escape-hatch fix has two named
+# interop checks for cherry-pick (a REAL git binary pauses, then sg's
+# --quit/--abort must still work even though sg cannot read git's 7-hex
+# todo). Revert shares the exact same code path, but nothing had ever
+# built the git-paused fixture for revert specifically. "$P57B_MULTI-git"
+# above is already exactly that fixture (real git paused a two-commit
+# revert on it), so it is reused here rather than rebuilt.
+check "phase57b oracle: precondition -- real git actually paused the revert too"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_MULTI-git"
+
+P57B_GP_QUIT="$WORKDIR/p57b_gitpaused_quit"
+rm -rf "$P57B_GP_QUIT"
+cp -R "$P57B_MULTI-git" "$P57B_GP_QUIT"
+(cd "$P57B_GP_QUIT" && "$SG" revert --quit) > "$P57B_GP_QUIT.out" 2>&1
+p57b_gp_quit_rc=$?
+check "phase57b: sg revert --quit clears a revert a REAL GIT BINARY paused"     test "$p57b_gp_quit_rc" = 0
+check "phase57b: ...leaving neither REVERT_HEAD nor sequencer/ behind"     sh -c 'test ! -f "$0/.git/REVERT_HEAD" -a ! -d "$0/.git/sequencer"' "$P57B_GP_QUIT"
+
+P57B_GP_ABORT="$WORKDIR/p57b_gitpaused_abort"
+rm -rf "$P57B_GP_ABORT"
+cp -R "$P57B_MULTI-git" "$P57B_GP_ABORT"
+(cd "$P57B_GP_ABORT" && "$SG" revert --abort) > "$P57B_GP_ABORT.out" 2>&1
+p57b_gp_abort_rc=$?
+check "phase57b: sg revert --abort recovers a revert a REAL GIT BINARY paused"     test "$p57b_gp_abort_rc" = 0
+check "phase57b: ...restoring master to the exact commit git's own sequencer/head named"     sh -c 'test "$(cd "$0" && LC_ALL=C git rev-parse master)" = "$1"' "$P57B_GP_ABORT"     "$P57B_MULTI_PRE_MASTER"
+check "phase57b: ...and clearing the paused state"     sh -c 'test ! -f "$0/.git/REVERT_HEAD" -a ! -d "$0/.git/sequencer"' "$P57B_GP_ABORT"
+
+P57B_GP_CONT="$WORKDIR/p57b_gitpaused_continue"
+rm -rf "$P57B_GP_CONT"
+cp -R "$P57B_MULTI-git" "$P57B_GP_CONT"
+(cd "$P57B_GP_CONT" && "$SG" revert --continue) > "$P57B_GP_CONT.out" 2>&1
+p57b_gp_cont_rc=$?
+check "phase57b: sg revert --continue still refuses on git's 7-hex todo"     test "$p57b_gp_cont_rc" = 1
+check "phase57b: ...but its message names --abort, a command that actually works on this input"     sh -c 'grep -q -- "--abort" "$0"' "$P57B_GP_CONT.out"
+check "phase57b: ...and does NOT tell the user to re-run --continue or --skip (which fail identically)"     sh -c '! grep -qE -- "run \`?sg revert (--continue|--skip)" "$0"' "$P57B_GP_CONT.out"
+check "phase57b: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit)"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GP_CONT"
+
+P57B_GP_STATUS="$WORKDIR/p57b_gitpaused_status"
+rm -rf "$P57B_GP_STATUS"
+cp -R "$P57B_MULTI-git" "$P57B_GP_STATUS"
+(cd "$P57B_GP_STATUS" && "$SG" status) > "$P57B_GP_STATUS.out" 2>&1
+check "phase57b: sg status still prints the revert banner when sequencer/todo is git's 7-hex shape"     sh -c 'grep -q "^You are currently reverting commit [0-9a-f]\{7\}\.$" "$0"'     "$P57B_GP_STATUS.out"
+check "phase57b: ...naming the SAME commit REVERT_HEAD holds (independent of sequencer/'s parse)"     sh -c 'want=$(cut -c1-7 "$0/.git/REVERT_HEAD"); grep -q "commit $want\.\$" "$1"'     "$P57B_GP_STATUS" "$P57B_GP_STATUS.out"
 
 # --abort restores the pre-revert state on both sides; --quit leaves the
 # conflicted index in place (spec section 5).
@@ -14991,6 +15081,106 @@ check "phase57b oracle: precondition -- git's status names the revert (not cherr
     sh -c 'grep -q "currently reverting" "$0"' "$P57B_STATUS_GIT.raw"
 check "phase57b: sg status's revert banner matches git's skeleton byte-for-byte" \
     cmp -s "$P57B_STATUS_SG.sk" "$P57B_STATUS_GIT.sk"
+
+# Item 3 (review finding): of the eight gate sites CLAUDE.md's convergence
+# list names, only cmd_commit.c's (divergence 5, checked below) had ever
+# been exercised with a REVERT-paused fixture -- the other seven were only
+# ever proven against a paused CHERRY-PICK. Since the predicate
+# (`sg_sequencer_kind_in_progress`) and the message-naming branch
+# (`seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert"`) are
+# per-site, cherry-pick coverage says nothing about revert's own branch at
+# each site. Measured: mutating cmd_switch.c's own branch to a hard-coded
+# "cherry-pick" left ALL 2502 existing checks green. Each site below is
+# checked individually (not with one shared assertion) and gets its own
+# mutation, matching phase57's own "do not use /g, it smears per-site
+# results together" rule.
+p57b_gate_pause() {
+    # $1 = target dir. Leaves it with a single-commit sg-paused revert.
+    rm -rf "$1"
+    cp -R "$P57B_CONFLICT" "$1"
+    (cd "$1" && "$SG" revert --no-edit "$P57B_CONFLICT_EDIT1") > /dev/null 2>&1
+}
+
+# apply.c:333/362 (sg_safe_apply_tree's dirty-workdir confirmation), via
+# `sg reset --hard`.
+P57B_GATE_RESETHARD="$WORKDIR/p57b_gate_resethard"
+p57b_gate_pause "$P57B_GATE_RESETHARD"
+(cd "$P57B_GATE_RESETHARD" && "$SG" reset --hard HEAD) > "$P57B_GATE_RESETHARD.out" 2>&1
+p57b_gate_resethard_rc=$?
+check "phase57b gate site: apply.c's dirty-workdir check (via sg reset --hard) refuses and names revert"     sh -c 'test "$0" = 1 && grep -qi revert "$1"' "$p57b_gate_resethard_rc" "$P57B_GATE_RESETHARD.out"
+check "phase57b gate site: ...and REVERT_HEAD survives the refusal"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GATE_RESETHARD"
+
+# cmd_reset.c's `--soft` refusal.
+P57B_GATE_RESETSOFT="$WORKDIR/p57b_gate_resetsoft"
+p57b_gate_pause "$P57B_GATE_RESETSOFT"
+(cd "$P57B_GATE_RESETSOFT" && "$SG" reset --soft HEAD) > "$P57B_GATE_RESETSOFT.out" 2>&1
+p57b_gate_resetsoft_rc=$?
+check "phase57b gate site: cmd_reset.c's --soft refusal names revert"     sh -c 'test "$0" = 1 && grep -qi revert "$1"' "$p57b_gate_resetsoft_rc" "$P57B_GATE_RESETSOFT.out"
+
+# cmd_merge.c's start gate.
+P57B_GATE_MERGE="$WORKDIR/p57b_gate_merge"
+p57b_gate_pause "$P57B_GATE_MERGE"
+(cd "$P57B_GATE_MERGE" && "$SG" merge p57bother) > "$P57B_GATE_MERGE.out" 2>&1
+p57b_gate_merge_rc=$?
+check "phase57b gate site: cmd_merge.c's start gate refuses and names revert"     sh -c 'test "$0" = 1 && grep -qi revert "$1"' "$p57b_gate_merge_rc" "$P57B_GATE_MERGE.out"
+
+# cmd_switch.c's start gate -- `--force` specifically (same reasoning as
+# phase57's own switch gate check: apply.c's dirty CONFIRMATION is what
+# --force bypasses, cmd_switch.c's own gate is unconditional).
+P57B_GATE_SWITCH="$WORKDIR/p57b_gate_switch"
+p57b_gate_pause "$P57B_GATE_SWITCH"
+(cd "$P57B_GATE_SWITCH" && "$SG" switch --force p57bother) > "$P57B_GATE_SWITCH.out" 2>&1
+p57b_gate_switch_rc=$?
+check "phase57b gate site: cmd_switch.c's start gate refuses --force and names revert"     sh -c 'test "$0" = 1 && grep -qi revert "$1"' "$p57b_gate_switch_rc" "$P57B_GATE_SWITCH.out"
+check "phase57b gate site: ...--force does not bypass it (HEAD stays on master)"     sh -c 'test "$(cat "$0/.git/HEAD")" = "ref: refs/heads/master"' "$P57B_GATE_SWITCH"
+
+# cmd_rebase.c's start gate.
+P57B_GATE_REBASE="$WORKDIR/p57b_gate_rebase"
+p57b_gate_pause "$P57B_GATE_REBASE"
+(cd "$P57B_GATE_REBASE" && "$SG" branch p57bgaterebtarget HEAD) > /dev/null 2>&1
+(cd "$P57B_GATE_REBASE" && "$SG" rebase p57bgaterebtarget) > "$P57B_GATE_REBASE.out" 2>&1
+p57b_gate_rebase_rc=$?
+check "phase57b gate site: cmd_rebase.c's start gate refuses and names revert"     sh -c 'test "$0" = 1 && grep -qi revert "$1"' "$p57b_gate_rebase_rc" "$P57B_GATE_REBASE.out"
+check "phase57b gate site: ...and rebase does not clobber the paused conflict content"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GATE_REBASE"
+
+# cmd_stash.c's apply/pop gate -- needs a real stash entry BEFORE the
+# revert starts (same reasoning as phase57's own equivalent check:
+# sg_index_has_unmerged is checked first and unconditionally, so an
+# UNRESOLVED conflict never reaches this gate at all; the conflict must be
+# resolved and staged first).
+P57B_GATE_STASHAPPLY="$WORKDIR/p57b_gate_stashapply"
+rm -rf "$P57B_GATE_STASHAPPLY"
+cp -R "$P57B_CONFLICT" "$P57B_GATE_STASHAPPLY"
+printf 'stash me
+' >> "$P57B_GATE_STASHAPPLY/r.txt"
+(cd "$P57B_GATE_STASHAPPLY" && "$SG" stash push -m p57bstash) > /dev/null 2>&1
+(cd "$P57B_GATE_STASHAPPLY" && "$SG" revert --no-edit "$P57B_CONFLICT_EDIT1") > /dev/null 2>&1
+check "phase57b oracle: precondition -- a stash entry and a paused revert coexist"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GATE_STASHAPPLY"
+printf 'line1
+RESOLVED
+line3
+' > "$P57B_GATE_STASHAPPLY/r.txt"
+(cd "$P57B_GATE_STASHAPPLY" && "$SG" add r.txt) > /dev/null 2>&1
+check "phase57b oracle: precondition -- the revert conflict is resolved and staged, but still in progress"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GATE_STASHAPPLY"
+(cd "$P57B_GATE_STASHAPPLY" && "$SG" stash apply) > "$P57B_GATE_STASHAPPLY.out" 2>&1
+p57b_gate_stashapply_rc=$?
+check "phase57b gate site: cmd_stash.c's apply/pop gate refuses and names revert"     sh -c 'test "$0" = 1 && grep -qi revert "$1"' "$p57b_gate_stashapply_rc" "$P57B_GATE_STASHAPPLY.out"
+
+# cmd_stash.c's push-time warning (succeeds, but the warning must still
+# name revert, not cherry-pick).
+P57B_GATE_STASHPUSH="$WORKDIR/p57b_gate_stashpush"
+p57b_gate_pause "$P57B_GATE_STASHPUSH"
+printf 'line1
+RESOLVED
+line3
+' > "$P57B_GATE_STASHPUSH/r.txt"
+(cd "$P57B_GATE_STASHPUSH" && "$SG" add r.txt) > /dev/null 2>&1
+printf 'unrelated dirt
+' > "$P57B_GATE_STASHPUSH/unrelated.txt"
+(cd "$P57B_GATE_STASHPUSH" && "$SG" add unrelated.txt) > /dev/null 2>&1
+(cd "$P57B_GATE_STASHPUSH" && "$SG" stash push -m p57bstash2) > "$P57B_GATE_STASHPUSH.out" 2>&1
+p57b_gate_stashpush_rc=$?
+check "phase57b gate site: cmd_stash.c's push-time warning names revert (and still succeeds)"     sh -c 'test "$0" = 0 && grep -qi revert "$1"' "$p57b_gate_stashpush_rc" "$P57B_GATE_STASHPUSH.out"
 
 # Divergence 5 (spec section 6, last paragraph) applies to revert too: `sg
 # commit` is refused while a revert is stopped, `git commit` completes it.

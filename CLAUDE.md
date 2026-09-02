@@ -1961,6 +1961,22 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `Revert "Revert  "two spaces""`. Only the literal 8-byte prefix `Revert "`
   (exact case, exactly one space) triggers the swap to `Reapply "`. See
   Phase 57 spec section 4.3 / `docs/DESIGN.md` for the full table.
+  WARNING: **a revert's conflict-marker "theirs" label carries a
+  revert-only `"parent of "` prefix that cherry-pick's does not** (found in
+  Phase 57b's review round 2, alongside fixing the fixed-300-byte buffer
+  that silently truncated it past 300 bytes -- both live in the same
+  `attempt_one` `snprintf(NULL, 0, ...)` + `malloc` construction in
+  `src/cli/pick.c`, gated on `kind == SG_SEQ_REVERT`). Measured on both a
+  single-parent revert and a `-m 1` merge revert: git always prints
+  `>>>>>>> parent of <7hex> (<subject>)` for a revert conflict, never the
+  bare `<7hex> (<subject>)` cherry-pick uses. This had been wrong since
+  Phase 57a wrote the shared `theirs_label` construction with no `kind`
+  branch in it at all, and nothing caught it because no check before this
+  round ever compared a revert conflict's marker BYTES against real git
+  (the pre-existing `REVERT_HEAD`/`MERGE_MSG` checks don't read the
+  working-tree file's conflict markers). See Phase 57b's DESIGN.md section
+  6 for both the truncation and the prefix bug, and do not "simplify" the
+  label construction back to one shared format string.
   WARNING: **the gate convergence list is long and every site matters, and
   `cmd_rebase.c`'s OWN start gate is ON this list, not exempt from it.**
   This project's own Phase 57 spec originally said "every call site of

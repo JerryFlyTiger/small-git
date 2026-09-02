@@ -214,6 +214,24 @@ static void test_revert_message_rows(void)
 
     /* 4.1's plain wrapping case, an ordinary subject. */
     run_one_row("an ordinary change", "Revert \"an ordinary change\"");
+
+    /* Boundary rows (review finding, Phase 57b round 2): the 7 rows above
+       are all either well past 8 bytes or an obvious non-match; none of
+       them exercises the boundary of the 8-byte literal-prefix comparison
+       itself. Each row below was statically traced against
+       build_revert_subject_line before being added -- this is filling in
+       missing WITNESSES for already-correct behaviour, not chasing a bug
+       (see build_revert_subject_line's own comment in pick.c). */
+    /* Subject IS the 8-byte prefix, with nothing after it: still matches
+       (no closing-quote/balance check), rest is the empty string, so the
+       swap produces `Reapply "` with nothing following the opening quote. */
+    run_one_row("Revert \"", "Reapply \"");
+    /* Subject shorter than 8 bytes: strncmp's own length guard means this
+       can never match the prefix, so it falls through to plain wrapping. */
+    run_one_row("Rev", "Revert \"Rev\"");
+    /* Empty subject: also shorter than 8 bytes, same fallthrough, and
+       exercises wrapping an empty string specifically. */
+    run_one_row("", "Revert \"\"");
 }
 
 /* ==================== 4.2: merge, with -m ==================== */

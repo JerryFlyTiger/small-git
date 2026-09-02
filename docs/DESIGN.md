@@ -10458,3 +10458,101 @@ finish, or abort a pick/revert sg paused; sg can only `--abort`/`--quit`,
 never `--continue`/`--skip`, one git itself paused, and explains why --
 git's todo ids are its own abbreviated 7-hex, which sg has no
 abbreviated-object-name resolution to read back).
+
+### 6. Review round 2: a found-and-fixed live bug, plus four coverage gaps
+
+A cold review of the committed Phase 57b diff found no live bug in the
+revert message/author logic itself -- every line was traced and confirmed
+correct. All five items below are either genuine coverage gaps (57a wrote
+the revert branch of shared code, but 57b was the first thing to actually
+exercise it, and most of those branches had no witness) or, for item 1,
+a bug the new coverage itself exposed while being written.
+
+**Item 1a (real bug, fixed): the conflict marker's "theirs" label was
+truncated past 300 bytes.** `attempt_one`'s `theirs_label` (`src/cli/
+pick.c`) was a fixed `char[300]` filled with `snprintf` -- no overflow, but
+a silent truncation once `<7hex> (<subject>)` exceeded that width. Measured
+against real git 2.55.0 (subject lengths 20/300/400 bytes, cherry-pick to a
+conflict, read the `>>>>>>>` line): git never truncates. Fixed by measuring
+the needed length first and `malloc`ing, the same idiom `build_revert_
+message` already used. Verified against real git at all three lengths
+after the fix: byte-identical.
+
+**Item 1b (a SECOND real bug, found by the interop check item 1a's fix
+required, not part of the original review): revert's conflict marker is
+missing git's "parent of " prefix entirely.** Real git's `theirs` label
+for a `git revert` conflict is `parent of <7hex> (<subject>)`, not the bare
+`<7hex> (<subject>)` cherry-pick uses -- measured on both a single-parent
+revert and a `-m 1` merge revert, the prefix is present in both. sg's
+`theirs_label` construction was shared verbatim between the two commands
+and had never had `kind` threaded into it at all, so `sg revert` produced
+cherry-pick's label shape for every conflict it ever raised, and nothing
+had caught this because no check before this round ever `cmp`'d the marker
+line's bytes for a revert conflict -- the pre-existing `REVERT_HEAD`/
+`MERGE_MSG` checks don't touch the working-tree file's conflict markers at
+all. Fixed in the same edit as item 1a (`kind == SG_SEQ_REVERT` selects an
+extra `"parent of "` prefix baked into the same `snprintf(NULL, 0, ...)` +
+`malloc` construction). Interop's new byte-for-byte marker-line check
+(originally written only to prove item 1a) is what caught this; it would
+have caught it even without item 1a ever existing, which is the whole
+argument for measuring the actual bytes instead of only the length.
+
+**Item 2 (coverage gap, no bug): `sg_pick_continue`'s revert-author branch
+had no witness.** `attempt_one` (the direct-apply path) and `sg_pick_
+continue` (the resume path) are two SEPARATE, independently-written
+`if (kind == SG_SEQ_CHERRY_PICK)` branches building the same commit's
+author fields -- sharing a kind parameter does not share a code path, let
+alone a test. `test_revert_author_from_environment` only ever drove the
+first; `test_revert_continue_author_from_environment` (new) drives a
+revert through a real conflict, resolves it, and asserts the `--continue`'d
+commit's author is the environment fallback, not the reverted commit's
+-- both as a positive assertion (matches `env_or`'s own fallback values)
+and a negative one (does not match the reverted commit's author), so a
+mutation substituting a third, wrong value is still caught. Reverse-mutated
+(`if (kind == SG_SEQ_CHERRY_PICK)` -> `if (1)` at this specific site, not
+`attempt_one`'s): confirmed red on all three assertions.
+
+**Item 3 (coverage gap, no bug): 7 of 8 gate sites had only ever been
+proven against a paused CHERRY-PICK, never a paused REVERT.** The predicate
+(`sg_sequencer_kind_in_progress`) and the message-naming branch
+(`seq_kind == SG_SEQ_CHERRY_PICK ? "cherry-pick" : "revert"`) are
+per-site, so cherry-pick coverage says nothing about whether a given site's
+own branch correctly names "revert". `phase57b:`'s new gate-site block
+pauses a revert (not a cherry-pick) and checks each of `apply.c`'s
+dirty-workdir confirmation (via `reset --hard`), `cmd_reset.c`'s
+`--soft`, `cmd_merge.c`, `cmd_switch.c --force`, `cmd_rebase.c`,
+`cmd_stash.c`'s apply/pop gate, and `cmd_stash.c`'s push-time warning --
+seven separate named checks, not one shared assertion. Each was reverse-
+mutated INDIVIDUALLY (its own `"cherry-pick"`-hardcoding, not `/g` across
+the whole file, per the project's own "do not smear per-site results
+together" rule), and each turned exactly its own named check red and no
+others. `cmd_commit.c`'s gate (divergence 5) already had revert coverage
+from the original 57b commit and needed no new check; `cmd_undo.c`'s
+clearing exception was out of this round's scope.
+
+**Item 4 (coverage gap, no bug): the spec-5b escape-hatch fix had no
+revert-specific interop witness against a REAL git-paused revert.** 57a's
+own two named checks (cherry-pick `--quit` clears a git-paused sequence;
+`--abort` recovers one) only ever drove a cherry-pick. `phase57b:` already
+built exactly the needed fixture for its `sequencer/todo` verb check
+(`$P57B_MULTI-git`, a real two-commit `git revert` paused by real git,
+never touched by sg) -- reused rather than rebuilt. New checks confirm
+`sg revert --quit` clears it unconditionally, `sg revert --abort` restores
+`master` to the exact commit git's own `sequencer/head` named,
+`sg revert --continue` still refuses (git's 7-hex todo is genuinely
+unreadable) but names `--abort`, never `--continue`/`--skip` (which fail
+identically), and `sg status` still prints the "You are currently
+reverting commit <7hex>." banner from `REVERT_HEAD` alone, independent of
+whether `sequencer/todo` parses.
+
+**Item 5 (coverage gap, no bug, confirmed by static trace before
+writing): the 4.3 Reapply rule's 7 rows never touched the 8-byte boundary
+itself.** All 7 were either well past 8 bytes or an obvious non-match.
+Three boundary rows were added and MATCHED the statically-traced
+expectation on the first run, with no source change required: the subject
+being exactly the 8-byte prefix `Revert "` and nothing else (produces
+`Reapply "` with nothing following the opening quote -- still no
+closing-quote check, matching the existing rule); a subject shorter than 8
+bytes (`Rev`, falls through to plain wrapping because `strncmp`'s own
+length guard cannot match); and the empty subject (also falls through,
+wraps to `Revert ""`).

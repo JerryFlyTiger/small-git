@@ -301,7 +301,7 @@ static attempt_rc attempt_one(const char *git_dir, const char *repo_root, sg_seq
     char **conflict_paths = NULL;
     size_t conflict_count = 0;
     char short_sha[8];
-    char theirs_label[300];
+    char *theirs_label = NULL;
     attempt_rc rc = ATTEMPT_ERROR;
     size_t i;
 
@@ -348,19 +348,41 @@ static attempt_rc attempt_one(const char *git_dir, const char *repo_root, sg_seq
 
     short_hex(commit_id, short_sha);
     {
+        /* Measured against real git 2.55.0: a revert's conflict-marker
+           "theirs" label is prefixed with the literal "parent of ", a
+           revert-only difference from cherry-pick's plain "<7hex>
+           (<subject>)" -- reproduced on both a single-parent revert and a
+           merge revert with -m. Found while adding Phase 57b's own
+           byte-for-byte interop check for this line; nothing had ever
+           compared it for revert before. */
+        const char *prefix = kind == SG_SEQ_REVERT ? "parent of " : "";
         char *summary = first_line_dup(commit.message);
+        const char *summary_or_empty = summary != NULL ? summary : "";
+        int need = snprintf(NULL, 0, "%s%s (%s)", prefix, short_sha, summary_or_empty);
 
-        snprintf(theirs_label, sizeof(theirs_label), "%s (%s)", short_sha,
-                summary != NULL ? summary : "");
+        if (need < 0) {
+            free(summary);
+            sg_commit_free(&commit);
+            return ATTEMPT_ERROR;
+        }
+        theirs_label = malloc((size_t)need + 1);
+        if (theirs_label == NULL) {
+            free(summary);
+            sg_commit_free(&commit);
+            return ATTEMPT_ERROR;
+        }
+        snprintf(theirs_label, (size_t)need + 1, "%s%s (%s)", prefix, short_sha, summary_or_empty);
         free(summary);
     }
 
     if (sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, "HEAD", theirs_label,
                        SG_SIMILARITY_DEFAULT, &result) != 0) {
+        free(theirs_label);
         sg_commit_free(&commit);
         attempt_result_free(out);
         return ATTEMPT_ERROR;
     }
+    free(theirs_label);
 
     if (sg_merge_result_apply(git_dir, repo_root, &result, &new_idx, &conflict_paths,
                               &conflict_count) != 0) {
