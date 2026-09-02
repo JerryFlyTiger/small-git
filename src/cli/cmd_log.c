@@ -14,7 +14,26 @@
 
 static const char USAGE[] =
     "usage: sg log [-n <count>|-<count>|--max-count=<count>] [--oneline] "
-    "[-p|--patch] [--stat] [<rev>]\n";
+    "[--pretty[=<fmt>]|--format=<fmt>] [-p|--patch] [--stat] [<rev>]\n";
+
+/* Phase 60: parses the value of --pretty/--format (raw is the text after
+   `=`, or the literal "medium" for a bare --pretty) and rejects a
+   FORMAT/TFORMAT user_format containing `%` -- placeholder expansion is
+   Phase 60b, not yet wired up. Returns 0 with *out filled, or -1 having
+   already printed a diagnostic and exit code decided by the caller. */
+static int resolve_pretty_arg(const char *raw, sg_pretty_format *out)
+{
+    if (sg_pretty_parse(raw, out) != 0) {
+        fprintf(stderr, "sg: invalid --pretty format: %s\n", raw);
+        return -1;
+    }
+    if ((out->kind == SG_PRETTY_FORMAT || out->kind == SG_PRETTY_TFORMAT) &&
+       strchr(out->user_format, '%') != NULL) {
+        fprintf(stderr, "sg: --pretty format placeholders are not supported yet\n");
+        return -1;
+    }
+    return 0;
+}
 
 /* "-n <count>", "--max-count=<count>" and the bare "-<count>" all mean the
    same thing; 0 is legal and prints nothing (measured: git exits 0). */
@@ -38,9 +57,11 @@ int sg_cmd_log(int argc, char **argv)
     unsigned char id[SG_SHA1_RAW_LEN];
     const char *rev = NULL;
     sg_commit_out_opts o;
+    sg_pretty_format pretty_storage;
     long max_count = -1;
     int rc = 0;
     int first = 1;
+    int suppress_join;
     long shown = 0;
     int i;
 
@@ -57,12 +78,30 @@ int sg_cmd_log(int argc, char **argv)
        rather than through a single factory). */
     o.name_only = 0;
     o.name_status = 0;
+    /* Phase 60 added `pretty` to the same shared struct -- same warning
+       applies, a NULL here means "legacy medium/oneline via o.oneline". */
+    o.pretty = NULL;
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
 
         if (strcmp(a, "--oneline") == 0) {
             o.oneline = 1;
+        } else if (strcmp(a, "--pretty") == 0) {
+            /* Bare --pretty (no '=') is legal and means medium -- measured
+               asymmetry with bare --format below, CLAUDE.md's `sg log`
+               grammar section has the full table. */
+            if (resolve_pretty_arg("medium", &pretty_storage) != 0)
+                return 1;
+            o.pretty = &pretty_storage;
+        } else if (strncmp(a, "--pretty=", 9) == 0) {
+            if (resolve_pretty_arg(a + 9, &pretty_storage) != 0)
+                return 1;
+            o.pretty = &pretty_storage;
+        } else if (strncmp(a, "--format=", 9) == 0) {
+            if (resolve_pretty_arg(a + 9, &pretty_storage) != 0)
+                return 1;
+            o.pretty = &pretty_storage;
         } else if (strcmp(a, "-p") == 0 || strcmp(a, "--patch") == 0) {
             o.patch = 1;
         } else if (strcmp(a, "--stat") == 0) {
@@ -141,8 +180,32 @@ int sg_cmd_log(int argc, char **argv)
            cannot be folded into the message block inside the shared
            renderer. Keeping it here also leaves the first line of `sg log`
            a bare `commit <sha>`, which interop already parses with
-           `head -1`. --oneline gets no separator at all (measured). */
-        if (!first && !o.oneline)
+           `head -1`. --oneline gets no separator at all (measured).
+
+           Phase 60: builtin `oneline` joins that exemption, and so does
+           TFORMAT -- a tformat: entry already terminates itself with its
+           own trailing '\n' (commit_out.c's SG_PRETTY_TFORMAT branch), so
+           back-to-back entries need nothing extra (measured: "plain\nplain\n"
+           for two entries, not a blank line between them). FORMAT is the
+           opposite of TFORMAT here even though neither terminates itself
+           the same way builtins do: measured, it DOES get this same "\n"
+           printed before each entry but the first ("plain\nplain", joined
+           by exactly one newline) -- see CLAUDE.md's `sg log` Phase 60
+           entry for the byte-level derivation of why the two land on
+           different sides of this same boolean.
+
+           REFERENCE joins the no-separator set too (Phase 60a oracle round
+           2, measured directly): `git log -N --pretty=reference` prints
+           entries back to back with no blank line, even though the SAME
+           entry's own diff separator (an ordinary commit's `-p`) still gets
+           the usual blank line -- this is a between-ENTRIES-only rule, not
+           a blanket "reference behaves like oneline" one, so it belongs
+           only here and not in commit_out.c's print_commit_diff. */
+        suppress_join = o.oneline ||
+                       (o.pretty != NULL &&
+                        (o.pretty->kind == SG_PRETTY_ONELINE || o.pretty->kind == SG_PRETTY_TFORMAT ||
+                         o.pretty->kind == SG_PRETTY_REFERENCE));
+        if (!first && !suppress_join)
             printf("\n");
         first = 0;
 

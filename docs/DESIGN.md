@@ -10977,3 +10977,254 @@ Files touched beyond round 2: `src/cli/cmd_show.c` (the two `render_id`
 changes above), `tests/interop.sh` (6 more `phase59:` checks, reusing the
 existing `v1` annotated-tag fixture from the `phase55:` group rather than
 building a new one).
+
+## Phase 60a: `--pretty`/`--format` built-in formats for `sg log`/`sg show`
+
+Scope: sections 2/3/4 of the Phase 60 spec (the seven built-in formats, the
+argument grammar, the separator model), for both commands. Section 5
+(placeholder expansion, e.g. `%H`/`%an`) is deferred to Phase 60b; the
+grammar already recognizes `format:`/`tformat:`/bare-`%` strings this phase,
+but any string that actually contains a `%` is rejected up front with "not
+supported yet" -- a literal string with no `%` (e.g. `format:plain`) already
+renders correctly, which is how the separator model below could be
+interop-tested a full phase before placeholder expansion exists.
+
+### 1. Measured against real git 2.55.0 before writing any code
+
+All seven built-ins, the five grammar rows, and the separator matrix in the
+spec were independently re-measured on this machine (not trusted from the
+spec alone) using `git commit-tree`-built fixtures (to get exact control
+over parent counts and a genuine merge/root commit without the git-guard
+hook blocking `git commit`/`checkout`/`merge` on a throwaway scratch repo).
+Every one of the spec's tables reproduced exactly, including the two most
+surprising rows: `--format=plain` (no `format:`/`tformat:` prefix, no `%`)
+is REJECTED by real git ("invalid --pretty format: plain") -- rule 4 needs
+an actual `%` to reach TFORMAT, so a bare literal with neither a builtin
+name nor a `%` falls to rule 5 even when it arrived via `--format=`, not
+just `--pretty=`. And tab expansion is not "medium only" as an earlier
+CLAUDE.md note (written when only oneline/medium existed) claimed: measured
+directly, `full` and `fuller` also expand tabs to columns of 8, `short` and
+`raw` do not, matching git's own `cmit_fmt >= CMIT_FMT_MEDIUM` grouping.
+
+### 2. The separator model is one shared rule, not three special cases
+
+The spec's own table describes format:/tframat:/builtin as three different
+buckets for "separator before the diff", which reads like three code
+branches. Measuring byte-for-byte with `od -c` against real git found a
+single rule that produces the whole table with no branch on which pretty
+kind is active except one (builtin `oneline`):
+
+- The separator PRINTED is always exactly one of `"\n"` or `"---\n"`
+  (`stat && patch`), unconditionally -- this is the EXISTING pre-Phase-60
+  code path, untouched. The only new condition is that builtin `oneline`
+  joins legacy `--oneline` in skipping it entirely (verified with a
+  targeted mutation, see below).
+- What makes `format:<str>` look different is NOT a different separator --
+  it is that the entry's own text has no trailing newline of its own
+  (literally nothing appended after the user string), so the SAME `"\n"`
+  that reads as a blank line after a builtin's message block (which always
+  ends in its own `\n`) reads as a single line break after `format:`'s
+  bare text. `--stat -p` on `format:plain` produces `plain---\n f.txt |
+  ...` -- the `---` stuck directly onto `plain` with no line break at all,
+  because `format:` never emits one and the separator string itself is
+  exactly `"---\n"`, unconditionally, same as everywhere else.
+- Between LOG ENTRIES (not diffs), the picture is genuinely different from
+  the entry-diff rule and needed its own measurement: `tformat:` entries
+  self-terminate with their own `'\n'` and get NOTHING extra between them
+  (`"plain\nplain\n"` for two entries, no blank line) -- the opposite of
+  the entry-diff rule, where `tformat:` DOES get the blank-line separator.
+  `format:` entries get exactly one `'\n'` printed before each entry but
+  the first (same as every builtin except `oneline`), with no trailing
+  newline after the last entry -- `cmd_log.c`'s pre-existing "blank line
+  between entries, none after the last" loop already does exactly this
+  when generalized from `!o.oneline` to also exclude TFORMAT.
+
+This means `commit_out.c`'s `print_commit_diff` needed exactly ONE new
+condition (builtin `SG_PRETTY_ONELINE` joins the existing `oneline`
+exemption) rather than a kind-by-kind dispatch, and `cmd_log.c`'s
+between-entries loop needed exactly one new condition (TFORMAT joins that
+same exemption, on top of builtin ONELINE). `render_merge_diff`
+(`cmd_show.c`'s merge-specific diff renderer) needed NO changes at all --
+it already prints its leading blank line unconditionally regardless of
+`o->oneline` (a pre-existing, documented divergence from the ordinary-commit
+rule: `git show --oneline <merge>` still gets a blank line before `diff
+--cc`), and this turned out to already be format-kind-agnostic by
+construction: measured against a `commit-tree`-built 2-parent merge with
+`--pretty=format:plain -p`/`--pretty=tformat:plain -p`/`--pretty=oneline
+-p`, all three matched real git byte-for-byte with zero code changes to
+that function.
+
+### 3. `reference` needed a new date formatter, not a new format string
+
+`sg_date_format_normal` (git's DATE_NORMAL, `Wed Nov 15 06:13:20 2023
++0800`) has no short form built in, and `reference`'s `(<subject>, <date>)`
+uses `%as`-style `YYYY-MM-DD`. Rather than hand-format that separately (and
+risk a second, drifted implementation of the offset-shift rule
+`sg_date_format_normal`'s own CLAUDE.md warning documents), `src/util/date.c`
+factored the shift-into-`tz` + `gmtime_r` step into a shared static
+`shift_tm`, and `sg_date_format_short` is a second thin formatter over the
+same shifted `struct tm`. This is also the function Phase 60b's `%as`/`%cs`
+placeholders will reuse.
+
+`reference` uses the AUTHOR date, never the committer's -- pinned with a
+fixture whose author date (Nov 14) and committer date (Nov 17) fall on
+different days (three days apart, not the fixture's ordinary ~100-second
+author/committer gap, which can land on the same day depending on time
+zone and would not have distinguished the two).
+
+### 4. The shared-struct field, and why it is a pointer and not a kind+union
+
+`sg_commit_out_opts` gained exactly one field, `const sg_pretty_format
+*pretty` (NULL means the pre-Phase-60 legacy path, decided by the existing
+`oneline` bool) -- per the spec's own steer and the CLAUDE.md Phase 29
+shared-struct warning (Phase 59 broke `sg log -p` silently by adding two
+bool fields to this exact struct without auditing every construction site).
+All three construction sites were re-audited before writing any rendering
+code: `cmd_log.c`'s field-by-field build now sets `o.pretty = NULL;`
+explicitly next to its existing name_only/name_status initialization;
+`cmd_show.c`'s `resolve_commit_out_opts` derives it from a new `show_flags`
+field (`pretty_set` + `pretty`, storage kept on `show_flags` itself rather
+than a bare local, so the borrowed pointer stays valid for the entire
+render loop); the third site, `cmd_show.c`'s `header_o = o;` merge-header
+copy, needed no change at all since it is a whole-struct copy.
+
+`sg_pretty_format` is `{ sg_pretty_kind kind; const char *user_format; }`
+rather than the field growing into several new booleans, both because the
+spec asked for it and because a kind enum makes the grammar's rule
+ordering (case-insensitive builtin lookup before the case-sensitive
+`format:`/`tformat:` prefixes before the `%`-contains fallback) a single
+function (`sg_pretty_parse`) returning one value, instead of several
+booleans a caller could set inconsistently.
+
+### 5. Reverse mutations (main-conversation-run, per this project's convention)
+
+Four properties named in the spec's own test section, each isolated to a
+single-line mutation and verified to turn exactly the expected checks red
+(via `tests/mutate.sh`, which rebuilds from a scratch copy per round --
+none of these touched the working tree):
+
+- **Case-insensitive builtin lookup**: `ascii_ci_equal(...)` ->
+  `strcmp(...) == 0` in `sg_pretty_parse`'s builtin loop. Caught by
+  `test_pretty_parse`'s `test_case_insensitive_builtin` (unit test, exit 1).
+- **`format:`/`tformat:` trailing newline**: removed the `putchar('\n')`
+  from the `SG_PRETTY_TFORMAT` render branch (making it byte-identical to
+  `SG_PRETTY_FORMAT`). Caught by 5 named `phase60:` interop checks (the
+  `tformat:plain` separator rows for `-p`/`--stat`/`--name-status`/
+  `--stat -p`, and the `sg log -2` between-entry row) -- interop
+  2636/2641.
+- **oneline/`format:` "no blank line before diff" rule**: narrowed to
+  isolate the NEW clause specifically (`if (!o->oneline &&
+  !(...ONELINE))` -> `if (!o->oneline)`, i.e. only removing the builtin-
+  ONELINE half, not the pre-existing legacy-oneline half) -- caught by 6
+  named `phase60:` checks (builtin-`oneline` non-merge/root render, and
+  all four `oneline` rows of the separator matrix), interop 2635/2641. An
+  earlier, broader version of this mutation (`if (1)`, removing BOTH
+  halves) was also run and additionally turned red 6 PRE-EXISTING
+  `phase54`/`phase55`/`phase59` checks guarding legacy `--oneline` --
+  confirming the new condition is additive, not a replacement of the old
+  guard.
+- **`reference` uses the author date**: swapped `commit->author_time`/
+  `author_tz` for `committer_time`/`committer_tz` in
+  `print_pretty_reference`'s `sg_date_format_short` call. Caught by 3 named
+  `phase60:` checks (the `reference` row on the non-merge, merge and root
+  fixtures) -- all three use the Nov-14/Nov-17 author/committer split, so
+  all three are independently discriminating, not one control plus two
+  copies. Interop 2638/2641.
+
+The fifth mutation the spec names (section 5.2's `%f` run-collapsing) is
+NOT applicable this phase: `%f` is a Phase 60b placeholder, not implemented
+here.
+
+### 6. Numbers
+
+`bash tests/gates.sh --rebuild`: `make` 0 warnings (71 TUs), `make test`
+71/71 binaries (1 new: `test_pretty_parse`), `interop.sh` 2641/2641 passed,
+0 skipped (48 new `phase60:` checks plus 2 oracle preconditions, up from
+Phase 59's 2593). `bash tests/gates.sh --sanitize`: `interop.sh` 2641/2641,
+`make sanitize` 71/71 binaries, 0 sanitizer errors. A manual `diff`/`od -c`
+comparison against real git 2.55.0 (not just the interop harness) found 0
+mismatches across all 7 builtins x {non-merge, merge, root} = 21
+comparisons, plus the separator matrix (3 entry kinds x {`-p`, `--stat`,
+`--name-status`, `--stat -p`} = 12 comparisons for `sg show`, 4 entry kinds
+for `sg log -2` between-entries, 1 for `sg log -2 --pretty=format:plain -p`
+combining both rules at once).
+
+Files touched: `include/sg/commit_out.h`, `src/cli/commit_out.c`,
+`src/cli/cmd_log.c`, `src/cli/cmd_show.c`, `include/sg/date.h`,
+`src/util/date.c`, `tests/test_pretty_parse.c` (new), `tests/interop.sh`,
+`docs/sg.1`, `CLAUDE.md`.
+
+
+### 7. Round 2 (external 212-probe oracle, coordinator-run): three more gaps, none in the seven-builtin table itself
+
+A second, independently-built oracle matrix (fixtures by real git only, sg
+never writes anything the comparison reads) found 37/212 mismatches after
+round 1 landed -- all three causes were things round 1's manual comparison
+never constructed a fixture for, not errors in the byte-exact tables
+already measured:
+
+- **An ANNOTATED TAG's header follows a different rule per builtin, not
+  just `--oneline`.** Phase 59 fixed `--oneline`'s tag header by branching
+  on `flags->oneline` directly inside `cmd_show.c`'s `SG_OBJ_TAG` case, so
+  `--pretty=oneline` (which does not set that flag) never reached the fix,
+  and the other five non-oneline builtins had never been measured against
+  a tag at all. Re-measured all seven rows directly (`resolve_tag_header_shape`
+  in `cmd_show.c`): a `Date:`/`TaggerDate:` line appears only for
+  medium/fuller (the same two that show a date on a COMMIT header), and the
+  blank line between the tag's message and its target is suppressed only
+  for oneline/reference. Captured as a small struct + switch rather than
+  seven `if`s, specifically so the next format only adds one table row
+  instead of needing a matching change in five unrelated branches.
+- **`short` printed the whole message body; git prints the subject only.**
+  Every fixture through round 1 happened to use a one-line commit message,
+  so `print_message(commit->message, 0)` (full body, tabs untouched) looked
+  byte-exact by coincidence. `reference` was already correct (it never
+  called `print_message` at all -- it builds the subject inline). Fixed
+  with a new `print_message_subject_only`, reusing `print_message_line`'s
+  blank-line + four-space-indent shape for just the first line.
+- **`reference` needed its OWN between-LOG-ENTRIES rule, separate from its
+  entry-diff rule.** `git log -N --pretty=reference` prints entries back to
+  back with no blank line at all, but `git show --pretty=reference -p` on
+  a single entry still gets the ordinary blank line before its diff --
+  these are independently measured facts about two different separators,
+  not one "reference behaves like oneline" rule. `cmd_log.c`'s
+  `suppress_join` gained `SG_PRETTY_REFERENCE`; `commit_out.c`'s
+  `print_commit_diff` was deliberately NOT touched a second time.
+
+All three fixes are additive to round 1's mechanism (one more struct/
+predicate, one more enum value in an existing OR-chain) rather than a
+redesign; the round-1 byte-exact builtin table and separator model were
+unaffected by any of them -- re-measured 0 regressions across the existing
+`phase54`/`phase55`/`phase59` groups (all three reverse mutations below
+also confirmed this: each turns red ONLY the newly-added checks plus, in
+one case, the pre-existing `phase59` `--oneline`-on-tag checks that share
+the same code path by construction).
+
+Reverse mutations (main-conversation-run):
+- **tag header table, oneline row**: removed `s.show_tagger = 0;
+  s.blank_before_target = 0;` from the `SG_PRETTY_ONELINE` case of
+  `resolve_tag_header_shape`. Caught by 3 pre-existing `phase59:` checks
+  (which share this same switch via the `legacy oneline -> ONELINE row`
+  mapping) plus the new `phase60: sg show --pretty=oneline matches git on
+  an annotated tag` check -- interop 2649/2653.
+- **`short` subject-only**: reverted `print_message_subject_only` back to
+  `print_message(commit->message, 0)`. Caught by 2 named `phase60:` checks
+  (the root-commit builtin comparison, and the dedicated "prints SUBJECT
+  ONLY" check) -- interop 2651/2653.
+- **`reference` between log entries**: dropped `SG_PRETTY_REFERENCE` from
+  `cmd_log.c`'s `suppress_join` OR-chain. Caught by 2 named `phase60:`
+  checks (`log -2` and `log -3`, the latter added specifically because a
+  2-entry fixture cannot distinguish "no separator" from an off-by-one) --
+  interop 2651/2653.
+
+Numbers after round 2: `bash tests/gates.sh --rebuild`: interop
+**2653/2653** passed (12 more than round 1's 2641: 7 tag-header checks + 1
+short-body check + 1 short-body precondition + 1 body-precondition + 1
+`log -3 --pretty=reference` check, plus the `--format=<name>` check already
+counted in round 1 unaffected). `bash tests/gates.sh --sanitize`: interop
+2653/2653, `make sanitize` 71/71 binaries, 0 sanitizer errors. The external
+212-probe oracle (`oracle60.py`, coordinator-supplied): **206/212 matched,
+6 pending 60b** (the `%`-containing grammar rows, correctly deferred), **0
+mismatched** -- the control run (`CONTROL=1 SG=$(which git)`, git compared
+against itself) reports 212/212, confirming the harness's own zero-mismatch
+baseline before trusting sg's 206/212+6-pending reading.

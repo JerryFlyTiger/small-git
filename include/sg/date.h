@@ -30,4 +30,17 @@
 int sg_date_format_normal(long long time_sec, const char *tz,
                           char *out, size_t out_size);
 
+/* Longest string sg_date_format_short can produce, including the NUL.
+   "YYYY-MM-DD" is 11 for a four-digit year; the slack covers a year outside
+   that range. */
+#define SG_DATE_SHORT_MAX 16
+
+/* Renders a commit/tag timestamp as git's `%as` / `--pretty=reference`'s
+   date field does: "YYYY-MM-DD", the same SHIFTED-INTO-`tz` wall clock
+   `sg_date_format_normal` uses (Phase 60), not UTC and not the machine's
+   local time. Returns 0 on success, -1 on the same failures
+   `sg_date_format_normal` has (`out` set to the empty string). */
+int sg_date_format_short(long long time_sec, const char *tz,
+                         char *out, size_t out_size);
+
 #endif /* SG_DATE_H */
