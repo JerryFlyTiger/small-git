@@ -273,6 +273,11 @@ static void print_pretty_raw(const char *hex, const sg_commit *commit)
           commit->author_time, commit->author_tz);
     printf("committer %s <%s> %lld %s\n", commit->committer_name, commit->committer_email,
           commit->committer_time, commit->committer_tz);
+    /* Phase 61: unknown trailing headers (e.g. "gpgsig") are reprinted here,
+       byte for byte, exactly where they sat in the original object --
+       measured against real git 2.55.0. extra_headers is "" (never NULL)
+       when there were none, so this is a no-op printf in the common case. */
+    printf("%s", commit->extra_headers);
     /* raw does NOT expand tabs (measured), unlike medium/full/fuller --
        print_message's own blank-line + four-space-indent shape still
        applies, that part is common to every builtin that shows a message. */

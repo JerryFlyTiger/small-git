@@ -11228,3 +11228,170 @@ counted in round 1 unaffected). `bash tests/gates.sh --sanitize`: interop
 mismatched** -- the control run (`CONTROL=1 SG=$(which git)`, git compared
 against itself) reports 212/212, confirming the harness's own zero-mismatch
 baseline before trusting sg's 206/212+6-pending reading.
+
+## Phase 61: tolerate unknown commit/tag headers
+
+Bug fix, not a feature: `sg_commit_parse`/`sg_tag_parse` accepted exactly
+the known headers and then required a blank line immediately -- any extra
+header made the WHOLE OBJECT fail to parse. `gpgsig` is the one that
+matters in practice: GitHub's web UI stamps it on every merge/squash commit
+it creates, so a single such commit anywhere in a repo's history took down
+`sg log`'s entire walk (rc=1 `sg: malformed commit object`), and
+`show`/`diff`/`cherry-pick`/`revert` on that one commit directly. `sg
+cat-file -p/-t` were unaffected (never parse). Tag objects had the same
+shape (`encoding`, `gpgsig` on a tag, or any unrecognized header).
+
+### 1. The fix: skip to the next blank line, not to EOF
+
+Measured against real git 2.55.0 (narrower than the obvious guess): after
+the known headers, unknown lines are skipped verbatim UNTIL THE FIRST BLANK
+LINE -- that blank line, not a continuation line's leading space, is what
+ends the header section. `foo l1\n\n l2\n\nsubj` gives the MESSAGE
+` l2\n\nsubj` (whose own subject is `l2`): the blank line right after
+`foo l1` already ended the headers, so continuation-looking lines after it
+are just message text. This means the skip loop needs no line-shape
+awareness at all, "keep consuming lines while the current one isn't empty"
+is the whole rule, implemented identically in `sg_commit_parse`
+(`src/object/commit.c`) and `sg_tag_parse` (`src/object/tag.c`).
+
+The ORDER of the known headers (`tree`, `parent`*, `author`, `committer` for
+a commit; `object`, `type`, `tag`, `tagger` for a tag) is untouched, and
+`committer`/`tagger` are still mandatory -- relaxing either would be sg
+inventing tolerance real git does not have on the WRITE side (see section 3
+below for why "the write side" is the right qualifier, not "the read side").
+
+### 2. Storing the skipped bytes: a genuine mid-review correction
+
+The spec this phase started from said "do not store the skipped headers,
+nothing needs them" -- **wrong, caught before landing**: Phase 60a's
+`--pretty=raw` reprints a commit's headers verbatim, gpgsig included
+(measured: `git show --pretty=raw -s <signed>` reproduces the whole
+`gpgsig -----BEGIN...` block byte for byte, in its original position,
+between the `committer` line and the message). Skipping without storing
+would have made `sg show --pretty=raw` on a signed commit silently drop the
+signature block while still exiting 0 -- exactly the kind of regression
+Phase 59/60a's own "adding a field, check every construction site" lesson
+exists to prevent, just one phase later and for a different field.
+
+Both `sg_commit` and `sg_tag` gained one field, `char *extra_headers`
+(malloc'd, owned, `""` rather than NULL when there were none, freed in
+`sg_commit_free`/`sg_tag_free` alongside every other owned field) -- the
+captured range is `[header_start, blank_line)`, i.e. every skipped header
+line WITH its own trailing newline but WITHOUT the terminating blank line
+itself (that blank line is `print_message`'s own leading `\n` on the
+render side, so including it here would double it up).
+
+`print_pretty_raw` (`src/cli/commit_out.c`) prints it verbatim right after
+the `committer` line, before the message. No other builtin format reads it
+(`short`/`medium`/`full`/`fuller`/`oneline`/`reference` all measured to NOT
+reprint unknown headers, only `raw` does).
+
+**`sg_tag`'s `extra_headers` is captured but never read anywhere**, and that
+is not an oversight -- measured directly: `git show`'s TAG header block
+(`tag <name>` / `Tagger:` / `Date:` / message) does not reprint the tag's
+own unknown headers under ANY pretty format, including `--pretty=raw`
+(`raw` only reaches the COMMIT nested underneath an annotated tag, not the
+tag object itself). So there is currently no caller for it; it is captured
+purely for parity with `sg_commit`'s field and in case a future command
+needs it, matching the "shared struct" convention rather than adding an
+asymmetric API.
+
+**Construction/free site audit** (required because this project has hit
+"added a field, missed a construction site" twice before -- Phase 59, and
+nearly again in Phase 60a): every non-parse construction site of
+`sg_commit`/`sg_tag` (`pick.c`, `cmd_rebase.c`, `cmd_merge.c`,
+`cmd_commit.c`, `safety/snapshot.c`, `storage/chunk.c`, `safety/stash.c`,
+`cmd_tag.c`, all the `sg_commit_serialize`/`sg_tag_serialize` callers in
+`tests/`) already does `memset(&x, 0, sizeof(x))` before setting fields by
+hand and never calls `sg_commit_free`/`sg_tag_free` on that same local (it
+holds borrowed pointers like `env_or()`'s return value, which
+`_free` would wrongly try to free) -- so the new field is simply zeroed and
+inert there, no site needed a change. Every PARSE-side construction goes
+through `sg_commit_parse`/`sg_tag_parse` (which `memset` the whole struct
+first) and is freed through `sg_commit_free`/`sg_tag_free` -- both already
+updated, so every one of those call sites (`cmd_log.c`, `cmd_show.c`,
+`cmd_status.c`, `pick.c`, `cmd_push.c`, `cmd_fetch.c`, `workdir/merge.c`,
+`cmd_restore.c`, `cmd_stash.c`, `cmd_rebase.c`, `storage/objstore.c`,
+`storage/revparse.c`, `safety/sequencer.c`, `storage/chunk.c`,
+`safety/rebase.c`, `cmd_switch.c`) gets the fix for free, with no per-site
+change required. `sg_commit_serialize`/`sg_tag_serialize` deliberately do
+NOT read `extra_headers` back out -- sg never re-signs or otherwise
+re-emits a header it did not itself understand, a freshly-built commit
+always has `extra_headers == ""`.
+
+### 3. Deliberate divergence, corrected from the original spec draft
+
+The original spec reasoned "git refuses to CREATE these objects (`fsck:
+missingTree`/`missingAuthor`/`missingCommitter`), so sg's continued
+rejection is fine" -- true as far as it goes, but conflates a WRITE-time
+check with a READ-time one, which turned out to matter for one of the three
+rows. Measured directly with `git hash-object -t commit -w --stdin
+--literally` (bypasses the write-time fsck) followed by `git show -s
+<oid>`:
+
+| shape | git READS it |
+|---|---|
+| unknown header before `tree` | **no** -- git's own commit parser requires `tree` as the literal first line, this is not merely an fsck policy |
+| unknown header before `author` | **yes** |
+| no `committer` at all | **yes** |
+
+So there are only TWO real deliberate divergences here, not three: sg
+keeps refusing all three shapes (CLAUDE.md's divergence list, order of
+known headers stays fixed, `committer`/`tagger` stay mandatory), but only
+the "before `author`" and "no `committer`" rows are actually pinned as
+divergences in `tests/interop.sh`'s `phase61:` group (git succeeds, sg
+still fails) -- pinning "before `tree`" the same way would have asserted
+something false, since both tools already agree there (both fail) and
+`interop.sh` proves it with its own precondition-style pair rather than
+trusting the original draft's blanket claim.
+
+### 4. Testing
+
+Unit (`tests/test_object.c`, `tests/test_tag.c`): a commit/tag with a
+`gpgsig` header plus continuation lines parses with every known field
+correct; a header with no value at all followed immediately by a blank
+line (empty message); the blank-line-wins row from section 1, verbatim;
+and the three negative rows (header before `tree`/`object`, header before
+`author`, missing `committer`/missing `tagger`) still fail to parse -- all
+six of these are pure `sg_commit_parse`/`sg_tag_parse` unit assertions, no
+oracle needed since they test sg's own grammar rule, not a byte-for-byte
+comparison.
+
+Interop (`tests/interop.sh`'s `phase61:` group, fixture built with `git
+hash-object -t commit/tag -w --stdin` since porcelain cannot create these):
+full `sg log` walk, `sg show -s` and `--pretty=raw -s`, `sg diff HEAD~1`,
+`sg cherry-pick` of the signed commit onto a branch that never saw it, `sg
+cat-file -p` (byte-identical control, proving the passthrough path stayed
+untouched), and the tag-with-unknown-header pair (`show -s`, `cat-file
+-p`) -- all compared byte-for-byte against real git. Every fixture carries
+a precondition check asserting the signed object really contains the
+header it claims to (`grep -q '^gpgsig '`/`'^extraheader '`) and that the
+signed commit really sits inside the range a full walk visits, per this
+project's standing lesson that an unasserted fixture shape silently tests
+nothing. The two genuine divergences (section 3) are pinned head-on: one
+`check` that git succeeds, one that sg still fails, for each.
+
+External oracle (`oracle61.py`, coordinator-supplied, run separately from
+`interop.sh`): 28/31 matched, 2 deliberate divergences (the "before
+`author`"/"no `committer`" pair from section 3), 1 pending-60b row
+(`log -1 --format=%s`, out of this phase's scope) -- **0 mismatched**. One
+informational NOTE the script itself prints (`expected divergence did not
+occur: ['show -s <unknown header before tree>']`) is exactly section 3's
+finding, not a failure: the oracle's own `DELIBERATE` set only names the
+two REAL divergences, so "before tree" cleanly falls through as an ordinary
+matched case (both tools fail) rather than needing to be caught by that
+set. Control run (`SG=$(which git)`): 31/31 matched, 0 deliberate
+divergences, confirming the harness's own zero-mismatch baseline.
+
+Reverse mutation (main-conversation-run): reverted `commit.c`'s skip loop
+to `while (0)` (never skip anything, i.e. pre-fix behavior: require a blank
+line immediately after `committer`). Caught by 3 named unit checks
+(`test_commit_unknown_header_gpgsig`, `test_commit_unknown_header_no_value`,
+`test_commit_unknown_header_blank_line_wins`) and, at the interop level, 4
+named `phase61:` checks (the full-walk `log`, `show -s`, `show
+--pretty=raw -s`, and `diff HEAD~1` checks) -- interop 2667/2671.
+
+`bash tests/gates.sh --rebuild --sanitize`: `make` 0 new warnings, `make
+test` 71/71 binaries ran with 0 FAIL, interop **2671/2671** passed (18 more
+than the pre-phase 2653: the full `phase61:` group), `make sanitize` 71/71
+binaries, 0 sanitizer errors.

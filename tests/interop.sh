@@ -15880,6 +15880,184 @@ check "phase60: bare --format (no '=') is an error, exit non-zero" \
 check "phase60 oracle: precondition -- real git also rejects bare --format" \
     sh -c "! (cd '$P60' && LC_ALL=C git show --format -s '$P60_HEAD') > /dev/null 2>&1"
 
+# --- Phase 61: sg_commit_parse/sg_tag_parse tolerate unknown trailing
+# headers -- "gpgsig" is the one GitHub's web UI stamps on every merge/
+# squash commit it creates, and a single one anywhere in history used to
+# fail sg's ENTIRE walk. Real git's porcelain refuses to create these
+# objects, so the signed commit/tag fixtures below are built directly with
+# `git hash-object -t commit/tag -w --stdin`, same technique phase56 and
+# oracle61.py (this phase's own python oracle, run separately) both use.
+P61="$WORKDIR/p61_headers"
+mkdir -p "$P61"
+(cd "$WORKDIR" && LC_ALL=C git init -q -b master p61_headers) > /dev/null 2>&1
+printf '1\n' > "$P61/a.txt"
+(cd "$P61" && LC_ALL=C git add a.txt) > /dev/null 2>&1
+( cd "$P61" &&
+  GIT_AUTHOR_DATE="@1700000000 +0800" GIT_COMMITTER_DATE="@1700000100 +0900" \
+  GIT_AUTHOR_NAME="A U Thor" GIT_AUTHOR_EMAIL="author@example.com" \
+  GIT_COMMITTER_NAME="C O Mitter" GIT_COMMITTER_EMAIL="committer@example.com" \
+  LC_ALL=C git commit -q -m root ) > /dev/null 2>&1
+P61_TREE=$(cd "$P61" && LC_ALL=C git rev-parse "HEAD^{tree}" 2>/dev/null)
+P61_PARENT=$(cd "$P61" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+(cd "$P61" && LC_ALL=C git branch p61side "$P61_PARENT") > /dev/null 2>&1
+
+P61_HDR="tree $P61_TREE
+parent $P61_PARENT
+author A U Thor <author@example.com> 1700000000 +0800
+committer C O Mitter <committer@example.com> 1700000100 +0900
+"
+P61_SIG="gpgsig -----BEGIN PGP SIGNATURE-----
+
+ iQIzBAABCgAdFiEE0123456789
+ -----END PGP SIGNATURE-----
+"
+P61_SIGNED=$(cd "$P61" && printf '%s%s\nsigned subject\n\nsigned body\n' "$P61_HDR" "$P61_SIG" \
+    | LC_ALL=C git hash-object -t commit -w --stdin)
+
+check "phase61 oracle: precondition -- the fixture commit really carries a gpgsig header" \
+    sh -c "(cd '$P61' && LC_ALL=C git cat-file -p '$P61_SIGNED') | grep -q '^gpgsig '"
+
+(cd "$P61" && LC_ALL=C git update-ref refs/heads/master "$P61_SIGNED") > /dev/null 2>&1
+printf '2\n' > "$P61/a.txt"
+(cd "$P61" && LC_ALL=C git add a.txt) > /dev/null 2>&1
+( cd "$P61" &&
+  GIT_AUTHOR_DATE="@1700000200 +0000" GIT_COMMITTER_DATE="@1700000200 +0000" \
+  GIT_AUTHOR_NAME="A U Thor" GIT_AUTHOR_EMAIL="author@example.com" \
+  GIT_COMMITTER_NAME="C O Mitter" GIT_COMMITTER_EMAIL="committer@example.com" \
+  LC_ALL=C git commit -q -m "after the signed one" ) > /dev/null 2>&1
+
+check "phase61 oracle: precondition -- the signed commit is inside the history a full walk visits" \
+    sh -c "(cd '$P61' && LC_ALL=C git log --first-parent --format=%H) | grep -qx '$P61_SIGNED'"
+
+# Full walk: this is the bug's headline symptom -- one signed commit
+# anywhere in history used to take rc=1 for the entire `sg log`, not just
+# for that one entry.
+(cd "$P61" && LC_ALL=C git $P54_GIT_PINS log $P54_LOG_FLAGS) > "$WORKDIR/p61_git_log.txt" 2>&1
+(cd "$P61" && "$SG" log) > "$WORKDIR/p61_sg_log.txt" 2>&1
+check "phase61: sg log's full walk succeeds through a signed commit and matches git" \
+    cmp -s "$WORKDIR/p61_sg_log.txt" "$WORKDIR/p61_git_log.txt"
+
+(cd "$P61" && LC_ALL=C git $P55_GIT_PINS show --no-decorate -s "$P61_SIGNED") \
+    > "$WORKDIR/p61_git_show.txt" 2>&1
+(cd "$P61" && "$SG" show -s "$P61_SIGNED") > "$WORKDIR/p61_sg_show.txt" 2>&1
+check "phase61: sg show -s on a signed commit matches git" \
+    cmp -s "$WORKDIR/p61_sg_show.txt" "$WORKDIR/p61_git_show.txt"
+
+# --pretty=raw is the one format that reprints a commit's unknown headers
+# verbatim (measured against real git 2.55.0) -- this is the only place the
+# gpgsig block itself needs to come out byte for byte, everywhere else it is
+# simply skipped.
+(cd "$P61" && LC_ALL=C git $P55_GIT_PINS show --no-decorate --pretty=raw -s "$P61_SIGNED") \
+    > "$WORKDIR/p61_git_raw.txt" 2>&1
+(cd "$P61" && "$SG" show --pretty=raw -s "$P61_SIGNED") > "$WORKDIR/p61_sg_raw.txt" 2>&1
+check "phase61: sg show --pretty=raw on a signed commit reproduces the gpgsig header byte for byte" \
+    cmp -s "$WORKDIR/p61_sg_raw.txt" "$WORKDIR/p61_git_raw.txt"
+
+(cd "$P61" && LC_ALL=C git diff "HEAD~1") > "$WORKDIR/p61_git_diff.txt" 2>&1
+(cd "$P61" && "$SG" diff "HEAD~1") > "$WORKDIR/p61_sg_diff.txt" 2>&1
+check "phase61: sg diff HEAD~1 works when HEAD~1 is a signed commit" \
+    cmp -s "$WORKDIR/p61_sg_diff.txt" "$WORKDIR/p61_git_diff.txt"
+
+(cd "$P61" && LC_ALL=C git cat-file -p "$P61_SIGNED") > "$WORKDIR/p61_git_catfile.txt" 2>&1
+(cd "$P61" && "$SG" cat-file -p "$P61_SIGNED") > "$WORKDIR/p61_sg_catfile.txt" 2>&1
+check "phase61: sg cat-file -p on a signed commit is byte-identical to git (never parses)" \
+    cmp -s "$WORKDIR/p61_sg_catfile.txt" "$WORKDIR/p61_git_catfile.txt"
+
+# cherry-pick THE SIGNED COMMIT onto a branch that never saw it -- exercises
+# sg_commit_parse succeeding on it as the thing being picked (tree/message/
+# author all come out of the parse), not just as an ancestor being walked.
+P61_CP_SG="$WORKDIR/p61_cp_sg"
+P61_CP_GIT="$WORKDIR/p61_cp_git"
+rm -rf "$P61_CP_SG" "$P61_CP_GIT"
+cp -R "$P61" "$P61_CP_SG"
+cp -R "$P61" "$P61_CP_GIT"
+(cd "$P61_CP_SG" && LC_ALL=C git checkout -q p61side) > /dev/null 2>&1
+(cd "$P61_CP_GIT" && LC_ALL=C git checkout -q p61side) > /dev/null 2>&1
+(cd "$P61_CP_SG" && "$SG" cherry-pick "$P61_SIGNED") > "$P61_CP_SG.out" 2>&1
+(cd "$P61_CP_GIT" && LC_ALL=C git cherry-pick "$P61_SIGNED") > "$P61_CP_GIT.out" 2>&1
+(cd "$P61_CP_SG" && LC_ALL=C git cat-file -p HEAD) > "$P61_CP_SG.commit" 2>/dev/null
+(cd "$P61_CP_GIT" && LC_ALL=C git cat-file -p HEAD) > "$P61_CP_GIT.commit" 2>/dev/null
+grep -v '^committer ' "$P61_CP_SG.commit" > "$P61_CP_SG.commit.nc" 2>/dev/null
+grep -v '^committer ' "$P61_CP_GIT.commit" > "$P61_CP_GIT.commit.nc" 2>/dev/null
+
+check "phase61 oracle: precondition -- git's cherry-pick of the signed commit really succeeded" \
+    sh -c 'grep -q "^tree " "$0"' "$P61_CP_GIT.commit"
+check "phase61: sg cherry-pick of a signed commit succeeds and matches git (author/tree/parent/message)" \
+    cmp -s "$P61_CP_SG.commit.nc" "$P61_CP_GIT.commit.nc"
+
+# --- tag with an unknown header ---
+P61_TAGBODY="object $P61_PARENT
+type commit
+tag t1
+tagger A U Thor <author@example.com> 1700000000 +0800
+extraheader whatever
+
+tag message
+"
+P61_TAG=$(cd "$P61" && printf '%s' "$P61_TAGBODY" | LC_ALL=C git hash-object -t tag -w --stdin)
+
+check "phase61 oracle: precondition -- the fixture tag really carries an extra header" \
+    sh -c "(cd '$P61' && LC_ALL=C git cat-file -p '$P61_TAG') | grep -q '^extraheader '"
+
+(cd "$P61" && LC_ALL=C git show -s "$P61_TAG") > "$WORKDIR/p61_git_tagshow.txt" 2>&1
+(cd "$P61" && "$SG" show -s "$P61_TAG") > "$WORKDIR/p61_sg_tagshow.txt" 2>&1
+check "phase61: sg show -s on a tag with an unknown header matches git" \
+    cmp -s "$WORKDIR/p61_sg_tagshow.txt" "$WORKDIR/p61_git_tagshow.txt"
+
+(cd "$P61" && LC_ALL=C git cat-file -p "$P61_TAG") > "$WORKDIR/p61_git_tagcat.txt" 2>&1
+(cd "$P61" && "$SG" cat-file -p "$P61_TAG") > "$WORKDIR/p61_sg_tagcat.txt" 2>&1
+check "phase61: sg cat-file -p on a tag with an unknown header is byte-identical to git (never parses)" \
+    cmp -s "$WORKDIR/p61_sg_tagcat.txt" "$WORKDIR/p61_git_tagcat.txt"
+
+# --- deliberate divergences (see CLAUDE.md's list) ---
+#
+# git itself refuses to CREATE a commit with a header before "tree", an
+# unknown header before "author", or no "committer" at all (fsck:
+# missingTree/missingAuthor/missingCommitter) -- `--literally` bypasses that
+# write-time check so the shapes can be measured. But git's READER treats
+# these three differently, measured directly (not assumed from the write-
+# time refusal, which an earlier draft of this spec conflated with a parse
+# rule): a header before "tree" is ALSO rejected by git's own commit
+# parser (git needs "tree" as the literal first line), so there is no
+# divergence to pin there at all -- both tools already agree, and pinning
+# it as a divergence would be asserting something false. A header before
+# "author" and a missing "committer", by contrast, are read back by git
+# just fine; sg keeps refusing both on purpose (CLAUDE.md's divergence
+# list), so those two ARE pinned here, head-on: git succeeds, sg fails.
+P61_BEFORE_AUTHOR_BODY="tree $P61_TREE
+parent $P61_PARENT
+foo bar
+author A U Thor <author@example.com> 1700000000 +0800
+committer C O Mitter <committer@example.com> 1700000100 +0900
+
+subj
+"
+P61_BEFORE_AUTHOR=$(cd "$P61" && printf '%s' "$P61_BEFORE_AUTHOR_BODY" \
+    | LC_ALL=C git hash-object -t commit -w --stdin --literally)
+
+check "phase61 oracle: precondition -- git --literally could still write a header-before-author commit" \
+    test -n "$P61_BEFORE_AUTHOR"
+check "phase61 divergence: real git reads a header-before-author commit just fine" \
+    sh -c "(cd '$P61' && LC_ALL=C git show -s '$P61_BEFORE_AUTHOR') > /dev/null 2>&1"
+check "phase61 divergence: sg deliberately still refuses a header-before-author commit" \
+    sh -c "! (cd '$P61' && '$SG' show -s '$P61_BEFORE_AUTHOR') > /dev/null 2>&1"
+
+P61_NO_COMMITTER_BODY="tree $P61_TREE
+parent $P61_PARENT
+author A U Thor <author@example.com> 1700000000 +0800
+
+subj
+"
+P61_NO_COMMITTER=$(cd "$P61" && printf '%s' "$P61_NO_COMMITTER_BODY" \
+    | LC_ALL=C git hash-object -t commit -w --stdin --literally)
+
+check "phase61 oracle: precondition -- git --literally could still write a missing-committer commit" \
+    test -n "$P61_NO_COMMITTER"
+check "phase61 divergence: real git reads a commit missing committer just fine" \
+    sh -c "(cd '$P61' && LC_ALL=C git show -s '$P61_NO_COMMITTER') > /dev/null 2>&1"
+check "phase61 divergence: sg deliberately still refuses a commit missing committer" \
+    sh -c "! (cd '$P61' && '$SG' show -s '$P61_NO_COMMITTER') > /dev/null 2>&1"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

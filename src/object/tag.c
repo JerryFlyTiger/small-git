@@ -163,9 +163,27 @@ int sg_tag_parse(const unsigned char *content, size_t content_len, sg_tag *out)
     }
     p = line_end + 1;
 
-    if (p >= end || *p != '\n')
-        goto fail;
-    p++;
+    /* Unknown trailing headers are skipped over but kept verbatim in
+       out->extra_headers, same rule and same reasoning as sg_commit_parse
+       -- see its comment and docs/DESIGN.md Phase 61. */
+    {
+        const char *header_start = p;
+
+        while (p < end && *p != '\n') {
+            line_end = find_eol(p, end);
+            if (line_end == NULL)
+                goto fail;
+            p = line_end + 1;
+        }
+
+        if (p >= end || *p != '\n')
+            goto fail;
+
+        out->extra_headers = dup_range(header_start, (size_t)(p - header_start));
+        if (out->extra_headers == NULL)
+            goto fail;
+        p++;
+    }
 
     out->message = dup_range(p, (size_t)(end - p));
     if (out->message == NULL)
@@ -184,5 +202,6 @@ void sg_tag_free(sg_tag *tag)
     free(tag->tagger_name);
     free(tag->tagger_email);
     free(tag->message);
+    free(tag->extra_headers);
     memset(tag, 0, sizeof(*tag));
 }
