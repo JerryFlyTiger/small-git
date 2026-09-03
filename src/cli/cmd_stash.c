@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/cli_args.h"
 #include "sg/diff.h"
 #include "sg/diff_out.h"
 #include "sg/hash.h"
@@ -40,27 +41,6 @@ static void print_dropped(const char *spec, size_t index, const char *hex)
         printf("Dropped %s (%s)\n", spec, hex);
     else
         printf("Dropped refs/stash@{%zu} (%s)\n", index, hex);
-}
-
-/* Phase 37: `sg stash push -- <pathspec>...` -- a third, deliberate copy of
-   this function (cmd_diff.c, cmd_status.c already each have one). CLAUDE.md
-   names the precedent (report_bad_tree_path/report_bad_stash_tree_path,
-   Phase 25): converge once interop covers all three, not before. */
-static void report_pathspec_error(sg_pathspec_error err, const char *arg, const char *repo_root)
-{
-    switch (err) {
-    case SG_PATHSPEC_ERR_EMPTY:
-        fprintf(stderr, "sg: an empty string is not a valid path; use . to match all paths\n");
-        break;
-    case SG_PATHSPEC_ERR_MAGIC:
-        fprintf(stderr, "sg: unsupported pathspec magic: %s\n", sg_quote_path_delimited(arg));
-        break;
-    case SG_PATHSPEC_ERR_NONE:
-    case SG_PATHSPEC_ERR_OUTSIDE:
-        fprintf(stderr, "sg: %s is outside the repository %s\n",
-               sg_quote_path_delimited(arg), sg_quote_path_delimited(repo_root));
-        break;
-    }
 }
 
 static int cmd_stash_push(int argc, char **argv, const char *usage)
@@ -139,7 +119,7 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         sg_pathspec_error perr;
 
         if (sg_pathspec_add(&pathspec, repo_root, pos[i], &perr) != 0) {
-            report_pathspec_error(perr, pos[i], repo_root);
+            sg_cli_report_pathspec_error(perr, pos[i], repo_root);
             sg_pathspec_free(&pathspec);
             free(pos);
             free(repo_root);

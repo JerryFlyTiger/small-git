@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/cli_args.h"
 #include "sg/diff.h"
 #include "sg/diff_out.h"
 #include "sg/hash.h"
@@ -15,7 +16,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
 static const char USAGE[] =
     "usage: sg diff [--cached|--staged] [--stat[=<w>[,<n>]]|--numstat|--shortstat|--name-only|"
@@ -66,96 +66,6 @@ static void report_bad_tree_path(const char *bad_path)
 {
     fprintf(stderr, "sg: path %s is invalid, refusing to expand this tree into file paths\n",
            sg_quote_path_delimited(bad_path));
-}
-
-static void report_pathspec_error(sg_pathspec_error err, const char *arg, const char *repo_root)
-{
-    switch (err) {
-    case SG_PATHSPEC_ERR_EMPTY:
-        fprintf(stderr, "sg: an empty string is not a valid path; use . to match all paths\n");
-        break;
-    case SG_PATHSPEC_ERR_MAGIC:
-        fprintf(stderr, "sg: unsupported pathspec magic: %s\n", sg_quote_path_delimited(arg));
-        break;
-    /* No `default:` on purpose. NONE cannot reach here -- sg_pathspec_add
-       fills err only when it fails -- but naming every value keeps the
-       switch exhaustive, so -Wswitch complains if a future error code is
-       added and nobody teaches this function to print it. A `default` would
-       silently render it as "outside the repository". */
-    case SG_PATHSPEC_ERR_NONE:
-    case SG_PATHSPEC_ERR_OUTSIDE:
-        fprintf(stderr, "sg: %s is outside the repository %s\n",
-               sg_quote_path_delimited(arg), sg_quote_path_delimited(repo_root));
-        break;
-    }
-}
-
-/* Whether an argument names something that exists in the working tree, which
-   is what decides a bare (no "--") argument's fate. A wildcard argument is
-   accepted without asking the filesystem -- measured against git 2.55.0,
-   `git diff '*.zzz'` matching nothing exits 0 while `git diff nosuch` is a
-   hard error. lstat, not stat: a dangling symlink is still a path the user
-   named. */
-static int arg_exists_in_worktree(const char *arg)
-{
-    struct stat st;
-
-    if (sg_pathspec_looks_like_spec(arg))
-        return 1;
-    return lstat(arg, &st) == 0;
-}
-
-/* Splits the positional arguments into revisions and pathspecs the way git
-   does when no "--" was given, and returns how many leading arguments are
-   revisions (-1 after printing an error).
-
-   The rules, measured against git 2.55.0:
-     - an argument that is both a valid revision and an existing file is
-       rejected outright rather than guessed at;
-     - the first argument that is a path ends the revision list, and from
-       there on EVERY remaining argument must exist -- `git diff a.txt HEAD`
-       fails naming HEAD, even though HEAD is a perfectly good revision;
-     - an argument that is neither is the "ambiguous argument" error, which
-       is what `git diff nosuch` prints.
-   Each message names the offending argument and points at "--", because the
-   whole point of these errors is that "--" is the way to say what you meant. */
-static int split_revs_and_paths(const char *git_dir, char **pos, int n_pos)
-{
-    unsigned char commit_id[SG_SHA1_RAW_LEN];
-    int rev_count = 0;
-    int i;
-
-    while (rev_count < n_pos) {
-        const char *arg = pos[rev_count];
-        int is_rev = sg_rev_parse_commit(git_dir, arg, commit_id) == 0;
-        int is_path = arg_exists_in_worktree(arg);
-
-        if (is_rev && is_path) {
-            fprintf(stderr, "sg: ambiguous argument %s: could be both a revision and a file; use -- to separate revisions from paths\n",
-                   sg_quote_path_delimited(arg));
-            return -1;
-        }
-        if (is_rev) {
-            rev_count++;
-            continue;
-        }
-        if (is_path)
-            break;
-        fprintf(stderr, "sg: ambiguous argument %s: not a revision, and no such path in the working directory; "
-                       "use -- to separate revisions from paths\n",
-               sg_quote_path_delimited(arg));
-        return -1;
-    }
-
-    for (i = rev_count; i < n_pos; i++) {
-        if (!arg_exists_in_worktree(pos[i])) {
-            fprintf(stderr, "sg: %s: no such path in the working directory; "
-                           "to name a path that does not exist, use sg diff -- <path>\n",
-                   sg_quote_path_delimited(pos[i]));
-            return -1;
-        }
-    }
-    return rev_count;
 }
 
 int sg_cmd_diff(int argc, char **argv)
@@ -365,7 +275,7 @@ int sg_cmd_diff(int argc, char **argv)
     /* An explicit "--" settles the split with no guessing at all -- that is
        the entire point of typing it -- so the arguments before it are taken
        as revisions without ever being stat'd. */
-    rev_count = dashdash >= 0 ? dashdash : split_revs_and_paths(git_dir, pos, n_pos);
+    rev_count = dashdash >= 0 ? dashdash : sg_cli_split_revs_and_paths(git_dir, pos, n_pos, "diff");
     if (rev_count < 0)
         goto done;
     if (rev_count > 2) {
@@ -379,7 +289,7 @@ int sg_cmd_diff(int argc, char **argv)
         sg_pathspec_error perr;
 
         if (sg_pathspec_add(&pathspec, repo_root, pos[i], &perr) != 0) {
-            report_pathspec_error(perr, pos[i], repo_root);
+            sg_cli_report_pathspec_error(perr, pos[i], repo_root);
             goto done;
         }
     }
