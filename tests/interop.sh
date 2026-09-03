@@ -16668,8 +16668,9 @@ check "phase62: reject -- --follow (sg)" test $? -eq 1
 (cd "$P62" && LC_ALL=C git log --follow -- renamed.txt > /dev/null 2>&1)
 check "phase62: reject -- --follow (git accepts it, real divergence)" test $? -eq 0
 
-(cd "$P62" && "$SG" log --graph > /dev/null 2>&1)
-check "phase62: reject -- --graph" test $? -eq 1
+# --graph is implemented as of Phase 63 (see the dedicated phase63: group
+# below) -- this used to assert rejection; removed rather than flipped in
+# place, per this project's own convention for a closed gap.
 
 (cd "$P62" && "$SG" log --all > /dev/null 2>&1)
 check "phase62: reject -- --all" test $? -eq 1
@@ -16710,6 +16711,341 @@ check "phase62: reject -- pathspec magic (git accepts it, real divergence)" test
 p62_cmp "$P62" regression_no_pathspec
 check "phase62: sg log (no pathspec) still matches git log --first-parent byte-for-byte" \
     cmp -s "$WORKDIR/p62_sg_regression_no_pathspec.txt" "$WORKDIR/p62_git_regression_no_pathspec.txt"
+
+# ============================================================
+# Phase 63: sg log --graph (first-parent walk only; no multi-column
+# characters are ever produced, see CLAUDE.md's `sg log` entry).
+# Reuses $P62/$P62M/$P62_GIT_PINS/$P62_LOG_FLAGS/p62_cmp verbatim -- these
+# fixtures already carry a mode-only change, a rename, a deletion, an empty
+# commit, a deeply nested path, and a `-s ours` merge, which is everything
+# this phase needs; no new fixture is built for it.
+# ============================================================
+
+# --- (a) format x diff-mode combinations, each a named byte-for-byte cmp. ---
+p62_cmp "$P62" graph_oneline --graph --oneline
+check "phase63: --graph --oneline" \
+    cmp -s "$WORKDIR/p62_sg_graph_oneline.txt" "$WORKDIR/p62_git_graph_oneline.txt"
+
+p62_cmp "$P62" graph_medium --graph
+check "phase63: --graph (medium)" \
+    cmp -s "$WORKDIR/p62_sg_graph_medium.txt" "$WORKDIR/p62_git_graph_medium.txt"
+
+p62_cmp "$P62" graph_p --graph -p
+check "phase63: --graph -p" \
+    cmp -s "$WORKDIR/p62_sg_graph_p.txt" "$WORKDIR/p62_git_graph_p.txt"
+
+p62_cmp "$P62" graph_stat --graph --stat
+check "phase63: --graph --stat" \
+    cmp -s "$WORKDIR/p62_sg_graph_stat.txt" "$WORKDIR/p62_git_graph_stat.txt"
+
+p62_cmp "$P62" graph_p_stat --graph -p --stat
+check "phase63: --graph -p --stat (the --- separator line is itself \"| \")" \
+    cmp -s "$WORKDIR/p62_sg_graph_p_stat.txt" "$WORKDIR/p62_git_graph_p_stat.txt"
+
+p62_cmp "$P62" graph_oneline_p --graph --oneline -p
+check "phase63: --graph --oneline -p (no separator line between entries)" \
+    cmp -s "$WORKDIR/p62_sg_graph_oneline_p.txt" "$WORKDIR/p62_git_graph_oneline_p.txt"
+
+# --- (b) --graph x --pretty=<name>/--format=<...>. Section 0.3's rule (the
+# format:/medium separator difference is the SAME rule, not two) has its
+# only witness in graph_fmt_format below. --
+p62_cmp "$P62" graph_fmt_oneline --graph --pretty=oneline
+check "phase63: --graph --pretty=oneline" \
+    cmp -s "$WORKDIR/p62_sg_graph_fmt_oneline.txt" "$WORKDIR/p62_git_graph_fmt_oneline.txt"
+
+p62_cmp "$P62" graph_fmt_format --graph --format=format:%h%x20%s
+check "phase63: --graph --format=format: (section 0.3's sole witness -- no separator graph line between entries)" \
+    cmp -s "$WORKDIR/p62_sg_graph_fmt_format.txt" "$WORKDIR/p62_git_graph_fmt_format.txt"
+
+p62_cmp "$P62" graph_fmt_tformat --graph --format=tformat:%h%x20%s
+check "phase63: --graph --format=tformat:" \
+    cmp -s "$WORKDIR/p62_sg_graph_fmt_tformat.txt" "$WORKDIR/p62_git_graph_fmt_tformat.txt"
+
+p62_cmp "$P62" graph_fmt_short --graph --pretty=short
+check "phase63: --graph --pretty=short" \
+    cmp -s "$WORKDIR/p62_sg_graph_fmt_short.txt" "$WORKDIR/p62_git_graph_fmt_short.txt"
+
+p62_cmp "$P62" graph_fmt_raw --graph --pretty=raw
+check "phase63: --graph --pretty=raw" \
+    cmp -s "$WORKDIR/p62_sg_graph_fmt_raw.txt" "$WORKDIR/p62_git_graph_fmt_raw.txt"
+
+# --pretty=reference needs its own git invocation, same reason as phase62's
+# own reference check just above: $P62_LOG_FLAGS pins --date=default, which
+# overrides reference's own short date.
+(cd "$P62" && LC_ALL=C git $P62_GIT_PINS log --first-parent --no-decorate --pretty=reference --graph) \
+    > "$WORKDIR/p62_git_graph_fmt_reference.txt" 2>&1
+(cd "$P62" && "$SG" log --pretty=reference --graph) > "$WORKDIR/p62_sg_graph_fmt_reference.txt" 2>&1
+check "phase63: --graph --pretty=reference (own git invocation, no --date=default pin)" \
+    cmp -s "$WORKDIR/p62_sg_graph_fmt_reference.txt" "$WORKDIR/p62_git_graph_fmt_reference.txt"
+
+# --- (c) --graph x pathspec: matches something, and matches nothing. ---
+p62_cmp "$P62" graph_sel_a --graph -- a.txt
+check "phase63: --graph -- a.txt (pathspec matches)" \
+    cmp -s "$WORKDIR/p62_sg_graph_sel_a.txt" "$WORKDIR/p62_git_graph_sel_a.txt"
+
+p62_cmp "$P62" graph_sel_nosuch --graph -- nosuch
+check "phase63: --graph -- nosuch (pathspec matches nothing, exit 0, no output at all)" \
+    cmp -s "$WORKDIR/p62_sg_graph_sel_nosuch.txt" "$WORKDIR/p62_git_graph_sel_nosuch.txt"
+
+# --- (d) --graph x -n / <rev>. ---
+p62_cmp "$P62" graph_n2 --graph -n 2
+check "phase63: --graph -n 2" \
+    cmp -s "$WORKDIR/p62_sg_graph_n2.txt" "$WORKDIR/p62_git_graph_n2.txt"
+
+p62_cmp "$P62" graph_rev --graph "$P62_C4"
+check "phase63: --graph <rev>" \
+    cmp -s "$WORKDIR/p62_sg_graph_rev.txt" "$WORKDIR/p62_git_graph_rev.txt"
+
+# --- section 0.1a's decisive four-way matrix: the predicate is "did the
+# walk end NATURALLY", not "does the last printed commit have a parent".
+# graph_sel_deep is the ONE fixture that falsifies parent_count == 0 as the
+# rule: its last printed commit (c8) has a parent (c7), but the walk
+# continues past c8 -- unprinted, filtered out by the pathspec -- all the
+# way down to the true root before stopping naturally, so c8's own
+# continuation lines still get "  " like a root commit's would. Every one
+# of these four uses medium (multi-line) rendering on purpose --
+# --oneline/format:/tformat:/reference have no continuation lines and
+# cannot distinguish "| " from "  " at all. ---
+p62_cmp "$P62" graph_full_to_root --graph
+check "phase63 0.1a: full walk reaches the root naturally -- last entry's continuation lines are \"  \"" \
+    cmp -s "$WORKDIR/p62_sg_graph_full_to_root.txt" "$WORKDIR/p62_git_graph_full_to_root.txt"
+
+p62_cmp "$P62" graph_n1_truncated --graph -n 1
+check "phase63 0.1a: -n 1 truncates the walk -- last (only) entry's continuation lines are \"| \"" \
+    cmp -s "$WORKDIR/p62_sg_graph_n1_truncated.txt" "$WORKDIR/p62_git_graph_n1_truncated.txt"
+
+p62_cmp "$P62" graph_sel_deep --graph -- deep
+check "phase63 0.1a: -- deep completes the walk to the root even though its last MATCH (c8) has a parent -- \"  \", not \"| \"" \
+    cmp -s "$WORKDIR/p62_sg_graph_sel_deep.txt" "$WORKDIR/p62_git_graph_sel_deep.txt"
+
+# NOTE: "-n 1 -- deep" was tried here first and DISCARDED -- deep matches
+# only ONE commit (c8) in the whole history, so -n 1 never actually cuts
+# anything off, and git's own output for it is "  " (natural end), not
+# "| " -- it is not a truncation case at all, and using it here would have
+# silently asserted the WRONG byte. a.txt matches four commits (c1/c2/c4/
+# c5), so "-n 2 -- a.txt" is a genuine truncation: two matches are shown,
+# two more (including the root, c1) are cut off by -n before the walk
+# would have reached them naturally.
+p62_cmp "$P62" graph_sel_a_n2 --graph -n 2 -- a.txt
+check "phase63 0.1a: -n 2 -- a.txt truncates the walk (a.txt matches 4 commits) -- last shown entry's continuation lines are \"| \"" \
+    cmp -s "$WORKDIR/p62_sg_graph_sel_a_n2.txt" "$WORKDIR/p62_git_graph_sel_a_n2.txt"
+
+# --- (e) merge fixture: --graph -p (diff is against parent 1, unaffected
+# by --graph; --graph itself never branches on parent count). ---
+p62_cmp "$P62M" graph_merge_p --graph -p
+check "phase63: merge fixture -- graph -p (diff against parent 1, no graph branching characters)" \
+    cmp -s "$WORKDIR/p62_sg_graph_merge_p.txt" "$WORKDIR/p62_git_graph_merge_p.txt"
+
+# --- (f) trailing space on an otherwise-empty graph line: rendering (a
+# terminal, `sed`, even eyeballing this very file) hides a trailing space,
+# so this is a dedicated grep -q '^| $' assertion, not just cmp equality. ---
+check "phase63: an otherwise-empty graph separator line is '| ' WITH a trailing space, not '|'" \
+    grep -q '^| $' "$WORKDIR/p62_sg_graph_medium.txt"
+
+# --- (g) sg show --graph is refused (usage + exit 1); real git refuses too
+# (exit 128, "options '--no-walk' and '--graph' cannot be used together").
+# Both are pinned so a future change that starts silently accepting either
+# side turns this red by name. ---
+(cd "$P62" && LC_ALL=C git show --graph HEAD > /dev/null 2>&1)
+check "phase63: git show --graph is refused (exit 128)" test $? -eq 128
+(cd "$P62" && "$SG" show --graph HEAD > /dev/null 2>&1)
+check "phase63: sg show --graph is refused (usage, exit 1) -- falls into cmd_show.c's existing unknown-flag branch" \
+    test $? -eq 1
+
+# --- (h) regression control: sg log (no --graph) is untouched by this
+# phase, on BOTH fixtures (phase62's own regression check above only
+# covers $P62). ---
+p62_cmp "$P62M" regression_no_graph_merge
+check "phase63: sg log (no --graph) on the merge fixture still matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p62_sg_regression_no_graph_merge.txt" "$WORKDIR/p62_git_regression_no_graph_merge.txt"
+
+# ============================================================
+# Phase 63 review round: two real bugs found by a cold review of the diff
+# above, neither one caught by any check that came before it in this file.
+#
+# Bug A (introduced by this phase, --graph only): an entry whose EXPANDED
+# bytes are empty (e.g. --pretty=format:%b on a body-less commit) lost its
+# own "* "/"| " marker entirely -- the byte-writing loop is a no-op for
+# len == 0, so it has no byte to hang a lazily-written prefix on. A MIDDLE
+# such entry's marker was silently absorbed by the FOLLOWING entry's own
+# separator write, invisible unless the empty entry was the very LAST one
+# printed (nothing left to borrow a marker from). $P62/$P62M are useless
+# for this: every commit in both carries a one-line subject and no body,
+# so `%b` is empty for every one of them -- exactly the shape that hides a
+# "middle entry" bug behind the "last entry" one. A fixture with a MIX
+# (some commits with a body, some without) is required to tell the two
+# apart; $P63_GFX below is exactly three commits, body-less / with-body /
+# body-less, in that order.
+#
+# Bug B (pre-existing since Phase 60a, has NOTHING to do with --graph):
+# `--pretty=tformat:` with an EMPTY format string (nothing after the
+# colon) must print ZERO bytes for the whole entry, not even its own
+# terminator -- measured, git prints literally nothing. sg used to print
+# the terminator regardless of whether the format string was empty. The
+# predicate is "is the FORMAT STRING itself empty", not "did expansion
+# produce zero bytes" -- `tformat:%b` on a body-less commit still gets its
+# terminator (format string is "%b", not ""), so this must not be
+# conflated with Bug A's predicate.
+# ============================================================
+
+P63_GFX="$WORKDIR/p63_gfx"
+mkdir -p "$P63_GFX"
+(cd "$P63_GFX" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+(
+  cd "$P63_GFX"
+  export GIT_AUTHOR_NAME=A GIT_AUTHOR_EMAIL=a@e GIT_COMMITTER_NAME=A GIT_COMMITTER_EMAIL=a@e
+  export GIT_AUTHOR_DATE="2023-11-15T06:13:20+0800" GIT_COMMITTER_DATE="2023-11-15T06:13:20+0800"
+  echo f1 > f.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "s1" > /dev/null 2>&1
+  echo f2 > f.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "s2
+
+body two" > /dev/null 2>&1
+  echo f3 > f.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "s3" > /dev/null 2>&1
+) > /dev/null 2>&1
+
+p63_gfx_cmp() {
+    p63tag="$1"; shift
+    (cd "$P63_GFX" && LC_ALL=C git log --first-parent "$@") > "$WORKDIR/p63_gfx_git_$p63tag.txt" 2>&1
+    (cd "$P63_GFX" && "$SG" log "$@") > "$WORKDIR/p63_gfx_sg_$p63tag.txt" 2>&1
+}
+
+# --- Bug A: --graph x an expanded-empty format, mixed body/no-body fixture. ---
+p63_gfx_cmp bugA_format_b --graph --pretty=format:%b
+check "phase63 review Bug A: --graph --pretty=format:%b (empty expansion on the body-less commits, non-empty on the middle one)" \
+    cmp -s "$WORKDIR/p63_gfx_sg_bugA_format_b.txt" "$WORKDIR/p63_gfx_git_bugA_format_b.txt"
+
+p63_gfx_cmp bugA_format_empty --graph --pretty=format:
+check "phase63 review Bug A: --graph --pretty=format: (format string itself empty -- expansion is empty for every commit)" \
+    cmp -s "$WORKDIR/p63_gfx_sg_bugA_format_empty.txt" "$WORKDIR/p63_gfx_git_bugA_format_empty.txt"
+
+p63_gfx_cmp bugA_tformat_b --graph --pretty=tformat:%b
+check "phase63 review Bug A: --graph --pretty=tformat:%b (empty expansion still gets its terminator, marker must survive)" \
+    cmp -s "$WORKDIR/p63_gfx_sg_bugA_tformat_b.txt" "$WORKDIR/p63_gfx_git_bugA_tformat_b.txt"
+
+# --- Both bugs combined: an empty tformat: format string prints NOTHING
+# per commit (Bug B) while --graph still emits a bare marker per commit
+# (Bug A's fix) -- the two effects compose into markers with no
+# separating newline at all, sitting on one line. ---
+p63_gfx_cmp both_bugs_combined --graph --pretty=tformat:
+check "phase63 review: --graph --pretty=tformat: (empty) -- both fixes combine into markers glued together with no newline" \
+    cmp -s "$WORKDIR/p63_gfx_sg_both_bugs_combined.txt" "$WORKDIR/p63_gfx_git_both_bugs_combined.txt"
+
+# --- Bug B on its own: NOT under --graph, this has nothing to do with the
+# graph column at all -- it is a Phase 60a tformat: rule. ---
+p63_gfx_cmp bugB_tformat_empty_no_graph --pretty=tformat:
+check "phase63 review Bug B (pre-existing, Phase 60a, unrelated to --graph): --pretty=tformat: with an empty format string prints nothing at all, not even a terminator" \
+    cmp -s "$WORKDIR/p63_gfx_sg_bugB_tformat_empty_no_graph.txt" "$WORKDIR/p63_gfx_git_bugB_tformat_empty_no_graph.txt"
+
+# ============================================================
+# Phase 63 review round (third pass, tail-of-review): a SECOND pre-existing
+# bug sharing Bug B's exact predicate ("is the FORMAT STRING itself empty",
+# not "did expansion produce zero bytes") -- this one in the blank-line/
+# `---` separator decision, not the terminator. `format:` (non-t) has this
+# bug too, so it is Phase 60a, the same age as Bug B, not introduced by
+# --graph. Fixed by sharing ONE predicate function (pretty_header_is_empty
+# in commit_out.c) between both call sites -- the first version of this
+# fix had written the same check twice and only one copy had the rule.
+# ============================================================
+
+P63_DVG="$WORKDIR/p63_dvg"
+mkdir -p "$P63_DVG"
+(cd "$P63_DVG" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+(
+  cd "$P63_DVG"
+  export GIT_AUTHOR_NAME=A GIT_AUTHOR_EMAIL=a@e GIT_COMMITTER_NAME=A GIT_COMMITTER_EMAIL=a@e
+  export GIT_AUTHOR_DATE="2023-11-15T06:13:20+0800" GIT_COMMITTER_DATE="2023-11-15T06:13:20+0800"
+  echo 2 > f
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "d1" > /dev/null 2>&1
+  echo 3 > f
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "d2" > /dev/null 2>&1
+) > /dev/null 2>&1
+
+p63_dvg_cmp() {
+    p63tag="$1"; shift
+    (cd "$P63_DVG" && LC_ALL=C git -c core.abbrev=7 log -1 --first-parent "$@") \
+        > "$WORKDIR/p63_dvg_git_$p63tag.txt" 2>&1
+    (cd "$P63_DVG" && "$SG" log -n 1 "$@") > "$WORKDIR/p63_dvg_sg_$p63tag.txt" 2>&1
+}
+
+# --- Bug: empty header suppresses the separator/`---` entirely, same
+# predicate as Bug B (format STRING empty, not expansion empty). ---
+p63_dvg_cmp empty_header_p --pretty=format: -p
+check "phase63 review (tail): --pretty=format: (empty) -p prints no blank line before the diff, no --graph involved" \
+    cmp -s "$WORKDIR/p63_dvg_sg_empty_header_p.txt" "$WORKDIR/p63_dvg_git_empty_header_p.txt"
+
+p63_dvg_cmp empty_header_stat --pretty=format: --stat
+check "phase63 review (tail): --pretty=format: (empty) --stat prints no blank line before the stat" \
+    cmp -s "$WORKDIR/p63_dvg_sg_empty_header_stat.txt" "$WORKDIR/p63_dvg_git_empty_header_stat.txt"
+
+p63_dvg_cmp empty_header_p_stat --pretty=format: -p --stat
+check "phase63 review (tail): --pretty=format: (empty) -p --stat prints no '---' line at all (this is the row that most easily hides the bug -- a naive fix that only touches the plain-newline branch leaves '---' behind)" \
+    cmp -s "$WORKDIR/p63_dvg_sg_empty_header_p_stat.txt" "$WORKDIR/p63_dvg_git_empty_header_p_stat.txt"
+
+p63_dvg_cmp empty_header_tformat_p --pretty=tformat: -p
+check "phase63 review (tail): --pretty=tformat: (empty) -p behaves identically to format: (same shared predicate)" \
+    cmp -s "$WORKDIR/p63_dvg_sg_empty_header_tformat_p.txt" "$WORKDIR/p63_dvg_git_empty_header_tformat_p.txt"
+
+p63_dvg_cmp empty_header_tformat_p_stat --pretty=tformat: -p --stat
+check "phase63 review (tail): --pretty=tformat: (empty) -p --stat also has no '---' line" \
+    cmp -s "$WORKDIR/p63_dvg_sg_empty_header_tformat_p_stat.txt" "$WORKDIR/p63_dvg_git_empty_header_tformat_p_stat.txt"
+
+# --- Control: format:%b (a NON-empty format string that happens to EXPAND
+# empty on a body-less commit) must still get its separator/`---` -- the
+# one check that falsifies "expansion is empty" as the predicate. Without
+# this, a rule keyed on expansion instead of the format string would pass
+# every check above just as well as the correct one. ---
+p63_dvg_cmp control_format_b_p_stat --pretty=format:%b -p --stat
+check "phase63 review (tail) CONTROL: --pretty=format:%b (non-empty format string, empty expansion on a body-less commit) still gets '---' -- proves the predicate is the STRING, not the expansion" \
+    cmp -s "$WORKDIR/p63_dvg_sg_control_format_b_p_stat.txt" "$WORKDIR/p63_dvg_git_control_format_b_p_stat.txt"
+
+# ============================================================
+# Deliberate divergence #6 (see CLAUDE.md's list): --graph combined with an
+# EMPTY format string AND a diff (-p/--stat). git renders the header and
+# the diff as two INDEPENDENT graph-prefixed blocks, so an empty header
+# still gets its own "* " marker, and the diff that follows gets its OWN
+# "| " right after it, on the SAME line ("* | diff --git..."). sg captures
+# one whole entry (header + diff) as a SINGLE block and prefixes it as one
+# unit, so it cannot produce "empty block, then a new block" -- only "* "
+# followed directly by the diff's own first byte, with no "| " in between.
+# Reproducing git's shape would require sg_commit_out_entry to expose the
+# header/diff boundary to its caller, which is also sg_show's public
+# contract -- not worth changing for this degenerate input. Both sides are
+# pinned to their OWN literal bytes (not to each other) so a future change
+# to either one fails by name instead of silently drifting. Measured AFTER
+# the fix above (unpatched, sg's bytes were different from what is pinned
+# here -- these are the POST-fix bytes, not a snapshot of the bug).
+# ============================================================
+(cd "$P63_DVG" && LC_ALL=C git -c core.abbrev=7 log -1 --first-parent --graph --pretty=format: -p) \
+    > "$WORKDIR/p63_dvg_git_graph_empty_p.txt" 2>&1
+check "phase63 deliberate divergence #6 (git side, pinned): --graph --pretty=format: (empty) -p -- header and diff are two independent graph blocks glued on one line" \
+    grep -qF 'diff --git a/f b/f' "$WORKDIR/p63_dvg_git_graph_empty_p.txt"
+check "phase63 deliberate divergence #6 (git side, pinned): the exact bytes" \
+    sh -c 'printf '"'"'* | diff --git a/f b/f\n| index 0cfbf08..00750ed 100644\n| --- a/f\n| +++ b/f\n| @@ -1 +1 @@\n| -2\n| +3\n'"'"' | cmp -s - "$0"' \
+    "$WORKDIR/p63_dvg_git_graph_empty_p.txt"
+
+(cd "$P63_DVG" && "$SG" log -n 1 --graph --pretty=format: -p) > "$WORKDIR/p63_dvg_sg_graph_empty_p.txt" 2>&1
+check "phase63 deliberate divergence #6 (sg side, pinned): --graph --pretty=format: (empty) -p -- one captured block, no separate '| ' before the diff" \
+    sh -c 'printf '"'"'* diff --git a/f b/f\n| index 0cfbf08..00750ed 100644\n| --- a/f\n| +++ b/f\n| @@ -1 +1 @@\n| -2\n| +3\n'"'"' | cmp -s - "$0"' \
+    "$WORKDIR/p63_dvg_sg_graph_empty_p.txt"
+
+(cd "$P63_DVG" && LC_ALL=C git -c core.abbrev=7 log -1 --first-parent --graph --pretty=format: -p --stat) \
+    > "$WORKDIR/p63_dvg_git_graph_empty_p_stat.txt" 2>&1
+check "phase63 deliberate divergence #6 (git side, pinned): --graph --pretty=format: (empty) -p --stat" \
+    sh -c 'printf '"'"'* |  f | 2 +-\n|  1 file changed, 1 insertion(+), 1 deletion(-)\n| \n| diff --git a/f b/f\n| index 0cfbf08..00750ed 100644\n| --- a/f\n| +++ b/f\n| @@ -1 +1 @@\n| -2\n| +3\n'"'"' | cmp -s - "$0"' \
+    "$WORKDIR/p63_dvg_git_graph_empty_p_stat.txt"
+
+(cd "$P63_DVG" && "$SG" log -n 1 --graph --pretty=format: -p --stat) > "$WORKDIR/p63_dvg_sg_graph_empty_p_stat.txt" 2>&1
+check "phase63 deliberate divergence #6 (sg side, pinned): --graph --pretty=format: (empty) -p --stat" \
+    sh -c 'printf '"'"'*  f | 2 +-\n|  1 file changed, 1 insertion(+), 1 deletion(-)\n| \n| diff --git a/f b/f\n| index 0cfbf08..00750ed 100644\n| --- a/f\n| +++ b/f\n| @@ -1 +1 @@\n| -2\n| +3\n'"'"' | cmp -s - "$0"' \
+    "$WORKDIR/p63_dvg_sg_graph_empty_p_stat.txt"
+
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

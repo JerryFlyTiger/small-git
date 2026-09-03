@@ -230,6 +230,7 @@ to discard the broken merge state.
 .RB [ --pretty [= <fmt> ]| --format= <fmt> ]
 .RB [ -p | --patch ]
 .RB [ --stat ]
+.RB [ --graph ]
 .RI [ rev ]
 .RB [ -- ]
 .RI [ path ...]
@@ -301,9 +302,37 @@ follows the same revision/path disambiguation
 uses: an argument that is both a valid revision and an existing path is
 rejected as ambiguous, and once the first path-like argument is seen every
 later argument must itself exist.
+.B --graph
+prefixes every line with a graph column: an entry's first line gets
+.RB \(dq "* " \(dq ,
+every other line (including an otherwise-empty separator line between two
+entries) gets
+.RB \(dq "| " \(dq
+\(em with a trailing space, which a terminal or
+.B sed
+will hide; verify with a byte-exact tool if in doubt. Since
+.B "sg log"
+walks first-parent only, the graph never branches: no
+.BR |\e ,
+.BR |/ ,
+or
+.B "* |"
+is ever produced. The very last entry printed is an exception: if the walk
+reached the true end of history naturally (no
+.B -n
+cutoff, no error), its continuation lines get
+.RB \(dq "  " \(dq
+(two plain spaces, same width) instead of
+.RB \(dq "| " \(dq
+\(em there is nothing left below it to connect a line to. This can happen
+even when that entry itself has a parent: a pathspec can filter out every
+commit between it and the true root, and the walk still continues,
+unseen, all the way down before stopping naturally.
+.B "sg show --graph"
+is refused (real git also rejects the combination, exiting 128 with
+.RB \(dq "options '--no-walk' and '--graph' cannot be used together" \(dq ).
 .PP
 There is no
-.BR --graph ,
 .BR --follow ,
 .BR --all ,
 .BR --reverse ,

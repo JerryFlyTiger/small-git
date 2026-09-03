@@ -1026,6 +1026,27 @@ int sg_commit_out_touches_pathspec(const char *git_dir, const sg_commit *commit,
     return 0;
 }
 
+/* Phase 63 review round (second pass): whether the entry's HEADER is
+   DEFINED to render as exactly zero bytes, by the FORMAT/TFORMAT grammar
+   itself -- not "did this particular commit's fields happen to expand to
+   nothing". The predicate is "is the FORMAT STRING itself empty", the
+   SAME one the SG_PRETTY_TFORMAT terminator-suppression case below uses
+   (this function exists specifically so the two never drift apart again;
+   see its own call sites' comments for what broke the first time this
+   rule was written down twice instead of once): `--pretty=format:%b` on a
+   body-less commit expands to zero bytes too, but its format STRING is
+   "%b", not "", so this returns 0 for it and both the header and this
+   function's callers keep behaving as if something had been printed --
+   correctly, since `format:%b` non-empty commits DO print something and
+   the separator rule cannot special-case per-commit content without
+   seeing every commit's rendering first. */
+static int pretty_header_is_empty(const sg_commit_out_opts *o)
+{
+    return o->pretty != NULL &&
+           (o->pretty->kind == SG_PRETTY_FORMAT || o->pretty->kind == SG_PRETTY_TFORMAT) &&
+           o->pretty->user_format[0] == '\0';
+}
+
 /* The commit's own diff: first parent's tree against its own, or the empty
    tree for a root commit. That this renders a diff for a MERGE at all is a
    consequence of sg's first-parent-only walk, and it agrees with git under
@@ -1103,8 +1124,30 @@ static int print_commit_diff(const char *git_dir, const sg_commit *commit,
        "no blank line" there (measured -- see CLAUDE.md's `sg log` Phase 60
        entry for the byte-level derivation), while every terminator-bearing
        kind (TFORMAT, and the six other builtins) reads it as an actual
-       blank line, exactly as it always has. */
-    if (!o->oneline && !(o->pretty != NULL && o->pretty->kind == SG_PRETTY_ONELINE))
+       blank line, exactly as it always has.
+
+       Phase 63 review round (second pass): a FORMAT/TFORMAT entry whose
+       format STRING is itself empty prints NEITHER the blank line NOR
+       `---` -- measured against real git directly (`format:`/`tformat:`
+       with nothing after the colon, `-p`/`--stat`/`-p --stat` all three):
+       an empty header is not "a header that happens to render short", it
+       is no header at all, and git treats it that way for the separator
+       exactly as it does for TFORMAT's own terminator (see
+       pretty_header_is_empty's own comment -- this is the SAME predicate,
+       shared with SG_PRETTY_TFORMAT's terminator suppression below, on
+       purpose: the two used to be written as two separate checks and one
+       of them was missing this rule entirely). `format:%b` on a body-less
+       commit is the control that proves the predicate is about the
+       STRING, not the expansion: its format string ("%b") is non-empty,
+       so it still gets its separator/`---` even though that particular
+       commit's own header text happens to be empty. --name-only/
+       --name-status are unaffected: `format:`/`tformat:` with
+       --name-only already has no separator logic to suppress (measured:
+       `--pretty=format: --name-only` prints the bare filename with no
+       separator either way), so pretty_header_is_empty is checked
+       alongside the existing name-format exemption, not instead of it. */
+    if (!o->oneline && !(o->pretty != NULL && o->pretty->kind == SG_PRETTY_ONELINE) &&
+        !pretty_header_is_empty(o))
         printf((o->stat && o->patch && !o->name_only && !o->name_status) ? "---\n" : "\n");
 
     memset(&opts, 0, sizeof opts);
@@ -1193,7 +1236,35 @@ int sg_commit_out_entry(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
         case SG_PRETTY_TFORMAT:
             /* Always terminates with exactly one '\n' -- this is what makes
                tformat: differ byte-for-byte from format: on the exact same
-               literal string (measured: "plain" -> "plain" vs "plain\n"). */
+               literal string (measured: "plain" -> "plain" vs "plain\n").
+
+               EXCEPTION, pre-existing since Phase 60a and unrelated to
+               --graph (found in Phase 63's review round, by a --graph
+               fixture that happened to be the first one ever to combine
+               tformat: with an EMPTY format string): when the user_format
+               itself is the empty string (`--pretty=tformat:` with
+               nothing after the colon), git prints ZERO bytes for the
+               whole entry -- not even the terminator. The predicate is
+               "is the format STRING empty", not "did expansion produce
+               zero bytes": `tformat:%b` on a body-less commit expands to
+               zero bytes too, but STILL gets its terminator (measured;
+               already covered by existing fixtures, unaffected by this
+               fix since user_format there is "%b", not ""). format:
+               (non-t) needs no equivalent special case -- an empty
+               format: entry is already correct, measured as a
+               zero-length string sitting between whatever separators the
+               caller prints (`git log -n 2 --pretty=format:` gives
+               "\n\n" for two entries, matched before this fix).
+
+               Phase 63 review round (second pass): this predicate is now
+               shared with print_commit_diff's separator suppression via
+               pretty_header_is_empty, rather than repeated here as a
+               second, independent `user_format[0] == '\0'` check -- the
+               first version of this fix wrote the same condition twice,
+               and only one of the two copies got the rule; see that
+               function's own comment. */
+            if (pretty_header_is_empty(opts))
+                break;
             expand_user_format(opts->pretty->user_format, hex, commit);
             putchar('\n');
             break;

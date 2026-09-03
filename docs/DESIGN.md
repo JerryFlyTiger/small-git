@@ -12174,3 +12174,473 @@ pre-phase 2720, all newly-added and passing, no regression in the existing
 2720); `make sanitize` 73/73 binaries, 0 sanitizer errors (required by the
 shared-struct field addition to `sg_commit_out_opts`, per CLAUDE.md's
 Phase 29 rule).
+## Phase 63: `sg log --graph`
+
+### 0. What was measured, in order (the model changed twice)
+
+All measurements against real git 2.55.0, `LC_ALL=C`, argv given directly
+via `subprocess` (never through a shell -- a shell-mangled arg would make
+git answer a different question and produce a plausible-looking wrong
+answer, not a visible error).
+
+**Round 1** (the original spec): a first-parent walk's graph column looked
+like a constant per-line prefix -- `"* "` on an entry's first line, `"| "`
+(with a trailing space) on every other line, including an otherwise-empty
+separator line between two entries. This was measured by printing only the
+first ~13 lines of a merge fixture, which never reached the end of the
+walk.
+
+**Round 2** (0.1a): the implementer, re-measuring with real pinned flags
+before wiring the design in, found the tail of a full walk did NOT match
+that rule -- the LAST printed entry's continuation lines were `"  "` (two
+spaces, same width as `"| "`) when the walk reached the true root
+(`parent_count == 0`) with no `-n` cutoff. The implementer's own proposed
+predicate was "does this commit have a parent" (i.e. `parent_count == 0`).
+
+**Round 3** (also 0.1a, superseding round 2's predicate): that predicate
+was measured and falsified. The decisive fixture is `--graph -- deep`
+against the linear fixture: `deep` matches exactly one commit (c8), which
+has a parent (c7) -- but every commit between c8 and the true root is
+filtered out by the pathspec, so the walk continues past c8, unprinted,
+all the way to the root before stopping. c8 still gets `"  "`. Meanwhile
+`--graph -n 1` (no pathspec) prints a commit that also has a parent, but
+the walk was cut off by `-n`, and that commit gets `"| "`. Eight rows,
+side by side (all against the linear fixture, looking at the LAST printed
+entry's continuation lines):
+
+| invocation | last entry's 2nd line |
+|---|---|
+| full walk (reaches root) | `"  Author: ..."` |
+| `-n 1` (cut off, non-root) | `"\| Author: ..."` |
+| `-n 2` (cut off) | `"\| Author: ..."` |
+| `-- deep` (completes, non-root, HAS a parent) | `"  Author: ..."` |
+| `-n 1 -- deep` (cut off) | `"\| Author: ..."` |
+| `-- a.txt` (completes, root) | `"  Author: ..."` |
+| `-n 2 -- a.txt` (cut off) | `"\| Author: ..."` |
+| `-- sub` (completes, root) | `"  Author: ..."` |
+
+The `-- deep` row is the only one that falsifies `parent_count == 0` as
+the rule while confirming the true one: **the predicate is "did the walk
+end NATURALLY" (reached the root with no `-n` cutoff and no error), never
+"does this particular commit have a parent"**. This mirrors git's own
+graph renderer asking "is there a line left to draw underneath this node"
+-- a pathspec is a history SIMPLIFICATION on git's side, which removes a
+non-matching commit from the graph entirely, so the last matching commit
+before the (also removed, non-matching) path to the root becomes a leaf in
+the simplified graph even though it has a parent in the real one. sg has
+no notion of a simplified graph, but the walk-based implementation below
+is operationally equivalent.
+
+This is also why round 1's own probe (13 lines of a merge fixture) could
+never have found this: it never reached the tail of any walk at all. A
+probe that only samples the head of an unbounded stream is blind to any
+rule whose trigger is "the stream is about to end".
+
+Single-line formats (`--oneline`, `format:`/`tformat:`, `reference`) have
+no continuation lines at all, so they cannot exercise this rule in either
+direction -- a test using one of them "passes" regardless of whether the
+implementation gets `"| "` vs `"  "` right. Every fixture and unit test for
+this rule uses a multi-line format (medium, or `--pretty=fuller`/`full`/
+`raw`).
+
+### 0.2 / 0.3: the rest of the rule, and why it needs no special case
+
+Measured, and true regardless of which of the two models above is
+correct, because they only ever change ONE thing (which two-byte string is
+used for continuation lines), never whether a byte gets prefixed at all:
+`-p`, `--stat`, `-p --stat` (even the `---` line), `--oneline -p`, a merge
+commit's diff (against parent 1, unaffected -- `--graph` never branches on
+parent count), and every `--pretty`/`--format` kind, all use the exact
+same per-line rule.
+
+The `format:`/`medium` separator-line difference (`format:` between two
+entries has NO empty graph line, `medium` does) is not a second rule: a
+`medium` entry terminates itself with `\n`, so the separator `\n` a caller
+feeds between two entries lands at the START of a new line, opening one
+that the prefixer then fills with a continuation string; a `format:`
+entry does NOT terminate itself, so the same separator `\n` lands
+MID-LINE and just ends the line already in progress, consuming no prefix
+at all. This is a property of the entry's own trailing byte, not of the
+format kind, and needs no branch anywhere in the prefixer.
+
+### 0.4 Deliberately out of scope, with no code and no TODO
+
+`sg show --graph` is refused -- real git also refuses it (exit 128, "options
+'--no-walk' and '--graph' cannot be used together"), and `sg`'s existing
+unknown-flag handling in `cmd_show.c` already refuses it (usage, exit 1)
+with zero code changes; this is pinned as a head-on pair in interop rather
+than left as an assumption. Multi-column graph characters (`|\`, `|/`,
+`* |`) are never produced and have no code path at all: a first-parent walk
+cannot branch, so there is no shape that would ever need them, and there is
+no oracle (no real-git output) to check such code against if it existed.
+`--graph` does not change WHICH commits are printed (Phase 62's pathspec
+selection logic, `sg_commit_out_touches_pathspec`, is untouched).
+
+### 1. Design: fd-1 capture + a one-entry lookahead, not a threaded parameter
+
+`sg_commit_out_entry` and `sg_diff_print` (`diff_out.c`, shared with
+`sg diff`) both write directly to stdout via `printf`. The alternative to
+capturing output was to thread a `FILE *`/prefix parameter into both --
+rejected, and this is the one deliberate design decision of this phase:
+`diff_out.c` has six output formats plus the combined-diff renderer, with
+`printf` call sites throughout; missing even one while threading a
+parameter through is invisible unless a fixture happens to combine
+`--graph` with exactly that format (the same shape as Phase 62's
+`cmd_name` blind spot). Capturing fd 1 instead has exactly ONE seam
+(`graph_capture_raw` in `cmd_log.c`), and its correctness argument is
+structural (it captures the file descriptor itself, not a set of call
+sites), not enumerative. It also has a property no threaded-parameter
+design can have for free: **if anything under `commit_out.c`/`diff_out.c`
+ever bypassed `printf` and wrote fd 1 directly (e.g. via `write(1, ...)`),
+fd-1 capture would still catch it**, where a threaded `FILE *` parameter
+would silently miss any such write.
+
+**The capture mechanism itself changed once, mid-phase, for a portability
+reason.** The original design was `open_memstream` + `dup2(fileno(...), 1)`.
+Measured on this project's own macOS development machine:
+`fileno(open_memstream(&buf, &len))` returns `-1`. POSIX does not guarantee
+a memstream `FILE *` has a backing file descriptor at all (glibc's is
+`fopencookie`-based, no fd either), so this is not macOS-specific -- it is
+a genuine hole in the original design, not a workaround for one platform.
+The fix is `tmpfile()`, which is guaranteed to return an fd-backed stream
+(it predates memstream, C89), reused across every entry rather than opened
+per entry, with the shared fd truncated at the fd level
+(`lseek`+`ftruncate`, since `dup2` makes fd 1 and the tmpfile's fd share
+one file description including the offset -- `rewind()` alone would not
+reset that shared offset) before each capture. A pipe was considered and
+rejected: nothing reads the write end while `sg_commit_out_entry` is
+running, so any entry whose output exceeds the pipe buffer (commonly 64 KB
+-- an easy threshold for a large `-p` diff) would deadlock, and that
+failure mode is data-size-dependent and intermittent, the worst kind to
+debug.
+
+**Every mechanical step of the capture (`lseek`/`ftruncate`/`dup2`/`read`/
+`malloc`) is a hard error on failure**, reported via `graph_capture_raw`'s
+own `-1` return and printed diagnostic -- there is no silent fallback to
+"print the bytes without a prefix", which would produce well-formed-looking
+but wrong output. fd 1 is restored to the saved copy on every path out of
+`graph_capture_raw`, including when `sg_commit_out_entry` itself reports
+failure, before anything else (including an error message) is attempted.
+
+**Holding back one entry (not the whole run) is what makes the 0.1a rule
+computable without unbounded memory.** Deciding entry k's continuation
+string requires knowing whether entry k+1 exists and, if not, whether the
+walk ended naturally -- information that is only available strictly after
+entry k+1 either arrives or the loop provably terminates. `cmd_log.c`
+therefore captures each touched commit's raw bytes into a buffer
+(`graph_capture_raw`, decoupled from prefixing) and keeps exactly one
+buffer pending:
+
+- On capturing entry k, if entry k-1 is pending, flush it immediately with
+  `"| "` continuation (a following entry -- k -- is now certain to exist,
+  regardless of whether ITS capture or render subsequently succeeds), and
+  feed the inter-entry separator `"\n"` through the prefixer right after it
+  (same reasoning: "a following entry exists" is already established at
+  that point). Entry k then becomes the new pending buffer.
+- At the single shared teardown site (reached by every `break` in the
+  walk), whatever is left pending is flushed with `"  "` if the walk ended
+  naturally (`graph_natural_end`, set only at the `parent_count == 0`
+  branch) or `"| "` otherwise (a `-n` cutoff, which breaks at the TOP of
+  the loop and never reaches that branch; or a mechanical capture failure,
+  or `sg_commit_out_entry` itself failing -- both already `break` before
+  reaching it).
+
+This bounds memory to one entry's captured bytes, not the whole run's
+output, which matters because `sg log` can print arbitrarily long history.
+
+### 2. Tests
+
+`tests/test_log_graph.c` (7 cases): empty write -> no output at all (never
+a lone prefix); a single unterminated line -> `"* "` + the line, no
+trailing `\n` added; two lines -> `"* "` then `"| "`; a formerly-blank line
+becomes `"| "` WITH the trailing space (asserted by exact byte comparison,
+not by eye -- rendering hides this); two entries back to back -> the
+second's first line is still `"* "`; a mid-line separator (the `format:`
+shape) consumes no prefix; and the continuation string is caller-controlled
+(`"  "` vs `"| "`), the one property `--oneline`/`format:` cannot exercise
+because they have no continuation lines.
+
+`tests/interop.sh`'s `phase63:` group (25 checks) reuses `$P62`/`$P62M`
+verbatim, no new fixture: every diff-mode x format combination from the
+original spec (a, b), pathspec matched/unmatched (c), `-n`/`<rev>` (d), the
+merge fixture's `-p` (e), a dedicated `grep -q '^| $'` assertion for the
+trailing-space byte (f), `sg show --graph`/`git show --graph` refusal as a
+head-on pair (g), and a regression control on the merge fixture with
+`--graph` absent (h). Section 0.1a's four-way matrix is its own named
+subgroup: full walk (root), `-n 1` (cutoff), `-- deep` (completes,
+non-root, has a parent -- the one row that falsifies `parent_count == 0`),
+and one more cutoff case paired with a pathspec.
+
+**That last case needed a real fixture, not just any `-n` + pathspec
+pair, and the first attempt was wrong.** `-n 1 -- deep` was tried first;
+since `deep` matches only ONE commit in the whole fixture, `-n 1` never
+actually cuts anything off (there is nothing after the one match to cut),
+so real git's own answer for it is `"  "` (natural end) -- using it as a
+"truncated" fixture would have silently asserted the wrong byte, passing
+by accident rather than by a correct implementation. `a.txt` matches four
+commits (c1/c2/c4/c5), so `-n 2 -- a.txt` is a genuine truncation: two
+matches are shown, two more (including the root) are cut off before the
+walk reaches them naturally. Measured and used instead.
+
+**Gates**: `make` 0 new warnings; `make test` 74/74 binaries ran, 0 FAIL;
+`bash tests/interop.sh` **2812/2812** passed, 0 skipped (pre-phase baseline
+measured at 2788, one of which -- the pre-existing phase62 check "reject
+-- --graph" -- now correctly fails against a build with `--graph`
+implemented and was removed rather than flipped in place; net +25 new
+phase63 checks added, -1 obsolete check removed); `make sanitize` 74/74
+binaries, 0 sanitizer errors
+(required regardless of the "no shared struct field added" exemption,
+because this phase does real fd/dup2/tmpfile manipulation).
+
+### 4. Review round: two real bugs, one older than this phase
+
+A cold review of the diff above found a real bug, and reproducing it
+surfaced a second, older one, unrelated to `--graph` entirely. Both are
+fixed in the same round; both needed their own new fixture, because
+neither pre-existing fixture ($P62/$P62M) could have exposed either one.
+
+**Bug A (introduced by this phase, `--graph`-only): an entry whose
+EXPANDED bytes are empty loses its own marker.** `sg_log_graph_write`'s
+byte-writing loop is `for (i = 0; i < len; i++)`, a no-op for `len == 0`
+by design (it must not invent a prefix for a legitimately empty write,
+e.g. an entry with genuinely nothing captured). But that design choice has
+a second consequence nobody had traced through: an entry whose OWN bytes
+are empty (`--pretty=format:%b` on a body-less commit is the real-world
+trigger -- every commit in `$P62`/`$P62M` happens to have exactly this
+shape) never gets its `"* "` marker written either, because the marker
+was written lazily, attached to the first byte of the entry's own
+content -- and there is no such byte. Measured on 11 body-less commits
+(`format:%b`, `$P62`'s linear fixture): real git prints 11 markers
+(`b'* \n* \n...* '`), sg printed only 10, with an extra trailing `\n` real
+git does not have. The reason it is 10 and not 0: a MIDDLE empty entry's
+marker was silently "absorbed" by the FOLLOWING entry's own separator
+`'\n'` write, which still goes through the byte loop and still triggers
+the `at_line_start` prefix -- one entry late, but a prefix still gets
+written somewhere, so the total count only comes up short by exactly one,
+on whichever entry has no follower to borrow from (the LAST one).
+
+Fix: `sg_log_graph_write_entry` (`include/sg/log_graph.h`/`src/cli/
+log_graph.c`) is a new function that combines `sg_log_graph_begin_entry`
+with the write, and is now the ONLY place in the codebase that does so --
+`cmd_log.c`'s two call sites (the lookahead flush, and the final pending
+flush) both went through a separate `begin_entry()` + `write()` pair
+before this fix, which is exactly the shape that let the `len == 0` case
+fall through the crack between the two calls. When `len == 0`, it emits
+`"* "` explicitly (never `cont` -- an entry with no bytes at all has, by
+construction, nothing but a first line) and updates the prefixer's state
+by hand, since the byte loop it would otherwise delegate to never runs.
+
+**Bug B (pre-existing since Phase 60a, has NOTHING to do with `--graph`):
+`--pretty=tformat:` with an EMPTY format string prints the wrong thing.**
+Reproducing Bug A meant building the first fixture in this project with a
+MIXED body shape (some commits with a body, some without -- see below),
+and that fixture is what made this second, unrelated bug visible for the
+first time: `git log --pretty=tformat:` (nothing after the colon) prints
+zero bytes total, while `sg log --pretty=tformat:` printed one `'\n'` per
+commit. The predicate that was missing is "is the FORMAT STRING itself
+empty", not "did expansion produce zero bytes" -- `tformat:%b` on a
+body-less commit expands to zero bytes too, and it STILL gets its
+terminator (measured; this shape already worked and needed no fix). Fix:
+`commit_out.c`'s `SG_PRETTY_TFORMAT` case now checks
+`opts->pretty->user_format[0] == '\0'` and, if so, prints nothing at all
+-- not even `putchar('\n')`. `format:` (non-`t`) needs no equivalent
+change: an empty `format:` entry was already correct (a zero-length
+string sitting between whatever separators the caller prints), which is
+precisely why this bug had gone unnoticed since the format existed --
+`format:` and `tformat:` differ ONLY in the terminator, and the terminator
+is exactly the one byte the empty-string case gets wrong.
+
+This is this project's fourth occurrence of the same shape CLAUDE.md
+already names: **a new fixture illuminates a bug older than the phase
+that built it**. Neither `$P62` nor `$P62M` could ever have found Bug B,
+because finding it required a fixture built specifically to isolate Bug
+A -- a fixture with a genuinely mixed body shape, which nothing before
+this phase had ever needed to construct. `$P63_GFX` (three commits,
+body-less / with-body / body-less, in that order -- the middle one
+having a body is what makes it possible to tell "Bug A: marker lost on an
+empty ENTRY" apart from "every entry in this fixture happens to be
+empty").
+
+**The two fixes compose correctly, and the composed case is itself a
+named interop check**: `--graph --pretty=tformat:` (empty format string)
+on `$P63_GFX` produces three bare `"* "` markers glued together with NO
+separating byte at all (`b'* * * '`), because Bug B's fix means the
+per-commit terminator is gone (so there is no `'\n'` between them) while
+Bug A's fix means each entry still emits its own marker regardless.
+
+### 5. Three lower-severity review findings
+
+- **`graph_capture_raw`'s header comment used to claim fd 1 is
+  "guaranteed to be restored... on every path"** -- false: if the
+  restoring `dup2(saved_fd, STDOUT_FILENO)` call itself fails, fd 1 is
+  left pointing at the tmpfile with no further recovery available. The
+  comment is corrected to say so explicitly rather than assert a
+  guarantee the code cannot actually provide; the behavior itself needed
+  no change (the process exits 1 regardless, and there is no third fd to
+  fall back to).
+- **A dead write**: the graph branch inside `cmd_log.c`'s `if (touches)`
+  block used to set `printed_any = 1;`, but `printed_any` is only ever
+  READ inside the non-graph `else` branch two dozen lines later (graph
+  mode tracks "is a separator due" via `graph_has_pending` instead).
+  Confirmed by `grep` before removing it -- this was a leftover from an
+  earlier draft that shared more state between the two branches.
+- **`--graph` still opens a `tmpfile()` even when zero entries end up
+  being printed** (`-n 0`, or a pathspec matching nothing) -- wasted work,
+  not a correctness bug (the file is created and immediately closed with
+  nothing ever written to it), and left as-is rather than special-cased:
+  the cost is one `tmpfile()`/`close()`/`fclose()` pair, and adding a
+  "will anything be printed at all" pre-check would duplicate the walk's
+  own termination logic for a saving that does not matter at the scale
+  `sg log` operates at.
+
+**Gates after the review round**: `make` 0 new warnings; `make test`
+74/74 binaries ran, 0 FAIL; `bash tests/interop.sh` **2817/2817** passed, 0
+skipped (+5 new checks over the pre-review-round 2812); `make sanitize`
+74/74 binaries, 0 sanitizer errors.
+
+### 6. Second review pass (tail-of-review): a third bug, same predicate as Bug B, plus a new deliberate divergence
+
+A second cold review of the tail of this phase's diff (the fixes from
+section 4/5 above, which had not been reviewed by anyone yet) found a
+third real byte divergence, measured directly against real git 2.55.0 on
+a minimal two-commit fixture (`f` containing `2\n`, then `3\n`):
+
+```
+--pretty=format: (empty) -p          git: no blank line before the diff   sg: prints one
+--pretty=format: (empty) --stat      git: no blank line before the stat   sg: prints one
+--pretty=format: (empty) -p --stat   git: no '---' line at all            sg: prints '---'
+--pretty=tformat: (empty), all three: same shape as format:
+--pretty=format:%b (expands empty)   -p --stat: BOTH sides print '---'    <- control
+--pretty=tformat:X (non-empty)       -p --stat: BOTH sides print '---'    <- control
+--pretty=format: (empty) --name-only git: b'f\n' (no separator logic to suppress in the first place)
+```
+
+**Same predicate as Bug B, one call site later**: an entry whose FORMAT
+STRING is empty must suppress the blank-line/`---` separator entirely,
+not just the terminator. This is Phase 60a's original bug (`format:`,
+non-`t`, has it too, so it has nothing to do with `--graph`), found only
+now because reproducing Bug A required building `$P63_GFX`, the first
+fixture in this project with a genuinely mixed body shape, and diffing
+that fixture against `format:`/`tformat:` combined with `-p`/`--stat` is
+what this review pass tried next.
+
+**Fix, and why it is one function instead of two copies of the same
+check**: `commit_out.c`'s `print_commit_diff` (the separator) and its
+`SG_PRETTY_TFORMAT` case (the terminator) used to each carry their own,
+independently-written `user_format[0] == '\0'` check -- Bug B's fix
+(section 4 above) added the terminator check without also touching the
+separator, because nobody had looked at the separator logic yet. This is
+the SECOND time in this same phase that "the same rule, written down
+twice, with only one copy correct" has happened (the first was Bug A/Bug
+B being two symptoms discovered together but living in different
+functions). The fix factors the predicate into one function,
+`pretty_header_is_empty(const sg_commit_out_opts *o)`, called from both
+sites; there is now exactly one place that can answer "is this entry's
+header empty by construction", and the two behaviors derived from that
+answer (no terminator, no separator) cannot drift apart again.
+
+**Control, not decoration**: `--pretty=format:%b` on a body-less commit
+(its EXPANSION is empty, but its format STRING, `"%b"`, is not) still gets
+its separator/`---` on both sides, and this is a named interop check, not
+an incidental side effect of the other checks. Without it, a rule keyed on
+"did the header render zero bytes for THIS commit" (a broader, wrong
+model) would pass every other check in this group exactly as well as the
+correct "is the format string itself empty" rule -- the two models only
+disagree on this one row. `--name-only`/`--name-status` needed no special
+casing: measured directly, `--pretty=format: --name-only` already prints
+no separator at all regardless of header emptiness (name formats have no
+separator logic to suppress in the first place, confirmed via `sg show`
+since `sg log` does not implement `--name-only` at all).
+
+### 7. Deliberate divergence #6 (CLAUDE.md's list): `--graph` + an empty format string + a diff
+
+Measured directly, AFTER the section 6 fix above (the pre-fix bytes on
+sg's side were different -- do not confuse the two):
+
+```
+git log -1 --graph --pretty=format: -p
+  b'* | diff --git a/f b/f\n| index 0cfbf08..00750ed 100644\n| --- a/f\n| +++ b/f\n| @@ -1 +1 @@\n| -2\n| +3\n'
+sg  log -1 --graph --pretty=format: -p
+  b'* diff --git a/f b/f\n| index 0cfbf08..00750ed 100644\n| --- a/f\n| +++ b/f\n| @@ -1 +1 @@\n| -2\n| +3\n'
+```
+
+git's `--graph` treats an entry's header and its diff as TWO INDEPENDENT
+graph-prefixed blocks. An empty header still gets its own `"* "` marker
+(section 6's fix does not remove that -- Bug A's fix from section 3 above
+is what guarantees a marker for an empty block), and the diff that
+follows is a SEPARATE block that gets its OWN `"| "` immediately after,
+landing on the same physical line as the header's marker
+(`"* | diff --git..."`, two graph tokens glued together with no `\n`
+between them). sg's `graph_capture_raw` captures a whole entry -- header
+and diff together -- as ONE buffer and feeds it through the prefixer as
+one unit, so the shape "an empty block, immediately followed by a second,
+independently-prefixed block" cannot be produced: sg's output is `"* "`
+(the entry's own marker, correctly non-absorbed thanks to section 3's
+fix) directly followed by the diff's own first byte, with no second `"| "`
+inserted anywhere.
+
+**Not chased, deliberately**: producing git's shape would require
+`sg_commit_out_entry` to expose the boundary between "header rendering
+ended" and "diff rendering began" to its caller (`cmd_log.c`), so the
+prefixer could be told to start a fresh block there. That boundary is also
+`sg_commit_out_entry`'s public contract with `sg show` (Phase 55's shared
+renderer) -- widening it just to reproduce git's behavior on the
+degenerate combination "empty custom format string, under `--graph`, with
+a diff attached" is not worth the risk to that shared contract. Pinned on
+both sides in interop as two LITERAL byte assertions (not a git-vs-sg
+`cmp`, since the two are supposed to differ) so a future change to either
+renderer fails by name rather than silently drifting away from its own
+pinned bytes. This is CLAUDE.md's divergence list entry #6.
+
+**Gates after this second review pass**: `make` 0 new warnings; `make
+test` 74/74 binaries ran, 0 FAIL; `bash tests/interop.sh` **2828/2828**
+passed, 0 skipped (+11 new checks over the 2817 baseline after section
+4/5's fixes: 6 for the shared-predicate bug and its control, 5 for the
+new deliberate divergence's pins); `make sanitize` 74/74 binaries, 0
+sanitizer errors.
+
+### Mutation results, and one control that turned out not to be one
+
+Every fix in this phase was mutation-verified, and the two review-found
+fixes were **reverse**-mutated (undone one at a time) since a fix found by
+review has, by construction, no failing test behind it. Eleven rounds, all
+red, each on the checks it was aimed at:
+
+- The `-- deep` row of the 0.1a matrix is red for **exactly one** mutation
+  (`graph_natural_end = touches`) and nothing else -- it is the sole
+  witness that distinguishes the correct "the walk ran to the end" rule
+  from the discarded "the last printed commit has no parent" one. It was
+  built for that job and it does only that job.
+- Reversing Bug A's empty-entry marker turns three interop checks and
+  `test_entry_write_emits_marker_for_empty_last_entry` red.
+- Reversing Bug B's terminator suppression turns its own named check red.
+- Reversing the third fix's separator half (`r3a`) turns the five
+  separator rows red and leaves the `%b` control green; making the shared
+  predicate always-false (`r3b`) turns BOTH downstreams red at once, which
+  is the evidence that they really are one rule and not two copies.
+
+**The `%b` control is NOT a unique witness, and this file should not
+pretend otherwise.** It exists to pin the measured distinction between
+"the format STRING is empty" and "the expansion is empty" (`format:%b` on
+a body-less commit keeps its separator; `format:` does not). But the
+over-broad mutation that would violate it (`r3c`, predicate always true)
+is caught first by thirteen PRE-EXISTING `phase60`/`phase60b` checks on
+non-empty format strings, and the implementation shape it really guards
+against -- a predicate that inspects the RENDERED LENGTH rather than the
+format string -- cannot be expressed at that point in the code at all,
+because `pretty_header_is_empty` has no access to the expansion. So the
+control is documentation of a measurement, not a defence line with its own
+coverage. Keeping it is cheap; claiming it is the discriminator would be
+the "a control whose two arms already agree" mistake this project has
+already recorded once.
+
+### Not cold-read
+
+The third bug's fix (`pretty_header_is_empty` and its two call sites), the
+interop rows for it, the deliberate-divergence #6 pins, and this
+coordinator's own rename of
+`test_empty_middle_entry_composes_but_cannot_witness_bug_a` were all
+written AFTER the second review round finished. Per this project's own
+rule, a second review round is not recursed into -- so those changes have
+been mutation-verified (above) but never cold-read by a reviewer. Recorded
+here rather than left implicit.
