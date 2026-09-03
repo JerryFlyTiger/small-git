@@ -396,13 +396,57 @@ containing a
 .B %
 placeholder, which is treated the same as
 .BI tformat: str .
-Placeholder expansion itself (the
-.B %H
+A user format string may use the placeholders
+.BR %H / %h / %T / %t / %P / %p
+(object ids; the abbreviated forms use 7 hex digits, and
+.BR %P / %p
+list every parent space-separated),
+.BR %an / %ae / %al / %ad / %aD / %at / %ai / %aI / %as
+and the committer equivalents
+.BR %cn / %ce / %cl / %cd / %cD / %ct / %ci / %cI / %cs
+(name, email, email's local part before
+.BR @ ,
+and six renderings of the same timestamp \(em
+.B %ad
 /
-.B %an
-/ etc. table) is not yet implemented \(em only a literal string with no
+.B %cd
+git's default format,
+.B %aD
+/
+.B %cD
+RFC 2822,
+.B %at
+/
+.B %ct
+the raw Unix timestamp,
+.B %ai
+/
+.B %ci
+ISO 8601 with a space,
+.B %aI
+/
+.B %cI
+strict ISO 8601 with a
+.B T
+separator, and
+.B %as
+/
+.B %cs
+just the date), and
+.BR %s / %f / %b / %B
+(subject, a filename-safe sanitized subject, the body after the first
+blank line, and the raw message), plus the literal escapes
+.BR %n " (newline), " %% " (a literal " % "), and " %xNN
+(the raw byte given by hex digits
+.IR NN ).
+Every timestamp placeholder shows the clock shifted into the timestamp's
+own stored offset, not UTC and not the machine's local time. Any
 .B %
-in it can be given this way today.
+sequence outside this table is refused with a diagnostic naming it and a
+non-zero exit \(em real git instead prints such a sequence literally or as
+empty, which is a deliberate, measured divergence (see
+.B CAVEATS
+below).
 .B --pretty
 with no
 .RI = fmt

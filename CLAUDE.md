@@ -267,6 +267,16 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   **not `strftime`'s `%a`/`%b`** -- those follow the locale, and one
   `setlocale` call anywhere in the process would silently translate a format
   whose entire job is to match git byte for byte.
+  WARNING: **a stored offset of exactly `-0000` is normalized to `+0000`**
+  (Phase 60d, `normalize_tz_for_display` in `date.c`, shared by
+  `sg_date_format_normal`/`_rfc2822`/`_iso` so the three can't drift apart
+  on it) -- every other value, including ordinary `+0000` and any non-zero
+  offset, is echoed unchanged. `--pretty=raw` and `sg cat-file -p` do NOT
+  go through this or any rendering function -- they print the object's own
+  stored bytes directly, so a stored `-0000` stays `-0000` there, matching
+  real git measured the same way. `%aI` needs no such rule: it already
+  collapses BOTH `+0000` and `-0000` to a literal `"Z"` before reaching a
+  tz-string branch at all.
   WARNING: **`cmd_undo.c` has its own date formatter and must not be
   converged onto this one.** `sg undo` has no real-git counterpart, so it has
   no oracle; it deliberately prints local time in ISO form.
@@ -507,13 +517,105 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `--pretty=<str>` would be** -- `--format=plain` is a rule-5 error on both
   tools, measured; there is no separate "assume format: mode" fallback for
   `--format=`.
-  **Placeholder expansion (the `%H`/`%an`/etc. table) is Phase 60b, not
-  implemented yet.** The grammar already classifies FORMAT/TFORMAT mode
-  correctly this phase (so a literal string with no `%`, e.g.
-  `format:plain`, already renders), but any string that actually contains a
-  `%` is rejected with "not supported yet", exit 1, at the CLI layer before
-  `sg_commit_out_entry` is ever called -- see that function's own
-  precondition comment.
+  **Placeholder expansion (the `%H`/`%an`/etc. table) is implemented as of
+  Phase 60b.** `sg_pretty_validate_format` (`commit_out.c`) walks a
+  FORMAT/TFORMAT user_format's `%`-sequences once at the CLI layer, before
+  any commit is ever rendered (`cmd_log.c`'s/`cmd_show.c`'s
+  `resolve_pretty_arg`), and `expand_user_format` does the actual rendering
+  per commit, driven by the same `decode_placeholder` token table so the two
+  can never drift apart. The supported table: `%H %h %T %t %P %p` (ids,
+  `%h`/`%t`/`%p` abbreviate to 7 hex like the rest of this project, `%P`/`%p`
+  are every parent space-separated); `%an %ae %al %ad %aD %at %ai %aI %as`
+  and the committer mirror `%cn %ce %cl %cd %cD %ct %ci %cI %cs`; `%s %f %b
+  %B`; `%n %% %xNN`.
+  WARNING: **six date renderings, not one** -- `%ad`/`%cd` reuse the
+  existing `sg_date_format_normal`, `%as`/`%cs` reuse `sg_date_format_short`
+  (Phase 60a), and Phase 60b adds three more to `date.h`:
+  `sg_date_format_rfc2822` (`%aD`, `"Wed, 15 Nov 2023 06:13:20 +0800"` --
+  the day of month is NOT zero-padded, measured: day 4 renders `"Sat, 4 Nov
+  2023"`), `sg_date_format_iso` (`%ai`, `"2023-11-15 06:13:20 +0800"`, a
+  space between date and time), and `sg_date_format_iso_strict` (`%aI`,
+  `"2023-11-15T06:13:20+08:00"`, a literal `T` and the timezone with a
+  colon). All six show the epoch SHIFTED INTO the stored offset, same rule
+  `sg_date_format_normal`'s own warning states. `%at` is the one exception
+  that needs no shifting at all -- it prints the raw epoch integer.
+  WARNING: **`%aI`/`%cI`'s ZERO offset is a further exception on top of the
+  colon-insertion rule**: `"+0000"` and `"-0000"` both render as a literal
+  `"Z"`, never `"+00:00"`/`"-00:00"` -- measured, and easy to miss because
+  every other Phase 60 fixture in this file happens to use a non-zero
+  offset; interop's own `phase60b` group used `+0000` and caught this.
+  WARNING: **`%f`'s algorithm is "collapse a RUN of non-title bytes to ONE
+  `-`", not "one `-` per byte"** -- a byte is TITLE (alnum, `.`, or `_`;
+  `@` is deliberately NOT title, despite an older git comment claiming
+  otherwise) and copied as-is, with consecutive `.` bytes collapsing to a
+  single `.`; a run of non-title bytes (including each byte of a multi-byte
+  UTF-8 character, since none of them test alnum) collapses to a single
+  `-`, emitted lazily right before the next title byte -- a run at the very
+  end of the string, with nothing following it, emits nothing at all.
+  Leading `-` bytes are then stripped, but a leading `.` is NOT (measured:
+  `".leading"` keeps its dot, `"-leading"` loses its dash), and trailing
+  `-`/`.` bytes are both stripped. Ten rows measured against real git 2.55.0
+  pin this in both `tests/test_pretty_format.c` and interop; the `café` row
+  (a UTF-8 character followed by a space) is what distinguishes "collapse a
+  run" from "one dash per byte", and the `a...b` -> `a.b` rows are what
+  prove `.` is not simply lumped in with ordinary non-title punctuation.
+  WARNING: **`%b`/`%B` differ, and `%b`'s blank-line skip is not just ONE
+  line** -- `%B` is the raw message verbatim; `%b` is everything after the
+  first blank line, with any FURTHER immediately-following blank lines also
+  skipped (measured: a message with two consecutive blank lines after the
+  subject still starts `%b` with no leading blank at all). A message with
+  no blank line anywhere gives `%b` an empty string; measured on a
+  body-less commit, `%b` is empty and `%B` is `<subject>\n`.
+  WARNING: **`%b`'s notion of "blank line" is `line_is_blank`** (empty OR
+  all-whitespace), the SAME test `fold_subject`/`first_paragraph_span`/
+  `print_message` use, not a narrower literal-`"\n\n"` search -- Phase
+  60d fixed a review-round bug where `print_body` had re-derived the OLD,
+  narrower rule while every sibling function in the same diff had already
+  converged on `line_is_blank`. Measured: a separator line containing a
+  single space or tab (not literally empty) still counts as the blank-line
+  boundary in real git.
+  WARNING: **`%s` FOLDS a multi-line subject, and this rule now has FIVE
+  call sites sharing ONE function, `fold_subject` in `commit_out.c`** --
+  `%s`, the `oneline`/`reference` builtins, and legacy `--oneline` all
+  fold; `%f` and `short` deliberately do NOT (see their own entries below).
+  The algorithm (measured against real git 2.55.0, 8 rows plus 2 further
+  probes): skip leading BLANK lines (a line is blank if it is empty or
+  consists entirely of spaces/tabs), then join every following line up to
+  (not including) the next blank line with a single space -- each line's
+  own TRAILING whitespace is stripped before joining, but a continuation
+  line's LEADING whitespace survives untouched
+  (`"l1\n l2\n l3\n\nbody\n"` -> `"l1  l2  l3"`, two spaces: one join,
+  one preserved leading space). A message with NO blank line anywhere folds
+  its entire remaining content into one line
+  (`"l1\nl2\nl3\n"` -> `"l1 l2 l3"`, and `%b` for that same message is
+  empty -- there is no body left once every line joined the subject).
+  WARNING: **`short` is the ONE exception, and does NOT go through
+  `fold_subject`** -- measured directly: `git log --pretty=short` on a
+  message whose first paragraph spans 3 lines prints 3 SEPARATE indented
+  lines, not one folded line, despite `short` otherwise being subject-only
+  (no body). It uses `first_paragraph_span` instead: same leading-blank-
+  skip and same "stop before the next blank line" boundary as
+  `fold_subject`, but the lines are handed to `print_message` UNCHANGED
+  (verbatim, one physical line per output line) rather than joined.
+  WARNING: **`%f` was already correct and stays untouched** -- it sanitizes
+  only the literal first physical line, never the folded form (same input
+  `"subject\ntrailing no blank\n"` gives `%f` = `"subject"`, not `%s`'s
+  folded `"subject trailing no blank"`); `%b`/`%B` were also already
+  correct. Do not route either of them through `fold_subject`.
+  WARNING: **two further bugs were found while measuring this, and are
+  FIXED as of Phase 60c** -- see the dedicated `print_message` bullet below
+  for the full rule and why no earlier fixture (built through ordinary
+  porcelain commits) ever exercised either shape.
+  **Section 5.3's rejection is a deliberate divergence from real git**:
+  git prints an unrecognized placeholder literally (`%z` -> `%z`) and
+  renders a recognized-but-contextless one as empty (`%C(red)`, `%d`, `%N`,
+  `%G?`); sg refuses the WHOLE invocation instead, exit 1, naming the
+  offending sequence (e.g. `sg: unsupported --pretty placeholder '%z'`) --
+  same standing convention as `--patience`/`--diff-algorithm=` being
+  rejected rather than approximated. A lone trailing `%` is rejected the
+  same way (git prints it literally: `--format=100%` -> `100%`). Pinned on
+  both sides in interop's `phase60b` group (`%z`, `%ar`, `%d`, `%C(red)`,
+  `100%` -- git exits 0, sg exits 1).
   **Bare `--pretty` (no `=`) means `medium`; bare `--format` (no `=`) is a
   usage error** -- a measured asymmetry, reproduce it rather than "fixing"
   it into a symmetric pair.
@@ -593,6 +695,48 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   independently -- `cmd_log.c`'s `suppress_join` needed `SG_PRETTY_REFERENCE`
   added to its OR-chain; `commit_out.c`'s `print_commit_diff` (the
   entry-diff separator) is correctly untouched.
+- **`print_message` (the WHOLE-message-body renderer shared by
+  `medium`/`full`/`fuller`/`raw`, `commit_out.c`) has THREE rules beyond
+  "indent every line 4 spaces", fixed in Phase 60c** (measured against real
+  git 2.55.0 via `git hash-object -t commit -w --stdin` -- **`git commit`'s
+  own message cleanup silently erases every one of these shapes before the
+  object ever reaches the store**, which is exactly why no fixture built
+  through ordinary porcelain commits ever exercised any of them, and why
+  interop's fixtures for this bullet use the plumbing layer instead):
+  1. Leading blank lines (empty OR all-whitespace -- `line_is_blank`, the
+     SAME test `fold_subject`/`first_paragraph_span` use, factored into one
+     shared function) are skipped ENTIRELY, not even rendered as `    \n`.
+  2. Trailing blank lines are likewise skipped entirely (measured:
+     `"subj\n\nbody\n\n\n"` renders identically to
+     `"subj\n\nbody\n"`).
+  3. Every line's own TRAILING whitespace (spaces and tabs) is stripped
+     before indenting -- this applies to EVERY line, not just the subject,
+     including body lines, and applies REGARDLESS of `expand_tabs` (measured
+     on `raw`/`short`, neither of which expands tabs, both still strip
+     trailing whitespace).
+  WARNING: **a BLANK line in the MIDDLE is preserved, and EACH one
+  individually -- there is no squeezing.** Measured: two consecutive middle
+  blank lines render as TWO separate `    \n` lines, not one. This needs no
+  special case: a middle blank/whitespace-only line's content, after the
+  SAME trailing-whitespace-strip every other line gets, is simply empty, so
+  it naturally prints as `    ` + nothing + `\n` -- the only lines that
+  need SKIPPING (not printing) are the leading and trailing RUNS, which
+  `print_message` implements by buffering each blank-line run and flushing
+  it lazily right before the next non-blank line (a run that reaches the
+  end of the string unflushed is a trailing run, discarded unprinted).
+  WARNING: **`%B` is completely unaffected -- this is a RENDERING rule, not
+  a message-content rule.** `%B` returns the raw message verbatim
+  regardless of any of the above (measured: `%B` on
+  `"subj\n\nbody\n\n\n"` still returns all five lines, blank ones
+  included). Do not go looking for this logic near `sg_commit_parse` or
+  `expand_user_format`'s `PH_RAW_BODY` case -- it belongs only in
+  `print_message`, which only `medium`/`full`/`fuller`/`raw` call.
+  WARNING: **trailing-whitespace-strip and tab-expansion are measured to
+  commute** -- both orders were tested and give byte-identical output,
+  because the trailing suffix being stripped is always pure whitespace,
+  unaffected by an earlier tab's own column expansion. The implementation
+  strips first (`print_message_line_stripped`), then hands the trimmed
+  range to the unchanged `print_message_line` for tab expansion.
 - **Joining `base/rel` always goes through `sg_path_join`**- **Joining `base/rel` always goes through `sg_path_join`**
   (`include/sg/workdir.h`, Phase 21), buffer size uses `SG_PATH_MAX` from the
   same header. **Do not write a raw
