@@ -22,7 +22,7 @@
 
 static const char USAGE[] =
     "usage: sg show [-s] [-p|--patch] [--stat] [--name-only] [--name-status] "
-    "[--oneline] [--pretty[=<fmt>]|--format=<fmt>] [<object>...]\n";
+    "[--oneline] [--pretty[=<fmt>]|--format=<fmt>] [--date=<fmt>] [<object>...]\n";
 
 /* Phase 59 spec section 2: five bits, NOT Phase 55a's "last one wins" over
    just {patch, stat}. Measured over 29 flag combinations, and one detail
@@ -53,6 +53,14 @@ typedef struct {
        is the entire render loop. */
     int pretty_set;
     sg_pretty_format pretty;
+    /* Phase 64: --date=/--date, last one wins. Same "lives here, not a
+       bare local" reasoning as `pretty` above -- this needs to stay valid
+       for the whole render loop, AND it feeds a second, independent call
+       site (the annotated tag header's own Date:/TaggerDate: line,
+       cmd_show.c's own render_id -- not reached through
+       sg_commit_out_opts at all). */
+    int date_mode_set;
+    sg_date_mode date_mode;
 } show_flags;
 
 /* Mirrors cmd_log.c's own resolve_pretty_arg (not shared via a header --
@@ -77,6 +85,17 @@ static int resolve_pretty_arg(const char *raw, sg_pretty_format *out)
             fprintf(stderr, "sg: unsupported --pretty placeholder '%.*s'\n", (int)bad_len, bad);
             return -1;
         }
+    }
+    return 0;
+}
+
+/* Mirrors cmd_log.c's own resolve_date_arg (same reasoning as
+   resolve_pretty_arg above for why this is not shared via a header). */
+static int resolve_date_arg(const char *raw, sg_date_mode *out)
+{
+    if (sg_date_parse_mode(raw, out) != 0) {
+        fprintf(stderr, "sg: unknown date format %s\n", raw);
+        return -1;
     }
     return 0;
 }
@@ -155,6 +174,9 @@ static void resolve_commit_out_opts(const show_flags *f, sg_commit_out_opts *o)
        Phase 29 shared-struct warning in commit_out.h, this field must be
        set explicitly on every construction site regardless. */
     o->pathspec = NULL;
+    /* Phase 64: --date=/--date, borrowed from `flags` itself, same
+       "lives there, not a bare local" reasoning as `pretty` above. */
+    o->date_mode = f->date_mode_set ? &f->date_mode : NULL;
     /* Default is a patch -- measured, and differs from `sg stash show`,
        whose default is --stat. --oneline does NOT count as a format
        selector here: `git show --oneline` still prints the patch. */
@@ -882,7 +904,7 @@ static int render_id(const char *git_dir, const char *display_arg,
     }
     case SG_OBJ_TAG: {
         sg_tag tag;
-        char timebuf[SG_DATE_NORMAL_MAX];
+        char *timebuf = NULL;
         int rc;
 
         if (sg_tag_parse(content, content_len, &tag) != 0) {
@@ -910,8 +932,27 @@ static int render_id(const char *git_dir, const char *display_arg,
             }
         }
 
-        if (sg_date_format_normal(tag.tagger_time, tag.tagger_tz, timebuf, sizeof(timebuf)) != 0)
-            timebuf[0] = '\0';
+        /* Phase 64: this is its OWN reach point for --date=, separate from
+           every path through sg_commit_out_opts -- measured, `git show
+           -s --date=short v1` renders BOTH the tag's own date and the
+           commit's date in the requested format. */
+        if (flags->date_mode_set) {
+            /* flags->date_mode.kind may be SG_DATE_FORMAT, whose output
+               length is unbounded user input -- must go through the
+               alloc'ing renderer, not a fixed SG_DATE_MODE_MAX stack
+               buffer (see that constant's header comment in date.h for
+               the silent-truncation bug this avoids). */
+            if (sg_date_format_mode_alloc(&flags->date_mode, tag.tagger_time,
+                                          tag.tagger_tz, &timebuf) != 0)
+                timebuf = NULL;
+        } else {
+            char normalbuf[SG_DATE_NORMAL_MAX];
+
+            if (sg_date_format_normal(tag.tagger_time, tag.tagger_tz,
+                                      normalbuf, sizeof normalbuf) != 0)
+                normalbuf[0] = '\0';
+            timebuf = strdup(normalbuf);
+        }
 
         if (entry_like && (nested || *shown))
             printf("\n");
@@ -944,14 +985,16 @@ static int render_id(const char *git_dir, const char *display_arg,
             }
             if (shape.show_date) {
                 if (shape.fuller_pad)
-                    printf("%-12s%s\n", "TaggerDate:", timebuf);
+                    printf("%-12s%s\n", "TaggerDate:", timebuf != NULL ? timebuf : "");
                 else
-                    printf("Date:   %s\n", timebuf);
+                    printf("Date:   %s\n", timebuf != NULL ? timebuf : "");
             }
         }
         if (tag.message != NULL && tag.message[0] != '\0')
             printf("\n%s", tag.message);
         *shown = 1;
+
+        free(timebuf);
 
         if (hops >= SG_SHOW_MAX_TAG_HOPS) {
             fprintf(stderr, "sg: tag chain too deep\n");
@@ -1045,6 +1088,7 @@ int sg_cmd_show(int argc, char **argv)
     flags.no_output = 0;
     flags.format_seen = 0;
     flags.pretty_set = 0;
+    flags.date_mode_set = 0;
 
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1064,6 +1108,21 @@ int sg_cmd_show(int argc, char **argv)
             if (resolve_pretty_arg(a + 9, &flags.pretty) != 0)
                 return 1;
             flags.pretty_set = 1;
+        } else if (strncmp(a, "--date=", 7) == 0) {
+            if (resolve_date_arg(a + 7, &flags.date_mode) != 0)
+                return 1;
+            flags.date_mode_set = 1;
+        } else if (strcmp(a, "--date") == 0) {
+            /* Separate-argument form -- measured accepted by real git on
+               both `log` and `show`. */
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s", USAGE);
+                return 1;
+            }
+            i++;
+            if (resolve_date_arg(argv[i], &flags.date_mode) != 0)
+                return 1;
+            flags.date_mode_set = 1;
         } else if (strcmp(a, "-s") == 0) {
             /* -s CLEARS every one of the five bits, then sets no_output --
                see show_flags's own comment for the full model and why an

@@ -228,6 +228,7 @@ to discard the broken merge state.
 .RB [ -n <count> | -<count> | --max-count= <count> ]
 .RB [ --oneline ]
 .RB [ --pretty [= <fmt> ]| --format= <fmt> ]
+.RB [ --date= <fmt> ]
 .RB [ -p | --patch ]
 .RB [ --stat ]
 .RB [ --graph ]
@@ -336,7 +337,6 @@ There is no
 .BR --follow ,
 .BR --all ,
 .BR --reverse ,
-.BR --date= ,
 .BR --author= / --grep= ,
 .BR -c / --cc ,
 .BR --full-history ,
@@ -351,6 +351,15 @@ select the entry's rendering; see
 .B "sg show"
 below for the full grammar and the seven built-in format names \(em both
 commands share the same renderer and the same rules.
+.PP
+.B --date= fmt
+(also the separate-argument form
+.BI --date " fmt" )
+selects how every rendered timestamp is displayed, shared with
+.BR "sg show" ,
+last one wins; see
+.B "sg show"
+below for the full grammar and byte tables.
 .SS show
 .B sg show
 .RB [ -s ]
@@ -359,6 +368,7 @@ commands share the same renderer and the same rules.
 .RB [ --name-only | --name-status ]
 .RB [ --oneline ]
 .RB [ --pretty [= <fmt> ]| --format= <fmt> ]
+.RB [ --date= <fmt> ]
 .RI [ object ...]
 .PP
 Shows one or more objects: a commit (the default entry format, shared with
@@ -564,6 +574,102 @@ writes the current branch's name instead (falling back to
 when detached), which is a deliberate, measured divergence \(em see
 .B CAVEATS
 below.
+.PP
+.BI --date= fmt
+(also the separate-argument form
+.BI --date " fmt" ,
+last one wins) selects how every rendered timestamp is displayed \(em the
+.B Date:
+line of
+.BR medium ,
+.B AuthorDate:
+/
+.B CommitDate:
+of
+.BR fuller ,
+the annotated tag header's own
+.B Date:
+/
+.B TaggerDate:
+line,
+.B %ad
+/
+.BR %cd ,
+and
+.BR reference 's
+own date field (whose own default remains
+.BR short ,
+distinct from every other reach point's
+.BR default ).
+Unaffected: every other timestamp placeholder
+.RB ( %aD / %ai / %aI / %as / %at
+and the committer equivalents), the
+.B raw
+built-in (prints the object's stored bytes verbatim), and
+.BR full / short / oneline
+(no date line at all).
+.I fmt
+is, case-sensitively, one of
+.BR default ,
+.BR iso " or " iso8601 ,
+.BR iso-strict " or " iso8601-strict ,
+.BR rfc " or " rfc2822 ,
+.BR short ,
+.BR raw ,
+or
+.BR unix ,
+each optionally suffixed with
+.B -local
+(stripped at most once; the remainder must itself be one of those names,
+so
+.B local-local
+and
+.B -local
+are both errors); the bare literal
+.B local
+is an alias for
+.BR default-local ;
+or
+.BI format: str
+/
+.BI format-local: str
+(prefixes, checked before any
+.B -local
+suffix handling, so
+.B -local
+appearing inside the format string itself is left alone) for a strftime
+string, with
+.BR %s / %z / %Z
+substituted by hand before the rest reaches the system
+.BR strftime (3)
+(git's own
+.BR strbuf_addftime ):
+.B %s
+is always the unshifted Unix timestamp,
+.B %z
+the offset actually being rendered, and
+.B %Z
+the zone abbreviation (empty unless
+.BR -local ).
+An unrecognized
+.I fmt
+(including
+.BR relative ,
+.BR human ,
+and
+.BI auto: name ,
+each a real git renderer with no shared machinery to reuse \(em not
+approximated, always refused) is a diagnostic naming it and a non-zero
+exit.
+A
+.B -local
+name ignores the object's own stored offset entirely and uses the
+.B machine's own offset at that timestamp's instant
+(so a DST boundary between two commits renders two different offsets, not
+a single cached one);
+.B default-local
+additionally omits the offset field altogether, rather than printing the
+machine's own.
 .SS status
 .B sg status
 .RB [ -s | --short | --porcelain ]

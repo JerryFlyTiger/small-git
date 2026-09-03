@@ -301,6 +301,72 @@ static void print_date_field(long long t, const char *tz, date_fmt_fn fn)
     fputs(buf, stdout);
 }
 
+/* Phase 64: the same job as print_date_field, but for one of the FOUR
+   reach points --date=<name> affects (CLAUDE.md's --date= entry section
+   2): %ad/%cd here, Date:/AuthorDate:/CommitDate:/the legacy Date: line
+   and reference's own date field elsewhere in this file, and the
+   annotated-tag header's own separate call site in cmd_show.c. A NULL
+   date_mode reproduces the pre-Phase-64 fallback byte for byte (calling
+   fallback_fn directly); every OTHER date placeholder (%aD/%ai/%aI/%as/
+   %at and the committer mirrors) is a fixed format and must keep calling
+   print_date_field above, unaffected by --date=. */
+static void print_configured_date_field(long long t, const char *tz,
+                                        const sg_date_mode *date_mode,
+                                        date_fmt_fn fallback_fn)
+{
+    if (date_mode != NULL) {
+        /* mode->kind may be SG_DATE_FORMAT, whose output length is
+           unbounded user input -- must go through the alloc'ing renderer,
+           not a fixed SG_DATE_MODE_MAX stack buffer (see that constant's
+           header comment in date.h for the truncation bug this avoids). */
+        char *buf = NULL;
+
+        if (sg_date_format_mode_alloc(date_mode, t, tz, &buf) == 0) {
+            fputs(buf, stdout);
+            free(buf);
+        }
+        return;
+    }
+    {
+        char buf[SG_DATE_NORMAL_MAX];
+
+        if (fallback_fn(t, tz, buf, sizeof buf) != 0)
+            buf[0] = '\0';
+        fputs(buf, stdout);
+    }
+}
+
+/* Same fallback/override rule as print_configured_date_field, but handing
+   the caller a MALLOC'd string (the caller must free() it) instead of
+   writing to stdout directly -- used by the medium/fuller/legacy/reference
+   call sites in sg_commit_out_entry, which need the
+   formatted string before they can decide layout (padding, labels) around
+   it. On a rendering failure the string is empty (never NULL, matching the
+   old fixed-buffer callers' fallback), but a genuine OOM can still return
+   NULL -- callers must check, same as any other malloc-returning call in
+   this codebase. */
+static char *format_configured_date_field_alloc(long long t, const char *tz,
+                                                 const sg_date_mode *date_mode,
+                                                 date_fmt_fn fallback_fn)
+{
+    if (date_mode != NULL) {
+        /* See print_configured_date_field above -- SG_DATE_FORMAT's output
+           is unbounded, so this must go through the alloc'ing renderer. */
+        char *buf = NULL;
+
+        if (sg_date_format_mode_alloc(date_mode, t, tz, &buf) == 0)
+            return buf;
+        return strdup("");
+    }
+    {
+        char buf[SG_DATE_NORMAL_MAX];
+
+        if (fallback_fn(t, tz, buf, sizeof buf) != 0)
+            buf[0] = '\0';
+        return strdup(buf);
+    }
+}
+
 /* A line (given as [p, end), never including its own '\n') is BLANK if it
    is empty or consists entirely of spaces/tabs. This single test is shared
    by fold_subject, first_paragraph_span, and print_message -- all three
@@ -571,7 +637,8 @@ static void print_body(const char *msg)
    decode_placeholder cannot fail here in practice -- the fallback branch
    below (print the sequence literally) exists only so this function stays
    safe if that precondition is ever violated, it is not a second policy. */
-static void expand_user_format(const char *fmt, const char *hex, const sg_commit *commit)
+static void expand_user_format(const char *fmt, const char *hex, const sg_commit *commit,
+                               const sg_date_mode *date_mode)
 {
     const char *p = fmt;
 
@@ -599,7 +666,7 @@ static void expand_user_format(const char *fmt, const char *hex, const sg_commit
         case PH_A_NAME: fputs(commit->author_name, stdout); break;
         case PH_A_EMAIL: fputs(commit->author_email, stdout); break;
         case PH_A_LOCAL: print_email_local(commit->author_email); break;
-        case PH_A_DATE: print_date_field(commit->author_time, commit->author_tz, sg_date_format_normal); break;
+        case PH_A_DATE: print_configured_date_field(commit->author_time, commit->author_tz, date_mode, sg_date_format_normal); break;
         case PH_A_DATE_RFC2822: print_date_field(commit->author_time, commit->author_tz, sg_date_format_rfc2822); break;
         case PH_A_DATE_UNIX: printf("%lld", commit->author_time); break;
         case PH_A_DATE_ISO: print_date_field(commit->author_time, commit->author_tz, sg_date_format_iso); break;
@@ -608,7 +675,7 @@ static void expand_user_format(const char *fmt, const char *hex, const sg_commit
         case PH_C_NAME: fputs(commit->committer_name, stdout); break;
         case PH_C_EMAIL: fputs(commit->committer_email, stdout); break;
         case PH_C_LOCAL: print_email_local(commit->committer_email); break;
-        case PH_C_DATE: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_normal); break;
+        case PH_C_DATE: print_configured_date_field(commit->committer_time, commit->committer_tz, date_mode, sg_date_format_normal); break;
         case PH_C_DATE_RFC2822: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_rfc2822); break;
         case PH_C_DATE_UNIX: printf("%lld", commit->committer_time); break;
         case PH_C_DATE_ISO: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_iso); break;
@@ -970,10 +1037,10 @@ static void print_pretty_raw(const char *hex, const sg_commit *commit)
 }
 
 static void print_pretty_reference(const unsigned char id[SG_SHA1_RAW_LEN],
-                                   const sg_commit *commit)
+                                   const sg_commit *commit, const sg_date_mode *date_mode)
 {
     char hex7[SG_SHA1_HEX_LEN + 1];
-    char short_date[SG_DATE_SHORT_MAX];
+    char *short_date;
     size_t subject_len;
     char *subject_buf;
 
@@ -981,15 +1048,20 @@ static void print_pretty_reference(const unsigned char id[SG_SHA1_RAW_LEN],
     /* As of Phase 60b, the FOLDED subject (fold_subject above), not just
        the first physical line. */
     subject_buf = fold_subject_alloc(commit->message, &subject_len);
-    /* `reference` uses the AUTHOR date (short form, "YYYY-MM-DD"), NOT the
-       committer's -- measured with a fixture whose two dates fall on
-       different days. */
-    if (sg_date_format_short(commit->author_time, commit->author_tz,
-                             short_date, sizeof(short_date)) != 0)
-        short_date[0] = '\0';
+    /* `reference` uses the AUTHOR date (short form, "YYYY-MM-DD" by
+       default), NOT the committer's -- measured with a fixture whose two
+       dates fall on different days. Phase 64: --date=<name> reaches this
+       field too (its own default remains SHORT, distinct from every other
+       reach point's DEFAULT) -- measured with a control that does NOT
+       coincide with short's own rendering (a fixture using --date=short
+       against this field proves nothing, it is what the field already
+       renders). */
+    short_date = format_configured_date_field_alloc(commit->author_time, commit->author_tz,
+                                                     date_mode, sg_date_format_short);
     printf("%.*s (%.*s, %s)\n", SG_COMMIT_OUT_ABBREV, hex7, (int)subject_len,
-          subject_buf != NULL ? subject_buf : "", short_date);
+          subject_buf != NULL ? subject_buf : "", short_date != NULL ? short_date : "");
     free(subject_buf);
+    free(short_date);
 }
 
 /* Phase 62: see the header comment. Deliberately mirrors print_commit_diff's
@@ -1187,13 +1259,10 @@ int sg_commit_out_entry(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
                         const sg_commit *commit, const sg_commit_out_opts *opts)
 {
     char hex[SG_SHA1_HEX_LEN + 1];
-    char timebuf[SG_DATE_NORMAL_MAX];
 
     sg_sha1_to_hex(id, hex);
 
     if (opts->pretty != NULL) {
-        char committer_timebuf[SG_DATE_NORMAL_MAX];
-
         switch (opts->pretty->kind) {
         case SG_PRETTY_ONELINE:
             print_pretty_oneline(hex, commit);
@@ -1201,29 +1270,37 @@ int sg_commit_out_entry(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
         case SG_PRETTY_SHORT:
             print_pretty_short(hex, commit);
             break;
-        case SG_PRETTY_MEDIUM:
-            if (sg_date_format_normal(commit->author_time, commit->author_tz,
-                                      timebuf, sizeof(timebuf)) != 0)
-                timebuf[0] = '\0';
-            print_pretty_medium(hex, commit, timebuf);
+        case SG_PRETTY_MEDIUM: {
+            char *timebuf = format_configured_date_field_alloc(
+                commit->author_time, commit->author_tz,
+                opts->date_mode, sg_date_format_normal);
+
+            print_pretty_medium(hex, commit, timebuf != NULL ? timebuf : "");
+            free(timebuf);
             break;
+        }
         case SG_PRETTY_FULL:
             print_pretty_full(hex, commit);
             break;
-        case SG_PRETTY_FULLER:
-            if (sg_date_format_normal(commit->author_time, commit->author_tz,
-                                      timebuf, sizeof(timebuf)) != 0)
-                timebuf[0] = '\0';
-            if (sg_date_format_normal(commit->committer_time, commit->committer_tz,
-                                      committer_timebuf, sizeof(committer_timebuf)) != 0)
-                committer_timebuf[0] = '\0';
-            print_pretty_fuller(hex, commit, timebuf, committer_timebuf);
+        case SG_PRETTY_FULLER: {
+            char *timebuf = format_configured_date_field_alloc(
+                commit->author_time, commit->author_tz,
+                opts->date_mode, sg_date_format_normal);
+            char *committer_timebuf = format_configured_date_field_alloc(
+                commit->committer_time, commit->committer_tz,
+                opts->date_mode, sg_date_format_normal);
+
+            print_pretty_fuller(hex, commit, timebuf != NULL ? timebuf : "",
+                                committer_timebuf != NULL ? committer_timebuf : "");
+            free(timebuf);
+            free(committer_timebuf);
             break;
+        }
         case SG_PRETTY_RAW:
             print_pretty_raw(hex, commit);
             break;
         case SG_PRETTY_REFERENCE:
-            print_pretty_reference(id, commit);
+            print_pretty_reference(id, commit, opts->date_mode);
             break;
         case SG_PRETTY_FORMAT:
             /* No terminator -- the entry text is exactly opts->pretty->
@@ -1231,7 +1308,7 @@ int sg_commit_out_entry(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
                The CLI layer has already validated every `%`-sequence in
                this string before this function is ever reached (see this
                function's own header-comment precondition). */
-            expand_user_format(opts->pretty->user_format, hex, commit);
+            expand_user_format(opts->pretty->user_format, hex, commit, opts->date_mode);
             break;
         case SG_PRETTY_TFORMAT:
             /* Always terminates with exactly one '\n' -- this is what makes
@@ -1265,7 +1342,7 @@ int sg_commit_out_entry(const char *git_dir, const unsigned char id[SG_SHA1_RAW_
                function's own comment. */
             if (pretty_header_is_empty(opts))
                 break;
-            expand_user_format(opts->pretty->user_format, hex, commit);
+            expand_user_format(opts->pretty->user_format, hex, commit, opts->date_mode);
             putchar('\n');
             break;
         case SG_PRETTY_LEGACY:
@@ -1288,14 +1365,15 @@ legacy:
                offset. Reading it as UTC while still printing "+0800" beside
                it was wrong by the offset -- eight hours here -- and said so
                in its own output. */
-            if (sg_date_format_normal(commit->author_time, commit->author_tz,
-                                      timebuf, sizeof(timebuf)) != 0)
-                timebuf[0] = '\0';
+            char *timebuf = format_configured_date_field_alloc(
+                commit->author_time, commit->author_tz,
+                opts->date_mode, sg_date_format_normal);
 
             printf("commit %s\n", hex);
             print_merge_line(commit);
             printf("Author: %s <%s>\n", commit->author_name, commit->author_email);
-            printf("Date:   %s\n", timebuf);
+            printf("Date:   %s\n", timebuf != NULL ? timebuf : "");
+            free(timebuf);
             print_message(commit->message, 1);
         }
     }

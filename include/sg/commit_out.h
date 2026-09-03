@@ -1,6 +1,7 @@
 #ifndef SG_COMMIT_OUT_H
 #define SG_COMMIT_OUT_H
 
+#include "sg/date.h"
 #include "sg/hash.h"
 #include "sg/object.h"
 #include "sg/pathspec.h"
@@ -111,6 +112,16 @@ typedef struct {
        field explicitly, same Phase 29 shared-struct warning as `pretty`
        above. */
     const sg_pathspec *pathspec;
+    /* Phase 64: NULL means the pre-Phase-64 default at every one of the
+       FOUR reach points --date= affects (Date:/AuthorDate:/CommitDate:,
+       %ad/%cd, and reference's own date field -- CLAUDE.md's --date=
+       entry has the full list, including the annotated-tag header's own
+       SEPARATE call site in cmd_show.c, which is not reached through this
+       struct at all). Non-NULL overrides all of them uniformly with the
+       same *date_mode. Borrowed, same convention as `pretty`/`pathspec`
+       above. Every construction site of this struct MUST set this field
+       explicitly, same Phase 29 shared-struct warning. */
+    const sg_date_mode *date_mode;
 } sg_commit_out_opts;
 
 /* Whether <commit> changed anything <ps> names, compared against its first
