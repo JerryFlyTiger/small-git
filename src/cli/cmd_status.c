@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/cli_args.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/merge.h"
@@ -26,29 +27,10 @@ static const char USAGE[] =
 /* Unlike `sg diff`, `sg status` has NO revision/path disambiguation at all:
    measured against git 2.55.0, `git status master` (a real branch name)
    prints nothing and exits 0 -- every positional argument is a pathspec,
-   full stop. Do not port cmd_diff.c's split_revs_and_paths here, that logic
-   is specific to diff having revision arguments to disambiguate against. */
-
-static void report_pathspec_error(sg_pathspec_error err, const char *arg, const char *repo_root)
-{
-    switch (err) {
-    case SG_PATHSPEC_ERR_EMPTY:
-        fprintf(stderr, "sg: an empty string is not a valid path; use . to match all paths\n");
-        break;
-    case SG_PATHSPEC_ERR_MAGIC:
-        fprintf(stderr, "sg: unsupported pathspec magic: %s\n", sg_quote_path_delimited(arg));
-        break;
-    /* No `default:` on purpose, same reasoning as cmd_diff.c's copy of this
-       function (which this one is deliberately duplicated from, per
-       CLAUDE.md's Phase 25 precedent for report_bad_tree_path -- converge
-       once interop covers both). */
-    case SG_PATHSPEC_ERR_NONE:
-    case SG_PATHSPEC_ERR_OUTSIDE:
-        fprintf(stderr, "sg: %s is outside the repository %s\n",
-               sg_quote_path_delimited(arg), sg_quote_path_delimited(repo_root));
-        break;
-    }
-}
+   full stop. Do not call sg_cli_split_revs_and_paths here (it lived in
+   cmd_diff.c as split_revs_and_paths until Phase 62 converged it into
+   src/cli/cli_args.c) -- that logic is specific to a command having
+   revision arguments to disambiguate against, which this one does not. */
 
 /* -u<mode>/--untracked-files=<mode>. Measured against git 2.55.0: bare "-u"
    (no attached mode) behaves like "-uall", NOT like the flagless default --
@@ -661,7 +643,7 @@ int sg_cmd_status(int argc, char **argv)
         sg_pathspec_error perr;
 
         if (sg_pathspec_add(&pathspec, repo_root, pos[arg_i], &perr) != 0) {
-            report_pathspec_error(perr, pos[arg_i], repo_root);
+            sg_cli_report_pathspec_error(perr, pos[arg_i], repo_root);
             sg_pathspec_free(&pathspec);
             free(pos);
             free(repo_root);

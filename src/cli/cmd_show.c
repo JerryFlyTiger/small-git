@@ -151,6 +151,10 @@ static void resolve_commit_out_opts(const show_flags *f, sg_commit_out_opts *o)
        below, measured (`git show --pretty=oneline` alone still defaults to
        a patch). */
     o->pretty = f->pretty_set ? &f->pretty : NULL;
+    /* Phase 62: `sg show` does not implement path limiting -- see the
+       Phase 29 shared-struct warning in commit_out.h, this field must be
+       set explicitly on every construction site regardless. */
+    o->pathspec = NULL;
     /* Default is a patch -- measured, and differs from `sg stash show`,
        whose default is --stat. --oneline does NOT count as a format
        selector here: `git show --oneline` still prints the patch. */

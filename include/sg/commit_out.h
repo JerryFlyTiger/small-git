@@ -3,6 +3,7 @@
 
 #include "sg/hash.h"
 #include "sg/object.h"
+#include "sg/pathspec.h"
 
 /* git abbreviates to core.abbrev, whose default is `auto` and scales with the
    repository's object count. sg pins 7, which is what auto yields for a small
@@ -98,7 +99,48 @@ typedef struct {
        is exactly the kind of field a partial field-by-field assignment
        leaves as stack garbage. */
     const sg_pretty_format *pretty;
+    /* Phase 62: borrowed, NULL means no path limiting. Restricts the
+       -p/--stat/--name-only/--name-status diff to the paths it names,
+       exactly as it restricts which commits are shown in the first place
+       (see sg_commit_out_touches_pathspec below) -- the two share the same
+       pathspec, but are two independent applications of it (one decides
+       whether to print an entry at all, the other trims that entry's own
+       diff), so print_commit_diff still applies its own empty-list check
+       after filtering rather than trusting the caller already proved the
+       list non-empty. Every construction site of this struct MUST set this
+       field explicitly, same Phase 29 shared-struct warning as `pretty`
+       above. */
+    const sg_pathspec *pathspec;
 } sg_commit_out_opts;
+
+/* Whether <commit> changed anything <ps> names, compared against its first
+   parent (an empty tree for a root commit, same as print_commit_diff's own
+   diff base -- this function is intentionally built the same way so the two
+   can never disagree about what "the commit's diff" is). NULL ps (or an
+   empty one) means "everything", and answers 1 without reading any tree --
+   a pathspec-less `sg log` must not pay this function's cost at all.
+
+   Runs BEFORE sg_diff_detect_renames, same ordering rule as every other
+   pathspec filter in this codebase (CLAUDE.md's Phase 29 rule): rename
+   detection only ever merges two rows into one, never turns a non-empty
+   list into an empty one, so skipping it here changes no answer while
+   saving the work.
+
+   Returns 0 on success (*out_touches set to 0 or 1), -1 on failure, and -2
+   -- sg_diff_trees's own third state, propagated rather than flattened --
+   when a tree entry's name is unsafe, having filled bad_path (buffer size
+   SG_PATH_MAX, and only ever written in the -2 case).
+   WARNING: collapsing -2 into -1 here is what the first version of this
+   function did, and it is worse than it looks: bad_path is untouched on an
+   ordinary -1 (a missing or corrupt object), so the caller cannot tell the
+   two apart and ends up reporting an EMPTY path as "invalid" for what is
+   really object-store corruption on no particular path. The caller must
+   also route bad_path through sg_quote_path_delimited before printing it,
+   like cmd_diff.c's report_bad_tree_path already does -- an unsafe entry
+   name is exactly the place a raw ESC byte would reach the terminal. */
+int sg_commit_out_touches_pathspec(const char *git_dir, const sg_commit *commit,
+                                   const sg_pathspec *ps, int *out_touches,
+                                   char *bad_path);
 
 /* Prints one commit entry exactly as `git log` / `git show` render it:
    either the "<abbrev> <subject>" oneline header, or the full

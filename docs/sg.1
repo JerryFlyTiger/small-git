@@ -231,6 +231,8 @@ to discard the broken merge state.
 .RB [ -p | --patch ]
 .RB [ --stat ]
 .RI [ rev ]
+.RB [ -- ]
+.RI [ path ...]
 .PP
 Prints the commit history starting at
 .B HEAD
@@ -266,11 +268,52 @@ and
 attach each entry's own diff against its first parent (the empty tree for a
 root commit), the same rendering
 .B "sg show"
-uses. There is no
+uses.
+.PP
+An optional
+.RB [ -- ]
+.RI [ path ...]
+restricts which commits are shown to those that changed something under
+one of the given paths, compared against
+.B each commit's own first parent
+\(em the same restriction
+.B -p / --stat
+applies to a single entry's diff, applied here to the walk itself. A
+pathspec also restricts
+.B -p / --stat 's
+own diff to the same paths. The matching rules are the same three ordered
+clauses
+.B "sg diff"
+uses (exact path, leading directory, or wildcard \(em see
+.B "sg diff"
+above); pathspec magic
+.RB ( :(icase) ,
+.BR :! ,
+.BR :/ )
+is rejected outright, matching nothing or matching a file literally
+starting with
+.B :
+would both silently answer a question that was never asked. A bare
+argument (no
+.BR -- )
+follows the same revision/path disambiguation
+.B "sg diff"
+uses: an argument that is both a valid revision and an existing path is
+rejected as ambiguous, and once the first path-like argument is seen every
+later argument must itself exist.
+.PP
+There is no
 .BR --graph ,
-path filtering, or any other
-.B "git log"
-option.
+.BR --follow ,
+.BR --all ,
+.BR --reverse ,
+.BR --date= ,
+.BR --author= / --grep= ,
+.BR -c / --cc ,
+.BR --full-history ,
+.BR --simplify-merges ,
+or a second
+.IR rev .
 .PP
 .B --pretty
 and

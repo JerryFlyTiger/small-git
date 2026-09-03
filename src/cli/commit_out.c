@@ -992,6 +992,40 @@ static void print_pretty_reference(const unsigned char id[SG_SHA1_RAW_LEN],
     free(subject_buf);
 }
 
+/* Phase 62: see the header comment. Deliberately mirrors print_commit_diff's
+   own "first parent's tree, empty tree for a root commit" construction so
+   the two can never answer a different question about the same commit. */
+int sg_commit_out_touches_pathspec(const char *git_dir, const sg_commit *commit,
+                                   const sg_pathspec *ps, int *out_touches,
+                                   char *bad_path)
+{
+    sg_diff_list list;
+    unsigned char parent_tree[SG_SHA1_RAW_LEN];
+    const unsigned char *old_tree = NULL;
+    int rc;
+
+    if (ps == NULL || ps->count == 0) {
+        *out_touches = 1;
+        return 0;
+    }
+
+    if (commit->parent_count > 0) {
+        if (sg_commit_tree_of(git_dir, commit->parents[0], parent_tree) != 0)
+            return -1;
+        old_tree = parent_tree;
+    }
+
+    rc = sg_diff_trees(git_dir, old_tree, commit->tree, &list, bad_path, 0);
+    if (rc != 0)
+        return rc == -2 ? -2 : -1;
+
+    /* Run before rename detection on purpose -- see the header comment. */
+    sg_diff_list_filter(&list, ps);
+    *out_touches = list.count > 0;
+    sg_diff_list_free(&list);
+    return 0;
+}
+
 /* The commit's own diff: first parent's tree against its own, or the empty
    tree for a root commit. That this renders a diff for a MERGE at all is a
    consequence of sg's first-parent-only walk, and it agrees with git under
@@ -1018,6 +1052,15 @@ static int print_commit_diff(const char *git_dir, const sg_commit *commit,
     bad_path[0] = '\0';
     if (sg_diff_trees(git_dir, old_tree, commit->tree, &list, bad_path, 0) != 0)
         return -1;
+
+    /* Phase 62: restrict the diff to o->pathspec's paths, same as
+       sg_commit_out_touches_pathspec restricts which commits are shown --
+       must run BEFORE rename detection (CLAUDE.md's Phase 29 ordering
+       rule: filtering after detection can turn a real rename into a plain
+       delete because only half the pair survives). NULL/empty is a no-op
+       (sg_diff_list_filter's own contract), so an unfiltered `sg log -p`
+       pays nothing extra here. */
+    sg_diff_list_filter(&list, o->pathspec);
 
     /* git's own default since 2.9: diff.renames is on, so `git log -p` shows
        `rename from`/`rename to` rather than a delete plus an add. */

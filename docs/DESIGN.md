@@ -11867,3 +11867,310 @@ named `phase61:` checks (the full-walk `log`, `show -s`, `show
 test` 71/71 binaries ran with 0 FAIL, interop **2671/2671** passed (18 more
 than the pre-phase 2653: the full `phase61:` group), `make sanitize` 71/71
 binaries, 0 sanitizer errors.
+
+## Phase 62: `sg log [<rev>] [--] <pathspec>...`
+
+### Measured facts (git 2.55.0, all against `git log --first-parent`)
+
+- **Section 0.1 -- selection is a FILTER over the first-parent walk, not
+  history simplification.** `git log --first-parent -- <path>` prints commit
+  C iff C's tree differs from its FIRST parent's tree (empty tree for a
+  root), restricted to the pathspec. Measured on a 7-commit fixture with two
+  merges: a pathspec naming a file only the merge's SECOND parent carries
+  (`t.txt`, brought in by an ordinary `--no-ff` merge) shows only the merge
+  commit itself, never the commits on the side branch that actually created
+  or edited it -- those are not on the first-parent chain at all. A pathspec
+  naming a file that a `-s ours` merge's second parent added (`c.txt`) shows
+  NOTHING, because `-s ours` makes the merge's tree identical to parent 1;
+  there is no first-parent commit anywhere whose tree contains that path.
+  This directly contradicts this project's own pre-Phase-62 claim ("path-
+  limited history is git's history simplification, not a filter over the
+  same walk") -- that claim is true of a FULL walk (where git also has to
+  reconsider parent linkage, not just presence/absence), but this project's
+  walk was already first-parent-only by Phase 2 scope, and under that
+  restriction "which commits changed the tree" and "which commits show up
+  under `-- path`" are the same question. If sg ever grows a full,
+  every-parent walk, this equivalence must be re-measured -- it is a
+  property of the RESTRICTED walk, not of pathspec-filtered history in
+  general.
+- **Section 0.2 -- a mode-only change (`chmod +x`, content unchanged)
+  counts as touching the path.** `sg_diff_trees` already emits a row for a
+  mode-only change (pre-existing, verified against `fx2`'s `c4` before
+  writing a line of Phase 62 code: `sg log -p`/`--stat` on that fixture was
+  already byte-identical to `git log --first-parent`), so
+  `sg_commit_out_touches_pathspec` is built directly on top of it rather
+  than re-deriving a tree comparison from scratch.
+- **Section 0.4 -- rename detection must be pathspec-filtered, THEN detected,
+  never the other way (Phase 29's rule, re-confirmed for this new call
+  site).** `git log -p -- a.txt`, at the commit that renamed `a.txt` to
+  `renamed.txt`, prints a plain `deleted file mode` + `--- a/a.txt` +
+  `+++ /dev/null` -- NOT `rename from`/`rename to` -- because filtering by
+  `a.txt` removes the `renamed.txt` half of the pair before rename
+  detection ever runs, leaving only a deletion. `git log --oneline --
+  renamed.txt` shows only that one commit (the ADD half survives its own
+  filter). Both are pinned as their own named interop checks (`tests/
+  interop.sh`'s `phase62:` group) specifically because this is the shape
+  that distinguishes "filter before detect" from "detect then filter".
+- **Section 0.5 -- the disambiguation grammar for a bare (no `--`) argument
+  is IDENTICAL to `sg diff`'s, re-measured rather than assumed**: an arg
+  that is both a valid revision and an existing path is rejected outright
+  (`ambiguous argument ...: could be both a revision and a file`); the
+  first non-revision, existing-path argument ends the revision list, and
+  every argument after it must exist (`<path> HEAD` fails naming `HEAD`,
+  even though `HEAD` is a perfectly good revision -- measured error text is
+  literally identical to `git diff`'s own, modulo `log`/`diff` in the
+  suggestion); a bare wildcard (`sg_pathspec_looks_like_spec`) is accepted
+  without ever touching the filesystem, matching nothing is exit 0 not an
+  error. This is why Phase 62's first code change is extracting
+  `split_revs_and_paths`/`arg_exists_in_worktree`/`report_pathspec_error`
+  out of `cmd_diff.c` into a shared `sg_cli_*` module (section 2 below)
+  rather than writing a second, "log-flavored" copy that could drift.
+
+### Design
+
+`sg_commit_out_touches_pathspec` (`commit_out.c`, declared in
+`commit_out.h`) answers the selection question independently of rendering:
+it builds the SAME old/new tree pair `print_commit_diff` builds (first
+parent's tree, or `NULL` for a root commit, against the commit's own tree),
+runs `sg_diff_trees` + `sg_diff_list_filter`, and reports whether anything
+survived -- BEFORE `sg_diff_detect_renames` runs, per the ordering rule
+above (rename detection can only ever merge two rows into one, never turn
+a non-empty list into an empty one, so skipping it here changes no answer
+while saving the cost). `ps == NULL` (or an empty pathspec) returns 1
+without reading a single tree, so a pathspec-less `sg log` pays nothing
+extra.
+
+`cmd_log.c`'s walk loop calls this once per commit it visits and only
+"prints" (increments `shown`, prints the entry-to-entry separator, calls
+`sg_commit_out_entry`) when it answers 1; it always advances to
+`parents[0]` regardless, stopping only on `parent_count == 0`, `-n`
+exhaustion, or a read failure. Two things about this loop needed rewriting,
+not just adding a call:
+
+1. **`shown` (interacting with `-n`) had to move from "count commits
+   walked" to "count commits printed"** -- `-n 2 -- a.txt` must stop after
+   the SECOND commit that touches `a.txt`, not the second commit visited
+   overall (measured, section 0.6). Moving the increment inside the
+   `touches` branch is the entire fix.
+2. **The blank-line-between-entries decision had to move from "was this
+   the first commit the walk reached" to "was this the first commit
+   actually PRINTED"** -- a commit the pathspec filtered out must leave
+   behind no separator at all, otherwise two printed entries three commits
+   apart in the walk would get a leading blank line meant for a commit that
+   was never shown. The `first` flag was renamed `printed_any` and is now
+   only read/written inside the `touches` branch.
+
+`sg_diff_trees` + `sg_diff_list_filter` run a SECOND time inside
+`print_commit_diff` (`commit_out.c`) when the caller also asked for `-p`/
+`--stat`/`--name-only`/`--name-status` -- this is a deliberate, accepted
+double-flatten of the same tree pair, not an oversight to optimize away:
+the alternative (caching the first pass's already-filtered list and handing
+it to the renderer) would mean the selection judgment and the rendering
+filter are no longer two independent applications of
+`sg_diff_list_filter` to two independently-built lists, and any future
+change to one call site's tree construction (e.g. adding `include_unchanged`
+for some future flag) could silently desync the two without either call
+site's own tests catching it. Paying one extra `sg_diff_trees` call per
+rendered commit keeps the pathspec's two applications provably identical by
+construction rather than by discipline.
+
+### Review round: two real bugs and two blind spots, all after a green board
+
+All four gates were green (`make` 0 warnings, `make test` 73/73, `interop:
+2774/2774 passed, 0 skipped`, `make sanitize` 73/73 with 0 sanitizer
+errors) and a 119-probe one-off oracle harness reported 0 byte divergences
+and 0 exit-code divergences against real git, **before** any of the
+following was known. This is the fifth time this project has used a
+one-off oracle harness and the second time the harness alone was not
+enough -- a cold review of the diff is what found items 1 and 2.
+
+1. **`bad_path` was printed raw** (`cmd_log.c`), where `cmd_diff.c`'s
+   `report_bad_tree_path` -- the same message, word for word -- has always
+   routed it through `sg_quote_path_delimited`. The new call site was
+   written from the message TEXT rather than from that function, and the
+   quoting did not come along. An unsafe tree entry name is precisely
+   where a raw ESC byte reaches the terminal, which is the whole reason
+   CLAUDE.md's quoting rule exists.
+2. **`sg_commit_out_touches_pathspec` collapsed `sg_diff_trees`'s -2 into
+   -1.** Only -2 fills `bad_path`; an ordinary -1 (missing or corrupt
+   object) leaves the buffer as the caller initialised it, so the single
+   shared message printed `sg: path  is invalid` -- an EMPTY path -- and
+   blamed a path for object-store corruption on no path at all. Strictly
+   worse than the pre-Phase-62 behaviour, where the same history got a
+   generic "cannot render this commit's diff". The function now returns
+   -2 in its own right (the project's existing third-state convention,
+   e.g. `sg_chunk_read_blob`) and `cmd_log.c` branches on it.
+   Neither bug was reachable by any fixture in the phase's original
+   interop group: reaching them takes `git mktree` (for a `..` entry) and
+   deleting a tree object by hand (for the -1 half), the same
+   "porcelain cannot build this shape" pattern the phase61/60c fixtures
+   already had to work around. Both halves are now pinned by name, and
+   both fixes were **reverse-mutated** (undone, one at a time) and
+   confirmed to turn exactly one named check red each.
+3. **Blind spot: `sg_cli_split_revs_and_paths`'s `cmd_name`.** The whole
+   reason that parameter exists is so the error names the command the user
+   ran (`use sg log -- <path>` vs `use sg diff -- <path>`), and every
+   disambiguation check in the group asserted only `exit 1`. Measured with
+   a directed mutation: reverting `cmd_log.c`'s `"log"` to `"diff"` left
+   `interop: 2774/2774 passed, exit 0`. The spec claimed an existing check
+   pinned the `sg diff` side; grep found none -- so BOTH sides were
+   unpinned, and the two are now a head-on pair, which a single shared
+   wrong constant cannot satisfy.
+4. **Blind spot: a pathspec was never combined with `--pretty`/`--format`.**
+   Phase 62 rewrote the between-entries separator decision ("was the
+   PREVIOUS commit PRINTED", not "was this the first commit walked"), which
+   lives inside the same `suppress_join` expression every `--pretty` kind
+   routes through -- yet no check drove a skipping walk through any of
+   them. Four formats now do, chosen to sit on both sides of that boolean
+   (`oneline`/`tformat:`/`reference` emit nothing between entries,
+   `format:` emits exactly one newline before each entry but the first).
+
+### A trap in the ORACLE, not in sg: `--date=default` and `--pretty=reference`
+
+The one-off harness's first run reported three byte divergences, all on
+`--pretty=reference`. They were entirely the harness's own doing: it had
+copied phase54's `--date=default` pin, and that pin **overrides
+`reference`'s built-in short date**, so git printed
+`Wed Nov 15 06:13:20 2023 +0800` where `reference`'s own format is
+`2023-11-15`. sg was right and the oracle was misconfigured. This is the
+inverse of the usual failure -- the rule "declare every knob that moves
+the oracle" is necessary but not sufficient, because a knob declared for
+one format can silently be wrong for another. `interop.sh`'s
+`--pretty=reference` check therefore gets its OWN git invocation rather
+than going through `p62_cmp`, with a precondition check that pins the
+override itself, so a future edit that "tidies" it back onto the shared
+helper fails by name instead of looking like an sg bug.
+
+### Accepted, measured, and deliberately not closed
+
+- **A pathspec-limited `sg log` now flattens trees even with no
+  `-p`/`--stat`.** Before Phase 62, `sg log --oneline` never called
+  `sg_diff_trees` at all. It is the selection judgment, so it cannot be
+  avoided; the consequence is that a corrupt tree entry ANYWHERE in the
+  walked history now aborts `sg log -- <path>` where a pathspec-less
+  `sg log` still succeeds. This is not a new class of bug (`sg diff <rev>
+  <rev> -- <path>` has always had it, flattening before filtering per the
+  Phase 29 ordering rule); it is a newly reachable instance, and it is
+  exactly the condition the two new failure-class checks above exercise.
+- **The merge path (`parent_count > 1`, using only `parents[0]`) has an
+  interop witness but no unit one.** `tests/test_log_pathspec.c`'s
+  `make_commit` helper builds 0- or 1-parent commits only. The witness
+  that exists is real-git-oracled (`$P62M`'s two checks, both confirmed
+  red by the `m4a` mutation), which is stronger evidence than a unit test
+  would be; the gap is only that a `make test`-only iteration loop would
+  not catch a regression there. Recorded rather than closed.
+
+### Second review round (tail only): no new bugs, three recorded asymmetries
+
+The fixes above were themselves written after the reviewer had already
+filed its report, so by this project's own rule ("an implementer must not
+verify their own fix" applies to the coordinator too) the tail went back
+for one more cold read. It found no correctness bug, and confirmed by
+tracing the full call chain that both new fixtures are green for the right
+reason -- `P62_BAD` really does reach the -2 branch, and `P62_GONE` really
+does reach -1 (`sg_rev_parse_commit` never validates that a 40-hex object
+exists, the commit object itself is intact, and `sg_commit_tree_of` only
+reads the PARENT commit, so the first thing that actually touches the
+deleted tree is `sg_diff_trees`'s own flatten). Three things it recorded:
+
+- **`print_commit_diff` still collapses -2 into -1** (`commit_out.c`), the
+  mirror function of `sg_commit_out_touches_pathspec` right beside it.
+  This is PRE-EXISTING -- that function's contract was -1-only before
+  Phase 62 and this phase added only a filter call to it -- and it is
+  reachable only when `o.pathspec == NULL`, because a non-NULL pathspec
+  means the predicate flattened the same trees first and already failed.
+  So a pathspec-less `sg log -p` over an unsafe tree still prints the
+  generic "cannot render this commit's diff" rather than naming the path.
+  Deliberately not fixed here: raising it would change
+  `sg_commit_out_entry`'s public contract, which `sg show` also depends
+  on, and that is a wider change than this phase's subject. Recorded as an
+  asymmetry to converge when `sg show`'s own error paths are next touched.
+- **The -2/-1 split has NO unit-test witness**; `tests/test_log_pathspec.c`
+  only ever asserts the success return. `make test` and `make sanitize`
+  are both blind to it, and `interop.sh` is its only defense. That is a
+  thinner net than it looks, and the reason it is accepted rather than
+  closed is that the witness which does exist is real-git-built (`git
+  mktree` for the `..` entry, a deleted loose object for the -1 half) --
+  neither shape is constructible from inside a unit test without
+  hand-writing object files, which would be re-implementing the oracle.
+- **`P62_C4`'s subject lookup asserts its own uniqueness** as of this
+  round. `sed -n '.../p'` prints every match; a future second commit whose
+  subject began "c4 " would glue two hex ids together with a newline and
+  the dependent checks would fail at "not a valid revision" -- a failure
+  message pointing nowhere near the property they assert. The precondition
+  check added beside it fails by name instead.
+
+### Shared-struct audit (`sg_commit_out_opts.pathspec`, Phase 29 rule)
+
+Five construction sites, all audited (three in `src/`, two in `tests/`):
+
+- `cmd_log.c`: field-by-field, `o.pathspec = NULL;` initially, overwritten
+  to `&pathspec` only when the built pathspec is non-empty.
+- `cmd_show.c`'s `resolve_commit_out_opts`: field-by-field, `o->pathspec =
+  NULL;` explicit (`sg show` does not implement path limiting).
+- `cmd_show.c`'s `header_o = o;` (merge header copy): whole-struct copy,
+  needs no change, confirmed by inspection.
+- `tests/test_pretty_format.c`, two sites: both `memset(&o, 0, sizeof o)`
+  first, so the new field is correctly zeroed. Safe **this time and only
+  because of the memset** -- they were missing from this section's first
+  draft (which said "three sites"), and a future sixth field added to a
+  constructor that assigns field-by-field instead would not be. The rule
+  is "every construction site", not "every construction site in `src/`";
+  `grep -rn 'sg_commit_out_opts' src include tests` is the check, and this
+  project has already been bitten twice by a construction site that the
+  audit's own list did not name (Phase 29's `tests/test_diff_out.c`, whose
+  field-by-field assignment after a bare `malloc` left the new fields as
+  heap garbage -- `make test` and interop both green, ASan red).
+
+### Convergence (section 2, its own commit)
+
+`report_pathspec_error`/`arg_exists_in_worktree`/`split_revs_and_paths`
+existed as three byte-for-byte-identical copies (`cmd_diff.c`,
+`cmd_status.c`'s and `cmd_stash.c`'s own `report_pathspec_error` only --
+`cmd_status.c` never had the other two, it has no rev/path disambiguation
+at all) before this phase. Moved into `include/sg/cli_args.h` +
+`src/cli/cli_args.c` as `sg_cli_report_pathspec_error`/
+`sg_cli_arg_exists_in_worktree`/`sg_cli_split_revs_and_paths`, the last
+gaining a `cmd_name` parameter (`"diff"`/`"log"`) so its `use sg <cmd> --
+<path>` suggestion names the actual caller instead of being hardcoded to
+`diff`. Behavior is unchanged: `bash tests/interop.sh` reported
+`interop: 2720/2720 passed, 0 skipped` both immediately before and
+immediately after this commit.
+
+### Tests
+
+`tests/test_log_pathspec.c` (new -- `cmd_log.c`/`commit_out.c` had no unit
+tests before this phase): `sg_commit_out_touches_pathspec(ps=NULL)` always
+1; a root commit compared against the empty tree, hit and miss; a
+mode-only change counts as touching; a change to X does not touch a
+pathspec naming only Y. Builds commits directly via `sg_tree_build` +
+`sg_commit_serialize` (no working directory needed, since the function
+under test only ever reads objects), following `test_merge_base.c`'s
+`make_commit` idiom.
+
+`tests/interop.sh`'s `phase62:` group (54 checks): two fixtures, `$P62`
+(linear -- mode-only change, rename, deletion, empty commit, a deeply
+nested path, matching the machine-measured `fx2` shape) and `$P62M` (two
+merges, matching `fx`'s shape: an ordinary merge that brings a new file in
+via its second parent, and a `-s ours` merge that must not). Selection (14
+pathspec forms, matching Phase 28's own three-clause matcher table
+byte-for-byte), the merge dimension (2), rendering (`-p`/`--stat` restricted
+by the same pathspec, including the named filter-before-detect check), `-n`
+interacting with the filter (2), disambiguation (11, each a head-on pair:
+git's 128 vs sg's existing 1), the rejection list (13 named flags/shapes,
+replacing the old single generic `--nosuchflag` probe for this phase's
+purposes), and a regression check that plain `sg log` (no pathspec) is
+still byte-identical to `git log --first-parent` on the new fixture.
+`core.quotepath=false` is pinned alongside Phase 54's existing knobs
+(`core.abbrev=7`, the `--pretty=medium --no-decorate --no-abbrev-commit
+--date=default` flag set) -- required by this phase's own pathspec axis,
+none of the fixture paths need it, but the pin belongs on principle next to
+the other three (CLAUDE.md's own warning about not dropping an oracle
+axis).
+
+**Gates**: `make` 0 new warnings; `make test` 73/73 binaries ran, 0 FAIL;
+`bash tests/interop.sh` **2774/2774** passed, 0 skipped (54 more than the
+pre-phase 2720, all newly-added and passing, no regression in the existing
+2720); `make sanitize` 73/73 binaries, 0 sanitizer errors (required by the
+shared-struct field addition to `sg_commit_out_opts`, per CLAUDE.md's
+Phase 29 rule).
