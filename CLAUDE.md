@@ -17,7 +17,7 @@ section when needed, do not read the whole thing**).
 
 ```bash
 make                              # build/sg, with -g
-make test                         # 64 unit test binaries, any failure fails the whole thing
+make test                         # 73 unit test binaries, any failure fails the whole thing
 bash tests/interop.sh             # interop test against real git (needs a prior make)
 make sanitize                     # clean + rebuild with ASan/UBSan + run unit tests
 python3 tests/fuzz_ignore.py      # .gitignore consistency fuzzer (200 rounds by default)
@@ -48,7 +48,7 @@ these four things (the script's comments have the full WHY):
 - The line that prints "0 TUs recompiled" **does not give you a warning
   count**: make compiled nothing this run, so the 0 means "not measured", not
   "measured as zero". To actually measure, use `--rebuild`.
-- In the `make test` line's "N/64 ran", if N is less than 64 it means
+- In the `make test` line's "N/73 ran", if N is less than 73 it means
   **aborted partway through** (the Makefile stops at the first failing
   binary), not "the rest passed".
 - A non-zero exit code with zero FAIL lines still counts as FAIL: crashes,
@@ -91,7 +91,7 @@ ASan job. Two things about reading its row, both measured:
 - **A crashed binary yields exit code 0 and no summary line at all**, so
   reading the exit code alone would score a segfault as green. The gate
   therefore demands the `N leaks for M total leaked bytes` line from every
-  binary and reports `analyzed N/64`, the same "not measured != measured as
+  binary and reports `analyzed N/73`, the same "not measured != measured as
   zero" shape as the `make` and `make test` rows. Non-macOS is a `skip` row,
   never a silent pass.
 
@@ -458,10 +458,10 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   between its own two commands and sg matches git in both -- do not "fix"
   `cmd_show.c` to quote by analogy with `cmd_cat_file.c`.
 - **`sg log` takes `-n <count>` / `-<count>` / `--max-count=`, `--oneline`,
-  `-p`/`--patch`, `--stat` and a single `<rev>`** (Phase 54). `-p`/`--stat`
-  are reuse -- the commit's first-parent tree against its own, through
-  `sg_diff_trees` + `sg_diff_print` -- so what needed measuring was where the
-  diff sits inside the entry, not the diff.
+  `-p`/`--patch`, `--stat`, a single `<rev>`, and (Phase 62) `[--] [<path>...]`**
+  (Phase 54). `-p`/`--stat` are reuse -- the commit's first-parent tree
+  against its own, through `sg_diff_trees` + `sg_diff_print` -- so what
+  needed measuring was where the diff sits inside the entry, not the diff.
   WARNING: **the `---` line appears ONLY when `-p` and `--stat` are both
   on.** With `-p` alone git introduces the diff with a blank line, so a rule
   that always printed `---` passes the combined check and fails the plain
@@ -481,15 +481,66 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   rename.
   WARNING: **`-n 0` is a legal request for nothing**, not an error and not
   "unlimited": git prints nothing and exits 0.
-  **Deliberately not implemented: `-- <pathspec>`** (path-limited history is
-  git's history SIMPLIFICATION, not a filter over the same walk -- the same
-  reason `--patience` is rejected rather than approximated), `--graph`,
-  `--date=`, `--author=`/`--grep=`, `--reverse`, `--all`, and `-c`/`--cc`.
-  All are rejected with the usage line and exit 1, never silently ignored.
+  **Deliberately not implemented: `--follow`, `--graph`, `--date=`,
+  `--author=`/`--grep=`, `--reverse`, `--all`, `-c`/`--cc`,
+  `--full-history`, `--simplify-merges`, and a second `<rev>`.** All are
+  rejected with the usage line and exit 1, never silently ignored.
   **`--pretty`/`--format` are implemented as of Phase 60a** (see the
   dedicated bullet below) -- this list used to include them, they are gone
   from it now that they exist rather than marked "fixed" in place, same
   convention this file uses everywhere else for a closed gap.
+  **`-- <pathspec>` is implemented as of Phase 62.** This used to say
+  "path-limited history is git's history SIMPLIFICATION, not a filter over
+  the same walk" and reject it for the same reason `--patience` is
+  rejected -- that claim is **measured false under sg's own first-parent-
+  only walk** (Phase 2 scope): `git log --first-parent -- <path>` IS
+  exactly a filter over that restricted walk (print commit C iff C's tree
+  differs from its FIRST parent's tree, intersected with the pathspec), so
+  it can be implemented as `sg_commit_out_touches_pathspec` deciding
+  per-commit whether to print, with no change to the walk itself. **This
+  equivalence holds only because the walk is first-parent-only** -- if sg
+  ever grows a full, every-parent walk, this needs to be re-measured before
+  trusting it again; a full walk's own path-limiting is genuinely git's
+  history-simplification machinery (parent-relinking included), not a bare
+  filter. `sg_pathspec_add`/`sg_pathspec_matches`/`sg_diff_list_filter` are
+  reused as-is, same three-clause matcher as `sg diff` (Phase 28) -- no
+  second matcher was written. Two known-since-Phase-29 rules bit this new
+  call site exactly as documented there: filtering must run BEFORE rename
+  detection (measured: `sg log -p -- a.txt`, at the commit that renamed
+  `a.txt` to `renamed.txt`, prints a plain `deleted file mode`, not
+  `rename from`/`rename to`, because the ADD half of the pair was already
+  filtered out), and a mode-only change (`chmod +x`, no content change)
+  counts as touching the path -- `sg_diff_trees` already emits a row for
+  it, so the selection judgment is built on top of that existing row rather
+  than a from-scratch tree comparison. WARNING: **`shown++` (the `-n`
+  counter) had to move to AFTER the selection judgment** -- `-n 2 --
+  a.txt` counts the second commit that actually touches `a.txt`, not the
+  second commit the walk visits (measured); and the entry-to-entry blank
+  line now depends on "was the PREVIOUS commit actually printed", not "was
+  this the first commit the walk reached" -- a filtered-out commit must
+  leave behind no separator. WARNING: **pathspec magic (`:(icase)`, `:!`,
+  `:/`) and `--follow` are both accepted by git and both REFUSED by sg**
+  (`--follow` genuinely walks across a rename, which sg's pathspec filter
+  does not attempt) -- pinned as real, named divergences in interop, not
+  silently approximated.
+  WARNING: **`sg_commit_out_touches_pathspec` returns THREE values, and
+  collapsing -2 into -1 is a real bug, not a simplification** (found by
+  review after a fully green board, fixed in the same phase). Only -2
+  fills `bad_path` (`sg_diff_trees`'s own third state, an unsafe tree
+  entry name); an ordinary -1 -- a missing or corrupt object -- leaves the
+  buffer untouched, so a caller that reports one message for both prints
+  `sg: path  is invalid` with an EMPTY path and blames a path for
+  something no path caused. That is strictly worse than the pre-Phase-62
+  behaviour, where `sg log -p` on the same history printed a generic
+  render failure. **And `bad_path` must go through
+  `sg_quote_path_delimited`** (`cmd_diff.c`'s `report_bad_tree_path` had
+  always done so; the new call site was written from the message text
+  rather than from that function, and lost the quoting on the way) -- an
+  entry name unsafe enough to reach here is exactly the kind that carries
+  a raw ESC byte. Both halves are pinned by their own named interop
+  checks, built with `git mktree`/`commit-tree` the same way the phase26
+  group builds its `..` fixture; the -1 half additionally deletes a tree
+  object, since no porcelain will produce that shape either.
 - **`--pretty=<name>` / `--format=<...>` select the entry's rendering,
   shared verbatim between `sg log` and `sg show`** (Phase 60a,
   `sg_pretty_parse` in `src/cli/commit_out.c`; `include/sg/commit_out.h`).
@@ -1757,6 +1808,17 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   this** (using `git mktree` to build a tree containing a `..` entry, going
   through `sg diff <rev> <rev>` and `sg stash show` respectively, asserting
   the error message names the path), so **it is now safe to converge them**.
+  **Phase 62 converged the OTHER three-way duplicate this file used to list
+  separately**: `report_pathspec_error` (`cmd_diff.c`/`cmd_status.c`/
+  `cmd_stash.c`, byte-for-byte) and `cmd_diff.c`'s own
+  `arg_exists_in_worktree`/`split_revs_and_paths` (pure functions,
+  `sg log` needed the exact same disambiguation grammar, measured
+  identical rather than assumed) now live in `include/sg/cli_args.h` +
+  `src/cli/cli_args.c` as `sg_cli_report_pathspec_error`/
+  `sg_cli_arg_exists_in_worktree`/`sg_cli_split_revs_and_paths` (the last
+  taking a `cmd_name` parameter so its `use sg <cmd> -- <path>` suggestion
+  names the actual caller). Verified as a pure refactor: `interop:
+  2720/2720` both immediately before and immediately after this commit.
 - **`sg clone`/`fetch`/`push` speak SSH as well as smart HTTP since Phase
   47** (`src/net/ssh.c`, `include/sg/ssh.h`): `ssh://[user@]host[:port]/path`
   and the scp-like `[user@]host:path`. **pkt-line framing, want/have
@@ -2643,7 +2705,7 @@ bumping the version, keep the man page in sync.
 
 ## Testing conventions
 
-- 64 independent unit test `.c` files, **no shared header, no test
+- 73 independent unit test `.c` files, **no shared header, no test
   framework**. Each file carries its own `static int failures = 0;` and a
   same-named `CHECK(cond, ...)` macro (prints `FAIL %s:%d` and
   `failures++` on failure, **does not abort**), and `main` ends with

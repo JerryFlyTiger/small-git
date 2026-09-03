@@ -16313,6 +16313,403 @@ check "phase61 divergence: real git reads a commit missing committer just fine" 
 check "phase61 divergence: sg deliberately still refuses a commit missing committer" \
     sh -c "! (cd '$P61' && '$SG' show -s '$P61_NO_COMMITTER') > /dev/null 2>&1"
 
+
+# --- Phase 62: `sg log [<rev>] [--] <pathspec>...` -- path-limited history,
+# under sg's first-parent-only walk. Measured against real git 2.55.0
+# (`git log --first-parent -- <path>` IS a filter over that same walk, not
+# git's general history-simplification machinery -- see CLAUDE.md's `sg
+# log` entry for the full derivation and PHASE62_SPEC.md section 0).
+#
+# Two fixtures, because two independent dimensions need separate probing:
+# $P62 is linear (mode-only change, rename, deletion, empty commit, a
+# deeply-nested path) and $P62M carries two merges (one that brings a new
+# file into the first-parent chain via its second parent, one built with
+# `-s ours` that must NOT bring its second parent's file in at all).
+P62="$WORKDIR/p62_linear"
+P62_GIT_PINS="-c core.abbrev=7 -c core.quotepath=false"
+P62_LOG_FLAGS="--first-parent --pretty=medium --no-decorate --no-abbrev-commit --date=default"
+
+mkdir -p "$P62"
+(cd "$P62" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+(
+  cd "$P62"
+  export GIT_AUTHOR_NAME=A GIT_AUTHOR_EMAIL=a@e GIT_COMMITTER_NAME=A GIT_COMMITTER_EMAIL=a@e
+  export GIT_AUTHOR_DATE="2023-11-15T06:13:20+0800" GIT_COMMITTER_DATE="2023-11-15T06:13:20+0800"
+  mkdir -p sub other deep/nest
+  echo a1 > a.txt; echo s1 > sub/d.c; echo o1 > other/d.c
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c1 root adds a sub/d.c other/d.c" > /dev/null 2>&1
+  echo a2 > a.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c2 edits a" > /dev/null 2>&1
+  echo s2 > sub/d.c
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c3 edits sub/d.c" > /dev/null 2>&1
+  chmod +x a.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c4 chmod a only" > /dev/null 2>&1
+  LC_ALL=C git mv a.txt renamed.txt > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c5 renames a to renamed" > /dev/null 2>&1
+  LC_ALL=C git rm -q other/d.c > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c6 deletes other/d.c" > /dev/null 2>&1
+  LC_ALL=C git commit -q --allow-empty -m "c7 empty" > /dev/null 2>&1
+  rmdir deep/nest deep > /dev/null 2>&1
+  mkdir -p deep/nest; echo x > deep/nest/f.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c8 adds deep/nest/f.txt" > /dev/null 2>&1
+) > /dev/null 2>&1
+
+P62M="$WORKDIR/p62_merge"
+mkdir -p "$P62M"
+(cd "$P62M" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+(
+  cd "$P62M"
+  export GIT_AUTHOR_NAME=A GIT_AUTHOR_EMAIL=a@e GIT_COMMITTER_NAME=A GIT_COMMITTER_EMAIL=a@e
+  export GIT_AUTHOR_DATE="2023-11-15T06:13:20+0800" GIT_COMMITTER_DATE="2023-11-15T06:13:20+0800"
+  echo a1 > a.txt; echo b1 > b.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m c1 > /dev/null 2>&1
+  echo a2 > a.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c2 touches a" > /dev/null 2>&1
+  echo b2 > b.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c3 touches b" > /dev/null 2>&1
+  LC_ALL=C git checkout -qb topic HEAD~1 > /dev/null 2>&1
+  echo t1 > t.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "t1 adds t" > /dev/null 2>&1
+  echo t2 > t.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "t2 touches t" > /dev/null 2>&1
+  LC_ALL=C git checkout -q master > /dev/null 2>&1
+  LC_ALL=C git merge -q --no-ff -m "m1 merge topic" topic > /dev/null 2>&1
+  echo a4 > a.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "c4 touches a" > /dev/null 2>&1
+  LC_ALL=C git checkout -qb side HEAD~1 > /dev/null 2>&1
+  echo c1 > c.txt
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m "s1 adds c" > /dev/null 2>&1
+  LC_ALL=C git checkout -q master > /dev/null 2>&1
+  LC_ALL=C git merge -q --no-ff -m "m2 merge side" -s ours side > /dev/null 2>&1
+  LC_ALL=C git commit -q --allow-empty -m "c5 empty" > /dev/null 2>&1
+) > /dev/null 2>&1
+
+# Resolved by SUBJECT, never by a HEAD~N offset: an offset silently slides
+# when the fixture grows and a check resting on the wrong commit still looks
+# like it ran.
+P62_C4=$(cd "$P62" && LC_ALL=C git log --format='%H %s' | sed -n 's/^\([0-9a-f]*\) c4 .*/\1/p')
+# sed prints EVERY match, not the first, so a second fixture commit whose
+# subject also began "c4 " would silently make this two hex lines glued
+# together by a newline -- and the checks below would then fail at
+# "not a valid revision", i.e. for a reason that has nothing to do with what
+# they assert. Assert the resolution is unique instead of hoping it stays so.
+check "phase62 oracle: precondition -- exactly one fixture commit's subject starts with 'c4 '" \
+    sh -c 'test -n "$0" && test "$(printf %s "$0" | wc -l | tr -d " \t")" = "0"' "$P62_C4"
+
+# $1 = fixture dir, $2 = tag, $3.. = the sg args after "sg log" (also given
+# to git's log verbatim, appended after the pinned flags).
+p62_cmp() {
+    p62dir="$1"; p62tag="$2"; shift 2
+    (cd "$p62dir" && LC_ALL=C git $P62_GIT_PINS log $P62_LOG_FLAGS "$@") \
+        > "$WORKDIR/p62_git_$p62tag.txt" 2>&1
+    (cd "$p62dir" && "$SG" log "$@") > "$WORKDIR/p62_sg_$p62tag.txt" 2>&1
+}
+
+# --- (a) selection: pathspec matching rules, same three clauses as Phase 28. ---
+p62_cmp "$P62" sel_a --oneline -- a.txt
+check "phase62: selection -- a.txt" cmp -s "$WORKDIR/p62_sg_sel_a.txt" "$WORKDIR/p62_git_sel_a.txt"
+
+p62_cmp "$P62" sel_renamed --oneline -- renamed.txt
+check "phase62: selection -- renamed.txt" cmp -s "$WORKDIR/p62_sg_sel_renamed.txt" "$WORKDIR/p62_git_sel_renamed.txt"
+
+p62_cmp "$P62" sel_sub --oneline -- sub
+check "phase62: selection -- sub (leading directory)" cmp -s "$WORKDIR/p62_sg_sel_sub.txt" "$WORKDIR/p62_git_sel_sub.txt"
+
+p62_cmp "$P62" sel_sub_slash --oneline -- sub/
+check "phase62: selection -- sub/ (trailing slash)" cmp -s "$WORKDIR/p62_sg_sel_sub_slash.txt" "$WORKDIR/p62_git_sel_sub_slash.txt"
+
+p62_cmp "$P62" sel_sub_d_c --oneline -- sub/d.c
+check "phase62: selection -- sub/d.c" cmp -s "$WORKDIR/p62_sg_sel_sub_d_c.txt" "$WORKDIR/p62_git_sel_sub_d_c.txt"
+
+p62_cmp "$P62" sel_other_d_c --oneline -- other/d.c
+check "phase62: selection -- other/d.c" cmp -s "$WORKDIR/p62_sg_sel_other_d_c.txt" "$WORKDIR/p62_git_sel_other_d_c.txt"
+
+p62_cmp "$P62" sel_bare_basename --oneline -- d.c
+check "phase62: selection -- bare basename d.c matches nothing" cmp -s "$WORKDIR/p62_sg_sel_bare_basename.txt" "$WORKDIR/p62_git_sel_bare_basename.txt"
+
+p62_cmp "$P62" sel_star_d_c --oneline -- '*/d.c'
+check "phase62: selection -- */d.c (wildcard crossing one level)" cmp -s "$WORKDIR/p62_sg_sel_star_d_c.txt" "$WORKDIR/p62_git_sel_star_d_c.txt"
+
+p62_cmp "$P62" sel_su_q --oneline -- 'su?'
+check "phase62: selection -- su? has no leading-directory extension" cmp -s "$WORKDIR/p62_sg_sel_su_q.txt" "$WORKDIR/p62_git_sel_su_q.txt"
+
+p62_cmp "$P62" sel_s_star_b --oneline -- 's*b'
+check "phase62: selection -- s*b has no leading-directory extension" cmp -s "$WORKDIR/p62_sg_sel_s_star_b.txt" "$WORKDIR/p62_git_sel_s_star_b.txt"
+
+p62_cmp "$P62" sel_sub_star --oneline -- 'sub*'
+check "phase62: selection -- sub* (wildcard crosses /)" cmp -s "$WORKDIR/p62_sg_sel_sub_star.txt" "$WORKDIR/p62_git_sel_sub_star.txt"
+
+p62_cmp "$P62" sel_star_txt --oneline -- '*.txt'
+check "phase62: selection -- *.txt reaches a deeply nested file" cmp -s "$WORKDIR/p62_sg_sel_star_txt.txt" "$WORKDIR/p62_git_sel_star_txt.txt"
+
+p62_cmp "$P62" sel_a_txt_slash --oneline -- a.txt/
+check "phase62: selection -- a.txt/ (trailing slash on a file) matches nothing" cmp -s "$WORKDIR/p62_sg_sel_a_txt_slash.txt" "$WORKDIR/p62_git_sel_a_txt_slash.txt"
+
+p62_cmp "$P62" sel_deep --oneline -- deep
+check "phase62: selection -- deep (leading directory, deeply nested)" cmp -s "$WORKDIR/p62_sg_sel_deep.txt" "$WORKDIR/p62_git_sel_deep.txt"
+
+p62_cmp "$P62" sel_nosuch --oneline -- nosuch
+check "phase62: selection -- nosuch matches nothing, exit 0" cmp -s "$WORKDIR/p62_sg_sel_nosuch.txt" "$WORKDIR/p62_git_sel_nosuch.txt"
+
+p62_cmp "$P62" sel_two_specs --oneline -- a.txt sub/d.c
+check "phase62: selection -- two pathspecs union" cmp -s "$WORKDIR/p62_sg_sel_two_specs.txt" "$WORKDIR/p62_git_sel_two_specs.txt"
+
+# --- (b) merge dimension. ---
+p62_cmp "$P62M" merge_t --oneline -- t.txt
+check "phase62: merge -- t.txt only exists via the merge's second parent (m1 alone shown)" \
+    cmp -s "$WORKDIR/p62_sg_merge_t.txt" "$WORKDIR/p62_git_merge_t.txt"
+
+p62_cmp "$P62M" merge_c --oneline -- c.txt
+check "phase62: merge -- c.txt was merged with -s ours, never reaches first-parent tree (empty)" \
+    cmp -s "$WORKDIR/p62_sg_merge_c.txt" "$WORKDIR/p62_git_merge_c.txt"
+
+# --- (c) rendering: -p/--stat restricted to the same pathspec, covering the
+# mode-only change (c4) and the rename (c5). ---
+p62_cmp "$P62" render_p_a -p -- a.txt
+check "phase62: -p -- a.txt matches git byte-for-byte (covers mode-only c4 and rename c5)" \
+    cmp -s "$WORKDIR/p62_sg_render_p_a.txt" "$WORKDIR/p62_git_render_p_a.txt"
+check "phase62: -p -- a.txt at c5 prints a plain deletion, NOT a rename (filter runs before detect)" \
+    sh -c 'grep -q "^deleted file mode 100755$" "$0"' "$WORKDIR/p62_sg_render_p_a.txt"
+check "phase62: -p -- a.txt at c5 precondition -- git itself prints the same plain deletion" \
+    sh -c 'grep -q "^deleted file mode 100755$" "$0"' "$WORKDIR/p62_git_render_p_a.txt"
+
+p62_cmp "$P62" render_stat_a --stat -- a.txt
+check "phase62: --stat -- a.txt matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p62_sg_render_stat_a.txt" "$WORKDIR/p62_git_render_stat_a.txt"
+
+# --- (c2) a pathspec combined with --pretty/--format. Phase 62 rewrote the
+# between-entries separator decision ("was the PREVIOUS commit PRINTED",
+# not "was this the first commit walked"), and that decision lives in the
+# same suppress_join expression every --pretty kind is routed through -- but
+# nothing above combines a pathspec with any of them, so a separator bug
+# that only shows once commits are being SKIPPED would pass every check in
+# this group. These four formats sit on both sides of that boolean:
+# oneline/tformat/reference emit no separator at all, format: emits exactly
+# one "\n" before each entry but the first.
+p62_cmp "$P62" fmt_oneline --pretty=oneline -- a.txt
+check "phase62: --pretty=oneline with a pathspec (no separator between kept entries)" \
+    cmp -s "$WORKDIR/p62_sg_fmt_oneline.txt" "$WORKDIR/p62_git_fmt_oneline.txt"
+
+p62_cmp "$P62" fmt_format --format=format:%h%x20%s -- a.txt
+check "phase62: --format=format: with a pathspec (one newline before every kept entry but the first)" \
+    cmp -s "$WORKDIR/p62_sg_fmt_format.txt" "$WORKDIR/p62_git_fmt_format.txt"
+
+p62_cmp "$P62" fmt_tformat --format=tformat:%h%x20%s -- a.txt
+check "phase62: --format=tformat: with a pathspec (self-terminating, nothing between entries)" \
+    cmp -s "$WORKDIR/p62_sg_fmt_tformat.txt" "$WORKDIR/p62_git_fmt_tformat.txt"
+
+# --pretty=reference needs its OWN git invocation: $P62_LOG_FLAGS pins
+# --date=default, and that pin OVERRIDES reference's built-in short date
+# (git then prints "Wed Nov 15 06:13:20 2023 +0800" where reference's own
+# format is "2023-11-15"). Measured while building this group -- comparing
+# reference through the shared helper reports three phantom failures that
+# are entirely the oracle's own flags. The precondition below pins that
+# fact, so a future edit that "tidies" this back onto p62_cmp fails by name
+# instead of looking like an sg bug.
+check "phase62 oracle: precondition -- --date=default would override --pretty=reference's own short date" \
+    sh -c '(cd "$0" && LC_ALL=C git log --first-parent --pretty=reference --date=default -n 1) | grep -q "2023 +0800"' "$P62"
+(cd "$P62" && LC_ALL=C git $P62_GIT_PINS log --first-parent --no-decorate --pretty=reference -- a.txt) \
+    > "$WORKDIR/p62_git_fmt_reference.txt" 2>&1
+(cd "$P62" && "$SG" log --pretty=reference -- a.txt) > "$WORKDIR/p62_sg_fmt_reference.txt" 2>&1
+check "phase62: --pretty=reference with a pathspec (short date, no separator between kept entries)" \
+    cmp -s "$WORKDIR/p62_sg_fmt_reference.txt" "$WORKDIR/p62_git_fmt_reference.txt"
+
+p62_cmp "$P62" fmt_p_stat -p --stat -- a.txt
+check "phase62: -p --stat with a pathspec (the --- separator rule survives path limiting)" \
+    cmp -s "$WORKDIR/p62_sg_fmt_p_stat.txt" "$WORKDIR/p62_git_fmt_p_stat.txt"
+
+# --- (e2) the disambiguation error's TEXT, not just its exit code. ---
+# sg_cli_split_revs_and_paths took a cmd_name parameter in this phase's
+# convergence commit precisely so its suggestion names the command the user
+# actually ran. Every disambiguation check above asserts only `exit 1`, so
+# reverting that parameter to a hardcoded "diff" passes all of them --
+# measured with a directed mutation. These two are a head-on pair: a single
+# shared wrong constant cannot satisfy both.
+(cd "$P62" && "$SG" log renamed.txt nosuch) > /dev/null 2> "$WORKDIR/p62_msg_log.txt"
+check "phase62: sg log's disambiguation error names sg log, not the command it was converged out of" \
+    grep -q 'use sg log -- <path>' "$WORKDIR/p62_msg_log.txt"
+(cd "$P62" && "$SG" diff renamed.txt nosuch) > /dev/null 2> "$WORKDIR/p62_msg_diff.txt"
+check "phase62: control -- sg diff's own message still names sg diff after the convergence" \
+    grep -q 'use sg diff -- <path>' "$WORKDIR/p62_msg_diff.txt"
+
+# --- (c3) a mode-only change on its own, and the two failure classes of the
+# selection judgment. The `-p -- a.txt` cmp above covers c4's mode-only
+# rendering only as one slice of a whole-file byte comparison, so a
+# regression there is indistinguishable from any other line moving; this
+# narrows it to one commit and one assertion.
+(cd "$P62" && "$SG" log -p -n 1 "$P62_C4" -- a.txt) > "$WORKDIR/p62_sg_modeonly.txt" 2>&1
+check "phase62: a mode-only change is SELECTED by a pathspec naming it (no content change at all)" \
+    grep -q '^old mode 100644$' "$WORKDIR/p62_sg_modeonly.txt"
+check "phase62 oracle: precondition -- git agrees the same commit is a mode-only change to a.txt" \
+    sh -c '(cd "$0" && LC_ALL=C git diff --raw "$1^" "$1" -- a.txt) | grep -q "^:100644 100755 "' "$P62" "$P62_C4"
+
+# --- (f2) the selection judgment's two FAILURE classes are different errors.
+# sg_commit_out_touches_pathspec returns -2 (bad_path filled) for an unsafe
+# tree entry name and -1 (bad_path untouched) for ordinary object-store
+# corruption. Reporting both the same way -- which the first version of this
+# phase did -- prints "sg: path  is invalid" with an EMPTY path for a missing
+# object, blaming a path for something no path caused. Built with real git's
+# plumbing, same technique as the phase26 group: neither sg nor git porcelain
+# will construct a tree with a ".." entry.
+P62_BAD="$WORKDIR/p62_bad"
+(cd "$WORKDIR" && "$SG" init p62_bad) > /dev/null 2>&1
+(cd "$P62_BAD" && git config user.email "a@b.c" && git config user.name "git user") > /dev/null 2>&1
+printf 'x\n' > "$P62_BAD/f.txt"
+(cd "$P62_BAD" && "$SG" add . && "$SG" commit -m base) > /dev/null 2>&1
+P62_BAD_BASE=$(git -C "$P62_BAD" rev-parse HEAD)
+P62_BAD_BLOB=$(git -C "$P62_BAD" hash-object -w f.txt)
+P62_BAD_TREE=$(printf '100644 blob %s\t..\n' "$P62_BAD_BLOB" | git -C "$P62_BAD" mktree)
+P62_BAD_COMMIT=$(git -C "$P62_BAD" commit-tree "$P62_BAD_TREE" -p "$P62_BAD_BASE" -m badcommit)
+
+(cd "$P62_BAD" && "$SG" log "$P62_BAD_COMMIT" -- f.txt) > "$WORKDIR/p62_bad_log.txt" 2>&1
+check "phase62: sg log -- <path> refuses a tree containing a '..' entry" \
+    sh -c "! (cd '$P62_BAD' && '$SG' log '$P62_BAD_COMMIT' -- f.txt) > /dev/null 2>&1"
+check "phase62: and the offending path is QUOTED, not written raw to the terminal" \
+    grep -q '"\.\."' "$WORKDIR/p62_bad_log.txt"
+
+# The -1 half: a commit whose own tree object is gone. bad_path is never
+# written in this case, so the -2 wording would name an empty path.
+P62_GONE_TREE=$(git -C "$P62_BAD" rev-parse "$P62_BAD_BASE^{tree}")
+P62_GONE_COMMIT=$(git -C "$P62_BAD" commit-tree "$P62_GONE_TREE" -p "$P62_BAD_BASE" -m gonetree)
+rm -f "$P62_BAD/.git/objects/$(printf %s "$P62_GONE_TREE" | cut -c1-2)/$(printf %s "$P62_GONE_TREE" | cut -c3-)"
+(cd "$P62_BAD" && "$SG" log "$P62_GONE_COMMIT" -- f.txt) > "$WORKDIR/p62_gone_log.txt" 2>&1
+check "phase62: a missing tree object is reported as a READ failure, not as an invalid path" \
+    sh -c 'grep -q "cannot read this commit.s tree" "$0" && ! grep -q "is invalid, refusing" "$0"' \
+        "$WORKDIR/p62_gone_log.txt"
+
+# --- (d) -n interacts with the filter, not the raw walk. ---
+p62_cmp "$P62" n2_a -n 2 --oneline -- a.txt
+check "phase62: -n 2 -- a.txt counts PRINTED commits, not walked ones" \
+    cmp -s "$WORKDIR/p62_sg_n2_a.txt" "$WORKDIR/p62_git_n2_a.txt"
+
+p62_cmp "$P62" n0_a -n 0 --oneline -- a.txt
+check "phase62: -n 0 -- a.txt prints nothing, exit 0" \
+    cmp -s "$WORKDIR/p62_sg_n0_a.txt" "$WORKDIR/p62_git_n0_a.txt"
+
+# --- (e) disambiguation: git exits 128, sg exits 1 (this project's
+# existing 0/1-only convention -- CLAUDE.md's deliberate-divergence #3). ---
+(cd "$P62" && LC_ALL=C git branch renamed.txt) > /dev/null 2>&1
+(cd "$P62" && LC_ALL=C git log --first-parent renamed.txt > /dev/null 2>&1; echo "rc=$?") \
+    > "$WORKDIR/p62_git_ambig_both.txt"
+(cd "$P62" && "$SG" log renamed.txt > /dev/null 2>&1; echo "rc=$?") \
+    > "$WORKDIR/p62_sg_ambig_both.txt"
+(cd "$P62" && LC_ALL=C git branch -D renamed.txt) > /dev/null 2>&1
+check "phase62: disambiguation -- git rejects an arg that is both a rev and a file (exit 128)" \
+    sh -c 'grep -q "^rc=128$" "$0"' "$WORKDIR/p62_git_ambig_both.txt"
+check "phase62: disambiguation -- sg rejects an arg that is both a rev and a file (exit 1)" \
+    sh -c 'grep -q "^rc=1$" "$0"' "$WORKDIR/p62_sg_ambig_both.txt"
+
+(cd "$P62" && LC_ALL=C git log --first-parent a.txt > /dev/null 2>&1; echo "rc=$?") \
+    > "$WORKDIR/p62_git_ambig_gone.txt"
+(cd "$P62" && "$SG" log a.txt > /dev/null 2>&1; echo "rc=$?") \
+    > "$WORKDIR/p62_sg_ambig_gone.txt"
+check "phase62: disambiguation -- git rejects a bare arg naming a path no longer in the worktree (128)" \
+    sh -c 'grep -q "^rc=128$" "$0"' "$WORKDIR/p62_git_ambig_gone.txt"
+check "phase62: disambiguation -- sg rejects the same (exit 1)" \
+    sh -c 'grep -q "^rc=1$" "$0"' "$WORKDIR/p62_sg_ambig_gone.txt"
+
+(cd "$P62" && LC_ALL=C git log --first-parent renamed.txt HEAD > /dev/null 2>&1; echo "rc=$?") \
+    > "$WORKDIR/p62_git_ambig_path_then_rev.txt"
+(cd "$P62" && "$SG" log renamed.txt HEAD > /dev/null 2>&1; echo "rc=$?") \
+    > "$WORKDIR/p62_sg_ambig_path_then_rev.txt"
+check "phase62: disambiguation -- <path> HEAD: git rejects the following valid rev as a path (128)" \
+    sh -c 'grep -q "^rc=128$" "$0"' "$WORKDIR/p62_git_ambig_path_then_rev.txt"
+check "phase62: disambiguation -- <path> HEAD: sg rejects it too (exit 1)" \
+    sh -c 'grep -q "^rc=1$" "$0"' "$WORKDIR/p62_sg_ambig_path_then_rev.txt"
+
+(cd "$P62" && LC_ALL=C git log --first-parent renamed.txt nosuch > /dev/null 2>&1; echo "rc=$?") \
+    > "$WORKDIR/p62_git_ambig_path_then_nosuch.txt"
+(cd "$P62" && "$SG" log renamed.txt nosuch > /dev/null 2>&1; echo "rc=$?") \
+    > "$WORKDIR/p62_sg_ambig_path_then_nosuch.txt"
+check "phase62: disambiguation -- <path> nosuch: git rejects it (128)" \
+    sh -c 'grep -q "^rc=128$" "$0"' "$WORKDIR/p62_git_ambig_path_then_nosuch.txt"
+check "phase62: disambiguation -- <path> nosuch: sg rejects it too (exit 1)" \
+    sh -c 'grep -q "^rc=1$" "$0"' "$WORKDIR/p62_sg_ambig_path_then_nosuch.txt"
+
+p62_cmp "$P62" ambig_rev_then_path --oneline HEAD -- renamed.txt
+check "phase62: disambiguation -- HEAD <path>: accepted on both sides, byte-identical" \
+    cmp -s "$WORKDIR/p62_sg_ambig_rev_then_path.txt" "$WORKDIR/p62_git_ambig_rev_then_path.txt"
+
+p62_cmp "$P62" ambig_bare_star --oneline '*.txt'
+check "phase62: disambiguation -- bare *.txt (no --) is accepted as a pathspec on both sides" \
+    cmp -s "$WORKDIR/p62_sg_ambig_bare_star.txt" "$WORKDIR/p62_git_ambig_bare_star.txt"
+
+p62_cmp "$P62" ambig_bare_star_nomatch --oneline 'nosuch*.zzz'
+check "phase62: disambiguation -- bare wildcard matching nothing exits 0 on both sides" \
+    cmp -s "$WORKDIR/p62_sg_ambig_bare_star_nomatch.txt" "$WORKDIR/p62_git_ambig_bare_star_nomatch.txt"
+
+p62_cmp "$P62" dashdash_nosuch --oneline -- nosuch_deleted_thing
+check "phase62: disambiguation -- \"--\" before a nonexistent path is accepted (rc=0, no error)" \
+    cmp -s "$WORKDIR/p62_sg_dashdash_nosuch.txt" "$WORKDIR/p62_git_dashdash_nosuch.txt"
+
+p62_cmp "$P62" dashdash_empty --oneline --
+check "phase62: disambiguation -- \"--\" with nothing after it means no pathspec at all" \
+    cmp -s "$WORKDIR/p62_sg_dashdash_empty.txt" "$WORKDIR/p62_git_dashdash_empty.txt"
+
+p62_cmp "$P62" dashdash_oneline_as_path -- --oneline
+check "phase62: disambiguation -- \"--\" then --oneline is a literal path, matches nothing" \
+    cmp -s "$WORKDIR/p62_sg_dashdash_oneline_as_path.txt" "$WORKDIR/p62_git_dashdash_oneline_as_path.txt"
+
+# --- (f) rejection list: named checks, not just a generic --nosuchflag. ---
+(cd "$P62" && "$SG" log --follow > /dev/null 2>&1)
+check "phase62: reject -- --follow (sg)" test $? -eq 1
+(cd "$P62" && LC_ALL=C git log --follow -- renamed.txt > /dev/null 2>&1)
+check "phase62: reject -- --follow (git accepts it, real divergence)" test $? -eq 0
+
+(cd "$P62" && "$SG" log --graph > /dev/null 2>&1)
+check "phase62: reject -- --graph" test $? -eq 1
+
+(cd "$P62" && "$SG" log --all > /dev/null 2>&1)
+check "phase62: reject -- --all" test $? -eq 1
+
+(cd "$P62" && "$SG" log --reverse > /dev/null 2>&1)
+check "phase62: reject -- --reverse" test $? -eq 1
+
+(cd "$P62" && "$SG" log --date=iso > /dev/null 2>&1)
+check "phase62: reject -- --date=iso" test $? -eq 1
+
+(cd "$P62" && "$SG" log --author=x > /dev/null 2>&1)
+check "phase62: reject -- --author=x" test $? -eq 1
+
+(cd "$P62" && "$SG" log --grep=x > /dev/null 2>&1)
+check "phase62: reject -- --grep=x" test $? -eq 1
+
+(cd "$P62" && "$SG" log -c > /dev/null 2>&1)
+check "phase62: reject -- -c" test $? -eq 1
+
+(cd "$P62" && "$SG" log --cc > /dev/null 2>&1)
+check "phase62: reject -- --cc" test $? -eq 1
+
+(cd "$P62" && "$SG" log --full-history > /dev/null 2>&1)
+check "phase62: reject -- --full-history" test $? -eq 1
+
+(cd "$P62" && "$SG" log --simplify-merges > /dev/null 2>&1)
+check "phase62: reject -- --simplify-merges" test $? -eq 1
+
+(cd "$P62" && "$SG" log HEAD HEAD~1 > /dev/null 2>&1)
+check "phase62: reject -- a second <rev>" test $? -eq 1
+
+(cd "$P62" && "$SG" log -- ':(icase)a.txt' > /dev/null 2>&1)
+check "phase62: reject -- pathspec magic :(icase)a.txt (sg)" test $? -eq 1
+(cd "$P62" && LC_ALL=C git log -- ':(icase)a.txt' > /dev/null 2>&1)
+check "phase62: reject -- pathspec magic (git accepts it, real divergence)" test $? -eq 0
+
+# --- (g) regression: no-pathspec output must be untouched by this phase. ---
+p62_cmp "$P62" regression_no_pathspec
+check "phase62: sg log (no pathspec) still matches git log --first-parent byte-for-byte" \
+    cmp -s "$WORKDIR/p62_sg_regression_no_pathspec.txt" "$WORKDIR/p62_git_regression_no_pathspec.txt"
 echo ""
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
