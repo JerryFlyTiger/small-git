@@ -166,6 +166,10 @@ static void test_sanitized_subject_rows(void)
         { "-leading-dash", "leading-dash" },
         { "UPPER Case", "UPPER-Case" },
         { "unicode caf\xc3\xa9 test", "unicode-caf-test" },
+        /* Review round: this asymmetry (leading '.' survives, leading '-'
+           does not) had no witness anywhere in the original ten-row table
+           -- none of them start with '.'. Measured against real git. */
+        { ".leading", ".leading" },
     };
     size_t i;
     sg_commit commit;

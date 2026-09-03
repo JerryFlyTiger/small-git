@@ -23,7 +23,14 @@
      11:13:20).
    - the day of month is NOT padded: "Nov 14" but "Jan 1".
    - `tz` is echoed back verbatim, never recomputed, so an offset git
-     itself would not have written survives round-trip.
+     itself would not have written survives round-trip -- with ONE
+     measured exception: the exact stored value "-0000" is normalized to
+     "+0000" (git's own DATE_NORMAL does this; `--pretty=raw` and
+     `sg cat-file -p`, which print the object's stored bytes directly
+     rather than going through this function, do NOT, and still show
+     "-0000" verbatim -- see `sg_date_format_rfc2822`/`_iso`'s own header
+     comments, which share this exact rule via `normalize_tz_for_display`
+     in date.c).
 
    Returns 0 on success, -1 if the result does not fit or the shifted time
    cannot be converted, in which case `out` is set to the empty string. */
@@ -50,8 +57,10 @@ int sg_date_format_short(long long time_sec, const char *tz,
    date format. Same SHIFTED-INTO-`tz` wall clock and hard-coded English
    weekday/month tables as sg_date_format_normal; the day of month is NOT
    zero-padded either (measured: day 4 renders "Sat, 4 Nov 2023", not
-   "Sat, 04 ..."). Returns 0 on success, -1 on the same failures
-   sg_date_format_normal has. */
+   "Sat, 04 ..."). Shares sg_date_format_normal's "-0000" -> "+0000"
+   normalization (see that function's own header comment) via the same
+   `normalize_tz_for_display` helper. Returns 0 on success, -1 on the same
+   failures sg_date_format_normal has. */
 int sg_date_format_rfc2822(long long time_sec, const char *tz,
                            char *out, size_t out_size);
 
@@ -59,8 +68,11 @@ int sg_date_format_rfc2822(long long time_sec, const char *tz,
 #define SG_DATE_ISO_MAX 32
 
 /* Renders `%ai`/`%ci`: "2023-11-15 06:13:20 +0800" (a space between the date
-   and time halves, `tz` echoed verbatim as stored, same shifted wall clock).
-   Returns 0 on success, -1 on the same failures sg_date_format_normal has. */
+   and time halves, `tz` echoed verbatim as stored, same shifted wall clock,
+   same "-0000" -> "+0000" normalization as sg_date_format_normal/_rfc2822 --
+   see sg_date_format_normal's own header comment for the exception this
+   does NOT apply to). Returns 0 on success, -1 on the same failures
+   sg_date_format_normal has. */
 int sg_date_format_iso(long long time_sec, const char *tz,
                        char *out, size_t out_size);
 

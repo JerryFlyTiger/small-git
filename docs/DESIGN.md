@@ -11579,6 +11579,128 @@ demonstrates the buffered-discard mechanism is load-bearing for the entire
 message-rendering surface this project has, not merely for the exotic
 multi-blank-line shapes the fix was written to handle.
 
+## Phase 60d: review round -- three real bugs from a cold review
+
+A cold review of the Phase 60b/60c diff (commit `8dcc5be`) found three real
+bugs, each measured and confirmed before fixing.
+
+**1. `print_body` (%b) used a literal `"\n\n"` search, narrower than every
+sibling function in the same diff.** `fold_subject`/`first_paragraph_span`/
+`print_message` all converged on `line_is_blank` (empty OR all-whitespace);
+`print_body`, rewritten in the same diff, re-derived the OLD narrower rule
+instead of reusing it. Measured: a separator line containing a single space
+or tab (not literally empty) still counts as the blank-line boundary in
+real git -- `"subject\n \nbody\n"` and `"subject\n\t\nbody\n"` both give
+`%b` = `"body\n"`, which the literal-`"\n\n"` search missed entirely (it
+returned nothing, since there is no adjacent `\n\n` anywhere in either
+message). Fixed by rewriting `print_body` to scan line by line with
+`line_is_blank`, matching the other three.
+
+**2. A stored `-0000` offset was not normalized to `+0000`.** Real git's
+DATE_NORMAL/RFC2822/ISO renderers (`%ad`/`%aD`/`%ai`, and therefore
+`--pretty=medium`'s own `Date:` line -- `sg log`/`sg show`'s default
+output) all normalize the single exact value `-0000` to `+0000`; every
+other value, including ordinary `+0000` and any non-zero offset, is
+echoed unchanged. `sg_date_format_normal` has done this correctly since
+Phase 54; `sg_date_format_rfc2822`/`_iso`, both new in Phase 60b, each
+independently copied `sg_date_format_normal`'s "echo tz verbatim" comment
+without picking up the one designed exception to it. Fixed with one
+shared helper, `normalize_tz_for_display` (`date.c`), called from all
+three affected renderers so they cannot drift apart on this rule again.
+`%aI` needed no change -- it already collapses BOTH `+0000` and `-0000` to
+a literal `"Z"` before ever reaching a tz-string branch (Phase 60b).
+**Reverse control, measured and pinned**: `--pretty=raw` and
+`sg cat-file -p` print the commit object's own stored bytes directly, not
+through any rendering function, and both correctly keep printing `-0000`
+verbatim -- confirmed against real git, which does the same. The fix lives
+strictly in the four rendering functions; nothing in the parse or
+object-output path was touched.
+
+**3. `shift_tm`'s `time_sec + offset` is undefined behavior (signed
+integer overflow) when `time_sec` is itself out of range.** A hand-crafted
+or injected loose object can make a decimal author-timestamp string
+saturate `strtoll` to `LLONG_MAX` (real git's own `hash-object -w` refuses
+such an object via fsck's `badDateOverflow`; sg's own commit parser does
+not reject the timestamp field at all, and `git hash-object --literally`
+bypasses fsck the same way several existing Phase 61 fixtures already do,
+for the identical reason: sg has to tolerate a hand-placed loose object
+that never went through `hash-object`'s own fsck). This UB predates Phase
+60 (`sg_date_format_normal` has always called `shift_tm`), but Phase 60b
+widened the reachable surface from 2 placeholders to 6
+(`%ad`/`%aD`/`%ai`/`%aI`/`%as`, plus every commit-header format that shows
+a date) -- `%at` remains immune, since it prints the raw stored integer
+with no arithmetic at all. Fixed by checking the addition's bounds before
+performing it (`offset` is at most a few hundred thousand seconds in
+magnitude, so `LLONG_MAX - offset` cannot itself overflow), returning -1
+(the same "formatting failed, print nothing" fallback every other failure
+mode in these functions already uses) instead of ever performing the
+overflow-prone addition.
+**Reproduced independently before AND after the fix**, since a plain
+`time_sec + offset` at `LLONG_MAX` is confirmed (via an isolated one-file
+repro) to trigger UBSan's own `runtime error: signed integer overflow`
+diagnostic. Locally reproduced against the full binary too:
+`build/sg show --pretty=fuller -s <overflow-fixture>` built under
+`make sanitize` prints the same diagnostic but does NOT abort by default
+(UBSan does not `halt_on_error` unless told to); rebuilt with
+`UBSAN_OPTIONS=halt_on_error=1` (**CI's own exact setting**, `.github/
+workflows/ci.yml`), the same command aborts with SIGABRT (exit 134). This
+is why the interop check for this item only asserts "does not crash"
+(`test $? -le 1`, this project's own exit-code convention) rather than a
+byte-for-byte match against git: a **plain, non-sanitized local build
+cannot observe this bug at all** (the overflow silently wraps instead of
+trapping), so the check's real teeth are CI's ubuntu ASan/UBSan job, which
+sets `UBSAN_OPTIONS: halt_on_error=1` and therefore turns this exact abort
+into a hard CI failure if the guard is ever removed -- confirmed by
+manually rebuilding a mutated copy (guard stripped) under
+`make sanitize` + `UBSAN_OPTIONS=halt_on_error=1` and observing the
+SIGABRT firsthand.
+
+**Side items, not bugs:** `print_sanitized_subject`'s `if (len == 0)
+return;` was flagged as dead code (the leading-blank-skip loop above it
+already guarantees at least one non-whitespace byte remains) -- converted
+to a comment explaining why, left in place as documentation rather than a
+live guard. The `%f` ten-row table had no witness for "a leading `.`
+survives" (the only asymmetry rule not covered by any of the original ten
+rows) -- added as an eleventh row in both `test_pretty_format.c` and
+interop's `phase60d:` group.
+
+Testing: `tests/interop.sh`'s new `phase60d:` group has 12 named checks --
+2 for item 1 (space/tab-only separator lines), 6 for item 2 (4 renderers
+normalized + 2 reverse-control checks pinning raw/cat-file unchanged, plus
+2 preconditions), 2 for item 3 (does-not-crash on the overflow fixture via
+two different call paths), and 1 for the `%f` `.leading` row (plus its own
+precondition). `tests/test_pretty_format.c` gained the `.leading` row to
+`test_sanitized_subject_rows`'s table.
+
+Numbers: `bash tests/gates.sh --rebuild --sanitize`: `make` 0 warnings,
+`make test` 72/72 binaries, interop **2720/2720** passed 0 skipped (16
+more than Phase 60c's 2704: 12 new `phase60d:` checks + 2 preconditions +
+1 `%f` `.leading` check + its own precondition), `make sanitize` 72/72
+binaries 0 sanitizer errors. External oracles: `oracle60.py` **213/213
+matched, 0 pending**; `oracle61.py` **29/31 matched, 2 deliberate
+divergences, 0 pending**.
+
+Reverse mutations, all three run once by the implementer per the
+coordinator's own request:
+- Item 1: `print_body`'s first scan's `line_is_blank(p, line_end)` test
+  reverted to `line_end == p` (literal-empty-only). Caught exactly the 2
+  named `phase60d:` %b checks, nothing else -- interop 2718/2720.
+- Item 2: `normalize_tz_for_display` reverted to `return tz;`
+  unconditionally. Caught exactly the 4 named `phase60d:` renderer checks
+  (`%ad`/`%aD`/`%ai`/medium), leaving the 2 raw/cat-file reverse-control
+  checks correctly GREEN (confirming they are structurally independent of
+  this function, exactly as designed) -- interop 2716/2720.
+- Item 3: the bounds check removed, restoring the bare
+  `shifted = time_sec + offset;`. `tests/mutate.sh --interop` (a PLAIN
+  build) reports **0/2720 caught -- a confirmed, deliberate blind spot at
+  that build type**, matching the reasoning in item 3's own write-up
+  above: this mutation is invisible without a sanitizer. Manually rebuilt
+  the same mutated copy with `make sanitize` and ran the overflow fixture
+  under `UBSAN_OPTIONS=halt_on_error=1` (CI's own setting): confirmed
+  SIGABRT (exit 134), which the interop check's `test $? -le 1` would flag
+  as a failure -- the guard this exists for is CI's ubuntu ASan/UBSan job,
+  not a local plain-build run of `tests/mutate.sh`.
+
 ## Phase 61: tolerate unknown commit/tag headers
 
 Bug fix, not a feature: `sg_commit_parse`/`sg_tag_parse` accepted exactly

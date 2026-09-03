@@ -1,5 +1,6 @@
 #include "sg/date.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -52,6 +53,25 @@ static int shift_tm(long long time_sec, const char *tz, struct tm *tmv)
     if (parse_tz(tz, &offset) != 0)
         offset = 0;
 
+    /* `time_sec + offset` can overflow when time_sec is itself an
+       out-of-range value -- a hand-crafted or injected loose object whose
+       author/committer line lets strtoll saturate to LLONG_MAX/LLONG_MIN
+       is enough (real git's `hash-object -w` rejects such an object via
+       fsck; sg's own commit parser does not reject the timestamp field at
+       all, so this function has no way to tell such an object apart from
+       a legitimate one). Signed integer overflow is undefined behavior in
+       C, caught by UBSan -- check the bounds before adding instead of
+       after. `offset` is at most a few hundred thousand seconds in
+       magnitude (parse_tz's widest legal input is "+9999"/"-9999"), so
+       computing `LLONG_MAX - offset` / `LLONG_MIN - offset` cannot itself
+       overflow. */
+    if (offset >= 0) {
+        if (time_sec > LLONG_MAX - offset)
+            return -1;
+    } else {
+        if (time_sec < LLONG_MIN - offset)
+            return -1;
+    }
     shifted = time_sec + offset;
     t = (time_t)shifted;
     if ((long long)t != shifted)
@@ -61,6 +81,34 @@ static int shift_tm(long long time_sec, const char *tz, struct tm *tmv)
     if (tmv->tm_wday < 0 || tmv->tm_wday > 6 || tmv->tm_mon < 0 || tmv->tm_mon > 11)
         return -1;
     return 0;
+}
+
+/* git normalizes exactly the stored value "-0000" to "+0000" when
+   rendering a date for a human -- DATE_NORMAL (%ad), RFC2822 (%aD), and
+   ISO (%ai) all do this; measured against real git 2.55.0. Every OTHER
+   value, including the ordinary "+0000" and every non-zero offset
+   ("-0030", "-0100", "+0030"), is echoed completely unchanged -- this is
+   NOT a general sign-normalization, only that one exact 5-byte sequence is
+   special. `--pretty=raw` and `sg cat-file -p` do NOT go through this (or
+   any) rendering function at all -- they print the commit object's own
+   stored bytes directly, so they echo a stored "-0000" verbatim, matching
+   real git measured the same way; do not "fix" that path to match this
+   one, they answer different questions. `%aI` (ISO strict) also does not
+   call this -- it already collapses BOTH "+0000" and "-0000" to a literal
+   "Z" before ever reaching a tz-string branch, so this rule never applies
+   to it. Shared by all three affected renderers so a future date format
+   cannot independently re-derive (and get wrong) this same one-line rule
+   the way sg_date_format_rfc2822/_iso did in Phase 60b -- both were newly
+   written alongside this exact "-0000" bug already present in
+   sg_date_format_normal since Phase 54, and both copied its "echo tz
+   verbatim" comment without noticing the one designed exception to it.
+   Returns tz unchanged unless it is exactly "-0000", in which case it
+   returns the string literal "+0000". */
+static const char *normalize_tz_for_display(const char *tz)
+{
+    if (tz != NULL && strcmp(tz, "-0000") == 0)
+        return "+0000";
+    return tz;
 }
 
 int sg_date_format_normal(long long time_sec, const char *tz,
@@ -81,7 +129,7 @@ int sg_date_format_normal(long long time_sec, const char *tz,
     written = snprintf(out, out_size, "%s %s %d %02d:%02d:%02d %d %s",
                        WDAY[tmv.tm_wday], MON[tmv.tm_mon], tmv.tm_mday,
                        tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
-                       tmv.tm_year + 1900, tz);
+                       tmv.tm_year + 1900, normalize_tz_for_display(tz));
     if (written < 0 || (size_t)written >= out_size) {
         out[0] = '\0';
         return -1;
@@ -128,7 +176,8 @@ int sg_date_format_rfc2822(long long time_sec, const char *tz,
        "Sat, 4 Nov 2023", not "Sat, 04 ...". */
     written = snprintf(out, out_size, "%s, %d %s %d %02d:%02d:%02d %s",
                        WDAY[tmv.tm_wday], tmv.tm_mday, MON[tmv.tm_mon],
-                       tmv.tm_year + 1900, tmv.tm_hour, tmv.tm_min, tmv.tm_sec, tz);
+                       tmv.tm_year + 1900, tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                       normalize_tz_for_display(tz));
     if (written < 0 || (size_t)written >= out_size) {
         out[0] = '\0';
         return -1;
@@ -152,7 +201,8 @@ int sg_date_format_iso(long long time_sec, const char *tz,
 
     written = snprintf(out, out_size, "%04d-%02d-%02d %02d:%02d:%02d %s",
                        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                       tmv.tm_hour, tmv.tm_min, tmv.tm_sec, tz);
+                       tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                       normalize_tz_for_display(tz));
     if (written < 0 || (size_t)written >= out_size) {
         out[0] = '\0';
         return -1;

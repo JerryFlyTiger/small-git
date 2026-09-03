@@ -500,8 +500,11 @@ static void print_sanitized_subject(const char *msg)
     }
     nl = strchr(msg, '\n');
     len = nl == NULL ? strlen(msg) : (size_t)(nl - msg);
-    if (len == 0)
-        return;
+    /* len == 0 is unreachable here (not a guard against it): the
+       leading-blank-skip loop above only ever stops at a line that failed
+       line_is_blank, i.e. one containing at least one non-whitespace byte,
+       so [msg, nl) always has at least 1 byte. malloc(0) is therefore
+       never requested; no `if (len == 0) return;` needed. */
     buf = malloc(len);
     if (buf == NULL)
         return;
@@ -519,12 +522,45 @@ static void print_body(const char *msg)
 
     if (msg == NULL)
         return;
-    p = strstr(msg, "\n\n");
-    if (p == NULL)
-        return;
-    p += 2;
-    while (*p == '\n')
-        p++;
+    p = msg;
+
+    /* Find the first BLANK line, using line_is_blank -- the same test
+       fold_subject/first_paragraph_span/print_message all use (a line
+       consisting only of spaces/tabs counts as blank, not just a
+       literally empty one). This function used to search for a literal
+       "\n\n" instead, which is a NARROWER test than every sibling
+       function in this file settled on -- measured, found during review:
+       a separator line containing a single space or tab (not literally
+       empty) still counts as the blank line boundary in real git, and the
+       old literal-"\n\n" search missed it entirely. */
+    for (;;) {
+        const char *eol = strchr(p, '\n');
+        const char *line_end = eol != NULL ? eol : p + strlen(p);
+
+        if (line_is_blank(p, line_end))
+            break;
+        if (eol == NULL)
+            return; /* no blank line anywhere -- no body */
+        p = eol + 1;
+    }
+    if (strchr(p, '\n') == NULL)
+        return; /* the blank line found above is the message's last line */
+    p = strchr(p, '\n') + 1;
+
+    /* Skip any further immediately-following blank lines (measured:
+       "subject\n\n\nbody\n" prints body with no leading blank line at
+       all, not one). */
+    for (;;) {
+        const char *eol = strchr(p, '\n');
+        const char *line_end = eol != NULL ? eol : p + strlen(p);
+
+        if (!line_is_blank(p, line_end))
+            break;
+        if (eol == NULL)
+            return;
+        p = eol + 1;
+    }
+
     fputs(p, stdout);
 }
 

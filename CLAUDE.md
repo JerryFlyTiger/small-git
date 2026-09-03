@@ -267,6 +267,16 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   **not `strftime`'s `%a`/`%b`** -- those follow the locale, and one
   `setlocale` call anywhere in the process would silently translate a format
   whose entire job is to match git byte for byte.
+  WARNING: **a stored offset of exactly `-0000` is normalized to `+0000`**
+  (Phase 60d, `normalize_tz_for_display` in `date.c`, shared by
+  `sg_date_format_normal`/`_rfc2822`/`_iso` so the three can't drift apart
+  on it) -- every other value, including ordinary `+0000` and any non-zero
+  offset, is echoed unchanged. `--pretty=raw` and `sg cat-file -p` do NOT
+  go through this or any rendering function -- they print the object's own
+  stored bytes directly, so a stored `-0000` stays `-0000` there, matching
+  real git measured the same way. `%aI` needs no such rule: it already
+  collapses BOTH `+0000` and `-0000` to a literal `"Z"` before reaching a
+  tz-string branch at all.
   WARNING: **`cmd_undo.c` has its own date formatter and must not be
   converged onto this one.** `sg undo` has no real-git counterpart, so it has
   no oracle; it deliberately prints local time in ISO form.
@@ -556,6 +566,14 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   subject still starts `%b` with no leading blank at all). A message with
   no blank line anywhere gives `%b` an empty string; measured on a
   body-less commit, `%b` is empty and `%B` is `<subject>\n`.
+  WARNING: **`%b`'s notion of "blank line" is `line_is_blank`** (empty OR
+  all-whitespace), the SAME test `fold_subject`/`first_paragraph_span`/
+  `print_message` use, not a narrower literal-`"\n\n"` search -- Phase
+  60d fixed a review-round bug where `print_body` had re-derived the OLD,
+  narrower rule while every sibling function in the same diff had already
+  converged on `line_is_blank`. Measured: a separator line containing a
+  single space or tab (not literally empty) still counts as the blank-line
+  boundary in real git.
   WARNING: **`%s` FOLDS a multi-line subject, and this rule now has FIVE
   call sites sharing ONE function, `fold_subject` in `commit_out.c`** --
   `%s`, the `oneline`/`reference` builtins, and legacy `--oneline` all

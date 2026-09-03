@@ -16035,8 +16035,95 @@ p60_cmp "c_f_folded" --format=%f -s "$P60C_FOLDED"
 check "phase60c: ...but %f still takes only the first PHYSICAL line, never %s's folded paragraph" \
     cmp -s "$WORKDIR/p60_sg_c_f_folded.txt" "$WORKDIR/p60_git_c_f_folded.txt"
 
+# review round: the "leading '.' survives, leading '-' does not" asymmetry
+# had no witness anywhere in section 5.2's original ten-row table.
+P60D_F_DOTLEAD=$(p60c_raw_commit $'.leading\n')
+p60_cmp "d_f_dotlead" --format=%f -s "$P60D_F_DOTLEAD"
+check "phase60d: %f keeps a leading '.' (sanitize_subject's dash/dot asymmetry), matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_f_dotlead.txt" "$WORKDIR/p60_git_d_f_dotlead.txt"
+
 check "phase60c: %B is unaffected -- returns the raw message verbatim, blank lines and all, matching git" \
     cmp -s "$WORKDIR/p60_sg_c_trailing_B.txt" "$WORKDIR/p60_git_c_trailing_B.txt"
+
+# --- Phase 60d: review round. Three real bugs, one per item below, found
+# by a cold review of the Phase 60b/60c diff.
+
+# 1. %b used to search for a LITERAL "\n\n", a narrower test than the
+# line_is_blank (empty OR all-whitespace) rule fold_subject/
+# first_paragraph_span/print_message all settled on -- print_body was
+# rewritten alongside them in this same diff and re-derived the OLD,
+# narrower rule instead of reusing line_is_blank. A separator line
+# containing a single space or tab (not literally empty) still counts as
+# the blank-line boundary in real git.
+P60D_B_SPACE=$(p60c_raw_commit $'subject\n \nbody\n')
+P60D_B_TAB=$(p60c_raw_commit $'subject\n\t\nbody\n')
+p60_cmp "d_b_space" --format=%b -s "$P60D_B_SPACE"
+check "phase60d: %b treats a space-only separator line as blank, matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_b_space.txt" "$WORKDIR/p60_git_d_b_space.txt"
+p60_cmp "d_b_tab" --format=%b -s "$P60D_B_TAB"
+check "phase60d: %b treats a tab-only separator line as blank, matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_b_tab.txt" "$WORKDIR/p60_git_d_b_tab.txt"
+
+# 2. A stored "-0000" offset is normalized to "+0000" by real git's
+# DATE_NORMAL/RFC2822/ISO renderers (%ad/%aD/%ai and --pretty=medium's own
+# Date: line), but NOT by --pretty=raw or `cat-file -p`, which print the
+# object's own stored bytes verbatim. sg_date_format_normal has done this
+# correctly since Phase 54; sg_date_format_rfc2822/_iso, both new in Phase
+# 60b, each independently re-derived the OLD "echo tz verbatim" comment
+# without the "-0000" exception, becoming two more places this diff
+# reintroduced a bug that other parts of itself had already fixed.
+p60c_raw_commit_tz() {
+    printf 'tree %s\nauthor A U Thor <author@example.com> 1700000000 %s\ncommitter C O Mitter <committer@example.com> 1700000100 %s\n\n%s\n' \
+        "$P60C_TREE" "$2" "$2" "$1" | (cd "$P60" && LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+}
+P60D_TZ_NEG0000=$(p60c_raw_commit_tz "subj" "-0000")
+p60_cmp "d_tz_ad" --format=%ad -s "$P60D_TZ_NEG0000"
+check "phase60d: %ad normalizes a stored -0000 to +0000, matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_tz_ad.txt" "$WORKDIR/p60_git_d_tz_ad.txt"
+p60_cmp "d_tz_aD" --format=%aD -s "$P60D_TZ_NEG0000"
+check "phase60d: %aD normalizes a stored -0000 to +0000, matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_tz_aD.txt" "$WORKDIR/p60_git_d_tz_aD.txt"
+p60_cmp "d_tz_ai" --format=%ai -s "$P60D_TZ_NEG0000"
+check "phase60d: %ai normalizes a stored -0000 to +0000, matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_tz_ai.txt" "$WORKDIR/p60_git_d_tz_ai.txt"
+p60_cmp "d_tz_medium" --pretty=medium -s "$P60D_TZ_NEG0000"
+check "phase60d: --pretty=medium's Date: line normalizes -0000 too (the default sg log/show output), matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_tz_medium.txt" "$WORKDIR/p60_git_d_tz_medium.txt"
+# reverse control: raw / cat-file must NOT normalize -- they print the
+# object's own stored bytes, unchanged.
+p60_cmp "d_tz_raw" --pretty=raw -s "$P60D_TZ_NEG0000"
+check "phase60d: control -- --pretty=raw echoes a stored -0000 verbatim, NOT normalized, matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_tz_raw.txt" "$WORKDIR/p60_git_d_tz_raw.txt"
+check "phase60d oracle: precondition -- the raw fixture's author line really still says -0000 on git's side" \
+    sh -c "(cd '$P60' && LC_ALL=C git show --pretty=raw -s '$P60D_TZ_NEG0000') | grep -q -- '-0000'"
+(cd "$P60" && LC_ALL=C git cat-file -p "$P60D_TZ_NEG0000") > "$WORKDIR/p60_git_d_catfile.txt" 2>&1
+(cd "$P60" && "$SG" cat-file -p "$P60D_TZ_NEG0000") > "$WORKDIR/p60_sg_d_catfile.txt" 2>&1
+check "phase60d: control -- sg cat-file -p also echoes a stored -0000 verbatim, matching git" \
+    cmp -s "$WORKDIR/p60_sg_d_catfile.txt" "$WORKDIR/p60_git_d_catfile.txt"
+
+# 3. shift_tm's `time_sec + offset` is undefined behavior (signed integer
+# overflow) when time_sec is itself out of range -- a hand-crafted/injected
+# loose object can make a decimal timestamp string saturate strtoll to
+# LLONG_MAX. Real git's own `hash-object -w` refuses such an object via
+# fsck (badDateOverflow); `--literally` bypasses that the same way Phase 61
+# and the addAdd/missingCommitter fixtures elsewhere in this file do, since
+# sg's own object reader has to tolerate a hand-placed loose object that
+# never went through hash-object's fsck at all. This predates Phase 60
+# (sg_date_format_normal has always called shift_tm), but Phase 60b widened
+# the reachable surface from 2 placeholders (%ad, the medium/short Date:
+# line) to 6 (%ad/%aD/%ai/%aI/%as, plus every commit-header format that
+# shows a date). %at is immune -- it prints the raw stored integer with no
+# arithmetic at all, so it is deliberately not exercised here.
+P60D_OVERFLOW_TREE=$(cd "$P60" && LC_ALL=C git write-tree 2>/dev/null)
+P60D_OVERFLOW=$( printf 'tree %s\nauthor A U Thor <author@example.com> 99999999999999999999 +0800\ncommitter C O Mitter <committer@example.com> 1700000100 +0000\n\nsubj\n' \
+    "$P60D_OVERFLOW_TREE" | (cd "$P60" && LC_ALL=C git hash-object -t commit -w --stdin --literally 2>/dev/null) )
+check "phase60d oracle: precondition -- the overflow fixture really has a timestamp real git itself refuses without --literally" \
+    sh -c "! printf 'tree %s\nauthor A U Thor <author@example.com> 99999999999999999999 +0800\ncommitter C O Mitter <committer@example.com> 1700000100 +0000\n\nsubj\n' '$P60D_OVERFLOW_TREE' | (cd '$P60' && LC_ALL=C git hash-object -t commit -w --stdin) > /dev/null 2>&1"
+check "phase60d: sg does not crash rendering an overflowing author date (shift_tm's signed-overflow UB, CI's UBSan job is the real guard here)" \
+    sh -c "(cd '$P60' && '$SG' show --pretty=fuller -s '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase60d: sg does not crash rendering the same overflowing date via %aD/%ai/%aI (the other three shift_tm callers)" \
+    sh -c "(cd '$P60' && '$SG' show --format='%aD|%ai|%aI' -s '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+
 
 # --- section 5.3: everything outside the table is rejected -- git accepts
 # every one of these (prints something, exits 0), sg refuses all of them
