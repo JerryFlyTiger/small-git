@@ -16678,8 +16678,19 @@ check "phase62: reject -- --all" test $? -eq 1
 (cd "$P62" && "$SG" log --reverse > /dev/null 2>&1)
 check "phase62: reject -- --reverse" test $? -eq 1
 
-(cd "$P62" && "$SG" log --date=iso > /dev/null 2>&1)
-check "phase62: reject -- --date=iso" test $? -eq 1
+# --date=iso is implemented as of Phase 64 (see the dedicated phase64:
+# group below) -- this used to assert rejection of every --date= value;
+# rewritten (not deleted) to keep pinning the names Phase 64 deliberately
+# still refuses, per this project's own convention for a partially-closed
+# gap: relative/human/auto: are real git renderers (each with its own
+# threshold table or isatty(1)-dependent meaning, Phase 65), and are
+# rejected on sg's side even though git itself accepts them.
+for p64_bad_name in relative relative-local human human-local auto:short auto:; do
+    (cd "$P62" && "$SG" log "--date=$p64_bad_name" > /dev/null 2>&1)
+    check "phase62: reject -- --date=$p64_bad_name (sg, deliberately unimplemented)" test $? -eq 1
+    (cd "$P62" && LC_ALL=C TZ=UTC git log "--date=$p64_bad_name" > /dev/null 2>&1)
+    check "phase62: reject -- --date=$p64_bad_name (git accepts it, real divergence)" test $? -eq 0
+done
 
 (cd "$P62" && "$SG" log --author=x > /dev/null 2>&1)
 check "phase62: reject -- --author=x" test $? -eq 1
@@ -17047,6 +17058,342 @@ check "phase63 deliberate divergence #6 (sg side, pinned): --graph --pretty=form
     "$WORKDIR/p63_dvg_sg_graph_empty_p_stat.txt"
 
 echo ""
+
+# ============================================================
+# Phase 64: sg log --date=<format> / sg show --date=<format> (CLAUDE.md's
+# --date= entry has the full grammar/byte tables). Every row below was
+# re-measured against real git 2.55.0 through python subprocess with an
+# argv list before being written here (per this project's own
+# "oracle measurements must bypass the shell" rule).
+# ============================================================
+
+P64="$WORKDIR/p64_date"
+mkdir -p "$P64"
+(cd "$P64" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+(
+  cd "$P64"
+  export GIT_AUTHOR_NAME=A GIT_AUTHOR_EMAIL=a@e GIT_COMMITTER_NAME=A GIT_COMMITTER_EMAIL=a@e
+  export GIT_AUTHOR_DATE="@1704067200 +0000" GIT_COMMITTER_DATE="@1704067200 +0000"
+  echo x > f
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m third > /dev/null 2>&1
+  LC_ALL=C git tag -a v64 -m tagmsg > /dev/null 2>&1
+  export GIT_AUTHOR_DATE="@1720000000 +0000" GIT_COMMITTER_DATE="@1720000000 +0000"
+  echo y >> f
+  LC_ALL=C git add -A > /dev/null 2>&1
+  LC_ALL=C git commit -q -m july > /dev/null 2>&1
+) > /dev/null 2>&1
+P64_JAN=$(cd "$P64" && LC_ALL=C git rev-parse v64^{commit} 2>/dev/null)
+P64_JUL=$(cd "$P64" && LC_ALL=C git rev-parse HEAD 2>/dev/null)
+
+# A hand-crafted commit storing a literal "-0000" (real git canonicalizes
+# that to "+0000" at commit-creation time, so an ordinary commit can never
+# produce this fixture -- CLAUDE.md's own warning about needing the
+# plumbing layer for this shape, same technique Phase 60d's date section
+# uses). Only used for the -0000 normalization checks below.
+P64_TREE=$(cd "$P64" && LC_ALL=C git rev-parse "$P64_JAN^{tree}" 2>/dev/null)
+P64_NEG0000=$(cd "$P64" && printf 'tree %s\nauthor A <a@e> 1704067200 -0000\ncommitter A <a@e> 1704067200 -0000\n\nthird\n' "$P64_TREE" | LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+
+P64_GIT_PINS="-c core.abbrev=7"
+
+check "phase64 oracle: precondition -- fixture commit's stored author date is exactly the target epoch" \
+    sh -c "test \$(cd '$P64' && LC_ALL=C git show -s --pretty=%at '$P64_JAN') -eq 1704067200"
+check "phase64 oracle: precondition -- the -0000 fixture really stores a literal -0000 (ordinary commit creation canonicalizes it away)" \
+    sh -c "cd '$P64' && LC_ALL=C git cat-file -p '$P64_NEG0000' | grep -q 'author A <a@e> 1704067200 -0000'"
+
+p64_show_cmp() {
+    p64tag="$1"; p64tz="$2"; shift 2
+    (cd "$P64" && LC_ALL=C TZ="$p64tz" git $P64_GIT_PINS show --no-decorate "$@") \
+        > "$WORKDIR/p64_git_$p64tag.txt" 2>&1
+    (cd "$P64" && TZ="$p64tz" "$SG" show "$@") > "$WORKDIR/p64_sg_$p64tag.txt" 2>&1
+}
+
+p64_log_cmp() {
+    p64tag="$1"; p64tz="$2"; shift 2
+    (cd "$P64" && LC_ALL=C TZ="$p64tz" git $P64_GIT_PINS log --no-decorate "$@") \
+        > "$WORKDIR/p64_git_$p64tag.txt" 2>&1
+    (cd "$P64" && TZ="$p64tz" "$SG" log "$@") > "$WORKDIR/p64_sg_$p64tag.txt" 2>&1
+}
+
+# --- section 3: every deterministic name, at all FOUR reach points, over
+# two timezones (Asia/Tokyo: +0900 no DST; America/New_York: DST, and
+# crosses the day boundary backwards for the January fixture -- the one
+# shape that makes short-local differ from short at all). ---
+for p64tz in Asia/Tokyo America/New_York; do
+    p64tzsafe=$(printf '%s' "$p64tz" | tr -c 'A-Za-z0-9' '_')
+    for p64name in default local default-local iso iso8601 iso-local iso8601-local \
+                   iso-strict iso8601-strict iso-strict-local iso8601-strict-local \
+                   rfc rfc2822 rfc-local rfc2822-local short short-local \
+                   raw raw-local unix unix-local "format:%Y-%m-%d %z %Z" "format-local:%Y-%m-%d %z %Z"; do
+        p64safe=$(printf '%s' "$p64name" | tr -c 'A-Za-z0-9' '_')
+
+        # Reach point 1: Date:/AuthorDate:/CommitDate: -- legacy medium
+        # (no --pretty) and the fuller builtin, on the January fixture.
+        p64_show_cmp "r1_legacy_${p64tzsafe}_${p64safe}" "$p64tz" -s "--date=$p64name" "$P64_JAN"
+        check "phase64: sg show -s --date=$p64name (TZ=$p64tz) matches git (legacy medium Date: line)" \
+            cmp -s "$WORKDIR/p64_sg_r1_legacy_${p64tzsafe}_${p64safe}.txt" "$WORKDIR/p64_git_r1_legacy_${p64tzsafe}_${p64safe}.txt"
+
+        p64_show_cmp "r1_fuller_${p64tzsafe}_${p64safe}" "$p64tz" -s --pretty=fuller "--date=$p64name" "$P64_JAN"
+        check "phase64: sg show -s --pretty=fuller --date=$p64name (TZ=$p64tz) matches git (AuthorDate:/CommitDate:)" \
+            cmp -s "$WORKDIR/p64_sg_r1_fuller_${p64tzsafe}_${p64safe}.txt" "$WORKDIR/p64_git_r1_fuller_${p64tzsafe}_${p64safe}.txt"
+
+        # Reach point 2: the annotated tag header's OWN Date:/TaggerDate:
+        # call site (cmd_show.c, not reached through sg_commit_out_opts).
+        p64_show_cmp "r2_tag_${p64tzsafe}_${p64safe}" "$p64tz" -s "--date=$p64name" v64
+        check "phase64: sg show -s --date=$p64name (TZ=$p64tz) matches git (annotated tag Date: line)" \
+            cmp -s "$WORKDIR/p64_sg_r2_tag_${p64tzsafe}_${p64safe}.txt" "$WORKDIR/p64_git_r2_tag_${p64tzsafe}_${p64safe}.txt"
+
+        # Reach point 3: %ad/%cd.
+        p64_show_cmp "r3_phad_${p64tzsafe}_${p64safe}" "$p64tz" -s --pretty=%ad "--date=$p64name" "$P64_JAN"
+        check "phase64: sg show -s --pretty=%ad --date=$p64name (TZ=$p64tz) matches git" \
+            cmp -s "$WORKDIR/p64_sg_r3_phad_${p64tzsafe}_${p64safe}.txt" "$WORKDIR/p64_git_r3_phad_${p64tzsafe}_${p64safe}.txt"
+
+        # Reach point 4: --pretty=reference's own date field (default
+        # short, distinct from every other reach point's default -- the
+        # spec's own section 2 warning about a control that proves nothing
+        # if it happens to coincide with the field's own rendering).
+        p64_log_cmp "r4_reference_${p64tzsafe}_${p64safe}" "$p64tz" -1 --pretty=reference "--date=$p64name" "$P64_JAN"
+        check "phase64: sg log -1 --pretty=reference --date=$p64name (TZ=$p64tz) matches git" \
+            cmp -s "$WORKDIR/p64_sg_r4_reference_${p64tzsafe}_${p64safe}.txt" "$WORKDIR/p64_git_r4_reference_${p64tzsafe}_${p64safe}.txt"
+    done
+done
+
+# --- the DST pair itself, named explicitly (not just implied by the sweep
+# above): the January and July fixtures render DIFFERENT local offsets
+# under America/New_York, proving the offset is computed at the COMMIT'S
+# OWN instant via localtime_r, never a cached value. ---
+p64_show_cmp dst_jan America/New_York -s --date=raw-local "$P64_JAN"
+p64_show_cmp dst_jul America/New_York -s --date=raw-local "$P64_JUL"
+check "phase64: --date=raw-local (TZ=America/New_York) on the January fixture matches git (-0500, standard time)" \
+    cmp -s "$WORKDIR/p64_sg_dst_jan.txt" "$WORKDIR/p64_git_dst_jan.txt"
+check "phase64: --date=raw-local (TZ=America/New_York) on the July fixture matches git (-0400, daylight time)" \
+    cmp -s "$WORKDIR/p64_sg_dst_jul.txt" "$WORKDIR/p64_git_dst_jul.txt"
+check "phase64 oracle: precondition -- the DST pair really renders two DIFFERENT offsets, or the pair proves nothing" \
+    sh -c "! cmp -s '$WORKDIR/p64_git_dst_jan.txt' '$WORKDIR/p64_git_dst_jul.txt'"
+
+# --- the -0000 normalization finding (measured, NOT in the spec draft):
+# raw and format:%z both normalize a stored "-0000" to "+0000", same rule
+# every other renderer already applies; only cat-file -p/--pretty=raw
+# (neither of which is --date=-affected) echo it verbatim. ---
+p64_show_cmp neg0000_raw Asia/Tokyo -s --pretty=%ad --date=raw "$P64_NEG0000"
+check "phase64: --date=raw normalizes a stored -0000 to +0000, matching git" \
+    cmp -s "$WORKDIR/p64_sg_neg0000_raw.txt" "$WORKDIR/p64_git_neg0000_raw.txt"
+p64_show_cmp neg0000_fmtz Asia/Tokyo -s --pretty=%ad --date=format:%z "$P64_NEG0000"
+check "phase64: --date=format:%z normalizes a stored -0000 to +0000, matching git" \
+    cmp -s "$WORKDIR/p64_sg_neg0000_fmtz.txt" "$WORKDIR/p64_git_neg0000_fmtz.txt"
+check "phase64 oracle: precondition -- --pretty=raw / cat-file -p, which --date= does NOT reach, still show -0000 verbatim" \
+    sh -c "cd '$P64' && LC_ALL=C git cat-file -p '$P64_NEG0000' | grep -q -- '-0000'"
+
+# --- section 2: negative controls -- these five placeholders (and
+# --pretty=raw, and reference's non-coincidental names already swept
+# above) are FIXED formats, unmoved by --date=. Compared against each
+# tool's own --date=-less baseline, not against each other, so a bug that
+# moves BOTH tools identically still gets caught. ---
+for p64ph in %ai %aI %aD %as %at; do
+    p64phsafe=$(printf '%s' "$p64ph" | tr -c 'A-Za-z0-9' '_')
+    p64_show_cmp "neg_base_${p64phsafe}" Asia/Tokyo -s --pretty="$p64ph" "$P64_JAN"
+    p64_show_cmp "neg_dated_${p64phsafe}" Asia/Tokyo -s --pretty="$p64ph" --date=unix "$P64_JAN"
+    check "phase64 negative control: git's $p64ph is unmoved by --date=unix" \
+        cmp -s "$WORKDIR/p64_git_neg_base_${p64phsafe}.txt" "$WORKDIR/p64_git_neg_dated_${p64phsafe}.txt"
+    check "phase64 negative control: sg's $p64ph is unmoved by --date=unix" \
+        cmp -s "$WORKDIR/p64_sg_neg_base_${p64phsafe}.txt" "$WORKDIR/p64_sg_neg_dated_${p64phsafe}.txt"
+    check "phase64 negative control: sg's $p64ph --date=unix still matches git" \
+        cmp -s "$WORKDIR/p64_sg_neg_dated_${p64phsafe}.txt" "$WORKDIR/p64_git_neg_dated_${p64phsafe}.txt"
+done
+
+p64_show_cmp neg_raw_base Asia/Tokyo -s --pretty=raw "$P64_JAN"
+p64_show_cmp neg_raw_dated Asia/Tokyo -s --pretty=raw --date=unix "$P64_JAN"
+check "phase64 negative control: git's --pretty=raw is unmoved by --date=unix" \
+    cmp -s "$WORKDIR/p64_git_neg_raw_base.txt" "$WORKDIR/p64_git_neg_raw_dated.txt"
+check "phase64 negative control: sg's --pretty=raw is unmoved by --date=unix" \
+    cmp -s "$WORKDIR/p64_sg_neg_raw_base.txt" "$WORKDIR/p64_sg_neg_raw_dated.txt"
+check "phase64 negative control: sg's --pretty=raw --date=unix still matches git" \
+    cmp -s "$WORKDIR/p64_sg_neg_raw_dated.txt" "$WORKDIR/p64_git_neg_raw_dated.txt"
+
+# --- grammar: both sides of the case-sensitive/empty/suffix rejection
+# rules -- git 128, sg 1 for an UNKNOWN name (not one of the deliberately-
+# unimplemented relative/human/auto: families, which are pinned separately
+# above alongside the old phase62 rejection-list check). ---
+for p64bad in DEFAULT Short ISO AUTO:short local-local default-local-local -local local- iso-strict-loca ""; do
+    (cd "$P64" && "$SG" show -s "--date=$p64bad" "$P64_JAN" > /dev/null 2>&1)
+    check "phase64: sg rejects --date=$p64bad, exit 1" test $? -eq 1
+    (cd "$P64" && LC_ALL=C git show -s "--date=$p64bad" "$P64_JAN" > /dev/null 2>&1)
+    check "phase64 oracle: git also rejects --date=$p64bad, exit 128" test $? -eq 128
+done
+
+# --- the separate-argument form: "--date <value>", not just "--date=<value>". ---
+p64_show_cmp sep_arg_form Asia/Tokyo -s --date unix "$P64_JAN"
+check "phase64: sg show -s --date unix (separate-argument form) matches git" \
+    cmp -s "$WORKDIR/p64_sg_sep_arg_form.txt" "$WORKDIR/p64_git_sep_arg_form.txt"
+
+# --- last one wins. ---
+p64_show_cmp last_one_wins Asia/Tokyo -s --date=short --date=iso "$P64_JAN"
+check "phase64: sg show -s --date=short --date=iso (last one wins) matches git" \
+    cmp -s "$WORKDIR/p64_sg_last_one_wins.txt" "$WORKDIR/p64_git_last_one_wins.txt"
+
+# ============================================================
+# Phase 64 review round: a real bug (a --date=format: string long enough
+# to overflow the old fixed SG_DATE_MODE_MAX buffer silently rendered as
+# an EMPTY date field, exit 0, no crash) plus three fixture gaps the review
+# found: the "--date"/"--date=" missing-value boundary had no check at
+# all, and the -0000 overflow fixture (section 3 above) was never fed to
+# any -local variant.
+# ============================================================
+
+# --- the real bug: 1200 'A's is comfortably past the old 1024-byte
+# ceiling. Before the fix this rendered as a zero-byte date field (exit 0,
+# no crash), so only a byte comparison against git -- never an exit-code
+# check -- can see it. ---
+P64_LONGFMT=$(python3 -c "print('format:' + 'A' * 1200)")
+(cd "$P64" && LC_ALL=C git $P64_GIT_PINS show -s --pretty=%ad "--date=$P64_LONGFMT" "$P64_JAN") \
+    > "$WORKDIR/p64_git_longfmt.txt" 2>&1
+(cd "$P64" && "$SG" show -s --pretty=%ad "--date=$P64_LONGFMT" "$P64_JAN") \
+    > "$WORKDIR/p64_sg_longfmt.txt" 2>&1
+check "phase64 review: a >1024-byte --date=format: string renders in full, matching git (not silently truncated to empty)" \
+    cmp -s "$WORKDIR/p64_sg_longfmt.txt" "$WORKDIR/p64_git_longfmt.txt"
+check "phase64 review oracle: precondition -- the long format literal's own git-side render really exceeds the old 1024-byte ceiling" \
+    sh -c '[ "$(wc -c < "$0")" -gt 1024 ]' "$WORKDIR/p64_git_longfmt.txt"
+
+# --- the same >1024-byte format string, at the four OTHER reach points
+# (the first review round's fixture only ever exercised %ad; a shared
+# renderer bug does not need a per-reach-point fixture to be CORRECT, but
+# it does need one to be VERIFIED -- CLAUDE.md's own
+# "sharing a function does not share its tests" note). ---
+p64_show_cmp longfmt_fuller Asia/Tokyo -s --pretty=fuller "--date=$P64_LONGFMT" "$P64_JAN"
+check "phase64 review: a >1024-byte --date=format: string renders in full at --pretty=fuller's AuthorDate:/CommitDate: too" \
+    cmp -s "$WORKDIR/p64_sg_longfmt_fuller.txt" "$WORKDIR/p64_git_longfmt_fuller.txt"
+
+p64_log_cmp longfmt_reference Asia/Tokyo -1 --pretty=reference "--date=$P64_LONGFMT" "$P64_JAN"
+check "phase64 review: a >1024-byte --date=format: string renders in full at --pretty=reference's own date field too" \
+    cmp -s "$WORKDIR/p64_sg_longfmt_reference.txt" "$WORKDIR/p64_git_longfmt_reference.txt"
+
+p64_show_cmp longfmt_legacy Asia/Tokyo -s "--date=$P64_LONGFMT" "$P64_JAN"
+check "phase64 review: a >1024-byte --date=format: string renders in full at the legacy medium Date: line too" \
+    cmp -s "$WORKDIR/p64_sg_longfmt_legacy.txt" "$WORKDIR/p64_git_longfmt_legacy.txt"
+
+p64_show_cmp longfmt_tag Asia/Tokyo -s "--date=$P64_LONGFMT" v64
+check "phase64 review: a >1024-byte --date=format: string renders in full at the annotated tag header's own Date: line too" \
+    cmp -s "$WORKDIR/p64_sg_longfmt_tag.txt" "$WORKDIR/p64_git_longfmt_tag.txt"
+
+# --- second review round: the first round's fix moved the exact same
+# silent-empty bug to a bigger boundary (1 MiB, strftime_grow's own
+# formerly-independent ceiling) instead of removing it. 50000 x "%c" is
+# ~1.2 MiB of rendered output at LC_ALL=C, past the OLD 1 MiB ceiling but
+# well under the new one -- before the second-round fix this rendered as
+# an empty date field, exit 0, the identical failure shape as the
+# 1024-byte bug above, one boundary up. A check anchored only to the
+# 1200-byte fixture above would have stayed green through this exact
+# regression. ---
+P64_LONGFMT2=$(python3 -c "print('format:' + '%c' * 50000)")
+(cd "$P64" && LC_ALL=C git $P64_GIT_PINS show -s --pretty=%ad "--date=$P64_LONGFMT2" "$P64_JAN") \
+    > "$WORKDIR/p64_git_longfmt2.txt" 2>&1
+(cd "$P64" && "$SG" show -s --pretty=%ad "--date=$P64_LONGFMT2" "$P64_JAN") \
+    > "$WORKDIR/p64_sg_longfmt2.txt" 2>&1
+check "phase64 review round 2: a ~1.2MiB --date=format: string (past the OLD 1MiB strftime_grow ceiling) renders in full, matching git" \
+    cmp -s "$WORKDIR/p64_sg_longfmt2.txt" "$WORKDIR/p64_git_longfmt2.txt"
+check "phase64 review round 2 oracle: precondition -- the ~1.2MiB format literal's own git-side render really exceeds the old 1MiB strftime_grow ceiling" \
+    sh -c '[ "$(wc -c < "$0")" -gt 1048576 ]' "$WORKDIR/p64_git_longfmt2.txt"
+
+# --- the missing-value boundary: "--date"/"--date=" as the LAST argument,
+# on both sg log and sg show. The code already has the "i + 1 >= argc"
+# check (pre-existing, unrelated to this review's fix); what was missing
+# was any test exercising it at all. ---
+(cd "$P64" && "$SG" log -1 --date > /dev/null 2>&1)
+check "phase64 review: sg log -1 --date with no following value is refused, exit 1" test $? -eq 1
+(cd "$P64" && LC_ALL=C git log -1 --date > /dev/null 2>&1)
+check "phase64 review oracle: git log -1 --date with no following value is also refused (exit 128)" test $? -eq 128
+
+(cd "$P64" && "$SG" show -s --date > /dev/null 2>&1)
+check "phase64 review: sg show -s --date with no following value is refused, exit 1" test $? -eq 1
+(cd "$P64" && LC_ALL=C git show -s --date > /dev/null 2>&1)
+check "phase64 review oracle: git show -s --date with no following value is also refused (exit 128)" test $? -eq 128
+
+# --- -local fixtures never reached the -0000/overflow net: section 3 above
+# only fed P60D_OVERFLOW's non-local renderers. Confirm the -local path
+# degrades the same way (does not crash, same exit-code ceiling) rather
+# than taking an entirely untested code path on this input. ---
+check "phase64 review: sg does not crash rendering an overflowing author date via --date=default-local" \
+    sh -c "(cd '$P60' && '$SG' show -s --date=default-local '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase64 review: sg does not crash rendering an overflowing author date via --date=raw-local" \
+    sh -c "(cd '$P60' && '$SG' show -s --date=raw-local '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase64 review: sg does not crash rendering an overflowing author date via --date=iso-strict-local" \
+    sh -c "(cd '$P60' && '$SG' show -s --date=iso-strict-local '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase64 review: sg does not crash rendering an overflowing author date via --date=format-local:%Y" \
+    sh -c "(cd '$P60' && '$SG' show -s --date=format-local:%Y '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+
+# ============================================================
+# Phase 64 second review round: a NON-integer-minute historical timezone
+# offset is NOT confined to the pre-1970 LMT era (an earlier round's own
+# claim that it was, and that there is no oracle either way, was itself
+# measured wrong -- see DESIGN.md's Phase 64 section). Africa/Monrovia's
+# offset is -2670 seconds (44m30s, not a multiple of 60) all the way to
+# 1972-01-07, well after 1970, and an ordinary POSITIVE-timestamp commit
+# (epoch 0, no "--literally" needed) is enough to observe it.
+#
+# git's own answer here is INTERNALLY INCONSISTENT (a second-precision
+# clock next to a hardcoded-zero offset label -- see DESIGN.md for the
+# root cause in git's own local_tzoffset()), so this is pinned as a
+# DELIBERATE divergence, literal bytes on both sides, not a git-vs-sg cmp
+# -- same shape as Phase 63's --graph + empty-format divergence pin.
+# ============================================================
+
+if python3 -c "import zoneinfo; zoneinfo.ZoneInfo('Africa/Monrovia')" > /dev/null 2>&1; then
+    P64M_TREE=$(cd "$P64" && LC_ALL=C git rev-parse "$P64_JAN^{tree}" 2>/dev/null)
+    P64M_EPOCH0=$(cd "$P64" && printf 'tree %s\nauthor A <a@e> 0 +0000\ncommitter A <a@e> 0 +0000\n\nepoch0\n' "$P64M_TREE" | LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+
+    check "phase64 monrovia oracle: precondition -- the epoch-0 fixture really stores author time 0" \
+        sh -c "test \$(cd '$P64' && LC_ALL=C git show -s --pretty=%at '$P64M_EPOCH0') -eq 0"
+
+    p64_show_cmp monrovia_iso Africa/Monrovia -s --pretty=%ad --date=iso-local "$P64M_EPOCH0"
+    check "phase64 deliberate divergence #7 (git side, pinned): --date=iso-local under a non-integer-minute pre-1972 Africa/Monrovia offset" \
+        sh -c 'printf "1969-12-31 23:15:30 +0000\n" | cmp -s - "$0"' "$WORKDIR/p64_git_monrovia_iso.txt"
+    check "phase64 deliberate divergence #7 (sg side, pinned): --date=iso-local under a non-integer-minute pre-1972 Africa/Monrovia offset" \
+        sh -c 'printf "1969-12-31 23:16:00 -0044\n" | cmp -s - "$0"' "$WORKDIR/p64_sg_monrovia_iso.txt"
+
+    p64_show_cmp monrovia_raw Africa/Monrovia -s --pretty=%ad --date=raw-local "$P64M_EPOCH0"
+    check "phase64 deliberate divergence #7 (git side, pinned): --date=raw-local under Africa/Monrovia" \
+        sh -c 'printf "0 +0000\n" | cmp -s - "$0"' "$WORKDIR/p64_git_monrovia_raw.txt"
+    check "phase64 deliberate divergence #7 (sg side, pinned): --date=raw-local under Africa/Monrovia" \
+        sh -c 'printf "0 -0044\n" | cmp -s - "$0"' "$WORKDIR/p64_sg_monrovia_raw.txt"
+
+    p64_show_cmp monrovia_default Africa/Monrovia -s --pretty=%ad --date=default-local "$P64M_EPOCH0"
+    check "phase64 deliberate divergence #7 (git side, pinned): --date=default-local under Africa/Monrovia" \
+        sh -c 'printf "Wed Dec 31 23:15:30 1969\n" | cmp -s - "$0"' "$WORKDIR/p64_git_monrovia_default.txt"
+    check "phase64 deliberate divergence #7 (sg side, pinned): --date=default-local under Africa/Monrovia" \
+        sh -c 'printf "Wed Dec 31 23:16:00 1969\n" | cmp -s - "$0"' "$WORKDIR/p64_sg_monrovia_default.txt"
+
+    p64_show_cmp monrovia_rfc Africa/Monrovia -s --pretty=%ad --date=rfc-local "$P64M_EPOCH0"
+    check "phase64 deliberate divergence #7 (git side, pinned): --date=rfc-local under Africa/Monrovia" \
+        sh -c 'printf "Wed, 31 Dec 1969 23:15:30 +0000\n" | cmp -s - "$0"' "$WORKDIR/p64_git_monrovia_rfc.txt"
+    check "phase64 deliberate divergence #7 (sg side, pinned): --date=rfc-local under Africa/Monrovia" \
+        sh -c 'printf "Wed, 31 Dec 1969 23:16:00 -0044\n" | cmp -s - "$0"' "$WORKDIR/p64_sg_monrovia_rfc.txt"
+
+    p64_show_cmp monrovia_isostrict Africa/Monrovia -s --pretty=%ad --date=iso-strict-local "$P64M_EPOCH0"
+    check "phase64 deliberate divergence #7 (git side, pinned): --date=iso-strict-local under Africa/Monrovia" \
+        sh -c 'printf "1969-12-31T23:15:30Z\n" | cmp -s - "$0"' "$WORKDIR/p64_git_monrovia_isostrict.txt"
+    check "phase64 deliberate divergence #7 (sg side, pinned): --date=iso-strict-local under Africa/Monrovia" \
+        sh -c 'printf "1969-12-31T23:16:00-00:44\n" | cmp -s - "$0"' "$WORKDIR/p64_sg_monrovia_isostrict.txt"
+
+    p64_show_cmp monrovia_fmtz Africa/Monrovia -s --pretty=%ad "--date=format-local:%z" "$P64M_EPOCH0"
+    check "phase64 deliberate divergence #7 (git side, pinned): --date=format-local:%z under Africa/Monrovia" \
+        sh -c 'printf "+0000\n" | cmp -s - "$0"' "$WORKDIR/p64_git_monrovia_fmtz.txt"
+    check "phase64 deliberate divergence #7 (sg side, pinned): --date=format-local:%z under Africa/Monrovia" \
+        sh -c 'printf -- "-0044\n" | cmp -s - "$0"' "$WORKDIR/p64_sg_monrovia_fmtz.txt"
+else
+    skip "phase64 deliberate divergence #7: --date=iso-local under Africa/Monrovia (git side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=iso-local under Africa/Monrovia (sg side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=raw-local under Africa/Monrovia (git side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=raw-local under Africa/Monrovia (sg side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=default-local under Africa/Monrovia (git side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=default-local under Africa/Monrovia (sg side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=rfc-local under Africa/Monrovia (git side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=rfc-local under Africa/Monrovia (sg side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=iso-strict-local under Africa/Monrovia (git side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=iso-strict-local under Africa/Monrovia (sg side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=format-local:%z under Africa/Monrovia (git side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+    skip "phase64 deliberate divergence #7: --date=format-local:%z under Africa/Monrovia (sg side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
+fi
+
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
 if [ "$FAIL" -gt 0 ]; then

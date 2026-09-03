@@ -12644,3 +12644,418 @@ written AFTER the second review round finished. Per this project's own
 rule, a second review round is not recursed into -- so those changes have
 been mutation-verified (above) but never cold-read by a reviewer. Recorded
 here rather than left implicit.
+
+## Phase 64: `sg log --date=<format>` / `sg show --date=<format>`
+
+`--date=<name>` selects how every timestamp that already had a renderer
+gets displayed, at exactly four reach points measured against real git
+2.55.0 (see CLAUDE.md's `--date=` entry for the full grammar and byte
+tables, this section only records what the spec draft got wrong and why):
+the `Date:`/`AuthorDate:`/`CommitDate:` lines of `medium`/`fuller` and the
+legacy no-`--pretty` path (`commit_out.c`), the annotated tag header's OWN
+`Date:`/`TaggerDate:` line (a separate call site in `cmd_show.c`, not
+reached through `sg_commit_out_opts` at all), `%ad`/`%cd`, and
+`--pretty=reference`'s own date field (default `short`, distinct from
+every other reach point's default).
+
+### The model
+
+`include/sg/date.h` gained `sg_date_kind`/`sg_date_mode`/
+`sg_date_parse_mode`/`sg_date_format_mode`, exactly the shape the spec
+draft proposed. The five pre-existing renderers (`sg_date_format_normal`/
+`_iso`/`_iso_strict`/`_rfc2822`/`_short`) keep their signatures and
+behaviour untouched; `sg_date_format_mode` dispatches to them for the
+non-local, non-raw, non-unix, non-format cases and implements three new
+shapes on top:
+
+- **`raw`**: `"<epoch> <tz>"`, trivial, but sharing the "-0000" ->
+  "+0000" normalization every other renderer applies -- measured with a
+  hand-crafted commit object (`git hash-object -t commit -w --stdin`)
+  storing a literal `-0000`: `raw` and `format:%z` both normalize it,
+  exactly like `default`/`iso`/`rfc`. This was **not** in the spec draft
+  at all (added after measurement); only `cat-file -p`/`--pretty=raw`,
+  neither of which reaches this function, echo the stored bytes verbatim.
+- **`unix`**: `"<epoch>"`, `-local` changes nothing (no offset field to
+  shift).
+- **`format:`/`format-local:`**: a from-scratch port of git's
+  `strbuf_addftime` -- one pass over the format string substitutes
+  `%s`/`%z`/`%Z` with plain text (a hand-built `struct tm` cannot carry
+  any of the three portably to the system `strftime`), everything else
+  (including `%%` itself) is copied through unchanged for the system
+  `strftime` to interpret. This single-pass design is what makes `%%z` ->
+  `%z` (the `%%` is its own two-byte token, it does not "protect" a `%z`
+  that happens to follow it) and `%z%%z` -> `<offset>%z` (the offset
+  substitution happens first, landing literal text in front of the `%%z`
+  that `strftime` then turns into `%z`) both fall out of the same rule
+  rather than needing two.
+
+`default-local` (and its alias `local`) suppress the offset field
+entirely -- `"Mon Jan 1 09:00:00 2024"`, no `+0900` -- the one shape none
+of the five original renderers can produce; a new file-local helper
+(`format_default_no_offset`) reuses `sg_date_format_normal`'s own
+`WDAY`/`MON` tables and `shift_tm`, just omitting the trailing `%s`.
+
+`-local` semantics: `localtime_r` on the raw epoch (never `mktime`/
+`timegm`, consistent with this file's existing "no mktime anywhere" rule),
+read at **the commit's own instant**, never a cached value or "now" --
+verified across a DST boundary with `TZ=America/New_York`: a 2024-01-01
+commit renders `-0500`, a 2024-07-03 commit renders `-0400`. The offset and
+zone-abbreviation (`tm_gmtoff`/`tm_zone`, both available given the
+project's existing `_DEFAULT_SOURCE`/`_DARWIN_C_SOURCE` feature-test
+macros) come from that ONE `localtime_r` call; the wall-clock y/m/d h:m:s
+used by every renderer (including `format:`'s `strftime`) is then obtained
+by handing the resulting offset string to the SAME `shift_tm` + `gmtime_r`
+path every non-local renderer already uses, rather than trusting
+`localtime_r`'s own `tm` fields directly -- this keeps exactly one
+"epoch -> wall clock" code path in the file, at the cost of one extra
+`gmtime_r` call.
+
+### Grammar, and where the spec draft's rules held up
+
+Every row of the spec draft's section 1 (case-sensitive names, the
+`-local` suffix stripped **at most once** with the remainder re-validated
+as a base name, `format:`/`format-local:` as prefixes checked BEFORE any
+suffix stripping so `-local` inside a format string is left alone, `local`
+alone as an alias for `default-local`, last-one-wins) was re-measured
+directly against real git 2.55.0 through `subprocess` with an argv list
+(never a shell string) and held exactly as written -- including the
+non-obvious negative rows (`local-local`, `default-local-local`, `-local`,
+`local-`, `iso-strict-loca` all `fatal: unknown date format`). Section 0's
+scope boundary (`relative`/`human`/`auto:` genuinely accepted by git but
+deliberately refused by sg, because each is a different algorithm with a
+threshold table sharing nothing with the five existing renderers) also
+held.
+
+**One spec gap, caught by the spec's own section 2 warning about itself**:
+section 2 already flagged that its first draft's `reference` control was
+worthless (`--date=short` against a field whose own default IS short
+proves nothing) and re-measured with `unix`/`raw`/`format:XX` instead --
+this phase reproduced that exact measurement independently before writing
+`print_pretty_reference`'s override, and it agreed.
+
+**One genuine finding beyond the spec**: `raw`/`format:%z`'s "-0000" ->
+"+0000" normalization (above) was not in the spec's byte-spec table at
+all. Found by testing the deliberately adversarial case the project's own
+`normalize_tz_for_display` comment warns about (a hand-crafted `-0000`
+survives every OTHER renderer's "echoed verbatim" rule except this one
+exception) -- worth checking for any NEW renderer specifically because
+this codebase already has one documented exception to "echo tz verbatim",
+and a new renderer sharing raw offset-printing logic is exactly where a
+second, undocumented copy of that exception would either silently
+reappear or silently vanish.
+
+### Threading through the CLI
+
+`sg_commit_out_opts` gained one field, `const sg_date_mode *date_mode`
+(NULL means every reach point keeps its pre-Phase-64 default, non-NULL
+overrides all of the `sg_commit_out_opts`-reachable ones uniformly) --
+per CLAUDE.md's Phase 29 shared-struct rule, all three known construction
+sites were re-audited: `cmd_log.c` sets it explicitly next to `pretty`/
+`pathspec`; `cmd_show.c`'s `resolve_commit_out_opts` derives it from a new
+`show_flags.date_mode_set`/`date_mode` pair (storage kept ON `show_flags`
+itself, same "borrowed pointer must outlive the render loop" reasoning
+`pretty` already documents); the third site (`header_o = o` merge-header
+whole-struct copy) needed no change. The annotated-tag header's OWN call
+site in `cmd_show.c` is NOT reached through this struct at all and reads
+`flags->date_mode_set`/`flags->date_mode` directly -- both `cmd_log.c` and
+`cmd_show.c` accept `--date=<fmt>` and the separate-argument form
+`--date <fmt>` (both measured accepted by real git on both commands),
+last one wins, mirroring `resolve_pretty_arg`'s existing shape
+(`resolve_date_arg`, one per file, same "not shared via a header, only two
+near-identical wrappers" reasoning `resolve_pretty_arg` already uses).
+
+Three places that used to declare `--date=` unsupported were updated
+together, per CLAUDE.md's own warning about this exact trap: the
+`cmd_log.c` catch-all comment, `docs/sg.1`'s unsupported-flags list, and
+`tests/interop.sh`'s existing `sg log --date=iso` exit-1 check -- the last
+one is NOT deleted, it is rewritten to pin the names still refused
+(`relative`, `relative-local`, `human`, `human-local`, `auto:short`,
+`auto:`), so the file keeps saying what is refused instead of falling
+silent on the point.
+
+### Testing
+
+`tests/test_date_mode.c` (new) pins the grammar table and every byte
+spec, including the DST pair, as exact strings (`strcmp`, not `strstr`);
+proven able to fail by `tests/mutate.sh` against
+`format_default_no_offset` (reverting it to `sg_date_format_normal`
+turned four rows red for the right reason: an offset field appearing
+where the assertion says there should be none).
+
+`tests/interop.sh` gained a `phase64:` group: the byte tables across two
+timezones (`Asia/Tokyo`, no DST; `America/New_York`, DST, and the fixture
+crosses the day boundary backwards for `short-local` specifically because
+`unix-local` cannot distinguish itself from `unix` on any fixture and
+`short-local` needs a fixture where it actually differs from `short`),
+`TZ` declared explicitly on both sides per CLAUDE.md's "oracle knobs must
+be declared" rule (a fourth environment axis alongside the three Phase 38
+already established), the negative controls from section 2 (`%ai`/`%aI`/
+`%aD`/`%as`/`%at` and `--pretty=raw` unmoved by `--date=`), and both
+rejected-name exit codes (git 0 / sg 1 for `relative`/`human`/`auto:...`;
+git 128 / sg 1 for an unknown name entirely).
+
+### Review round (post-green-board): a real bug, a resolved ambiguity, and
+### three fixture gaps
+
+A cold read of the green board found `sg_date_format_mode`'s FORMAT case
+was correctly detecting an oversized render (`strftime_grow` grows
+without a fixed ceiling, up to a 1 MB sanity cap) and correctly returning
+-1 for "does not fit" -- but **every one of its five callers** turned that
+-1 into an empty string, the same generic fallback used for a genuine
+rendering failure. A `--date=format:` string past `SG_DATE_MODE_MAX`
+(1024, a fixed stack buffer every caller used) therefore rendered as
+**zero bytes, exit 0** -- silent, not a crash, so nothing but a byte
+comparison against git could see it. Reproduced directly: 1010 `A`s
+rendered in full, 1200 `A`s rendered nothing.
+
+The fix is `sg_date_format_mode_alloc` (`date.h`/`date.c`): for every kind
+other than `SG_DATE_FORMAT` it is equivalent to the fixed-buffer function
+(every other kind's output is bounded by this project's own tables, so
+`SG_DATE_MODE_MAX` is provably enough for them), but for `SG_DATE_FORMAT`
+it doubles a heap buffer from `SG_DATE_MODE_MAX` up to a `1 << 24` sanity
+cap until the render fits. **Not** a bigger fixed constant -- that would
+only move the same silent-truncation bug to a longer input, which is
+exactly the mistake `SG_DATE_MODE_MAX`'s own header comment now warns
+against. All five callers (`commit_out.c`'s `print_configured_date_field`/
+`format_configured_date_field_alloc` -- renamed from
+`format_configured_date_field`, now returns a caller-freed `char *` instead
+of filling a fixed buffer -- and the annotated tag header's own call site
+in `cmd_show.c`) were converted; `tests/test_date_mode.c`'s own
+`check_render` helper was converted too, because it had independently
+hardcoded the identical `char buf[SG_DATE_MODE_MAX]` shape -- a test
+skeleton copying the exact flaw of the code it tests cannot, by
+construction, ever see that flaw regardless of what row is added to it.
+
+**A second, independent issue found in the same pass**: `strftime`
+returning 0 is genuinely ambiguous per POSIX -- both "the buffer was too
+small" and "the conversion legitimately produced zero bytes" (a lone
+`%p` under a locale with no AM/PM designation; `%n`/`%t` on a platform
+whose expansion happens to be empty) return the identical 0. The previous
+code trusted a platform assumption (measured on macOS only: `%p`, `%E*`/
+`%O*`, `%n`/`%t`, and unknown specifiers never return 0 for a non-empty
+format) that could not be verified against glibc, the C library CI's own
+ASan job actually exercises. Real git resolves this by construction
+rather than by platform assumption: `strftime_grow` now prepends one
+sentinel byte (`'\x01'`, chosen because it can never appear in this
+project's own hand-built format text and is copied through literally by
+`strftime`, which only interprets bytes at or after a `%`) to the format
+string before calling `strftime`, and strips exactly that one byte off a
+successful result. With the sentinel present, `n == 0` can only mean "did
+not fit" -- there is no longer a legitimate-empty-output case to confuse
+it with, on any platform.
+
+**Two review-round fixture gaps, closed**:
+
+- `format_offset_str`'s zero-offset sign choice (`offset < 0 ? '-' :
+  '+'`) had no witness anywhere in `tests/test_date_mode.c` -- every DST/
+  offset fixture (Tokyo +0900, New York -0500/-0400, Kolkata +0530) is
+  non-zero, so a `<=` mutation there is silently green. A `TZ=UTC` row
+  (`test_local_zero_offset`) was added and mutation-tested; **the
+  mutation does NOT turn it red**, but the mechanism is not one single
+  shared rule -- it is three DIFFERENT reasons, one per group of callers,
+  and an earlier draft of this note collapsed them into one incorrect
+  claim ("all five route through `normalize_tz_for_display`"), corrected
+  here after checking each renderer's actual source:
+  - `raw` (`SG_DATE_RAW`'s `snprintf`) and `format:%z`
+    (`build_format_intermediate`'s `%z` substitution) genuinely DO call
+    `normalize_tz_for_display(tz_str)` on the computed local offset before
+    printing it, and that function unconditionally rewrites the exact
+    string `"-0000"` to `"+0000"` regardless of how it was produced.
+    `iso` (`sg_date_format_iso`) does too. For these three, disabling
+    `normalize_tz_for_display` itself (not `format_offset_str`) is what
+    the pre-existing `test_minus_zero_normalization` test already catches
+    -- the real defense line is one layer downstream of
+    `format_offset_str`'s sign choice.
+  - `iso-strict` (`sg_date_format_iso_strict`) does **not** call
+    `normalize_tz_for_display` at all -- it has its own, separate
+    zero-offset check (a literal "are all four digits '0'" test on the
+    raw `+HHMM`/`-HHMM` text, sign-independent by construction) that maps
+    both `"+0000"` and `"-0000"` to a literal `"Z"`. The mutation is
+    inert here for an independent reason: iso-strict's OWN check already
+    treats the sign bit as irrelevant, so `format_offset_str`'s sign
+    choice was never load-bearing for this renderer's output either way.
+  - `default` (`format_default_no_offset`, the `-local` path for
+    `SG_DATE_DEFAULT`) prints **no offset field at all** -- there is
+    nothing for `normalize_tz_for_display` or any other downstream rule
+    to normalize, so the mutation is inert here for a third, even more
+    direct reason: the value `format_offset_str` computes never reaches
+    this renderer's output.
+
+  All three reasons land in the same "redundant guard / value never
+  observed" bucket rather than "genuine blind spot", so the conclusion
+  (no test needed here beyond the existing `test_minus_zero_normalization`
+  plus the new zero-offset regression row) is unchanged -- only the
+  mechanism list was wrong. `format_offset_str`'s own comment already
+  documents the `'+'` choice as belonging to the `raw`/`iso`/`format:%z`
+  invariant; the new test is kept as regression coverage for the byte
+  VALUE rather than as a claimed mutation witness for `format_offset_str`
+  specifically.
+- The `>1024`-byte `format:` bug above had no interop fixture, and
+  neither did the missing-value boundary (`sg log --date`/`sg show
+  --date` with nothing following it -- the `i + 1 >= argc` check was
+  already correct code, just never exercised by any check) or the
+  `-local` renderers against the pre-existing overflow fixture (Phase
+  60d's hand-crafted commit storing a timestamp of
+  `99999999999999999999`, which only ever reached the four non-local
+  renderers before this round). All three are now in `tests/interop.sh`'s
+  `phase64:` group under a `phase64 review:` prefix.
+
+**One item in the review request was measured and found NOT to be a bug**:
+real git's own message for an empty `--date=` value is
+`fatal: unknown date format \n` -- **with the same trailing space** sg
+already printed (`git log -1 --date=` under `LC_ALL=C`, byte-verified with
+`od -c`), not the space-free `fatal: unknown date format` the request
+described. sg's message was left unchanged; this is recorded here rather
+than silently dropped, per this project's own "measure, do not obey"
+convention.
+
+### Second review round: the first round's fix moved the same silent-empty
+### bug to a bigger boundary instead of removing it
+
+A cold read of the fix above found `sg_date_format_mode_alloc`'s growth
+loop and `strftime_grow`'s own growth loop were **two independent
+ceilings on the exact same rendering path**, not one: the outer loop
+(`sg_date_format_mode_alloc`, then capped `1 << 24`) doubled its OWN
+buffer and re-called `sg_date_format_mode` at each new size, but
+`sg_date_format_mode`'s FORMAT case unconditionally deferred to
+`strftime_grow`, which had its OWN separate ceiling
+(`DATE_STRFTIME_GROW_MAX`, then `1 << 20`, 1 MiB). Once the *rendered*
+output passed 1 MiB, `strftime_grow` failed identically no matter how
+large the outer buffer grew -- the outer loop's extra headroom (up to
+16 MiB) could never help, because the function it was calling had
+already given up one layer down. The result was the identical bug the
+first round had just fixed for the 1024-byte `SG_DATE_MODE_MAX` boundary,
+reappearing at the 1 MiB boundary: a `--date=format:` string whose
+rendered output is just past 1 MiB renders as an **empty string, exit
+0**, silently.
+
+Measured directly (`%c` under `TZ=UTC`, which expands to 24 bytes per
+occurrence at `LC_ALL=C`; argv sizes are all comfortably under any
+platform ARG_MAX):
+
+| repeat count | argv bytes | git output | sg output (before this fix) |
+|---|---|---|---|
+| 43690 | 87387 | 1048560 bytes | 1048560 bytes (matches) |
+| 43691 | 87389 | 1048584 bytes | **0 bytes, exit 0** |
+| 50000 | 100007 | 1200000 bytes | **0 bytes, exit 0** |
+
+The fix collapses the two ceilings into **one**: `render_format_mode_alloc`
+(`date.c`) is now the single function that calls `strftime_grow`, shared
+by `sg_date_format_mode`'s fixed-buffer FORMAT case (copies the result
+into the caller's buffer, failing if it does not fit -- unchanged
+behavior for every existing caller of the fixed-buffer entry point) and
+`sg_date_format_mode_alloc`'s FORMAT case (takes ownership of the
+malloc'd buffer directly, no second growth loop). `resolve_mode_tz` was
+factored out alongside it so the two entry points' identical "-local"
+tz/zone resolution could not independently drift apart either.
+
+`DATE_STRFTIME_GROW_MAX` itself is now the ONLY ceiling for this path,
+raised from 1 MiB to `1 << 28` (256 MiB) and derived rather than picked:
+measured that under `LC_ALL=C` the largest single-conversion expansion
+ratio across every printable-ASCII strftime specifier is 14x (`%+`: 2
+input bytes -> 28 output bytes; `%c` is next at 24), and that this
+machine's `getconf ARG_MAX` is 1048576 bytes (1 MiB, covering argv+
+environ together) while Linux additionally caps any ONE argv string at
+`MAX_ARG_STRLEN` (128 KiB) -- so a `--date=format:` argument reaching
+this code via argv is bounded well under 1 MiB, and 1 MiB of format text
+at a 14x ratio is at most ~14 MiB of rendered output. `1 << 28` leaves
+about 19x headroom over that figure, so the cap is not something an
+ordinary invocation can reach, while still bounding the loop instead of
+growing it without limit.
+
+`tests/interop.sh`'s `phase64:` group gained a check at the size that
+fails **before** this fix (50000 x `%c`, ~1.2 MiB of output) rather than
+merely re-confirming the 1200-byte case the first round already fixed --
+a check anchored to the OLD ceiling would have stayed green through this
+exact regression, the same "the boundary moved, the bug did not go away"
+trap the fixture is written to catch.
+
+### A previous round's "measured-inert, no oracle" claim was itself wrong,
+### corrected in a second review round
+
+The first review round recorded `format_offset_str`'s whole-minute
+truncation (`(mag % 3600) / 60` discards sub-minute remainder seconds) as
+measured-inert: a sweep of the full system zoneinfo database (every zone,
+five sample instants per zone across 1970-2023) found no non-integer-minute
+`tm_gmtoff` in that range, so the claim was "unreachable after 1970, and a
+pre-1970 timestamp has no self-consistent git oracle to compare against
+anyway". **Both halves of that claim are false, found by directly sampling
+zoneinfo transitions rather than five evenly-spaced instants per zone**:
+`Africa/Monrovia`'s offset is `-2670` seconds (44m30s, not a multiple of
+60) and stays that way until **1972-01-07**, entirely after 1970 -- five
+samples a year apart can straddle a transition and miss a zone's own
+non-minute era, which is exactly what happened here. And an ordinary,
+positive-timestamp commit (epoch 0, built with plain `git hash-object -t
+commit -w --stdin`, **no `--literally` needed**) is enough to observe it:
+this project's own `fsck`-avoidance concern only applies to *negative*
+(pre-1970) timestamps, and epoch 0 is not one.
+
+Measured directly (`TZ=Africa/Monrovia`, epoch-0 commit, all six `-local`
+renderers):
+
+```
+  iso-local          git='1969-12-31 23:15:30 +0000'       sg='1969-12-31 23:16:00 -0044'
+  raw-local          git='0 +0000'                         sg='0 -0044'
+  default-local      git='Wed Dec 31 23:15:30 1969'         sg='Wed Dec 31 23:16:00 1969'
+  rfc-local          git='Wed, 31 Dec 1969 23:15:30 +0000' sg='Wed, 31 Dec 1969 23:16:00 -0044'
+  iso-strict-local   git='1969-12-31T23:15:30Z'            sg='1969-12-31T23:16:00-00:44'
+  format-local:%z    git='+0000'                           sg='-0044'
+```
+
+**This is now treated as the project's seventh deliberate divergence
+(CLAUDE.md's own numbered list is not touched by this phase, but the
+convention -- pin both sides' literal bytes, do not "fix" one side to
+match the other -- applies unchanged), not a bug to close.** The root
+cause on git's side, not just sg's, rules out "just fix sg's rounding":
+
+- git's printed **clock** (`23:15:30`) comes from `localtime_r`, which is
+  genuinely second-precision and answers correctly for a pre-1970 local
+  time.
+- git's printed **offset label** (`+0000`) comes from a SEPARATE
+  computation, git's own `local_tzoffset()`, which special-cases any
+  local time landing before 1970 and returns a hardcoded 0 for the
+  offset -- regardless of what the clock next to it actually shows. So
+  git's own `23:15:30 +0000` is internally inconsistent: recombining that
+  clock and that offset does not reproduce the UTC instant (epoch 0) the
+  command was asked to render.
+- sg's `-local` renderers compute the offset once (`format_offset_str`,
+  whole minutes only) and reuse that same string both to shift the clock
+  and to print the label, so sg's clock and label always agree with each
+  other (`23:16:00 -0044`, self-consistent) -- but the whole-minute
+  rounding means sg's clock is 30 seconds later than git's true
+  second-precision one.
+
+Matching git byte-for-byte here would require **also reproducing git's
+own inconsistency** (a correct clock next to a wrong, hardcoded-zero
+label) -- not a rounding fix on sg's side, and not something to silently
+approximate either direction of. `tests/interop.sh`'s `phase64:` group
+pins both sides' literal bytes for this fixture (not a `cmp` between the
+two, since they are expected to differ), the same shape Phase 63's
+`--graph` + empty-`tformat:` divergence already uses -- see that entry
+for the pattern. The old "unreachable after 1970, no oracle either way"
+sentence is wrong and has been removed from this file; do not restore it.
+
+### One measured-inert finding: not yet reproduced, not "redundant" and
+### not "mathematically unobservable"
+
+- **The strftime-return-0 ambiguity this phase's sentinel-byte fix
+  resolves has no witness on either platform this project builds on, and
+  that is a gap in the search, not a proof the fix is unneeded.** Before
+  the fix, distinguishing "buffer too small" from "legitimately empty
+  output" depended on which specifiers a given platform's `strftime`
+  could return 0 for on non-empty input; a sweep on **macOS only** found
+  none among `%p`, `%E*`/`%O*`, `%n`/`%t`, and an unknown specifier (all
+  avoid 0 there). **glibc was never swept, on either round** -- CI's
+  ASan job runs on ubuntu and would exercise this code, but no format
+  string constructed so far is known to trigger a genuine zero-length,
+  non-empty-input render on it, so the sentinel guard has not actually
+  been observed catching anything on either platform. Per this project's
+  own three-way mutation classification (CLAUDE.md, testing conventions):
+  this is **"trigger input not yet found"**, not a redundant guard (there
+  is no other defense line one layer down for this specific ambiguity)
+  and not mathematically unobservable (a glibc specifier that returns 0
+  on non-empty input, if one exists, would be a real trigger). It is
+  recorded here as an open gap rather than closed by asserting the
+  platform table is "no longer load-bearing" -- that conclusion does not
+  follow from a search that only ever covered one of the two platforms
+  this project ships sanitizer coverage on.

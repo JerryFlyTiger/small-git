@@ -2,6 +2,7 @@
 
 #include "sg/cli_args.h"
 #include "sg/commit_out.h"
+#include "sg/date.h"
 #include "sg/hash.h"
 #include "sg/log_graph.h"
 #include "sg/objstore.h"
@@ -20,7 +21,7 @@
 
 static const char USAGE[] =
     "usage: sg log [-n <count>|-<count>|--max-count=<count>] [--oneline] "
-    "[--pretty[=<fmt>]|--format=<fmt>] [-p|--patch] [--stat] [--graph] [<rev>] [--] [<path>...]\n";
+    "[--pretty[=<fmt>]|--format=<fmt>] [--date=<fmt>] [-p|--patch] [--stat] [--graph] [<rev>] [--] [<path>...]\n";
 
 /* Phase 63: captures one entry's stdout output (sg_commit_out_entry AND
    whatever sg_diff_print underneath it prints for -p/--stat) into a shared
@@ -147,6 +148,19 @@ static int resolve_pretty_arg(const char *raw, sg_pretty_format *out)
     return 0;
 }
 
+/* Phase 64: parses the value of --date=/--date (CLAUDE.md's --date= entry
+   has the full grammar). Mirrors resolve_pretty_arg's own shape -- prints
+   its own diagnostic and returns -1 on an unknown/empty name, including
+   the deliberately-unimplemented `relative`/`human`/`auto:` families. */
+static int resolve_date_arg(const char *raw, sg_date_mode *out)
+{
+    if (sg_date_parse_mode(raw, out) != 0) {
+        fprintf(stderr, "sg: unknown date format %s\n", raw);
+        return -1;
+    }
+    return 0;
+}
+
 /* "-n <count>", "--max-count=<count>" and the bare "-<count>" all mean the
    same thing; 0 is legal and prints nothing (measured: git exits 0). */
 static int parse_count(const char *s, long *out)
@@ -171,6 +185,7 @@ int sg_cmd_log(int argc, char **argv)
     const char *rev = NULL;
     sg_commit_out_opts o;
     sg_pretty_format pretty_storage;
+    sg_date_mode date_mode_storage;
     sg_pathspec pathspec;
     long max_count = -1;
     int rc = 0;
@@ -223,6 +238,11 @@ int sg_cmd_log(int argc, char **argv)
        and is overwritten once the pathspec is actually built, further
        down, only when it is non-empty). */
     o.pathspec = NULL;
+    /* Phase 64 added `date_mode` -- see commit_out.h's own warning, same
+       Phase 29 shared-struct rule. NULL means every reach point keeps its
+       pre-Phase-64 default; overwritten below only when --date= is given
+       (last one wins, see resolve_date_mode's own caller). */
+    o.date_mode = NULL;
 
     pos = malloc((size_t)(argc > 0 ? argc : 1) * sizeof(*pos));
     if (pos == NULL) {
@@ -268,6 +288,26 @@ int sg_cmd_log(int argc, char **argv)
                 return 1;
             }
             o.pretty = &pretty_storage;
+        } else if (strncmp(a, "--date=", 7) == 0) {
+            if (resolve_date_arg(a + 7, &date_mode_storage) != 0) {
+                free(pos);
+                return 1;
+            }
+            o.date_mode = &date_mode_storage;
+        } else if (strcmp(a, "--date") == 0) {
+            /* Separate-argument form, "--date <value>" -- measured accepted
+               by real git on both `log` and `show`. */
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s", USAGE);
+                free(pos);
+                return 1;
+            }
+            i++;
+            if (resolve_date_arg(argv[i], &date_mode_storage) != 0) {
+                free(pos);
+                return 1;
+            }
+            o.date_mode = &date_mode_storage;
         } else if (strcmp(a, "-p") == 0 || strcmp(a, "--patch") == 0) {
             o.patch = 1;
         } else if (strcmp(a, "--stat") == 0) {
@@ -293,12 +333,14 @@ int sg_cmd_log(int argc, char **argv)
             }
         } else if (a[0] == '-' && a[1] != '\0') {
             /* Everything not implemented lands here and is refused, never
-               silently ignored -- --follow, --all, --reverse, --date=,
-               --author=, --grep=, -c, --cc, --full-history,
-               --simplify-merges among them (Phase 62 section 1's rejection
-               list; CLAUDE.md's `sg log` entry names the reasons).
-               --graph is implemented as of Phase 63, see the dedicated
-               parse branch above. */
+               silently ignored -- --follow, --all, --reverse, --author=,
+               --grep=, -c, --cc, --full-history, --simplify-merges among
+               them (Phase 62 section 1's rejection list; CLAUDE.md's
+               `sg log` entry names the reasons). --graph is implemented as
+               of Phase 63, --date=<name> as of Phase 64 (a deterministic
+               name only -- `relative`/`human`/`auto:` still land here and
+               are refused, see resolve_date_arg / sg_date_parse_mode),
+               see the dedicated parse branches above. */
             fprintf(stderr, "%s", USAGE);
             free(pos);
             return 1;

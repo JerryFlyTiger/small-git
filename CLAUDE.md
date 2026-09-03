@@ -298,6 +298,67 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `--oneline`) while git's default `core.abbrev=auto` scales with object
   count; interop declares `core.abbrev=7` on git's side rather than
   pretending the two policies agree.
+- **`--date=<format>` selects how a timestamp is RENDERED, and is shared
+  verbatim by `sg log` and `sg show`** (Phase 64, `sg_date_parse_mode` /
+  `sg_date_format_mode` / `sg_date_format_mode_alloc` in
+  `include/sg/date.h`). Both `--date=<v>` and the separate-argument
+  `--date <v>` are accepted, last one wins, and the names are
+  **case-sensitive** (`Short`, `ISO`, `DEFAULT` are all errors; git exits
+  128, sg exits 1 per this project's 0-or-1 convention, pinned on both
+  sides). Supported: `default`, `local`/`default-local`, `iso`/`iso8601`,
+  `iso-strict`/`iso8601-strict`, `rfc`/`rfc2822`, `short`, `raw`, `unix`,
+  `format:<strftime>`, `format-local:<strftime>`, plus a `-local` suffix on
+  any of those base names.
+  **Deliberately not implemented: `relative`, `human`, and `auto:<name>`**
+  -- rejected, never approximated. WARNING: **the reason is NOT "they
+  cannot be tested"**, which is what this project assumed before measuring:
+  git honours **`GIT_TEST_DATE_NOW`**, so `relative`/`human` ARE
+  byte-reproducible (measured: `GIT_TEST_DATE_NOW=1000000100` on a commit
+  stamped 1000000000 renders `2 minutes ago`). They are excluded because
+  each is a new algorithm with its own threshold table, sharing nothing
+  with the five renderers `date.h` already had. `auto:<name>` is excluded
+  because its meaning depends on `isatty(1)` (measured: piped,
+  `auto:relative` renders as `default`), so it has no oracle without a pty.
+  WARNING: **`--date=` reaches exactly FOUR places, and the fourth is the
+  one a careless probe misses**: medium's `Date:` and fuller's
+  `AuthorDate:`/`CommitDate:`; the **annotated tag header's own `Date:`**
+  (a SEPARATE call site in `cmd_show.c`, not reached through anything in
+  `commit_out.c`); `%ad`/`%cd`; and **`--pretty=reference`'s date field**.
+  That last one was recorded as UNAFFECTED in this phase's own spec,
+  because the probe that established it used `--date=short` -- which is
+  exactly what `reference` already renders. A control whose two arms agree
+  by construction proves nothing; re-measured with `unix`/`raw`/`format:`,
+  it moves. Genuine negatives, each re-measured with a non-coinciding
+  name: `%ai`/`%aI`/`%aD`/`%as`/`%at` and the committer mirrors are fixed
+  formats, `--pretty=raw` prints the object's stored bytes, and
+  `full`/`short`/`oneline` have no date line at all.
+  WARNING: **`-local` takes the machine's offset AT THE COMMIT'S OWN
+  INSTANT**, never a cached one and never "now" -- measured across a DST
+  boundary (`TZ=America/New_York`: a January commit renders `-0500`, a July
+  one `-0400`). The stored tz is ignored entirely by every `-local` name.
+  `local`/`default-local` additionally print **no offset field at all**,
+  the one shape none of the five original renderers can produce.
+  WARNING: **`format:`/`format-local:` do NOT hand the string to
+  `strftime` unchanged.** `%s`, `%z` and `%Z` are substituted first (a
+  hand-built `struct tm` cannot carry them portably), and `%Z` is **empty**
+  for the non-local form. `%%` is its own two-byte token, NOT a shield for
+  a following `%z`: `%%z` -> `%z`, but `%z%%z` -> `+0000%z`.
+  WARNING: **the output buffer must GROW; a fixed one is the wrong tool
+  and this was got wrong TWICE in one phase.** The format string is
+  unbounded user input. Round 1 used a 1024-byte stack buffer at all five
+  render call sites and turned "does not fit" into an **empty date field
+  with exit 0** (measured: 1010 bytes agreed with git, 1200 rendered
+  nothing). Round 2 replaced it with a growing buffer but left **two
+  independent caps** -- an outer `1<<24` and `strftime_grow`'s own
+  `1<<20` -- and since the inner one is the real bound, the identical
+  silent-empty bug reappeared at exactly 1048584 bytes of output, reachable
+  with an 87 KB argv. There is now ONE cap, `1<<28`, and it is justified by
+  measurement rather than chosen: the largest `strftime` expansion under
+  `LC_ALL=C` is 14x (`%+`, 2 bytes in / 28 out; `%c` is next at 24), and
+  `ARG_MAX` here is 1 MiB (Linux caps a single argv string at 128 KiB), so
+  the largest output reachable through the CLI is about 14 MiB, roughly
+  19x below the cap. **Do not "simplify" this back toward a constant-size
+  buffer, and do not add a second cap.**
 - **`sg show` exists as of Phase 55** and shares `sg log`'s entry renderer:
   `git show <non-merge-commit>` is byte-identical to `git log -1 -p` of it in
   every flag combination (measured), so the renderer lives in
@@ -481,10 +542,13 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   rename.
   WARNING: **`-n 0` is a legal request for nothing**, not an error and not
   "unlimited": git prints nothing and exits 0.
-  **Deliberately not implemented: `--follow`, `--date=`,
+  **Deliberately not implemented: `--follow`,
   `--author=`/`--grep=`, `--reverse`, `--all`, `-c`/`--cc`,
   `--full-history`, `--simplify-merges`, and a second `<rev>`.** All are
   rejected with the usage line and exit 1, never silently ignored.
+  **`--date=<format>` is implemented as of Phase 64** (see the dedicated
+  bullet below) -- gone from this list rather than marked "fixed" in
+  place, same convention `--pretty` and `-- <pathspec>` follow here.
   **`--pretty`/`--format` are implemented as of Phase 60a** (see the
   dedicated bullet below) -- this list used to include them, they are gone
   from it now that they exist rather than marked "fixed" in place, same
@@ -2625,7 +2689,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 
 ## Deliberate divergences from real git
 
-Six places where sg's answer differs from real git **on purpose**, not by
+Seven places where sg's answer differs from real git **on purpose**, not by
 oversight -- each was measured against git 2.55.0, each is pinned on both
 sides by an interop check (so accidentally "fixing" one back into silent
 agreement with git would itself go undetected without the pin), and none of
@@ -2703,6 +2767,33 @@ no longer a divergence, so it is gone from this list rather than marked
    git's exact bytes, one asserting sg's exact bytes, so a future change to
    either renderer fails by name instead of silently drifting apart from
    its own pin.
+7. **`--date=*-local` disagrees with git for a zone whose offset is not a
+   whole number of minutes** (Phase 64). Such zones exist AFTER 1970 --
+   `Africa/Monrovia` is `-2670` seconds until 1972-01-07 -- so this is
+   reachable with an ordinary, positive-timestamp commit (epoch 0) and
+   `TZ=Africa/Monrovia`, no `--literally` and no crafted object needed.
+   Measured, all six `-local` names: git prints
+   `1969-12-31 23:15:30 +0000`, sg prints `1969-12-31 23:16:00 -0044`.
+   **Both halves of git's answer come from different code and contradict
+   each other**: the wall clock is `localtime_r` at full second precision,
+   while the offset LABEL goes through git's own `local_tzoffset`, which
+   returns 0 whenever the local time lands before 1970 (its `tm_to_time_t`
+   rejects `tm_year < 70`) -- so git labels a `-00:44:30` clock `+0000`.
+   sg routes `-local` through a whole-minute `+HHMM` string and is
+   internally consistent instead. **Fixing only sg's clock would produce
+   agreement in exactly ZERO cases** -- a non-whole-minute offset is the
+   only situation that diverges at all, and in every one of those git's
+   label is also wrong -- so byte-for-byte agreement would mean
+   reproducing git's own inconsistency. Pinned on both sides in interop's
+   `phase64` group as twelve LITERAL byte pins (six git, six sg), the same
+   shape as divergence #6, with a `skip()` for a machine whose zoneinfo
+   lacks the zone.
+   WARNING: **this entry replaced a claim in `docs/DESIGN.md` that the
+   shape was "measured inert, no oracle in either direction"** -- that
+   claim was written from a zoneinfo scan that reported no post-1970
+   non-whole-minute offset, and the scan was simply wrong. A negative
+   result needs its own path verified before it becomes a documented
+   reason not to act; see the Phase 64 section of `docs/DESIGN.md`.
 
 ## Core types cheat sheet
 
@@ -2814,13 +2905,13 @@ bumping the version, keep the man page in sync.
 
 ## Testing conventions
 
-- One independent unit test `.c` file per area (74 as of Phase 63), **no shared header, no test
+- One independent unit test `.c` file per area (75 as of Phase 64), **no shared header, no test
   framework**. **Do not hardcode that count anywhere in this file again**: the
   Makefile globs `tests/*.c`, so it grows every phase that adds a test, and a
   stale number in the gate-reading instructions above is exactly the
   "misreading the gate" failure this file calls its worst. It said 64 while
   the real total was 72 (fixed in Phase 62), then 73 while it was 74 (Phase
-  63). Read the `N/M` the gate itself prints and compare N against M. Each file carries its own `static int failures = 0;` and a
+  63), and 74 while it was 75 (Phase 64) -- three phases in a row. Read the `N/M` the gate itself prints and compare N against M. Each file carries its own `static int failures = 0;` and a
   same-named `CHECK(cond, ...)` macro (prints `FAIL %s:%d` and
   `failures++` on failure, **does not abort**), and `main` ends with
   `return 1` if `failures > 0`. To add a test, copy `tests/test_confirm.c`

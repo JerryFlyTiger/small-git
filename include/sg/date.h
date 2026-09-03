@@ -89,4 +89,107 @@ int sg_date_format_iso(long long time_sec, const char *tz,
 int sg_date_format_iso_strict(long long time_sec, const char *tz,
                               char *out, size_t out_size);
 
+/* Phase 64: the `--date=<name>` model shared by `sg log`/`sg show`, both
+   for the header date line(s) and for %ad/%cd. CLAUDE.md's `--date=` entry
+   has the full measured grammar and byte tables; the short version:
+   - DEFAULT/ISO/ISO_STRICT/RFC2822/SHORT dispatch to the five renderers
+     above, unchanged, when `local` is 0 (byte-identical to calling them
+     directly with the object's own stored tz).
+   - `local` ignores the stored tz completely and shifts by the machine's
+     OWN offset at time_sec's instant (localtime_r on time_sec, never a
+     cached value or "now" -- this is a genuine per-commit computation,
+     verified across a DST boundary). DEFAULT+local additionally SUPPRESSES
+     the offset field entirely ("Mon Jan 1 09:00:00 2024", no "+0900") --
+     the one shape none of the five existing renderers can produce.
+   - RAW ("<epoch> <tz>") and UNIX ("<epoch>") are new, trivial formats.
+     RAW shares the "-0000" -> "+0000" normalization the five existing
+     renderers apply (measured against real git with a hand-crafted
+     commit object storing a literal "-0000": every rendering normalizes
+     it, RAW and FORMAT's %z included -- only `sg cat-file -p`/
+     `--pretty=raw` echo the stored bytes verbatim, and neither of those
+     goes through this function at all).
+   - FORMAT is git's `strbuf_addftime`: %s/%z/%Z/%% are substituted by hand
+     before the remaining bytes reach the system `strftime` (see date.c for
+     the measured substitution rules) -- %s is always the UNSHIFTED epoch,
+     %z is the offset actually being rendered (stored tz, or the local
+     offset under `-local`), %Z is the zone name (empty unless `local`). */
+typedef enum {
+    SG_DATE_DEFAULT,
+    SG_DATE_ISO,
+    SG_DATE_ISO_STRICT,
+    SG_DATE_RFC2822,
+    SG_DATE_SHORT,
+    SG_DATE_RAW,
+    SG_DATE_UNIX,
+    SG_DATE_FORMAT
+} sg_date_kind;
+
+typedef struct {
+    sg_date_kind kind;
+    int local; /* the "-local" suffix / "format-local:" prefix */
+    /* Borrowed pointer into the caller's argv string, past "format:"/
+       "format-local:" -- only meaningful when kind == SG_DATE_FORMAT. May
+       be "" (an empty format prints zero bytes, not even under -local). */
+    const char *strftime_fmt;
+} sg_date_mode;
+
+/* A generous buffer size for sg_date_format_mode when kind is anything
+   other than SG_DATE_FORMAT: every one of the other seven kinds has an
+   output length bounded by this project's own tables (weekday/month names,
+   a four-digit-or-so year, a fixed number of separator bytes), so a stack
+   buffer of this size is always big enough for them.
+
+   SG_DATE_FORMAT's output length is bounded only by the caller's own
+   format string, which is unbounded user input (Phase 64 review: a
+   `--pretty=format:` string that is itself thousands of bytes long, or a
+   strftime expansion of one, silently truncated to an empty string here --
+   `sg_date_format_mode` correctly returned -1 for "does not fit", but
+   every one of its FORMAT-mode callers turned that -1 into an empty
+   string rather than growing the buffer). **Do not raise this constant to
+   paper over that** -- it only moves the same silent-truncation bug to a
+   longer input, it does not fix it. A FORMAT-mode caller must use
+   sg_date_format_mode_alloc below instead of a fixed buffer of this size. */
+#define SG_DATE_MODE_MAX 1024
+
+/* Parses the text after "--date="/"--date " (CLAUDE.md's --date= entry has
+   the full grammar): a case-SENSITIVE match against one of `default` /
+   `iso`|`iso8601` / `iso-strict`|`iso8601-strict` / `rfc`|`rfc2822` /
+   `short` / `raw` / `unix`, each optionally suffixed with "-local" (the
+   suffix is stripped AT MOST ONCE, and the remainder must itself be one of
+   those names -- "local-local" and "-local" are both errors); the bare
+   literal `local` is an alias for `default-local`; and "format:"/
+   "format-local:" are prefixes checked FIRST (before any suffix-stripping)
+   with everything after the colon taken verbatim, "-local" appearing
+   inside the format string included.
+
+   Deliberately unimplemented and always rejected: `relative`/`human`
+   (each is a real git renderer, but a genuinely different algorithm with
+   its own threshold table -- Phase 65) and `auto:<anything>` (its meaning
+   depends on isatty(1), no oracle without a pty). Returns 0 with *out
+   filled, or -1 for any of those, an unknown name, or an empty string. */
+int sg_date_parse_mode(const char *arg, sg_date_mode *out);
+
+/* Renders time_sec/tz per *mode -- see the type's own comment above for
+   the dispatch. Returns 0 on success, -1 on the same failures the five
+   renderers above report (out set to the empty string), or if the result
+   does not fit in out_size. */
+int sg_date_format_mode(const sg_date_mode *mode, long long time_sec,
+                        const char *tz, char *out, size_t out_size);
+
+/* Same rendering as sg_date_format_mode, but into a MALLOC'd buffer sized
+   to fit -- the caller frees *out. For every kind other than SG_DATE_FORMAT
+   this is equivalent to sg_date_format_mode into an SG_DATE_MODE_MAX
+   buffer, just heap-allocated; for SG_DATE_FORMAT it grows the buffer as
+   many times as needed (bounded only by an internal sanity cap, the same
+   one strftime_grow uses internally in date.c) rather than failing past a
+   fixed ceiling. Every caller that renders a FORMAT-mode --date= (i.e.
+   every one of the four reach points CLAUDE.md's --date= entry names) MUST
+   use this function, not a fixed SG_DATE_MODE_MAX stack buffer -- see that
+   constant's own comment for the bug this exists to fix.
+
+   Returns 0 with *out set (caller frees), or -1 on the same failures
+   sg_date_format_mode reports (*out left NULL) or on allocation failure. */
+int sg_date_format_mode_alloc(const sg_date_mode *mode, long long time_sec,
+                              const char *tz, char **out);
+
 #endif /* SG_DATE_H */
