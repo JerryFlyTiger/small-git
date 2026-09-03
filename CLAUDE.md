@@ -17,7 +17,7 @@ section when needed, do not read the whole thing**).
 
 ```bash
 make                              # build/sg, with -g
-make test                         # 73 unit test binaries, any failure fails the whole thing
+make test                         # one binary per tests/*.c, any failure fails the whole thing
 bash tests/interop.sh             # interop test against real git (needs a prior make)
 make sanitize                     # clean + rebuild with ASan/UBSan + run unit tests
 python3 tests/fuzz_ignore.py      # .gitignore consistency fuzzer (200 rounds by default)
@@ -48,7 +48,7 @@ these four things (the script's comments have the full WHY):
 - The line that prints "0 TUs recompiled" **does not give you a warning
   count**: make compiled nothing this run, so the 0 means "not measured", not
   "measured as zero". To actually measure, use `--rebuild`.
-- In the `make test` line's "N/73 ran", if N is less than 73 it means
+- In the `make test` line's "N/M ran", if N is less than M it means
   **aborted partway through** (the Makefile stops at the first failing
   binary), not "the rest passed".
 - A non-zero exit code with zero FAIL lines still counts as FAIL: crashes,
@@ -91,7 +91,7 @@ ASan job. Two things about reading its row, both measured:
 - **A crashed binary yields exit code 0 and no summary line at all**, so
   reading the exit code alone would score a segfault as green. The gate
   therefore demands the `N leaks for M total leaked bytes` line from every
-  binary and reports `analyzed N/73`, the same "not measured != measured as
+  binary and reports `analyzed N/M`, the same "not measured != measured as
   zero" shape as the `make` and `make test` rows. Non-macOS is a `skip` row,
   never a silent pass.
 
@@ -481,7 +481,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   rename.
   WARNING: **`-n 0` is a legal request for nothing**, not an error and not
   "unlimited": git prints nothing and exits 0.
-  **Deliberately not implemented: `--follow`, `--graph`, `--date=`,
+  **Deliberately not implemented: `--follow`, `--date=`,
   `--author=`/`--grep=`, `--reverse`, `--all`, `-c`/`--cc`,
   `--full-history`, `--simplify-merges`, and a second `<rev>`.** All are
   rejected with the usage line and exit 1, never silently ignored.
@@ -541,6 +541,96 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   checks, built with `git mktree`/`commit-tree` the same way the phase26
   group builds its `..` fixture; the -1 half additionally deletes a tree
   object, since no porcelain will produce that shape either.
+  **`--graph` is implemented as of Phase 63.** Under sg's first-parent-only
+  walk the graph column is a per-line prefix, not a real graph layout --
+  `"* "` on an entry's first line, otherwise `"| "` (WITH a trailing space,
+  not a bare `"|"` -- a terminal or `sed` hides that byte, verify with
+  `repr()`/`od -c`, never by eye). No multi-column characters (`|\`, `|/`,
+  `* |`) are ever produced and there is no code path for them: a
+  first-parent walk cannot branch, so the shape they exist for cannot
+  occur, and there is no real-git output to check such code against if it
+  existed.
+  WARNING: **the LAST printed entry's continuation lines are `"  "` (two
+  spaces, same width as `"| "`) instead, and the predicate for this is
+  "did the walk end NATURALLY" (reached the true root with no `-n` cutoff
+  and no error), never "does this particular commit have a parent"**
+  (measured: a first draft of this predicate was `parent_count == 0` on
+  the LAST commit, and that is also wrong). The decisive fixture is a
+  pathspec that filters out everything between the last matching commit
+  and the root: `--graph -- deep` against a fixture where `deep` matches
+  exactly one non-root commit with a real parent -- the walk continues
+  past it, unprinted, all the way to the root before stopping naturally,
+  and that commit still gets `"  "`. Meanwhile `-n 1` (no pathspec) prints
+  a commit that also has a parent, but the walk was cut off, and it gets
+  `"| "`. `--oneline`/`format:`/`tformat:`/`reference` have no continuation
+  lines at all and cannot distinguish the two -- a test using one of them
+  verifies nothing about this rule; use a multi-line format (medium/
+  fuller/full/raw).
+  WARNING: **the `format:`/`medium` inter-entry separator difference (a
+  `format:` pair has no empty graph line between them, `medium` does) is
+  the SAME rule seen from two angles, not two rules.** A `medium` entry
+  terminates itself with `\n`, so the separator `\n` a caller feeds between
+  two entries lands at the START of a new line and opens one for the
+  prefixer to fill; a `format:` entry does NOT terminate itself, so the
+  identical separator byte lands MID-LINE and merely ends the line already
+  in progress, consuming no prefix at all. This falls out of the entry's
+  own trailing byte and needs no branch keyed on format kind anywhere in
+  the prefixer.
+  WARNING: **the capture mechanism is `tmpfile()`, not `open_memstream()`
+  -- `fileno()` on a memstream `FILE *` is not guaranteed to return a
+  valid fd (measured: `-1` on this project's own macOS dev machine), so it
+  cannot be `dup2`'d onto fd 1.** A pipe was also considered and rejected:
+  nothing reads its write end while the captured call is running, so an
+  entry whose output exceeds the pipe buffer (commonly 64 KB, an easy
+  bar for a large `-p` diff) would deadlock, intermittently and by data
+  size -- the worst kind of failure to debug. See Phase 63 of
+  `docs/DESIGN.md` for the full design, including why capturing fd 1
+  (rather than threading a `FILE *`/prefix parameter into
+  `commit_out.c`/`diff_out.c`) was chosen deliberately: `diff_out.c` alone
+  has six output formats plus the combined-diff renderer, and a missed
+  `printf` call site while threading a parameter through would be
+  invisible without a fixture that happens to combine `--graph` with
+  exactly that format.
+  WARNING: **`sg show --graph` is refused** -- git also refuses it (exit
+  128, "options '--no-walk' and '--graph' cannot be used together"), and
+  sg's existing unknown-flag handling in `cmd_show.c` already refuses it
+  (usage, exit 1) with zero code changes needed; this is pinned as a
+  head-on pair in interop rather than left as an unverified assumption.
+  WARNING: **an entry whose EXPANDED bytes are empty must still emit its
+  own `"* "` marker** (found by review, fixed in the same phase): the
+  per-byte prefixer loop is a no-op for a zero-length write by design (it
+  must not invent a prefix for a legitimately empty write), but that also
+  meant an entry with genuinely nothing captured -- `--pretty=format:%b`
+  on a body-less commit is the real trigger -- never got a marker either,
+  since the marker used to be written lazily, attached to the entry's own
+  first byte. A MIDDLE such entry's marker was silently absorbed by the
+  FOLLOWING entry's separator write one entry late, which is why this was
+  invisible except on the very LAST entry of a run (nothing left to
+  absorb it into): 11 body-less commits under `--graph
+  --pretty=format:%b` printed 10 markers, not 11, plus an extra trailing
+  `\n` real git does not have. `$P62`/`$P62M` could not have caught this
+  -- every commit in both is a one-line-subject, no-body commit, so `%b`
+  is empty for ALL of them, which hides a "middle entry" bug behind the
+  "last entry" one; telling the two apart needs a fixture with a genuine
+  MIX of body-less and with-body commits. `sg_log_graph_write_entry`
+  (`log_graph.h`/`log_graph.c`) is now the ONLY function allowed to
+  combine `sg_log_graph_begin_entry` with writing an entry's bytes, for
+  exactly this reason -- the bug shipped through a call site that did the
+  two separately.
+  WARNING: **the SAME review also reproduced a bug in `--pretty=tformat:`
+  that PREDATES this phase (Phase 60a) and has NOTHING to do with
+  `--graph`**: an EMPTY format string (`--pretty=tformat:`, nothing after
+  the colon) must print ZERO bytes total, not even the terminator --
+  measured, real git prints nothing at all; sg printed one bare `\n` per
+  commit. The predicate is "is the FORMAT STRING itself empty", not "did
+  expansion produce zero bytes" -- do not conflate this with the `--graph`
+  bug above: `tformat:%b` on a body-less commit expands to zero bytes too
+  and STILL correctly gets its terminator, because its format string
+  (`"%b"`) is not empty. `format:` (non-`t`) needed no equivalent fix, an
+  empty `format:` entry was already correct. Both fixes compose: `--graph
+  --pretty=tformat:` on a mixed fixture produces bare markers with no
+  separating byte at all (`b'* * * '`), which is itself a named interop
+  check rather than an assumption.
 - **`--pretty=<name>` / `--format=<...>` select the entry's rendering,
   shared verbatim between `sg log` and `sg show`** (Phase 60a,
   `sg_pretty_parse` in `src/cli/commit_out.c`; `include/sg/commit_out.h`).
@@ -2535,7 +2625,7 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
 
 ## Deliberate divergences from real git
 
-Five places where sg's answer differs from real git **on purpose**, not by
+Six places where sg's answer differs from real git **on purpose**, not by
 oversight -- each was measured against git 2.55.0, each is pinned on both
 sides by an interop check (so accidentally "fixing" one back into silent
 agreement with git would itself go undetected without the pin), and none of
@@ -2594,6 +2684,25 @@ no longer a divergence, so it is gone from this list rather than marked
    commit is worse than a refusal. Pinned on both sides in interop's
    `phase57` group (git: exit 0, the pick completes and the state clears;
    sg: exit 1, the state survives the refusal).
+6. **`sg log --graph` combined with an EMPTY `--pretty=format:`/`tformat:`
+   format string AND a diff (`-p`/`--stat`) does not reproduce git's
+   layout** (Phase 63 review round). git renders an entry's header and its
+   diff as two INDEPENDENT graph-prefixed blocks: an empty header still
+   gets its own `"* "` marker, and the diff that follows gets its OWN
+   `"| "` immediately after it, on the SAME physical line
+   (`"* | diff --git a/f b/f\n..."`). sg captures a whole entry (header +
+   diff together) as a SINGLE block and prefixes it as one unit, so it can
+   only ever produce `"* "` directly followed by the diff's own first byte
+   -- there is no code path that produces "one empty graph block, then a
+   second block" from a single capture. Reproducing git's shape would
+   require `sg_commit_out_entry` to expose the header/diff boundary to its
+   caller, and that boundary is also `sg show`'s own public contract --
+   not worth changing for this degenerate combination of inputs. Pinned on
+   both sides in interop's `phase63` group as two LITERAL byte pins (not a
+   git-vs-sg `cmp`, since the two are expected to differ): one asserting
+   git's exact bytes, one asserting sg's exact bytes, so a future change to
+   either renderer fails by name instead of silently drifting apart from
+   its own pin.
 
 ## Core types cheat sheet
 
@@ -2705,8 +2814,13 @@ bumping the version, keep the man page in sync.
 
 ## Testing conventions
 
-- 73 independent unit test `.c` files, **no shared header, no test
-  framework**. Each file carries its own `static int failures = 0;` and a
+- One independent unit test `.c` file per area (74 as of Phase 63), **no shared header, no test
+  framework**. **Do not hardcode that count anywhere in this file again**: the
+  Makefile globs `tests/*.c`, so it grows every phase that adds a test, and a
+  stale number in the gate-reading instructions above is exactly the
+  "misreading the gate" failure this file calls its worst. It said 64 while
+  the real total was 72 (fixed in Phase 62), then 73 while it was 74 (Phase
+  63). Read the `N/M` the gate itself prints and compare N against M. Each file carries its own `static int failures = 0;` and a
   same-named `CHECK(cond, ...)` macro (prints `FAIL %s:%d` and
   `failures++` on failure, **does not abort**), and `main` ends with
   `return 1` if `failures > 0`. To add a test, copy `tests/test_confirm.c`
