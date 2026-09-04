@@ -1,5 +1,6 @@
 #include "sg/date.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -634,6 +635,7 @@ static const struct {
     { "short", SG_DATE_SHORT },
     { "raw", SG_DATE_RAW },
     { "unix", SG_DATE_UNIX },
+    { "relative", SG_DATE_RELATIVE },
 };
 
 int sg_date_parse_mode(const char *arg, sg_date_mode *out)
@@ -706,6 +708,16 @@ int sg_date_format_mode(const sg_date_mode *mode, long long time_sec,
     if (out == NULL || out_size == 0 || mode == NULL)
         return -1;
     out[0] = '\0';
+
+    /* SG_DATE_RELATIVE needs no tz at all -- it renders a DURATION between
+       time_sec and "now", and relative-local is byte-identical to relative
+       in every zone (measured, CLAUDE.md's --date= entry). Dispatched
+       before resolve_mode_tz on purpose: that helper's `local` branch calls
+       localtime_r on time_sec and can fail for an out-of-range value, which
+       would needlessly fail a rendering that was never going to look at
+       tz_str/zone_name in the first place. */
+    if (mode->kind == SG_DATE_RELATIVE)
+        return sg_date_format_relative(time_sec, sg_date_now(), out, out_size);
 
     if (resolve_mode_tz(mode, time_sec, tz, local_tz, sizeof local_tz,
                         local_zone, sizeof local_zone, &tz_str, &zone_name) != 0)
@@ -816,4 +828,146 @@ int sg_date_format_mode_alloc(const sg_date_mode *mode, long long time_sec,
         *out = rendered;
         return 0;
     }
+}
+
+/* --------------------------------------------------------------------
+   Phase 66: --date=relative / relative-local, %ar / %cr.
+   -------------------------------------------------------------------- */
+
+/* Writes "<n> <word>[s] ago" -- shared by every branch of
+   relative_diff_to_words below. `out` must have room for the caller's
+   out_size (checked the same way every other renderer in this file
+   checks snprintf's return). */
+static int write_ago(long long n, const char *word, char *out, size_t out_size)
+{
+    int written = snprintf(out, out_size, "%lld %s%s ago", n, word, n == 1 ? "" : "s");
+
+    if (written < 0 || (size_t)written >= out_size) {
+        out[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
+/* git's relative-date algorithm (`date.c`'s `show_date_relative`), verified
+   independently against real git 2.55.0 over 1239 probes, 0 mismatches --
+   see sg_date_format_relative's own header comment in date.h and
+   docs/DESIGN.md's Phase 66 entry, do not re-derive this from memory.
+   `diff` is `now - time_sec`, already saturated to a representable range by
+   the caller (sg_date_format_relative) so every arithmetic step below is
+   safe from signed overflow.
+
+   WARNING: two DIFFERENT month formulas, not one reused twice -- below 365
+   days the month count is `(days + 15) / 30`; the `totalmonths` expression
+   is used from 365 days on. Measured: using `totalmonths` for both matched
+   git on 538 of 539 probes, the one miss being delta=6476307 (75 days,
+   totalmonths says 2 months, git says 3).
+   WARNING: every threshold below is compared against the CONVERTED value
+   (minutes/hours/days), never against the original seconds. */
+static int relative_diff_to_words(long long diff, char *out, size_t out_size)
+{
+    if (diff < 0) {
+        int written = snprintf(out, out_size, "in the future");
+
+        if (written < 0 || (size_t)written >= out_size) {
+            out[0] = '\0';
+            return -1;
+        }
+        return 0;
+    }
+    if (diff < 90)
+        return write_ago(diff, "second", out, out_size);
+
+    diff = (diff + 30) / 60; /* -> minutes */
+    if (diff < 90)
+        return write_ago(diff, "minute", out, out_size);
+
+    diff = (diff + 30) / 60; /* -> hours */
+    if (diff < 36)
+        return write_ago(diff, "hour", out, out_size);
+
+    diff = (diff + 12) / 24; /* -> days */
+    if (diff < 14)
+        return write_ago(diff, "day", out, out_size);
+    if (diff < 70)
+        return write_ago((diff + 3) / 7, "week", out, out_size);
+    if (diff < 365)
+        return write_ago((diff + 15) / 30, "month", out, out_size);
+
+    {
+        /* diff is in DAYS here, already divided down from seconds by three
+           /60,/60,/24 steps, so it is bounded well under LLONG_MAX / 1000 --
+           `diff * 12 * 2` cannot overflow (see sg_date_format_relative's own
+           overflow-clamp comment for the seconds-level bound this relies
+           on). */
+        long long totalmonths = (diff * 12 * 2 + 365) / (365 * 2);
+
+        if (diff < 1825) {
+            long long years = totalmonths / 12;
+            long long months = totalmonths % 12;
+
+            if (months != 0) {
+                int written = snprintf(out, out_size, "%lld year%s, %lld month%s ago",
+                                       years, years == 1 ? "" : "s",
+                                       months, months == 1 ? "" : "s");
+
+                if (written < 0 || (size_t)written >= out_size) {
+                    out[0] = '\0';
+                    return -1;
+                }
+                return 0;
+            }
+            return write_ago(years, "year", out, out_size);
+        }
+        return write_ago((diff + 183) / 365, "year", out, out_size);
+    }
+}
+
+int sg_date_format_relative(long long time_sec, long long now,
+                            char *out, size_t out_size)
+{
+    /* diff = now - time_sec, saturated rather than left to signed-overflow
+       UB. This is a defensive net for a hand-crafted/corrupt commit object
+       (a time_sec far outside any real epoch range) -- CLAUDE.md's
+       shift_tm precedent for the same style of bounds check elsewhere in
+       this file. Clamped to LLONG_MAX/4 in magnitude, which leaves ample
+       headroom for every "+something" addition inside
+       relative_diff_to_words (the largest, diff*12*2, is only reached
+       after diff has already been divided down to days by ~86400, so even
+       a maximally saturated diff cannot make that multiplication overflow
+       either). */
+    long long diff;
+
+    if (out == NULL || out_size == 0)
+        return -1;
+    out[0] = '\0';
+
+    if (time_sec > 0 && now < LLONG_MIN + time_sec) {
+        diff = LLONG_MIN / 4; /* time_sec unrepresentably far in the future */
+    } else if (time_sec < 0 && now > LLONG_MAX + time_sec) {
+        diff = LLONG_MAX / 4; /* time_sec unrepresentably far in the past */
+    } else {
+        diff = now - time_sec;
+        if (diff > LLONG_MAX / 4)
+            diff = LLONG_MAX / 4;
+        else if (diff < LLONG_MIN / 4)
+            diff = LLONG_MIN / 4;
+    }
+
+    return relative_diff_to_words(diff, out, out_size);
+}
+
+long long sg_date_now(void)
+{
+    const char *raw = getenv("GIT_TEST_DATE_NOW");
+    char *end = NULL;
+    long long v;
+
+    if (raw != NULL && raw[0] != '\0') {
+        errno = 0;
+        v = strtoll(raw, &end, 10);
+        if (end != NULL && *end == '\0' && errno == 0)
+            return v;
+    }
+    return (long long)time(NULL);
 }

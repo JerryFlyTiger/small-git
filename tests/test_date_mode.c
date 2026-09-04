@@ -84,10 +84,16 @@ static void test_grammar(void)
     /* rule 3: empty value. */
     check_parse_err("");
 
-    /* section 0: deliberately unimplemented, even though real git accepts
-       them (Phase 65). */
-    check_parse_err("relative");
-    check_parse_err("relative-local");
+    /* relative/relative-local are implemented as of Phase 66 -- see
+       test_date_relative.c for the byte-level boundary table. Only the
+       grammar (kind/local) is asserted here. */
+    check_parse_ok("relative", SG_DATE_RELATIVE, 0);
+    check_parse_ok("relative-local", SG_DATE_RELATIVE, 1);
+
+    /* section 0: deliberately still unimplemented, even though real git
+       accepts them (Phase 66 spec section 0 -- human is calendar-driven,
+       not duration-driven, a genuinely different algorithm deferred to its
+       own phase; auto: depends on isatty(1), no oracle without a pty). */
     check_parse_err("human");
     check_parse_err("human-local");
     check_parse_err("auto:short");

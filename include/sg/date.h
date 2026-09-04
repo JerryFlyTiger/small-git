@@ -121,7 +121,9 @@ typedef enum {
     SG_DATE_SHORT,
     SG_DATE_RAW,
     SG_DATE_UNIX,
-    SG_DATE_FORMAT
+    SG_DATE_FORMAT,
+    SG_DATE_RELATIVE /* Phase 66: "relative" / "relative-local" -- see
+                         sg_date_format_relative below. */
 } sg_date_kind;
 
 typedef struct {
@@ -162,11 +164,15 @@ typedef struct {
    with everything after the colon taken verbatim, "-local" appearing
    inside the format string included.
 
-   Deliberately unimplemented and always rejected: `relative`/`human`
-   (each is a real git renderer, but a genuinely different algorithm with
-   its own threshold table -- Phase 65) and `auto:<anything>` (its meaning
-   depends on isatty(1), no oracle without a pty). Returns 0 with *out
-   filled, or -1 for any of those, an unknown name, or an empty string. */
+   `relative`/`relative-local` are implemented as of Phase 66 (see
+   sg_date_format_relative below) -- both parse to SG_DATE_RELATIVE, and
+   `-local` is accepted but changes nothing about the rendering (a
+   duration has no timezone to shift). Deliberately still unimplemented
+   and always rejected: `human`/`human-local` (measured to be
+   CALENDAR-driven, not duration-driven -- a genuinely different algorithm,
+   deferred to its own phase) and `auto:<anything>` (its meaning depends on
+   isatty(1), no oracle without a pty). Returns 0 with *out filled, or -1
+   for any of those, an unknown name, or an empty string. */
 int sg_date_parse_mode(const char *arg, sg_date_mode *out);
 
 /* Renders time_sec/tz per *mode -- see the type's own comment above for
@@ -191,5 +197,68 @@ int sg_date_format_mode(const sg_date_mode *mode, long long time_sec,
    sg_date_format_mode reports (*out left NULL) or on allocation failure. */
 int sg_date_format_mode_alloc(const sg_date_mode *mode, long long time_sec,
                               const char *tz, char **out);
+
+/* Longest string sg_date_format_relative can produce, including the NUL.
+   "in the future" is 14; the numeric forms are bounded by
+   date.c's own overflow clamp on the diff it computes, which keeps every
+   count well under 20 digits -- 64 bytes covers every case with slack to
+   spare. */
+#define SG_DATE_RELATIVE_MAX 64
+
+/* Phase 66: git's `--date=relative` / `%ar` / `%cr` algorithm -- a
+   DURATION between `time_sec` and `now`, not a wall-clock rendering, so it
+   takes no `tz` at all (`relative-local` is measured byte-identical to
+   `relative` in every zone, CLAUDE.md's `sg log` --date= entry has the
+   measured proof). Re-implemented independently in Python and
+   cross-checked against real git 2.55.0 over 1239 probes (0 mismatches);
+   see CLAUDE.md / docs/DESIGN.md's Phase 66 entry for the full
+   two-formula, unit-threshold table -- do not re-derive it from memory,
+   there are two different month formulas and using either one everywhere
+   silently produces a wrong answer 1 probe out of 539.
+
+   `diff = now - time_sec` is computed WITH SATURATION, not signed-overflow
+   UB: a `time_sec`/`now` pair whose difference cannot be represented is
+   clamped to a very large finite value in the appropriate direction (huge
+   past, or negative -> "in the future") rather than wrapping. This is a
+   defensive net for a hand-crafted or corrupt commit object, not a real
+   git behavior to match -- it is unreachable through interop, which only
+   ever feeds a legitimate epoch pair.
+
+   `now` is deliberately a caller-supplied parameter rather than sampled
+   internally, so both reach points (sg_date_format_mode's SG_DATE_RELATIVE
+   case, and %ar/%cr's own call sites in commit_out.c) go through the SAME
+   clock decision -- sg_date_now() below -- without this function itself
+   depending on getenv/time(2) at all. Returns 0 on success, -1 if the
+   result does not fit in out_size (out set to the empty string). */
+int sg_date_format_relative(long long time_sec, long long now,
+                            char *out, size_t out_size);
+
+/* The single clock accessor for `--date=relative` and `%ar`/`%cr`: reads
+   `GIT_TEST_DATE_NOW` (seconds since the epoch, the same variable real git
+   honours for its own relative-date rendering -- CLAUDE.md's --date= entry
+   has the measurement) and falls back to the real wall clock (`time(NULL)`)
+   when it is absent OR malformed.
+
+   Deliberately NOT a byte-for-byte port of git's own parsing of this
+   variable: git's test hook does unsigned-wraparound arithmetic on a bad
+   value (measured: "abc" and "" both become 0, "1700000000x" parses only
+   the numeric prefix, "-5" wraps to a 584942417301-years-ago answer) --
+   that is a test hook's incidental behavior, not an interface worth
+   reproducing. sg parses a strict decimal integer (optional leading sign,
+   every remaining byte a digit, the whole string consumed, no overflow)
+   and treats anything else as ABSENT, falling back to the real clock
+   rather than silently rendering "in the future" for a typo. This
+   divergence is unobservable in interop, which only ever passes a valid
+   integer; documented, not pinned (docs/DESIGN.md's Phase 66 entry has the
+   measurement).
+
+   This function does not cache its result -- GIT_TEST_DATE_NOW is stable
+   for a process's whole lifetime, and the real-clock fallback's drift
+   across one invocation's several calls is far below relative's own
+   granularity (seconds), so re-reading the environment/clock at each of
+   the few call sites that need "now" is simpler than threading a
+   once-computed value through every renderer, and was the explicit design
+   choice for this phase (see docs/DESIGN.md). */
+long long sg_date_now(void);
 
 #endif /* SG_DATE_H */

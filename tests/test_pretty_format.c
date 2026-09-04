@@ -237,7 +237,10 @@ static void test_parent_list_on_merge(void)
    offending sequence. */
 static void test_validate_rejects_outside_table(void)
 {
-    static const char *const BAD[] = { "%z", "%ar", "%d", "%C(red)", "100%" };
+    /* %ar/%cr are implemented as of Phase 66 (see test_validate_accepts_
+       every_table_entry below); %ah/%ch (human, a genuinely different
+       calendar-driven algorithm, Phase 66 spec section 0) stay rejected. */
+    static const char *const BAD[] = { "%z", "%ah", "%ch", "%d", "%C(red)", "100%" };
     size_t i;
 
     for (i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++) {
@@ -254,8 +257,8 @@ static void test_validate_accepts_every_table_entry(void)
 {
     static const char *const GOOD[] = {
         "%H", "%h", "%T", "%t", "%P", "%p",
-        "%an", "%ae", "%al", "%ad", "%aD", "%at", "%ai", "%aI", "%as",
-        "%cn", "%ce", "%cl", "%cd", "%cD", "%ct", "%ci", "%cI", "%cs",
+        "%an", "%ae", "%al", "%ad", "%aD", "%at", "%ai", "%aI", "%as", "%ar",
+        "%cn", "%ce", "%cl", "%cd", "%cD", "%ct", "%ci", "%cI", "%cs", "%cr",
         "%s", "%f", "%b", "%B",
         "%n", "%%", "%x41",
     };

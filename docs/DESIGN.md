@@ -13498,3 +13498,142 @@ function (lines 309-311, 317-319) which do NOT call
 `attempt_result_free` either, because at those two earlier points
 `out->message` has not been set yet -- this third site is the one where it
 has, and is the one exception among the three.
+
+## Phase 66: `sg log`/`sg show --date=relative` / `relative-local`, `%ar`/`%cr`
+
+Measured against real git 2.55.0 on 2026-09-04. The algorithm
+(`relative_diff_to_words` in `src/util/date.c`) is a direct, independently
+re-verified port of git's own `show_date_relative` -- see PHASE66_SPEC.md's
+section 1 for the reference Python and the 1239-probe cross-check (0
+mismatches), and the header comment on `sg_date_format_relative`
+(`include/sg/date.h`) for the boundary table itself; not re-derived here to
+avoid a second, driftable copy.
+
+### The "now" design decision
+
+`--date=relative` and `%ar`/`%cr` are the first renderers in this project
+that need an input none of the other seven `sg_date_mode` kinds need: the
+current time. Two shapes were considered:
+
+1. Thread a `now` parameter through every renderer signature that might
+   reach a relative rendering (`sg_commit_out_entry`, `expand_user_format`,
+   `print_configured_date_field`, `sg_date_format_mode`, the annotated-tag
+   header's own call site in `cmd_show.c`) -- correct, but touches every
+   one of the four-plus-one reach points Phase 64 already enumerated, for a
+   value that exactly one kind out of eight needs.
+2. **A single clock accessor, `sg_date_now(void)` (`date.c`), called at
+   each of the few places that actually need "now"** -- `sg_date_format_
+   mode`'s `SG_DATE_RELATIVE` case, and the two new `%ar`/`%cr` placeholder
+   handlers in `commit_out.c` (`print_relative_date_field`). Chosen.
+
+Reason: `sg_date_now()` reads `GIT_TEST_DATE_NOW` (falling back to
+`time(NULL)`) -- a read-only, side-effect-free operation, and the value is
+process-lifetime-stable whenever the test hook is set (the only case where
+determinism actually matters, i.e. every interop check, which pins
+`GIT_TEST_DATE_NOW` on both sides of every comparison). **The real-clock
+fallback's per-call drift is a design choice, not a measured-safe claim**:
+nothing in this project has actually measured whether real git's own
+`show_date_relative` re-samples "now" per commit or caches it once per
+invocation, so there is no oracle confirming sg's choice matches git's
+behavior here, only an argument that the drift (at most a few milliseconds
+across however many calls one invocation makes, against a coarsest granularity
+of minutes) would be difficult to observe. None of this project's own gates
+can see it either way: every `make test`/interop assertion that touches a
+relative rendering pins `GIT_TEST_DATE_NOW`, so the real-clock path is
+untested by construction. Do not read this as "known safe" -- it is
+"unmeasured, and not on this project's own critical path to measure since
+the test hook covers every check that exists." This keeps
+`sg_date_mode`, `sg_commit_out_opts`, and every renderer's signature
+unchanged, and does not require CLAUDE.md's "Every construction site of
+this struct MUST set this field explicitly" Phase 29 shared-struct
+discipline to be re-litigated for a struct that already has plenty of
+fields. **Do not sprinkle a second, independent `getenv("GIT_TEST_DATE_
+NOW")`/`time(NULL)` fallback anywhere else in this codebase** -- there is
+exactly one function that owns this decision.
+
+`sg_date_format_mode`'s `SG_DATE_RELATIVE` case is dispatched **before**
+`resolve_mode_tz` is called, not after: that helper's `-local` branch calls
+`localtime_r` on `time_sec` and can fail for an out-of-range value, and
+`SG_DATE_RELATIVE` needs neither `tz_str` nor `zone_name` at all (a
+duration has no timezone to shift into) -- calling it anyway would make a
+rendering that was never going to touch either value depend on their
+success.
+
+### `GIT_TEST_DATE_NOW` parsing: strict, not a port of git's test-hook bug
+
+Measured: real git's own handling of a malformed `GIT_TEST_DATE_NOW` is
+unsigned-wraparound arithmetic inside a test-only code path, not a
+designed interface -- `"abc"`/`""` both become 0 (so every commit renders
+"in the future"), `"1700000000x"` parses only the leading numeric prefix,
+and `"-5"` wraps around to a nonsensical `584942417301 years ago`. `sg_date_
+now()` deliberately does NOT reproduce any of this: it parses a strict
+decimal integer via `strtoll` (the whole string must be consumed, no
+overflow) and treats anything else -- unset, empty, trailing garbage,
+overflow -- as ABSENT, falling back to the real wall clock rather than
+silently misrendering. This divergence is unobservable through `tests/
+interop.sh`, which only ever feeds a valid integer to the variable (an
+interop check exercising a malformed value would only be testing a code
+path this project deliberately chose not to match, not verifying
+correctness), so it is documented here rather than pinned as a two-sided
+oracle check.
+
+### The overflow-clamp inside `sg_date_format_relative`
+
+`diff = now - time_sec` is computed with a bounds check in the same style
+as `shift_tm`'s pre-existing overflow guard (`date.c`, used by every one of
+the other seven date renderers) -- a hand-crafted or corrupt commit object
+can carry a `time_sec` far enough from any real epoch that the plain
+subtraction would be signed-integer-overflow UB (caught by `make
+sanitize`). The result is saturated to +/- `LLONG_MAX/4` rather than
+wrapping, in the direction that still produces a sane answer ("far in the
+past" saturates toward a huge positive diff, "far in the future" saturates
+toward a huge negative one, which the "diff < 0" branch alone turns into
+the literal `"in the future"`). This is a defensive net, not a real git
+behavior being matched -- there is no oracle for what git does with a
+timestamp outside any real epoch's range, and it is unreachable through
+`tests/interop.sh`'s fixtures, which only ever use ordinary commit dates.
+
+The clamp bound (`LLONG_MAX/4`) was chosen so that every later arithmetic
+step inside `relative_diff_to_words` (`diff + 30`, `diff + 12`, `diff * 12
+* 2`, etc.) stays comfortably inside `long long` range even at the
+saturated extreme -- the largest multiplication, `diff * 12 * 2`, is only
+reached after `diff` has already been divided down from seconds to DAYS by
+three `/60`, `/60`, `/24` steps (roughly `/86400`), so even a maximally
+saturated `diff` cannot make it overflow either; the guard exists purely
+for the FIRST subtraction, where no such division has happened yet.
+
+### Test coverage
+
+`tests/test_date_relative.c` (new): the full measured boundary table from
+`sg_date_format_relative`'s own header comment, each boundary's exact
+seconds value tested at -1/exact/+1 as precise byte strings (no `strstr`);
+the two-month-formula discriminating witness (`delta=6476307` -> "3 months
+ago", the one probe out of 539 that a `totalmonths`-everywhere draft got
+wrong); the future case at four magnitudes; a handful of non-boundary
+mid-range values (so a mutation that only breaks the first row of a unit's
+branch cannot hide behind boundary-only checks); `relative`/`relative-
+local` byte-equality under three real `TZ` values (UTC, Asia/Tokyo,
+America/New_York), driven through the actual `sg_date_parse_mode` +
+`sg_date_format_mode` dispatch path (not just the bare renderer) so the
+"RELATIVE bypasses tz resolution" design decision above is exercised, not
+merely asserted; and `sg_date_now()`'s own env-var/malformed-value/
+fallback-to-real-clock behavior. `tests/test_date_mode.c`'s pre-existing
+`check_parse_err("relative")`/`("relative-local")` pair (written when both
+were still rejected, Phase 64/65) is converted to `check_parse_ok`;
+`tests/test_pretty_format.c`'s `BAD[]`/`GOOD[]` placeholder-validation
+tables are updated the same way (`%ar` moves from `BAD` to `GOOD` alongside
+`%cr`; `%ah`/`%ch`, human's own placeholders and still unimplemented, take
+`%ar`'s old seat in `BAD`).
+
+`tests/interop.sh`'s `phase66:` group: `GIT_TEST_DATE_NOW` pinned on BOTH
+sides for every relative-rendering check (an unpinned clock would make
+every comparison flaky by construction); the four Phase-64-established
+reach points swept for `relative`/`relative-local` the same way Phase 64's
+own group swept the eight deterministic names; `%ar`/`%cr` byte-compared
+against git directly; the negative control that `%ar` is unmoved by
+`--date=short` (the one row Phase 66's spec flagged as "not yet measured"
+-- measured now, see the fixture); and the still-rejected pins for
+`human`/`human-local`/`%ah`/`%ch`/`auto:short` (git exits 0, sg exits 1),
+carried forward unchanged from Phase 64's own rejection-list group so a
+future accidental implementation of `human` cannot silently start passing
+these without the check noticing the assumption moved.

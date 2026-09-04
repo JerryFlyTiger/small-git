@@ -148,10 +148,11 @@ static int resolve_pretty_arg(const char *raw, sg_pretty_format *out)
     return 0;
 }
 
-/* Phase 64: parses the value of --date=/--date (CLAUDE.md's --date= entry
-   has the full grammar). Mirrors resolve_pretty_arg's own shape -- prints
-   its own diagnostic and returns -1 on an unknown/empty name, including
-   the deliberately-unimplemented `relative`/`human`/`auto:` families. */
+/* Phase 64/66: parses the value of --date=/--date (CLAUDE.md's --date=
+   entry has the full grammar). Mirrors resolve_pretty_arg's own shape --
+   prints its own diagnostic and returns -1 on an unknown/empty name,
+   including the deliberately-unimplemented `human`/`auto:` families
+   (`relative`/`relative-local` are implemented as of Phase 66). */
 static int resolve_date_arg(const char *raw, sg_date_mode *out)
 {
     if (sg_date_parse_mode(raw, out) != 0) {
@@ -338,8 +339,9 @@ int sg_cmd_log(int argc, char **argv)
                them (Phase 62 section 1's rejection list; CLAUDE.md's
                `sg log` entry names the reasons). --graph is implemented as
                of Phase 63, --date=<name> as of Phase 64 (a deterministic
-               name only -- `relative`/`human`/`auto:` still land here and
-               are refused, see resolve_date_arg / sg_date_parse_mode),
+               name only -- `human`/`auto:` still land here and are
+               refused; `relative`/`relative-local` as of Phase 66 do not,
+               see resolve_date_arg / sg_date_parse_mode),
                see the dedicated parse branches above. */
             fprintf(stderr, "%s", USAGE);
             free(pos);
