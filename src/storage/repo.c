@@ -2,6 +2,7 @@
 
 #include "sg/chunk.h"
 #include "sg/refs.h"
+#include "sg/strfmt.h"
 #include "sg/workdir.h"
 
 #include <errno.h>
@@ -125,9 +126,10 @@ char *sg_require_git_dir(void)
 char *sg_repo_read_remote_url(const char *git_dir, const char *remote)
 {
     char path[SG_PATH_MAX];
-    char header[256];
+    char *header;
     FILE *f;
-    char line[1024];
+    char *line = NULL;
+    size_t line_cap = 0;
     int in_section = 0;
     char *result = NULL;
 
@@ -136,9 +138,29 @@ char *sg_repo_read_remote_url(const char *git_dir, const char *remote)
     if (f == NULL)
         return NULL;
 
-    snprintf(header, sizeof(header), "[remote \"%s\"]", remote);
+    /* Phase 65 follow-up: heap, not a fixed 256-byte buffer. A remote name
+       long enough to overflow the old header[256] made this string shorter
+       than the "[remote \"<name>\"]" section header it needed to match, so
+       strcmp() never found the section and every lookup silently answered
+       "remote not configured" -- fail-CLOSED, safe but wrong. */
+    header = sg_strfmt_alloc("[remote \"%s\"]", remote);
+    if (header == NULL) {
+        fclose(f);
+        return NULL;
+    }
 
-    while (fgets(line, sizeof(line), f) != NULL) {
+    /* Phase 65 follow-up: heap, not a fixed 1024-byte line buffer read with
+       fgets(). This half is fail-OPEN, not fail-closed: fgets() silently
+       returns a PARTIAL line once it hits the buffer limit, so a `url = ...`
+       value longer than ~1024 bytes was truncated mid-value with no error at
+       all, and every caller (e.g. `sg fetch`) went on to connect to that
+       truncated, wrong URL. Measured: a 2029-byte url in .git/config, real
+       `git remote get-url` returns it in full; the old sg code returned a
+       silently truncated prefix, and `sg fetch` issued a network request to
+       that different address. getline() grows the buffer as needed instead
+       of introducing a new fixed ceiling -- a bigger constant would only
+       move the same bug further out. */
+    while (getline(&line, &line_cap, f) != -1) {
         char *p = line;
         size_t plen;
 
@@ -165,6 +187,8 @@ char *sg_repo_read_remote_url(const char *git_dir, const char *remote)
             }
         }
     }
+    free(line);
+    free(header);
     fclose(f);
     return result;
 }

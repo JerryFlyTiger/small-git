@@ -5,6 +5,7 @@
 #include "sg/merge.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/strfmt.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
@@ -58,7 +59,7 @@ static int create_branch(const char *git_dir, const char *name)
     char ref_path[SG_PATH_MAX];
     char *current;
     const char *current_name;
-    char reflog_msg[512];
+    char *reflog_msg;
     int rc;
 
     if (!sg_ref_name_valid_for_create(name)) {
@@ -92,10 +93,20 @@ static int create_branch(const char *git_dir, const char *name)
        (e.g. a foreign detached state left behind by something else). */
     current = sg_ref_current_branch(git_dir);
     current_name = current != NULL ? current : "HEAD";
-    snprintf(reflog_msg, sizeof(reflog_msg), "branch: Created from %s", current_name);
+    /* Phase 65: heap, not a fixed 512-byte buffer. Measured against git
+       2.55.0 byte-for-byte, and current_name is a ref name -- a PATH whose
+       per-component length is capped but whose total is not (this project's
+       own bug #3, a four-component 803-char branch name, is the proof that
+       "a branch name is at most 255 bytes" is false). */
+    reflog_msg = sg_strfmt_alloc("branch: Created from %s", current_name);
     free(current);
+    if (reflog_msg == NULL) {
+        fprintf(stderr, "sg: out of memory\n");
+        return 1;
+    }
 
     rc = sg_ref_update(git_dir, ref_path, head_id, reflog_msg);
+    free(reflog_msg);
     if (rc != 0) {
         fprintf(stderr, "sg: cannot create branch '%s'\n", name);
         return 1;

@@ -13059,3 +13059,442 @@ sentence is wrong and has been removed from this file; do not restore it.
   platform table is "no longer load-bearing" -- that conclusion does not
   follow from a search that only ever covered one of the two platforms
   this project ships sanitizer coverage on.
+
+## Phase 65: converge the fixed-size message buffers
+
+Three MEASURED byte-compatibility bugs (git 2.55.0, 2026-09-04), all the
+same shape: a fixed-size stack buffer fed by `snprintf` with a
+user-controlled `%s`, return value never checked.
+
+| # | site | measured |
+|---|---|---|
+| 1 | `cmd_rebase.c`'s `theirs_label[300]` | the rebase CONFLICT MARKER. A 404-char subject: git writes a 422-byte marker, sg wrote a truncated 307 bytes -- **and lost the closing `)`**, a malformed marker, not merely a short one. |
+| 2 | `cmd_merge.c`'s `message[512]` | the MERGE COMMIT MESSAGE. Two 250-char branch names: git's message is 523 bytes, sg's was a silently-truncated 513. A different message is a different object id -- the most severe of the three. |
+| 3 | `cmd_reset.c`'s `reflog_msg[512]` (x3) | the `logs/HEAD` reset line. An 803-char, four-component branch name (every component individually legal): git writes 939 bytes, sg wrote a truncated 630. |
+
+This is the third and fourth time this exact shape has been found in this
+project (Phase 57b, `pick.c`'s conflict-marker label; Phase 64, the date
+code, twice). The correct idiom already existed in-tree, in the very file
+carrying bug #1: `cmd_rebase.c`'s `first_line_dup`/`reflog_msg_with_subject`
+size with `snprintf(NULL, 0, ...)` then `malloc`. It was simply never
+applied to `theirs_label` 90 lines further down.
+
+### The helper
+
+`char *sg_strfmt_alloc(const char *fmt, ...)` (`include/sg/strfmt.h` +
+`src/util/strfmt.c`, `printf`-format-attributed for `-Wformat` coverage on
+GCC/Clang): sizes with `vsnprintf(NULL, 0, fmt, ap)`, `malloc`s exactly that
+many bytes plus one, fills it with a second `vsnprintf`. Returns NULL on a
+negative `vsnprintf` result or an allocation failure (the two are not
+distinguished -- no caller in this codebase needs to tell them apart, every
+other allocator failure in this codebase is already treated as bare OOM).
+Placed in `util/` per the module table (pure, no fs access, no dependencies
+on anything above it).
+
+`pick.c`'s `msg_with_subject`/`build_revert_message`'s two `snprintf(NULL,
+0, ...)` blocks/`theirs_label`, and `cmd_rebase.c`'s
+`reflog_msg_with_subject`, were all already-correct hand-rolled copies of
+this exact idiom (no bug in any of them) and are now converged onto the one
+helper, per CLAUDE.md's own "known duplication, converge opportunistically
+when you touch it" rule. `cmd_switch.c`'s `checkout_msg` was deliberately
+**left unconverted**: it treats a negative `vsnprintf` result as "skip
+writing this reflog line" (not an error -- a `from == NULL` case elsewhere in
+the same function already does this legitimately), a distinction
+`sg_strfmt_alloc` collapses into a single NULL return that every other call
+site treats as fatal OOM. Converting it would need a second helper variant
+or a caller-side special case for no benefit, since that site never had a
+truncation bug to begin with.
+
+### Site-by-site verdict (`src/cli/`, `src/safety/`)
+
+Every `char <name>[<literal>]` in both directories was swept (not just
+`grep`-found -- re-swept manually after fixing, see the WARNING on ref-name
+length below).
+
+**Fixed** (user-controlled length, real-git oracle exists):
+
+- `cmd_rebase.c`: `theirs_label[300]` (bug #1, conflict marker).
+  `label[300]` x2 ("rebase onto %s" snapshot label -- see "no oracle" below,
+  listed here because the SAME conversion also fixes `start_msg[512]` x2 in
+  the same two code blocks, which DOES have an oracle: `REBASE_START_FMT`
+  ("rebase (start): checkout %s") feeds `sg_ref_set_head_detached`, i.e.
+  `logs/HEAD`. **This one was not silent truncation, it was a THIRD
+  behaviour**: the old code checked the `snprintf` return and REFUSED the
+  whole rebase ("upstream name too long", exit 1) for a long
+  `<upstream>`, where real git has no such limit and always succeeds. That is
+  sg inventing a failure real git does not have -- the opposite failure
+  direction from the other sites, but still a real divergence. Both the
+  fast-forward and the ordinary-replay code paths build this message
+  independently and both were fixed and both are exercised by their own
+  interop check.
+- `cmd_merge.c`: `message[512]` (bug #2). `reflog_msg[400]` for
+  `"merge %s: Fast-forward"` -- **measured** to be byte-for-byte what real
+  git itself writes to `logs/HEAD` on a fast-forward merge (not one of the
+  original three, found during this phase's own sweep).
+  `reflog_msg[400]` for `"merge %s: Merge made by the 'sg-3way' strategy."`
+  -- sg's wording here is a pre-existing, already-documented deliberate
+  divergence from git's own text ("Merge made by the 'ort' strategy.", see
+  `cmd_merge.c`'s own comment), so there is no git-side byte comparison to
+  pin the FULL line against; the buffer conversion is still real (a long
+  `branch_arg` truncated it) and is pinned against sg's own expected
+  literal, same convention the divergence comment already establishes.
+  **WARNING -- and this warning itself was WRONG once, which is the part
+  worth keeping.** A cold review reported that nothing had ever read this
+  line, and a follow-up round wrote that into this paragraph as "a search
+  of both `tests/interop.sh` and every `tests/*.c` found zero hits". That
+  is false: `tests/interop.sh:7516` and `:7543` have pinned this exact
+  literal since **Phase 17**, byte for byte, against both `logs/HEAD` and
+  `refs/heads/master`. The original review had scoped its grep to the
+  `phase65:` block alone and correctly found zero hits THERE; the next
+  round widened "zero hits in this block" into "zero hits anywhere"
+  without re-running the grep. **A negative search result carries its own
+  scope, and dropping the scope turns it into a different, false claim** --
+  the same failure shape as Phase 64's "no post-1970 zone has a
+  non-whole-minute offset", which was also a real scan whose range was
+  narrower than the sentence it became.
+  What IS true, and is why the new check earns its place: Phase 17's
+  fixture uses the branch name `br2`, three bytes, so it can only pin the
+  WORDING -- it cannot detect truncation of any kind. The `phase65:` check
+  added beside group B's tree check drives the same line with a 250-char
+  branch name, which is what actually witnesses the buffer conversion.
+  Group B's own assertions, correctly, still only compare the commit
+  MESSAGE and the TREE and never touch `logs/HEAD`.**
+  `build_merge_name`'s internal `out`/`out_size` (formerly a caller-supplied
+  `char[SG_PATH_MAX]`, now returns a malloc'd string): every one of its
+  format calls (`"branch '%s'"`, `"tag '%s'"`, `"commit '%s'"`) writes a
+  wrapped `base` back into a same-sized-as-input buffer, so a `base` within
+  a few bytes of `SG_PATH_MAX` (4096) could silently truncate the FINAL
+  message even though `base` itself was safely bounded -- found during the
+  sweep, not one of the three measured bugs, and has **no dedicated interop
+  fixture**: reaching the overflow needs a single argv token within
+  shouting distance of 4096 bytes, a shape none of this phase's other
+  fixtures produce (the 250-char branch names are two orders of magnitude
+  short of it). Recorded as fixed-but-unfixtured rather than silently
+  claimed covered.
+- `cmd_reset.c`: `reflog_msg[512]` x3 (bug #3, all three reset modes).
+  `label[256]` x2 (`--mixed`/`--hard` snapshot labels, no oracle -- see
+  below, fixed anyway).
+- `cmd_branch.c`: `reflog_msg[512]` for `"branch: Created from %s"` --
+  measured byte-for-byte against git. Not one of the original three, found
+  during the sweep (the fix converts `current_name`, a ref name, which per
+  the four-component bug #3 fixture is unbounded).
+- `cmd_switch.c`: `label[256]` (`detach at '%s'`/`switch to '%s'` snapshot
+  label, no oracle -- fixed anyway).
+- `cmd_restore.c`: `label[512]` (`"restore %s"`, `affected.buf` is a
+  comma-joined list of paths with no length bound, no oracle -- fixed
+  anyway).
+- `cmd_fetch.c`: `msg[256]` for `"fetch %s: %s"` -- measured (in the pre-
+  Phase-65 code's own comment, and re-verified this phase) byte-for-byte
+  against git's own fetch reflog message. Not one of the original three,
+  found during the sweep.
+- `safety/stash.c`: `subj_buf[512]`, reused for THREE different subjects in
+  sequence (`"index on ..."`, `"untracked files on ..."`,
+  `"On %s: %s"`/`"WIP on %s: %s %s"`) -- all three measured byte-for-byte
+  against git's own stash message forms. **Not one of the original three,
+  found during this phase's own sweep of `src/safety/`** -- arguably the
+  most severe omission from the original bug list, since the stash SUBJECT
+  is also the STASH COMMIT's own message (a different message is a
+  different object id, same severity class as bug #2) and is reused
+  VERBATIM as the `refs/stash` reflog line (the raw, uncleaned `subj_buf`,
+  not the cleaned message -- this is why `subj_buf` has to survive past
+  `sg_message_cleanup` in the rewritten code, same asymmetry the original
+  fixed buffer had).
+
+**No dedicated interop fixture, fixed anyway (mechanical, no oracle)**:
+every "no oracle" site above (`cmd_rebase.c`'s two `label[300]` snapshot
+labels, `cmd_merge.c`'s two snapshot labels, `cmd_reset.c`'s two,
+`cmd_switch.c`'s one, `cmd_restore.c`'s one) is `sg`'s own feature
+(automatic pre-operation snapshots have no real-git counterpart), so there
+is nothing to compare bytes against. Converted anyway because CLAUDE.md's
+"no default" rule for `sg_workdir_missing` applies here in spirit: silently
+truncating a label that the user never sees compared against, but which
+`sg undo`'s listing later prints back, is still a real (if unwitnessed)
+correctness bug -- a label describing a 300-char branch name that got cut
+to "rebase onto aaaa...<CUT>" is actively misleading, not merely short.
+
+**Unreachable** (argued, not just asserted):
+
+- `cmd_rebase.c`/`cmd_merge.c`/`pick.c`/`safety/stash.c`'s every
+  `short_hex[8]`/`onto_label[8]`/`short_sha[8]`: always exactly
+  `sg_sha1_to_hex`'s first 7 hex digits plus a NUL, written by a helper that
+  takes a fixed `char out[8]` parameter and controls both ends -- there is no
+  variable-length input anywhere in the call.
+- `cmd_undo.c`'s `label[64]` (`"undo (restore snapshot #%ld)"`): the only
+  variable is `%ld` on a parsed `long`, at most ~20 decimal digits (64-bit),
+  plus a fixed ~26-byte literal -- under 64 by a comfortable margin, and `n`
+  is bounded above by `list.count` (an actual snapshot count) long before it
+  reaches this line. `sg undo` also has no real-git oracle at all (documented
+  elsewhere in this file), so there would be nothing to compare against even
+  if it could overflow.
+- `cmd_stash.c`'s `usage[80]` (`"usage: sg stash %s ..."`, `cmd_name`):
+  `cmd_name` is one of exactly two hardcoded C string literals
+  (`"pop"`/`"apply"`), never argv.
+- `pick.c`'s `what[32]` (`"sg %s"`, `op`): `op` is one of exactly two
+  hardcoded literals (`"cherry-pick"`/`"revert"`), never argv.
+- `safety/stash.c`'s `buf[32]` (`sg_stash_parse_spec`'s digit-parsing
+  buffer): not a `snprintf`-into-fixed-buffer site at all -- it's an
+  explicit `memcpy` gated on `digits_len >= sizeof(buf)` returning -1
+  first, the correctly-bounded shape this whole phase's fix converges
+  everything else onto.
+- `cmd_branch.c`'s/`cmd_status.c`'s `detached[4160]`
+  (`sg_ref_detach_description`'s caller buffer): **already correct, not
+  converted.** `sg_ref_detach_description` itself (`storage/refs.c`) DOES
+  check its own `snprintf` return and degrades gracefully to the abbreviated
+  id on overflow, with an explicit, pre-existing comment recording that this
+  is "sg's own bounded-buffer degradation, not a measured behaviour" (real
+  git has no such limit). This is the checked-with-fallback shape the rest
+  of this phase converts TOWARD, not the silent-truncation shape it removes
+  -- there was nothing to fix here.
+- `cmd_switch.c`'s `checkout_msg`/`from_hex[SG_SHA1_HEX_LEN+1]`: already
+  heap (see "The helper" above for why it was deliberately left as its own
+  hand-rolled copy rather than converged); `from_hex` is a fixed 7-hex-digit
+  buffer, same shape as the `short_hex[8]` sites above.
+
+**`src/storage/repo.c`, fixed in a Phase 65 follow-up round (a cold review
+after all four gates were green found a SECOND, more severe bug in the same
+function; both are now fixed).** This section originally recorded
+`sg_repo_read_remote_url`'s `char header[256]` as found-but-explicitly-out-
+of-scope. That review found the function has **two** independent fixed-size
+buffers, not one, and the second is worse than the first:
+
+1. `char header[256]`, built via `snprintf(header, sizeof(header), "[remote
+   \"%s\"]", remote)` with the return value unchecked. A remote NAME long
+   enough to overflow this truncates the generated header to fewer bytes
+   than the config section it needs to match, so the `strcmp` comparing
+   them never succeeds -- a well-formed `[remote "<name>"]` section is
+   silently reported as "remote not configured". **Fail-CLOSED**: safe
+   (nothing is contacted), but still a wrong answer. Originally found by
+   accident: an earlier draft of this phase's `cmd_fetch.c` interop fixture
+   used a 250-char remote name and the fetch silently failed even though
+   the matching section was present in `.git/config` verbatim; the phase65
+   fetch fixture's remote name was shortened to 240 chars specifically to
+   stay under this buffer's (then-unfixed) threshold.
+2. `char line[1024]`, read with `fgets(line, sizeof(line), f)`. A `url =
+   ...` value long enough that the WHOLE LINE (indentation + `url = ` +
+   value + newline) exceeds roughly 1024 bytes is silently truncated
+   mid-value -- `fgets` returns a partial line at the buffer boundary with
+   no error at all. **Fail-OPEN, and the more severe of the two**: every
+   caller (`sg fetch`/`sg push`) goes on to connect to a DIFFERENT, wrong
+   address, with no warning. Measured directly: a 2029-byte url written to
+   `.git/config`, `git remote get-url` (real git has no such limit) returns
+   it in full; the old sg code returned a silently truncated prefix, and a
+   `sg fetch` built against that config issued a real network request to
+   the different, truncated address (an `example.com` HTTP error page came
+   back, confirming the request actually left for a host the user never
+   configured). This bug was NOT found during Phase 65's own sweep at all
+   -- Phase 65 only ever looked at `header[256]`, one buffer over.
+
+Both are fixed the same way as the rest of this phase: `header` now uses
+`sg_strfmt_alloc`, and `line` is now read with POSIX `getline()` (grows as
+needed, already the idiom `safety/sequencer.c` uses elsewhere in this
+codebase) instead of a bigger fixed ceiling, which would only move bug #2
+further out rather than remove it. Regression-tested by
+`tests/test_repo_remote_url.c` (calls `sg_repo_read_remote_url` directly:
+one case for each buffer, a 400-char remote name and a 2029-character url)
+and by `tests/interop.sh`'s new `phase65 follow-up:` checks for bug #1 (a
+250-char remote name, fetched over the same local ssh shim `phase47`/
+group H use -- no real network request; a 400-char name was tried first
+and rejected with "File name too long", since the remote name becomes a
+single `refs/remotes/<name>/` path COMPONENT and this filesystem's
+NAME_MAX is 255 bytes, unrelated to the bug under test). Bug #2 has **no**
+interop-level check, and the reason is scoped, not absolute: reproducing it
+over the SSH SHIM would need a real filesystem path over 1024 bytes for
+that shim to exec against, which exceeds this platform's `PATH_MAX` (1024,
+confirmed by `mkdir`/`git init --bare` actually failing at that length).
+**That argument covers the ssh transport only.** `tests/interop.sh` also
+has an `HTTP_AVAILABLE` branch (`git http-backend`), whose URL does not
+have to survive a path system call byte for byte, so padding a
+`url = ...` line past 1024 bytes there was NOT ruled out -- it was simply
+not attempted, and is written down here as an open possibility rather than
+an impossibility. The unit test is the only witness today.
+**Do not read the ssh measurement as covering both**: this write-up has
+already had two negative results widen past their own scope (the
+"zero hits" claim above, and Phase 64's zoneinfo scan), and each time the
+sentence outlived the measurement that justified it. Both mutated back to their
+original fixed-buffer shape and rebuilt to confirm the new tests catch
+them (see the accompanying implementation report for the exact mutation
+diffs and output).
+
+### Tests
+
+- `tests/test_strfmt.c`: empty result, no-specifier passthrough, a result
+  crossing ten sizes from 8 to 10000 bytes (there is no internal "initial
+  guess" to cross, since sizing is exact via `vsnprintf(NULL, 0, ...)`, but
+  this still pins that nothing truncates at any of the sizes the buffers
+  this phase removes used to be), an embedded `%%`, and multiple arguments.
+- `tests/interop.sh`'s `phase65:` group, all built with the "construct once
+  with sg, then copy" technique (same as `phase41`) so both tools operate on
+  IDENTICAL commits/trees -- the compared bytes are always a reflog MESSAGE
+  FIELD (extracted with `cut -f2-`, not the whole log line, which also
+  carries a timestamp neither tool can be made to agree on without a shared
+  fake clock; **do not use a `sed 's/^[^\t]*\t//'` bracket-expression
+  pattern for this on this platform** -- see the WARNING below, it silently
+  extracts nothing):
+  - A: rebase conflict marker, 404-char subject (bug #1), plus a regression
+    witness that the marker keeps its closing `)`.
+  - B: merge commit MESSAGE, two 250-char branch names (bug #2) --
+    compares the message AND the resulting tree (the tree is
+    timestamp-independent and catches a broken merge; the id itself is not
+    compared for a reason explained below).
+  - C: reset reflog, 803-char 4-component ref name (bug #3).
+  - D: branch-create reflog, 803-char current branch name.
+  - E: fast-forward merge reflog, 501-char branch name.
+  - F: stash message, 600-char `-m`.
+  - G: rebase start message, 501-char upstream name, BOTH the
+    fast-forward and the ordinary-replay code paths, asserting exit 0
+    where the old code refused with "upstream name too long".
+  - H: fetch reflog, 240-char remote name, over the same unconditional SSH
+    shim `phase47` uses (no live HTTP server needed, no `HTTP_AVAILABLE`
+    gate).
+  All eight groups: `bash tests/interop.sh` is **3169/3169 passed, 0
+  skipped, 0 FAIL, exit 0**.
+
+WARNING: **`sed 's/^[^\t]*\t//'` does not strip up to the first TAB on this
+project's target sed (BSD sed, macOS) -- `\t` INSIDE a bracket expression
+`[...]` is not a tab, it's the two literal characters `\` and `t`,
+individually excluded from the class.** (`\t` OUTSIDE a bracket expression,
+e.g. a bare `s/^\t//`, IS interpreted as tab -- that usage, `phase38`'s
+`sed -n 's/^\t//p'`, is unaffected and was never the bug.) The first draft
+of this phase's fixtures used `[^\t]*\t` to strip a reflog line's
+`<old> <new> <name> <email> <ts> <tz>` prefix before comparing the message,
+and it silently stopped at the first literal `t` character anywhere in that
+prefix (the committer NAME almost always has one, e.g. "Interop **T**est"),
+producing a false PASS/FAIL pattern that looked like real divergences.
+Fixed by using `cut -f2-` instead (the reflog format has exactly one tab,
+separating the fixed-width prefix from the free-form message, and `cut`'s
+default delimiter is tab).
+
+WARNING: **a genuinely unrelated shell bug in the SAME fixture round
+briefly looked like a real sg regression**: the non-fast-forward rebase
+fixture (group G's second half) originally had both branches edit the SAME
+file with incompatible content, which is a real merge conflict -- the
+fixture's own precondition, not a bug in the fix being tested. Changed to
+touch two different files so the rebase completes cleanly and the check
+(exit 0, no such limit) actually tests what it claims to.
+
+### Follow-up round: closing the witness gaps a cold review found
+
+A review after all four gates were green found the repo.c bug above plus
+five sites this phase's own fixtures exercised the CODE of but never
+actually asserted anything about -- reverting any one of them alone left
+`bash tests/interop.sh` fully green. Each is now covered:
+
+- `cmd_reset.c:174` (`RESET_SOFT`) and `cmd_reset.c:266` (`RESET_MIXED`):
+  group C above only ever ran `--hard`. Two new parallel fixtures
+  (`P65_RSOFT`/`P65_RMIXED`, same 803-char 4-component ref shape) run
+  `--soft`/`--mixed` and `cmp` `logs/HEAD`'s message field against git,
+  same technique as the rest of this phase.
+- `safety/stash.c`'s `subj_buf` is reused for FOUR different subject
+  forms in sequence, and group F's `-m` fixture can only ever reach one
+  of them (`"On %s: %s"`). A new fixture (`P65_STB`, an 803-char
+  4-component branch name, `stash push -u` with no `-m`) exercises and
+  `cmp`s the other three against git: `"index on %s: %s %s"`
+  (stash.c:657, always built regardless of `-m`), `"untracked files on
+  %s: %s %s"` (stash.c:704, needs `-u`), and `"WIP on %s: %s %s"`
+  (stash.c:742, the no-`-m` default -- arguably the most common form in
+  practice).
+- `cmd_merge.c:462`'s `"merge %s: Merge made by the 'sg-3way' strategy."`
+  reflog line: this phase's own write-up (a few paragraphs above) claimed
+  it was "pinned against sg's own expected literal", and that claim was
+  false -- no check anywhere in `tests/interop.sh` or `tests/*.c` ever
+  read `logs/HEAD` for this line before this follow-up round. Group B's
+  existing fixture already executes the line; a new check right after its
+  tree comparison now reads `logs/HEAD`'s last line and `cmp`s it against
+  sg's own expected literal (there is still no git-side text to compare
+  against, per the pre-existing deliberate-divergence comment beside that
+  line).
+
+Two more sites had a real oracle but a weaker method than every other
+group in this phase, also found and fixed by the same review:
+
+- Group G (`cmd_rebase.c`'s `start_msg`) previously only checked the exit
+  code and grep'd for the SUBSTRING `rebase (start)`/`rebase (finish)` in
+  `logs/HEAD` -- it never `cmp`'d the line's actual bytes against git,
+  unlike every other group in this phase. Both `P65_RFF` (fast-forward)
+  and `P65_RSTART` (ordinary replay) now build a `git-copy` (same
+  "construct once with sg, then copy" technique as the rest of this
+  phase), run `git rebase` on the copy, and `cmp` the `rebase (start):
+  checkout <upstream>` message field byte-for-byte. (Measured first, via a
+  throwaway probe: real git writes this exact line even on a pure
+  fast-forward rebase with no commits to replay -- it is not a
+  fast-forward-only shortcut that skips the sequencer's reflog lines.)
+- Group H (`cmd_fetch.c`'s reflog message) was the only group in this
+  phase comparing sg's output against a self-built expected STRING
+  (`printf 'fetch %s: storing head\n' ...`) rather than against real
+  git's own actual output on an identically-built fixture -- every other
+  group does a direct git-vs-sg A/B. Changed to `cmp` against
+  `$P65_FDEST_GIT`'s own reflog line instead (that destination was
+  already being fetched into for the exit-code oracle check two lines
+  above; this reuses it rather than adding a second fetch).
+
+All ten groups (A-I, where I is the new `src/storage/repo.c` group):
+`bash tests/interop.sh` is **3184/3184 passed, 0 skipped, 0 FAIL, exit 0**
+after this follow-up round (see the report accompanying this round for the
+exact command output).
+
+### Why no direct git-vs-sg MERGE COMMIT ID comparison
+
+Section 3 of this phase's spec asked for a commit-ID comparison ("that's
+what makes the severity visible"), and group B compares the MESSAGE and the
+TREE but not the commit id itself. Reason: neither `cmd_merge.c`'s nor
+`cmd_commit.c`'s `author_time`/`committer_time` reads `GIT_AUTHOR_DATE`/
+`GIT_COMMITTER_DATE` (both call `time(NULL)` directly) -- a pre-existing gap
+in this codebase, outside this phase's scope, and it means two commits built
+by two different processes running at two different wall-clock seconds can
+never hash to the same id no matter how correct the message is. `phase43`
+(Phase 43's own merge-message interop group) hit the identical constraint
+and also only ever compares `git log -1 --format=%s`, never the id.
+
+The severity claim ("a different message is a different commit id") is
+instead demonstrated by MUTATION: reverting `cmd_merge.c`'s `message[512]`
+fix and rebuilding, then running the IDENTICAL phase65-group-B fixture
+against both the fixed and the mutated `sg` binary, produces two DIFFERENT
+commit ids for the same tree/parents/branch names -- proving the message
+change is not merely cosmetic. This project's own testing convention
+requires mutation verification to be run by the reviewing conversation, not
+by whoever wrote the fix/test, so the exact commands are handed off rather
+than run here; see the accompanying implementation report for the list.
+
+### Leak check (`/usr/bin/leaks --atExit`, macOS ASan does not detect leaks)
+
+Every converted call site was driven once through a fixture long enough to
+actually allocate via `sg_strfmt_alloc` and exercise the success path:
+rebase conflict (theirs_label), merge (message + both labels +
+build_merge_name's branch arm), reset --hard, branch create, switch, restore
+(a lossy `--force` restore), stash push -m, fetch over the ssh shim. All
+eight: **`0 leaks for 0 total leaked bytes`**.
+
+### `src/storage/repo.c`'s new `sg_repo_read_remote_url` allocations
+
+The follow-up round's two new heap sites (`header` via `sg_strfmt_alloc`,
+`line` via `getline`) were driven through `sg fetch` over the ssh shim
+(the phase65 follow-up `phase65 follow-up:` interop group, a 400-char
+remote name) under `/usr/bin/leaks --atExit`: **0 leaks for 0 total leaked
+bytes**.
+
+### KNOWN, PRE-EXISTING leak in `pick.c`'s `attempt_one` (not introduced by
+Phase 65, not fixed by this follow-up round)
+
+Found by review while cold-reading this phase's diff: in `attempt_one`
+(`src/cli/pick.c`), when `theirs_label = sg_strfmt_alloc(...)` returns NULL
+(an OOM path), the function returns `ATTEMPT_ERROR` directly
+(`src/cli/pick.c:337-340`) without calling `attempt_result_free(out)` --
+`out->message` (set a few lines earlier, at either the cherry-pick or the
+revert branch) is therefore leaked on that one path.
+
+**Confirmed pre-existing, not a Phase 65 regression**: the hand-rolled
+`snprintf(NULL, 0, ...)` + `malloc` code this phase replaced with
+`sg_strfmt_alloc` had the exact same gap at the exact same spot -- the
+conversion changed the ALLOCATOR, not the error-handling shape around it,
+so this leak predates Phase 65 by however many phases `pick.c`'s own
+`theirs_label` construction does (Phase 57). Reachable only on real OOM
+(a `malloc`/`vsnprintf` failure), which is why none of this project's
+fuzzers or interop fixtures have ever hit it. **Deliberately left unfixed
+in this round** (recorded rather than silently repaired, per this
+project's own "say noted vs. fixed plainly" convention) -- the fix, if
+done, is a one-line `attempt_result_free(out); return ATTEMPT_ERROR;` at
+that call site, matching the two OTHER early-return sites in the same
+function (lines 309-311, 317-319) which do NOT call
+`attempt_result_free` either, because at those two earlier points
+`out->message` has not been set yet -- this third site is the one where it
+has, and is the one exception among the three.

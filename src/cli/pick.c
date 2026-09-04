@@ -12,6 +12,7 @@
 #include "sg/refs.h"
 #include "sg/similarity.h"
 #include "sg/snapshot.h"
+#include "sg/strfmt.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -65,16 +66,8 @@ static char *first_line_dup(const char *message)
 static char *msg_with_subject(const char *prefix, const char *message)
 {
     size_t subject_len = strcspn(message, "\n");
-    int need = snprintf(NULL, 0, "%s%.*s", prefix, (int)subject_len, message);
-    char *out;
 
-    if (need < 0)
-        return NULL;
-    out = malloc((size_t)need + 1);
-    if (out == NULL)
-        return NULL;
-    snprintf(out, (size_t)need + 1, "%s%.*s", prefix, (int)subject_len, message);
-    return out;
+    return sg_strfmt_alloc("%s%.*s", prefix, (int)subject_len, message);
 }
 
 /* ==================== revert's message (Phase 57 spec section 4) ==================== */
@@ -140,35 +133,15 @@ static int build_revert_message(const unsigned char commit_id[SG_SHA1_RAW_LEN],
     sg_sha1_to_hex(commit_id, commit_hex);
 
     if (has_mainline) {
-        int need;
-
         sg_sha1_to_hex(parent_id, parent_hex);
-        need = snprintf(NULL, 0, "%s\n\nThis reverts commit %s, reversing\nchanges made to %s.\n",
-                        subject_line, commit_hex, parent_hex);
-        if (need < 0) {
-            free(subject_line);
-            return -1;
-        }
-        raw = malloc((size_t)need + 1);
-        if (raw == NULL) {
-            free(subject_line);
-            return -1;
-        }
-        snprintf(raw, (size_t)need + 1, "%s\n\nThis reverts commit %s, reversing\nchanges made to %s.\n",
-                subject_line, commit_hex, parent_hex);
+        raw = sg_strfmt_alloc("%s\n\nThis reverts commit %s, reversing\nchanges made to %s.\n",
+                              subject_line, commit_hex, parent_hex);
     } else {
-        int need = snprintf(NULL, 0, "%s\n\nThis reverts commit %s.\n", subject_line, commit_hex);
-
-        if (need < 0) {
-            free(subject_line);
-            return -1;
-        }
-        raw = malloc((size_t)need + 1);
-        if (raw == NULL) {
-            free(subject_line);
-            return -1;
-        }
-        snprintf(raw, (size_t)need + 1, "%s\n\nThis reverts commit %s.\n", subject_line, commit_hex);
+        raw = sg_strfmt_alloc("%s\n\nThis reverts commit %s.\n", subject_line, commit_hex);
+    }
+    if (raw == NULL) {
+        free(subject_line);
+        return -1;
     }
     free(subject_line);
 
@@ -358,21 +331,13 @@ static attempt_rc attempt_one(const char *git_dir, const char *repo_root, sg_seq
         const char *prefix = kind == SG_SEQ_REVERT ? "parent of " : "";
         char *summary = first_line_dup(commit.message);
         const char *summary_or_empty = summary != NULL ? summary : "";
-        int need = snprintf(NULL, 0, "%s%s (%s)", prefix, short_sha, summary_or_empty);
 
-        if (need < 0) {
-            free(summary);
-            sg_commit_free(&commit);
-            return ATTEMPT_ERROR;
-        }
-        theirs_label = malloc((size_t)need + 1);
-        if (theirs_label == NULL) {
-            free(summary);
-            sg_commit_free(&commit);
-            return ATTEMPT_ERROR;
-        }
-        snprintf(theirs_label, (size_t)need + 1, "%s%s (%s)", prefix, short_sha, summary_or_empty);
+        theirs_label = sg_strfmt_alloc("%s%s (%s)", prefix, short_sha, summary_or_empty);
         free(summary);
+        if (theirs_label == NULL) {
+            sg_commit_free(&commit);
+            return ATTEMPT_ERROR;
+        }
     }
 
     if (sg_merge_trees(git_dir, base_tree, ours_tree, theirs_tree, "HEAD", theirs_label,

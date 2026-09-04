@@ -8,6 +8,7 @@
 #include "sg/pack.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/strfmt.h"
 #include "sg/transport.h"
 #include "sg/workdir.h"
 
@@ -429,7 +430,7 @@ int sg_cmd_fetch(int argc, char **argv)
                which is enough to make `sg fetch origin` and `git fetch
                origin` produce byte-identical messages (measured against git
                2.55.0). */
-            char msg[256];
+            char *msg;
             const char *result;
 
             if (!had_old)
@@ -438,12 +439,24 @@ int sg_cmd_fetch(int argc, char **argv)
                 result = "fast-forward";
             else
                 result = "forced-update";
-            snprintf(msg, sizeof(msg), "fetch %s: %s", remote, result);
+            /* Phase 65: heap, not a fixed 256-byte buffer. `remote` is
+               argv, not bounded to any particular length, and this line is
+               measured byte-identical to real git's own fetch reflog
+               message for `sg fetch <remote>` (see the comment above) -- a
+               long remote name silently truncating it would be a real
+               divergence, not just a cosmetic one. */
+            msg = sg_strfmt_alloc("fetch %s: %s", remote, result);
+            if (msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
+                goto done;
+            }
 
             if (sg_ref_update(git_dir, ref_path, adv.refs[i].id, msg) != 0) {
                 fprintf(stderr, "sg: failed to update %s\n", ref_path);
+                free(msg);
                 goto done;
             }
+            free(msg);
         }
         any_updated = 1;
 

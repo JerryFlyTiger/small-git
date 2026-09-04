@@ -19,6 +19,7 @@
 #include "sg/similarity.h"
 #include "sg/snapshot.h"
 #include "sg/status.h"
+#include "sg/strfmt.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -100,12 +101,20 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
                            const unsigned char theirs_commit[SG_SHA1_RAW_LEN],
                            const unsigned char theirs_tree[SG_SHA1_RAW_LEN], int force)
 {
-    char label[300];
+    char *label;
     int apply_rc;
-    char reflog_msg[400];
+    char *reflog_msg;
 
-    snprintf(label, sizeof(label), "merge %s (fast-forward)", branch_arg);
+    /* Phase 65: heap, not a fixed 300-byte buffer -- this is a snapshot
+       label (sg's own feature, no real-git oracle), but a truncated one
+       would still silently misname the snapshot. */
+    label = sg_strfmt_alloc("merge %s (fast-forward)", branch_arg);
+    if (label == NULL) {
+        fprintf(stderr, "sg: out of memory\n");
+        return 1;
+    }
     apply_rc = sg_safe_apply_tree(git_dir, repo_root, theirs_tree, label, force);
+    free(label);
     if (apply_rc == 1) {
         fprintf(stderr, "sg: merge aborted\n");
         return 1;
@@ -113,11 +122,22 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
     if (apply_rc != 0)
         return 1;
 
-    snprintf(reflog_msg, sizeof(reflog_msg), "merge %s: Fast-forward", branch_arg);
-    if (sg_ref_move_head(git_dir, current_branch, theirs_commit, reflog_msg) != 0) {
-        fprintf(stderr, "sg: failed to update HEAD\n");
+    /* Phase 65: heap, not a fixed 400-byte buffer. Measured against real
+       git 2.55.0: this line ("merge <branch>: Fast-forward") IS byte-for-
+       byte what git itself writes to logs/HEAD on a fast-forward merge, so
+       a long branch_arg silently truncating it is a real divergence, not
+       just a cosmetically short reflog line. */
+    reflog_msg = sg_strfmt_alloc("merge %s: Fast-forward", branch_arg);
+    if (reflog_msg == NULL) {
+        fprintf(stderr, "sg: out of memory\n");
         return 1;
     }
+    if (sg_ref_move_head(git_dir, current_branch, theirs_commit, reflog_msg) != 0) {
+        fprintf(stderr, "sg: failed to update HEAD\n");
+        free(reflog_msg);
+        return 1;
+    }
+    free(reflog_msg);
 
     if (ours_commit != NULL)
         print_fast_forward_report(git_dir, repo_root, ours_commit, theirs_commit, theirs_tree);
@@ -154,17 +174,23 @@ static void print_conflict_message(char **conflict_paths, size_t conflict_count)
    before classifying, then the SHORTENED name is what gets printed, so
    `topic~0` reads as a branch merge. Anything that is neither a branch nor a
    tag after stripping is a commit. */
-static void build_merge_name(const char *git_dir, const char *arg, char *out, size_t out_size)
+/* Returns a malloc'd string the caller frees, NULL on OOM. Phase 65: `out`/
+   `out_size` used to be a caller-supplied `char[SG_PATH_MAX]` buffer, and
+   every branch below formats "<kind> '<base>'" straight into it -- `base`
+   itself is bounded to SG_PATH_MAX-1 bytes by the first snprintf below, but
+   formatting it back with a "branch '"/"tag '"/"commit '" wrapper and a
+   closing quote can still overflow an SG_PATH_MAX-sized `out` for a `base`
+   within a few bytes of that bound, silently truncating the merge commit
+   MESSAGE. Heap avoids that the same way the other Phase 65 sites do. */
+static char *build_merge_name(const char *git_dir, const char *arg)
 {
     char base[SG_PATH_MAX];
     size_t len;
     unsigned char id[SG_SHA1_RAW_LEN];
     char tag_path[SG_PATH_MAX];
 
-    if (snprintf(base, sizeof(base), "%s", arg) >= (int)sizeof(base)) {
-        snprintf(out, out_size, "commit '%s'", arg);
-        return;
-    }
+    if (snprintf(base, sizeof(base), "%s", arg) >= (int)sizeof(base))
+        return sg_strfmt_alloc("commit '%s'", arg);
     for (;;) {
         len = strlen(base);
         while (len > 1 && base[len - 1] == '^')
@@ -187,20 +213,14 @@ static void build_merge_name(const char *git_dir, const char *arg, char *out, si
         base[len] = '\0';
     }
     if (sg_ref_branch_exists(git_dir, base) ||
-       (strncmp(base, "refs/heads/", 11) == 0 && sg_ref_read_path(git_dir, base, id) == 0)) {
-        snprintf(out, out_size, "branch '%s'", base);
-        return;
-    }
+       (strncmp(base, "refs/heads/", 11) == 0 && sg_ref_read_path(git_dir, base, id) == 0))
+        return sg_strfmt_alloc("branch '%s'", base);
     if (snprintf(tag_path, sizeof(tag_path), "refs/tags/%s", base) < (int)sizeof(tag_path) &&
-       sg_ref_read_path(git_dir, tag_path, id) == 0) {
-        snprintf(out, out_size, "tag '%s'", base);
-        return;
-    }
-    if (strncmp(base, "refs/tags/", 10) == 0 && sg_ref_read_path(git_dir, base, id) == 0) {
-        snprintf(out, out_size, "tag '%s'", base);
-        return;
-    }
-    snprintf(out, out_size, "commit '%s'", base);
+       sg_ref_read_path(git_dir, tag_path, id) == 0)
+        return sg_strfmt_alloc("tag '%s'", base);
+    if (strncmp(base, "refs/tags/", 10) == 0 && sg_ref_read_path(git_dir, base, id) == 0)
+        return sg_strfmt_alloc("tag '%s'", base);
+    return sg_strfmt_alloc("commit '%s'", base);
 }
 
 /* git omits the " into <branch>" suffix on exactly two branch names,
@@ -267,11 +287,17 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
        unconditional, not gated on `dirty`. A failed snapshot must abort the
        whole operation rather than proceed unprotected. */
     {
-        char label[300];
-
+        /* Phase 65: heap, not a fixed 300-byte buffer -- snapshot label,
+           sg's own feature (no real-git oracle), but still worth sizing to
+           branch_arg rather than truncating it silently. */
+        char *label = sg_strfmt_alloc("merge %s", branch_arg);
         char snap_bad_path[SG_PATH_MAX];
 
-        snprintf(label, sizeof(label), "merge %s", branch_arg);
+        if (label == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            sg_index_free(&idx);
+            return 1;
+        }
         snap_bad_path[0] = '\0';
         if (sg_snapshot_create(git_dir, repo_root, &idx, label, NULL, snap_bad_path) != 0) {
             if (snap_bad_path[0] != '\0')
@@ -281,9 +307,11 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
             else
                 fprintf(stderr, "sg: automatic snapshot failed, aborting this merge for safety "
                                 "(no changes made)\n");
+            free(label);
             sg_index_free(&idx);
             return 1;
         }
+        free(label);
     }
     sg_index_free(&idx);
 
@@ -332,23 +360,42 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         unsigned char *serialized;
         size_t serialized_len;
         unsigned char new_commit_id[SG_SHA1_RAW_LEN];
-        char message[512];
+        char *message;
         char *cleaned_message;
         const char *name = env_or("GIT_AUTHOR_NAME", "small_git");
         const char *email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
 
-        char merge_name[SG_PATH_MAX];
+        char *merge_name;
 
-        build_merge_name(git_dir, branch_arg, merge_name, sizeof(merge_name));
-        if (merge_msg_names_target(ours_label))
-            snprintf(message, sizeof(message), "Merge %s into %s\n", merge_name, ours_label);
-        else
-            snprintf(message, sizeof(message), "Merge %s\n", merge_name);
-        if (sg_message_cleanup(message, &cleaned_message) != 0) {
+        merge_name = build_merge_name(git_dir, branch_arg);
+        if (merge_name == NULL) {
             fprintf(stderr, "sg: out of memory\n");
             rc = 1;
             goto done;
         }
+        /* Phase 65: heap, not a fixed 512-byte buffer -- MEASURED against
+           git 2.55.0 producing a genuinely different commit id, not just a
+           short message: two 250-char branch names gave git a 523-byte
+           message and sg a silently-truncated 513-byte one. A different
+           message is a different object id, the most severe of the three
+           bugs this phase exists to fix. */
+        if (merge_msg_names_target(ours_label))
+            message = sg_strfmt_alloc("Merge %s into %s\n", merge_name, ours_label);
+        else
+            message = sg_strfmt_alloc("Merge %s\n", merge_name);
+        free(merge_name);
+        if (message == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            rc = 1;
+            goto done;
+        }
+        if (sg_message_cleanup(message, &cleaned_message) != 0) {
+            fprintf(stderr, "sg: out of memory\n");
+            free(message);
+            rc = 1;
+            goto done;
+        }
+        free(message);
 
         memset(&commit, 0, sizeof(commit));
         if (sg_tree_build_from_index(git_dir, &new_idx, commit.tree) != 0) {
@@ -404,15 +451,29 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
                ran `git reflog` against an sg-built repo. This is a
                deliberate divergence from real git's exact text, not a gap
                -- interop coverage for this line asserts sg's own string. */
-            char reflog_msg[400];
+            /* Phase 65: heap. sg's own wording deliberately diverges from
+               git's exact text (see above), but a long branch_arg silently
+               truncating the line is still a bug -- the fixed 400-byte
+               buffer is converted for the same reason as every other site
+               in this phase, even though there is no real-git byte
+               comparison to pin the result against (interop pins sg's own
+               expected literal instead, same convention this line's own
+               comment already documents). */
+            char *reflog_msg = sg_strfmt_alloc(
+                    "merge %s: Merge made by the 'sg-3way' strategy.", branch_arg);
 
-            snprintf(reflog_msg, sizeof(reflog_msg), "merge %s: Merge made by the 'sg-3way' strategy.",
-                    branch_arg);
-            if (sg_ref_move_head(git_dir, current_branch, new_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: failed to update HEAD\n");
+            if (reflog_msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
                 rc = 1;
                 goto done;
             }
+            if (sg_ref_move_head(git_dir, current_branch, new_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: failed to update HEAD\n");
+                free(reflog_msg);
+                rc = 1;
+                goto done;
+            }
+            free(reflog_msg);
         }
 
         if (sg_merge_head_remove(git_dir) != 0)

@@ -17394,6 +17394,419 @@ else
     skip "phase64 deliberate divergence #7: --date=format-local:%z under Africa/Monrovia (sg side, pinned) -- Africa/Monrovia not in this machine's zoneinfo database"
 fi
 
+# ============================================================
+# Phase 65: converge the fixed-size message buffers. Three MEASURED
+# byte-compatibility bugs, all the same shape (a fixed-size stack buffer fed
+# by snprintf with a user-controlled %s, return value never checked): the
+# rebase conflict marker, the merge commit MESSAGE (a different message is a
+# different commit id -- the most severe of the three), and the reset
+# reflog line. Each fixture below is built ONCE with sg, then copied so both
+# tools operate on IDENTICAL commits/trees (same technique as phase41) --
+# where the compared bytes are a reflog MESSAGE FIELD (not the whole log
+# line, which also carries a timestamp neither tool can be made to agree on
+# without a shared fake clock) this is what makes a byte-for-byte cmp
+# meaningful at all.
+#
+# A true git-vs-sg MERGE COMMIT ID comparison (the id, not just the message)
+# is blocked by that same wall-clock non-determinism -- neither
+# cmd_merge.c's nor cmd_commit.c's author_time reads GIT_AUTHOR_DATE, a
+# pre-existing gap outside this phase's scope. The "different message means
+# a different id" severity claim is instead demonstrated by mutation (see
+# the report accompanying this phase): reverting the message[512] fix and
+# rerunning the identical fixture on the fixed vs. mutated sg binary
+# produces two DIFFERENT commit ids for the same tree/parents, not merely
+# different printed text.
+
+# --- A. sg_rebase's theirs conflict-marker label, bug #1: a 404-char
+# subject. Measured: git writes a 422-byte marker, the old sg buffer wrote
+# a truncated 307 bytes and even lost the closing ')'. ---
+P65_R="$WORKDIR/p65_rebase_label"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_R")") > /dev/null 2>&1
+printf 'r1\nr2\nr3\nr4\n' > "$P65_R/g.txt"
+(cd "$P65_R" && "$SG" add g.txt && "$SG" commit -m base) > /dev/null 2>&1
+(cd "$P65_R" && "$SG" branch topic) > /dev/null 2>&1
+printf 'r1\nr2\nMASTER-3\nr4\n' > "$P65_R/g.txt"
+(cd "$P65_R" && "$SG" add g.txt && "$SG" commit -m "master edits g") > /dev/null 2>&1
+(cd "$P65_R" && "$SG" switch topic) > /dev/null 2>&1
+printf 'r1\nr2\nTOPIC-3\nr4\n' > "$P65_R/g.txt"
+P65_LONGSUBJECT=$(python3 -c "print('A' * 404)")
+(cd "$P65_R" && "$SG" add g.txt && "$SG" commit -m "$P65_LONGSUBJECT") > /dev/null 2>&1
+rm -rf "$P65_R.git-copy"
+cp -R "$P65_R" "$P65_R.git-copy"
+(cd "$P65_R" && "$SG" rebase master) > /dev/null 2>&1
+(cd "$P65_R.git-copy" && LC_ALL=C git rebase master) > /dev/null 2>&1
+check "phase65: precondition -- both copies really conflicted during the rebase" \
+    sh -c "grep -q '^>>>>>>> ' '$P65_R/g.txt' && grep -q '^>>>>>>> ' '$P65_R.git-copy/g.txt'"
+check "phase65 oracle: precondition -- git's marker for the 404-char subject exceeds the old 300-byte sg buffer" \
+    sh -c "test \$(grep '^>>>>>>> ' '$P65_R.git-copy/g.txt' | wc -c) -gt 300"
+check "phase65: sg's rebase theirs label with a 404-char subject matches git byte-for-byte (not truncated, closing ')' intact)" \
+    sh -c "grep '^>>>>>>> ' '$P65_R/g.txt' > $WORKDIR/p65_r_sg.txt; grep '^>>>>>>> ' '$P65_R.git-copy/g.txt' > $WORKDIR/p65_r_git.txt; cmp -s $WORKDIR/p65_r_sg.txt $WORKDIR/p65_r_git.txt"
+check "phase65: regression witness -- the marker still ends with the closing parenthesis" \
+    grep -qE '\)$' "$P65_R/g.txt"
+
+# --- B. cmd_merge.c's commit MESSAGE, bug #2: two 250-char branch names.
+# Measured: git's message is 523 bytes, the old sg buffer silently wrote a
+# truncated 513. Both branches are non-master/non-main so the " into <B>"
+# suffix is also exercised at full length. ---
+P65_M="$WORKDIR/p65_merge_longname"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_M")") > /dev/null 2>&1
+printf 'base\n' > "$P65_M/f.txt"
+(cd "$P65_M" && "$SG" add f.txt && "$SG" commit -m base) > /dev/null 2>&1
+P65_BRANCH_A=$(python3 -c "print('a' * 250)")
+P65_BRANCH_B=$(python3 -c "print('b' * 250)")
+(cd "$P65_M" && "$SG" branch "$P65_BRANCH_A") > /dev/null 2>&1
+(cd "$P65_M" && "$SG" branch "$P65_BRANCH_B") > /dev/null 2>&1
+(cd "$P65_M" && "$SG" switch "$P65_BRANCH_A") > /dev/null 2>&1
+printf 'a-side\n' > "$P65_M/a.txt"
+(cd "$P65_M" && "$SG" add a.txt && "$SG" commit -m "a side") > /dev/null 2>&1
+(cd "$P65_M" && "$SG" switch "$P65_BRANCH_B") > /dev/null 2>&1
+printf 'b-side\n' > "$P65_M/b.txt"
+(cd "$P65_M" && "$SG" add b.txt && "$SG" commit -m "b side") > /dev/null 2>&1
+(cd "$P65_M" && "$SG" switch "$P65_BRANCH_A") > /dev/null 2>&1
+rm -rf "$P65_M.git-copy"
+cp -R "$P65_M" "$P65_M.git-copy"
+(cd "$P65_M" && "$SG" merge "$P65_BRANCH_B") > /dev/null 2>&1
+(cd "$P65_M.git-copy" && LC_ALL=C git merge "$P65_BRANCH_B") > /dev/null 2>&1
+check "phase65: precondition -- both copies produced a clean 2-parent merge commit" \
+    sh -c "(cd '$P65_M' && LC_ALL=C git rev-parse -q --verify HEAD^2) > /dev/null 2>&1 && (cd '$P65_M.git-copy' && LC_ALL=C git rev-parse -q --verify HEAD^2) > /dev/null 2>&1"
+check "phase65 oracle: precondition -- git's merge message for two 250-char branch names exceeds the old 512-byte sg buffer" \
+    sh -c "test \$(cd '$P65_M.git-copy' && LC_ALL=C git log -1 --format=%B | wc -c) -gt 512"
+check "phase65: sg's merge commit MESSAGE with two 250-char branch names matches git byte-for-byte (not truncated -- a different message is a different commit id)" \
+    sh -c "(cd '$P65_M' && LC_ALL=C git log -1 --format=%B) > $WORKDIR/p65_m_sg.txt; (cd '$P65_M.git-copy' && LC_ALL=C git log -1 --format=%B) > $WORKDIR/p65_m_git.txt; cmp -s $WORKDIR/p65_m_sg.txt $WORKDIR/p65_m_git.txt"
+check "phase65: and the merge commit's TREE matches git (message truncation would not move this, but a genuinely broken merge would)" \
+    sh -c "test \"\$(cd '$P65_M' && LC_ALL=C git log -1 --format=%T)\" = \"\$(cd '$P65_M.git-copy' && LC_ALL=C git log -1 --format=%T)\""
+
+# cmd_merge.c's "sg-3way" reflog line (logs/HEAD, not the commit MESSAGE
+# above) is a SEPARATE fixed-buffer site with its own conversion -- reusing
+# this same fixture's 250-char branch name exercises it too. The WORDING of
+# this line has been pinned since Phase 17 (lines 7516 and 7543 above), but
+# with a three-byte branch name (`br2`), so those two checks cannot witness
+# truncation: only the 250-char name here can. There is no real-git text to
+# compare against (sg's wording is a deliberate, pre-existing divergence
+# from git's own "Merge made by the 'ort' strategy." -- see the code comment
+# beside this reflog line), so this pins sg's own expected literal, the same
+# convention Phase 17's two checks already use.
+python3 -c "import sys; sys.stdout.write(\"merge %s: Merge made by the 'sg-3way' strategy.\n\" % '$P65_BRANCH_B')" > "$WORKDIR/p65_m_reflog_expected.txt"
+tail -1 "$P65_M/.git/logs/HEAD" | cut -f2- > "$WORKDIR/p65_m_reflog_sg.txt"
+check "phase65: cmd_merge.c's 'sg-3way' reflog line (logs/HEAD) with a 250-char branch name matches sg's own expected literal, not truncated (phase17 pins the same wording, but with a 3-byte branch name, so only this one witnesses the buffer)" \
+    cmp -s "$WORKDIR/p65_m_reflog_sg.txt" "$WORKDIR/p65_m_reflog_expected.txt"
+
+# --- C. cmd_reset.c's reflog line, bug #3: an 803-char, FOUR-component ref
+# name (each component capped, the total is not -- see the module-layout
+# entry on this). Measured: git writes 939 bytes, the old sg buffer wrote a
+# truncated 630. ---
+P65_RS="$WORKDIR/p65_reset_longref"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_RS")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_RS/f.txt"
+(cd "$P65_RS" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+P65_LONGREF=$(python3 -c "print('/'.join(['a'*200, 'b'*200, 'c'*200, 'd'*200]))")
+(cd "$P65_RS" && "$SG" branch "$P65_LONGREF") > /dev/null 2>&1
+(cd "$P65_RS" && "$SG" switch "$P65_LONGREF") > /dev/null 2>&1
+printf 'c2\n' > "$P65_RS/f.txt"
+(cd "$P65_RS" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+(cd "$P65_RS" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P65_RS.git-copy"
+cp -R "$P65_RS" "$P65_RS.git-copy"
+(cd "$P65_RS" && "$SG" reset --hard "$P65_LONGREF") > /dev/null 2>&1
+(cd "$P65_RS.git-copy" && LC_ALL=C git reset --hard "$P65_LONGREF") > /dev/null 2>&1
+check "phase65 oracle: precondition -- git's reset reflog message for an 803-char, 4-component ref name exceeds the old 512-byte sg buffer" \
+    sh -c "test \$(tail -1 '$P65_RS.git-copy/.git/logs/HEAD' | cut -f2- | wc -c) -gt 512"
+check "phase65: sg's reset reflog message for an 803-char, 4-component ref name matches git byte-for-byte" \
+    sh -c "tail -1 '$P65_RS/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rs_sg.txt; tail -1 '$P65_RS.git-copy/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rs_git.txt; cmp -s $WORKDIR/p65_rs_sg.txt $WORKDIR/p65_rs_git.txt"
+
+# --- C-soft. cmd_reset.c:174's RESET_SOFT reflog_msg, the SAME site shape as
+# group C above but a DIFFERENT code path (--hard's own reflog_msg is at a
+# different call site, see cmd_reset.c). Found by review: reverting only
+# this site to a fixed buffer left every existing phase65 check green, since
+# group C above only ever exercises --hard. ---
+P65_RSOFT="$WORKDIR/p65_reset_soft_longref"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_RSOFT")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_RSOFT/f.txt"
+(cd "$P65_RSOFT" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+P65_LONGREF_SOFT=$(python3 -c "print('/'.join(['e'*200, 'f'*200, 'g'*200, 'h'*200]))")
+(cd "$P65_RSOFT" && "$SG" branch "$P65_LONGREF_SOFT") > /dev/null 2>&1
+(cd "$P65_RSOFT" && "$SG" switch "$P65_LONGREF_SOFT") > /dev/null 2>&1
+printf 'c2\n' > "$P65_RSOFT/f.txt"
+(cd "$P65_RSOFT" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+(cd "$P65_RSOFT" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P65_RSOFT.git-copy"
+cp -R "$P65_RSOFT" "$P65_RSOFT.git-copy"
+(cd "$P65_RSOFT" && "$SG" reset --soft "$P65_LONGREF_SOFT") > /dev/null 2>&1
+(cd "$P65_RSOFT.git-copy" && LC_ALL=C git reset --soft "$P65_LONGREF_SOFT") > /dev/null 2>&1
+check "phase65 oracle: precondition -- git's --soft reset reflog message for an 803-char, 4-component ref name exceeds the old 512-byte sg buffer" \
+    sh -c "test \$(tail -1 '$P65_RSOFT.git-copy/.git/logs/HEAD' | cut -f2- | wc -c) -gt 512"
+check "phase65: sg's RESET_SOFT (cmd_reset.c:174) reflog message for an 803-char, 4-component ref name matches git byte-for-byte" \
+    sh -c "tail -1 '$P65_RSOFT/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rsoft_sg.txt; tail -1 '$P65_RSOFT.git-copy/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rsoft_git.txt; cmp -s $WORKDIR/p65_rsoft_sg.txt $WORKDIR/p65_rsoft_git.txt"
+
+# --- C-mixed. cmd_reset.c:266's RESET_MIXED reflog_msg, a third distinct
+# call site, same reasoning as C-soft above. ---
+P65_RMIXED="$WORKDIR/p65_reset_mixed_longref"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_RMIXED")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_RMIXED/f.txt"
+(cd "$P65_RMIXED" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+P65_LONGREF_MIXED=$(python3 -c "print('/'.join(['i'*200, 'j'*200, 'k'*200, 'l'*200]))")
+(cd "$P65_RMIXED" && "$SG" branch "$P65_LONGREF_MIXED") > /dev/null 2>&1
+(cd "$P65_RMIXED" && "$SG" switch "$P65_LONGREF_MIXED") > /dev/null 2>&1
+printf 'c2\n' > "$P65_RMIXED/f.txt"
+(cd "$P65_RMIXED" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+(cd "$P65_RMIXED" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P65_RMIXED.git-copy"
+cp -R "$P65_RMIXED" "$P65_RMIXED.git-copy"
+(cd "$P65_RMIXED" && "$SG" reset --mixed "$P65_LONGREF_MIXED") > /dev/null 2>&1
+(cd "$P65_RMIXED.git-copy" && LC_ALL=C git reset --mixed "$P65_LONGREF_MIXED") > /dev/null 2>&1
+check "phase65 oracle: precondition -- git's --mixed reset reflog message for an 803-char, 4-component ref name exceeds the old 512-byte sg buffer" \
+    sh -c "test \$(tail -1 '$P65_RMIXED.git-copy/.git/logs/HEAD' | cut -f2- | wc -c) -gt 512"
+check "phase65: sg's RESET_MIXED (cmd_reset.c:266) reflog message for an 803-char, 4-component ref name matches git byte-for-byte" \
+    sh -c "tail -1 '$P65_RMIXED/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rmixed_sg.txt; tail -1 '$P65_RMIXED.git-copy/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rmixed_git.txt; cmp -s $WORKDIR/p65_rmixed_sg.txt $WORKDIR/p65_rmixed_git.txt"
+
+# --- D. cmd_branch.c's "branch: Created from <current>" reflog line, same
+# 803-char ref name as the current branch. Not one of the original three,
+# found during this phase's own audit sweep. ---
+P65_BR="$WORKDIR/p65_branch_longname"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_BR")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_BR/f.txt"
+(cd "$P65_BR" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+P65_LONGCUR=$(python3 -c "print('/'.join(['p'*200, 'q'*200, 'r'*200, 's'*200]))")
+(cd "$P65_BR" && "$SG" branch "$P65_LONGCUR") > /dev/null 2>&1
+(cd "$P65_BR" && "$SG" switch "$P65_LONGCUR") > /dev/null 2>&1
+rm -rf "$P65_BR.git-copy"
+cp -R "$P65_BR" "$P65_BR.git-copy"
+(cd "$P65_BR" && "$SG" branch child) > /dev/null 2>&1
+(cd "$P65_BR.git-copy" && LC_ALL=C git branch child) > /dev/null 2>&1
+check "phase65 oracle: precondition -- git's 'branch: Created from <803-char ref>' line exceeds the old 512-byte sg buffer" \
+    sh -c "test \$(tail -1 '$P65_BR.git-copy/.git/logs/refs/heads/child' | cut -f2- | wc -c) -gt 512"
+check "phase65: sg's 'branch: Created from' reflog message for an 803-char current branch name matches git byte-for-byte" \
+    sh -c "tail -1 '$P65_BR/.git/logs/refs/heads/child' | cut -f2- > $WORKDIR/p65_br_sg.txt; tail -1 '$P65_BR.git-copy/.git/logs/refs/heads/child' | cut -f2- > $WORKDIR/p65_br_git.txt; cmp -s $WORKDIR/p65_br_sg.txt $WORKDIR/p65_br_git.txt"
+
+# --- E. cmd_merge.c's fast-forward reflog line ("merge <branch>:
+# Fast-forward"), a 501-char branch name. Also found during this phase's
+# audit sweep, not one of the original three. ---
+P65_FF="$WORKDIR/p65_ff_longname"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_FF")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_FF/f.txt"
+(cd "$P65_FF" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+P65_FFNAME=$(python3 -c "print('f' * 250 + '/' + 'g' * 250)")
+(cd "$P65_FF" && "$SG" branch "$P65_FFNAME") > /dev/null 2>&1
+(cd "$P65_FF" && "$SG" switch "$P65_FFNAME") > /dev/null 2>&1
+printf 'c2\n' > "$P65_FF/f.txt"
+(cd "$P65_FF" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+(cd "$P65_FF" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P65_FF.git-copy"
+cp -R "$P65_FF" "$P65_FF.git-copy"
+(cd "$P65_FF" && "$SG" merge "$P65_FFNAME") > /dev/null 2>&1
+(cd "$P65_FF.git-copy" && LC_ALL=C git merge "$P65_FFNAME") > /dev/null 2>&1
+check "phase65 oracle: precondition -- git's fast-forward reflog line for a 501-char branch name exceeds the old 400-byte sg buffer" \
+    sh -c "test \$(tail -1 '$P65_FF.git-copy/.git/logs/HEAD' | cut -f2- | wc -c) -gt 400"
+check "phase65: sg's fast-forward reflog message for a 501-char branch name matches git byte-for-byte" \
+    sh -c "tail -1 '$P65_FF/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_ff_sg.txt; tail -1 '$P65_FF.git-copy/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_ff_git.txt; cmp -s $WORKDIR/p65_ff_sg.txt $WORKDIR/p65_ff_git.txt"
+
+# --- F. safety/stash.c's stash message ("On <branch>: <message>"), a
+# 600-char -m argument. Found during this phase's own audit sweep while
+# tracing every fixed buffer in src/safety/, not in the original three. ---
+P65_ST="$WORKDIR/p65_stash_longmsg"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_ST")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_ST/f.txt"
+(cd "$P65_ST" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'c2\n' > "$P65_ST/f.txt"
+rm -rf "$P65_ST.git-copy"
+cp -R "$P65_ST" "$P65_ST.git-copy"
+P65_LONGMSG=$(python3 -c "print('m' * 600)")
+(cd "$P65_ST" && "$SG" stash push -m "$P65_LONGMSG") > /dev/null 2>&1
+(cd "$P65_ST.git-copy" && LC_ALL=C git stash push -m "$P65_LONGMSG") > /dev/null 2>&1
+check "phase65 oracle: precondition -- git's stash message for a 600-char -m exceeds the old 512-byte sg buffer" \
+    sh -c "test \$(cd '$P65_ST.git-copy' && LC_ALL=C git log -1 --format=%s refs/stash | wc -c) -gt 512"
+check "phase65: sg's stash message for a 600-char -m matches git byte-for-byte" \
+    sh -c "(cd '$P65_ST' && LC_ALL=C git log -1 --format=%s refs/stash) > $WORKDIR/p65_st_sg.txt; (cd '$P65_ST.git-copy' && LC_ALL=C git log -1 --format=%s refs/stash) > $WORKDIR/p65_st_git.txt; cmp -s $WORKDIR/p65_st_sg.txt $WORKDIR/p65_st_git.txt"
+
+# --- F2. safety/stash.c's subj_buf is reused for THREE OTHER subject forms
+# group F above never exercises: "index on ..." (stash.c:657, the index
+# commit's own message -- ALWAYS built, independent of -m), "untracked
+# files on ..." (stash.c:704, needs -u), and "WIP on ..." (stash.c:742, the
+# NO -m default -- arguably the most common form in practice, and the one
+# group F's own -m fixture cannot reach). Found by review: reverting any of
+# these three sites alone left group F fully green, since -m always takes
+# the "On <branch>: <message>" branch and never builds the other three.
+# Uses an 803-char, 4-component branch name (same shape as groups C/D) --
+# with no -m, it is the BRANCH NAME that is unbounded here, not a message
+# argument. ---
+P65_STB="$WORKDIR/p65_stash_longbranch"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_STB")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_STB/f.txt"
+(cd "$P65_STB" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+P65_LONGBRANCH_ST=$(python3 -c "print('/'.join(['e'*200, 'f'*200, 'g'*200, 'h'*200]))")
+(cd "$P65_STB" && "$SG" branch "$P65_LONGBRANCH_ST") > /dev/null 2>&1
+(cd "$P65_STB" && "$SG" switch "$P65_LONGBRANCH_ST") > /dev/null 2>&1
+printf 'c2\n' > "$P65_STB/f.txt"
+printf 'untracked\n' > "$P65_STB/u.txt"
+rm -rf "$P65_STB.git-copy"
+cp -R "$P65_STB" "$P65_STB.git-copy"
+(cd "$P65_STB" && "$SG" stash push -u) > /dev/null 2>&1
+(cd "$P65_STB.git-copy" && LC_ALL=C git stash push -u) > /dev/null 2>&1
+check "phase65 oracle: precondition -- git's stash subjects for an 803-char branch name exceed the old 512-byte sg subj_buf" \
+    sh -c "test \$(cd '$P65_STB.git-copy' && LC_ALL=C git log -1 --format=%s refs/stash | wc -c) -gt 512"
+check "phase65: sg's stash.c:657 'index on <branch>: <short> <subject>' message (always built, independent of -m -- not exercised by group F) matches git byte-for-byte" \
+    sh -c "(cd '$P65_STB' && LC_ALL=C git log -1 --format=%s refs/stash^2) > $WORKDIR/p65_stb_index_sg.txt; (cd '$P65_STB.git-copy' && LC_ALL=C git log -1 --format=%s refs/stash^2) > $WORKDIR/p65_stb_index_git.txt; cmp -s $WORKDIR/p65_stb_index_sg.txt $WORKDIR/p65_stb_index_git.txt"
+check "phase65: sg's stash.c:704 'untracked files on <branch>: <short> <subject>' message (-u only -- not exercised by group F) matches git byte-for-byte" \
+    sh -c "(cd '$P65_STB' && LC_ALL=C git log -1 --format=%s refs/stash^3) > $WORKDIR/p65_stb_untracked_sg.txt; (cd '$P65_STB.git-copy' && LC_ALL=C git log -1 --format=%s refs/stash^3) > $WORKDIR/p65_stb_untracked_git.txt; cmp -s $WORKDIR/p65_stb_untracked_sg.txt $WORKDIR/p65_stb_untracked_git.txt"
+check "phase65: sg's stash.c:742 'WIP on <branch>: <short> <subject>' default message (no -m, the most common form -- not exercised by group F) matches git byte-for-byte" \
+    sh -c "(cd '$P65_STB' && LC_ALL=C git log -1 --format=%s refs/stash) > $WORKDIR/p65_stb_wip_sg.txt; (cd '$P65_STB.git-copy' && LC_ALL=C git log -1 --format=%s refs/stash) > $WORKDIR/p65_stb_wip_git.txt; cmp -s $WORKDIR/p65_stb_wip_sg.txt $WORKDIR/p65_stb_wip_git.txt"
+
+# --- G. cmd_rebase.c's start_msg: this one used to be CHECKED and REFUSED
+# ("upstream name too long", exit 1) rather than silently truncated -- a
+# third, distinct failure mode from the other sites (real git has no such
+# limit and always succeeds). Both the pure-fast-forward branch and the
+# ordinary replay branch build this message independently; both are
+# exercised. ---
+P65_RFF="$WORKDIR/p65_rebase_start_ff_long"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_RFF")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_RFF/f.txt"
+(cd "$P65_RFF" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+P65_UPNAME2=$(python3 -c "print('w' * 250 + '/' + 'x' * 250)")
+(cd "$P65_RFF" && "$SG" branch "$P65_UPNAME2") > /dev/null 2>&1
+(cd "$P65_RFF" && "$SG" switch "$P65_UPNAME2") > /dev/null 2>&1
+printf 'c2\n' > "$P65_RFF/f.txt"
+(cd "$P65_RFF" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+(cd "$P65_RFF" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P65_RFF.git-copy"
+cp -R "$P65_RFF" "$P65_RFF.git-copy"
+(cd "$P65_RFF" && "$SG" rebase "$P65_UPNAME2") > /dev/null 2>&1
+p65_rff_rc=$?
+(cd "$P65_RFF.git-copy" && LC_ALL=C git rebase "$P65_UPNAME2") > /dev/null 2>&1
+check "phase65: sg rebase's fast-forward branch, with a 501-char upstream name, no longer refuses with 'upstream name too long' (real git has no such limit)" \
+    test "$p65_rff_rc" -eq 0
+check "phase65: after the fast-forward the reflog correctly records the (start)/(finish) pair, not an aborted rebase" \
+    sh -c "grep -q 'rebase (start)' '$P65_RFF/.git/logs/HEAD' && grep -q 'rebase (finish)' '$P65_RFF/.git/logs/HEAD'"
+check "phase65 oracle: precondition -- git's own fast-forward rebase also writes a 'rebase (start)' line with the 501-char upstream name (not a fast-forward-only shortcut with no such line)" \
+    sh -c "grep -q 'rebase (start)' '$P65_RFF.git-copy/.git/logs/HEAD'"
+check "phase65: sg rebase's fast-forward 'rebase (start): checkout <upstream>' reflog line matches git byte-for-byte (group G, was previously only checked by substring/exit-code, not cmp)" \
+    sh -c "grep 'rebase (start)' '$P65_RFF/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rff_start_sg.txt; grep 'rebase (start)' '$P65_RFF.git-copy/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rff_start_git.txt; cmp -s $WORKDIR/p65_rff_start_sg.txt $WORKDIR/p65_rff_start_git.txt"
+
+P65_RSTART="$WORKDIR/p65_rebase_start_long"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_RSTART")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_RSTART/f.txt"
+(cd "$P65_RSTART" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+P65_UPNAME=$(python3 -c "print('u' * 250 + '/' + 'v' * 250)")
+(cd "$P65_RSTART" && "$SG" branch "$P65_UPNAME") > /dev/null 2>&1
+printf 'c2\n' > "$P65_RSTART/f.txt"
+(cd "$P65_RSTART" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+(cd "$P65_RSTART" && "$SG" switch "$P65_UPNAME") > /dev/null 2>&1
+printf 'c3\n' > "$P65_RSTART/g.txt"
+(cd "$P65_RSTART" && "$SG" add g.txt && "$SG" commit -m c3) > /dev/null 2>&1
+(cd "$P65_RSTART" && "$SG" switch master) > /dev/null 2>&1
+rm -rf "$P65_RSTART.git-copy"
+cp -R "$P65_RSTART" "$P65_RSTART.git-copy"
+(cd "$P65_RSTART" && "$SG" rebase "$P65_UPNAME") > /dev/null 2>&1
+p65_rstart_rc=$?
+(cd "$P65_RSTART.git-copy" && LC_ALL=C git rebase "$P65_UPNAME") > /dev/null 2>&1
+check "phase65: sg rebase's ordinary (non-fast-forward) replay branch, with a 501-char upstream name, also no longer refuses" \
+    test "$p65_rstart_rc" -eq 0
+check "phase65: sg rebase's ordinary-replay 'rebase (start): checkout <upstream>' reflog line matches git byte-for-byte (group G, was previously only checked by substring/exit-code, not cmp)" \
+    sh -c "grep 'rebase (start)' '$P65_RSTART/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rstart_start_sg.txt; grep 'rebase (start)' '$P65_RSTART.git-copy/.git/logs/HEAD' | cut -f2- > $WORKDIR/p65_rstart_start_git.txt; cmp -s $WORKDIR/p65_rstart_start_sg.txt $WORKDIR/p65_rstart_start_git.txt"
+
+# --- H. cmd_fetch.c's reflog message ("fetch <remote>: <result>"), a
+# 257-char remote name -- over ssh, same unconditional shim technique as
+# phase47 (no live HTTP server needed, so this needs no HTTP_AVAILABLE
+# gate). Compared as a message FIELD, not the whole log line, for the same
+# timestamp reason as the other sites above. ---
+P65_FETCH_SSH="$WORKDIR/p65_fetch_ssh.sh"
+cat > "$P65_FETCH_SSH" <<'P65EOF'
+#!/bin/sh
+for last do :; done
+exec /bin/sh -c "$last"
+P65EOF
+chmod +x "$P65_FETCH_SSH"
+P65_FBARE="$WORKDIR/p65_fetch_remote.git"
+rm -rf "$P65_FBARE"
+(LC_ALL=C git init -q --bare -b master "$P65_FBARE") > /dev/null 2>&1
+P65_FSRC="$WORKDIR/p65_fetch_src"
+rm -rf "$P65_FSRC"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_FSRC")") > /dev/null 2>&1
+printf 'c1\n' > "$P65_FSRC/f.txt"
+(cd "$P65_FSRC" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+# 240 chars: long enough that "fetch <name>: storing head" (20 extra bytes)
+# exceeds the old 256-byte cmd_fetch.c buffer, but short enough that
+# "[remote \"<name>\"]" (11 extra bytes) stays under the UNRELATED 256-byte
+# header[] buffer in sg_repo_read_remote_url (src/storage/repo.c) -- that
+# one is the same shape but out of this phase's stated sweep (src/cli/,
+# src/safety/), found only because this fixture happened to graze it; see
+# the phase65 report for the exact numbers.
+P65_LONGREMOTE=$(python3 -c "print('r' * 240)")
+printf '[remote "%s"]\n\turl = ssh://localhost%s\n' "$P65_LONGREMOTE" "$P65_FBARE" >> "$P65_FSRC/.git/config"
+(cd "$P65_FSRC" && GIT_SSH_COMMAND="$P65_FETCH_SSH" "$SG" push "$P65_LONGREMOTE" master < /dev/null) > /dev/null 2>&1
+
+P65_FDEST_SG="$WORKDIR/p65_fetch_dest_sg"
+P65_FDEST_GIT="$WORKDIR/p65_fetch_dest_git"
+rm -rf "$P65_FDEST_SG" "$P65_FDEST_GIT"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65_FDEST_SG")") > /dev/null 2>&1
+(LC_ALL=C git init -q "$P65_FDEST_GIT") > /dev/null 2>&1
+printf '[remote "%s"]\n\turl = ssh://localhost%s\n' "$P65_LONGREMOTE" "$P65_FBARE" >> "$P65_FDEST_SG/.git/config"
+printf '[remote "%s"]\n\turl = ssh://localhost%s\n\tfetch = +refs/heads/*:refs/remotes/%s/*\n' \
+    "$P65_LONGREMOTE" "$P65_FBARE" "$P65_LONGREMOTE" >> "$P65_FDEST_GIT/.git/config"
+
+(cd "$P65_FDEST_SG" && GIT_SSH_COMMAND="$P65_FETCH_SSH" "$SG" fetch "$P65_LONGREMOTE" < /dev/null) > /dev/null 2>&1
+p65_fetch_sg_rc=$?
+(cd "$P65_FDEST_GIT" && GIT_SSH_COMMAND="$P65_FETCH_SSH" LC_ALL=C git fetch "$P65_LONGREMOTE" < /dev/null) > /dev/null 2>&1
+p65_fetch_git_rc=$?
+check "phase65: sg fetch with a 240-char remote name exits 0" test "$p65_fetch_sg_rc" -eq 0
+check "phase65 oracle: precondition -- real git also succeeds fetching the same long remote name over the same shim" test "$p65_fetch_git_rc" -eq 0
+check "phase65 oracle: precondition -- git's fetch reflog message for this remote name exceeds the old 256-byte sg buffer" \
+    sh -c "test \$(tail -1 '$P65_FDEST_GIT/.git/logs/refs/remotes/$P65_LONGREMOTE/master' | cut -f2- | wc -c) -gt 256"
+check "phase65: sg's fetch reflog message for a 240-char remote name matches git's OWN fetch reflog message byte-for-byte (was: compared against a self-built template string, not git's actual output -- the only phase65 group not doing a direct git-vs-sg A/B)" \
+    sh -c "tail -1 '$P65_FDEST_SG/.git/logs/refs/remotes/$P65_LONGREMOTE/master' | cut -f2- > $WORKDIR/p65_fetch_sg_msg.txt; tail -1 '$P65_FDEST_GIT/.git/logs/refs/remotes/$P65_LONGREMOTE/master' | cut -f2- > $WORKDIR/p65_fetch_expected_msg.txt; cmp -s $WORKDIR/p65_fetch_sg_msg.txt $WORKDIR/p65_fetch_expected_msg.txt"
+
+# --- I. src/storage/repo.c's sg_repo_read_remote_url -- found while auditing
+# group H above (see the comment on P65_LONGREMOTE there), but explicitly
+# OUT of Phase 65's stated sweep (src/cli/, src/safety/ only) at the time.
+# Fixed in this follow-up round; regression-tested here at the interop
+# level for the fail-CLOSED half (a long remote NAME truncates the
+# "[remote \"<name>\"]" header snprintf() built to search for, so the
+# strcmp() against a well-formed config section never matches, and every
+# lookup silently answers "not configured"). Reuses group H's ssh shim
+# (P65_FETCH_SSH, a local subprocess -- no real network request). The
+# fail-OPEN half (a long url VALUE silently truncated by the old
+# line[1024]/fgets() read, sending a caller to a DIFFERENT, wrong address)
+# is regression-tested by tests/test_repo_remote_url.c instead: reproducing
+# it end-to-end here would need a real filesystem path over 1024 bytes for
+# this shim to exec against, which exceeds this platform's PATH_MAX (1024)
+# and cannot be constructed with an ordinary mkdir. ---
+P65I_FBARE="$WORKDIR/p65i_fetch_remote.git"
+rm -rf "$P65I_FBARE"
+(LC_ALL=C git init -q --bare -b master "$P65I_FBARE") > /dev/null 2>&1
+P65I_FSRC="$WORKDIR/p65i_fetch_src"
+rm -rf "$P65I_FSRC"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65I_FSRC")") > /dev/null 2>&1
+printf 'c1\n' > "$P65I_FSRC/f.txt"
+(cd "$P65I_FSRC" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+# 250 chars: longer than the old header[256] buffer needed ("[remote \"" +
+# name + "\"]" needs name + 11 bytes to fit in 256, so anything over 245
+# overflows it) while staying under this filesystem's 255-byte NAME_MAX --
+# the remote name becomes a single path COMPONENT under refs/remotes/,
+# and a longer one (400 was tried first) fails with "File name too long"
+# for a reason that has nothing to do with the bug being tested.
+P65I_LONGREMOTE=$(python3 -c "print('z' * 250)")
+printf '[remote "%s"]\n\turl = ssh://localhost%s\n' "$P65I_LONGREMOTE" "$P65I_FBARE" >> "$P65I_FSRC/.git/config"
+(cd "$P65I_FSRC" && GIT_SSH_COMMAND="$P65_FETCH_SSH" "$SG" push "$P65I_LONGREMOTE" master < /dev/null) > /dev/null 2>&1
+
+P65I_FDEST_SG="$WORKDIR/p65i_fetch_dest_sg"
+P65I_FDEST_GIT="$WORKDIR/p65i_fetch_dest_git"
+rm -rf "$P65I_FDEST_SG" "$P65I_FDEST_GIT"
+(cd "$WORKDIR" && "$SG" init "$(basename "$P65I_FDEST_SG")") > /dev/null 2>&1
+(LC_ALL=C git init -q "$P65I_FDEST_GIT") > /dev/null 2>&1
+printf '[remote "%s"]\n\turl = ssh://localhost%s\n' "$P65I_LONGREMOTE" "$P65I_FBARE" >> "$P65I_FDEST_SG/.git/config"
+printf '[remote "%s"]\n\turl = ssh://localhost%s\n\tfetch = +refs/heads/*:refs/remotes/%s/*\n' \
+    "$P65I_LONGREMOTE" "$P65I_FBARE" "$P65I_LONGREMOTE" >> "$P65I_FDEST_GIT/.git/config"
+
+(cd "$P65I_FDEST_SG" && GIT_SSH_COMMAND="$P65_FETCH_SSH" "$SG" fetch "$P65I_LONGREMOTE" < /dev/null) > /dev/null 2>&1
+p65i_fetch_sg_rc=$?
+(cd "$P65I_FDEST_GIT" && GIT_SSH_COMMAND="$P65_FETCH_SSH" LC_ALL=C git fetch "$P65I_LONGREMOTE" < /dev/null) > /dev/null 2>&1
+p65i_fetch_git_rc=$?
+check "phase65 follow-up: sg fetch with a 250-char remote NAME (exceeds the old sg_repo_read_remote_url header[256] buffer, src/storage/repo.c) exits 0, not refused with 'remote not configured'" \
+    test "$p65i_fetch_sg_rc" -eq 0
+check "phase65 follow-up oracle: precondition -- real git also succeeds fetching the same 250-char remote name over the same shim" \
+    test "$p65i_fetch_git_rc" -eq 0
+check "phase65 follow-up: the fetch's reflog message matches git's OWN reflog message byte-for-byte, proving the url lookup actually resolved and connected (not a stale/absent ref left by a silently-failed fetch)" \
+    sh -c "tail -1 '$P65I_FDEST_SG/.git/logs/refs/remotes/$P65I_LONGREMOTE/master' | cut -f2- > $WORKDIR/p65i_fetch_sg_msg.txt; tail -1 '$P65I_FDEST_GIT/.git/logs/refs/remotes/$P65I_LONGREMOTE/master' | cut -f2- > $WORKDIR/p65i_fetch_git_msg.txt; cmp -s $WORKDIR/p65i_fetch_sg_msg.txt $WORKDIR/p65i_fetch_git_msg.txt"
+
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
 if [ "$FAIL" -gt 0 ]; then

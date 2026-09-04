@@ -1887,6 +1887,45 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   which is a gap that predates Phase 21 and is **still unfixed**: path
   containment should be enforced at the layer that parses trees / writes the
   index, not patched separately at every consumer.
+- **Building any user-facing string that embeds a user-controlled one goes
+  through `sg_strfmt_alloc`** (`include/sg/strfmt.h`, Phase 65) -- it sizes
+  with `vsnprintf(NULL, 0, ...)`, mallocs exactly that, and returns a string
+  the caller frees. **Do not write `char buf[N]; snprintf(buf, sizeof buf,
+  "...%s...", <anything a user can lengthen>)`.** That shape had produced
+  FOUR measured byte-compatibility bugs by the time it was converged, every
+  one of them silent (exit 0, no warning):
+  the rebase CONFLICT MARKER (`cmd_rebase.c`, `theirs_label[300]`: a
+  289-char subject agreed with git, 290 diverged, and at 404 the marker lost
+  its closing `)` -- malformed, not merely short); the MERGE COMMIT MESSAGE
+  (`cmd_merge.c`, `message[512]`: two 250-char branch names gave git 523
+  bytes and sg 513, and **a different message is a different object id**);
+  the `logs/HEAD` line (`cmd_reset.c`, `reflog_msg[512]`: 939 bytes vs 630);
+  and `sg_repo_read_remote_url` (`storage/repo.c`), which was the worst
+  because it is the only **fail-OPEN** one -- a 2029-byte `url` in
+  `.git/config` was truncated and `sg fetch` then made a real network
+  request **to a different address than the one configured**, silently. Its
+  line reader is now `getline()`, not a bigger `fgets` buffer.
+  WARNING: **"a branch name is at most 255 bytes" is a FALSE bound and was
+  the reasoning that hid one of these.** A ref name is a PATH: each
+  component is capped by `NAME_MAX`, the total is not. The reset fixture
+  uses four 200-char components (803 bytes). When arguing that some fixed
+  buffer is unreachable, this is the bound that is usually wrong.
+  WARNING: **the fixtures need shapes an ordinary test cannot produce** --
+  a long commit SUBJECT for the marker, a MULTI-COMPONENT ref for the
+  reflog lines, a hand-written `.git/config` for the remote URL. Every
+  converted site has its own named check, and each was mutation-verified
+  ALONE (one check red per site, 3183/3184): a mutation covering several
+  sites at once lets a broken one hide behind a check another site turned
+  red.
+  WARNING: **`sg undo`'s snapshot labels go through the same helper but
+  have NO oracle** (`sg undo` has no real-git counterpart), so their
+  conversion is mechanical hygiene, not something a differential check can
+  ever witness. Do not go looking for a test.
+  WARNING: **one pre-existing leak was found and deliberately NOT fixed**:
+  `pick.c`'s `attempt_one` leaks `out->message` on the OOM path where the
+  theirs label fails to allocate. It predates this phase (the hand-rolled
+  version leaked identically) and is reachable only under OOM; recorded in
+  `docs/DESIGN.md` rather than fixed inside a phase about a different bug.
 - Known duplication (converge opportunistically when you touch it, do not add
   another copy): the two literal copies of `path_join` (`cmd_add.c`,
   `status.c`) were converged into `sg_path_join` in Phase 21, along with 14
@@ -2905,7 +2944,7 @@ bumping the version, keep the man page in sync.
 
 ## Testing conventions
 
-- One independent unit test `.c` file per area (75 as of Phase 64), **no shared header, no test
+- One independent unit test `.c` file per area (77 as of Phase 65), **no shared header, no test
   framework**. **Do not hardcode that count anywhere in this file again**: the
   Makefile globs `tests/*.c`, so it grows every phase that adds a test, and a
   stale number in the gate-reading instructions above is exactly the
