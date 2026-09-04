@@ -16128,7 +16128,11 @@ check "phase60d: sg does not crash rendering the same overflowing date via %aD/%
 # --- section 5.3: everything outside the table is rejected -- git accepts
 # every one of these (prints something, exits 0), sg refuses all of them
 # (exit 1). Both sides pinned, per the spec's "pin BOTH sides" instruction.
-for p60bad in '%z' '%ar' '%d' '%C(red)' '100%'; do
+# %ar was in this list until Phase 66 implemented it (see the phase66:
+# group's own GOOD-side coverage further down); %ah (human, a genuinely
+# different calendar-driven algorithm, still not implemented) takes its
+# seat here.
+for p60bad in '%z' '%ah' '%d' '%C(red)' '100%'; do
     check "phase60b oracle: precondition -- real git accepts --pretty=format:$p60bad (exits 0)" \
         sh -c "(cd '$P60' && LC_ALL=C git show --pretty=\"format:$p60bad\" -s '$P60_HEAD') > /dev/null 2>&1"
     check "phase60b: sg show --pretty=format:$p60bad is rejected -- deliberate divergence, section 5.3" \
@@ -16678,14 +16682,16 @@ check "phase62: reject -- --all" test $? -eq 1
 (cd "$P62" && "$SG" log --reverse > /dev/null 2>&1)
 check "phase62: reject -- --reverse" test $? -eq 1
 
-# --date=iso is implemented as of Phase 64 (see the dedicated phase64:
-# group below) -- this used to assert rejection of every --date= value;
-# rewritten (not deleted) to keep pinning the names Phase 64 deliberately
-# still refuses, per this project's own convention for a partially-closed
-# gap: relative/human/auto: are real git renderers (each with its own
-# threshold table or isatty(1)-dependent meaning, Phase 65), and are
+# --date=iso is implemented as of Phase 64, and --date=relative/
+# relative-local as of Phase 66 (see the dedicated phase64:/phase66:
+# groups below) -- this used to assert rejection of every --date= value;
+# rewritten (not deleted) each time a name's gap closed, per this
+# project's own convention for a partially-closed gap: human/auto: remain
+# real git renderers with no shared machinery to reuse (human is
+# calendar-driven, not duration-driven, a genuinely different algorithm
+# deferred to its own phase; auto: depends on isatty(1)), and stay
 # rejected on sg's side even though git itself accepts them.
-for p64_bad_name in relative relative-local human human-local auto:short auto:; do
+for p64_bad_name in human human-local auto:short auto:; do
     (cd "$P62" && "$SG" log "--date=$p64_bad_name" > /dev/null 2>&1)
     check "phase62: reject -- --date=$p64_bad_name (sg, deliberately unimplemented)" test $? -eq 1
     (cd "$P62" && LC_ALL=C TZ=UTC git log "--date=$p64_bad_name" > /dev/null 2>&1)
@@ -17321,6 +17327,59 @@ check "phase64 review: sg does not crash rendering an overflowing author date vi
 check "phase64 review: sg does not crash rendering an overflowing author date via --date=format-local:%Y" \
     sh -c "(cd '$P60' && '$SG' show -s --date=format-local:%Y '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
 
+# --- Phase 66 review: relative/relative-local are the two -local-scan
+# entries added by Phase 66 and never swept over P60D_OVERFLOW at all --
+# sg_date_format_relative's own LLONG_MIN/LLONG_MAX saturating clamp
+# (src/util/date.c) exists specifically for this input shape (a hand-placed
+# loose object whose author timestamp decimal string saturates strtoll),
+# and nothing in the pre-Phase-66-review suite ever fed it one. This is
+# deliberately NOT a `cmp` against git's own answer on this fixture (unlike
+# every ordinary phase66: check below, which does cmp) -- measured directly
+# (python3 subprocess, argv list, bypassing the shell per this project's own
+# oracle-measurement rule): git's `%99999999999999999999`-timestamp commit
+# renders "57 years ago" under --date=relative, while sg (which saturates
+# strtoll to LLONG_MAX rather than whatever internal wraparound git's own
+# parser lands on) renders "in the future" for the identical object -- the
+# two tools parse an out-of-range decimal timestamp differently, a
+# pre-existing divergence this review round measured but did not create and
+# is out of this phase's scope to close. Same "does not crash" shape as the
+# four fixtures immediately above, not a byte-identity claim. ---
+check "phase66 review: sg does not crash rendering an overflowing author date via --date=relative" \
+    sh -c "(cd '$P60' && '$SG' show -s --date=relative '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase66 review: sg does not crash rendering an overflowing author date via --date=relative-local" \
+    sh -c "(cd '$P60' && '$SG' show -s --date=relative-local '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase66 review oracle: precondition -- real git itself renders (does not crash on) the same overflowing timestamp via --date=relative, so the crash-only check above is measuring sg against a real reachable input, not a shape git also refuses" \
+    sh -c "(cd '$P60' && LC_ALL=C git show -s --date=relative '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -eq 0"
+
+# --- a CONTENT check, not just "does not crash": --date=relative-local's
+# `-local` branch (resolve_mode_tz's `mode->local` path, src/util/date.c)
+# calls local_offset_at -> localtime_r on this fixture's saturated
+# LLONG_MAX timestamp, which can itself fail (platform-dependent). If the
+# SG_DATE_RELATIVE dispatch in sg_date_format_mode were ever moved to AFTER
+# resolve_mode_tz -- instead of before it, which is the order the function
+# is deliberately written in, see its own header comment -- a failing
+# resolve_mode_tz would make sg_date_format_mode return -1 before ever
+# reaching the relative renderer, and print_configured_date_field
+# (commit_out.c) swallows that failure into an EMPTY field rather than
+# refusing the whole command: exit code stays 0, so the exit<=1 crash check
+# above cannot see this at all. Measured directly: reordering the two so
+# resolve_mode_tz runs first turns this exact fixture's --date=relative-local
+# output empty while --date=relative (no -local) is unaffected (its
+# resolve_mode_tz call is a no-fail passthrough when mode->local == 0) --
+# exit code 0 both before and after the mutation, only the bytes differ. ---
+(cd "$P60" && "$SG" show -s --pretty=%ad --date=relative-local "$P60D_OVERFLOW") \
+    > "$WORKDIR/p66_review_overflow_rel_local.txt" 2>&1
+# NOTE: this must grep for the actual rendered TEXT, not merely assert the
+# file is non-empty -- `sg show -s --pretty=%ad` on an EMPTY expanded
+# placeholder still writes a single trailing newline from the entry
+# renderer itself (commit_out.c), so a bare "[ -s file ]" check is 1 byte
+# non-empty and PASSES even when the date field itself rendered nothing.
+# Measured directly: under the reordering mutation this check exists to
+# catch, the file's entire content is a lone "\n" -- a non-emptiness check
+# on that file is a genuine false green, not a design margin.
+check "phase66 review: sg's --date=relative-local on an overflowing author date renders actual duration text (catches the SG_DATE_RELATIVE-dispatched-after-resolve_mode_tz reordering, which degrades to a silently empty field rather than a crash)" \
+    grep -Eq "ago|in the future" "$WORKDIR/p66_review_overflow_rel_local.txt"
+
 # ============================================================
 # Phase 64 second review round: a NON-integer-minute historical timezone
 # offset is NOT confined to the pre-1970 LMT era (an earlier round's own
@@ -17806,6 +17865,160 @@ check "phase65 follow-up oracle: precondition -- real git also succeeds fetching
     test "$p65i_fetch_git_rc" -eq 0
 check "phase65 follow-up: the fetch's reflog message matches git's OWN reflog message byte-for-byte, proving the url lookup actually resolved and connected (not a stale/absent ref left by a silently-failed fetch)" \
     sh -c "tail -1 '$P65I_FDEST_SG/.git/logs/refs/remotes/$P65I_LONGREMOTE/master' | cut -f2- > $WORKDIR/p65i_fetch_sg_msg.txt; tail -1 '$P65I_FDEST_GIT/.git/logs/refs/remotes/$P65I_LONGREMOTE/master' | cut -f2- > $WORKDIR/p65i_fetch_git_msg.txt; cmp -s $WORKDIR/p65i_fetch_sg_msg.txt $WORKDIR/p65i_fetch_git_msg.txt"
+
+# ============================================================
+# Phase 66: sg log/sg show --date=relative / relative-local, %ar/%cr
+# (CLAUDE.md's --date= entry / commit_out.c's placeholder table have the
+# full rule). Reuses Phase 64's P64 fixture (P64/P64_JAN/P64_JUL/v64,
+# P64_GIT_PINS) -- the same four reach points Phase 64 already
+# established, swept with `relative`/`relative-local` this time.
+# GIT_TEST_DATE_NOW is pinned on BOTH sides of every comparison below, or
+# the comparison would be flaky by construction (the wall clock moves
+# between the git-side and sg-side invocations, however briefly).
+# ============================================================
+
+P66_NOW=1736940570
+
+p66_show_cmp() {
+    p66tag="$1"; p66tz="$2"; shift 2
+    (cd "$P64" && LC_ALL=C TZ="$p66tz" GIT_TEST_DATE_NOW="$P66_NOW" git $P64_GIT_PINS show --no-decorate "$@") \
+        > "$WORKDIR/p66_git_$p66tag.txt" 2>&1
+    (cd "$P64" && TZ="$p66tz" GIT_TEST_DATE_NOW="$P66_NOW" "$SG" show "$@") > "$WORKDIR/p66_sg_$p66tag.txt" 2>&1
+}
+
+p66_log_cmp() {
+    p66tag="$1"; p66tz="$2"; shift 2
+    (cd "$P64" && LC_ALL=C TZ="$p66tz" GIT_TEST_DATE_NOW="$P66_NOW" git $P64_GIT_PINS log --no-decorate "$@") \
+        > "$WORKDIR/p66_git_$p66tag.txt" 2>&1
+    (cd "$P64" && TZ="$p66tz" GIT_TEST_DATE_NOW="$P66_NOW" "$SG" log "$@") > "$WORKDIR/p66_sg_$p66tag.txt" 2>&1
+}
+
+# --- the same four reach points Phase 64 established, this time swept
+# with relative/relative-local, over two timezones. ---
+for p66tz in Asia/Tokyo America/New_York; do
+    p66tzsafe=$(printf '%s' "$p66tz" | tr -c 'A-Za-z0-9' '_')
+    for p66name in relative relative-local; do
+        p66safe=$(printf '%s' "$p66name" | tr -c 'A-Za-z0-9' '_')
+
+        p66_show_cmp "r1_legacy_${p66tzsafe}_${p66safe}" "$p66tz" -s "--date=$p66name" "$P64_JAN"
+        check "phase66: sg show -s --date=$p66name (TZ=$p66tz) matches git (legacy medium Date: line)" \
+            cmp -s "$WORKDIR/p66_sg_r1_legacy_${p66tzsafe}_${p66safe}.txt" "$WORKDIR/p66_git_r1_legacy_${p66tzsafe}_${p66safe}.txt"
+
+        p66_show_cmp "r1_fuller_${p66tzsafe}_${p66safe}" "$p66tz" -s --pretty=fuller "--date=$p66name" "$P64_JAN"
+        check "phase66: sg show -s --pretty=fuller --date=$p66name (TZ=$p66tz) matches git (AuthorDate:/CommitDate:)" \
+            cmp -s "$WORKDIR/p66_sg_r1_fuller_${p66tzsafe}_${p66safe}.txt" "$WORKDIR/p66_git_r1_fuller_${p66tzsafe}_${p66safe}.txt"
+
+        p66_show_cmp "r2_tag_${p66tzsafe}_${p66safe}" "$p66tz" -s "--date=$p66name" v64
+        check "phase66: sg show -s --date=$p66name (TZ=$p66tz) matches git (annotated tag Date: line)" \
+            cmp -s "$WORKDIR/p66_sg_r2_tag_${p66tzsafe}_${p66safe}.txt" "$WORKDIR/p66_git_r2_tag_${p66tzsafe}_${p66safe}.txt"
+
+        p66_show_cmp "r3_phad_${p66tzsafe}_${p66safe}" "$p66tz" -s --pretty=%ad "--date=$p66name" "$P64_JAN"
+        check "phase66: sg show -s --pretty=%ad --date=$p66name (TZ=$p66tz) matches git" \
+            cmp -s "$WORKDIR/p66_sg_r3_phad_${p66tzsafe}_${p66safe}.txt" "$WORKDIR/p66_git_r3_phad_${p66tzsafe}_${p66safe}.txt"
+
+        p66_log_cmp "r4_reference_${p66tzsafe}_${p66safe}" "$p66tz" -1 --pretty=reference "--date=$p66name" "$P64_JAN"
+        check "phase66: sg log -1 --pretty=reference --date=$p66name (TZ=$p66tz) matches git" \
+            cmp -s "$WORKDIR/p66_sg_r4_reference_${p66tzsafe}_${p66safe}.txt" "$WORKDIR/p66_git_r4_reference_${p66tzsafe}_${p66safe}.txt"
+    done
+done
+
+# --- oracle precondition: git's OWN relative and relative-local really do
+# render byte-identically on this fixture, over the two zones swept above
+# -- "the answer is a duration, so a timezone has nothing to shift" is
+# only a useful claim if the control itself is non-trivial (CLAUDE.md's
+# oracle-needs-a-control-group lesson). ---
+check "phase66 oracle: precondition -- git's own --date=relative and --date=relative-local render byte-identically (TZ=Asia/Tokyo)" \
+    cmp -s "$WORKDIR/p66_git_r1_legacy_Asia_Tokyo_relative.txt" "$WORKDIR/p66_git_r1_legacy_Asia_Tokyo_relative_local.txt"
+check "phase66 oracle: precondition -- git's own --date=relative and --date=relative-local render byte-identically (TZ=America/New_York)" \
+    cmp -s "$WORKDIR/p66_git_r1_legacy_America_New_York_relative.txt" "$WORKDIR/p66_git_r1_legacy_America_New_York_relative_local.txt"
+
+# --- %ar/%cr, direct byte comparison against git, plus the July fixture
+# too (a different delta, same GIT_TEST_DATE_NOW). ---
+p66_show_cmp phar_jan Asia/Tokyo -s --pretty=%ar "$P64_JAN"
+check "phase66: sg show -s --pretty=%ar matches git (January fixture)" \
+    cmp -s "$WORKDIR/p66_sg_phar_jan.txt" "$WORKDIR/p66_git_phar_jan.txt"
+p66_show_cmp phar_jul Asia/Tokyo -s --pretty=%ar "$P64_JUL"
+check "phase66: sg show -s --pretty=%ar matches git (July fixture, a different delta)" \
+    cmp -s "$WORKDIR/p66_sg_phar_jul.txt" "$WORKDIR/p66_git_phar_jul.txt"
+check "phase66 oracle: precondition -- the January and July fixtures really render DIFFERENT %ar deltas, or the pair proves nothing" \
+    sh -c "! cmp -s '$WORKDIR/p66_git_phar_jan.txt' '$WORKDIR/p66_git_phar_jul.txt'"
+p66_show_cmp phcr_jan Asia/Tokyo -s --pretty=%cr "$P64_JAN"
+check "phase66: sg show -s --pretty=%cr matches git" \
+    cmp -s "$WORKDIR/p66_sg_phcr_jan.txt" "$WORKDIR/p66_git_phcr_jan.txt"
+
+# --- negative control: %ar is a FIXED format, unmoved by --date=short --
+# the one row Phase 66's spec flagged as "not yet measured". Compared
+# against each tool's own --date=-less baseline (same technique Phase 64's
+# section-2 negative controls use), not against each other, so a bug that
+# moves BOTH tools identically the same way still gets caught. ---
+p66_show_cmp neg_ar_base Asia/Tokyo -s --pretty=%ar "$P64_JAN"
+p66_show_cmp neg_ar_dated Asia/Tokyo -s --pretty=%ar --date=short "$P64_JAN"
+check "phase66 negative control: git's %ar is unmoved by --date=short" \
+    cmp -s "$WORKDIR/p66_git_neg_ar_base.txt" "$WORKDIR/p66_git_neg_ar_dated.txt"
+check "phase66 negative control: sg's %ar is unmoved by --date=short" \
+    cmp -s "$WORKDIR/p66_sg_neg_ar_base.txt" "$WORKDIR/p66_sg_neg_ar_dated.txt"
+check "phase66 negative control: sg's %ar --date=short still matches git" \
+    cmp -s "$WORKDIR/p66_sg_neg_ar_dated.txt" "$WORKDIR/p66_git_neg_ar_dated.txt"
+
+# --- review round: the REVERSE negative control from spec section 3 --
+# %ai/%aI/%aD/%as/%at (and the committer mirror %ci/%cI/%cD/%cs/%ct) must
+# not be moved by --date=relative, same as Phase 64's own --date=unix sweep
+# above never touched %ar. Architecturally low-risk (print_date_field takes
+# no sg_date_mode parameter at all -- there is no code path for --date= to
+# reach it), so this is expected to be a REDUNDANT guard rather than a real
+# blind spot; kept anyway as a named check, and the mutation result is
+# recorded in the phase66 section of DESIGN.md rather than assumed. ---
+for p66ph in %ai %aI %aD %as %at %ci %cI %cD %cs %ct; do
+    p66phsafe=$(printf '%s' "$p66ph" | tr -c 'A-Za-z0-9' '_')
+    p66_show_cmp "neg_rev_base_${p66phsafe}" Asia/Tokyo -s --pretty="$p66ph" "$P64_JAN"
+    p66_show_cmp "neg_rev_dated_${p66phsafe}" Asia/Tokyo -s --pretty="$p66ph" --date=relative "$P64_JAN"
+    check "phase66 review negative control: git's $p66ph is unmoved by --date=relative" \
+        cmp -s "$WORKDIR/p66_git_neg_rev_base_${p66phsafe}.txt" "$WORKDIR/p66_git_neg_rev_dated_${p66phsafe}.txt"
+    check "phase66 review negative control: sg's $p66ph is unmoved by --date=relative" \
+        cmp -s "$WORKDIR/p66_sg_neg_rev_base_${p66phsafe}.txt" "$WORKDIR/p66_sg_neg_rev_dated_${p66phsafe}.txt"
+    check "phase66 review negative control: sg's $p66ph --date=relative still matches git" \
+        cmp -s "$WORKDIR/p66_sg_neg_rev_dated_${p66phsafe}.txt" "$WORKDIR/p66_git_neg_rev_dated_${p66phsafe}.txt"
+done
+
+# --- review round: "in the future" has NO interop witness -- the review's
+# own mutation of the literal ("in the futuer") turned 4 unit-test rows red
+# while leaving all of `bash tests/interop.sh` (3219/3219 at the time) fully
+# green, since every phase66: fixture's GIT_TEST_DATE_NOW (P66_NOW=
+# 1736940570) postdates every commit it compares (both P64_JAN's 1704067200
+# and P64_JUL's 1720000000), so diff is always positive and the "in the
+# future" branch is simply never reached by any existing check. GIT_TEST_
+# DATE_NOW here (1700000000) predates P64_JAN's own author/committer
+# timestamp (1704067200), making diff negative on both sides. ---
+(cd "$P64" && LC_ALL=C TZ=Asia/Tokyo GIT_TEST_DATE_NOW=1700000000 git $P64_GIT_PINS show -s --pretty=%ar "$P64_JAN") \
+    > "$WORKDIR/p66_git_future_ar.txt" 2>&1
+(cd "$P64" && TZ=Asia/Tokyo GIT_TEST_DATE_NOW=1700000000 "$SG" show -s --pretty=%ar "$P64_JAN") \
+    > "$WORKDIR/p66_sg_future_ar.txt" 2>&1
+check "phase66 review: sg's %ar prints \"in the future\" for a commit dated after GIT_TEST_DATE_NOW, matching git" \
+    cmp -s "$WORKDIR/p66_sg_future_ar.txt" "$WORKDIR/p66_git_future_ar.txt"
+check "phase66 review oracle: precondition -- git's own %ar really does say \"in the future\" here (not some other wording), or the check above proves nothing about the literal" \
+    grep -q "in the future" "$WORKDIR/p66_git_future_ar.txt"
+
+# --- still-rejected pins, carried forward from Phase 64's own
+# deliberately-unimplemented list: human/human-local/%ah/%ch/auto: remain
+# refused on sg's side (exit 1) while git accepts them (exit 0), so a
+# future accidental implementation of `human` cannot silently start
+# passing these without the check noticing the assumption moved. ---
+for p66bad in human human-local; do
+    (cd "$P64" && "$SG" show -s "--date=$p66bad" "$P64_JAN" > /dev/null 2>&1)
+    check "phase66: sg still rejects --date=$p66bad, exit 1" test $? -eq 1
+    (cd "$P64" && LC_ALL=C git show -s "--date=$p66bad" "$P64_JAN" > /dev/null 2>&1)
+    check "phase66 oracle: git still accepts --date=$p66bad, exit 0" test $? -eq 0
+done
+for p66bad in %ah %ch; do
+    (cd "$P64" && "$SG" show -s --pretty="$p66bad" "$P64_JAN" > /dev/null 2>&1)
+    check "phase66: sg still rejects --pretty=$p66bad, exit 1" test $? -eq 1
+    (cd "$P64" && LC_ALL=C git show -s --pretty="$p66bad" "$P64_JAN" > /dev/null 2>&1)
+    check "phase66 oracle: git still accepts --pretty=$p66bad, exit 0" test $? -eq 0
+done
+(cd "$P64" && "$SG" show -s --date=auto:short "$P64_JAN" > /dev/null 2>&1)
+check "phase66: sg still rejects --date=auto:short, exit 1" test $? -eq 1
+(cd "$P64" && LC_ALL=C git show -s --date=auto:short "$P64_JAN" > /dev/null 2>&1)
+check "phase66 oracle: git still accepts --date=auto:short, exit 0" test $? -eq 0
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

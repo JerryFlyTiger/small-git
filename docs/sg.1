@@ -483,12 +483,12 @@ A user format string may use the placeholders
 (object ids; the abbreviated forms use 7 hex digits, and
 .BR %P / %p
 list every parent space-separated),
-.BR %an / %ae / %al / %ad / %aD / %at / %ai / %aI / %as
+.BR %an / %ae / %al / %ad / %aD / %at / %ai / %aI / %as / %ar
 and the committer equivalents
-.BR %cn / %ce / %cl / %cd / %cD / %ct / %ci / %cI / %cs
+.BR %cn / %ce / %cl / %cd / %cD / %ct / %ci / %cI / %cs / %cr
 (name, email, email's local part before
 .BR @ ,
-and six renderings of the same timestamp \(em
+and seven renderings of the same timestamp \(em
 .B %ad
 /
 .B %cd
@@ -514,15 +514,29 @@ separator, and
 .B %as
 /
 .B %cs
-just the date), and
+just the date, and
+.B %ar
+/
+.B %cr
+a relative duration such as
+.RB \(dq "3 weeks ago" \(dq ,
+a FIXED format unmoved by
+.BR --date= ,
+same as the other five), and
 .BR %s / %f / %b / %B
 (subject, a filename-safe sanitized subject, the body after the first
 blank line, and the raw message), plus the literal escapes
 .BR %n " (newline), " %% " (a literal " % "), and " %xNN
 (the raw byte given by hex digits
 .IR NN ).
-Every timestamp placeholder shows the clock shifted into the timestamp's
-own stored offset, not UTC and not the machine's local time. Any
+Every timestamp placeholder except
+.B %ar / %cr
+shows the clock shifted into the timestamp's own stored offset, not UTC and
+not the machine's local time;
+.B %ar / %cr
+render a DURATION relative to the current time instead (see
+.B --date=relative
+above), which has no stored offset to shift into. Any
 .B %
 sequence outside this table is refused with a diagnostic naming it and a
 non-zero exit \(em real git instead prints such a sequence literally or as
@@ -602,7 +616,7 @@ own date field (whose own default remains
 distinct from every other reach point's
 .BR default ).
 Unaffected: every other timestamp placeholder
-.RB ( %aD / %ai / %aI / %as / %at
+.RB ( %aD / %ai / %aI / %as / %at / %ar
 and the committer equivalents), the
 .B raw
 built-in (prints the object's stored bytes verbatim), and
@@ -616,8 +630,9 @@ is, case-sensitively, one of
 .BR rfc " or " rfc2822 ,
 .BR short ,
 .BR raw ,
-or
 .BR unix ,
+or
+.BR relative ,
 each optionally suffixed with
 .B -local
 (stripped at most once; the remainder must itself be one of those names,
@@ -651,10 +666,20 @@ the offset actually being rendered, and
 .B %Z
 the zone abbreviation (empty unless
 .BR -local ).
+.B relative
+(and
+.BR relative-local ,
+byte-identical to it in every timezone \(em the answer is a duration, so a
+timezone has nothing to shift) renders a duration like
+.RB \(dq "3 weeks ago" \(dq
+or, for a timestamp in the future,
+.RB \(dq "in the future" \(dq
+verbatim, with no number; see
+.B docs/DESIGN.md
+for the boundary at which each unit rolls over to the next.
 An unrecognized
 .I fmt
 (including
-.BR relative ,
 .BR human ,
 and
 .BI auto: name ,

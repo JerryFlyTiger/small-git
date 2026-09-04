@@ -298,6 +298,59 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `--oneline`) while git's default `core.abbrev=auto` scales with object
   count; interop declares `core.abbrev=7` on git's side rather than
   pretending the two policies agree.
+- **`--date=relative` / `relative-local` and the `%ar` / `%cr` placeholders**
+  (Phase 66, `sg_date_format_relative` + `sg_date_now` in `src/util/date.c`).
+  The algorithm was not derived, it was **verified**: re-implemented
+  independently in Python from bisected boundaries and cross-checked against
+  real git over 1239 probes, 0 mismatches, and a cold review then repeated
+  the exercise with its own 176-probe harness and also got 0 -- the same
+  "two independent ports agreeing" bar `similarity.c` is held to.
+  WARNING: **there are TWO different month formulas and using one of them
+  everywhere is wrong.** Below 365 days the count is `(days + 15) / 30`;
+  from 365 days on it is `(days * 12 * 2 + 365) / (365 * 2)`. A draft using
+  the second one everywhere matched git on **538 of 539** probes -- the one
+  failure was 75 days, where it says 2 months and git says 3. One miss in
+  539 was the entire signal, and a smaller probe set would have called that
+  draft correct. `tests/test_date_relative.c` carries that delta (6476307)
+  as a named witness; it is the ONLY row in the suite that can catch it.
+  WARNING: **each threshold is compared against the CONVERTED value, not the
+  seconds.** The minutes branch ends when the computed MINUTES reach 90
+  (delta 5370), not when the seconds reach 5400. Boundaries, each bisected
+  to the exact second and pinned +/-1: 90, 5370, 127770, 1164570, 6002970,
+  31490970, and 32873370 (`1 year ago` -> `1 year, 1 month ago`).
+  WARNING: **a commit in the FUTURE renders the literal `in the future`** --
+  no number, no "ago". This had a unit test pinning sg's own literal but
+  **no interop witness at all** until a mutation found it: changing the
+  string left `interop` fully green while four unit rows went red. It is now
+  compared against git.
+  WARNING: **`relative-local` is byte-identical to `relative` in every
+  zone** -- the answer is a duration, so the tz has nothing to change. It
+  still has to parse. Its dispatch happens BEFORE `resolve_mode_tz`, and
+  that ordering is load-bearing: moving it after makes `relative-local`
+  return a silently EMPTY field for an out-of-range timestamp instead of a
+  duration, which is pinned by its own named check (the first draft of that
+  check used `[ -s file ]` and verified nothing, because an empty date field
+  still emits a trailing newline).
+  **The clock is injectable through `GIT_TEST_DATE_NOW`**, the same name git
+  uses, so one interop line sets it for both tools; it reaches `%ar`/`%cr`
+  as well as `--date=relative`. sg parses it as a strict decimal integer and
+  treats anything malformed as ABSENT. **Do NOT reproduce git's own parsing
+  of a bad value** (measured: `abc` and `""` become 0, `1700000000x` takes
+  the numeric prefix, `-5` wraps to `584942417301 years ago`) -- that is
+  unsigned wraparound in a test hook, not an interface.
+  WARNING: **an out-of-range stored timestamp diverges in EVERY date
+  format, and this predates Phase 66** -- measured on the `99999999999999999999`
+  fixture: git parses it as 0 and renders the epoch (`1970-01-01`,
+  `54 years ago`), while sg's `strtoll` saturates to `LLONG_MAX` and renders
+  an empty field for most formats, the raw number for `raw`/`unix`, and
+  `in the future` for `relative`. That is why the interop checks on that
+  fixture assert "does not crash", not byte equality -- a `cmp` there would
+  fail permanently for a reason unrelated to whatever is being tested.
+  WARNING: **`sg_date_now()` samples the clock afresh at every call site and
+  this is UNMEASURED** -- both against real git's own behaviour and against
+  this project's gates, since every interop check pins `GIT_TEST_DATE_NOW`
+  and so never exercises the real-clock path at all. Recorded honestly in
+  `docs/DESIGN.md` rather than defended.
 - **`--date=<format>` selects how a timestamp is RENDERED, and is shared
   verbatim by `sg log` and `sg show`** (Phase 64, `sg_date_parse_mode` /
   `sg_date_format_mode` / `sg_date_format_mode_alloc` in
@@ -309,16 +362,18 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `iso-strict`/`iso8601-strict`, `rfc`/`rfc2822`, `short`, `raw`, `unix`,
   `format:<strftime>`, `format-local:<strftime>`, plus a `-local` suffix on
   any of those base names.
-  **Deliberately not implemented: `relative`, `human`, and `auto:<name>`**
-  -- rejected, never approximated. WARNING: **the reason is NOT "they
-  cannot be tested"**, which is what this project assumed before measuring:
-  git honours **`GIT_TEST_DATE_NOW`**, so `relative`/`human` ARE
-  byte-reproducible (measured: `GIT_TEST_DATE_NOW=1000000100` on a commit
-  stamped 1000000000 renders `2 minutes ago`). They are excluded because
-  each is a new algorithm with its own threshold table, sharing nothing
-  with the five renderers `date.h` already had. `auto:<name>` is excluded
-  because its meaning depends on `isatty(1)` (measured: piped,
-  `auto:relative` renders as `default`), so it has no oracle without a pty.
+  **`relative` and `relative-local` are implemented as of Phase 66** (see
+  the dedicated bullet below), gone from this list rather than marked
+  "fixed" in place. **Still deliberately not implemented: `human`,
+  `human-local`, and `auto:<name>`** -- rejected, never approximated.
+  `human` is deferred because it is **calendar-driven, not
+  duration-driven** and needs its own measurement round (measured: a Dec 31
+  2023 commit viewed on Jan 2 2024 renders `Dec 31 2023`, the YEAR shape,
+  after only two days, purely because the calendar year differs, and all
+  three of its shape transitions land exactly on local midnight).
+  `auto:<name>` is excluded because its meaning depends on `isatty(1)`
+  (measured: piped, `auto:relative` renders as `default`), so it has no
+  oracle without a pty.
   WARNING: **`--date=` reaches exactly FOUR places, and the fourth is the
   one a careless probe misses**: medium's `Date:` and fuller's
   `AuthorDate:`/`CommitDate:`; the **annotated tag header's own `Date:`**
@@ -2944,7 +2999,7 @@ bumping the version, keep the man page in sync.
 
 ## Testing conventions
 
-- One independent unit test `.c` file per area (77 as of Phase 65), **no shared header, no test
+- One independent unit test `.c` file per area (78 as of Phase 66), **no shared header, no test
   framework**. **Do not hardcode that count anywhere in this file again**: the
   Makefile globs `tests/*.c`, so it grows every phase that adds a test, and a
   stale number in the gate-reading instructions above is exactly the

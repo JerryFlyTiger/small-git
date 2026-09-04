@@ -94,8 +94,10 @@ typedef enum {
     PH_PARENTS_FULL, PH_PARENTS_ABBR,
     PH_A_NAME, PH_A_EMAIL, PH_A_LOCAL, PH_A_DATE, PH_A_DATE_RFC2822,
     PH_A_DATE_UNIX, PH_A_DATE_ISO, PH_A_DATE_ISO_STRICT, PH_A_DATE_SHORT,
+    PH_A_DATE_RELATIVE,
     PH_C_NAME, PH_C_EMAIL, PH_C_LOCAL, PH_C_DATE, PH_C_DATE_RFC2822,
     PH_C_DATE_UNIX, PH_C_DATE_ISO, PH_C_DATE_ISO_STRICT, PH_C_DATE_SHORT,
+    PH_C_DATE_RELATIVE,
     PH_SUBJECT, PH_SANITIZED_SUBJECT, PH_BODY, PH_RAW_BODY,
     PH_NEWLINE, PH_PERCENT, PH_HEX_BYTE
 } sg_ph_kind;
@@ -123,6 +125,10 @@ static const struct {
     { 'i', PH_A_DATE_ISO, PH_C_DATE_ISO },
     { 'I', PH_A_DATE_ISO_STRICT, PH_C_DATE_ISO_STRICT },
     { 's', PH_A_DATE_SHORT, PH_C_DATE_SHORT },
+    /* Phase 66: %ar/%cr. FIXED formats, same as every other entry in this
+       table except %ad/%cd -- --date= must never move them, see
+       print_relative_date_field's own header comment. */
+    { 'r', PH_A_DATE_RELATIVE, PH_C_DATE_RELATIVE },
 };
 
 /* Single-char placeholders reached only when the char after `%` is none of
@@ -153,7 +159,8 @@ static int ph_hex_digit(char c)
 /* p[0] must be '%'. On success fills *tok and returns 0. On failure returns
    -1 and fills *bad_len with how many bytes (starting at p, '%' included)
    name the offending placeholder for an error message -- e.g. 1 for a
-   trailing lone '%', 3 for "%ar" (unrecognized suffix after %a), 2 for an
+   trailing lone '%', 3 for "%az" (unrecognized suffix after %a -- %ar is a
+   legal suffix as of Phase 66, see PH_DATE_SUFFIX above), 2 for an
    unrecognized single char like "%z". */
 static int decode_placeholder(const char *p, sg_ph_token *tok, size_t *bad_len)
 {
@@ -297,6 +304,22 @@ static void print_date_field(long long t, const char *tz, date_fmt_fn fn)
     char buf[SG_DATE_NORMAL_MAX];
 
     if (fn(t, tz, buf, sizeof buf) != 0)
+        buf[0] = '\0';
+    fputs(buf, stdout);
+}
+
+/* Phase 66: %ar/%cr -- a FIXED format, unaffected by --date= (same rule as
+   print_date_field's ten siblings, %ad/%cd being the one exception routed
+   through print_configured_date_field instead). "now" comes from
+   sg_date_now(), the single clock accessor shared with --date=relative's
+   own dispatch in date.c's sg_date_format_mode -- see that function's own
+   header comment in date.h for why this is not threaded through as a
+   parameter instead. */
+static void print_relative_date_field(long long t)
+{
+    char buf[SG_DATE_RELATIVE_MAX];
+
+    if (sg_date_format_relative(t, sg_date_now(), buf, sizeof buf) != 0)
         buf[0] = '\0';
     fputs(buf, stdout);
 }
@@ -672,6 +695,7 @@ static void expand_user_format(const char *fmt, const char *hex, const sg_commit
         case PH_A_DATE_ISO: print_date_field(commit->author_time, commit->author_tz, sg_date_format_iso); break;
         case PH_A_DATE_ISO_STRICT: print_date_field(commit->author_time, commit->author_tz, sg_date_format_iso_strict); break;
         case PH_A_DATE_SHORT: print_date_field(commit->author_time, commit->author_tz, sg_date_format_short); break;
+        case PH_A_DATE_RELATIVE: print_relative_date_field(commit->author_time); break;
         case PH_C_NAME: fputs(commit->committer_name, stdout); break;
         case PH_C_EMAIL: fputs(commit->committer_email, stdout); break;
         case PH_C_LOCAL: print_email_local(commit->committer_email); break;
@@ -681,6 +705,7 @@ static void expand_user_format(const char *fmt, const char *hex, const sg_commit
         case PH_C_DATE_ISO: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_iso); break;
         case PH_C_DATE_ISO_STRICT: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_iso_strict); break;
         case PH_C_DATE_SHORT: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_short); break;
+        case PH_C_DATE_RELATIVE: print_relative_date_field(commit->committer_time); break;
         case PH_SUBJECT: print_folded_subject(commit->message); break;
         case PH_SANITIZED_SUBJECT: print_sanitized_subject(commit->message); break;
         case PH_BODY: print_body(commit->message); break;
