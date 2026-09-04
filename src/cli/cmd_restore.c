@@ -10,6 +10,7 @@
 #include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/snapshot.h"
+#include "sg/strfmt.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -307,9 +308,24 @@ int sg_cmd_restore(int argc, char **argv)
            real restore loop below touches anything -- a failed snapshot
            must abort instead of silently restoring unprotected */
         if (any_lossy) {
-            char label[512];
+            /* Phase 65: heap, not a fixed 512-byte buffer -- snapshot
+               label, sg's own feature, no real-git oracle, but
+               `affected.buf` is a comma-joined list of paths with no bound
+               on its length, so sizing it instead of truncating matters
+               just as much as it does for the sites that do have an
+               oracle. */
+            char *label = sg_strfmt_alloc("restore %s", affected.buf != NULL ? affected.buf : "");
 
-            snprintf(label, sizeof(label), "restore %s", affected.buf != NULL ? affected.buf : "");
+            if (label == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
+                free(msg.buf);
+                free(affected.buf);
+                sg_flat_list_free(&head_flat);
+                sg_index_free(&idx);
+                free(repo_root);
+                free(git_dir);
+                return 1;
+            }
             {
                 char snap_bad_path[SG_PATH_MAX];
 
@@ -325,6 +341,7 @@ int sg_cmd_restore(int argc, char **argv)
                         fprintf(stderr,
                                "sg: automatic snapshot failed, aborting this restore for safety "
                                "(no changes made)\n");
+                    free(label);
                     free(msg.buf);
                     free(affected.buf);
                     sg_flat_list_free(&head_flat);
@@ -334,6 +351,7 @@ int sg_cmd_restore(int argc, char **argv)
                     return 1;
                 }
             }
+            free(label);
         }
         free(msg.buf);
         free(affected.buf);

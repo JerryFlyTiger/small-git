@@ -13,6 +13,7 @@
 #include "sg/revparse.h"
 #include "sg/sequencer.h"
 #include "sg/snapshot.h"
+#include "sg/strfmt.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
@@ -163,21 +164,36 @@ int sg_cmd_reset(int argc, char **argv)
            uncommitted is ever at risk, so there is no confirmation gate and
            no automatic snapshot -- same rule real git follows. */
         {
-            char reflog_msg[512];
+            /* Phase 65: heap, not a fixed 512-byte buffer. Measured against
+               git 2.55.0: this line ("reset: moving to <rev_arg>") is
+               byte-for-byte what git itself writes to logs/HEAD, and
+               rev_arg is a ref name -- a PATH whose per-component length is
+               capped but whose total is not (measured with a four-
+               component, 803-char branch name: git wrote 939 bytes, sg's
+               fixed buffer wrote a silently truncated 630). */
+            char *reflog_msg = sg_strfmt_alloc("reset: moving to %s", rev_arg);
 
-            snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
-            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: cannot update %s\n",
-                       current_branch != NULL ? current_branch : "HEAD");
+            if (reflog_msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
                 free(current_branch);
                 free(git_dir);
                 free(repo_root);
                 return 1;
             }
+            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: cannot update %s\n",
+                       current_branch != NULL ? current_branch : "HEAD");
+                free(reflog_msg);
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
+            free(reflog_msg);
         }
     } else if (mode == RESET_MIXED) {
         sg_index idx;
-        char label[256];
+        char *label;
         int merge_in_progress;
 
         if (sg_commit_tree_of(git_dir, target_commit_id, target_tree_id) != 0) {
@@ -201,7 +217,18 @@ int sg_cmd_reset(int argc, char **argv)
            unlike --hard it never touches the working directory, so real git
            doesn't prompt for it either. Split the difference: snapshot
            automatically, without an interactive confirmation. */
-        snprintf(label, sizeof(label), "reset --mixed to '%s'", rev_arg);
+        /* Phase 65: heap, not a fixed 256-byte buffer -- snapshot label,
+           sg's own feature (no real-git oracle), but sized to rev_arg
+           rather than truncated. */
+        label = sg_strfmt_alloc("reset --mixed to '%s'", rev_arg);
+        if (label == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            sg_index_free(&idx);
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
         {
             char snap_bad_path[SG_PATH_MAX];
 
@@ -215,6 +242,7 @@ int sg_cmd_reset(int argc, char **argv)
                 else
                     fprintf(stderr, "sg: automatic snapshot failed, aborting this operation for "
                                     "safety (no changes made)\n");
+                free(label);
                 sg_index_free(&idx);
                 free(current_branch);
                 free(git_dir);
@@ -222,6 +250,7 @@ int sg_cmd_reset(int argc, char **argv)
                 return 1;
             }
         }
+        free(label);
         sg_index_free(&idx);
 
         merge_in_progress = sg_merge_head_exists(git_dir);
@@ -234,17 +263,25 @@ int sg_cmd_reset(int argc, char **argv)
         }
 
         {
-            char reflog_msg[512];
+            char *reflog_msg = sg_strfmt_alloc("reset: moving to %s", rev_arg);
 
-            snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
-            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: cannot update %s\n",
-                       current_branch != NULL ? current_branch : "HEAD");
+            if (reflog_msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
                 free(current_branch);
                 free(git_dir);
                 free(repo_root);
                 return 1;
             }
+            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: cannot update %s\n",
+                       current_branch != NULL ? current_branch : "HEAD");
+                free(reflog_msg);
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
+            free(reflog_msg);
         }
 
         /* Leaving MERGE_HEAD behind would make a later, unrelated `sg
@@ -259,7 +296,7 @@ int sg_cmd_reset(int argc, char **argv)
         if (merge_in_progress && sg_merge_head_remove(git_dir) != 0)
             fprintf(stderr, "sg: warning: failed to remove MERGE_HEAD\n");
     } else {
-        char label[256];
+        char *label;
         int apply_rc;
 
         if (sg_commit_tree_of(git_dir, target_commit_id, target_tree_id) != 0) {
@@ -270,8 +307,18 @@ int sg_cmd_reset(int argc, char **argv)
             return 1;
         }
 
-        snprintf(label, sizeof(label), "reset --hard to '%s'", rev_arg);
+        /* Phase 65: heap, not a fixed 256-byte buffer -- snapshot label, no
+           real-git oracle, sized instead of truncated. */
+        label = sg_strfmt_alloc("reset --hard to '%s'", rev_arg);
+        if (label == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
         apply_rc = sg_safe_apply_tree(git_dir, repo_root, target_tree_id, label, force);
+        free(label);
         if (apply_rc == 1) {
             fprintf(stderr, "sg: reset aborted\n");
             free(current_branch);
@@ -287,17 +334,25 @@ int sg_cmd_reset(int argc, char **argv)
         }
 
         {
-            char reflog_msg[512];
+            char *reflog_msg = sg_strfmt_alloc("reset: moving to %s", rev_arg);
 
-            snprintf(reflog_msg, sizeof(reflog_msg), "reset: moving to %s", rev_arg);
-            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: cannot update %s\n",
-                       current_branch != NULL ? current_branch : "HEAD");
+            if (reflog_msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
                 free(current_branch);
                 free(git_dir);
                 free(repo_root);
                 return 1;
             }
+            if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
+                fprintf(stderr, "sg: cannot update %s\n",
+                       current_branch != NULL ? current_branch : "HEAD");
+                free(reflog_msg);
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
+            free(reflog_msg);
         }
     }
 

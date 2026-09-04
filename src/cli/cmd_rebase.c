@@ -15,6 +15,7 @@
 #include "sg/sequencer.h"
 #include "sg/similarity.h"
 #include "sg/snapshot.h"
+#include "sg/strfmt.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -45,16 +46,8 @@ static const char REBASE_START_FMT[] = "rebase (start): checkout %s";
 static char *reflog_msg_with_subject(const char *prefix, const char *message)
 {
     size_t subject_len = strcspn(message, "\n");
-    int need = snprintf(NULL, 0, "%s%.*s", prefix, (int)subject_len, message);
-    char *out;
 
-    if (need < 0)
-        return NULL;
-    out = malloc((size_t)need + 1);
-    if (out == NULL)
-        return NULL;
-    snprintf(out, (size_t)need + 1, "%s%.*s", prefix, (int)subject_len, message);
-    return out;
+    return sg_strfmt_alloc("%s%.*s", prefix, (int)subject_len, message);
 }
 
 static void short_hex(const unsigned char id[SG_SHA1_RAW_LEN], char out[8])
@@ -137,7 +130,7 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
     size_t conflict_count = 0;
     int has_conflict;
     char short_sha[8];
-    char theirs_label[300];
+    char *theirs_label;
     pick_rc rc = PICK_ERROR;
     size_t i;
 
@@ -177,17 +170,29 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
            cmd_merge.c's ours label, nothing recorded this one as
            deliberate -- no comment, no test -- so it read as an oversight
            against this project's byte-compatibility goal and is corrected
-           rather than pinned as-is. */
-        snprintf(theirs_label, sizeof(theirs_label), "%s (%s)", short_sha,
-                summary != NULL ? summary : "");
+           rather than pinned as-is.
+
+           Phase 65: heap, not a fixed buffer -- a 300-byte
+           `char theirs_label[300]` silently truncated a long commit
+           subject, and at 404 chars the marker even lost its closing `)`
+           (measured against git 2.55.0: git writes 422 bytes, sg wrote
+           307). A subject long enough to truncate produced a malformed
+           conflict marker, not merely a short one. */
+        theirs_label = sg_strfmt_alloc("%s (%s)", short_sha, summary != NULL ? summary : "");
         free(summary);
+    }
+    if (theirs_label == NULL) {
+        sg_commit_free(&commit);
+        return PICK_ERROR;
     }
 
     if (sg_merge_trees(git_dir, base_tree, ours_tree, commit.tree, "HEAD", theirs_label,
                        SG_SIMILARITY_DEFAULT, &result) != 0) {
+        free(theirs_label);
         sg_commit_free(&commit);
         return PICK_ERROR;
     }
+    free(theirs_label);
 
     /* Materializes the merge result into the working tree and a fresh
        index; a -1 here means either a chunked blob's data was unrecoverable
@@ -571,7 +576,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         /* HEAD is an ancestor of upstream: a pure fast-forward. */
         unsigned char upstream_tree[SG_SHA1_RAW_LEN];
         sg_index idx;
-        char label[300];
+        char *label;
 
         if (sg_commit_tree_of(git_dir, upstream_commit, upstream_tree) != 0) {
             fprintf(stderr, "sg: corrupt commit for branch '%s'\n", upstream_arg);
@@ -584,7 +589,17 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             free(current_branch);
             return 1;
         }
-        snprintf(label, sizeof(label), "rebase onto %s", upstream_arg);
+        /* Phase 65: heap. This is a snapshot label (sg's own feature, no
+           real-git oracle), but sizing it to upstream_arg's own length
+           instead of a fixed 300 bytes is still the right idiom -- a
+           truncated label would silently misname the snapshot. */
+        label = sg_strfmt_alloc("rebase onto %s", upstream_arg);
+        if (label == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            sg_index_free(&idx);
+            free(current_branch);
+            return 1;
+        }
         {
             char snap_bad_path[SG_PATH_MAX];
 
@@ -598,11 +613,13 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
                 else
                     fprintf(stderr, "sg: automatic snapshot failed, aborting this rebase for "
                                     "safety (no changes made)\n");
+                free(label);
                 sg_index_free(&idx);
                 free(current_branch);
                 return 1;
             }
         }
+        free(label);
         sg_index_free(&idx);
 
         if (sg_apply_tree_to_workdir(git_dir, repo_root, upstream_tree) != 0) {
@@ -617,7 +634,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
                (measured). Reusing the same detach/re-attach sequence is what
                makes that fall out, rather than a second, special shape. */
             sg_rebase_state ff_state;
-            char start_msg[512];
+            char *start_msg;
             int frc;
 
             memset(&ff_state, 0, sizeof(ff_state));
@@ -625,9 +642,16 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             memcpy(ff_state.orig_head, head_commit, SG_SHA1_RAW_LEN);
             ff_state.orig_branch = current_branch; /* borrowed: freed by this function, not the state */
 
-            if (snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg) >=
-                   (int)sizeof(start_msg)) {
-                fprintf(stderr, "sg: upstream name too long\n");
+            /* Phase 65: heap, not a checked-and-refused fixed 512-byte
+               buffer. Real git has no length limit on this reflog line and
+               always writes the whole upstream name -- refusing the whole
+               rebase for a long <upstream> argument was sg inventing a
+               failure real git does not have, the same class of bug as the
+               silent-truncation sites, just with the opposite failure
+               direction (error instead of wrong bytes). */
+            start_msg = sg_strfmt_alloc(REBASE_START_FMT, upstream_arg);
+            if (start_msg == NULL) {
+                fprintf(stderr, "sg: out of memory\n");
                 free(current_branch);
                 return 1;
             }
@@ -644,15 +668,18 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
                touching anything for the same reason. */
             if (sg_rebase_state_write(git_dir, &ff_state) != 0) {
                 fprintf(stderr, "sg: cannot write rebase state\n");
+                free(start_msg);
                 free(current_branch);
                 return 1;
             }
             if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
                 fprintf(stderr, "sg: cannot point HEAD at '%s'\n", upstream_arg);
+                free(start_msg);
                 sg_rebase_state_remove(git_dir);
                 free(current_branch);
                 return 1;
             }
+            free(start_msg);
             frc = finish_rebase(git_dir, current_branch, &ff_state);
             if (frc != 0) {
                 free(current_branch);
@@ -709,7 +736,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
 
     {
         sg_index idx;
-        char label[300];
+        char *label;
 
         if (sg_index_read(git_dir, &idx) != 0) {
             fprintf(stderr, "sg: failed to read index (corrupt?)\n");
@@ -717,7 +744,16 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             free(current_branch);
             return 1;
         }
-        snprintf(label, sizeof(label), "rebase onto %s", upstream_arg);
+        /* Phase 65: heap -- see the fast-forward branch above for why (this
+           is the same snapshot label, no oracle, but sized to fit). */
+        label = sg_strfmt_alloc("rebase onto %s", upstream_arg);
+        if (label == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            sg_index_free(&idx);
+            free(state.todo);
+            free(current_branch);
+            return 1;
+        }
         {
             char snap_bad_path[SG_PATH_MAX];
 
@@ -731,12 +767,14 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
                 else
                     fprintf(stderr, "sg: automatic snapshot failed, aborting this rebase for "
                                     "safety (no changes made)\n");
+                free(label);
                 sg_index_free(&idx);
                 free(state.todo);
                 free(current_branch);
                 return 1;
             }
         }
+        free(label);
         sg_index_free(&idx);
     }
 
@@ -766,23 +804,27 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
            The branch stays put for the whole replay and moves once, at
            finish_rebase. "checkout <upstream_arg>" uses the token the user
            typed, the same way a plain checkout's reflog does. */
-        char start_msg[512];
+        char *start_msg;
 
-        /* Checked, not silently truncated: upstream_arg is argv, and a
-           truncated "checkout <arg>" would be a reflog line that quietly
-           disagrees with what was actually checked out -- the same reason
-           reflog_msg_with_subject allocates instead of using a fixed buffer. */
-        if (snprintf(start_msg, sizeof(start_msg), REBASE_START_FMT, upstream_arg) >=
-               (int)sizeof(start_msg)) {
-            fprintf(stderr, "sg: upstream name too long\n");
+        /* Heap, not a checked-and-refused fixed buffer: upstream_arg is
+           argv, and real git has no length limit here and writes the whole
+           name -- refusing the rebase for a long <upstream> would be sg
+           inventing a failure real git does not have (Phase 65; the same
+           reason reflog_msg_with_subject allocates instead of using a fixed
+           buffer). */
+        start_msg = sg_strfmt_alloc(REBASE_START_FMT, upstream_arg);
+        if (start_msg == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
             sg_rebase_state_free(&state);
             return 1;
         }
         if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
             fprintf(stderr, "sg: cannot point HEAD at '%s'\n", upstream_arg);
+            free(start_msg);
             sg_rebase_state_free(&state);
             return 1;
         }
+        free(start_msg);
     }
 
     rc = run_rebase_todo(git_dir, repo_root, state.orig_branch, upstream_arg, &state);

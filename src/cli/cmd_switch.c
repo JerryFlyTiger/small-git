@@ -10,6 +10,7 @@
 #include "sg/repo.h"
 #include "sg/revparse.h"
 #include "sg/sequencer.h"
+#include "sg/strfmt.h"
 #include "sg/workdir.h"
 
 #include <stdio.h>
@@ -60,7 +61,7 @@ int sg_cmd_switch(int argc, char **argv)
        HEAD position was" line is printed after HEAD has already moved. */
     unsigned char prev_commit_id[SG_SHA1_RAW_LEN];
     int have_prev_commit = 0;
-    char label[256];
+    char *label;
     int apply_rc;
     char *old_branch;
     char *checkout_msg = NULL;
@@ -296,8 +297,20 @@ int sg_cmd_switch(int argc, char **argv)
         return 1;
     }
 
-    snprintf(label, sizeof(label), detach ? "detach at '%s'" : "switch to '%s'", branch_arg);
+    /* Phase 65: heap, not a fixed 256-byte buffer -- snapshot label, sg's
+       own feature, no real-git oracle, but sized to branch_arg instead of
+       truncated. */
+    label = sg_strfmt_alloc(detach ? "detach at '%s'" : "switch to '%s'", branch_arg);
+    if (label == NULL) {
+        fprintf(stderr, "sg: out of memory\n");
+        free(checkout_msg);
+        free(old_branch);
+        free(git_dir);
+        free(repo_root);
+        return 1;
+    }
     apply_rc = sg_safe_apply_tree(git_dir, repo_root, target_tree_id, label, force);
+    free(label);
     if (apply_rc == 1) {
         fprintf(stderr, "sg: switch aborted\n");
         free(checkout_msg);

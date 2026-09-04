@@ -14,6 +14,7 @@
 #include "sg/similarity.h"
 #include "sg/snapshot.h"
 #include "sg/status.h"
+#include "sg/strfmt.h"
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
@@ -531,7 +532,7 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     const char *branch_display;
     char short_hex[8];
     char *head_subject = NULL;
-    char subj_buf[512];
+    char *subj_buf = NULL;
     char *cleaned_index_msg = NULL;
     char *cleaned_untracked_msg = NULL;
     char *cleaned_subject = NULL;
@@ -647,9 +648,15 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     when = (long long)time(NULL);
 
     /* index commit (parent 2): always the "index on" form, independent of
-       the user-supplied message. */
-    snprintf(subj_buf, sizeof(subj_buf), "index on %s: %s %s", branch_display, short_hex, head_subject);
-    if (sg_message_cleanup(subj_buf, &cleaned_index_msg) != 0) {
+       the user-supplied message. Phase 65: heap, not a fixed 512-byte
+       buffer -- this is the stash message, observable via `sg stash show`/
+       `sg stash list`, and measured byte-identical to git's own "index on
+       <branch>: <short> <subject>" form; branch_display and head_subject
+       are both unbounded (a branch name is a ref path, its total length is
+       not capped -- see this project's own bug #3). */
+    subj_buf = sg_strfmt_alloc("index on %s: %s %s", branch_display, short_hex, head_subject);
+    if (subj_buf == NULL || sg_message_cleanup(subj_buf, &cleaned_index_msg) != 0) {
+        free(subj_buf);
         free(head_subject);
         for (i = 0; i < untracked_path_count; i++)
             free(untracked_paths[i]);
@@ -658,6 +665,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         sg_index_free(&idx);
         return -1;
     }
+    free(subj_buf);
+    subj_buf = NULL;
 
     memcpy(index_parents[0], head_commit, SG_SHA1_RAW_LEN);
     if (build_and_write_commit(git_dir, index_tree, index_parents, 1, cleaned_index_msg, name, email, when,
@@ -692,9 +701,10 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
             sg_index_free(&idx);
             return -1;
         }
-        snprintf(subj_buf, sizeof(subj_buf), "untracked files on %s: %s %s", branch_display, short_hex,
-                head_subject);
-        if (sg_message_cleanup(subj_buf, &cleaned_untracked_msg) != 0) {
+        subj_buf = sg_strfmt_alloc("untracked files on %s: %s %s", branch_display, short_hex,
+                                   head_subject);
+        if (subj_buf == NULL || sg_message_cleanup(subj_buf, &cleaned_untracked_msg) != 0) {
+            free(subj_buf);
             free(head_subject);
             for (i = 0; i < untracked_path_count; i++)
                 free(untracked_paths[i]);
@@ -703,6 +713,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
             sg_index_free(&idx);
             return -1;
         }
+        free(subj_buf);
+        subj_buf = NULL;
         if (build_and_write_commit(git_dir, untracked_tree, NULL, 0, cleaned_untracked_msg, name, email,
                                    when, untracked_commit_id) != 0) {
             free(cleaned_untracked_msg);
@@ -717,15 +729,30 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         free(cleaned_untracked_msg);
     }
 
-    /* stash commit's own subject -- also the reflog message. */
+    /* stash commit's own subject -- also the reflog message. Phase 65:
+       heap, not a fixed 512-byte buffer -- measured byte-for-byte against
+       git 2.55.0 (both the "On <branch>: <message>" form, where message is
+       the unbounded -m argument, and the "WIP on <branch>: <short>
+       <subject>" default). subj_buf survives past sg_message_cleanup below
+       because sg_reflog_append (further down) logs the RAW subject, not
+       the cleaned one -- same asymmetry the pre-existing fixed buffer had. */
     if (message != NULL)
-        snprintf(subj_buf, sizeof(subj_buf), "On %s: %s", branch_display, message);
+        subj_buf = sg_strfmt_alloc("On %s: %s", branch_display, message);
     else
-        snprintf(subj_buf, sizeof(subj_buf), "WIP on %s: %s %s", branch_display, short_hex, head_subject);
+        subj_buf = sg_strfmt_alloc("WIP on %s: %s %s", branch_display, short_hex, head_subject);
     free(head_subject);
     head_subject = NULL;
+    if (subj_buf == NULL) {
+        for (i = 0; i < untracked_path_count; i++)
+            free(untracked_paths[i]);
+        free(untracked_paths);
+        free(branch);
+        sg_index_free(&idx);
+        return -1;
+    }
 
     if (sg_message_cleanup(subj_buf, &cleaned_subject) != 0) {
+        free(subj_buf);
         for (i = 0; i < untracked_path_count; i++)
             free(untracked_paths[i]);
         free(untracked_paths);
@@ -744,6 +771,7 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     if (build_and_write_commit(git_dir, worktree_tree, stash_parents, stash_parent_count, cleaned_subject,
                                name, email, when, stash_commit_id) != 0) {
         free(cleaned_subject);
+        free(subj_buf);
         for (i = 0; i < untracked_path_count; i++)
             free(untracked_paths[i]);
         free(untracked_paths);
@@ -758,6 +786,7 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
 
     if (sg_reflog_append(git_dir, "refs/stash", old_stash_id, stash_commit_id, subj_buf, &appended_at) !=
        0) {
+        free(subj_buf);
         for (i = 0; i < untracked_path_count; i++)
             free(untracked_paths[i]);
         free(untracked_paths);
@@ -765,6 +794,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         sg_index_free(&idx);
         return -1;
     }
+    free(subj_buf);
+    subj_buf = NULL;
 
     if (sg_ref_write_path(git_dir, "refs/stash", stash_commit_id) != 0) {
         sg_reflog_truncate(git_dir, "refs/stash", appended_at);
