@@ -90,12 +90,14 @@ static void test_grammar(void)
     check_parse_ok("relative", SG_DATE_RELATIVE, 0);
     check_parse_ok("relative-local", SG_DATE_RELATIVE, 1);
 
-    /* section 0: deliberately still unimplemented, even though real git
-       accepts them (Phase 66 spec section 0 -- human is calendar-driven,
-       not duration-driven, a genuinely different algorithm deferred to its
-       own phase; auto: depends on isatty(1), no oracle without a pty). */
-    check_parse_err("human");
-    check_parse_err("human-local");
+    /* human/human-local are implemented as of Phase 67 -- see
+       test_date_human.c for the byte-level shape table. Only the grammar
+       (kind/local) is asserted here. */
+    check_parse_ok("human", SG_DATE_HUMAN, 0);
+    check_parse_ok("human-local", SG_DATE_HUMAN, 1);
+
+    /* section 0: deliberately still unimplemented -- auto: depends on
+       isatty(1), no oracle without a pty. */
     check_parse_err("auto:short");
     check_parse_err("auto:");
 
@@ -286,6 +288,40 @@ static void test_local_zero_offset(void)
     check_render("iso-local", FIXTURE_EPOCH, FIXTURE_TZ, "2024-01-01 00:00:00 +0000");
 }
 
+/* Phase 67: --date=human/human-local go through sg_date_format_mode's
+   dispatch, the same alloc'ing path every other name uses -- this exercises
+   THAT wiring (the SG_DATE_HUMAN case, and resolve_mode_tz feeding it the
+   right tz_str for human-local), not the shape algorithm itself (that is
+   tests/test_date_human.c's job, calling sg_date_format_human directly).
+   Bytes measured against real git 2.55.0 via python subprocess (argv, no
+   shell), TZ=Asia/Tokyo, FIXTURE_EPOCH (2024-01-01 00:00:00 UTC). */
+static void test_human_mode_end_to_end(void)
+{
+    with_tz("Asia/Tokyo");
+
+    setenv("GIT_TEST_DATE_NOW", "1704326400" /* FIXTURE_EPOCH + 3 days */, 1);
+    check_render("human", FIXTURE_EPOCH, FIXTURE_TZ, "Mon 00:00 +0000");
+    check_render("human-local", FIXTURE_EPOCH, FIXTURE_TZ, "Mon 09:00");
+
+    setenv("GIT_TEST_DATE_NOW", "1707523200" /* FIXTURE_EPOCH + 40 days */, 1);
+    check_render("human", FIXTURE_EPOCH, FIXTURE_TZ, "Mon Jan 1 00:00");
+    check_render("human-local", FIXTURE_EPOCH, FIXTURE_TZ, "Mon Jan 1 09:00");
+
+    /* human-local's own no-offset rule needs a fixture where the resolved
+       tz (local offset AT THE COMMIT'S instant) genuinely differs from the
+       local offset at "now" -- Asia/Tokyo above has no DST, so the two
+       coincide there and a wiring bug that hardcodes local_mode=0 at the
+       sg_date_format_mode dispatch site (as opposed to test_date_human.c's
+       own direct sg_date_format_human coverage of the SAME rule) would go
+       unnoticed. Same DST-crossing fixture as
+       tests/test_date_human.c's test_human_local_never_offset. */
+    with_tz("America/New_York");
+    setenv("GIT_TEST_DATE_NOW", "1699416000" /* 1699156800 + 3 days, crosses the fall-back */, 1);
+    check_render("human-local", 1699156800, "-0400", "Sun 00:00");
+
+    unsetenv("GIT_TEST_DATE_NOW");
+}
+
 int main(void)
 {
     test_grammar();
@@ -295,6 +331,7 @@ int main(void)
     test_dst_pair_kolkata();
     test_format_overflow();
     test_local_zero_offset();
+    test_human_mode_end_to_end();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

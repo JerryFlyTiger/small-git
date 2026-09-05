@@ -12,7 +12,9 @@
 #include "sg/hash.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -150,6 +152,47 @@ static void test_unix_timestamp_end_to_end(void)
     CHECK(strcmp(out, "1700000000") == 0, "%%at: got '%s'", out);
 }
 
+/* Phase 67: %ah/%ch end to end. Deliberately uses author/committer times 40
+   days apart (matching PHASE67_SPEC.md section 3's own example) rather than
+   make_fixture_commit's stock 100-second gap -- a swap of author<->committer
+   fields is invisible at 100 seconds (both would render the same relative-
+   day shape), but at 40 days the two placeholders land in genuinely
+   different output shapes, so a swap bug produces a wrong STRING, not just
+   a coincidentally-matching one. Byte values measured against real git
+   2.55.0 via python subprocess (argv, no shell) -- see PHASE67_SPEC.md's
+   own oracle methodology note. */
+static void test_human_placeholder_end_to_end(void)
+{
+    sg_commit commit;
+    sg_pretty_format pf;
+    unsigned char id[SG_SHA1_RAW_LEN] = { 0 };
+    char out[128];
+
+    make_fixture_commit(&commit);
+    commit.author_time = 1700000000;
+    strcpy(commit.author_tz, "+0800");
+    commit.committer_time = 1700000000 + 40 * 86400;
+    strcpy(commit.committer_tz, "-0500");
+
+    /* %ah/%ch compares "now" against the MACHINE'S LOCAL zone (never the
+       stored tz) -- pin TZ so this test is deterministic regardless of
+       where it runs, same idiom tests/test_date_mode.c's with_tz uses. */
+    setenv("TZ", "UTC", 1);
+    tzset();
+    setenv("GIT_TEST_DATE_NOW", "1703888000" /* 1700000000 + 45*86400 */, 1);
+
+    pf.kind = SG_PRETTY_FORMAT;
+    pf.user_format = "%ah";
+    capture(&commit, id, &pf, out, sizeof out);
+    CHECK(strcmp(out, "Wed Nov 15 06:13") == 0, "%%ah: got '%s'", out);
+
+    pf.user_format = "%ch";
+    capture(&commit, id, &pf, out, sizeof out);
+    CHECK(strcmp(out, "Sun Dec 24 17:13") == 0, "%%ch: got '%s'", out);
+
+    unsetenv("GIT_TEST_DATE_NOW");
+}
+
 /* Section 5.2's ten %f rows, byte-exact. */
 static void test_sanitized_subject_rows(void)
 {
@@ -237,10 +280,9 @@ static void test_parent_list_on_merge(void)
    offending sequence. */
 static void test_validate_rejects_outside_table(void)
 {
-    /* %ar/%cr are implemented as of Phase 66 (see test_validate_accepts_
-       every_table_entry below); %ah/%ch (human, a genuinely different
-       calendar-driven algorithm, Phase 66 spec section 0) stay rejected. */
-    static const char *const BAD[] = { "%z", "%ah", "%ch", "%d", "%C(red)", "100%" };
+    /* %ar/%cr are implemented as of Phase 66, %ah/%ch as of Phase 67 (see
+       test_validate_accepts_every_table_entry below). */
+    static const char *const BAD[] = { "%z", "%d", "%C(red)", "100%" };
     size_t i;
 
     for (i = 0; i < sizeof(BAD) / sizeof(BAD[0]); i++) {
@@ -257,8 +299,8 @@ static void test_validate_accepts_every_table_entry(void)
 {
     static const char *const GOOD[] = {
         "%H", "%h", "%T", "%t", "%P", "%p",
-        "%an", "%ae", "%al", "%ad", "%aD", "%at", "%ai", "%aI", "%as", "%ar",
-        "%cn", "%ce", "%cl", "%cd", "%cD", "%ct", "%ci", "%cI", "%cs", "%cr",
+        "%an", "%ae", "%al", "%ad", "%aD", "%at", "%ai", "%aI", "%as", "%ar", "%ah",
+        "%cn", "%ce", "%cl", "%cd", "%cD", "%ct", "%ci", "%cI", "%cs", "%cr", "%ch",
         "%s", "%f", "%b", "%B",
         "%n", "%%", "%x41",
     };
@@ -430,6 +472,7 @@ int main(void)
 {
     test_date_renderings();
     test_unix_timestamp_end_to_end();
+    test_human_placeholder_end_to_end();
     test_sanitized_subject_rows();
     test_parent_list_on_merge();
     test_validate_rejects_outside_table();

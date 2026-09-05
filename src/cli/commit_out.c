@@ -94,10 +94,10 @@ typedef enum {
     PH_PARENTS_FULL, PH_PARENTS_ABBR,
     PH_A_NAME, PH_A_EMAIL, PH_A_LOCAL, PH_A_DATE, PH_A_DATE_RFC2822,
     PH_A_DATE_UNIX, PH_A_DATE_ISO, PH_A_DATE_ISO_STRICT, PH_A_DATE_SHORT,
-    PH_A_DATE_RELATIVE,
+    PH_A_DATE_RELATIVE, PH_A_DATE_HUMAN,
     PH_C_NAME, PH_C_EMAIL, PH_C_LOCAL, PH_C_DATE, PH_C_DATE_RFC2822,
     PH_C_DATE_UNIX, PH_C_DATE_ISO, PH_C_DATE_ISO_STRICT, PH_C_DATE_SHORT,
-    PH_C_DATE_RELATIVE,
+    PH_C_DATE_RELATIVE, PH_C_DATE_HUMAN,
     PH_SUBJECT, PH_SANITIZED_SUBJECT, PH_BODY, PH_RAW_BODY,
     PH_NEWLINE, PH_PERCENT, PH_HEX_BYTE
 } sg_ph_kind;
@@ -129,6 +129,9 @@ static const struct {
        table except %ad/%cd -- --date= must never move them, see
        print_relative_date_field's own header comment. */
     { 'r', PH_A_DATE_RELATIVE, PH_C_DATE_RELATIVE },
+    /* Phase 67: %ah/%ch. Also FIXED, same as %ar/%cr -- unaffected by
+       --date= (measured, see print_human_date_field's own comment). */
+    { 'h', PH_A_DATE_HUMAN, PH_C_DATE_HUMAN },
 };
 
 /* Single-char placeholders reached only when the char after `%` is none of
@@ -320,6 +323,21 @@ static void print_relative_date_field(long long t)
     char buf[SG_DATE_RELATIVE_MAX];
 
     if (sg_date_format_relative(t, sg_date_now(), buf, sizeof buf) != 0)
+        buf[0] = '\0';
+    fputs(buf, stdout);
+}
+
+/* Phase 67: %ah/%ch -- a FIXED format, unaffected by --date= (same rule as
+   %ar/%cr's print_relative_date_field just above; measured with
+   --date=raw/--date=iso/--date=human-local, %ah stays the non-local human
+   form in all three). Unlike %ar/%cr this DOES need the commit's own
+   stored tz (human's output depends on it), which is why it cannot share
+   print_relative_date_field verbatim. */
+static void print_human_date_field(long long t, const char *tz)
+{
+    char buf[SG_DATE_HUMAN_MAX];
+
+    if (sg_date_format_human(t, tz, sg_date_now(), 0, buf, sizeof buf) != 0)
         buf[0] = '\0';
     fputs(buf, stdout);
 }
@@ -696,6 +714,7 @@ static void expand_user_format(const char *fmt, const char *hex, const sg_commit
         case PH_A_DATE_ISO_STRICT: print_date_field(commit->author_time, commit->author_tz, sg_date_format_iso_strict); break;
         case PH_A_DATE_SHORT: print_date_field(commit->author_time, commit->author_tz, sg_date_format_short); break;
         case PH_A_DATE_RELATIVE: print_relative_date_field(commit->author_time); break;
+        case PH_A_DATE_HUMAN: print_human_date_field(commit->author_time, commit->author_tz); break;
         case PH_C_NAME: fputs(commit->committer_name, stdout); break;
         case PH_C_EMAIL: fputs(commit->committer_email, stdout); break;
         case PH_C_LOCAL: print_email_local(commit->committer_email); break;
@@ -706,6 +725,7 @@ static void expand_user_format(const char *fmt, const char *hex, const sg_commit
         case PH_C_DATE_ISO_STRICT: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_iso_strict); break;
         case PH_C_DATE_SHORT: print_date_field(commit->committer_time, commit->committer_tz, sg_date_format_short); break;
         case PH_C_DATE_RELATIVE: print_relative_date_field(commit->committer_time); break;
+        case PH_C_DATE_HUMAN: print_human_date_field(commit->committer_time, commit->committer_tz); break;
         case PH_SUBJECT: print_folded_subject(commit->message); break;
         case PH_SANITIZED_SUBJECT: print_sanitized_subject(commit->message); break;
         case PH_BODY: print_body(commit->message); break;
