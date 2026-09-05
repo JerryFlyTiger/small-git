@@ -16128,11 +16128,11 @@ check "phase60d: sg does not crash rendering the same overflowing date via %aD/%
 # --- section 5.3: everything outside the table is rejected -- git accepts
 # every one of these (prints something, exits 0), sg refuses all of them
 # (exit 1). Both sides pinned, per the spec's "pin BOTH sides" instruction.
-# %ar was in this list until Phase 66 implemented it (see the phase66:
-# group's own GOOD-side coverage further down); %ah (human, a genuinely
-# different calendar-driven algorithm, still not implemented) takes its
-# seat here.
-for p60bad in '%z' '%ah' '%d' '%C(red)' '100%'; do
+# %ar was in this list until Phase 66 implemented it, and %ah left it as of
+# Phase 67 (see the phase67: group's own GOOD-side coverage further down),
+# gone from the list rather than marked "fixed" in place, same convention
+# %ar's own removal used.
+for p60bad in '%z' '%d' '%C(red)' '100%'; do
     check "phase60b oracle: precondition -- real git accepts --pretty=format:$p60bad (exits 0)" \
         sh -c "(cd '$P60' && LC_ALL=C git show --pretty=\"format:$p60bad\" -s '$P60_HEAD') > /dev/null 2>&1"
     check "phase60b: sg show --pretty=format:$p60bad is rejected -- deliberate divergence, section 5.3" \
@@ -16682,16 +16682,14 @@ check "phase62: reject -- --all" test $? -eq 1
 (cd "$P62" && "$SG" log --reverse > /dev/null 2>&1)
 check "phase62: reject -- --reverse" test $? -eq 1
 
-# --date=iso is implemented as of Phase 64, and --date=relative/
-# relative-local as of Phase 66 (see the dedicated phase64:/phase66:
-# groups below) -- this used to assert rejection of every --date= value;
-# rewritten (not deleted) each time a name's gap closed, per this
-# project's own convention for a partially-closed gap: human/auto: remain
-# real git renderers with no shared machinery to reuse (human is
-# calendar-driven, not duration-driven, a genuinely different algorithm
-# deferred to its own phase; auto: depends on isatty(1)), and stay
-# rejected on sg's side even though git itself accepts them.
-for p64_bad_name in human human-local auto:short auto:; do
+# --date=iso is implemented as of Phase 64, --date=relative/relative-local
+# as of Phase 66, and --date=human/human-local as of Phase 67 (see the
+# dedicated phase64:/phase66:/phase67: groups below) -- this used to
+# assert rejection of every --date= value; rewritten (not deleted) each
+# time a name's gap closed, per this project's own convention for a
+# partially-closed gap: auto: alone remains, since its meaning depends on
+# isatty(1), no oracle without a pty.
+for p64_bad_name in auto:short auto:; do
     (cd "$P62" && "$SG" log "--date=$p64_bad_name" > /dev/null 2>&1)
     check "phase62: reject -- --date=$p64_bad_name (sg, deliberately unimplemented)" test $? -eq 1
     (cd "$P62" && LC_ALL=C TZ=UTC git log "--date=$p64_bad_name" > /dev/null 2>&1)
@@ -17351,6 +17349,27 @@ check "phase66 review: sg does not crash rendering an overflowing author date vi
 check "phase66 review oracle: precondition -- real git itself renders (does not crash on) the same overflowing timestamp via --date=relative, so the crash-only check above is measuring sg against a real reachable input, not a shape git also refuses" \
     sh -c "(cd '$P60' && LC_ALL=C git show -s --date=relative '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -eq 0"
 
+# --- Phase 67 extends that same sweep to human/human-local. Phase 66's own
+# review round exists because `relative`/`relative-local` were added without
+# ever being swept over P60D_OVERFLOW; adding two more date names without
+# extending the sweep would reproduce that gap one phase later, which is the
+# "one rule copied N times, one copy missing" shape this project keeps
+# hitting. Measured (python3 subprocess, argv list, no shell): git renders
+# "Jan 1 1970" for this object under both names (its own parser lands on 0),
+# while sg's strtoll saturates to LLONG_MAX and sg_date_format_human's
+# shift_tm therefore fails, rendering an EMPTY field with exit 0 -- the same
+# pre-existing out-of-range divergence CLAUDE.md already records for every
+# other date format, so this is deliberately a "does not crash" check and
+# NOT a cmp against git. ---
+check "phase67 review: sg does not crash rendering an overflowing author date via --date=human" \
+    sh -c "(cd '$P60' && '$SG' show -s --date=human '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase67 review: sg does not crash rendering an overflowing author date via --date=human-local" \
+    sh -c "(cd '$P60' && '$SG' show -s --date=human-local '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase67 review: sg does not crash rendering an overflowing author date via %ah/%ch (the FIXED-format path, which never goes through sg_date_format_mode at all)" \
+    sh -c "(cd '$P60' && '$SG' show -s --pretty=tformat:'[%ah][%ch]' '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -le 1"
+check "phase67 review oracle: precondition -- real git itself renders (does not crash on) the same overflowing timestamp via --date=human, so the three crash-only checks above measure sg against a real reachable input" \
+    sh -c "(cd '$P60' && LC_ALL=C git show -s --date=human '$P60D_OVERFLOW') > /dev/null 2>&1; test \$? -eq 0"
+
 # --- a CONTENT check, not just "does not crash": --date=relative-local's
 # `-local` branch (resolve_mode_tz's `mode->local` path, src/util/date.c)
 # calls local_offset_at -> localtime_r on this fixture's saturated
@@ -17998,27 +18017,286 @@ check "phase66 review: sg's %ar prints \"in the future\" for a commit dated afte
 check "phase66 review oracle: precondition -- git's own %ar really does say \"in the future\" here (not some other wording), or the check above proves nothing about the literal" \
     grep -q "in the future" "$WORKDIR/p66_git_future_ar.txt"
 
-# --- still-rejected pins, carried forward from Phase 64's own
-# deliberately-unimplemented list: human/human-local/%ah/%ch/auto: remain
-# refused on sg's side (exit 1) while git accepts them (exit 0), so a
-# future accidental implementation of `human` cannot silently start
-# passing these without the check noticing the assumption moved. ---
-for p66bad in human human-local; do
-    (cd "$P64" && "$SG" show -s "--date=$p66bad" "$P64_JAN" > /dev/null 2>&1)
-    check "phase66: sg still rejects --date=$p66bad, exit 1" test $? -eq 1
-    (cd "$P64" && LC_ALL=C git show -s "--date=$p66bad" "$P64_JAN" > /dev/null 2>&1)
-    check "phase66 oracle: git still accepts --date=$p66bad, exit 0" test $? -eq 0
-done
-for p66bad in %ah %ch; do
-    (cd "$P64" && "$SG" show -s --pretty="$p66bad" "$P64_JAN" > /dev/null 2>&1)
-    check "phase66: sg still rejects --pretty=$p66bad, exit 1" test $? -eq 1
-    (cd "$P64" && LC_ALL=C git show -s --pretty="$p66bad" "$P64_JAN" > /dev/null 2>&1)
-    check "phase66 oracle: git still accepts --pretty=$p66bad, exit 0" test $? -eq 0
-done
+# --- still-rejected pin, carried forward from Phase 64's own
+# deliberately-unimplemented list: auto: remains refused on sg's side
+# (exit 1) while git accepts it (exit 0) -- its meaning depends on
+# isatty(1), no oracle without a pty, out of scope for Phase 67 too. The
+# human/human-local/%ah/%ch pins that used to sit here (asserting sg
+# refused them) are GONE, not "fixed in place" -- see the phase67: group
+# below, which asserts byte-for-byte agreement instead, same convention
+# Phase 66 itself used when relative/relative-local stopped being
+# rejected. ---
 (cd "$P64" && "$SG" show -s --date=auto:short "$P64_JAN" > /dev/null 2>&1)
 check "phase66: sg still rejects --date=auto:short, exit 1" test $? -eq 1
 (cd "$P64" && LC_ALL=C git show -s --date=auto:short "$P64_JAN" > /dev/null 2>&1)
 check "phase66 oracle: git still accepts --date=auto:short, exit 0" test $? -eq 0
+
+echo ""
+
+# ============================================================
+# Phase 67: sg log/sg show --date=human / --date=human-local, %ah/%ch
+# (CLAUDE.md's --date=human bullet has the full measured algorithm).
+# Reuses Phase 64's P64 fixture (P64/P64_JAN/P64_JUL/v64, P64_GIT_PINS),
+# same idiom as Phase 66's own p66_show_cmp/p66_log_cmp, this time with
+# GIT_TEST_DATE_NOW swept across several values chosen to land in each of
+# the four output shapes (same calendar day / the 5-day window / same
+# year / different year) rather than just one -- unlike Phase 66's single
+# P66_NOW (which happens to land human in the SAME shape, "different
+# year", for both fixtures), the sweep below is what actually exercises
+# the calendar-driven branches this algorithm is built from.
+# ============================================================
+
+p67_show_cmp() {
+    p67tag="$1"; p67tz="$2"; p67now="$3"; shift 3
+    (cd "$P64" && LC_ALL=C TZ="$p67tz" GIT_TEST_DATE_NOW="$p67now" git $P64_GIT_PINS show --no-decorate "$@") \
+        > "$WORKDIR/p67_git_$p67tag.txt" 2>&1
+    (cd "$P64" && TZ="$p67tz" GIT_TEST_DATE_NOW="$p67now" "$SG" show "$@") > "$WORKDIR/p67_sg_$p67tag.txt" 2>&1
+}
+
+p67_log_cmp() {
+    p67tag="$1"; p67tz="$2"; p67now="$3"; shift 3
+    (cd "$P64" && LC_ALL=C TZ="$p67tz" GIT_TEST_DATE_NOW="$p67now" git $P64_GIT_PINS log --no-decorate "$@") \
+        > "$WORKDIR/p67_git_$p67tag.txt" 2>&1
+    (cd "$P64" && TZ="$p67tz" GIT_TEST_DATE_NOW="$p67now" "$SG" log "$@") > "$WORKDIR/p67_sg_$p67tag.txt" 2>&1
+}
+
+# NOW values relative to P64_JAN (1704067200, Mon 2024-01-01 00:00:00 UTC):
+# +1h (same calendar day, at least under TZ=UTC-ish zones), +3 days (the
+# 5-day window), +40 days (same year, different month), +400 days
+# (different year). Reused for P64_JUL (1720000000, Wed 2024-07-03) too --
+# which shape each actually lands in depends on the zone as well as the
+# offset, which is exactly why this is a byte cmp against git rather than
+# a set of hand-derived literals.
+for p67tz in Asia/Tokyo America/New_York; do
+    p67tzsafe=$(printf '%s' "$p67tz" | tr -c 'A-Za-z0-9' '_')
+    for p67offset in 3600 259200 3456000 34560000; do
+        for p67name in human human-local; do
+            p67safe=$(printf '%s' "$p67name" | tr -c 'A-Za-z0-9' '_')
+            p67now_jan=$((1704067200 + p67offset))
+            p67now_jul=$((1720000000 + p67offset))
+
+            # Reach point 1: Date:/AuthorDate:/CommitDate:.
+            p67_show_cmp "r1_legacy_${p67tzsafe}_${p67offset}_${p67safe}_jan" "$p67tz" "$p67now_jan" \
+                -s "--date=$p67name" "$P64_JAN"
+            check "phase67: sg show -s --date=$p67name (TZ=$p67tz, +$p67offset s, Jan fixture) matches git (legacy medium Date: line)" \
+                cmp -s "$WORKDIR/p67_sg_r1_legacy_${p67tzsafe}_${p67offset}_${p67safe}_jan.txt" "$WORKDIR/p67_git_r1_legacy_${p67tzsafe}_${p67offset}_${p67safe}_jan.txt"
+
+            p67_show_cmp "r1_legacy_${p67tzsafe}_${p67offset}_${p67safe}_jul" "$p67tz" "$p67now_jul" \
+                -s "--date=$p67name" "$P64_JUL"
+            check "phase67: sg show -s --date=$p67name (TZ=$p67tz, +$p67offset s, Jul fixture) matches git (legacy medium Date: line)" \
+                cmp -s "$WORKDIR/p67_sg_r1_legacy_${p67tzsafe}_${p67offset}_${p67safe}_jul.txt" "$WORKDIR/p67_git_r1_legacy_${p67tzsafe}_${p67offset}_${p67safe}_jul.txt"
+
+            p67_show_cmp "r1_fuller_${p67tzsafe}_${p67offset}_${p67safe}" "$p67tz" "$p67now_jan" \
+                -s --pretty=fuller "--date=$p67name" "$P64_JAN"
+            check "phase67: sg show -s --pretty=fuller --date=$p67name (TZ=$p67tz, +$p67offset s) matches git (AuthorDate:/CommitDate:)" \
+                cmp -s "$WORKDIR/p67_sg_r1_fuller_${p67tzsafe}_${p67offset}_${p67safe}.txt" "$WORKDIR/p67_git_r1_fuller_${p67tzsafe}_${p67offset}_${p67safe}.txt"
+
+            # Reach point 2: the annotated tag header's own Date: line.
+            p67_show_cmp "r2_tag_${p67tzsafe}_${p67offset}_${p67safe}" "$p67tz" "$p67now_jan" \
+                -s "--date=$p67name" v64
+            check "phase67: sg show -s --date=$p67name (TZ=$p67tz, +$p67offset s) matches git (annotated tag Date: line)" \
+                cmp -s "$WORKDIR/p67_sg_r2_tag_${p67tzsafe}_${p67offset}_${p67safe}.txt" "$WORKDIR/p67_git_r2_tag_${p67tzsafe}_${p67offset}_${p67safe}.txt"
+
+            # Reach point 3: %ad/%cd.
+            p67_show_cmp "r3_phad_${p67tzsafe}_${p67offset}_${p67safe}" "$p67tz" "$p67now_jan" \
+                -s --pretty=%ad "--date=$p67name" "$P64_JAN"
+            check "phase67: sg show -s --pretty=%ad --date=$p67name (TZ=$p67tz, +$p67offset s) matches git" \
+                cmp -s "$WORKDIR/p67_sg_r3_phad_${p67tzsafe}_${p67offset}_${p67safe}.txt" "$WORKDIR/p67_git_r3_phad_${p67tzsafe}_${p67offset}_${p67safe}.txt"
+
+            # Reach point 4: --pretty=reference's own date field.
+            p67_log_cmp "r4_reference_${p67tzsafe}_${p67offset}_${p67safe}" "$p67tz" "$p67now_jan" \
+                -1 --pretty=reference "--date=$p67name" "$P64_JAN"
+            check "phase67: sg log -1 --pretty=reference --date=$p67name (TZ=$p67tz, +$p67offset s) matches git" \
+                cmp -s "$WORKDIR/p67_sg_r4_reference_${p67tzsafe}_${p67offset}_${p67safe}.txt" "$WORKDIR/p67_git_r4_reference_${p67tzsafe}_${p67offset}_${p67safe}.txt"
+        done
+    done
+done
+
+# --- %ah/%ch: FIXED, unaffected by --date=, both timezones, a few NOW
+# values, cross-checked with --date=raw/--date=iso/--date=human-local (the
+# spec's own control that %ah must not move). ---
+for p67tz in Asia/Tokyo America/New_York; do
+    p67tzsafe=$(printf '%s' "$p67tz" | tr -c 'A-Za-z0-9' '_')
+    for p67offset in 3600 259200 34560000; do
+        p67now_jan=$((1704067200 + p67offset))
+        for p67dateflag in "" "--date=raw" "--date=iso" "--date=human-local"; do
+            p67dsafe=$(printf '%s' "$p67dateflag" | tr -c 'A-Za-z0-9' '_')
+            if [ -n "$p67dateflag" ]; then
+                p67_show_cmp "ah_${p67tzsafe}_${p67offset}_${p67dsafe}" "$p67tz" "$p67now_jan" \
+                    -s --pretty=%ah "$p67dateflag" "$P64_JAN"
+            else
+                p67_show_cmp "ah_${p67tzsafe}_${p67offset}_${p67dsafe}" "$p67tz" "$p67now_jan" \
+                    -s --pretty=%ah "$P64_JAN"
+            fi
+            check "phase67: sg show -s --pretty=%ah ${p67dateflag:-(no --date=)} (TZ=$p67tz, +$p67offset s) matches git and is unmoved by --date=" \
+                cmp -s "$WORKDIR/p67_sg_ah_${p67tzsafe}_${p67offset}_${p67dsafe}.txt" "$WORKDIR/p67_git_ah_${p67tzsafe}_${p67offset}_${p67dsafe}.txt"
+        done
+        p67_show_cmp "ch_${p67tzsafe}_${p67offset}" "$p67tz" "$p67now_jan" -s --pretty=%ch "$P64_JAN"
+        check "phase67: sg show -s --pretty=%ch (TZ=$p67tz, +$p67offset s) matches git" \
+            cmp -s "$WORKDIR/p67_sg_ch_${p67tzsafe}_${p67offset}.txt" "$WORKDIR/p67_git_ch_${p67tzsafe}_${p67offset}.txt"
+    done
+done
+
+# --- now-swept oracle: precondition -- the four p67offset values above
+# really do land in at least two DIFFERENT shapes for the Jan fixture
+# under a fixed zone, or the sweep proves nothing beyond a single shape
+# (same trap CLAUDE.md's Phase 66 boundary-table warnings describe for a
+# single-example spec). ---
+p67_show_cmp oracle_shape_a Asia/Tokyo $((1704067200 + 3600)) -s --pretty=%ad --date=human "$P64_JAN"
+p67_show_cmp oracle_shape_b Asia/Tokyo $((1704067200 + 34560000)) -s --pretty=%ad --date=human "$P64_JAN"
+check "phase67 oracle: precondition -- the +1h and +400d NOW values really render DIFFERENT --date=human shapes for the Jan fixture, or the sweep above proves nothing" \
+    sh -c '! cmp -s "$0" "$1"' "$WORKDIR/p67_git_oracle_shape_a.txt" "$WORKDIR/p67_git_oracle_shape_b.txt"
+
+# --- names accepted/refused (section 5 of the spec): human/human-local
+# are now accepted on both sides (byte comparison above already covers
+# this implicitly, since a refusal on either side would produce mismatched
+# exit codes AND stderr text that the cmp above would catch) -- these are
+# the explicit exit-code pins, kept as their own named checks the same way
+# Phase 66 pinned relative/relative-local's acceptance directly rather
+# than relying only on the byte-cmp sweep to imply it. HUMAN/humanlocal/
+# human-locale/humanx/auto:human stay refused by sg (exit 1) while git
+# accepts every one of them (exit 0) except HUMAN's own siblings, which
+# git also refuses (case-sensitive) -- both sides' exit codes are pinned
+# per name rather than assumed identical across the group. ---
+for p67ok in human human-local; do
+    (cd "$P64" && "$SG" show -s "--date=$p67ok" "$P64_JAN" > /dev/null 2>&1)
+    check "phase67: sg accepts --date=$p67ok, exit 0" test $? -eq 0
+    (cd "$P64" && LC_ALL=C git show -s "--date=$p67ok" "$P64_JAN" > /dev/null 2>&1)
+    check "phase67 oracle: git accepts --date=$p67ok, exit 0" test $? -eq 0
+done
+for p67ok in %ah %ch; do
+    (cd "$P64" && "$SG" show -s --pretty="$p67ok" "$P64_JAN" > /dev/null 2>&1)
+    check "phase67: sg accepts --pretty=$p67ok, exit 0" test $? -eq 0
+    (cd "$P64" && LC_ALL=C git show -s --pretty="$p67ok" "$P64_JAN" > /dev/null 2>&1)
+    check "phase67 oracle: git accepts --pretty=$p67ok, exit 0" test $? -eq 0
+done
+for p67bad in HUMAN humanlocal human-locale humanx; do
+    (cd "$P64" && "$SG" show -s "--date=$p67bad" "$P64_JAN" > /dev/null 2>&1)
+    check "phase67: sg rejects --date=$p67bad, exit 1" test $? -eq 1
+    (cd "$P64" && LC_ALL=C git show -s "--date=$p67bad" "$P64_JAN" > /dev/null 2>&1)
+    check "phase67 oracle: git rejects --date=$p67bad, exit 128 (a fatal error, definitely not 0)" test $? -eq 128
+done
+# auto:human stays refused by sg (unchanged from Phase 64/66: its meaning
+# depends on isatty(1), no oracle without a pty) -- git accepts it.
+(cd "$P64" && "$SG" show -s --date=auto:human "$P64_JAN" > /dev/null 2>&1)
+check "phase67: sg still rejects --date=auto:human, exit 1" test $? -eq 1
+(cd "$P64" && LC_ALL=C git show -s --date=auto:human "$P64_JAN" > /dev/null 2>&1)
+check "phase67 oracle: git still accepts --date=auto:human, exit 0" test $? -eq 0
+
+# --- deliberate divergence #7 gains human-local as of Phase 67 (CLAUDE.md
+# divergence #7's own entry has the full byte derivation): in a zone whose
+# UTC offset is not a whole number of minutes, sg's whole-minute -local
+# shift renders a different clock from git's localtime_r. A hand-crafted
+# 1970-06-01 commit (an ordinary `git commit` cannot store a pre-1973
+# author date -- git's own date parser rejects a bare epoch that small,
+# CLAUDE.md's "measure git behaviour, never recall it" lesson applies to
+# fixture construction too, not just to the algorithm) under
+# TZ=Africa/Monrovia, whose offset was -2670s (not a whole minute) until
+# 1972-01-07. Both LITERAL pins (git's and sg's own, since the two are
+# EXPECTED to differ, same shape as divergence #6's own two-literal pins),
+# skipped on a machine whose zoneinfo lacks the zone. ---
+P67_MONROVIA_TREE=$(cd "$P64" && LC_ALL=C git rev-parse "$P64_JAN^{tree}" 2>/dev/null)
+P67_MONROVIA=$(cd "$P64" && printf 'tree %s\nauthor A <a@e> 13089600 +0000\ncommitter A <a@e> 13089600 +0000\n\nmonrovia\n' "$P67_MONROVIA_TREE" | LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+if python3 -c "import zoneinfo; zoneinfo.ZoneInfo('Africa/Monrovia')" > /dev/null 2>&1; then
+    (cd "$P64" && LC_ALL=C TZ=Africa/Monrovia GIT_TEST_DATE_NOW=$((13089600 + 2 * 86400)) git $P64_GIT_PINS show -s --date=human-local --pretty=%ad "$P67_MONROVIA") \
+        > "$WORKDIR/p67_dvg_git_monrovia.txt" 2>&1
+    (cd "$P64" && TZ=Africa/Monrovia GIT_TEST_DATE_NOW=$((13089600 + 2 * 86400)) "$SG" show -s --date=human-local --pretty=%ad "$P67_MONROVIA") \
+        > "$WORKDIR/p67_dvg_sg_monrovia.txt" 2>&1
+    check "phase67 deliberate divergence #7 (git side, pinned): --date=human-local in Africa/Monrovia's non-whole-minute zone" \
+        sh -c 'printf "Mon 11:15\n" | cmp -s - "$0"' "$WORKDIR/p67_dvg_git_monrovia.txt"
+    check "phase67 deliberate divergence #7 (sg side, pinned): the whole-minute shift disagrees with git by design" \
+        sh -c 'printf "Mon 11:16\n" | cmp -s - "$0"' "$WORKDIR/p67_dvg_sg_monrovia.txt"
+
+    # Control: plain (non-local) human does NOT diverge there.
+    (cd "$P64" && LC_ALL=C TZ=Africa/Monrovia GIT_TEST_DATE_NOW=$((13089600 + 2 * 86400)) git $P64_GIT_PINS show -s --date=human --pretty=%ad "$P67_MONROVIA") \
+        > "$WORKDIR/p67_dvg_git_monrovia_nonlocal.txt" 2>&1
+    (cd "$P64" && TZ=Africa/Monrovia GIT_TEST_DATE_NOW=$((13089600 + 2 * 86400)) "$SG" show -s --date=human --pretty=%ad "$P67_MONROVIA") \
+        > "$WORKDIR/p67_dvg_sg_monrovia_nonlocal.txt" 2>&1
+    check "phase67 deliberate divergence #7 control: plain --date=human (non-local) matches git in Africa/Monrovia" \
+        cmp -s "$WORKDIR/p67_dvg_sg_monrovia_nonlocal.txt" "$WORKDIR/p67_dvg_git_monrovia_nonlocal.txt"
+else
+    skip "phase67 deliberate divergence #7: this machine's zoneinfo lacks Africa/Monrovia (or TZ has no effect at all)"
+fi
+
+# --- Phase 67 review round: two bugs a cold read found after all four gates
+# were green, the independent 390-probe oracle harness was clean, and a
+# 9108-probe sg-vs-git sweep was clean. Both live in the same two lines of
+# sg_date_format_human and both need an input shape none of those probe sets
+# could produce, which is why they survived all of it.
+#
+# The zones below are POSIX TZ STRINGS, not zoneinfo names: "XXX0:44:30" is a
+# -2670s offset and "XXX-1" is +0100 on any POSIX system, so unlike the
+# Africa/Monrovia block above these checks need no tz database and can never
+# turn into a silent skip. The precondition immediately below proves the
+# sub-minute offset is really in effect before the two pins that depend on
+# it -- a platform that quietly ignored the seconds field would otherwise
+# make them pass for the wrong reason.
+#
+# Bug 1: "now"'s calendar date was computed by formatting localtime_r's
+# offset into "+HHMM" and shifting by that, truncating the SECONDS of a
+# non-whole-minute zone. human picks its output by a CALENDAR-DAY
+# comparison, so the 30-second error changed the SHAPE: in the 30 seconds
+# before local midnight git said "12 hours ago" and sg said
+# "Mon 12:44 +0000".
+#
+# Bug 2: the offset suffix was re-derived from seconds instead of echoing
+# the stored string. A commit may legally store an offset whose minute field
+# is >= 60; git echoes it, and sg's own --date=iso already did too, so sg
+# disagreed with itself as well as with git ("+0165" -> "+0205"). The same
+# string, not the duration, also decides whether the suffix appears at all:
+# a stored "+0060" against a local "+0100" is the same 3600 seconds and git
+# still prints it. ---
+P67R_TREE=$(cd "$P64" && LC_ALL=C git rev-parse "$P64_JAN^{tree}" 2>/dev/null)
+# 1970-06-01 12:44:30 UTC == exactly 12:00:00 local at -0044:30
+P67R_SUBMIN=$(cd "$P64" && printf 'tree %s\nauthor A <a@e> 13092270 +0000\ncommitter A <a@e> 13092270 +0000\n\nsubmin\n' "$P67R_TREE" | LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+P67R_TZ165=$(cd "$P64" && printf 'tree %s\nauthor A <a@e> 1705708800 +0165\ncommitter A <a@e> 1705708800 +0165\n\ntz165\n' "$P67R_TREE" | LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+P67R_TZ60=$(cd "$P64" && printf 'tree %s\nauthor A <a@e> 1705708800 +0060\ncommitter A <a@e> 1705708800 +0060\n\ntz60\n' "$P67R_TREE" | LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+P67R_TZ100=$(cd "$P64" && printf 'tree %s\nauthor A <a@e> 1705708800 +0100\ncommitter A <a@e> 1705708800 +0100\n\ntz100\n' "$P67R_TREE" | LC_ALL=C git hash-object -t commit -w --stdin 2>/dev/null)
+P67R_MID=13135470   # the UTC instant of 1970-06-02 00:00:00 local at -0044:30
+P67R_NOW=$((1705708800 + 2 * 86400))
+
+# The probe deliberately uses the +0165 fixture, NOT the sub-minute one: the
+# sub-minute commit's epoch was chosen so its LOCAL time lands on an exact
+# whole minute (12:00:00), which is what makes it a clean day-boundary
+# fixture -- and therefore makes it useless for proving the offset carries a
+# seconds part. The first draft of this precondition probed that commit and
+# failed on a machine where the zone works perfectly, which is the check
+# doing its job in the wrong direction: it verified nothing about the
+# platform and everything about my choice of fixture.
+check "phase67 review oracle: precondition -- TZ=XXX0:44:30 really is a non-whole-minute offset on this machine (the two day-boundary pins below verify nothing without it)" \
+    sh -c "(cd '$P64' && LC_ALL=C TZ=XXX0:44:30 git show -s --date=iso-local --pretty=%ad '$P67R_TZ165') | grep -q ':30 -0044\$'"
+
+p67r_cmp() {
+    p67r_label=$1; shift
+    p67r_tz=$1; shift
+    p67r_now=$1; shift
+    (cd "$P64" && LC_ALL=C TZ=$p67r_tz GIT_TEST_DATE_NOW=$p67r_now git $P64_GIT_PINS show -s --pretty=%ad "$@") \
+        > "$WORKDIR/p67r_git_$p67r_label.txt" 2>&1
+    (cd "$P64" && TZ=$p67r_tz GIT_TEST_DATE_NOW=$p67r_now "$SG" show -s --pretty=%ad "$@") \
+        > "$WORKDIR/p67r_sg_$p67r_label.txt" 2>&1
+}
+
+p67r_cmp subminbefore XXX0:44:30 $((P67R_MID - 1)) --date=human "$P67R_SUBMIN"
+check "phase67 review: --date=human one second BEFORE local midnight in a non-whole-minute zone matches git (the shape must still be the relative one)" \
+    cmp -s "$WORKDIR/p67r_sg_subminbefore.txt" "$WORKDIR/p67r_git_subminbefore.txt"
+p67r_cmp subminat XXX0:44:30 $P67R_MID --date=human "$P67R_SUBMIN"
+check "phase67 review: --date=human exactly AT local midnight in a non-whole-minute zone matches git (the control: the shape is supposed to change here)" \
+    cmp -s "$WORKDIR/p67r_sg_subminat.txt" "$WORKDIR/p67r_git_subminat.txt"
+p67r_cmp subminlocalbefore XXX0:44:30 $((P67R_MID - 1)) --date=human-local "$P67R_SUBMIN"
+check "phase67 review: --date=human-local one second BEFORE local midnight in a non-whole-minute zone matches git" \
+    cmp -s "$WORKDIR/p67r_sg_subminlocalbefore.txt" "$WORKDIR/p67r_git_subminlocalbefore.txt"
+
+p67r_cmp tz165 UTC $P67R_NOW --date=human "$P67R_TZ165"
+check "phase67 review: the offset suffix echoes a stored '+0165' verbatim rather than re-deriving '+0205' from seconds" \
+    cmp -s "$WORKDIR/p67r_sg_tz165.txt" "$WORKDIR/p67r_git_tz165.txt"
+check "phase67 review oracle: precondition -- sg's own --date=iso already echoed that same stored '+0165', so the check above is pinning sg against ITSELF as well as against git" \
+    sh -c "(cd '$P64' && TZ=UTC '$SG' show -s --date=iso --pretty=%ad '$P67R_TZ165') | grep -q '+0165\$'"
+p67r_cmp tz60 XXX-1 $P67R_NOW --date=human "$P67R_TZ60"
+check "phase67 review: a stored '+0060' against a local '+0100' -- the same 3600 seconds, a different encoding -- still prints the suffix, matching git" \
+    cmp -s "$WORKDIR/p67r_sg_tz60.txt" "$WORKDIR/p67r_git_tz60.txt"
+p67r_cmp tz100 XXX-1 $P67R_NOW --date=human "$P67R_TZ100"
+check "phase67 review: the control for that pair -- the canonical '+0100' spelling of the same offset is suppressed, so neither check alone is satisfied by the wrong rule" \
+    cmp -s "$WORKDIR/p67r_sg_tz100.txt" "$WORKDIR/p67r_git_tz100.txt"
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

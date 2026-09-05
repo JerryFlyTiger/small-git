@@ -122,8 +122,10 @@ typedef enum {
     SG_DATE_RAW,
     SG_DATE_UNIX,
     SG_DATE_FORMAT,
-    SG_DATE_RELATIVE /* Phase 66: "relative" / "relative-local" -- see
+    SG_DATE_RELATIVE, /* Phase 66: "relative" / "relative-local" -- see
                          sg_date_format_relative below. */
+    SG_DATE_HUMAN /* Phase 67: "human" / "human-local" -- see
+                     sg_date_format_human below. */
 } sg_date_kind;
 
 typedef struct {
@@ -167,12 +169,15 @@ typedef struct {
    `relative`/`relative-local` are implemented as of Phase 66 (see
    sg_date_format_relative below) -- both parse to SG_DATE_RELATIVE, and
    `-local` is accepted but changes nothing about the rendering (a
-   duration has no timezone to shift). Deliberately still unimplemented
-   and always rejected: `human`/`human-local` (measured to be
-   CALENDAR-driven, not duration-driven -- a genuinely different algorithm,
-   deferred to its own phase) and `auto:<anything>` (its meaning depends on
-   isatty(1), no oracle without a pty). Returns 0 with *out filled, or -1
-   for any of those, an unknown name, or an empty string. */
+   duration has no timezone to shift). `human`/`human-local` are
+   implemented as of Phase 67 (see sg_date_format_human below) -- both
+   parse to SG_DATE_HUMAN; `-local` changes the commit's own rendering
+   offset (Phase 64's usual -local rule) AND unconditionally suppresses
+   the trailing "+HHMM" suffix (see sg_date_format_human's own comment).
+   Deliberately still unimplemented and always rejected: `auto:<anything>`
+   (its meaning depends on isatty(1), no oracle without a pty). Returns 0
+   with *out filled, or -1 for any of those, an unknown name, or an empty
+   string. */
 int sg_date_parse_mode(const char *arg, sg_date_mode *out);
 
 /* Renders time_sec/tz per *mode -- see the type's own comment above for
@@ -260,5 +265,64 @@ int sg_date_format_relative(long long time_sec, long long now,
    once-computed value through every renderer, and was the explicit design
    choice for this phase (see docs/DESIGN.md). */
 long long sg_date_now(void);
+
+/* Longest string sg_date_format_human can produce, including the NUL.
+   Human's own longest shape ("Wed Sep 30 23:59 +1400", 22 bytes plus NUL)
+   is NOT what sets this number -- the same-calendar-day branch returns
+   sg_date_format_relative's own string, so this must be at least
+   SG_DATE_RELATIVE_MAX (they are equal, both 64, and share the identical
+   value on purpose so the two macros cannot silently drift apart). */
+#define SG_DATE_HUMAN_MAX SG_DATE_RELATIVE_MAX
+
+/* Phase 67: git's DATE_HUMAN -- `--date=human`/`human-local` and (always,
+   regardless of --date=) %ah/%ch. CLAUDE.md's --date= entry has the full
+   measured algorithm and its traps; the short version:
+
+   `time_sec`/`tz` are the commit exactly as sg_date_format_normal takes
+   them (`tz` is the stored "+HHMM", or already the LOCAL offset at
+   time_sec's own instant when rendering for human-local -- the caller
+   resolves that, same as every other -local mode; this function does not
+   know or care which). `now` is the current epoch (sg_date_now()).
+   `local_mode` is nonzero for human-local.
+
+   The algorithm compares the commit's own calendar date (in `tz`) against
+   "now"'s calendar date in the MACHINE'S LOCAL zone (never `tz`, and never
+   UTC) -- computed internally via localtime_r on `now`, not passed in,
+   since every call site would compute the identical value:
+
+   - same calendar day (year+month+day all equal) -> the existing
+     `--date=relative` string, via sg_date_format_relative verbatim
+     (including "in the future" for a future same-day commit). This is the
+     ONE shape not bounded by SG_DATE_HUMAN_MAX's own arithmetic, which is
+     exactly why that macro is defined in terms of SG_DATE_RELATIVE_MAX.
+   - same year+month, commit's day-of-month < now's AND commit's
+     day-of-month + 5 > now's day-of-month (strict, not >=) ->
+     "Www HH:MM", both zero-padded on the clock, PLUS a trailing "+HHMM"
+     when `local_mode` is 0 AND the commit's own render offset differs
+     from the machine's local offset at `now` -- this is the ONLY shape
+     that ever carries the suffix, and human-local NEVER carries it
+     (measured: 1080 probes across 8 zones, zero offsets), even across a
+     DST change inside the 5-day window where the two offsets do differ.
+   - same year, everything else (INCLUDING a future commit past the
+     5-day/same-month window, in either direction) -> "Www Mmm D HH:MM",
+     no year, no offset ever.
+   - different year (either direction) -> "Mmm D YYYY", no weekday, no
+     time, no offset ever.
+
+   Day of month is NOT zero-padded ("Sun Mar 5 04:07"), matching
+   sg_date_format_normal's own rule; the clock IS.
+
+   Deliberate divergence from real git in a zone whose UTC offset is not a
+   whole number of minutes (CLAUDE.md's divergence #7): human-local
+   inherits the existing whole-minute-shift divergence already pinned for
+   six other -local names, because its caller resolves `tz` the identical
+   way. Plain `human` (non-local) does NOT diverge there (measured).
+
+   Returns 0 on success, -1 if either shift_tm-equivalent step fails (an
+   out-of-range time_sec/now, mirroring sg_date_format_normal's own
+   failure) or the result does not fit in out_size (out set to the empty
+   string in both cases). */
+int sg_date_format_human(long long time_sec, const char *tz, long long now,
+                         int local_mode, char *out, size_t out_size);
 
 #endif /* SG_DATE_H */

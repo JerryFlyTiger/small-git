@@ -41,19 +41,20 @@ static int parse_tz(const char *tz, long *out)
     return 0;
 }
 
-/* Shared by sg_date_format_normal and sg_date_format_short: shifts
-   time_sec into tz and fills *tmv. Returns 0, or -1 on the same overflow/
-   invalid-conversion failures both callers report. */
-static int shift_tm(long long time_sec, const char *tz, struct tm *tmv)
+/* shift_tm's body, taking the offset already in SECONDS. Split out in
+   Phase 67 for sg_date_format_human, whose "now" side must shift by the
+   EXACT offset localtime_r reported -- routing it through a "+HHMM" string
+   the way every other caller does truncates the seconds part of a zone
+   whose offset is not a whole number of minutes (Africa/Monrovia is -2670s
+   until 1972-01-07), and human's output is decided by a CALENDAR-DAY
+   comparison, so a 30-second error there flips the whole shape rather than
+   moving a digit. Measured before the split: sg rolled the day over 30
+   seconds early, printing "Mon 12:44 +0000" where git printed
+   "12 hours ago". */
+static int shift_tm_offset(long long time_sec, long offset, struct tm *tmv)
 {
-    long offset = 0;
     long long shifted;
     time_t t;
-
-    if (tz == NULL)
-        tz = "+0000";
-    if (parse_tz(tz, &offset) != 0)
-        offset = 0;
 
     /* `time_sec + offset` can overflow when time_sec is itself an
        out-of-range value -- a hand-crafted or injected loose object whose
@@ -64,7 +65,9 @@ static int shift_tm(long long time_sec, const char *tz, struct tm *tmv)
        a legitimate one). Signed integer overflow is undefined behavior in
        C, caught by UBSan -- check the bounds before adding instead of
        after. `offset` is at most a few hundred thousand seconds in
-       magnitude (parse_tz's widest legal input is "+9999"/"-9999"), so
+       magnitude (parse_tz's widest legal input is "+9999"/"-9999"; the
+       other caller, sg_date_format_human, passes localtime_r's own
+       tm_gmtoff, which is smaller still), so
        computing `LLONG_MAX - offset` / `LLONG_MIN - offset` cannot itself
        overflow. */
     if (offset >= 0) {
@@ -83,6 +86,20 @@ static int shift_tm(long long time_sec, const char *tz, struct tm *tmv)
     if (tmv->tm_wday < 0 || tmv->tm_wday > 6 || tmv->tm_mon < 0 || tmv->tm_mon > 11)
         return -1;
     return 0;
+}
+
+/* Shared by sg_date_format_normal and sg_date_format_short: shifts
+   time_sec into tz and fills *tmv. Returns 0, or -1 on the same overflow/
+   invalid-conversion failures both callers report. */
+static int shift_tm(long long time_sec, const char *tz, struct tm *tmv)
+{
+    long offset = 0;
+
+    if (tz == NULL)
+        tz = "+0000";
+    if (parse_tz(tz, &offset) != 0)
+        offset = 0;
+    return shift_tm_offset(time_sec, offset, tmv);
 }
 
 /* git normalizes exactly the stored value "-0000" to "+0000" when
@@ -636,6 +653,7 @@ static const struct {
     { "raw", SG_DATE_RAW },
     { "unix", SG_DATE_UNIX },
     { "relative", SG_DATE_RELATIVE },
+    { "human", SG_DATE_HUMAN },
 };
 
 int sg_date_parse_mode(const char *arg, sg_date_mode *out)
@@ -736,6 +754,17 @@ int sg_date_format_mode(const sg_date_mode *mode, long long time_sec,
         return sg_date_format_rfc2822(time_sec, tz_str, out, out_size);
     case SG_DATE_SHORT:
         return sg_date_format_short(time_sec, tz_str, out, out_size);
+    case SG_DATE_HUMAN:
+        /* Unlike SG_DATE_RELATIVE, human DOES need the resolved tz --
+           resolve_mode_tz already turned `tz_str` into the LOCAL offset
+           at time_sec's own instant when mode->local is set (Phase 64's
+           usual -local rule), which is exactly the offset human-local
+           needs to render the commit in. This is why human is dispatched
+           here, inside the switch, AFTER resolve_mode_tz -- copying
+           relative's early-dispatch shape (before resolve_mode_tz) would
+           break human-local by handing it the unresolved stored tz. */
+        return sg_date_format_human(time_sec, tz_str, sg_date_now(),
+                                    mode->local, out, out_size);
     case SG_DATE_RAW:
         /* Trivial, new: "<epoch> <tz>". Shares the "-0000" -> "+0000"
            normalization every other renderer applies (measured against a
@@ -970,4 +999,147 @@ long long sg_date_now(void)
             return v;
     }
     return (long long)time(NULL);
+}
+
+/* --------------------------------------------------------------------
+   Phase 67: --date=human / --date=human-local, and %ah/%ch.
+   -------------------------------------------------------------------- */
+
+/* Appends `piece` to `buf` (tracked by `*len`), preceded by a single space
+   if `buf` is already non-empty -- shared by every branch of
+   sg_date_format_human's shape table below, so the "single spaces between
+   parts, none leading" rule from CLAUDE.md's algorithm listing lives in
+   exactly one place. Returns -1 if it would not fit. */
+static int human_append(char *buf, size_t bufsize, size_t *len, const char *piece)
+{
+    int written;
+
+    if (*len != 0) {
+        if (*len + 1 >= bufsize)
+            return -1;
+        buf[*len] = ' ';
+        (*len)++;
+        buf[*len] = '\0';
+    }
+    written = snprintf(buf + *len, bufsize - *len, "%s", piece);
+    if (written < 0 || (size_t)written >= bufsize - *len)
+        return -1;
+    *len += (size_t)written;
+    return 0;
+}
+
+int sg_date_format_human(long long time_sec, const char *tz, long long now,
+                         int local_mode, char *out, size_t out_size)
+{
+    struct tm ct, nt;
+    long local_off = 0;
+    char local_tz_buf[8];
+    int hide_year = 0, hide_date = 0, hide_wday = 0, hide_time = 0;
+    size_t len = 0;
+    char piece[32];
+
+    if (out == NULL || out_size == 0)
+        return -1;
+    out[0] = '\0';
+
+    if (tz == NULL)
+        tz = "+0000";
+
+    /* ct: the commit, shifted into its own render offset -- exactly what
+       sg_date_format_normal does. */
+    if (shift_tm(time_sec, tz, &ct) != 0)
+        return -1;
+    /* nt: "now", shifted into the MACHINE'S LOCAL offset at now -- never
+       `tz`, never UTC (CLAUDE.md's --date=human section 2). Reusing
+       shift_tm (rather than a second gmtime+add) keeps this on the same
+       overflow-checked path every other renderer in this file uses. */
+    if (local_offset_at(now, &local_off, NULL, 0) != 0)
+        return -1;
+    if (shift_tm_offset(now, local_off, &nt) != 0)
+        return -1;
+    /* The STRING form of that same offset is what the suffix rule below
+       compares against -- git compares its own decimal "+HHMM" ENCODING of
+       the two zones, not their lengths in seconds (measured: a stored
+       "+0060" and a local "+0100" are the same 3600 seconds, and git still
+       prints the suffix). It is deliberately NOT used to compute `nt`. */
+    format_offset_str(local_off, local_tz_buf, sizeof local_tz_buf);
+
+    if (ct.tm_year == nt.tm_year) {
+        hide_year = 1;
+        if (ct.tm_mon == nt.tm_mon) {
+            if (ct.tm_mday > nt.tm_mday) {
+                /* future within the same month: nothing further hidden */
+            } else if (ct.tm_mday == nt.tm_mday) {
+                /* same local calendar day -- the existing relative
+                   algorithm owns this shape entirely, including
+                   "in the future". Do not re-derive a duration here. */
+                return sg_date_format_relative(time_sec, now, out, out_size);
+            } else if (ct.tm_mday + 5 > nt.tm_mday) {
+                hide_date = 1;
+            }
+        }
+    } else {
+        hide_wday = 1;
+        hide_time = 1;
+    }
+
+    if (!hide_wday) {
+        if (human_append(out, out_size, &len, WDAY[ct.tm_wday]) != 0)
+            goto fail;
+    }
+    if (!hide_date) {
+        int written = snprintf(piece, sizeof piece, "%s %d", MON[ct.tm_mon], ct.tm_mday);
+        if (written < 0 || (size_t)written >= sizeof piece)
+            goto fail;
+        if (human_append(out, out_size, &len, piece) != 0)
+            goto fail;
+    }
+    if (!hide_time) {
+        int written = snprintf(piece, sizeof piece, "%02d:%02d", ct.tm_hour, ct.tm_min);
+        if (written < 0 || (size_t)written >= sizeof piece)
+            goto fail;
+        if (human_append(out, out_size, &len, piece) != 0)
+            goto fail;
+    }
+    if (!hide_year) {
+        int written = snprintf(piece, sizeof piece, "%d", ct.tm_year + 1900);
+        if (written < 0 || (size_t)written >= sizeof piece)
+            goto fail;
+        if (human_append(out, out_size, &len, piece) != 0)
+            goto fail;
+    }
+    /* The offset suffix appears ONLY on the "Www HH:MM" shape (hide_date),
+       never on the other three, and human-local never prints it at all --
+       both measured, CLAUDE.md's --date=human section 2.
+
+       The bytes printed are the STORED string (through the same "-0000" ->
+       "+0000" normalization every other renderer applies), never a value
+       re-derived from the offset in seconds: a stored offset whose minute
+       field is >= 60
+       is legal input to a commit object and git echoes it unchanged, while
+       re-deriving it from seconds silently rewrites it (measured: a stored
+       "+0165" renders as "+0165" in git and, before this was fixed, as
+       "+0205" in sg -- sg's OWN --date=iso echoed "+0165" for the same
+       object, so sg disagreed with itself as well as with git).
+
+       The COMPARISON is between those same two strings, for the same
+       reason: git compares its decimal encoding of the two zones, so a
+       stored "+0060" against a local "+0100" -- identical as durations --
+       still prints the suffix. Comparing the two offsets in SECONDS is
+       what a reader expects and is measurably the wrong question -- the
+       stored offset is therefore never parsed into seconds here at all. */
+    if (hide_date && !local_mode) {
+        const char *disp = normalize_tz_for_display(tz);
+
+        if (disp != NULL && strcmp(disp, local_tz_buf) != 0) {
+            if (human_append(out, out_size, &len, disp) != 0)
+                goto fail;
+        }
+    }
+
+    return 0;
+
+fail:
+    out[0] = '\0';
+    return -1;
 }

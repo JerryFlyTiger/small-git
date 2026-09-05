@@ -483,9 +483,9 @@ A user format string may use the placeholders
 (object ids; the abbreviated forms use 7 hex digits, and
 .BR %P / %p
 list every parent space-separated),
-.BR %an / %ae / %al / %ad / %aD / %at / %ai / %aI / %as / %ar
+.BR %an / %ae / %al / %ad / %aD / %at / %ai / %aI / %as / %ar / %ah
 and the committer equivalents
-.BR %cn / %ce / %cl / %cd / %cD / %ct / %ci / %cI / %cs / %cr
+.BR %cn / %ce / %cl / %cd / %cD / %ct / %ci / %cI / %cs / %cr / %ch
 (name, email, email's local part before
 .BR @ ,
 and seven renderings of the same timestamp \(em
@@ -514,13 +514,25 @@ separator, and
 .B %as
 /
 .B %cs
-just the date, and
+just the date,
 .B %ar
 /
 .B %cr
 a relative duration such as
 .RB \(dq "3 weeks ago" \(dq ,
-a FIXED format unmoved by
+and
+.B %ah
+/
+.B %ch
+a calendar-aware rendering such as
+.RB \(dq "Tue 22:13" \(dq " or " "Nov 14 2023"
+(see
+.B --date=human
+below) \(em both
+.B %ar / %cr
+and
+.B %ah / %ch
+are FIXED formats unmoved by
 .BR --date= ,
 same as the other five), and
 .BR %s / %f / %b / %B
@@ -531,12 +543,18 @@ blank line, and the raw message), plus the literal escapes
 .IR NN ).
 Every timestamp placeholder except
 .B %ar / %cr
+and
+.B %ah / %ch
 shows the clock shifted into the timestamp's own stored offset, not UTC and
 not the machine's local time;
 .B %ar / %cr
 render a DURATION relative to the current time instead (see
 .B --date=relative
-above), which has no stored offset to shift into. Any
+above), which has no stored offset to shift into, and
+.B %ah / %ch
+render a CALENDAR-aware form relative to the current time (see
+.B --date=human
+below). Any
 .B %
 sequence outside this table is refused with a diagnostic naming it and a
 non-zero exit \(em real git instead prints such a sequence literally or as
@@ -616,7 +634,7 @@ own date field (whose own default remains
 distinct from every other reach point's
 .BR default ).
 Unaffected: every other timestamp placeholder
-.RB ( %aD / %ai / %aI / %as / %at / %ar
+.RB ( %aD / %ai / %aI / %as / %at / %ar / %ah
 and the committer equivalents), the
 .B raw
 built-in (prints the object's stored bytes verbatim), and
@@ -631,8 +649,9 @@ is, case-sensitively, one of
 .BR short ,
 .BR raw ,
 .BR unix ,
-or
 .BR relative ,
+or
+.BR human ,
 each optionally suffixed with
 .B -local
 (stripped at most once; the remainder must itself be one of those names,
@@ -677,15 +696,44 @@ or, for a timestamp in the future,
 verbatim, with no number; see
 .B docs/DESIGN.md
 for the boundary at which each unit rolls over to the next.
+.B human
+(and
+.BR human-local )
+renders a CALENDAR-aware form instead of a plain duration: the same
+calendar day as now renders exactly like
+.BR relative ;
+otherwise the commit's own weekday/date/time/year are shown, hiding
+whichever fields are redundant with "now" \(em same year+month within 5
+days of now shows
+.RB \(dq "Tue 22:13" \(dq
+(with a trailing
+.RB \(dq +HHMM \(dq
+when
+.B human
+(non-local) and the rendered offset differs from the machine's own,
+never for
+.BR human-local );
+same year otherwise shows
+.RB \(dq "Tue Nov 14 22:13" \(dq ;
+a different year shows
+.RB \(dq "Nov 14 2023" \(dq .
+A future commit is
+.RB \(dq "in the future" \(dq
+only on the same calendar day, never otherwise. See
+.B CLAUDE.md
+'s
+.B --date=human
+entry for the exact boundary rules (all measured against real git, with
+several counter-intuitive traps: the 5-day window is calendar-month
+arithmetic, not a day-count).
 An unrecognized
 .I fmt
 (including
-.BR human ,
-and
 .BI auto: name ,
-each a real git renderer with no shared machinery to reuse \(em not
-approximated, always refused) is a diagnostic naming it and a non-zero
-exit.
+a real git renderer with no shared machinery to reuse \(em its meaning
+depends on whether stdout is a terminal, so it has no oracle without a
+pty, and is not approximated, always refused) is a diagnostic naming it
+and a non-zero exit.
 A
 .B -local
 name ignores the object's own stored offset entirely and uses the

@@ -13637,3 +13637,282 @@ against git directly; the negative control that `%ar` is unmoved by
 carried forward unchanged from Phase 64's own rejection-list group so a
 future accidental implementation of `human` cannot silently start passing
 these without the check noticing the assumption moved.
+
+## Phase 67: `sg log`/`sg show --date=human` / `human-local`, `%ah`/`%ch`
+
+Measured against real git 2.55.0 on 2026-09-05, `GIT_TEST_DATE_NOW`
+injected, `LC_ALL=C`, `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`,
+argv passed directly from Python (never through a shell). The algorithm
+was then re-implemented independently in Python and cross-checked against
+real git over 5780 probes, 0 mismatches (520 + 520 boundary probes in one
+harness, 1580 x 3 seeded-random probes in a second) -- the same
+"two independent ports agreeing" bar `similarity.c` and Phase 66's own
+relative algorithm are held to. The full algorithm, its four output
+shapes, and every measured trap are written down once, in
+`sg_date_format_human`'s own header comment (`include/sg/date.h`) and in
+CLAUDE.md's `--date=human` bullet -- not repeated here to avoid a second,
+driftable copy.
+
+### Why this needed its own phase, not a `--date=relative` extension
+
+`human` looks at first glance like `relative` with extra formatting, and
+that reading is wrong: `relative` is pure duration arithmetic (needs only
+`now - time_sec`), while `human` needs to compare two CALENDAR DATES --
+the commit's (in its own render offset) against "now"'s (in the machine's
+LOCAL zone, a THIRD offset that neither `relative` nor any of the seven
+pre-existing renderers ever needed to resolve). That third offset is why
+`sg_date_format_human` takes `now` as a parameter rather than sampling it
+internally (same idiom `sg_date_format_relative` already established) but
+computes the local-offset-at-now itself internally via the existing
+`local_offset_at` helper, rather than accepting it as a further parameter
+-- every call site would need the identical value, and threading it
+through would just be another way to get the "which caller forgot to
+compute it identically" bug class Phase 64's `resolve_mode_tz` factoring
+already exists to prevent.
+
+### Dispatch ordering: the opposite of `relative`, and why
+
+`sg_date_format_mode`'s `SG_DATE_RELATIVE` case is dispatched BEFORE
+`resolve_mode_tz` runs (Phase 66), because relative needs no tz at all.
+`SG_DATE_HUMAN` is the opposite: dispatched INSIDE the switch, AFTER
+`resolve_mode_tz`, because human's commit-side calendar comparison happens
+in whatever offset the commit is being RENDERED in -- for `human-local`
+that is the local offset at the commit's own instant (Phase 64's existing
+`-local` rule), which is exactly what `resolve_mode_tz` already computes
+into `tz_str` before the switch. Copying relative's early-dispatch shape
+here would hand `human-local` the unresolved STORED tz instead, silently
+turning it into plain `human` for every -local caller. This was caught
+before it shipped by reading `resolve_mode_tz`'s own contract, not by a
+test failure -- there is no dedicated regression check for "human is
+dispatched after resolve_mode_tz specifically" beyond the human-local
+fixtures already exercising the correct offset end to end (a wrong
+ordering would make `human-local`'s DST-crossing fixture, see below,
+render the stored/UTC offset instead of the local one, which the existing
+byte comparisons already catch).
+
+### The two independent "local_mode" effects, and the fixture that
+### separates them
+
+`local_mode` is used twice, at two different layers, and a fixture that
+only exercises one of them proves nothing about the other:
+
+1. **Which offset the commit is rendered in** -- resolved entirely inside
+   `resolve_mode_tz`, upstream of `sg_date_format_human` ever running.
+   `human-local` gets the LOCAL offset at the commit's own instant;
+   `human` gets the stored offset verbatim.
+2. **Whether the offset SUFFIX is ever printed at all** -- inside
+   `sg_date_format_human` itself, gated on `hide_date && !local_mode &&
+   tz_off != local_off`. `human-local` suppresses it unconditionally.
+
+A fixture where the commit's own local offset (at its instant) EQUALS the
+local offset at "now" (any zone with no DST between the two, e.g.
+Asia/Tokyo) cannot distinguish "local_mode correctly forwarded as 0" from
+"local_mode wrongly hardcoded to 0 at the dispatch site" -- `tz_off ==
+local_off` either way, so the suffix is absent regardless of whether
+effect 2 is wired correctly. This was caught directly: a mutation forcing
+the dispatch site's `local_mode` argument to `0` passed `tests/test_date_
+mode.c` cleanly against every existing Tokyo/Kolkata fixture in that file.
+The fix was not a new algorithm-level test (the algorithm-level effect was
+already covered, directly, by `tests/test_date_human.c`'s `test_human_
+local_never_offset`, which calls `sg_date_format_human` itself, bypassing
+the dispatch site entirely) -- it was a NEW fixture at the DISPATCH level
+that crosses a real DST boundary (the same 2023-11-05 America/New_York
+fall-back `test_human_local_never_offset` uses, now driven through
+`sg_date_parse_mode` + `sg_date_format_mode_alloc`, i.e. through the
+dispatch site the first fixture never touched), so `tz_off` (the commit's
+own local offset, -0400) and `local_off` (now's local offset, three days
+later, -0500) genuinely differ, which is the only way a wrongly-hardcoded
+`local_mode` at the dispatch site can be told apart from a correctly-
+forwarded one.
+
+### Why `%ah`/`%ch` need their own render function, not a shared one with `%ar`/`%cr`
+
+`print_relative_date_field` (Phase 66) takes only the timestamp -- a
+duration has no tz to shift into. `%ah`/`%ch` DO need the commit's stored
+tz (human's output depends on it even in its FIXED, non-`--date=`-driven
+form), so `print_human_date_field` takes both `t` and `tz`, and is its own
+function rather than an overload. It deliberately does NOT go through
+`print_configured_date_field` (the `--date=`-driven path `%ad`/`%cd` use)
+-- `%ah`/`%ch` are fixed, unaffected by `--date=`, same rule `%ar`/`%cr`
+already established, re-measured here with three different `--date=`
+values (`raw`, `iso`, `human-local`) rather than assumed to carry over.
+
+### Test coverage
+
+`tests/test_date_human.c` (new): the four output shapes; the two
+discriminating pairs from the spec's section 1 (Nov 14 00:01 vs 23:59, and
+Oct 30 vs Oct 31 vs Nov 1); the `mday + 5 > now.mday` boundary at exactly
+4 and 5 days; the offset suffix present in the window shape and absent in
+the full shape with the identical stored offset, and absent when the
+stored offset equals "now"'s local offset; `human-local` never printing an
+offset even across a real DST boundary (the America/New_York 2023-11-05
+fall-back, resolved via `localtime_r` rather than a hardcoded offset
+literal, so the fixture is not itself hostage to a particular zoneinfo
+database's exact transition instant -- it asserts its own precondition,
+that the two computed offsets differ, before trusting the rendered
+result); a future commit in each of the three non-relative shapes.
+
+`tests/test_date_mode.c` gains `test_human_mode_end_to_end` (the dispatch-
+level coverage described above, including the DST-crossing fixture that
+`test_byte_specs_tokyo`'s zone cannot provide) and converts the
+pre-existing `check_parse_err("human")`/`("human-local")` pair (written
+when both were rejected, Phase 64-66) to `check_parse_ok`.
+
+`tests/test_pretty_format.c` gains `test_human_placeholder_end_to_end`:
+author and committer dates 40 days apart (not `make_fixture_commit`'s
+stock 100-second gap), because at 100 seconds a swapped-field bug
+(`%ah` reading the committer's time/tz or vice versa) is invisible -- both
+placeholders would land in the identical output shape and often the
+identical string. At 40 days the two genuinely diverge, so a swap produces
+a wrong STRING, not a coincidentally-matching one. `%ah`/`%ch` also move
+from `test_validate_rejects_outside_table`'s `BAD[]` to `test_validate_
+accepts_every_table_entry`'s `GOOD[]`.
+
+`tests/interop.sh`'s `phase67:` group: the same four Phase-64-established
+reach points (legacy medium `Date:`, fuller's `AuthorDate:`/`CommitDate:`,
+the annotated tag header's own `Date:`, `%ad`/`%cd`, and `reference`'s own
+date field) swept with `human`/`human-local` this time, over two
+timezones and FOUR different `GIT_TEST_DATE_NOW` offsets chosen to land in
+different output shapes (same day, the 5-day window, same year/different
+month, different year) rather than Phase 66's single `P66_NOW` (which
+happens to land `human` in the identical "different year" shape for BOTH
+of Phase 64's fixtures, an accident of that value's own distance from
+both, not a property of `human` worth relying on for coverage -- a
+dedicated precondition check in the `phase67:` group asserts two of the
+sweep's own NOW values really do produce different shapes, so a future
+narrowing of the sweep range fails loudly rather than silently losing
+shape coverage). `%ah`/`%ch` are checked directly, cross-checked against
+three different `--date=` values as the "unmoved by --date=" control; the
+still-rejected pins for `human`/`human-local`/`%ah`/`%ch` that used to sit
+in the `phase66:` group are GONE from there (not "fixed in place") and
+replaced by explicit ACCEPT pins in the new `phase67:` group, plus a
+byte-cmp sweep that would itself fail on a regression; `HUMAN`/`humanlocal`/
+`human-locale`/`humanx` stay refused (case-sensitivity and exact-match
+grammar, unaffected by this phase); `auto:human` stays refused
+unconditionally (its own dedicated pin, since `auto:` is out of scope for
+every phase that has touched `--date=` so far); and CLAUDE.md's deliberate
+divergence #7 (non-whole-minute UTC offsets) gains `human-local` as a
+seventh pinned name, with a NEW hand-crafted fixture: a 1970-06-01 commit,
+built through `git hash-object -t commit -w --stdin` with a hand-written
+commit body, the same plumbing-layer technique the pre-existing Phase 64
+divergence-#7 fixture already uses for its own epoch-0 commit -- an
+ordinary `git commit`/`commit-tree` with `GIT_AUTHOR_DATE` set cannot
+produce this fixture at all, since git's own date-string parser refuses a
+bare epoch below roughly 100000000 (measured: `1973` is fine, `1970` is
+not), well above the epoch this fixture needs. Plus a
+`skip()` for a machine whose zoneinfo lacks the zone, using the SAME
+`python3 -c "import zoneinfo; zoneinfo.ZoneInfo(...)"` precondition Phase
+64's own divergence-#7 group already established -- an earlier draft of
+this precondition compared the ZONE'S CURRENT offset against UTC's current
+offset, which is always false for Africa/Monrovia today (it has used
+UTC+0 for decades; the non-whole-minute offset is purely historical,
+pre-1972), and so always skipped the check regardless of whether the
+zoneinfo database actually carries the historical rule -- a "looks like a
+precondition, measures nothing" mistake of exactly the shape CLAUDE.md's
+own "oracle needs a control group" lesson warns about, caught before
+landing because the check unconditionally skipped even on this
+development machine (which does carry the historical rule) rather than
+running.
+
+Two PRE-EXISTING rejection-list checks, unrelated to the `phase66:`/
+`phase67:` groups, also needed updating since they enumerated `human`/
+`%ah` as still-rejected names: `phase60b`'s section-5.3 `BAD[]` sweep
+(`%ah` moves out, following `%ar`'s own Phase 66 precedent) and
+`phase62`'s carried-forward `--date=` rejection-list loop (`human`/
+`human-local` move out, leaving only `auto:short`/`auto:`). Both were
+caught by running the full `bash tests/interop.sh` after implementation,
+not anticipated in advance -- a reminder that "gone from this list rather
+than marked fixed in place" needs to be re-applied at EVERY site that
+enumerated the old gap, and grepping for the feature's own name across the
+whole file is more reliable than trying to remember every place a
+previous phase mentioned it.
+
+### Phase 67 review round: two bugs in two lines, both invisible to every automated net
+
+A cold read after the board was fully green -- `make` 0 warnings,
+`make test` 79/79, `interop` 3389/3389 with 0 skipped, `make sanitize`
+79/79, a 390-probe independent oracle harness at 0 divergences, and a
+9108-probe direct sg-vs-git sweep (7 stored offsets x 6 zones x 11
+calendar-trap commit instants, three seed ranges) also at 0 -- found two
+real byte-compatibility bugs. Both live in `sg_date_format_human`, both
+were reproduced against real git before being believed, and both need an
+input shape that none of those probe sets can generate.
+
+**Bug 1: "now" was shifted through a `+HHMM` string.** The first
+implementation asked `local_offset_at` for the machine's offset at `now`
+(exact, in seconds), formatted it into a `+HHMM` buffer, and shifted by
+*that*. In a zone whose offset is not a whole number of minutes the
+formatting truncates -- and unlike every other renderer in `date.c`, where
+an offset only decides which digits get printed, human's offset feeds a
+CALENDAR-DAY comparison. So the error is not a wrong digit, it is a wrong
+SHAPE. Measured at `-0044:30`, in the 30 seconds before local midnight:
+git `12 hours ago`, sg `Mon 12:44 +0000`. Both `human` and `human-local`
+were affected, since `nt` never looked at `local_mode`.
+
+The fix splits `shift_tm` into `shift_tm_offset` (offset already in
+seconds) plus a thin `shift_tm` that parses the string first. Human is the
+one caller that must not go through the string form; every other caller is
+unchanged and unaffected.
+
+This also falsifies, as a general statement, the sentence this phase had
+already written into CLAUDE.md -- "plain (non-local) `human` does NOT
+diverge there (measured: `Mon 12:00 +0000` on both)". That measurement was
+correct and the conclusion drawn from it was too wide: the probe sat two
+whole DAYS from the boundary, and the boundary was the only place the bug
+lived. It is the same failure shape as Phase 64's zoneinfo scan
+(`docs/DESIGN.md`'s Phase 64 section) and Phase 65's three over-wide
+negative claims: **the measurement was right, the sentence was wider than
+the measurement**. The entry now carries its own reason rather than just
+its result.
+
+**Bug 2: the offset suffix was re-derived from seconds.** The suffix was
+printed by formatting the parsed `tz_off` back into `+HHMM`, rather than
+echoing the stored string the way `sg_date_format_normal`/`_rfc2822`/
+`_iso` all do. A commit object may legally carry a minute field of 60 or
+more: measured, a stored `+0165` renders as `+0165` in git and as `+0205`
+under the re-derivation -- and **sg's own `--date=iso` already echoed
+`+0165` for the identical object**, so the new code disagreed with the
+rest of sg as much as with git. This is the project's recurring "one rule
+copied N times, one copy wrong" shape, with the twist that the wrong copy
+was the newest one.
+
+The same measurement round (run by the coordinator while verifying the
+reviewer's report, not by the reviewer) turned up a third variant the
+report had not named: the DECISION to print is also made on the string,
+not the duration. A stored `+0060` and a local `+0100` are the same 3600
+seconds and git prints the suffix anyway. Both halves are now string-based,
+which makes them agree with git on every canonical offset by construction
+and on the non-canonical ones by measurement.
+
+**Why nothing caught either.** Every probe in every net used a canonical
+offset and a `now` far from a local midnight; under those inputs all four
+rules (string vs seconds, exact vs truncated) agree by construction. The
+9108-probe sweep is not a weaker net than the two bugs -- it is a net whose
+holes are exactly the shape of them, which is what "a control whose two
+arms already agree" means at scale.
+
+**Regression coverage, reverse-mutated before being trusted.** Three unit
+rows and seven interop checks were added, then each fix was undone and the
+suite rerun:
+
+| reverse mutation | result |
+|---|---|
+| truncate the local offset to whole minutes again | 2 rows red, both one second before local midnight, printing exactly the `Mon 12:44 +0000` the reviewer measured |
+| print the local offset string instead of the stored one | 5 rows red, including the two new non-canonical ones |
+| compare the two offsets in seconds instead of as strings | exactly 1 row red -- the `+0060` one, which exists for precisely that distinction; its `+0100` control stayed green |
+
+The new checks use POSIX TZ strings (`XXX0:44:30` for -2670s, `XXX-1` for
++0100) rather than `Africa/Monrovia`. Both were verified to work in git and
+sg on this machine, they need no zoneinfo database at all, and so -- unlike
+divergence #7's own group, which is guarded by a zone-availability probe --
+they can never quietly degrade into a `skip`. A precondition check asserts
+the sub-minute offset is really in effect before the two pins that depend
+on it, so a platform that ignored the seconds field would fail by name
+instead of passing for the wrong reason.
+
+Also added in this round, and unrelated to the reviewer's two findings: the
+overflow sweep over `P60D_OVERFLOW` now covers `human`, `human-local` and
+`%ah`/`%ch`. Phase 66's own review round exists because `relative`/
+`relative-local` were added without extending that sweep; adding two more
+date names without extending it would have reproduced that gap one phase
+later.
