@@ -13916,3 +13916,17 @@ overflow sweep over `P60D_OVERFLOW` now covers `human`, `human-local` and
 `relative-local` were added without extending that sweep; adding two more
 date names without extending it would have reproduced that gap one phase
 later.
+
+**What in this phase nobody cold-read.** The review above was a cold read of
+commit `dee3a55`. Everything produced in response to it -- the two fixes in
+`sg_date_format_human`, the `shift_tm`/`shift_tm_offset` split, the third
+variant the coordinator measured while verifying the report (the print/skip
+decision being made on the string, not the duration), three unit rows, seven
+interop checks, and the extension of the overflow sweep -- was written
+afterwards and so was never read by anyone but its author. Per this project's
+one-round cap it was not sent back for a second review; it was instead
+verified by reverse mutation (each fix undone, each new check confirmed red
+for its own reason, results in the table above) and recorded here rather than
+defended. The same applies to the earlier unit row
+`test_now_is_read_in_the_local_zone`, added by the coordinator before the
+review after a mutation showed the file was blind to the mixed-zone rule.
