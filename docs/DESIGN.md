@@ -14150,3 +14150,135 @@ job runs with `detect_leaks=1` where a forking test's behaviour was untested.
   same wall-clock second pays a full rescan (release + re-mmap every pack) per
   call. There is no such caller today; if 68b grows a batch-resolution loop,
   this needs re-measuring rather than assuming.
+
+## Phase 68b: wiring abbreviated ids into revparse and the CLI
+
+68a's enumeration layer, reached from `sg_rev_parse_commit` /
+`sg_rev_parse_object` and every CLI that resolves a revision. interop
+3401 -> 3454.
+
+### 1. There are THREE disambiguation modes, not two
+
+The spec this phase started from had two (STRICT, and a commit-ish dwim for
+`sg log` / `sg reset --hard`). Measured against git 2.55.0 on ONE fixture
+carrying a 4-way collision (tag + commit + tree + blob on the same 4-hex
+prefix), the ambiguity hint list comes back at three different widths:
+
+| form | rows | mode |
+|---|---|---|
+| `cat-file -t <amb>` | 4 (all) | STRICT -- no filter |
+| `cat-file -t <amb>~1` | 2 (tag, commit) | COMMITTISH |
+| `cat-file -p <amb>:f.txt` | 3 (tag, commit, tree) | **TREEISH** |
+
+`SG_REV_TREEISH` exists because of that third row, and **answering it with
+COMMITTISH is not "one row short", it is a WRONG ANSWER**: on a prefix
+matching one commit, one tree and one blob, git's tree-ish count is 2 and it
+refuses, while a commit-ish count of 1 would RESOLVE. sg giving an answer
+where git refuses is worse than sg missing a feature.
+
+Both dwim triggers, and their priority, live in ONE function
+(`sg_rev_effective_disambig`): a `~`/`^`/`@{` suffix -> COMMITTISH, else a
+`:` -> TREEISH, else the caller's own request. **The suffix wins over the
+colon** (`<amb>~1:f.txt` is COMMITTISH's 2 rows, not TREEISH's 3), and the
+suffix scan is bounded at the colon so a PATH containing a `~` cannot be
+mistaken for a suffix.
+
+### 2. Membership is decided by the PEELED type, never the raw type
+
+A tag counts toward COMMITTISH only if it peels to a commit, and toward
+TREEISH only if it peels to a commit or a tree. The decisive fixture is a
+**tag pointing at a blob, colliding with a real commit**: `cat-file -t <amb>`
+(raw types) lists both, so counting by raw type would be two commit-ish
+candidates and `log -1 <amb>` would refuse -- measured, it RESOLVES to the
+commit. An earlier probe (tag->blob colliding with a plain blob) could not
+tell the two models apart: both predict "refuse".
+
+Narrowing itself is conditional: **at least one candidate must match the
+mode**, otherwise the full list is printed (measured on that same
+tag->blob + blob fixture, which lists both rows under COMMITTISH).
+
+### 3. Where the bugs actually came from
+
+Four independent nets ran against this phase, and **each found something the
+others could not**:
+
+- **The oracle harness** (38 probes, outside the repo, outside `gates.sh`)
+  found `sg cat-file -p <amb>:f.txt` refusing where git resolves, with all
+  five gates green and 22 new interop checks green. Root cause: the spec --
+  this file's own section 7.2 -- claimed `<rev>:<path>` "inherits trigger 2
+  for free" because its rev half goes through `sg_rev_parse_commit`. It
+  inherits the commit PARSE, not the suffix SIGNAL: `sg_rev_parse_object`
+  strips the colon before handing the rev half over, so the suffix scan sees
+  a bare prefix.
+- **Cold review round 1** found a `free()` on a possibly-uninitialized
+  pointer in `cli_args.c` (`sg_object_read` leaves `*content_out` unwritten
+  on every failure path, and the new code merged the read failure and the
+  parse failure into one `||` before freeing unconditionally). Written
+  correctly in `revparse.c` in the same phase -- one rule, two copies, one
+  wrong, again.
+- **Cold review round 2** found that the suffix-over-colon priority had zero
+  coverage, and that a unit test named
+  `test_report_ambiguous_oid_filters_by_peeled_type` could not detect the
+  bug it was written to guard (see section 4).
+- **Direct measurement by the coordinator** turned "tag peeling is
+  unmeasured" (review's finding, correctly flagged as an open question)
+  into "the implementation is wrong", via the decisive fixture in section 2.
+
+### 4. A test that named a guard it did not have
+
+`test_report_ambiguous_oid_filters_by_peeled_type` was added specifically to
+cover the candidate-printing loop's `break` -> `continue` fix (with filtering
+by PEELED type, the excluded candidates are no longer a contiguous tail of
+the raw-type sort, so stopping at the first non-match drops real rows). Its
+first fixture put the excluded candidates at the END of the sort, where
+`break` and `continue` produce identical output.
+
+Measured: reverting `continue` to `break` turned **one interop check** red and
+left the **entire `make test` green**. The fixture was rebuilt so the excluded
+candidate (a tag->blob, raw-type rank 0) sorts FIRST; the same reverse
+mutation now fails that unit test for its own named reason. The rule has two
+witnesses instead of one, and the test's name is true.
+
+### 5. Three things measured inert, each with its reason
+
+Recorded so nobody goes hunting for the missing test:
+
+- **`sg_rev_object_matches_disambig`'s `STRICT -> return 0` early return** is
+  mathematically unobservable: flipping it to `return 1` makes `match_count
+  == list.count`, which turns filtering ON but filters nothing, so the output
+  is byte-identical. Proof, not a guess.
+- **The `free()` fix cannot be witnessed with this project's testing
+  conventions.** The obvious fixture -- corrupt a loose object so the
+  enumeration still sees the filename -- does NOT work, and the reason is
+  worth keeping: `sg_cli_report_ambiguous_oid` reads each candidate twice
+  from the same unchanging bytes, so a statically corrupt object fails the
+  FIRST read and is folded to `SG_OBJ_BLOB` in the candidate loop, never
+  reaching `print_commit_candidate_line` at all. Triggering the bug needs an
+  object that changes state BETWEEN the two reads (a concurrent `git gc`),
+  which no hook in this test suite can stage. What WAS made deterministic
+  instead: a tag pointing at a nonexistent object, witnessing the adjacent
+  "peel chain fails -> candidate excluded" branch.
+- **`resolve_refspec_src` hands `sg_rev_parse_commit_ex` a `src` that may
+  contain an embedded colon**, violating that function's documented "no
+  colon" precondition. Proven unobservable by exhaustion: a base containing a
+  colon fails the pure-hex test before the mode it would have mis-selected is
+  ever consulted. Recorded against a future change to either the hex test or
+  the base scan.
+
+### 6. Process notes
+
+- **A mutation aimed at the wrong gate manufactures a coverage gap.** Three
+  rules whose guard is `interop` were first mutated against
+  `test_revparse_abbrev` alone and came back green; re-aimed with
+  `--interop`, all three go red on named checks. The failure direction of
+  mis-aimed verification is always "already verified".
+- **Subagents in this environment cannot run `git commit`/`git push`**, so
+  both the implementer and a reviewer were unable to build fixtures needing a
+  commit. Both said so plainly and lowered their confidence rather than
+  presenting reasoning as measurement; the measurements were then done by the
+  coordinator. Worth remembering when delegating anything oracle-shaped.
+- **The spec was overturned by measurement four times in this phase**, each
+  time correctly: the hint list narrows (spec said nothing); `:path` is a
+  third mode (spec said two); the colon form does not inherit the suffix
+  trigger (spec said it did); and a statically corrupt object cannot witness
+  the `free()` fix (the coordinator's own proposed fixture).

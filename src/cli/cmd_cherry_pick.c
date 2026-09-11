@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/cli_args.h"
 #include "sg/pick.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
@@ -119,7 +120,11 @@ int sg_cmd_cherry_pick(int argc, char **argv)
             return 1;
         }
         for (i = 0; i < commit_count; i++) {
-            if (sg_rev_parse_commit(git_dir, commit_args[i], ids[i]) != 0) {
+            int prc = sg_rev_parse_commit(git_dir, commit_args[i], ids[i]);
+
+            if (prc != 0) {
+                if (prc == -4)
+                    sg_cli_report_ambiguous_oid(git_dir, commit_args[i], SG_REV_STRICT);
                 fprintf(stderr, "sg: '%s' is not a valid object id\n", commit_args[i]);
                 free(ids);
                 free(git_dir);

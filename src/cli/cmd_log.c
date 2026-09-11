@@ -368,7 +368,7 @@ int sg_cmd_log(int argc, char **argv)
 
     /* An explicit "--" settles the split with no guessing at all, same
        shape as cmd_diff.c. */
-    rev_count = dashdash >= 0 ? dashdash : sg_cli_split_revs_and_paths(git_dir, pos, n_pos, "log");
+    rev_count = dashdash >= 0 ? dashdash : sg_cli_split_revs_and_paths(git_dir, pos, n_pos, "log", SG_REV_COMMITTISH);
     if (rev_count < 0) {
         free(pos);
         free(repo_root);
@@ -405,7 +405,11 @@ int sg_cmd_log(int argc, char **argv)
         o.pathspec = &pathspec;
 
     if (rev != NULL) {
-        if (sg_rev_parse_commit(git_dir, rev, id) != 0) {
+        int prc = sg_rev_parse_commit_ex(git_dir, rev, SG_REV_COMMITTISH, id);
+
+        if (prc != 0) {
+            if (prc == -4)
+                sg_cli_report_ambiguous_oid(git_dir, rev, SG_REV_COMMITTISH);
             fprintf(stderr, "sg: not a valid revision '%s'\n", rev);
             sg_pathspec_free(&pathspec);
             free(git_dir);

@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/cli_args.h"
 #include "sg/hash.h"
 #include "sg/merge.h"
 #include "sg/repo.h"
@@ -25,15 +26,27 @@ int sg_cmd_merge_base(int argc, char **argv)
     if (git_dir == NULL)
         return 1;
 
-    if (sg_rev_parse_commit(git_dir, argv[1], a) != 0) {
-        fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[1]);
-        free(git_dir);
-        return 1;
+    {
+        int prc = sg_rev_parse_commit(git_dir, argv[1], a);
+
+        if (prc != 0) {
+            if (prc == -4)
+                sg_cli_report_ambiguous_oid(git_dir, argv[1], SG_REV_STRICT);
+            fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[1]);
+            free(git_dir);
+            return 1;
+        }
     }
-    if (sg_rev_parse_commit(git_dir, argv[2], b) != 0) {
-        fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[2]);
-        free(git_dir);
-        return 1;
+    {
+        int prc = sg_rev_parse_commit(git_dir, argv[2], b);
+
+        if (prc != 0) {
+            if (prc == -4)
+                sg_cli_report_ambiguous_oid(git_dir, argv[2], SG_REV_STRICT);
+            fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[2]);
+            free(git_dir);
+            return 1;
+        }
     }
 
     rc = sg_merge_base(git_dir, a, b, out);

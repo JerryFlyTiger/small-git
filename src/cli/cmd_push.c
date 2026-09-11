@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/chunk.h"
+#include "sg/cli_args.h"
 #include "sg/hash.h"
 #include "sg/http.h"
 #include "sg/merge.h"
@@ -1071,8 +1072,12 @@ static int resolve_refspec_src(const char *git_dir, const char *src,
         return *exact_ref_path_out != NULL ? 0 : -3;
     }
 
-    if (sg_rev_parse_commit(git_dir, src, id_out) != 0)
-        return -1;
+    {
+        int prc = sg_rev_parse_commit(git_dir, src, id_out);
+
+        if (prc != 0)
+            return prc; /* propagates -4 (ambiguous prefix) as well as -1 */
+    }
     return 0;
 }
 
@@ -1530,6 +1535,8 @@ int sg_cmd_push(int argc, char **argv)
                     goto done;
                 }
                 if (src_rc != 0) {
+                    if (src_rc == -4)
+                        sg_cli_report_ambiguous_oid(git_dir, parsed.src, SG_REV_STRICT);
                     fprintf(stderr, "error: src refspec %s does not match any\n", parsed.src);
                     src_resolve_failed = 1;
                     sg_push_refspec_free(&parsed);

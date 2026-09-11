@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/cli_args.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/merge.h"
@@ -124,12 +125,18 @@ int sg_cmd_reset(int argc, char **argv)
         return 1;
     }
 
-    if (sg_rev_parse_commit(git_dir, rev_arg, target_commit_id) != 0) {
-        fprintf(stderr, "sg: invalid reference: %s\n", rev_arg);
-        free(current_branch);
-        free(git_dir);
-        free(repo_root);
-        return 1;
+    {
+        int prc = sg_rev_parse_commit_ex(git_dir, rev_arg, SG_REV_COMMITTISH, target_commit_id);
+
+        if (prc != 0) {
+            if (prc == -4)
+                sg_cli_report_ambiguous_oid(git_dir, rev_arg, SG_REV_COMMITTISH);
+            fprintf(stderr, "sg: invalid reference: %s\n", rev_arg);
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
     }
 
     if (mode == RESET_SOFT) {

@@ -55,6 +55,21 @@ typedef struct {
    "invalid --pretty format" usage error, matching its own USAGE string). */
 int sg_pretty_parse(const char *arg, sg_pretty_format *out);
 
+/* Phase 68b: folds msg the same way %s / the oneline/reference builtins do
+   (skip leading blank lines, join up to the next blank line with a single
+   space, strip each line's own trailing whitespace -- see fold_subject's
+   own comment in commit_out.c for the exact algorithm) into a freshly
+   malloc'd buffer sized to fit, and sets *out_len to the written length
+   (the buffer is NOT NUL-terminated on its own, same convention as the
+   rest of this file's line-writing helpers). Returns NULL (*out_len = 0)
+   for a NULL/empty msg or on allocation failure -- callers treat NULL the
+   same as "0-length". Exported so the abbreviated-object-id ambiguity
+   report (sg_cli_report_ambiguous_oid, Phase 68) can reuse the exact same
+   folding rule rather than writing "the first line of the message" a
+   sixth time -- see CLAUDE.md's `%s` warning: one rule copied N times has
+   historically had exactly one copy wrong. */
+char *sg_commit_out_fold_subject_alloc(const char *msg, size_t *out_len);
+
 /* Phase 60b: validates every `%`-sequence in a FORMAT/TFORMAT user_format
    against the placeholder table in CLAUDE.md's `sg log` Phase 60 entry
    (section 5.1 of the spec) -- ids, author/committer name/email/local-part/

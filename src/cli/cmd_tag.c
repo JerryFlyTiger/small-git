@@ -1,5 +1,6 @@
 #include "sg/cli.h"
 
+#include "sg/cli_args.h"
 #include "sg/hash.h"
 #include "sg/loose.h"
 #include "sg/object.h"
@@ -69,9 +70,16 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         fprintf(stderr, "sg: tag '%s' already exists\n", name);
         return 1;
     }
-    if (sg_rev_parse_commit(git_dir, rev != NULL ? rev : "HEAD", target_id) != 0) {
-        fprintf(stderr, "sg: cannot resolve '%s'\n", rev != NULL ? rev : "HEAD");
-        return 1;
+    {
+        const char *rev_or_head = rev != NULL ? rev : "HEAD";
+        int prc = sg_rev_parse_commit(git_dir, rev_or_head, target_id);
+
+        if (prc != 0) {
+            if (prc == -4)
+                sg_cli_report_ambiguous_oid(git_dir, rev_or_head, SG_REV_STRICT);
+            fprintf(stderr, "sg: cannot resolve '%s'\n", rev_or_head);
+            return 1;
+        }
     }
 
     if (snprintf(ref_path, sizeof(ref_path), "refs/tags/%s", name) >= (int)sizeof(ref_path)) {
