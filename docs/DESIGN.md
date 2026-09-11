@@ -9881,6 +9881,14 @@ interoperability: a real `git cherry-pick --continue` can finish a sequence
 
 ### 3. The full-hex `sequencer/todo` divergence
 
+> **Superseded in part by Phase 68c.** The DECISION below (sg writes the
+> full 40) still stands, but its stated REASON expired: sg gained
+> abbreviated-object-name resolution in Phase 68 and `parse_todo_line` was
+> widened to 4..40 hex in Phase 68c, so sg can now read a 7-hex todo back.
+> The standing reason is wide-in / narrow-out, not "sg cannot read it".
+> The rest of this section is left as the record of what was true in Phase
+> 57 rather than rewritten.
+
 git abbreviates the id field to 7 hex characters; sg writes the full 40.
 This is deliberate, not an oversight: **sg has no abbreviated-object-name
 resolution anywhere in this project** (a design choice recorded since
@@ -14282,3 +14290,135 @@ Recorded so nobody goes hunting for the missing test:
   third mode (spec said two); the colon form does not inherit the suffix
   trigger (spec said it did); and a statically corrupt object cannot witness
   the `free()` fix (the coordinator's own proposed fixture).
+
+## Phase 68c: `sequencer/todo` reads 4..40 hex -- the one-directional dead end closes
+
+This is what Phase 68 was for. `parse_todo_line` (`src/safety/sequencer.c`)
+was fixed-width: `strlen(line) < 40 || line[40] != ' '`. git's own
+`sequencer/todo` writes **7-hex**, so every id in it landed inside the
+subject text and the whole state read failed. interop 3454 -> 3481.
+
+### 1. The premise, measured before any code
+
+A real `git cherry-pick` pause writes `CHERRY_PICK_HEAD`, `sequencer/head`
+and `sequencer/abort-safety` as **full 40-hex**; only `sequencer/todo` is
+abbreviated. On that state today `sg status`, `--abort` and `--quit` already
+work (Phase 57's escape-hatch fix); only `--continue`/`--skip` failed, with
+`sg: cherry-pick state is corrupt, run sg cherry-pick --abort to clean up`.
+So exactly one parser needed widening, and `read_hex_file` deliberately did
+NOT change -- widening what those four files accept would enlarge the attack
+surface for no gain.
+
+The new rule: `strspn` a hex run, require a following space, then 40 -> the
+existing exact path, 4..39 -> `sg_object_find_prefix` with **`count != 1`
+rejected**. Ambiguity is a hard failure, never a guess: applying the wrong
+commit on `--continue` is far worse than refusing, and the refusal's message
+names `--abort`, which Phase 57 made independent of `todo` and which is
+therefore verified to work on that same input.
+
+`write_todo_file` still emits the full 40. The old reason ("sg could not read
+a short one back") expired with this commit; the standing reason is
+**wide-in / narrow-out** -- accept anything a real git paused, emit only what
+nothing can resolve to the wrong object.
+
+### 2. `--skip` and `--continue` now behave like git's, measured side by side
+
+Closing the dead end changed two OUTCOMES, not just an error string, so real
+git was re-measured on the identical fixture rather than assumed:
+
+| | git | sg |
+|---|---|---|
+| `--continue`, conflict unresolved | rc 128, refuses, state survives | rc 1, refuses, state survives |
+| `--skip` | rc 0, log `t2 \| master edit \| base`, state cleared | rc 0, **same log**, state cleared |
+
+That check mattered because this project's own Phase 57 spec twice invented
+behaviour git does not have. Six pre-existing `phase57`/`phase57b` checks
+pinned the dead end itself and had to be rewritten; a cold review traced each
+one to confirm no old assertion was quietly guarding an unrelated property on
+the way out.
+
+### 3. The ambiguity test proved nothing, and the reason generalises
+
+`test_ambiguous_prefix_in_todo_rejected` guards the single most important
+property here. Measured: weakening the guard from `count != 1` to `count < 1`
+(i.e. silently taking the first candidate) left it **completely green**.
+
+`sg_sequencer_state_read` has TWO independent failure paths, and the fixture
+set `current` to an unrelated commit -- so even when ambiguity resolved to the
+wrong blob, the later `todo[0] != current` check still returned -1. Same
+outcome, different reason; the test could not tell "ambiguity refused" from
+"ambiguity silently mis-resolved, then rejected for something else". Nothing
+else covered it either: interop's own comment defers all ambiguity coverage
+to this one test, because a real git pause cannot produce an ambiguous
+abbreviation (git widens until unique).
+
+The fixture now sets `current` to whichever of the two colliding ids
+`sg_object_find_prefix` sorts FIRST, so "take the first candidate" makes
+`state_read` SUCCEED where it must fail. The same reverse mutation now fails
+it by name.
+
+### 4. A negative assertion that would have become unconditionally true
+
+Review found `! grep -q -- "--abort" <file>` and asked what happens if the
+`--` is ever dropped. Measured over three files:
+
+| pattern | file containing `--abort` | file without it | empty file |
+|---|---|---|---|
+| `grep -q -- "--abort"` | FAIL (correct) | PASS | PASS |
+| `grep -q "--abort"` | **PASS** | PASS | PASS |
+| `grep -q '[-][-]abort'` | FAIL (correct) | PASS | PASS |
+
+Without `--`, grep exits 2 at argv parsing ("unrecognized option") **before
+reading the file at all**, and `!` turns that into PASS for every input --
+including the one the assertion exists to catch. Not a coincidence to
+document: option parsing always precedes reading.
+
+All five such assertions in `interop.sh` (two new here, three pre-existing in
+the `phase58` group) now use a bracket pattern, which cannot be parsed as an
+option at all -- the project's own rule that undefined behaviour is answered
+by removing the freedom, not by adding a test. Positive assertions need no
+change: a `grep` that exits 2 is a non-zero status, and `check()` already
+counts that as FAIL, so they announce themselves.
+
+Proven by a **directed** mutation, which is the only kind that can prove a
+negative assertion: planting `--abort` into the message turns both checks
+red. A blanket revert cannot do this -- it changes the wording without
+necessarily reintroducing the forbidden string.
+
+### 5. Mutation results
+
+| mutation | result |
+|---|---|
+| prefix branch disabled (dead end reopens) | RED, **8 interop checks**, incl. the end-to-end "a REAL GIT pause ... exits 0" |
+| hex must be followed by a space | RED, `test_todo_hex_without_trailing_space_rejected` |
+| ambiguity guard `!= 1` -> `< 1` | RED (after the fixture fix; GREEN before it) |
+| `--abort` planted in the message | RED, both negative assertions |
+| `hex_len < SG_OID_MIN_ABBREV` | GREEN -- **redundant guard**, not a gap: `sg_object_find_prefix` enforces 4..39 itself, so the `rc != 0` branch still fires |
+| `hex_len > SG_SHA1_HEX_LEN` | GREEN -- same redundant guard |
+
+### 6. Documentation that had gone stale, and how each was handled
+
+Closing this gap falsified claims in five places. They were NOT handled the
+same way, on purpose:
+
+- **`CLAUDE.md`** (two WARNINGs plus "Abbreviated sha is not supported"):
+  rewritten, because that file describes CURRENT behaviour and is the one
+  document later work actually reads. The "one-directional" WARNING now
+  records that the sentence was correct when written and that a code change,
+  not a re-measurement, ended it.
+- **`docs/sg.1`**: rewritten -- user-facing current documentation. The first
+  attempt updated only the first half of the passage and left it
+  self-contradicting ("the reverse direction works too: ... which sg cannot
+  resolve"), the same half-updated shape this phase caught three times in
+  other people's work.
+- **`docs/DESIGN.md`'s Phase 57 section**: NOT rewritten. It is the record of
+  what was true then; it carries a "superseded in part" note saying the
+  DECISION stands and the REASON expired.
+- **`include/sg/sequencer.h`** (three comments) and one stale present-tense
+  comment in `interop.sh`: updated. The interop one is the familiar shape --
+  the same fact stated twice, one copy updated and one not.
+- Four code comments cited "Phase 68 spec section 0 premise 4", a document
+  that **does not exist in the repo** (it lives in the coordinator's
+  scratch directory). The underlying fact is true and pinned by a Phase 57
+  precondition check, but the citation pointed at nothing; all four now cite
+  this section instead.

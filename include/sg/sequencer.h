@@ -26,13 +26,17 @@
        sg_sequencer_state's `has_sequence` flag carries this distinction.
 
      - sequencer/todo's id field is a full 40-hex string where git writes an
-       abbreviated 7-hex one. sg has no abbreviated-object-name resolution
-       at all, so writing 7 hex chars would produce a file sg itself could
-       not read back; writing 40 is still readable by real git (its own
-       parser accepts any length prefix >= 4), so the compatibility
-       direction that actually matters -- sg's own output must remain
-       readable, by both tools -- is preserved. See docs/DESIGN.md's Phase
-       57 section. */
+       abbreviated 7-hex one. As of Phase 68c sg CAN read an abbreviated
+       (4..39 hex) todo line back (parse_todo_line, sequencer.c, resolves
+       it the same way sg_rev_parse_object does), so this is no longer
+       forced by a reading limitation -- it stays a deliberate wide-in/
+       narrow-out choice: accept whatever a real git pause left behind, but
+       never emit anything an older sg build, or a reader with no prefix
+       resolution at all, could find ambiguous. Full 40-hex is of course
+       also readable by real git (its own parser accepts any length prefix
+       >= 4), so the compatibility direction that actually matters -- sg's
+       own output must remain readable, by both tools -- is preserved. See
+       docs/DESIGN.md's Phase 57 and 68 sections. */
 typedef enum { SG_SEQ_CHERRY_PICK = 1, SG_SEQ_REVERT = 2 } sg_seq_kind;
 
 typedef struct {
@@ -57,12 +61,18 @@ typedef struct {
 sg_seq_kind sg_sequencer_kind_in_progress(const char *git_dir);
 
 /* Reads and validates the full state for whichever of CHERRY_PICK_HEAD /
-   REVERT_HEAD is present. Every field is format-checked (hex fields exactly
-   40 hex chars; each todo line exactly "<verb> " + 40 hex chars + " " +
-   subject, verb "pick" for a cherry-pick sequence and "revert" for a
-   revert one; todo[0] must equal the id read from CHERRY_PICK_HEAD/
-   REVERT_HEAD) -- any violation is treated as corrupt. Returns 0 on
-   success, -1 if neither file is present or the state is malformed. */
+   REVERT_HEAD is present. Every field is format-checked: CHERRY_PICK_HEAD/
+   REVERT_HEAD/sequencer/head/sequencer/abort-safety are exactly 40 hex
+   chars (both tools always write these four full-width, so this stays
+   exact, never a prefix -- see the Phase 68c section of docs/DESIGN.md);
+   each todo line is
+   "<verb> " + 4..40 hex chars + " " + subject, verb "pick" for a
+   cherry-pick sequence and "revert" for a revert one -- a length other than
+   40 is resolved as an abbreviated prefix (Phase 68c), rejected outright if
+   it names zero or more than one object; todo[0] must equal the id read
+   from CHERRY_PICK_HEAD/REVERT_HEAD. Any violation, including an
+   unresolvable or ambiguous todo prefix, is treated as corrupt. Returns 0
+   on success, -1 if neither file is present or the state is malformed. */
 int sg_sequencer_state_read(const char *git_dir, sg_sequencer_state *out);
 
 /* Reads only what `--abort` needs, DELIBERATELY skipping sequencer/todo
@@ -72,10 +82,16 @@ int sg_sequencer_state_read(const char *git_dir, sg_sequencer_state *out);
    plain full 40-hex line in EITHER tool's own writing (git and sg agree on
    this format exactly; only sequencer/todo's id width diverges, see the
    header comment above). This is what lets `sg cherry-pick --abort` work
-   on a sequence a REAL GIT binary paused: git's sequencer/todo holds
-   abbreviated 7-hex ids sg's todo parser cannot read, but abort was never
+   on a sequence a REAL GIT binary paused: even though sg's todo parser can
+   now RESOLVE git's abbreviated 7-hex ids (Phase 68c), abort was never
    supposed to need todo at all -- git's own cherry-pick --abort does not
-   read it either, it only needs where to reset back to.
+   read it either, it only needs where to reset back to. Skipping it here
+   is therefore still correct on its own terms (not merely no-longer-wrong
+   now that the parser could technically read it): a todo entry might still
+   fail to resolve (an unresolvable or ambiguous prefix, a partial write),
+   and --abort must keep working precisely when the rest of the state is
+   damaged, so it must not gain a dependency on the one field most likely
+   to be the damaged one.
 
    Without this, `sg_sequencer_state_read`'s all-or-nothing contract makes
    `--abort` fail on exactly the input it exists to recover from: a

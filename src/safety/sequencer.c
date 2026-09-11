@@ -113,6 +113,15 @@ static int write_line_file(const char *path, const char *line)
     return fclose(f) == 0 ? 0 : -1;
 }
 
+/* CHERRY_PICK_HEAD / REVERT_HEAD / sequencer/head / sequencer/abort-safety
+   are all full 40-hex in BOTH tools (measured against real git 2.55.0, see
+   the Phase 68c section of docs/DESIGN.md), so this deliberately stays
+   fixed-width -- widening it
+   to accept a prefix would only grow the attack surface (a short, possibly
+   ambiguous read where a full id was always guaranteed) with no real-git
+   fixture that could ever exercise the wider path. Only sequencer/todo
+   (parse_todo_line, below) needs the prefix branch, because that is the
+   one file git itself writes abbreviated. */
 static int read_hex_file(const char *path, unsigned char out[SG_SHA1_RAW_LEN])
 {
     char *line = read_line_file(path);
@@ -161,27 +170,62 @@ static int seq_dir_exists(const char *git_dir)
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-/* Parses one todo line: "<verb> <40hex> <subject>\n". Subject is not
+/* Parses one todo line: "<verb> <hex> <subject>\n". Subject is not
    validated (any bytes up to the newline); only verb and hex are checked.
-   Returns 0 and fills id on success, -1 on any malformed field. */
-static int parse_todo_line(const char *line, sg_seq_kind kind, unsigned char id[SG_SHA1_RAW_LEN])
+   <hex> is EXACTLY 40 characters for a line sg itself wrote (write_todo_file
+   always writes full hex), or SG_OID_MIN_ABBREV..39 for a line a real git
+   wrote while paused (git's own sequencer/todo abbreviates to 7 hex) --
+   Phase 68c, closes the one-directional interop dead end CLAUDE.md records
+   for cherry-pick/revert --continue/--skip. Wide-in: an abbreviated
+   prefix is resolved against the WHOLE object store, any type, since the
+   caller only ever wants "the object this line names", not "a commit" --
+   downstream (run_todo's own sg_object_read as SG_OBJ_COMMIT) already
+   fails naturally if it names the wrong kind of object.
+   Ambiguity is a hard FAILURE, never a guess: applying the wrong commit
+   here is worse than refusing, and refusing here is safe because the
+   caller's caller (require_state, pick.c) already points the user at
+   --abort, which resolves this state without ever touching sequencer/todo.
+   Returns 0 and fills id on success, -1 on any malformed field, not-hex,
+   not-found, or ambiguous prefix. */
+static int parse_todo_line(const char *git_dir, const char *line, sg_seq_kind kind,
+                           unsigned char id[SG_SHA1_RAW_LEN])
 {
     const char *verb = todo_verb(kind);
     size_t verb_len = strlen(verb);
+    size_t hex_len;
     char hex[SG_SHA1_HEX_LEN + 1];
 
     if (strncmp(line, verb, verb_len) != 0 || line[verb_len] != ' ')
         return -1;
     line += verb_len + 1;
-    if (strlen(line) < SG_SHA1_HEX_LEN || line[SG_SHA1_HEX_LEN] != ' ')
+
+    hex_len = strspn(line, "0123456789abcdefABCDEF");
+    if (hex_len < SG_OID_MIN_ABBREV || hex_len > SG_SHA1_HEX_LEN || line[hex_len] != ' ')
         return -1;
-    memcpy(hex, line, SG_SHA1_HEX_LEN);
-    hex[SG_SHA1_HEX_LEN] = '\0';
-    return sg_hex_to_sha1(hex, id);
+    memcpy(hex, line, hex_len);
+    hex[hex_len] = '\0';
+
+    if (hex_len == SG_SHA1_HEX_LEN)
+        return sg_hex_to_sha1(hex, id);
+
+    {
+        sg_oid_list list;
+        int rc;
+
+        memset(&list, 0, sizeof(list));
+        rc = sg_object_find_prefix(git_dir, hex, &list);
+        if (rc != 0 || list.count != 1) {
+            sg_oid_list_free(&list);
+            return -1;
+        }
+        memcpy(id, list.ids[0], SG_SHA1_RAW_LEN);
+        sg_oid_list_free(&list);
+        return 0;
+    }
 }
 
-static int read_todo_file(const char *path, sg_seq_kind kind, unsigned char (**out)[SG_SHA1_RAW_LEN],
-                          size_t *out_count)
+static int read_todo_file(const char *git_dir, const char *path, sg_seq_kind kind,
+                          unsigned char (**out)[SG_SHA1_RAW_LEN], size_t *out_count)
 {
     FILE *f = fopen(path, "rb");
     unsigned char(*todo)[SG_SHA1_RAW_LEN] = NULL;
@@ -220,7 +264,7 @@ static int read_todo_file(const char *path, sg_seq_kind kind, unsigned char (**o
             todo = grown;
             cap = new_cap;
         }
-        if (parse_todo_line(line, kind, todo[count]) != 0) {
+        if (parse_todo_line(git_dir, line, kind, todo[count]) != 0) {
             free(line);
             fclose(f);
             free(todo);
@@ -240,6 +284,14 @@ static int read_todo_file(const char *path, sg_seq_kind kind, unsigned char (**o
     return 0;
 }
 
+/* Always writes full 40-hex, never git's own 7-hex abbreviation (a
+   deliberate, pre-existing divergence -- see include/sg/sequencer.h and
+   CLAUDE.md's "sequencer/todo's id field" note). Before Phase 68c the
+   reason was "sg cannot read an abbreviated id back"; that is no longer
+   true (parse_todo_line, above, now resolves a prefix), but the write side
+   still stays exact on purpose: wide-in/narrow-out -- accept whatever a
+   real git pause left behind, but never emit anything an older sg build,
+   or a reader with no prefix-resolution at all, could find ambiguous. */
 static int write_todo_file(const char *git_dir, const char *path, sg_seq_kind kind,
                            const unsigned char (*todo)[SG_SHA1_RAW_LEN], size_t count)
 {
@@ -311,7 +363,7 @@ int sg_sequencer_state_read(const char *git_dir, sg_sequencer_state *out)
        read_hex_file(path, out->abort_safety) != 0)
         return -1;
     if (seq_file_path(git_dir, "todo", path, sizeof(path)) != 0 ||
-       read_todo_file(path, kind, &out->todo, &out->todo_count) != 0)
+       read_todo_file(git_dir, path, kind, &out->todo, &out->todo_count) != 0)
         return -1;
     if (out->todo_count == 0 || memcmp(out->todo[0], out->current, SG_SHA1_RAW_LEN) != 0) {
         free(out->todo);

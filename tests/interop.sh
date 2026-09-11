@@ -14506,13 +14506,18 @@ check "phase57 oracle: precondition -- git commit completes the cherry-pick inst
 # Every phase57 check so far builds TWO copies (one per tool) and diffs
 # their outputs; this group instead builds ONE repository, pauses a
 # two-commit cherry-pick with REAL GIT ITSELF (so sequencer/todo holds
-# git's own abbreviated 7-hex ids -- a shape sg's todo parser cannot read
-# at all), and asserts sg's four escape-hatch subcommands still get the
-# user out. This is the dead end a second measurement round found after
-# the first green board: sg used to refuse ALL FOUR of
-# --continue/--skip/--quit/--abort on exactly this input, every one with
-# the identical "state is corrupt, run sg cherry-pick --abort to clean up"
-# -- advice naming one of the four commands that had just failed. ---
+# git's own abbreviated 7-hex ids -- a shape sg's todo parser could not
+# read at all before Phase 68c), and asserts sg's four escape-hatch
+# subcommands still get the user out. This is the dead end a second
+# measurement round found after the first green board: sg used to refuse
+# ALL FOUR of --continue/--skip/--quit/--abort on exactly this input, every
+# one with the identical "state is corrupt, run sg cherry-pick --abort to
+# clean up" -- advice naming one of the four commands that had just failed.
+# --quit and --abort never needed sequencer/todo at all (Phase 57's own
+# fix); Phase 68c widens parse_todo_line itself, so --continue/--skip below
+# are updated for their now-CORRECT behavior -- see the phase68c: group
+# further down for the full round trip (git pauses, sg resolves + finishes
+# the sequence; the reverse direction; --abort/--quit re-pinned). ---
 P57_GITPAUSED="$WORKDIR/p57_gitpaused"
 rm -rf "$P57_GITPAUSED"
 cp -R "$P57_CONFLICT" "$P57_GITPAUSED"
@@ -14521,7 +14526,7 @@ P57_GITPAUSED_PRE_MASTER=$(cd "$P57_GITPAUSED" && LC_ALL=C git rev-parse master 
     > /dev/null 2>&1
 check "phase57 oracle: precondition -- real git actually paused on the conflict" \
     sh -c 'test -f "$0/.git/CHERRY_PICK_HEAD"' "$P57_GITPAUSED"
-check "phase57 oracle: precondition -- git's own sequencer/todo really uses 7-hex ids, the shape sg's parser cannot read" \
+check "phase57 oracle: precondition -- git's own sequencer/todo really uses 7-hex ids (Phase 68c's parse_todo_line now resolves this)" \
     sh -c 'awk "{print length(\$2)}" "$0/.git/sequencer/todo" | grep -qx 7' "$P57_GITPAUSED"
 check "phase57 oracle: precondition -- git's sequencer/head is nonetheless a plain full 40-hex" \
     sh -c 'test $(wc -c < "$0/.git/sequencer/head") = 41' "$P57_GITPAUSED"
@@ -14552,34 +14557,45 @@ check "phase57: ...restoring master to the exact commit git's own sequencer/head
 check "phase57: ...and clearing the paused state" \
     sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD" -a ! -d "$0/.git/sequencer"' "$P57_GP_ABORT"
 
-# --continue/--skip: still refuse (they genuinely need a readable todo to
-# do their job), but the message must name a command that ACTUALLY WORKS
-# on this input -- never --continue or --skip themselves, which are the
-# two commands failing here.
+# --continue: as of Phase 68c, the 7-hex todo now READS -- so with the
+# CONFLICT STILL UNRESOLVED, --continue refuses for the ORDINARY reason
+# (unresolved conflicts remain), the same message and exit code any
+# sg-native paused pick would give, not "state is corrupt". The full
+# success round trip (resolve, then --continue actually finishes the
+# sequence) is in the phase68c: group below; this block is what changed
+# here in Phase 57's own fixture -- it deliberately does NOT resolve the
+# conflict, so it stays a "refuses" case, but for a different, legitimate
+# reason.
 P57_GP_CONT="$WORKDIR/p57_gitpaused_continue"
 rm -rf "$P57_GP_CONT"
 cp -R "$P57_GITPAUSED" "$P57_GP_CONT"
 (cd "$P57_GP_CONT" && "$SG" cherry-pick --continue) > "$P57_GP_CONT.out" 2>&1
 p57_gp_cont_rc=$?
-check "phase57: sg cherry-pick --continue still refuses on git's 7-hex todo (it genuinely needs to read it)" \
+check "phase68c cherry-pick continue: sg cherry-pick --continue on git's 7-hex todo now PARSES it -- with the conflict still unresolved it refuses for the ordinary reason, not 'state is corrupt'" \
     test "$p57_gp_cont_rc" = 1
-check "phase57: ...but its message names --abort, a command that actually works on this input" \
-    sh -c 'grep -q -- "--abort" "$0"' "$P57_GP_CONT.out"
-check "phase57: ...and does NOT tell the user to re-run --continue or --skip (which fail identically)" \
-    sh -c '! grep -qE -- "run \`?sg cherry-pick (--continue|--skip)" "$0"' "$P57_GP_CONT.out"
-check "phase57: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit)" \
+check "phase68c cherry-pick continue: ...its message names the unresolved path" \
+    sh -c 'grep -q "unresolved conflicts remain" "$0" && grep -q "r.txt" "$0"' "$P57_GP_CONT.out"
+check "phase68c cherry-pick continue: ...and does NOT name --abort (the dead-end wording is actually gone, not just unmentioned by coincidence)" \
+    sh -c '! grep -q "[-][-]abort" "$0"' "$P57_GP_CONT.out"
+check "phase68c cherry-pick continue: ...and it DOES tell the user to resolve and re-run --continue (the normal instruction, now reachable)" \
+    sh -c 'grep -qE -- "run \`?sg add" "$0" && grep -qE -- "sg cherry-pick --continue" "$0"' \
+    "$P57_GP_CONT.out"
+check "phase68c cherry-pick continue: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit/resolve+--continue)" \
     sh -c 'test -f "$0/.git/CHERRY_PICK_HEAD"' "$P57_GP_CONT"
 
+# --skip: as of Phase 68c the todo resolves, and --skip needs no clean
+# index at all (unlike --continue) -- it discards the conflicting commit
+# outright and runs the REST of the todo (here, just the clean second
+# commit), so it now SUCCEEDS and finishes the whole sequence.
 P57_GP_SKIP="$WORKDIR/p57_gitpaused_skip"
 rm -rf "$P57_GP_SKIP"
 cp -R "$P57_GITPAUSED" "$P57_GP_SKIP"
 (cd "$P57_GP_SKIP" && "$SG" cherry-pick --skip) > "$P57_GP_SKIP.out" 2>&1
 p57_gp_skip_rc=$?
-check "phase57: sg cherry-pick --skip also still refuses on git's 7-hex todo" \
-    test "$p57_gp_skip_rc" = 1
-check "phase57: ...but its message likewise names --abort, not --continue/--skip" \
-    sh -c 'grep -q -- "--abort" "$0" && ! grep -qE -- "run \`?sg cherry-pick (--continue|--skip)" "$0"' \
-    "$P57_GP_SKIP.out"
+check "phase68c: sg cherry-pick --skip on git's 7-hex todo now succeeds (exit 0), the dead end is closed" \
+    test "$p57_gp_skip_rc" = 0
+check "phase68c: ...and finishes the sequence (CHERRY_PICK_HEAD and sequencer/ are both gone)" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD" -a ! -d "$0/.git/sequencer"' "$P57_GP_SKIP"
 
 # sg status: the banner must print on EXISTENCE, not on a full parse --
 # git's own 7-hex sequencer/todo must not make the banner line disappear
@@ -15019,8 +15035,10 @@ check "phase57b: real git accepts sg's full-hex todo field as a valid object id"
 
 # Item 4 (review finding): 57a's spec 5b escape-hatch fix has two named
 # interop checks for cherry-pick (a REAL git binary pauses, then sg's
-# --quit/--abort must still work even though sg cannot read git's 7-hex
-# todo). Revert shares the exact same code path, but nothing had ever
+# --quit/--abort must still work even though sg could not read git's 7-hex
+# todo at all before Phase 68c -- --quit/--abort never needed to read it in
+# the first place, which is why this still holds unchanged after that
+# phase). Revert shares the exact same code path, but nothing had ever
 # built the git-paused fixture for revert specifically. "$P57B_MULTI-git"
 # above is already exactly that fixture (real git paused a two-commit
 # revert on it), so it is reused here rather than rebuilt.
@@ -15043,15 +15061,19 @@ check "phase57b: sg revert --abort recovers a revert a REAL GIT BINARY paused"  
 check "phase57b: ...restoring master to the exact commit git's own sequencer/head named"     sh -c 'test "$(cd "$0" && LC_ALL=C git rev-parse master)" = "$1"' "$P57B_GP_ABORT"     "$P57B_MULTI_PRE_MASTER"
 check "phase57b: ...and clearing the paused state"     sh -c 'test ! -f "$0/.git/REVERT_HEAD" -a ! -d "$0/.git/sequencer"' "$P57B_GP_ABORT"
 
+# As of Phase 68c the 7-hex todo now parses, so with the conflict left
+# UNRESOLVED, --continue refuses for the ordinary reason (same shape as
+# cherry-pick's own P57_GP_CONT block above), not "state is corrupt".
 P57B_GP_CONT="$WORKDIR/p57b_gitpaused_continue"
 rm -rf "$P57B_GP_CONT"
 cp -R "$P57B_MULTI-git" "$P57B_GP_CONT"
 (cd "$P57B_GP_CONT" && "$SG" revert --continue) > "$P57B_GP_CONT.out" 2>&1
 p57b_gp_cont_rc=$?
-check "phase57b: sg revert --continue still refuses on git's 7-hex todo"     test "$p57b_gp_cont_rc" = 1
-check "phase57b: ...but its message names --abort, a command that actually works on this input"     sh -c 'grep -q -- "--abort" "$0"' "$P57B_GP_CONT.out"
-check "phase57b: ...and does NOT tell the user to re-run --continue or --skip (which fail identically)"     sh -c '! grep -qE -- "run \`?sg revert (--continue|--skip)" "$0"' "$P57B_GP_CONT.out"
-check "phase57b: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit)"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GP_CONT"
+check "phase68c revert continue: sg revert --continue on git's 7-hex todo now parses it -- with the conflict still unresolved it refuses for the ordinary reason"     test "$p57b_gp_cont_rc" = 1
+check "phase68c revert continue: ...its message names the unresolved path"     sh -c 'grep -q "unresolved conflicts remain" "$0" && grep -q "r.txt" "$0"' "$P57B_GP_CONT.out"
+check "phase68c revert continue: ...and does NOT name --abort (the dead-end wording is actually gone, not just unmentioned by coincidence)"     sh -c '! grep -q "[-][-]abort" "$0"' "$P57B_GP_CONT.out"
+check "phase68c revert continue: ...and it DOES tell the user to resolve and re-run --continue"     sh -c 'grep -qE -- "run \`?sg add" "$0" && grep -qE -- "sg revert --continue" "$0"' "$P57B_GP_CONT.out"
+check "phase68c revert continue: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit/resolve+--continue)"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GP_CONT"
 
 P57B_GP_STATUS="$WORKDIR/p57b_gitpaused_status"
 rm -rf "$P57B_GP_STATUS"
@@ -15404,11 +15426,11 @@ sed -n '/currently rebasing/,/^$/p' "$P58_STATUS.out" > "$P58_STATUS.banner"
 check "phase58: the degraded hint names --quit" \
     sh -c 'grep -q -- "--quit" "$0"' "$P58_STATUS.banner"
 check "phase58: the degraded hint does NOT name --continue" \
-    sh -c '! grep -q -- "--continue" "$0"' "$P58_STATUS.banner"
+    sh -c '! grep -q "[-][-]continue" "$0"' "$P58_STATUS.banner"
 check "phase58: the degraded hint does NOT name --skip" \
-    sh -c '! grep -q -- "--skip" "$0"' "$P58_STATUS.banner"
+    sh -c '! grep -q "[-][-]skip" "$0"' "$P58_STATUS.banner"
 check "phase58: the degraded hint does NOT name --abort" \
-    sh -c '! grep -q -- "--abort" "$0"' "$P58_STATUS.banner"
+    sh -c '! grep -q "[-][-]abort" "$0"' "$P58_STATUS.banner"
 
 P58_STATUS_GIT="$WORKDIR/p58_status_git_oracle"
 rm -rf "$P58_STATUS_GIT"
@@ -18806,6 +18828,186 @@ check "phase68 review control: sg push origin <unique>:dst also reaches the netw
     sh -c "[ '$P68_SG_PUSHCONTROL_RC' -eq 1 ] && grep -qi \"couldn.t connect to server\" '$WORKDIR/p68_sg_pushcontrol.txt'"
 check "phase68 review control: ...and neither side's control output mentions the ambiguity block at all" \
     sh -c "! grep -q 'is ambiguous' '$WORKDIR/p68_git_pushcontrol.txt' && ! grep -q 'is ambiguous' '$WORKDIR/p68_sg_pushcontrol.txt'"
+
+# ============================================================
+# Phase 68c: sequencer/todo accepts an abbreviated (git's own 7-hex) id.
+# parse_todo_line (src/safety/sequencer.c) now scans a hex span, requires a
+# trailing space, and -- when the span is not exactly 40 characters --
+# resolves it as a 4..39-hex prefix via sg_object_find_prefix (Phase 68b),
+# the same resolver sg_rev_parse_object uses. CHERRY_PICK_HEAD/
+# sequencer/head/abort-safety stay fixed at full 40-hex on both sides
+# (measured -- see the Phase 68c section of docs/DESIGN.md), and sg's OWN
+# write_todo_file keeps writing full 40-hex (wide-in, narrow-out). This
+# closes the one-directional interop dead end CLAUDE.md records: a real
+# git pause used to be readable by sg's status/--abort/--quit but NOT by
+# --continue/--skip, because only sequencer/todo was abbreviated.
+# ============================================================
+P68C_DATE="@1700300000 +0000"
+p68c_commit() {
+    ( cd "$1" && GIT_AUTHOR_DATE="$P68C_DATE" GIT_COMMITTER_DATE="$P68C_DATE" \
+      LC_ALL=C git commit -q -m "$2" ) > /dev/null 2>&1
+}
+
+# Same shape as P57_CONFLICT: master and the feature branch edit the SAME
+# line (conflict on the first pick), and the feature branch carries a
+# SECOND, clean commit after that, so --skip's "discard one, apply the
+# rest" behavior and --continue's "resolve one, apply the rest" behavior
+# both have something real to finish.
+P68C_BASE="$WORKDIR/p68c_base"
+mkdir -p "$P68C_BASE"
+(cd "$P68C_BASE" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+printf 'line1\nline2\nline3\n' > "$P68C_BASE/r.txt"
+(cd "$P68C_BASE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p68c_commit "$P68C_BASE" "root"
+(cd "$P68C_BASE" && LC_ALL=C git branch p68cfeat) > /dev/null 2>&1
+(cd "$P68C_BASE" && LC_ALL=C git switch -q p68cfeat) > /dev/null 2>&1
+printf 'line1\nFEATURE\nline3\n' > "$P68C_BASE/r.txt"
+(cd "$P68C_BASE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p68c_commit "$P68C_BASE" "feature edit"
+P68C_FEAT1=$(cd "$P68C_BASE" && LC_ALL=C git rev-parse p68cfeat 2>/dev/null)
+printf 'extra\n' > "$P68C_BASE/extra.txt"
+(cd "$P68C_BASE" && LC_ALL=C git add extra.txt) > /dev/null 2>&1
+p68c_commit "$P68C_BASE" "add extra.txt"
+P68C_FEAT2=$(cd "$P68C_BASE" && LC_ALL=C git rev-parse p68cfeat 2>/dev/null)
+(cd "$P68C_BASE" && LC_ALL=C git switch -q master) > /dev/null 2>&1
+printf 'line1\nMASTER\nline3\n' > "$P68C_BASE/r.txt"
+(cd "$P68C_BASE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p68c_commit "$P68C_BASE" "master edit"
+P68C_MASTER_BEFORE=$(cd "$P68C_BASE" && LC_ALL=C git rev-parse master 2>/dev/null)
+
+# --- ORACLE: entirely real git, start to finish, to compare final tree
+# shape against (author/committer identity is NOT compared -- see the
+# per-check comments below for why). ---
+P68C_ORACLE="$WORKDIR/p68c_oracle"
+rm -rf "$P68C_ORACLE"
+cp -R "$P68C_BASE" "$P68C_ORACLE"
+(cd "$P68C_ORACLE" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+printf 'line1\nRESOLVED\nline3\n' > "$P68C_ORACLE/r.txt"
+(cd "$P68C_ORACLE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+(cd "$P68C_ORACLE" && LC_ALL=C git cherry-pick --continue) > /dev/null 2>&1
+check "phase68c oracle: precondition -- an all-real-git cherry-pick of both commits finishes cleanly" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_ORACLE"
+P68C_ORACLE_TREE1=$(cd "$P68C_ORACLE" && LC_ALL=C git rev-parse "HEAD~1^{tree}" 2>/dev/null)
+P68C_ORACLE_TREE2=$(cd "$P68C_ORACLE" && LC_ALL=C git rev-parse "HEAD^{tree}" 2>/dev/null)
+(cd "$P68C_ORACLE" && LC_ALL=C git log --format=%s -2) > "$WORKDIR/p68c_oracle_subjects.txt" 2>/dev/null
+
+# --- direction 1 (the dead end this phase closes): a real git pause,
+# finished by sg's --continue. ---
+P68C_SGCONT="$WORKDIR/p68c_sgcont"
+rm -rf "$P68C_SGCONT"
+cp -R "$P68C_BASE" "$P68C_SGCONT"
+(cd "$P68C_SGCONT" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+check "phase68c oracle: precondition -- the real-git pause used for the sg-continue direction really stopped on the conflict" \
+    sh -c 'test -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_SGCONT"
+check "phase68c oracle: precondition -- ...and its sequencer/todo id field really is 7 hex chars (git's own abbreviation)" \
+    sh -c 'awk "{print length(\$2)}" "$0/.git/sequencer/todo" | grep -qx 7' "$P68C_SGCONT"
+
+printf 'line1\nRESOLVED\nline3\n' > "$P68C_SGCONT/r.txt"
+(cd "$P68C_SGCONT" && "$SG" add r.txt) > /dev/null 2>&1
+(cd "$P68C_SGCONT" && "$SG" cherry-pick --continue) > "$WORKDIR/p68c_sgcont.out" 2>&1
+P68C_SGCONT_RC=$?
+
+check "phase68c: sg cherry-pick --continue on a REAL GIT pause (7-hex todo) exits 0 -- the one-directional dead end is closed" \
+    test "$P68C_SGCONT_RC" -eq 0
+check "phase68c sgcont: ...CHERRY_PICK_HEAD is gone after sg's --continue finishes a git-paused pick" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_SGCONT"
+check "phase68c sgcont: ...sequencer/ is gone after sg's --continue finishes a git-paused pick" \
+    sh -c 'test ! -d "$0/.git/sequencer"' "$P68C_SGCONT"
+(cd "$P68C_SGCONT" && LC_ALL=C git log --format=%s -2) > "$WORKDIR/p68c_sgcont_subjects.txt" 2>/dev/null
+check "phase68c sgcont: ...both commits landed (subjects/order match the oracle's)" \
+    cmp -s "$WORKDIR/p68c_sgcont_subjects.txt" "$WORKDIR/p68c_oracle_subjects.txt"
+P68C_SGCONT_TREE1=$(cd "$P68C_SGCONT" && LC_ALL=C git rev-parse "HEAD~1^{tree}" 2>/dev/null)
+P68C_SGCONT_TREE2=$(cd "$P68C_SGCONT" && LC_ALL=C git rev-parse "HEAD^{tree}" 2>/dev/null)
+check "phase68c sgcont: ...the resolved commit's tree matches the oracle's" \
+    test "$P68C_SGCONT_TREE1" = "$P68C_ORACLE_TREE1"
+check "phase68c sgcont: ...the clean follow-on commit's tree matches the oracle's too" \
+    test "$P68C_SGCONT_TREE2" = "$P68C_ORACLE_TREE2"
+
+# --- direction 2 (recorded in CLAUDE.md as already working before this
+# phase; re-pinned here so a future change to parse_todo_line cannot
+# silently break it): an sg pause (sg's own full-40-hex todo), finished by
+# real git's --continue. ---
+P68C_GITCONT="$WORKDIR/p68c_gitcont"
+rm -rf "$P68C_GITCONT"
+cp -R "$P68C_BASE" "$P68C_GITCONT"
+(cd "$P68C_GITCONT" && "$SG" cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+check "phase68c oracle: precondition -- sg's own pause really stopped on the conflict" \
+    sh -c 'test -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_GITCONT"
+check "phase68c oracle: precondition -- ...and its sequencer/todo id field really is 40 hex chars (sg's own divergence)" \
+    sh -c 'awk "{print length(\$2)}" "$0/.git/sequencer/todo" | grep -qx 40' "$P68C_GITCONT"
+
+printf 'line1\nRESOLVED\nline3\n' > "$P68C_GITCONT/r.txt"
+(cd "$P68C_GITCONT" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+(cd "$P68C_GITCONT" && LC_ALL=C git cherry-pick --continue) > /dev/null 2>&1
+P68C_GITCONT_RC=$?
+
+check "phase68c: real git cherry-pick --continue on AN SG pause (40-hex todo) still exits 0 -- the pre-existing direction, unaffected by this phase" \
+    test "$P68C_GITCONT_RC" -eq 0
+check "phase68c gitcont: ...CHERRY_PICK_HEAD is gone after real git's --continue finishes an sg-paused pick" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_GITCONT"
+check "phase68c gitcont: ...sequencer/ is gone after real git's --continue finishes an sg-paused pick" \
+    sh -c 'test ! -d "$0/.git/sequencer"' "$P68C_GITCONT"
+P68C_GITCONT_TREE1=$(cd "$P68C_GITCONT" && LC_ALL=C git rev-parse "HEAD~1^{tree}" 2>/dev/null)
+P68C_GITCONT_TREE2=$(cd "$P68C_GITCONT" && LC_ALL=C git rev-parse "HEAD^{tree}" 2>/dev/null)
+check "phase68c gitcont: ...the resolved commit's tree matches the oracle's" \
+    test "$P68C_GITCONT_TREE1" = "$P68C_ORACLE_TREE1"
+check "phase68c gitcont: ...the clean follow-on commit's tree matches the oracle's too" \
+    test "$P68C_GITCONT_TREE2" = "$P68C_ORACLE_TREE2"
+
+# --- --abort and --quit must stay usable on a real-git pause (Phase 57's
+# escape hatches; a regression here would resurrect exactly the dead end
+# the Phase 68c section of docs/DESIGN.md measured a way out of). ---
+P68C_ABORT="$WORKDIR/p68c_abort"
+rm -rf "$P68C_ABORT"
+cp -R "$P68C_BASE" "$P68C_ABORT"
+(cd "$P68C_ABORT" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+(cd "$P68C_ABORT" && "$SG" cherry-pick --abort) > "$WORKDIR/p68c_abort.out" 2>&1
+P68C_ABORT_RC=$?
+check "phase68c: sg cherry-pick --abort on a real-git pause (with the phase's wider parse_todo_line in place) still exits 0" \
+    test "$P68C_ABORT_RC" -eq 0
+check "phase68c abort: ...and restores HEAD to the pre-pick commit" \
+    sh -c 'test "$(cd "$0" && LC_ALL=C git rev-parse HEAD)" = "$1"' "$P68C_ABORT" "$P68C_MASTER_BEFORE"
+check "phase68c abort: ...CHERRY_PICK_HEAD is gone" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_ABORT"
+
+P68C_QUIT="$WORKDIR/p68c_quit"
+rm -rf "$P68C_QUIT"
+cp -R "$P68C_BASE" "$P68C_QUIT"
+(cd "$P68C_QUIT" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+(cd "$P68C_QUIT" && "$SG" cherry-pick --quit) > "$WORKDIR/p68c_quit.out" 2>&1
+P68C_QUIT_RC=$?
+check "phase68c: sg cherry-pick --quit on a real-git pause still exits 0" \
+    test "$P68C_QUIT_RC" -eq 0
+check "phase68c quit: ...CHERRY_PICK_HEAD is gone" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_QUIT"
+check "phase68c quit: ...HEAD did NOT move (--quit changes nothing but the state directory's existence)" \
+    sh -c 'test "$(cd "$0" && LC_ALL=C git rev-parse HEAD)" = "$1"' "$P68C_QUIT" "$P68C_MASTER_BEFORE"
+
+# --- a below-minimum-abbreviation id in sequencer/todo is a hard failure,
+# same code path an AMBIGUOUS prefix would take (parse_todo_line fails ->
+# require_state fails -> point at --abort). Genuine ambiguity is covered
+# directly by a planted birthday collision in
+# tests/test_sequencer_state.c; forcing a real one through porcelain here
+# would be impractical, so this fixture instead hand-shortens a real
+# git-written todo field to 3 hex characters (below SG_OID_MIN_ABBREV),
+# which exercises the identical failure path. ---
+P68C_SHORT="$WORKDIR/p68c_short"
+rm -rf "$P68C_SHORT"
+cp -R "$P68C_BASE" "$P68C_SHORT"
+(cd "$P68C_SHORT" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+(cd "$P68C_SHORT" && awk '{print $1, substr($2,1,3), "x"}' .git/sequencer/todo > .git/sequencer/todo.tmp && \
+ mv .git/sequencer/todo.tmp .git/sequencer/todo)
+printf 'line1\nRESOLVED\nline3\n' > "$P68C_SHORT/r.txt"
+(cd "$P68C_SHORT" && "$SG" add r.txt) > /dev/null 2>&1
+(cd "$P68C_SHORT" && "$SG" cherry-pick --continue) > "$WORKDIR/p68c_short.out" 2>&1
+P68C_SHORT_RC=$?
+check "phase68c: a below-minimum-abbreviation todo id refuses --continue (exit 1)" \
+    test "$P68C_SHORT_RC" -eq 1
+check "phase68c: ...and the message points at a command that actually works (--abort), not at --continue/--skip again" \
+    grep -q -- "--abort" "$WORKDIR/p68c_short.out"
+(cd "$P68C_SHORT" && "$SG" cherry-pick --abort) > /dev/null 2>&1
+check "phase68c: ...and --abort, as advised, actually clears it" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_SHORT"
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

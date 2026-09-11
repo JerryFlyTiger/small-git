@@ -346,9 +346,363 @@ static void test_short_hex_in_todo_rejected(void)
         }
     }
     snprintf(path, sizeof(path), "%s/sequencer/todo", git_dir);
-    write_raw_file(path, "pick deadbeef c1\n"); /* too short */
+    /* "deadbeef" is 8 hex characters -- a legal Phase 68c prefix LENGTH
+       (4..39), but it names no object in this tiny repo, so it must still
+       be rejected, now for "not found" rather than "too short". */
+    write_raw_file(path, "pick deadbeef c1\n");
 
-    CHECK(sg_sequencer_state_read(git_dir, &st) == -1, "a too-short hex in a todo line should be rejected");
+    CHECK(sg_sequencer_state_read(git_dir, &st) == -1,
+         "an unresolvable hex prefix in a todo line should be rejected");
+
+    free(git_dir);
+}
+
+/* Phase 68c: a real git pause writes sequencer/todo with a 7-hex
+   abbreviation (git's own default), and sg must now be able to read it
+   back -- this is the whole point of the phase, closing the
+   one-directional interop dead end CLAUDE.md records. */
+static void test_prefix_todo_resolves(void)
+{
+    char *git_dir = make_tmp_repo();
+    char path[4096];
+    unsigned char c1[SG_SHA1_RAW_LEN], head[SG_SHA1_RAW_LEN];
+    char hex[SG_SHA1_HEX_LEN + 1];
+    sg_sequencer_state st;
+
+    make_commit(git_dir, "head", NULL, 0, head);
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    sg_sha1_to_hex(c1, hex);
+
+    snprintf(path, sizeof(path), "%s/CHERRY_PICK_HEAD", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer", git_dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/sequencer/head", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer/abort-safety", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer/todo", git_dir);
+    {
+        FILE *f = fopen(path, "wb");
+        CHECK(f != NULL, "open sequencer/todo");
+        if (f != NULL) {
+            /* git's own 7-hex abbreviation. */
+            fprintf(f, "pick %.7s c1\n", hex);
+            fclose(f);
+        }
+    }
+
+    CHECK(sg_sequencer_state_read(git_dir, &st) == 0,
+         "a 7-hex abbreviated todo line (git's own shape) should resolve");
+    if (st.todo != NULL) {
+        CHECK(st.todo_count == 1, "todo_count should be 1");
+        CHECK(memcmp(st.todo[0], c1, SG_SHA1_RAW_LEN) == 0,
+             "the abbreviated todo[0] should resolve to c1's full id");
+        sg_sequencer_state_free(&st);
+    }
+
+    free(git_dir);
+}
+
+/* The minimum abbreviation length is 4 (SG_OID_MIN_ABBREV, same bound
+   sg_object_find_prefix enforces) -- 3 hex characters must be rejected even
+   when they happen to name a unique object, matching git's own minimum
+   (Phase 68 spec section 0/1). */
+static void test_below_min_abbrev_in_todo_rejected(void)
+{
+    char *git_dir = make_tmp_repo();
+    char path[4096];
+    unsigned char c1[SG_SHA1_RAW_LEN], head[SG_SHA1_RAW_LEN];
+    char hex[SG_SHA1_HEX_LEN + 1];
+    sg_sequencer_state st;
+
+    make_commit(git_dir, "head", NULL, 0, head);
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    sg_sha1_to_hex(c1, hex);
+
+    snprintf(path, sizeof(path), "%s/CHERRY_PICK_HEAD", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer", git_dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/sequencer/head", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer/abort-safety", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer/todo", git_dir);
+    {
+        FILE *f = fopen(path, "wb");
+        CHECK(f != NULL, "open sequencer/todo");
+        if (f != NULL) {
+            /* Only 3 hex characters -- below SG_OID_MIN_ABBREV, must be
+               rejected even though it is unique in this tiny repo. */
+            fprintf(f, "pick %.3s c1\n", hex);
+            fclose(f);
+        }
+    }
+
+    CHECK(sg_sequencer_state_read(git_dir, &st) == -1,
+         "a 3-hex prefix in a todo line must be rejected regardless of uniqueness");
+
+    free(git_dir);
+}
+
+/* No space at all after the hex field (subject glued directly onto the
+   hex) must be rejected -- this is the boundary the old fixed-width check
+   used to enforce with a single index compare, now done with strspn +
+   an explicit space check. */
+static void test_todo_hex_without_trailing_space_rejected(void)
+{
+    char *git_dir = make_tmp_repo();
+    char path[4096];
+    unsigned char c1[SG_SHA1_RAW_LEN], head[SG_SHA1_RAW_LEN];
+    char hex[SG_SHA1_HEX_LEN + 1];
+    sg_sequencer_state st;
+
+    make_commit(git_dir, "head", NULL, 0, head);
+    make_commit(git_dir, "c1", NULL, 0, c1);
+    sg_sha1_to_hex(c1, hex);
+
+    snprintf(path, sizeof(path), "%s/CHERRY_PICK_HEAD", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer", git_dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/sequencer/head", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer/abort-safety", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer/todo", git_dir);
+    {
+        FILE *f = fopen(path, "wb");
+        CHECK(f != NULL, "open sequencer/todo");
+        if (f != NULL) {
+            /* No space between the hex field and end of line. */
+            fprintf(f, "pick %.7s\n", hex);
+            fclose(f);
+        }
+    }
+
+    CHECK(sg_sequencer_state_read(git_dir, &st) == -1,
+         "a todo hex field with no trailing space should be rejected");
+
+    free(git_dir);
+}
+
+/* Phase 68c: an ambiguous prefix in sequencer/todo is a hard failure, never
+   a guess -- applying the wrong commit would be worse than refusing.
+   Two blobs are hashed in memory (no disk write) until two distinct raw
+   ids share a 4-hex prefix (pigeonhole guarantees this within 65537
+   tries); only then are they written to the loose store. Same technique
+   as tests/test_oid_prefix.c's test_multiple_candidates. */
+static void test_ambiguous_prefix_in_todo_rejected(void)
+{
+    char *git_dir = make_tmp_repo();
+    static unsigned char bucket_id[65536][SG_SHA1_RAW_LEN];
+    static int bucket_seen[65536];
+    unsigned char id_a[SG_SHA1_RAW_LEN], id_b[SG_SHA1_RAW_LEN];
+    char content_a[64], content_b[64];
+    char prefix[5];
+    unsigned char head[SG_SHA1_RAW_LEN];
+    char hex[SG_SHA1_HEX_LEN + 1];
+    char path[4096];
+    int i, found = 0;
+    sg_sequencer_state st;
+
+    make_commit(git_dir, "head", NULL, 0, head);
+    sg_sha1_to_hex(head, hex);
+
+    memset(bucket_seen, 0, sizeof(bucket_seen));
+    memset(content_a, 0, sizeof(content_a));
+    memset(content_b, 0, sizeof(content_b));
+
+    for (i = 0; i < 70000 && !found; i++) {
+        char content[64];
+        unsigned char id[SG_SHA1_RAW_LEN];
+        char oid_hex[SG_SHA1_HEX_LEN + 1];
+        char hex4[5];
+        unsigned int val;
+
+        snprintf(content, sizeof(content), "phase68c-collide-%d", i);
+        sg_object_hash(SG_OBJ_BLOB, content, strlen(content), id);
+        sg_sha1_to_hex(id, oid_hex);
+        memcpy(hex4, oid_hex, 4);
+        hex4[4] = '\0';
+        val = (unsigned int)strtoul(hex4, NULL, 16);
+
+        if (bucket_seen[val]) {
+            if (memcmp(bucket_id[val], id, SG_SHA1_RAW_LEN) != 0) {
+                memcpy(id_a, bucket_id[val], SG_SHA1_RAW_LEN);
+                memcpy(id_b, id, SG_SHA1_RAW_LEN);
+                memcpy(prefix, oid_hex, 4);
+                prefix[4] = '\0';
+                strcpy(content_a, "PLACEHOLDER"); /* re-derived below */
+                strcpy(content_b, content);
+                found = 1;
+            }
+        } else {
+            bucket_seen[val] = 1;
+            memcpy(bucket_id[val], id, SG_SHA1_RAW_LEN);
+        }
+    }
+    CHECK(found, "setup failed: no 4-hex collision found within 70000 tries (should be impossible)");
+    if (!found) {
+        free(git_dir);
+        return;
+    }
+
+    /* Re-derive content_a (the bucket's ORIGINAL occupant, whose loop
+       index was not retained) by re-scanning 0..i for the string whose
+       hash equals id_a. */
+    for (i = 0; i < 70000; i++) {
+        char content[64];
+        unsigned char id[SG_SHA1_RAW_LEN];
+
+        snprintf(content, sizeof(content), "phase68c-collide-%d", i);
+        sg_object_hash(SG_OBJ_BLOB, content, strlen(content), id);
+        if (memcmp(id, id_a, SG_SHA1_RAW_LEN) == 0) {
+            strcpy(content_a, content);
+            break;
+        }
+    }
+
+    {
+        unsigned char written_a[SG_SHA1_RAW_LEN], written_b[SG_SHA1_RAW_LEN];
+
+        CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, content_a, strlen(content_a), written_a) == 0,
+             "write colliding object a");
+        CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, content_b, strlen(content_b), written_b) == 0,
+             "write colliding object b");
+        CHECK(memcmp(written_a, id_a, SG_SHA1_RAW_LEN) == 0, "written a matches computed id");
+        CHECK(memcmp(written_b, id_b, SG_SHA1_RAW_LEN) == 0, "written b matches computed id");
+    }
+
+    /* CHERRY_PICK_HEAD (current) is deliberately set to whichever of
+       id_a/id_b sorts FIRST by raw bytes -- the same order
+       sg_object_find_prefix returns (objstore.h: "sorted ascending by raw
+       id"), i.e. list.ids[0]. This is what makes the test able to fail:
+       a broken resolver that silently takes list.ids[0] on ambiguity
+       instead of rejecting it would then find todo[0] == current, and
+       sg_sequencer_state_read's LATER, unrelated mismatch check
+       (todo[0] vs current) would never fire to mask the bug. Setting
+       current to an UNRELATED commit (as an earlier draft of this test
+       did) made state_read return -1 either way -- once from a correctly
+       rejected ambiguity, once from the mismatch check -- so the test
+       could not tell "ambiguity rejected" from "ambiguity silently
+       resolved to the wrong thing, then coincidentally still failed for a
+       different reason". Verified by mutation: widening
+       `list.count != 1` to `list.count < 1` in parse_todo_line now turns
+       this CHECK red (it did not before this fixture was corrected). */
+    {
+        const unsigned char *first_id =
+            memcmp(id_a, id_b, SG_SHA1_RAW_LEN) <= 0 ? id_a : id_b;
+        char current_hex[SG_SHA1_HEX_LEN + 1];
+
+        sg_sha1_to_hex(first_id, current_hex);
+        snprintf(path, sizeof(path), "%s/CHERRY_PICK_HEAD", git_dir);
+        write_raw_file(path, current_hex);
+        {
+            FILE *f = fopen(path, "ab");
+            if (f != NULL) {
+                fputs("\n", f);
+                fclose(f);
+            }
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer", git_dir);
+    mkdir(path, 0755);
+    snprintf(path, sizeof(path), "%s/sequencer/head", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer/abort-safety", git_dir);
+    write_raw_file(path, hex);
+    {
+        FILE *f = fopen(path, "ab");
+        if (f != NULL) {
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/sequencer/todo", git_dir);
+    {
+        FILE *f = fopen(path, "wb");
+        CHECK(f != NULL, "open sequencer/todo");
+        if (f != NULL) {
+            fprintf(f, "pick %s amb\n", prefix);
+            fclose(f);
+        }
+    }
+
+    CHECK(sg_sequencer_state_read(git_dir, &st) == -1,
+         "an ambiguous prefix in a todo line must be rejected, never guessed "
+         "(not merely rejected for the unrelated reason of not matching current)");
 
     free(git_dir);
 }
@@ -609,6 +963,10 @@ int main(void)
     test_merge_msg_without_conflicts();
     test_malformed_current_hex_rejected();
     test_short_hex_in_todo_rejected();
+    test_prefix_todo_resolves();
+    test_below_min_abbrev_in_todo_rejected();
+    test_todo_hex_without_trailing_space_rejected();
+    test_ambiguous_prefix_in_todo_rejected();
     test_missing_newline_in_todo_rejected();
     test_bad_verb_in_todo_rejected();
     test_missing_head_file_rejected();
