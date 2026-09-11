@@ -5,6 +5,7 @@
 
 #include "sg/hash.h"
 #include "sg/object.h"
+#include "sg/objstore.h"
 
 /* Scans git_dir/objects/pack/ for a *.idx + *.pack pair containing `id`,
    reading it and reconstructing OFS_DELTA/REF_DELTA chains as needed (a
@@ -74,5 +75,25 @@ int sg_pack_store_raw(const char *git_dir, const unsigned char *data, size_t len
    against git_dir's existing loose/pack storage. Returns 0 on success, -1 on
    any validation or I/O failure. */
 int sg_pack_index_existing(const char *pack_path);
+
+/* Appends the id of every object in every pack under git_dir/objects/pack/
+   whose id begins with the given prefix (its first `nibbles` hex digits, as
+   parsed by sg_hex_prefix_to_sha1) to *out, growing it via
+   sg_oid_list_append. Uses the same process-lifetime mmap'd pack registry
+   sg_pack_read does (scanning it if this is the first lookup for git_dir),
+   and for each pack narrows to the fanout bucket named by prefix[0] before
+   binary-searching for the prefix's lower bound -- it never linearly scans
+   a whole pack. Returns 0 on success (including zero matches), -1 on
+   malloc failure or if the pack registry itself can't be set up.
+
+   REQUIRES nibbles >= 2. The idx's fanout table buckets by a whole leading
+   BYTE, and sg_hex_prefix_to_sha1 zero-pads an odd trailing nibble's low
+   half -- so a 1-nibble prefix "N" only narrows to the 0xN0 bucket and
+   silently misses every real match in 0xN1..0xNF. sg_object_find_prefix
+   never passes fewer than SG_OID_MIN_ABBREV (4) nibbles down to this
+   function, so this is a documented precondition rather than a checked
+   one; callers other than sg_object_find_prefix must uphold it themselves. */
+int sg_pack_find_prefix(const char *git_dir, const unsigned char prefix[SG_SHA1_RAW_LEN],
+                        size_t nibbles, sg_oid_list *out);
 
 #endif

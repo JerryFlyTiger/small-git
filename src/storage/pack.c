@@ -790,6 +790,81 @@ static int idx_find(const struct sg_pack_file *pf, const unsigned char id[SG_SHA
     return 1;
 }
 
+/* Compares a full 20-byte id against a hex prefix (its first `nibbles`
+   significant digits, in prefix), in the same sign convention as memcmp --
+   <0 if id sorts before the prefix, >0 if after, 0 if id's own leading
+   `nibbles` digits equal the prefix's. This is idx_find's exact-match
+   memcmp widened to a partial-byte-aware ORDERING comparison, needed
+   because idx_find_prefix binary-searches a lower bound rather than an
+   exact slot. */
+static int cmp_id_to_prefix(const unsigned char id[SG_SHA1_RAW_LEN],
+                            const unsigned char prefix[SG_SHA1_RAW_LEN], size_t nibbles)
+{
+    size_t full_bytes;
+    int c;
+
+    /* Same clamp sg_sha1_has_prefix (hash.h) documents and applies -- the
+       two are the same rule in two implementations, kept in sync
+       deliberately. Without it, an out-of-range odd `nibbles` (e.g. 41)
+       reads id[20]/prefix[20], one byte past both SG_SHA1_RAW_LEN arrays --
+       a real heap OOB read against pf->sha1_table, which is mmap'd. */
+    if (nibbles > SG_SHA1_HEX_LEN)
+        nibbles = SG_SHA1_HEX_LEN;
+    full_bytes = nibbles / 2;
+
+    if (full_bytes > 0) {
+        c = memcmp(id, prefix, full_bytes);
+        if (c != 0)
+            return c;
+    }
+    if (nibbles % 2 != 0) {
+        unsigned char id_hi = id[full_bytes] & 0xf0;
+        unsigned char prefix_hi = prefix[full_bytes] & 0xf0;
+
+        if (id_hi != prefix_hi)
+            return id_hi < prefix_hi ? -1 : 1;
+    }
+    return 0;
+}
+
+/* Range variant of idx_find (a sibling, not a widening -- idx_find's callers
+   want its exact 0/1/-1 semantics unchanged). Narrows to id[0]'s fanout
+   bucket exactly like idx_find, then binary-searches within it for the
+   prefix's lower bound, then walks forward appending while the comparison
+   stays 0. Returns 0 on success (including zero matches), -1 on malloc
+   failure. A corrupt fanout bucket (lo > hi or hi > count) is treated as
+   zero matches for this pack, the same spirit as idx_find's own -1 ("not
+   present") on the identical condition. */
+static int idx_find_prefix(const struct sg_pack_file *pf, const unsigned char prefix[SG_SHA1_RAW_LEN],
+                           size_t nibbles, sg_oid_list *out)
+{
+    size_t lo, hi, i;
+    unsigned char first_byte = prefix[0];
+
+    lo = (first_byte == 0) ? 0 : be32(pf->fanout + (size_t)(first_byte - 1) * 4);
+    hi = be32(pf->fanout + (size_t)first_byte * 4);
+    if (lo > hi || hi > pf->count)
+        return 0;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = cmp_id_to_prefix(pf->sha1_table + mid * SG_SHA1_RAW_LEN, prefix, nibbles);
+
+        if (cmp < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+
+    for (i = lo; i < pf->count; i++) {
+        if (cmp_id_to_prefix(pf->sha1_table + i * SG_SHA1_RAW_LEN, prefix, nibbles) != 0)
+            break;
+        if (sg_oid_list_append(out, pf->sha1_table + i * SG_SHA1_RAW_LEN) != 0)
+            return -1;
+    }
+    return 0;
+}
+
 static void pack_file_list_free(struct sg_pack_file *pf)
 {
     while (pf != NULL) {
@@ -1106,6 +1181,50 @@ int sg_pack_read(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
                  sg_obj_type *type_out, unsigned char **content_out, size_t *content_len_out)
 {
     return pack_read_depth(git_dir, id, 0, type_out, content_out, content_len_out);
+}
+
+int sg_pack_find_prefix(const char *git_dir, const unsigned char prefix[SG_SHA1_RAW_LEN],
+                        size_t nibbles, sg_oid_list *out)
+{
+    struct sg_pack_dir *pd;
+    char pack_dir_path[SG_PATH_MAX];
+    struct sg_pack_file *pf;
+    struct stat st;
+    time_t current_mtime;
+    int scan_may_be_stale;
+
+    pd = pack_dir_get_or_create(git_dir);
+    if (pd == NULL)
+        return -1;
+
+    snprintf(pack_dir_path, sizeof(pack_dir_path), "%s/objects/pack", git_dir);
+
+    /* sg_pack_read (pack_read_depth_inner) only pays for a staleness check
+       AFTER a miss, because an exact lookup already knows whether it hit --
+       a stale cache just means "not found yet, worth a rescan before giving
+       up". Enumeration has no equivalent "did I hit" signal: a stale scan
+       doesn't fail here, it silently returns an INCOMPLETE candidate list,
+       and a missing candidate can turn a genuinely ambiguous prefix into a
+       falsely unique one -- resolving to the wrong object, the same failure
+       direction as sg_loose_find_prefix's opendir fail-open. So the same
+       staleness test pack_read_depth_inner uses (objects/pack/'s mtime
+       moved since the last scan, OR that scan's recorded mtime is still
+       "this second" and therefore not yet trustworthy at one-second
+       resolution -- see pack_read_depth_inner's own comment for the full
+       "racily clean" reasoning) runs unconditionally here, not only on a
+       miss. */
+    current_mtime = (stat(pack_dir_path, &st) == 0) ? st.st_mtime : (time_t)-1;
+    scan_may_be_stale =
+        pd->scanned && pd->scan_mtime != (time_t)-1 && pd->scan_mtime == time(NULL);
+
+    if (!pd->scanned || current_mtime != pd->scan_mtime || scan_may_be_stale)
+        pack_dir_do_scan(pd, pack_dir_path);
+
+    for (pf = pd->packs; pf != NULL; pf = pf->next) {
+        if (idx_find_prefix(pf, prefix, nibbles, out) != 0)
+            return -1;
+    }
+    return 0;
 }
 
 /* ---- writing (no delta compression -- every object stored literally) ---- */

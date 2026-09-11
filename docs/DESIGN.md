@@ -13930,3 +13930,223 @@ for its own reason, results in the table above) and recorded here rather than
 defended. The same applies to the earlier unit row
 `test_now_is_read_in_the_local_zone`, added by the coordinator before the
 review after a mutation showed the file was blind to the mixed-zone rule.
+
+## Phase 68a: object lookup by abbreviated (prefix) id
+
+The enumeration layer only. No CLI is wired to it yet -- `sg_rev_parse_commit`
+/ `sg_rev_parse_object` still reject an abbreviation, and `interop` is
+unchanged at 3401/3401 for exactly that reason. 68b wires it in, 68c widens
+`sequencer/todo`'s parser.
+
+### 1. What the premise measurement settled before any code was written
+
+The project memory named four premises to measure first, and said to change
+subject if any failed. All four held, and two came out narrower or cheaper
+than assumed:
+
+- **The minimum abbreviation is 4, not "whatever is unique".** `git rev-parse`
+  on a 1/2/3-char prefix fails even when that prefix matches exactly one
+  object; `cat-file -t ec` says `Not a valid object name ec`, not "ambiguous".
+- **`core.abbrev` affects OUTPUT ONLY, never resolution** (`-c core.abbrev=40`
+  still resolves a 5-hex prefix). sg reads no config, so this premise costs
+  nothing -- worth recording, because the opposite would have made the whole
+  phase depend on config reading sg deliberately does not do.
+- **git's ambiguity error is a two-part stderr block**, exit 128 (sg: 1, the
+  standing 0-or-1 convention, the same shape as deliberate divergence #3).
+- **`sequencer/todo` really is the ONLY blocker for git-paused -> sg-resumed
+  cherry-pick**, and the blocker is narrower than the memory assumed: a real
+  `git cherry-pick` pause writes `CHERRY_PICK_HEAD`, `sequencer/head` and
+  `sequencer/abort-safety` as full 40-hex; only `todo` is abbreviated. On that
+  state today, `sg status`, `--abort` and `--quit` all work; only
+  `--continue`/`--skip` refuse.
+
+### 2. The three measured rules that contradict the obvious model
+
+Recorded here because an implementation built on the obvious model passes its
+own tests and is wrong:
+
+1. **The commit-ish dwim is PER-COMMAND, not "does this command need a
+   commit".** Measured over 15 commands with one commit and one blob sharing a
+   4-hex prefix: `git log`, `git reset --hard` and `git rebase` resolve to the
+   commit; `rev-parse`, `show`, `merge-base`, `cat-file`, `diff`, `branch`,
+   `tag`, `switch --detach`, `merge`, `cherry-pick`, `revert` and **`rev-list`**
+   refuse. `rev-list` refusing while `log` resolves, and `merge`/`cherry-pick`
+   refusing at all, each falsify a simpler rule.
+2. **A SUFFIX OPERATOR makes the base commit-ish on its own**, independent of
+   the command: under `rev-parse`, which refuses the bare ambiguous prefix,
+   `<amb>~1`, `<amb>^{commit}` and `<amb>:f.txt` all resolve. So the dwim has
+   two triggers, and an implementation keyed only on the command gets every
+   suffixed form wrong.
+3. **Ref-vs-oid resolves in OPPOSITE directions at length 40 and at length 6.**
+   A branch literally named with a 6-hex prefix WINS over the prefix
+   interpretation (git warns `refname ... is ambiguous`); a branch named with a
+   full 40-hex LOSES to the object id. sg's existing order already produces
+   both answers, provided the new prefix branch sits AFTER the ref lookup.
+
+The dwim's own condition is "exactly ONE candidate is commit-ish": two
+colliding commits make all three dwim commands refuse, and **a tag counts as
+commit-ish and is peeled** (a tag colliding with a blob resolves, under `log`,
+to the tag's target commit).
+
+### 3. The candidate list
+
+    error: short object ID <prefix, LOWERCASED> is ambiguous
+    hint: The candidates are:
+    hint:   <7hex> <type>[ <YYYY-MM-DD> - <subject or tag name>]
+
+Ordered by TYPE first -- `tag`, `commit`, `tree`, `blob` -- then by hex within
+a type, measured with all four planted on one prefix at once (`hash-object -t
+tag` / `-t tree` on objects hashed in Python first, since no porcelain can
+make one land on a chosen prefix). The date is the **author** date rendered in
+the **commit's own stored offset**: measured against a commit whose author and
+committer dates fall three years apart, and separately with stored offsets
+`+0900` and `-1000`, where the printed day follows the stored offset in both
+directions while `TZ` changes nothing. That is exactly `sg_date_format_short`.
+The subject is the FOLDED subject (`fold_subject`, Phase 60c) -- measured on
+commits planted through `hash-object -t commit -w`, since `git commit`'s own
+cleanup erases every shape that distinguishes folding from "the first line".
+
+### 4. What this commit actually adds
+
+`sg_hex_prefix_to_sha1` / `sg_sha1_has_prefix` (`util/hash.c`; `sg_hex_to_sha1`
+is fixed at 40 with no length parameter and could not be reused, though
+`hex_nibble`'s existing case-insensitivity is inherited rather than
+re-decided), `sg_oid_list` + `sg_object_find_prefix` (`storage/objstore.c`,
+sorting and DEDUPLICATING -- an object can be both loose and packed),
+`sg_loose_find_prefix` (`storage/loose.c`, opening only the one
+`objects/<xx>/` the prefix's first byte names), and `sg_pack_find_prefix` +
+`idx_find_prefix` (`storage/pack.c`, a SIBLING of `idx_find` rather than a
+widening of it -- `idx_find`'s callers want its exact 0/1/-1 semantics).
+
+**`nibbles >= 2` is a real precondition of the two enumerators**, documented
+in both headers: the pack fanout buckets by a whole byte, so a 1-nibble prefix
+(whose low nibble `sg_hex_prefix_to_sha1` zero-fills) would scan only the
+`0xN0` bucket and silently miss 15 of 16 real matches. `sg_object_find_prefix`
+enforces `>= 4`, so the public path cannot reach it.
+
+### 5. Two defenses whose failure direction is "resolve to the WRONG object"
+
+Both were added after review, and both are worth stating as a pair because the
+naive version of each looks harmless:
+
+- `sg_loose_find_prefix`'s `opendir` failure now discriminates on `errno`:
+  only `ENOENT`/`ENOTDIR` mean "zero matches"; anything else (EACCES, EMFILE)
+  returns -1. Treating "could not look" as "looked and found nothing" is
+  fail-OPEN, and the consequence is not merely "not found": an unscanned loose
+  half can collapse a genuinely AMBIGUOUS prefix into a falsely unique one.
+- `sg_pack_find_prefix` runs the same mtime staleness check
+  `pack_read_depth_inner` uses, and runs it UNCONDITIONALLY rather than only
+  after a miss. An exact lookup knows whether it hit, so a stale cache there
+  just means "worth a rescan before giving up"; enumeration has no equivalent
+  signal, so a stale scan does not fail, it silently returns an INCOMPLETE
+  candidate list -- the same failure direction as the fail-open above.
+
+### 6. Mutation results, and the three green rows classified
+
+Nine mutations, each red on a check that names the property, on a snapshot
+with nothing else moving (see section 7 for why that qualifier is here):
+
+| mutation | red check |
+|---|---|
+| dedup neutralized | `test_dedup_loose_and_packed` |
+| `SG_OID_MIN_ABBREV` -> 1 | `test_malformed_inputs` (3-char) |
+| upper bound widened to allow 40 | `test_malformed_inputs` (40-char) |
+| `sg_sha1_has_prefix` odd-nibble branch off | `test_near_collision_disambiguates_loose` |
+| `cmp_id_to_prefix` odd-nibble branch off | `test_near_collision_disambiguates_pack` |
+| pack forward scan limited to one match | `test_near_collision_disambiguates_pack` |
+| `idx_find_prefix` binary search `<` -> `<=` | five checks |
+| staleness check reverted to `!pd->scanned` | `test_pack_registry_rescans_after_external_pack_write` |
+| `opendir` errno discrimination reverted | `test_loose_opendir_failure_is_fatal` |
+
+The first draft had **two blind spots and three gaps**, all found by mutation
+(the odd-nibble pair independently found by a cold review as well). The
+diagnosis for the odd-nibble pair is worth keeping: neutralizing that
+comparison just makes the prefix one nibble shorter, and no fixture held two
+objects agreeing on the first n-1 nibbles and differing at the nth, so the
+ANSWER never changed. The fix is a deliberate near-collision fixture, and
+**loose and pack each got their own check** -- one check covering both would
+let a break in one hide behind the other's red line.
+
+Three rows stay green and are **not** coverage gaps. Recorded per this
+project's three-way classification, each measured rather than assumed:
+
+- **`l->cap * 2` -> `l->cap`** (the growth FACTOR): green on a plain build,
+  **ASan ABORTING** (heap-buffer-overflow) on a sanitize build. The mutation
+  produces undefined behaviour, not a wrong answer -- any strategy that grows
+  gives the same answers, and the only way to break it is to stop growing.
+  The discriminator is the sanitizer, the same shape `test_fuzz_pack.c` and
+  `test_fuzz_index.c` are documented to have, and `make sanitize` is already
+  mandatory for this code. **Do not add an assertion for the growth factor.**
+- **`cmp_id_to_prefix`'s `nibbles > 40` clamp**: green under `make test` AND
+  under `make sanitize` (verified by inspecting the matched lines, not a grep
+  count -- the two hits were pre-existing test messages that merely contain
+  the word "AddressSanitizer"). Reachable only by violating the documented
+  `nibbles` precondition directly. Kept for symmetry with the sibling rule
+  `sg_sha1_has_prefix` documents and applies; same disposition as
+  `compact_one_side`'s three witness-less sub-conditions. **Do not go add a
+  test for it.**
+- **`scan_may_be_stale` (the "same wall-clock second" sub-clause)**: green,
+  measured. `test_pack_registry_rescans_after_external_pack_write`
+  deliberately sidesteps it -- the parent's only scan happens while
+  `objects/pack/` does not exist yet, so `scan_mtime` is the `(time_t)-1`
+  sentinel and the real mtime differs unconditionally, rather than the test
+  depending on a one-second race. It is a faithful copy of
+  `pack_read_depth_inner`'s own clause; kept, recorded, not chased.
+
+### 7. Three process failures in this phase, all self-inflicted
+
+- **A control whose two arms agreed by construction.** The oracle harness's
+  `sg rebase <40hex>` divergence row used the root commit's oid -- and the
+  fixture creates a BRANCH named with that same 40-hex for the ref-vs-oid pin,
+  so sg resolved it through the branch lookup and agreed with git for a reason
+  unrelated to the claim. The harness reported it as `EXPECTED DIVERGENCE
+  MISSING`, which is precisely why that list asserts divergence instead of
+  skipping those rows.
+- **Mutations run against a moving tree.** A mutation batch overlapped with an
+  implementer editing the same worktree, and `mutate.sh` copies the working
+  tree as it finds it -- so those results were not attributable to any known
+  snapshot and had to be discarded and re-run after `git add -A` fixed the
+  state. Mutation measurement needs a frozen tree, not merely a recent one.
+- **A mutation aimed one function off target.** `s/if (cmp < 0)/if (cmp <= 0)/`
+  matched `idx_find`'s own binary search (the first occurrence in the file)
+  rather than `idx_find_prefix`'s, and stayed green -- which, followed up,
+  turned out to be its own small finding: with a single-object pack, `idx_find`
+  returns from its exact-match branch before ever reaching the mutated line, so
+  that mutation could not have been observed either way. Re-aimed with the
+  `cmp_id_to_prefix` call as context, it goes red on five checks.
+
+And one caught by the implementer rather than by a gate, of exactly the shape
+this project keeps meeting: the first pack-freshness test passed **even under
+the mutation**, not because the check was blind but because `sg_pack_write`
+itself calls `pack_cache_invalidate()`, which reset `scanned` regardless of
+whether the staleness logic under test existed at all. Same outcome, different
+reason. The fixture now creates the pack in a SEPARATE repo (cache
+invalidation is keyed by `git_dir`) and copies the `.pack`/`.idx` in as raw
+files, which also models the real scenario -- an external `git gc` -- more
+honestly than the intermediate fork-based version did.
+
+That fork version is itself worth a line: it was green on all four completion
+gates and made the fifth, opt-in `--leaks` gate hang forever
+(`/usr/bin/leaks --atExit` against a binary that forks; 0.5s normally, still
+running at 60s under `leaks`). `--leaks` is not part of the completion
+criteria, but a permanently red gate is one nobody reads, and CI's ubuntu ASan
+job runs with `detect_leaks=1` where a forking test's behaviour was untested.
+
+### 8. Recorded, deliberately not done here
+
+- **`sg rebase <upstream>` never calls `sg_rev_parse_commit` at all**
+  (`cmd_rebase.c` uses `sg_ref_branch_exists`/`sg_ref_read_branch`), so it
+  accepts only a bare branch name -- no tag, no `refs/heads/x`, no 40-hex, no
+  `HEAD~2`. This is the bug Phase 43 fixed for `sg merge`, never converged to
+  rebase, and it predates this phase. Consequence: git's third dwim command
+  has no sg counterpart to wire in 68b. The oracle harness pins it as a named
+  divergence so the gap has a witness.
+- **`sg chunk-info <blob>` parses 40-hex itself** (`cmd_chunk_info.c`),
+  bypassing revparse entirely, so it will not gain abbreviations in 68b.
+- **git tolerates a 40-hex followed by extra ZEROS** (`<40hex>0` and
+  `<40hex>00` resolve; `<40hex>f` and `<40hex>zz` do not). Not reproduced.
+- **A performance note for 68b**: because the staleness check is
+  unconditional, a caller resolving many abbreviations for one repo inside the
+  same wall-clock second pays a full rescan (release + re-mmap every pack) per
+  call. There is no such caller today; if 68b grows a batch-resolution loop,
+  this needs re-measuring rather than assuming.
