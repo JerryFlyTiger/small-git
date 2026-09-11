@@ -3086,30 +3086,36 @@ lines, matching which command is running). Unlike
 this layout deliberately matches real git's own file names and format
 exactly (only the id field width of
 .B sequencer/todo
-differs, 40 hex characters instead of git's abbreviated 7, since
+differs, 40 hex characters instead of git's abbreviated 7: since Phase 68c
 .B sg
-has no abbreviated-object-name resolution to read a short one back with),
+reads 4 to 40 hex there, but still writes only the unambiguous full 40,
+so nothing it emits can ever resolve to the wrong object),
 so a real
 .B git
 binary can inspect, finish, or abort a pick/revert
 .B sg
-left paused. The reverse direction is more limited: a real
+left paused. As of Phase 68c the reverse direction works too: a real
 .B git
-binary's own todo entries use its abbreviated 7-hex ids, which
+binary's own todo entries use its abbreviated 7-hex ids, and
 .B sg
-cannot resolve back to an object, so
-.B sg
-can
+now resolves those, so all four of
+.BR --continue ,
+.BR --skip ,
 .B --abort
-or
+and
 .B --quit
-a pick/revert
+work on a pick/revert a real
 .B git
-left paused (both read only the two full-40-hex
-.B sequencer/
-files git also writes in full) but cannot
-.BR --continue / --skip
-it. Present only while a cherry-pick or revert is paused; removed when it
+left paused. An abbreviation matching more than one object is refused
+outright, never guessed \(em applying the wrong commit would be worse
+than refusing \(em and
+.B --abort
+and
+.B --quit
+deliberately read no
+.B sequencer/todo
+at all, so they keep working even when that file is damaged or
+genuinely ambiguous. Present only while a cherry-pick or revert is paused; removed when it
 finishes, is skipped to completion, or is aborted. Not intended to be
 edited by hand \(em use
 .BR "sg cherry-pick --continue|--skip|--abort|--quit" " or " "sg revert --continue|--skip|--abort|--quit" .

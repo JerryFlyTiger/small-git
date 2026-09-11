@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/cli_args.h"
 #include "sg/chunk.h"
 #include "sg/diff.h"
 #include "sg/diff_out.h"
@@ -700,12 +701,18 @@ int sg_cmd_merge(int argc, char **argv)
            a user-supplied revision always goes through sg_rev_parse_commit.
            That function peels annotated tags, which is what merge wants:
            measured, `git merge <annotated-tag>` merges the tagged COMMIT. */
-        if (sg_rev_parse_commit(git_dir, branch_arg, theirs_commit) != 0) {
-            fprintf(stderr, "sg: %s - not something we can merge\n", branch_arg);
-            free(current_branch);
-            free(git_dir);
-            free(repo_root);
-            return 1;
+        {
+            int prc = sg_rev_parse_commit(git_dir, branch_arg, theirs_commit);
+
+            if (prc != 0) {
+                if (prc == -4)
+                    sg_cli_report_ambiguous_oid(git_dir, branch_arg, SG_REV_STRICT);
+                fprintf(stderr, "sg: %s - not something we can merge\n", branch_arg);
+                free(current_branch);
+                free(git_dir);
+                free(repo_root);
+                return 1;
+            }
         }
 
         has_head = (sg_ref_resolve_head(git_dir, ours_commit) == 0);

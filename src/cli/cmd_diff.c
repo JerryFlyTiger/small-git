@@ -29,8 +29,11 @@ static const char USAGE[] =
 static int resolve_rev_tree(const char *git_dir, const char *rev, unsigned char tree_id_out[SG_SHA1_RAW_LEN])
 {
     unsigned char commit_id[SG_SHA1_RAW_LEN];
+    int prc = sg_rev_parse_commit(git_dir, rev, commit_id);
 
-    if (sg_rev_parse_commit(git_dir, rev, commit_id) != 0) {
+    if (prc != 0) {
+        if (prc == -4)
+            sg_cli_report_ambiguous_oid(git_dir, rev, SG_REV_STRICT);
         fprintf(stderr, "sg: invalid reference: %s\n", rev);
         return -1;
     }
@@ -275,7 +278,7 @@ int sg_cmd_diff(int argc, char **argv)
     /* An explicit "--" settles the split with no guessing at all -- that is
        the entire point of typing it -- so the arguments before it are taken
        as revisions without ever being stat'd. */
-    rev_count = dashdash >= 0 ? dashdash : sg_cli_split_revs_and_paths(git_dir, pos, n_pos, "diff");
+    rev_count = dashdash >= 0 ? dashdash : sg_cli_split_revs_and_paths(git_dir, pos, n_pos, "diff", SG_REV_STRICT);
     if (rev_count < 0)
         goto done;
     if (rev_count > 2) {

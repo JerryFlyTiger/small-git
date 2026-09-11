@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/apply.h"
+#include "sg/cli_args.h"
 #include "sg/hash.h"
 #include "sg/merge.h"
 #include "sg/objstore.h"
@@ -247,7 +248,11 @@ int sg_cmd_switch(int argc, char **argv)
     } else if (detach) {
         /* Any revision, not just a branch: --detach's whole point is to check
            out something that has no branch name. */
-        if (sg_rev_parse_commit(git_dir, branch_arg, target_commit_id) != 0) {
+        int prc = sg_rev_parse_commit(git_dir, branch_arg, target_commit_id);
+
+        if (prc != 0) {
+            if (prc == -4)
+                sg_cli_report_ambiguous_oid(git_dir, branch_arg, SG_REV_STRICT);
             fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
             free(checkout_msg);
             free(old_branch);
@@ -258,6 +263,7 @@ int sg_cmd_switch(int argc, char **argv)
     } else {
         if (!sg_ref_branch_exists(git_dir, branch_arg)) {
             unsigned char probe[SG_SHA1_RAW_LEN];
+            int prc = sg_rev_parse_commit(git_dir, branch_arg, probe);
 
             /* A resolvable commit that simply isn't a branch is a different
                mistake from a typo, and real git says so rather than calling
@@ -265,13 +271,16 @@ int sg_cmd_switch(int argc, char **argv)
                plus a --detach hint -- measured). Refusing without --detach is
                git's behaviour too: `git switch <sha>` does not silently
                detach. */
-            if (sg_rev_parse_commit(git_dir, branch_arg, probe) == 0)
+            if (prc == 0)
                 fprintf(stderr,
                        "sg: '%s' is a commit, not a branch\n"
                        "To point HEAD directly at it (detached HEAD), use sg switch --detach %s\n",
                        branch_arg, branch_arg);
-            else
+            else {
+                if (prc == -4)
+                    sg_cli_report_ambiguous_oid(git_dir, branch_arg, SG_REV_STRICT);
                 fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
+            }
             free(checkout_msg);
             free(old_branch);
             free(git_dir);

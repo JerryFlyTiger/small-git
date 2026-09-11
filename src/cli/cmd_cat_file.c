@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/chunk.h"
+#include "sg/cli_args.h"
 #include "sg/hash.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
@@ -108,6 +109,8 @@ int sg_cmd_cat_file(int argc, char **argv)
             return 1;
         }
         if (resolve_rc != 0) {
+            if (resolve_rc == -4)
+                sg_cli_report_ambiguous_oid(git_dir, hex_arg, SG_REV_STRICT);
             fprintf(stderr, "sg: not a valid object name '%s'\n", hex_arg);
             free(git_dir);
             return 1;

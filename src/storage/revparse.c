@@ -124,12 +124,171 @@ static int parse_suffix_number(const char *s, size_t len, unsigned long *out)
     return 0;
 }
 
+/* True iff s[0..len) is entirely hex digits (upper or lower case),
+   len >= SG_OID_MIN_ABBREV and < SG_SHA1_HEX_LEN -- exactly the shape
+   sg_object_find_prefix accepts. A stricter length check than
+   sg_object_find_prefix's own (which just rejects on a bad prefix) so
+   callers here can tell "not even worth trying as a prefix" apart from
+   "tried it and it happens not to exist" without relying on -1 meaning two
+   different things. */
+static int looks_like_oid_prefix(const char *s, size_t len)
+{
+    size_t i;
+
+    if (len < SG_OID_MIN_ABBREV || len >= SG_SHA1_HEX_LEN)
+        return 0;
+    for (i = 0; i < len; i++) {
+        char c = s[i];
+
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return 0;
+    }
+    return 1;
+}
+
+sg_rev_disambig sg_rev_effective_disambig(const char *rev, sg_rev_disambig disambig)
+{
+    const char *colon = strchr(rev, ':');
+    size_t limit = colon != NULL ? (size_t)(colon - rev) : strlen(rev);
+    size_t i = 0;
+
+    /* Priority 1: a "~"/"^"/"@{" suffix anywhere before the colon (or
+       before the end, if there is none) forces COMMITTISH -- the exact
+       same scan sg_rev_parse_commit_ex's own base_len loop performs, just
+       bounded at `limit` so a colon's PATH half is never mistaken for
+       containing one. */
+    while (i < limit && rev[i] != '~' && rev[i] != '^' && !(rev[i] == '@' && rev[i + 1] == '{'))
+        i++;
+    if (i < limit)
+        return SG_REV_COMMITTISH;
+
+    /* Priority 2: no suffix, but a colon -- a "<rev>:<path>" form is
+       TREEISH regardless of the caller's own request (resolve_rev_path
+       passes SG_REV_TREEISH explicitly and never reaches this branch
+       itself, since its own `rev` has already had the colon stripped off;
+       this branch exists for sg_cli_report_ambiguous_oid, which is handed
+       the ORIGINAL, still-colon-containing argument text). */
+    if (colon != NULL)
+        return SG_REV_TREEISH;
+
+    /* Priority 3: neither trigger fired, use what the caller asked for. */
+    return disambig;
+}
+
+int sg_rev_object_matches_disambig(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
+                                   sg_rev_disambig mode)
+{
+    unsigned char peeled[SG_SHA1_RAW_LEN];
+    sg_obj_type type;
+
+    /* STRICT has no filter -- an ambiguous prefix under STRICT is -4
+       outright, without narrowing, so callers only ever need this
+       predicate for the other two modes. */
+    if (mode == SG_REV_STRICT)
+        return 0;
+
+    memcpy(peeled, id, SG_SHA1_RAW_LEN);
+    /* Review round 3 (measured against real git 2.55.0): membership is
+       decided by the PEELED type, not the candidate's own raw type -- a
+       tag pointing at a blob does NOT count toward COMMITTISH, even though
+       it IS a tag object. Decisive fixture: a tag->blob colliding with a
+       real commit on the same 4-hex prefix. `cat-file -t <amb>` (STRICT,
+       raw types) lists both the tag and the commit; if COMMITTISH counted
+       by raw type that would be two commit-ish candidates and `log -1
+       <amb>` would refuse -- it does not, it resolves to the commit, so
+       git is counting the tag's PEELED type (a blob) and excluding it.
+       Reusing peel_to_non_tag here (the SAME peeling sg_rev_parse_commit_ex
+       itself performs on whatever this function eventually picks) keeps
+       there being exactly one peeling implementation in this file. A
+       candidate whose peel chain fails (missing/corrupt tag target) does
+       NOT match -- it is EXCLUDED from the count, not treated as a
+       resolution failure; see resolve_ambiguous_prefix's own comment on
+       why "exclude" rather than "fail loudly" is the accepted tradeoff
+       here. */
+    if (peel_to_non_tag(git_dir, peeled, &type) != 0)
+        return 0;
+
+    if (mode == SG_REV_COMMITTISH)
+        return type == SG_OBJ_COMMIT;
+    return type == SG_OBJ_COMMIT || type == SG_OBJ_TREE; /* SG_REV_TREEISH */
+}
+
+/* Resolves an abbreviated hex prefix (4..39 characters, already validated by
+   looks_like_oid_prefix) to a single raw object id, per `disambig`:
+
+     - 0 matches: -1 (not found -- matches git's plain "ambiguous argument"
+       wording for a well-formed-but-absent prefix, not "short object ID is
+       ambiguous").
+     - 1 match: that object's id, 0.
+     - >1 matches, SG_REV_STRICT: -4.
+     - >1 matches, SG_REV_COMMITTISH or SG_REV_TREEISH: if EXACTLY ONE
+       candidate matches sg_rev_object_matches_disambig for that mode
+       (by PEELED type, not raw type -- see that function's own comment),
+       that candidate's id, 0; otherwise -4, same as STRICT -- e.g. two
+       commits, or a commit plus a tag pointing at ANOTHER commit, both
+       still refuse under COMMITTISH (measured, section 4 of the Phase 68
+       spec); a commit+tag(->commit)+tree collision still refuses under
+       TREEISH (three matches, not one -- measured in the Phase 68b review
+       round).
+
+   The id itself, not its type, is returned -- this function does not know
+   or care whether the ultimate caller wants a commit; sg_rev_parse_object's
+   own prefix branch reads the type back out separately for exactly that
+   reason. */
+static int resolve_ambiguous_prefix(const char *git_dir, const char *prefix, sg_rev_disambig disambig,
+                                    unsigned char id_out[SG_SHA1_RAW_LEN])
+{
+    sg_oid_list list;
+    int rc = -1;
+
+    if (sg_object_find_prefix(git_dir, prefix, &list) != 0)
+        return -1;
+
+    if (list.count == 0) {
+        rc = -1;
+    } else if (list.count == 1) {
+        memcpy(id_out, list.ids[0], SG_SHA1_RAW_LEN);
+        rc = 0;
+    } else if (disambig == SG_REV_STRICT) {
+        rc = -4;
+    } else {
+        size_t i;
+        size_t match_count = 0;
+        size_t match_idx = 0;
+
+        for (i = 0; i < list.count; i++) {
+            /* An UNREADABLE candidate (sg_rev_object_matches_disambig
+               returns 0 for it, same as a genuine non-match) is simply
+               excluded from the count, never counted as a match. If it
+               happened to be the only real commit-ish/tree-ish candidate,
+               this makes the whole call refuse (-4) rather than either
+               silently resolving to the WRONG object or crashing --
+               deliberately the "refuse" failure direction, not "guess". */
+            if (sg_rev_object_matches_disambig(git_dir, list.ids[i], disambig)) {
+                match_count++;
+                match_idx = i;
+            }
+        }
+        if (match_count == 1) {
+            memcpy(id_out, list.ids[match_idx], SG_SHA1_RAW_LEN);
+            rc = 0;
+        } else {
+            rc = -4;
+        }
+    }
+
+    sg_oid_list_free(&list);
+    return rc;
+}
+
 /* Resolves just the <base> part of the grammar (see revparse.h) to a raw
    object id, trying a literal 40-hex sha1, then HEAD, then tag, then
-   branch, in that order -- the first that matches wins. This is real
-   git's own gitrevisions disambiguation order (full SHA-1 object name,
-   then refs/<name> -> refs/tags/<name> -> refs/heads/<name> -> ...);
-   measured against real git for both halves of this order:
+   branch, then (Phase 68b) an abbreviated hex prefix, in that order -- the
+   first that matches wins. This is real git's own gitrevisions
+   disambiguation order (full SHA-1 object name, then refs/<name> ->
+   refs/tags/<name> -> refs/heads/<name> -> ..., then an abbreviated
+   prefix); measured against real git for all three of the interesting
+   orderings:
 
      - a branch and a tag both named "foo" -- `git rev-parse foo` resolves
        to the TAG's target (with a "refname is ambiguous" warning), not
@@ -141,33 +300,49 @@ static int parse_suffix_number(const char *s, size_t len, unsigned long *out)
        hex wins over everything, including a branch whose name happens to
        collide with it, which is the counter-intuitive case worth calling
        out here.
+     - the MIRROR IMAGE at prefix length: a branch literally named with a
+       valid 6-hex prefix (also a valid abbreviation) WINS over the prefix
+       interpretation (git warns "refname '...' is ambiguous"), the exact
+       opposite direction from the 40-hex case above. sg's ref lookup
+       already runs before the new prefix branch, so both directions fall
+       out of the existing order for free -- do not "unify" the two,
+       CLAUDE.md's `sg_rev_parse_commit` entry pins them as a head-on pair.
 
-   Consistent with that: once base looks like a full 40-hex sha1 (right
-   length, all hex digits), that IS the answer -- if the object doesn't
-   exist, this returns failure without falling back to a same-named ref,
-   matching `git rev-parse --verify` on a well-formed-but-absent sha1.
+   Consistent with the 40-hex case: once base looks like a full 40-hex sha1
+   (right length, all hex digits), that IS the answer -- if the object
+   doesn't exist, this returns failure without falling back to a same-named
+   ref, matching `git rev-parse --verify` on a well-formed-but-absent
+   sha1. An abbreviated prefix has no such shortcut: it is only tried after
+   the ref lookup has already failed.
 
-   Does not peel tags or apply ~/^ suffixes. Returns 0 on success. */
-static int resolve_base(const char *git_dir, const char *base, unsigned char id_out[SG_SHA1_RAW_LEN])
+   Does not peel tags or apply ~/^ suffixes. Returns 0 on success, -1 if
+   nothing matches, -4 if an abbreviated prefix is ambiguous under
+   `disambig` (see resolve_ambiguous_prefix). */
+static int resolve_base(const char *git_dir, const char *base, sg_rev_disambig disambig,
+                        unsigned char id_out[SG_SHA1_RAW_LEN])
 {
     char ref_path[SG_PATH_MAX];
+    size_t len = strlen(base);
 
-    if (strlen(base) == SG_SHA1_HEX_LEN)
+    if (len == SG_SHA1_HEX_LEN)
         return sg_hex_to_sha1(base, id_out);
 
-    if (sg_rev_parse_ref_path(git_dir, base, ref_path, sizeof(ref_path)) != 0)
-        return -1;
+    if (sg_rev_parse_ref_path(git_dir, base, ref_path, sizeof(ref_path)) == 0) {
+        /* "HEAD" is a symref ("ref: refs/heads/<branch>\n"), not a raw oid
+           file, so it needs sg_ref_resolve_head's indirection rather than
+           sg_ref_read_path (which would try to hex-decode the "ref: ..."
+           line and fail). Every other path sg_rev_parse_ref_path can
+           return (refs/tags/<n>, refs/heads/<n>, or an already-"refs/..."
+           name) is an ordinary oid file. */
+        if (strcmp(ref_path, "HEAD") == 0)
+            return sg_ref_resolve_head(git_dir, id_out);
+        return sg_ref_read_path(git_dir, ref_path, id_out);
+    }
 
-    /* "HEAD" is a symref ("ref: refs/heads/<branch>\n"), not a raw oid file,
-       so it needs sg_ref_resolve_head's indirection rather than
-       sg_ref_read_path (which would try to hex-decode the "ref: ..." line
-       and fail). Every other path sg_rev_parse_ref_path can return
-       (refs/tags/<n>, refs/heads/<n>, or an already-"refs/..."  name) is an
-       ordinary oid file. */
-    if (strcmp(ref_path, "HEAD") == 0)
-        return sg_ref_resolve_head(git_dir, id_out);
+    if (looks_like_oid_prefix(base, len))
+        return resolve_ambiguous_prefix(git_dir, base, disambig, id_out);
 
-    return sg_ref_read_path(git_dir, ref_path, id_out);
+    return -1;
 }
 
 int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size_t out_size)
@@ -214,14 +389,16 @@ int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size
     return -1;
 }
 
-int sg_rev_parse_commit(const char *git_dir, const char *rev,
-                        unsigned char commit_id_out[SG_SHA1_RAW_LEN])
+int sg_rev_parse_commit_ex(const char *git_dir, const char *rev, sg_rev_disambig disambig,
+                           unsigned char commit_id_out[SG_SHA1_RAW_LEN])
 {
     char base[SG_PATH_MAX];
     unsigned char id[SG_SHA1_RAW_LEN];
     sg_obj_type type;
     size_t base_len;
     size_t pos;
+    sg_rev_disambig base_disambig;
+    int rc;
 
     if (rev == NULL || rev[0] == '\0')
         return -1;
@@ -233,6 +410,18 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
     while (rev[base_len] != '\0' && rev[base_len] != '~' && rev[base_len] != '^' &&
           !(rev[base_len] == '@' && rev[base_len + 1] == '{'))
         base_len++;
+
+    /* The single shared decision (sg_rev_effective_disambig) -- `rev` never
+       contains a ':' at this call site (see sg_rev_parse_object's comment),
+       so only priority 1 (a suffix left over after the base -- a "~"/"^"
+       run below, or an "@{N}" handled in its own branch further down) can
+       override `disambig` here; priority 2 (a colon) is resolve_rev_path's
+       own job, one layer up. Measured: under `rev-parse` (STRICT), the bare
+       ambiguous prefix refuses while the same prefix with "~1" appended
+       resolves -- an implementation keyed only on `disambig` gets every
+       suffixed form wrong. */
+    base_disambig = sg_rev_effective_disambig(rev, disambig);
+
     if (base_len >= sizeof(base))
         return -1;
     memcpy(base, rev, base_len);
@@ -303,7 +492,19 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
            scan at '~', so "@{1}" is left for the ~/^ suffix loop below,
            where it fails to parse as a number and is rejected. That is the
            whole enforcement of "@{N} must be adjacent to the ref name"; no
-           separate check is needed here. */
+           separate check is needed here.
+
+           NOTE: `base_disambig`, computed above, is NOT used anywhere in
+           this branch. An "@{N}" base names a REF (resolved via
+           sg_rev_parse_ref_path just below, then read out of its reflog),
+           never an abbreviated object id -- an id has no reflog to index
+           into -- so there is no ambiguous-prefix question here for
+           `base_disambig` to answer. It is still computed unconditionally
+           above (rather than only on the other branch) because the suffix
+           scan that feeds it is shared with base_len's own computation;
+           do not read its presence here as this branch load-bearing on
+           disambiguation, and do not "clean up" by deleting it -- the
+           other branch (resolve_base, below) needs it. */
         char ref_path[SG_PATH_MAX];
         sg_reflog log;
         const sg_reflog_entry *entry;
@@ -347,8 +548,9 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
         memcpy(id, entry->new_id, SG_SHA1_RAW_LEN);
         sg_reflog_free(&log);
     } else {
-        if (resolve_base(git_dir, base, id) != 0)
-            return -1;
+        rc = resolve_base(git_dir, base, base_disambig, id);
+        if (rc != 0)
+            return rc;
     }
 
     if (peel_to_non_tag(git_dir, id, &type) != 0)
@@ -396,11 +598,25 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
     return 0;
 }
 
-/* Splits `arg` at `colon` and resolves the left side as a commit (peeling,
-   via sg_rev_parse_commit), then walks its tree component by component to
-   find the entry named by the right side (an empty right side means the
-   commit's own tree). Returns 0 with *id_out and *type_out filled in; -1 if
-   `rev` itself does not resolve or is too long; -2 if `rev` resolved but
+int sg_rev_parse_commit(const char *git_dir, const char *rev,
+                        unsigned char commit_id_out[SG_SHA1_RAW_LEN])
+{
+    return sg_rev_parse_commit_ex(git_dir, rev, SG_REV_STRICT, commit_id_out);
+}
+
+/* Splits `arg` at `colon` and resolves the left side via
+   sg_rev_parse_commit_ex under SG_REV_TREEISH (peeling a resolved
+   commit/tag), then walks its tree component by component to find the
+   entry named by the right side (an empty right side means the commit's
+   own tree). Returns 0 with *id_out and *type_out filled in; -1 if `rev`
+   itself does not resolve, is too long, or resolves to a BARE TREE --
+   sg_rev_parse_commit_ex only ever yields a commit, so a rev that resolves
+   directly to a tree object (ambiguous or not, abbreviated or a full
+   40-hex) fails here exactly as it always has. This is a PRE-EXISTING gap
+   that predates Phase 68 entirely (measured: a full 40-hex tree id in
+   `<rev>:<path>` already failed before any abbreviation code existed) and
+   is deliberately not fixed by this phase -- pinned as a named divergence
+   in interop rather than silently reproduced. -2 if `rev` resolved but
    `path` does not exist inside its tree, with bad_path filled with `path`
    (truncation of `path` into bad_path is folded into -1, not -2, matching
    the header's "truncation is a hard failure" note). Prints nothing. */
@@ -420,8 +636,17 @@ static int resolve_rev_path(const char *git_dir, const char *arg, const char *co
     rev[rev_len] = '\0';
     path = colon + 1;
 
-    if (sg_rev_parse_commit(git_dir, rev, commit_id) != 0)
-        return -1;
+    {
+        /* Phase 68b review: TREEISH, not STRICT -- section 2/priority 2 of
+           sg_rev_disambig's own comment. A resolved bare TREE still fails
+           here (sg_rev_parse_commit_ex only ever yields a commit), which is
+           the pre-existing "<tree>:<path> doesn't work" gap, deliberately
+           left as-is -- see this function's own header comment. */
+        int prc = sg_rev_parse_commit_ex(git_dir, rev, SG_REV_TREEISH, commit_id);
+
+        if (prc != 0)
+            return prc; /* propagates -4 (ambiguous prefix) as well as -1 */
+    }
     if (sg_commit_tree_of(git_dir, commit_id, tree_id) != 0)
         return -1;
 
@@ -548,9 +773,46 @@ int sg_rev_parse_object(const char *git_dir, const char *arg,
         }
     }
 
-    if (sg_rev_parse_commit(git_dir, arg, id_out) == 0) {
-        *type_out = SG_OBJ_COMMIT;
-        return 0;
+    /* Phase 68b: an abbreviated hex prefix (4..39 characters), tried after
+       the ref lookup above (section 2 of the spec: a ref wins) and ALWAYS
+       SG_REV_STRICT here -- measured, `cat-file`/`show` refuse an ambiguous
+       prefix outright rather than dwimming to a commit the way `log` does.
+       This must resolve to whatever object the prefix names, any type, not
+       just a commit -- unlike sg_rev_parse_commit's own prefix handling in
+       resolve_base, which only ever sits inside a commit-shaped grammar. A
+       count of 0 (not found as any object) falls through to the general
+       grammar below, same as any other name that is not a bare prefix.
+       Routed through sg_rev_effective_disambig for the mode decision too
+       (rather than hardcoding SG_REV_STRICT inline) purely so there is
+       still only ONE place that decides a mode -- `arg` here is guaranteed
+       pure hex by looks_like_oid_prefix, so it can contain neither a ':'
+       nor a "~"/"^"/"@{", and the call is a no-op that always returns
+       SG_REV_STRICT unchanged. */
+    if (looks_like_oid_prefix(arg, strlen(arg))) {
+        int prc = resolve_ambiguous_prefix(git_dir, arg, sg_rev_effective_disambig(arg, SG_REV_STRICT), id_out);
+
+        if (prc == 0) {
+            unsigned char *content;
+            size_t content_len;
+
+            if (sg_object_read(git_dir, id_out, type_out, &content, &content_len) != 0)
+                return -1;
+            free(content);
+            return 0;
+        }
+        if (prc == -4)
+            return -4;
+    }
+
+    {
+        int prc = sg_rev_parse_commit(git_dir, arg, id_out);
+
+        if (prc == 0) {
+            *type_out = SG_OBJ_COMMIT;
+            return 0;
+        }
+        if (prc == -4)
+            return -4;
     }
 
     return -1;

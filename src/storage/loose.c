@@ -3,6 +3,7 @@
 #include "sg/workdir.h"
 #include "sg/zutil.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -200,5 +201,58 @@ int sg_loose_read(const char *git_dir, const unsigned char id[SG_SHA1_RAW_LEN],
     *content_len_out = obj.content_len;
 
     free(decompressed);
+    return 0;
+}
+
+int sg_loose_find_prefix(const char *git_dir, const unsigned char prefix[SG_SHA1_RAW_LEN],
+                         size_t nibbles, sg_oid_list *out)
+{
+    static const char digits[] = "0123456789abcdef";
+    char bucket[3];
+    char dir_path[SG_PATH_MAX];
+    DIR *d;
+    struct dirent *file;
+
+    bucket[0] = digits[(prefix[0] >> 4) & 0xf];
+    bucket[1] = digits[prefix[0] & 0xf];
+    bucket[2] = '\0';
+
+    snprintf(dir_path, sizeof(dir_path), "%s/objects/%s", git_dir, bucket);
+    d = opendir(dir_path);
+    if (d == NULL) {
+        /* ENOENT/ENOTDIR mean no loose object has ever begun with this byte
+           -- the bucket directory simply doesn't exist -- which really is
+           zero matches. Any OTHER errno (EACCES, EMFILE, ...) means we
+           genuinely could not look, and must NOT be reported as "zero
+           matches": silently treating "couldn't check" the same as "checked
+           and found nothing" is fail-OPEN here, and the failure direction
+           matters more than usual -- an ambiguous prefix whose loose half
+           went unscanned this way can silently collapse to a single
+           candidate from the pack half alone, resolving to the wrong
+           object instead of refusing as ambiguous. */
+        if (errno == ENOENT || errno == ENOTDIR)
+            return 0;
+        return -1;
+    }
+
+    while ((file = readdir(d)) != NULL) {
+        char hex[SG_SHA1_HEX_LEN + 1];
+        unsigned char id[SG_SHA1_RAW_LEN];
+
+        if (strlen(file->d_name) != SG_SHA1_HEX_LEN - 2)
+            continue;
+
+        snprintf(hex, sizeof(hex), "%s%s", bucket, file->d_name);
+        if (sg_hex_to_sha1(hex, id) != 0)
+            continue;
+        if (!sg_sha1_has_prefix(id, prefix, nibbles))
+            continue;
+
+        if (sg_oid_list_append(out, id) != 0) {
+            closedir(d);
+            return -1;
+        }
+    }
+    closedir(d);
     return 0;
 }

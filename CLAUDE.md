@@ -2337,8 +2337,61 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   both, rather than inventing an asymmetry between its own two spellings.
   It is not on the deliberate-divergence list (reaching it takes deleting a
   log file by hand); see Phase 48 of `docs/DESIGN.md`.
-  **Abbreviated sha is not supported** (deliberately). Do not hand-roll a
-  "branch name or 40-hex" fragment again. To list/delete refs under any
+  **Abbreviated (prefix) object ids are supported as of Phase 68** -- this
+  line used to say they deliberately were not; it is gone rather than marked
+  "fixed", the same convention this file uses for every closed gap. The
+  rules, all measured against git 2.55.0 (Phase 68 of `docs/DESIGN.md` has
+  the fixtures):
+  - **4..39 hex, case-insensitive; 40 is an exact id, not a prefix.** The
+    minimum really is 4, not "whatever is unique" -- a 1/2/3-char prefix
+    fails even when it matches exactly one object. Enumeration is
+    `sg_object_find_prefix` (`include/sg/objstore.h`), which scans the one
+    `objects/<xx>/` the first byte names plus every pack idx, then sorts and
+    DEDUPLICATES (an object can be both loose and packed).
+  - **`core.abbrev` affects OUTPUT only, never resolution** (measured:
+    `-c core.abbrev=40` still resolves a 5-hex prefix). sg reads no config,
+    so this costs nothing -- but do not "add" it to the resolver.
+  - **The prefix branch sits AFTER the ref lookup, and the two lengths
+    resolve in OPPOSITE directions**: a branch literally named with a valid
+    6-hex prefix WINS over the prefix reading, while a branch named with a
+    full 40-hex LOSES to the object id. Both are pinned head-on; collapsing
+    them into one rule breaks whichever was not measured last.
+  - **THREE disambiguation modes, not two** (`sg_rev_disambig`): STRICT
+    (git's `get_oid`), COMMITTISH (`get_oid_committish`), TREEISH
+    (`get_oid_treeish`). On one 4-way collision the hint list comes back at
+    three widths -- 4 rows bare, 2 rows for `<amb>~1`, **3 rows for
+    `<amb>:f.txt`**. Answering the third with COMMITTISH is a WRONG ANSWER,
+    not a missing row: on a commit+tree+blob prefix git's tree-ish count is
+    2 and it refuses, while a commit-ish count of 1 resolves.
+  - **TWO dwim triggers, and one of them is not the command.** Per command:
+    only `sg log` and `sg reset` pass COMMITTISH (measured over 15 git
+    commands -- `rev-list` REFUSES while `log` resolves, so the rule is not
+    "this command needs a commit"). Independently, **any `~`/`^`/`@{`
+    suffix forces COMMITTISH and a `:` forces TREEISH, whatever the caller
+    asked for**, with the suffix winning over the colon; the suffix scan is
+    bounded at the colon so a PATH containing a `~` is not mistaken for one.
+    Both triggers live in `sg_rev_effective_disambig` -- **do not re-derive
+    either at a call site**, they had two copies once and it cost a phase.
+  - **Membership is decided by the PEELED type, never the raw type.** A tag
+    counts toward COMMITTISH only if it peels to a commit (TREEISH: a commit
+    or a tree). Decisive fixture: a tag->blob colliding with a real commit --
+    counting by raw type gives two commit-ish candidates and refuses, git
+    resolves to the commit.
+  - **An ambiguous prefix returns -4**, and the CLI prints git's block
+    byte-for-byte via `sg_cli_report_ambiguous_oid` (`include/sg/cli_args.h`):
+    `error: short object ID <prefix, LOWERCASED> is ambiguous`, then `hint:`
+    rows ordered by TYPE (tag, commit, tree, blob) and then by hex. A commit
+    row carries the AUTHOR date in the commit's OWN stored offset
+    (`sg_date_format_short`) and the FOLDED subject (`fold_subject`, do not
+    write "the first line" at a new call site); a tag row carries the tag
+    NAME, not its message. The list is narrowed to the mode's matching rows
+    ONLY when at least one candidate matches; with none, every row prints.
+    git exits 128 here and sg exits 1, the standing 0-or-1 convention --
+    **except `sg push`, where both exit 1** (measured; pinned, because
+    "unifying" it would otherwise go unnoticed).
+  - `sequencer/todo` READS 4..40 hex as of Phase 68c and still WRITES 40
+    (wide-in / narrow-out); see the cherry-pick bullet above.
+  Do not hand-roll a "branch name or 40-hex" fragment again. To list/delete refs under any
   prefix use `sg_ref_list_under`/`sg_ref_delete_under` (`prefix` must end
   with `/`).
   **Exception: `sg push`'s explicit-dst refspec `<src>` (Phase 39,
@@ -2557,19 +2610,24 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   cherry-pick's mechanism (`sg_ref_move_head`, moving the branch/HEAD one
   commit per pick) is the SAME one git uses -- there is nothing to protect
   against, and mirroring buys real interop.
-  WARNING: **that interop is ONE-DIRECTIONAL, and "and vice versa" is
-  wrong -- do not write it back in.** Measured both directions: sg pauses
-  -> a real `git cherry-pick --continue` finishes it (works: log is
-  correct, state is cleared). git pauses -> `sg cherry-pick --continue`
-  (or `--skip`) CANNOT, because git's own `sequencer/todo` writes an
-  abbreviated 7-hex id and sg has no abbreviated-object-name resolution at
-  all to read it back with (same limitation the 7-vs-40 divergence two
-  bullets up documents). What sg CAN still do on a git-paused sequence,
-  after the Phase 57 spec 5b fix described below: `--abort` (restores to
-  `sequencer/head`, which -- unlike `sequencer/todo` -- git also writes as
-  a plain full 40-hex) and `--quit` (parses nothing at all). See Phase 57
-  of `docs/DESIGN.md` for the full reasoning, including the dead-end this
-  asymmetry caused before the fix.
+  WARNING: **that interop was ONE-DIRECTIONAL until Phase 68c, and is now
+  BIDIRECTIONAL -- but the sentence this file used to carry ("and vice
+  versa is wrong, do not write it back in") was CORRECT when written, and
+  the reason it stopped being correct is a code change, not a
+  re-measurement.** Phase 57 measured: sg pauses -> a real `git cherry-pick
+  --continue` finishes it; git pauses -> `sg cherry-pick --continue` (or
+  `--skip`) could NOT, because git's `sequencer/todo` writes an abbreviated
+  7-hex id and sg had no abbreviated-object-name resolution to read it back
+  with. **Phase 68 gave sg that resolution and Phase 68c widened
+  `parse_todo_line`, so both directions now work** -- measured end to end
+  against git 2.55.0, and pinned in interop's `phase68c` group in BOTH
+  directions. Two Phase 57 facts survive unchanged and must not be
+  "simplified" away now that the dead end is gone: `--abort` and `--quit`
+  still deliberately parse NO todo at all (they read only
+  `sequencer/head`/`abort-safety`, plain 40-hex in either tool), which is
+  what keeps them working when the todo is damaged or genuinely ambiguous;
+  and an ambiguous abbreviation is REFUSED, never guessed. See Phase 57 and
+  Phase 68c of `docs/DESIGN.md`.
   WARNING: **`sequencer/` itself (not just its contents) is conditional on
   commit COUNT, not on any per-call flag** -- a SINGLE-commit conflicting
   `sg cherry-pick <c>` writes `CHERRY_PICK_HEAD`/`MERGE_MSG` and creates NO
@@ -2590,14 +2648,17 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   `sg_sequencer_state_write` -- that asymmetry (one write, not the other)
   is the whole fix, do not add the state write "for consistency".
   WARNING: **`sequencer/todo`'s id field is a full 40-hex where git writes
-  an abbreviated 7-hex, and this is deliberate** -- sg has no abbreviated-
-  object-name resolution anywhere in this project (a rule that predates this
-  phase, see `sg_rev_parse_commit`'s own header comment), so a 7-hex todo
-  file would be one sg itself could not read back. Full hex is still
-  readable BY GIT (its own parser accepts any length-4-or-more hex prefix),
-  so the compatibility direction that matters -- "whatever sg writes,
-  something can read back" -- is preserved. Pinned on both sides in
-  interop's `phase57` group. **Do not "fix" this to 7 characters.**
+  an abbreviated 7-hex, and this is STILL deliberate as of Phase 68c -- but
+  for a different reason than the one this file used to give.** The old
+  reason ("sg cannot read a short one back") expired when Phase 68c widened
+  `parse_todo_line`; the standing reason is **wide-in / narrow-out**: sg
+  ACCEPTS 4..40 hex (so it can finish a sequence a real git binary paused)
+  and EMITS only the unambiguous full 40, which no reader -- git, an older
+  sg, or a future one -- can ever resolve to the wrong object. Full hex is
+  readable BY GIT either way (its own parser accepts any length-4-or-more
+  prefix). Pinned on both sides in interop's `phase57`/`phase68c` groups.
+  **Do not "fix" this to 7 characters**, and do not restore the old
+  justification.
   WARNING: **the reflog wording has one asymmetry that looks like a typo and
   is not**: a DIRECTLY-applied pick logs `cherry-pick: <subject>` /
   `revert: <subject>`; a pick finished by `--continue` logs `commit

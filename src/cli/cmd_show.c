@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/chunk.h"
+#include "sg/cli_args.h"
 #include "sg/commit_out.h"
 #include "sg/date.h"
 #include "sg/diff.h"
@@ -1061,6 +1062,8 @@ static int resolve_object(const char *git_dir, const char *arg,
         fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", bad_path, rev);
         return -1;
     }
+    if (rc == -4)
+        sg_cli_report_ambiguous_oid(git_dir, arg, SG_REV_STRICT);
     fprintf(stderr, "sg: not a valid object name '%s'\n", arg);
     return -1;
 }

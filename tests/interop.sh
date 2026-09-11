@@ -14506,13 +14506,18 @@ check "phase57 oracle: precondition -- git commit completes the cherry-pick inst
 # Every phase57 check so far builds TWO copies (one per tool) and diffs
 # their outputs; this group instead builds ONE repository, pauses a
 # two-commit cherry-pick with REAL GIT ITSELF (so sequencer/todo holds
-# git's own abbreviated 7-hex ids -- a shape sg's todo parser cannot read
-# at all), and asserts sg's four escape-hatch subcommands still get the
-# user out. This is the dead end a second measurement round found after
-# the first green board: sg used to refuse ALL FOUR of
-# --continue/--skip/--quit/--abort on exactly this input, every one with
-# the identical "state is corrupt, run sg cherry-pick --abort to clean up"
-# -- advice naming one of the four commands that had just failed. ---
+# git's own abbreviated 7-hex ids -- a shape sg's todo parser could not
+# read at all before Phase 68c), and asserts sg's four escape-hatch
+# subcommands still get the user out. This is the dead end a second
+# measurement round found after the first green board: sg used to refuse
+# ALL FOUR of --continue/--skip/--quit/--abort on exactly this input, every
+# one with the identical "state is corrupt, run sg cherry-pick --abort to
+# clean up" -- advice naming one of the four commands that had just failed.
+# --quit and --abort never needed sequencer/todo at all (Phase 57's own
+# fix); Phase 68c widens parse_todo_line itself, so --continue/--skip below
+# are updated for their now-CORRECT behavior -- see the phase68c: group
+# further down for the full round trip (git pauses, sg resolves + finishes
+# the sequence; the reverse direction; --abort/--quit re-pinned). ---
 P57_GITPAUSED="$WORKDIR/p57_gitpaused"
 rm -rf "$P57_GITPAUSED"
 cp -R "$P57_CONFLICT" "$P57_GITPAUSED"
@@ -14521,7 +14526,7 @@ P57_GITPAUSED_PRE_MASTER=$(cd "$P57_GITPAUSED" && LC_ALL=C git rev-parse master 
     > /dev/null 2>&1
 check "phase57 oracle: precondition -- real git actually paused on the conflict" \
     sh -c 'test -f "$0/.git/CHERRY_PICK_HEAD"' "$P57_GITPAUSED"
-check "phase57 oracle: precondition -- git's own sequencer/todo really uses 7-hex ids, the shape sg's parser cannot read" \
+check "phase57 oracle: precondition -- git's own sequencer/todo really uses 7-hex ids (Phase 68c's parse_todo_line now resolves this)" \
     sh -c 'awk "{print length(\$2)}" "$0/.git/sequencer/todo" | grep -qx 7' "$P57_GITPAUSED"
 check "phase57 oracle: precondition -- git's sequencer/head is nonetheless a plain full 40-hex" \
     sh -c 'test $(wc -c < "$0/.git/sequencer/head") = 41' "$P57_GITPAUSED"
@@ -14552,34 +14557,45 @@ check "phase57: ...restoring master to the exact commit git's own sequencer/head
 check "phase57: ...and clearing the paused state" \
     sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD" -a ! -d "$0/.git/sequencer"' "$P57_GP_ABORT"
 
-# --continue/--skip: still refuse (they genuinely need a readable todo to
-# do their job), but the message must name a command that ACTUALLY WORKS
-# on this input -- never --continue or --skip themselves, which are the
-# two commands failing here.
+# --continue: as of Phase 68c, the 7-hex todo now READS -- so with the
+# CONFLICT STILL UNRESOLVED, --continue refuses for the ORDINARY reason
+# (unresolved conflicts remain), the same message and exit code any
+# sg-native paused pick would give, not "state is corrupt". The full
+# success round trip (resolve, then --continue actually finishes the
+# sequence) is in the phase68c: group below; this block is what changed
+# here in Phase 57's own fixture -- it deliberately does NOT resolve the
+# conflict, so it stays a "refuses" case, but for a different, legitimate
+# reason.
 P57_GP_CONT="$WORKDIR/p57_gitpaused_continue"
 rm -rf "$P57_GP_CONT"
 cp -R "$P57_GITPAUSED" "$P57_GP_CONT"
 (cd "$P57_GP_CONT" && "$SG" cherry-pick --continue) > "$P57_GP_CONT.out" 2>&1
 p57_gp_cont_rc=$?
-check "phase57: sg cherry-pick --continue still refuses on git's 7-hex todo (it genuinely needs to read it)" \
+check "phase68c cherry-pick continue: sg cherry-pick --continue on git's 7-hex todo now PARSES it -- with the conflict still unresolved it refuses for the ordinary reason, not 'state is corrupt'" \
     test "$p57_gp_cont_rc" = 1
-check "phase57: ...but its message names --abort, a command that actually works on this input" \
-    sh -c 'grep -q -- "--abort" "$0"' "$P57_GP_CONT.out"
-check "phase57: ...and does NOT tell the user to re-run --continue or --skip (which fail identically)" \
-    sh -c '! grep -qE -- "run \`?sg cherry-pick (--continue|--skip)" "$0"' "$P57_GP_CONT.out"
-check "phase57: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit)" \
+check "phase68c cherry-pick continue: ...its message names the unresolved path" \
+    sh -c 'grep -q "unresolved conflicts remain" "$0" && grep -q "r.txt" "$0"' "$P57_GP_CONT.out"
+check "phase68c cherry-pick continue: ...and does NOT name --abort (the dead-end wording is actually gone, not just unmentioned by coincidence)" \
+    sh -c '! grep -q "[-][-]abort" "$0"' "$P57_GP_CONT.out"
+check "phase68c cherry-pick continue: ...and it DOES tell the user to resolve and re-run --continue (the normal instruction, now reachable)" \
+    sh -c 'grep -qE -- "run \`?sg add" "$0" && grep -qE -- "sg cherry-pick --continue" "$0"' \
+    "$P57_GP_CONT.out"
+check "phase68c cherry-pick continue: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit/resolve+--continue)" \
     sh -c 'test -f "$0/.git/CHERRY_PICK_HEAD"' "$P57_GP_CONT"
 
+# --skip: as of Phase 68c the todo resolves, and --skip needs no clean
+# index at all (unlike --continue) -- it discards the conflicting commit
+# outright and runs the REST of the todo (here, just the clean second
+# commit), so it now SUCCEEDS and finishes the whole sequence.
 P57_GP_SKIP="$WORKDIR/p57_gitpaused_skip"
 rm -rf "$P57_GP_SKIP"
 cp -R "$P57_GITPAUSED" "$P57_GP_SKIP"
 (cd "$P57_GP_SKIP" && "$SG" cherry-pick --skip) > "$P57_GP_SKIP.out" 2>&1
 p57_gp_skip_rc=$?
-check "phase57: sg cherry-pick --skip also still refuses on git's 7-hex todo" \
-    test "$p57_gp_skip_rc" = 1
-check "phase57: ...but its message likewise names --abort, not --continue/--skip" \
-    sh -c 'grep -q -- "--abort" "$0" && ! grep -qE -- "run \`?sg cherry-pick (--continue|--skip)" "$0"' \
-    "$P57_GP_SKIP.out"
+check "phase68c: sg cherry-pick --skip on git's 7-hex todo now succeeds (exit 0), the dead end is closed" \
+    test "$p57_gp_skip_rc" = 0
+check "phase68c: ...and finishes the sequence (CHERRY_PICK_HEAD and sequencer/ are both gone)" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD" -a ! -d "$0/.git/sequencer"' "$P57_GP_SKIP"
 
 # sg status: the banner must print on EXISTENCE, not on a full parse --
 # git's own 7-hex sequencer/todo must not make the banner line disappear
@@ -15019,8 +15035,10 @@ check "phase57b: real git accepts sg's full-hex todo field as a valid object id"
 
 # Item 4 (review finding): 57a's spec 5b escape-hatch fix has two named
 # interop checks for cherry-pick (a REAL git binary pauses, then sg's
-# --quit/--abort must still work even though sg cannot read git's 7-hex
-# todo). Revert shares the exact same code path, but nothing had ever
+# --quit/--abort must still work even though sg could not read git's 7-hex
+# todo at all before Phase 68c -- --quit/--abort never needed to read it in
+# the first place, which is why this still holds unchanged after that
+# phase). Revert shares the exact same code path, but nothing had ever
 # built the git-paused fixture for revert specifically. "$P57B_MULTI-git"
 # above is already exactly that fixture (real git paused a two-commit
 # revert on it), so it is reused here rather than rebuilt.
@@ -15043,15 +15061,19 @@ check "phase57b: sg revert --abort recovers a revert a REAL GIT BINARY paused"  
 check "phase57b: ...restoring master to the exact commit git's own sequencer/head named"     sh -c 'test "$(cd "$0" && LC_ALL=C git rev-parse master)" = "$1"' "$P57B_GP_ABORT"     "$P57B_MULTI_PRE_MASTER"
 check "phase57b: ...and clearing the paused state"     sh -c 'test ! -f "$0/.git/REVERT_HEAD" -a ! -d "$0/.git/sequencer"' "$P57B_GP_ABORT"
 
+# As of Phase 68c the 7-hex todo now parses, so with the conflict left
+# UNRESOLVED, --continue refuses for the ordinary reason (same shape as
+# cherry-pick's own P57_GP_CONT block above), not "state is corrupt".
 P57B_GP_CONT="$WORKDIR/p57b_gitpaused_continue"
 rm -rf "$P57B_GP_CONT"
 cp -R "$P57B_MULTI-git" "$P57B_GP_CONT"
 (cd "$P57B_GP_CONT" && "$SG" revert --continue) > "$P57B_GP_CONT.out" 2>&1
 p57b_gp_cont_rc=$?
-check "phase57b: sg revert --continue still refuses on git's 7-hex todo"     test "$p57b_gp_cont_rc" = 1
-check "phase57b: ...but its message names --abort, a command that actually works on this input"     sh -c 'grep -q -- "--abort" "$0"' "$P57B_GP_CONT.out"
-check "phase57b: ...and does NOT tell the user to re-run --continue or --skip (which fail identically)"     sh -c '! grep -qE -- "run \`?sg revert (--continue|--skip)" "$0"' "$P57B_GP_CONT.out"
-check "phase57b: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit)"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GP_CONT"
+check "phase68c revert continue: sg revert --continue on git's 7-hex todo now parses it -- with the conflict still unresolved it refuses for the ordinary reason"     test "$p57b_gp_cont_rc" = 1
+check "phase68c revert continue: ...its message names the unresolved path"     sh -c 'grep -q "unresolved conflicts remain" "$0" && grep -q "r.txt" "$0"' "$P57B_GP_CONT.out"
+check "phase68c revert continue: ...and does NOT name --abort (the dead-end wording is actually gone, not just unmentioned by coincidence)"     sh -c '! grep -q "[-][-]abort" "$0"' "$P57B_GP_CONT.out"
+check "phase68c revert continue: ...and it DOES tell the user to resolve and re-run --continue"     sh -c 'grep -qE -- "run \`?sg add" "$0" && grep -qE -- "sg revert --continue" "$0"' "$P57B_GP_CONT.out"
+check "phase68c revert continue: ...and the paused state SURVIVES the refusal (still recoverable via --abort/--quit/resolve+--continue)"     sh -c 'test -f "$0/.git/REVERT_HEAD"' "$P57B_GP_CONT"
 
 P57B_GP_STATUS="$WORKDIR/p57b_gitpaused_status"
 rm -rf "$P57B_GP_STATUS"
@@ -15404,11 +15426,11 @@ sed -n '/currently rebasing/,/^$/p' "$P58_STATUS.out" > "$P58_STATUS.banner"
 check "phase58: the degraded hint names --quit" \
     sh -c 'grep -q -- "--quit" "$0"' "$P58_STATUS.banner"
 check "phase58: the degraded hint does NOT name --continue" \
-    sh -c '! grep -q -- "--continue" "$0"' "$P58_STATUS.banner"
+    sh -c '! grep -q "[-][-]continue" "$0"' "$P58_STATUS.banner"
 check "phase58: the degraded hint does NOT name --skip" \
-    sh -c '! grep -q -- "--skip" "$0"' "$P58_STATUS.banner"
+    sh -c '! grep -q "[-][-]skip" "$0"' "$P58_STATUS.banner"
 check "phase58: the degraded hint does NOT name --abort" \
-    sh -c '! grep -q -- "--abort" "$0"' "$P58_STATUS.banner"
+    sh -c '! grep -q "[-][-]abort" "$0"' "$P58_STATUS.banner"
 
 P58_STATUS_GIT="$WORKDIR/p58_status_git_oracle"
 rm -rf "$P58_STATUS_GIT"
@@ -18297,6 +18319,695 @@ check "phase67 review: a stored '+0060' against a local '+0100' -- the same 3600
 p67r_cmp tz100 XXX-1 $P67R_NOW --date=human "$P67R_TZ100"
 check "phase67 review: the control for that pair -- the canonical '+0100' spelling of the same offset is suppressed, so neither check alone is satisfied by the wrong rule" \
     cmp -s "$WORKDIR/p67r_sg_tz100.txt" "$WORKDIR/p67r_git_tz100.txt"
+
+# --- Phase 68b: abbreviated (prefix) object name resolution ---
+# Two commits (so a 40-hex ref name can point somewhere DIFFERENT from the
+# oid it borrows, and so a suffix like "~1" has a real parent to walk to),
+# plus two crafted object collisions: a 4-way one (tag+commit+tree+blob, all
+# sharing one hex prefix) for the ambiguity block's full shape (section 3/3b
+# of the Phase 68 spec), and a 2-way one (a REAL commit + a crafted blob
+# sharing ITS prefix) for the positive dwim case -- exactly one commit-ish
+# candidate, so `sg log`/`sg reset` resolve while every STRICT command still
+# refuses on the same input.
+P68="$WORKDIR/phase68"
+mkdir -p "$P68"
+git init -q "$P68"
+(cd "$P68" && git config user.email "p68@example.com" && git config user.name "p68 tester")
+printf 'base\n' > "$P68/base.txt"
+(cd "$P68" && git add base.txt && git commit -q -m "c0 base")
+printf 'second\n' > "$P68/second.txt"
+(cd "$P68" && git add second.txt && git commit -q -m "c1 second")
+P68_C0=$(cd "$P68" && git rev-list --max-parents=0 HEAD)
+P68_C1=$(cd "$P68" && git rev-parse HEAD)
+
+P68_FIX=$(python3 - "$P68" "$P68_C1" <<'PYEOF'
+import hashlib, os, subprocess, sys, binascii
+
+worktree, c1 = sys.argv[1], sys.argv[2]
+
+def obj_hash(kind, content):
+    header = ("%s %d\0" % (kind, len(content))).encode()
+    return hashlib.sha1(header + content).hexdigest()
+
+def brute(kind, want, make_content, maxtries=5_000_000):
+    i = 0
+    while i < maxtries:
+        content = make_content(i)
+        oid = obj_hash(kind, content)
+        if oid.startswith(want):
+            return oid, content, i
+        i += 1
+    raise SystemExit("phase68 fixture: no match for %s/%s" % (kind, want))
+
+def writeobj(kind, oid, content):
+    p = subprocess.run(["git", "hash-object", "-t", kind, "-w", "--stdin", "--literally"],
+                       cwd=worktree, env=os.environ, input=content, capture_output=True)
+    got = p.stdout.decode().strip()
+    assert got == oid, (kind, got, oid, p.stderr)
+
+# --- 4-way collision: tag, commit, tree, blob, all on one prefix ---
+target = "abcd"
+blob_oid, blob_c, blob_i = brute("blob", target, lambda i: ("p68body%d\n" % i).encode())
+placeholder = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+def tree_content(i):
+    raw = binascii.unhexlify(placeholder)
+    name = ("p68f%d.txt" % i).encode()
+    return b"100644 " + name + b"\x00" + raw
+tree_oid, tree_c, tree_i = brute("tree", target, tree_content)
+def commit_content(i):
+    msg = "p68 line one\np68 line two\n\np68 body msg %d\n" % i
+    s = ("tree %s\nauthor P68 Tester <p68@example.com> 1700000000 +0000\n"
+        "committer P68 Tester <p68@example.com> 1700000000 +0000\n\n%s" % (tree_oid, msg))
+    return s.encode()
+commit_oid, commit_c, commit_i = brute("commit", target, commit_content)
+def tag_content(i):
+    s = ("object %s\ntype commit\ntag p68t%d\n"
+        "tagger P68 Tester <p68@example.com> 1700000000 +0000\n\np68 tag message\n" % (c1, i))
+    return s.encode()
+tag_oid, tag_c, tag_i = brute("tag", target, tag_content)
+writeobj("blob", blob_oid, blob_c)
+writeobj("tree", tree_oid, tree_c)
+writeobj("commit", commit_oid, commit_c)
+writeobj("tag", tag_oid, tag_c)
+
+# --- 2-way collision: the REAL commit c1, plus a crafted blob on c1's own
+# prefix -- exactly one commit-ish candidate (dwim's positive case). ---
+target2 = c1[:4]
+blob2_oid, blob2_c, blob2_i = brute("blob", target2, lambda i: ("p68solo%d\n" % i).encode())
+writeobj("blob", blob2_oid, blob2_c)
+
+print("P68_PREFIX=%s" % target)
+print("P68_BLOB=%s" % blob_oid)
+print("P68_TREE=%s" % tree_oid)
+print("P68_COMMIT=%s" % commit_oid)
+print("P68_TAG=%s" % tag_oid)
+print("P68_TREEFILE=p68f%d.txt" % tree_i)
+print("P68_PREFIX2=%s" % target2)
+print("P68_BLOB2=%s" % blob2_oid)
+PYEOF
+)
+eval "$P68_FIX"
+
+# --- Phase 68b review round 3: a tag pointing at a BLOB. Membership must
+# be decided by the PEELED type, not the tag's own raw type -- a
+# self-contained fixture, independent of P68_PREFIX/P68_PREFIX2 above (a
+# fresh commit, not P68_C1, so it cannot collide with either of those). ---
+P68_TB_FIX=$(python3 - "$P68" <<'PYEOF'
+import hashlib, os, subprocess, sys, binascii
+
+worktree = sys.argv[1]
+
+def obj_hash(kind, content):
+    header = ("%s %d\0" % (kind, len(content))).encode()
+    return hashlib.sha1(header + content).hexdigest()
+
+def brute(kind, want, make_content, maxtries=5_000_000):
+    i = 0
+    while i < maxtries:
+        content = make_content(i)
+        oid = obj_hash(kind, content)
+        if oid.startswith(want):
+            return oid, content, i
+        i += 1
+    raise SystemExit("phase68 tag-to-blob fixture: no match for %s/%s" % (kind, want))
+
+def writeobj(kind, oid, content):
+    p = subprocess.run(["git", "hash-object", "-t", kind, "-w", "--stdin", "--literally"],
+                       cwd=worktree, env=os.environ, input=content, capture_output=True)
+    got = p.stdout.decode().strip()
+    assert got == oid, (kind, got, oid, p.stderr)
+
+# an existing, real tree to anchor the crafted commit to (avoids also
+# having to brute-force a tree just for this)
+real_tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=worktree, env=os.environ,
+                           capture_output=True, text=True).stdout.strip()
+
+target = "beef"
+blob_oid, blob_c, _ = brute("blob", target, lambda i: ("p68tagblob%d\n" % i).encode())
+def commit_content(i):
+    s = ("tree %s\nauthor P68 Tester <p68@example.com> 1700000000 +0000\n"
+        "committer P68 Tester <p68@example.com> 1700000000 +0000\n\np68 tagblob commit %d\n" % (real_tree, i))
+    return s.encode()
+commit_oid, commit_c, _ = brute("commit", target, commit_content)
+def tag_content(i):
+    # points at the BLOB, type "blob" -- the whole point of this fixture
+    s = ("object %s\ntype blob\ntag p68tb%d\n"
+        "tagger P68 Tester <p68@example.com> 1700000000 +0000\n\ntag to a blob\n" % (blob_oid, i))
+    return s.encode()
+tag_oid, tag_c, _ = brute("tag", target, tag_content)
+placeholder = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+def tree_content(i):
+    raw = binascii.unhexlify(placeholder)
+    name = ("p68tb%d.txt" % i).encode()
+    return b"100644 " + name + b"\x00" + raw
+tree_oid, tree_c, tree_i = brute("tree", target, tree_content)
+
+writeobj("blob", blob_oid, blob_c)
+writeobj("commit", commit_oid, commit_c)
+writeobj("tag", tag_oid, tag_c)
+writeobj("tree", tree_oid, tree_c)
+
+print("P68_TB_PREFIX=%s" % target)
+print("P68_TB_COMMIT=%s" % commit_oid)
+print("P68_TB_TREEFILE=p68tb%d.txt" % tree_i)
+PYEOF
+)
+eval "$P68_TB_FIX"
+
+# Item 1/2's positive check: tag(->blob) + a real commit -- COMMITTISH must
+# resolve (only the commit is peeled-commit-ish; the tag does not count).
+(cd "$P68" && LC_ALL=C git log --oneline -1 "$P68_TB_PREFIX") > "$WORKDIR/p68_git_tagblob_committish.txt" 2>&1
+(cd "$P68" && "$SG" log --oneline -1 "$P68_TB_PREFIX") > "$WORKDIR/p68_sg_tagblob_committish.txt" 2>&1
+check "phase68 review: COMMITTISH resolves a tag(->blob) + real-commit collision (the tag does not count, only the commit does), matches git" \
+    cmp -s "$WORKDIR/p68_sg_tagblob_committish.txt" "$WORKDIR/p68_git_tagblob_committish.txt"
+check "phase68 review oracle: precondition -- git really did resolve (not refuse) the tag(->blob)+commit collision" \
+    sh -c "! grep -q 'ambiguous' '$WORKDIR/p68_git_tagblob_committish.txt'"
+
+# Item 1/2's negative check: same tag(->blob), plus the SAME commit, plus a
+# tree -- TREEISH must refuse (commit + tree both count, two matches), and
+# the printed candidate list must be exactly those two rows, excluding the
+# tag(->blob) entirely.
+(cd "$P68" && LC_ALL=C git cat-file -p "${P68_TB_PREFIX}:${P68_TB_TREEFILE}") > "$WORKDIR/p68_git_tagblob_treeish.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -p "${P68_TB_PREFIX}:${P68_TB_TREEFILE}") > "$WORKDIR/p68_sg_tagblob_treeish.txt" 2>&1
+sed '$d' "$WORKDIR/p68_git_tagblob_treeish.txt" > "$WORKDIR/p68_git_tagblob_treeish.trimmed"
+sed '$d' "$WORKDIR/p68_sg_tagblob_treeish.txt" > "$WORKDIR/p68_sg_tagblob_treeish.trimmed"
+check "phase68 review: TREEISH refuses a tag(->blob)+commit+tree collision (commit and tree both count, the tag does not) with a 2-row list, matches git byte for byte" \
+    cmp -s "$WORKDIR/p68_sg_tagblob_treeish.trimmed" "$WORKDIR/p68_git_tagblob_treeish.trimmed"
+check "phase68 review oracle: precondition -- the block really has exactly 2 hint lines (commit, tree -- NOT 3, the tag(->blob) must be excluded)" \
+    sh -c "[ \$(grep -c '^hint:   ' '$WORKDIR/p68_git_tagblob_treeish.trimmed') -eq 2 ] && \
+          ! grep -q ' tag ' '$WORKDIR/p68_git_tagblob_treeish.trimmed'"
+
+# unique-prefix resolution at 4/7/39 hex, mixed case -- no collision
+# involved. Note: P68_C1's own 4-hex prefix is deliberately NOT used here
+# for the length-4 case -- P68_PREFIX2 (above) made it ambiguous on
+# purpose (a crafted blob shares it), so the "unique" 4-hex case uses
+# P68_C0 instead, whose prefix was never targeted by anything crafted.
+P68_C0_4=$(printf '%s' "$P68_C0" | cut -c1-4)
+P68_C1_7=$(printf '%s' "$P68_C1" | cut -c1-7)
+P68_C1_39=$(printf '%s' "$P68_C1" | cut -c1-39)
+P68_C0_4_UPPER=$(printf '%s' "$P68_C0_4" | tr 'a-f' 'A-F')
+for p68len in P68_C0_4 P68_C1_7 P68_C1_39 P68_C0_4_UPPER; do
+    eval "p68val=\$$p68len"
+    (cd "$P68" && LC_ALL=C git cat-file -p "$p68val") > "$WORKDIR/p68_git_$p68len.txt" 2>&1
+    (cd "$P68" && "$SG" cat-file -p "$p68val") > "$WORKDIR/p68_sg_$p68len.txt" 2>&1
+    check "phase68: sg cat-file -p on a unique abbreviated prefix ($p68len) matches git" \
+        cmp -s "$WORKDIR/p68_sg_$p68len.txt" "$WORKDIR/p68_git_$p68len.txt"
+done
+
+# --- the ambiguity block, byte for byte, minus the trailing per-command
+# "fatal:"/"sg: ..." line (git exits 128, sg exits 1 -- this project's
+# standing 0-or-1 divergence, the same shape as divergence #3). ---
+(cd "$P68" && LC_ALL=C git cat-file -t "$P68_PREFIX") > "$WORKDIR/p68_git_amb4.txt" 2>&1
+P68_GIT_AMB4_RC=$?
+(cd "$P68" && "$SG" cat-file -t "$P68_PREFIX") > "$WORKDIR/p68_sg_amb4.txt" 2>&1
+P68_SG_AMB4_RC=$?
+sed '$d' "$WORKDIR/p68_git_amb4.txt" > "$WORKDIR/p68_git_amb4.trimmed"
+sed '$d' "$WORKDIR/p68_sg_amb4.txt" > "$WORKDIR/p68_sg_amb4.trimmed"
+check "phase68: the error:/hint: ambiguity block (4-way tag+commit+tree+blob collision, STRICT, full candidate list, folded subject, author date in stored offset) matches git byte for byte" \
+    cmp -s "$WORKDIR/p68_sg_amb4.trimmed" "$WORKDIR/p68_git_amb4.trimmed"
+check "phase68: git exits 128 on an ambiguous prefix" test "$P68_GIT_AMB4_RC" -eq 128
+check "phase68: sg exits 1 on an ambiguous prefix (this project's 0-or-1 exit-code convention, a deliberate divergence -- see CLAUDE.md's divergence #3)" \
+    test "$P68_SG_AMB4_RC" -eq 1
+
+P68_PREFIX_UPPER=$(printf '%s' "$P68_PREFIX" | tr 'a-f' 'A-F')
+(cd "$P68" && "$SG" cat-file -t "$P68_PREFIX_UPPER") > "$WORKDIR/p68_sg_amb4_upper.txt" 2>&1
+check "phase68: the error: line echoes an uppercase-typed prefix LOWERCASED, matching git" \
+    sh -c "head -1 '$WORKDIR/p68_sg_amb4_upper.txt' | grep -qx 'error: short object ID $P68_PREFIX is ambiguous'"
+
+# --- dwim: sg log/sg reset resolve where exactly one candidate is
+# commit-ish; every STRICT command on the SAME prefix still refuses. ---
+(cd "$P68" && LC_ALL=C git log --oneline -1 "$P68_PREFIX2") > "$WORKDIR/p68_git_dwimlog.txt" 2>&1
+(cd "$P68" && "$SG" log --oneline -1 "$P68_PREFIX2") > "$WORKDIR/p68_sg_dwimlog.txt" 2>&1
+check "phase68: sg log --oneline -1 on a prefix with exactly one commit-ish candidate resolves and matches git (positive dwim)" \
+    cmp -s "$WORKDIR/p68_sg_dwimlog.txt" "$WORKDIR/p68_git_dwimlog.txt"
+
+P68_RESET_GIT="$WORKDIR/p68_reset_git"
+P68_RESET_SG="$WORKDIR/p68_reset_sg"
+rm -rf "$P68_RESET_GIT" "$P68_RESET_SG"
+cp -R "$P68" "$P68_RESET_GIT"
+cp -R "$P68" "$P68_RESET_SG"
+(cd "$P68_RESET_GIT" && LC_ALL=C git reset --hard "$P68_PREFIX2") > "$WORKDIR/p68_git_dwimreset.txt" 2>&1
+(cd "$P68_RESET_SG" && "$SG" reset --hard "$P68_PREFIX2") > /dev/null 2>&1
+(cd "$P68_RESET_GIT" && LC_ALL=C git rev-parse HEAD) > "$WORKDIR/p68_git_dwimreset_head.txt" 2>&1
+(cd "$P68_RESET_SG" && LC_ALL=C git rev-parse HEAD) > "$WORKDIR/p68_sg_dwimreset_head.txt" 2>&1
+check "phase68: sg reset --hard on a prefix with exactly one commit-ish candidate resolves to the SAME commit as git (positive dwim, sg reset is the other COMMITTISH caller)" \
+    cmp -s "$WORKDIR/p68_sg_dwimreset_head.txt" "$WORKDIR/p68_git_dwimreset_head.txt"
+
+(cd "$P68" && LC_ALL=C git show "$P68_PREFIX2") > /dev/null 2>"$WORKDIR/p68_git_showstrict.err"
+P68_GIT_SHOWSTRICT_RC=$?
+(cd "$P68" && "$SG" show "$P68_PREFIX2") > /dev/null 2>"$WORKDIR/p68_sg_showstrict.err"
+P68_SG_SHOWSTRICT_RC=$?
+check "phase68: git show refuses the SAME ambiguous prefix that sg log/sg reset resolve (negative dwim, git side)" \
+    test "$P68_GIT_SHOWSTRICT_RC" -eq 128
+check "phase68: sg show refuses the SAME ambiguous prefix that sg log/sg reset resolve (negative dwim, sg side -- head-on pair with the two checks above)" \
+    test "$P68_SG_SHOWSTRICT_RC" -eq 1
+
+(cd "$P68" && LC_ALL=C git merge-base "$P68_PREFIX2" HEAD) > /dev/null 2>&1
+check "phase68: git merge-base refuses the same ambiguous prefix (negative dwim)" test $? -eq 128
+(cd "$P68" && "$SG" merge-base "$P68_PREFIX2" HEAD) > /dev/null 2>&1
+check "phase68: sg merge-base refuses the same ambiguous prefix (negative dwim)" test $? -eq 1
+
+(cd "$P68" && LC_ALL=C git diff "$P68_PREFIX2") > /dev/null 2>&1
+check "phase68: git diff refuses the same ambiguous prefix (negative dwim)" test $? -eq 128
+(cd "$P68" && "$SG" diff "$P68_PREFIX2") > "$WORKDIR/p68_sg_diffamb.txt" 2>&1
+check "phase68: sg diff refuses the same ambiguous prefix (negative dwim)" test $? -eq 1
+
+# review round 3: `sg diff <amb>`'s -4 handling goes through
+# sg_cli_split_revs_and_paths (cli_args.c), the classifier every bare
+# positional argument passes through BEFORE the pathspec fallback -- a
+# check that only asserts exit code 1 cannot tell "the ambiguity block
+# fired" apart from "the -4 branch was silently removed and this fell
+# through to the ORDINARY not-a-revision/not-a-path message", since both
+# shapes exit 1. Assert the actual message content instead.
+check "phase68 review: sg diff <amb>'s refusal is the error:/hint: ambiguity block, not the classifier's generic pathspec-fallback wording" \
+    sh -c "grep -q '^error: short object ID .* is ambiguous\$' '$WORKDIR/p68_sg_diffamb.txt' && \
+          grep -q '^hint: The candidates are:\$' '$WORKDIR/p68_sg_diffamb.txt' && \
+          ! grep -q 'no such path in the working directory' '$WORKDIR/p68_sg_diffamb.txt'"
+
+# --- trigger 2: a suffix escalates a STRICT command's base to commit-ish,
+# independent of the command. sg show (STRICT) refuses the bare prefix
+# above; the SAME prefix with "~1" resolves, matching git, and the
+# candidate hint list the bare form would print is narrowed the same way
+# sg log's own hint list is (see sg_cli_report_ambiguous_oid's own
+# comment). ---
+(cd "$P68" && LC_ALL=C git cat-file -t "${P68_PREFIX2}~1") > "$WORKDIR/p68_git_suffix.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -t "${P68_PREFIX2}~1") > "$WORKDIR/p68_sg_suffix.txt" 2>&1
+check "phase68: a '~1' suffix makes a STRICT command's ambiguous BASE resolve as commit-ish (trigger 2), matching git" \
+    cmp -s "$WORKDIR/p68_sg_suffix.txt" "$WORKDIR/p68_git_suffix.txt"
+
+# --- ref beats oid, in BOTH directions (section 2 and 5b of the spec). ---
+P68_REFWIN="$WORKDIR/p68_refwin"
+rm -rf "$P68_REFWIN"
+cp -R "$P68" "$P68_REFWIN"
+P68_C1_6=$(printf '%s' "$P68_C1" | cut -c1-6)
+(cd "$P68_REFWIN" && git branch "$P68_C1_6" "$P68_C0") > /dev/null 2>&1
+(cd "$P68_REFWIN" && LC_ALL=C git cat-file -p "$P68_C1_6") > "$WORKDIR/p68_git_refwin6.txt" 2>/dev/null
+(cd "$P68_REFWIN" && "$SG" cat-file -p "$P68_C1_6") > "$WORKDIR/p68_sg_refwin6.txt" 2>/dev/null
+check "phase68: a branch literally named with a valid 6-hex abbreviation WINS over the prefix interpretation (matches git, resolves to the branch's OWN target, not the object the hex would otherwise abbreviate)" \
+    cmp -s "$WORKDIR/p68_sg_refwin6.txt" "$WORKDIR/p68_git_refwin6.txt"
+check "phase68 oracle: precondition -- the 6-hex branch name really is a DIFFERENT object from what it points at (otherwise the check above cannot tell ref-wins from oid-wins)" \
+    sh -c "[ '$P68_C1_6' != '$(printf '%s' "$P68_C0" | cut -c1-6)' ]"
+
+P68_REFLOSE="$WORKDIR/p68_reflose"
+rm -rf "$P68_REFLOSE"
+cp -R "$P68" "$P68_REFLOSE"
+(cd "$P68_REFLOSE" && git branch "$P68_C0" "$P68_C1") > /dev/null 2>&1
+(cd "$P68_REFLOSE" && LC_ALL=C git cat-file -p "$P68_C0") > "$WORKDIR/p68_git_reflose.txt" 2>/dev/null
+(cd "$P68_REFLOSE" && "$SG" cat-file -p "$P68_C0") > "$WORKDIR/p68_sg_reflose.txt" 2>/dev/null
+check "phase68: a branch literally named with a FULL 40-hex oid LOSES to the oid interpretation (mirror image of the 6-hex check above, pinned as a head-on pair)" \
+    cmp -s "$WORKDIR/p68_sg_reflose.txt" "$WORKDIR/p68_git_reflose.txt"
+
+# --- sg rebase never reaches sg_rev_parse_commit at all (section 9 of the
+# spec, a pre-existing gap this phase does not close) -- pinned as a named
+# divergence so it has a witness, not just a paragraph in CLAUDE.md. ---
+P68_REBASE="$WORKDIR/p68_rebase_gap"
+rm -rf "$P68_REBASE"
+cp -R "$P68" "$P68_REBASE"
+(cd "$P68_REBASE" && git checkout -q -b p68side "$P68_C0" && printf 'side\n' > side.txt && git add side.txt && git commit -q -m side)
+(cd "$P68_REBASE" && LC_ALL=C git rebase "$P68_C1") > /dev/null 2>&1
+check "phase68 oracle: precondition -- real git accepts a 40-hex <upstream> for rebase" test $? -eq 0
+(cd "$P68_REBASE" && git rebase --abort) > /dev/null 2>&1
+(cd "$P68_REBASE" && "$SG" rebase "$P68_C1") > /dev/null 2>&1
+check "phase68: sg rebase does NOT accept a 40-hex <upstream> (recorded gap, section 9 of the Phase 68 spec -- sg rebase never calls sg_rev_parse_commit at all)" \
+    test $? -ne 0
+
+# --- Phase 68b review round: the SG_REV_TREEISH mode for "<rev>:<path>" ---
+# The bug this closes: sg_rev_parse_object used to hand resolve_rev_path's
+# rev half to plain (STRICT) resolution, so an ambiguous prefix that git
+# resolves via its TREEISH dwim (exactly one of {tag,commit,tree} matches)
+# was wrongly refused by sg. Positive check first: a UNIQUE prefix's own
+# ":path" form, which was NEVER broken (no disambiguation involved at all),
+# pinned here as the regression guard for this exact fix.
+(cd "$P68" && LC_ALL=C git cat-file -p "$P68_C1_7:second.txt") > "$WORKDIR/p68_git_uniquecolon.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -p "$P68_C1_7:second.txt") > "$WORKDIR/p68_sg_uniquecolon.txt" 2>&1
+check "phase68 review: sg cat-file -p on a UNIQUE prefix's <rev>:<path> form matches git" \
+    cmp -s "$WORKDIR/p68_sg_uniquecolon.txt" "$WORKDIR/p68_git_uniquecolon.txt"
+(cd "$P68" && LC_ALL=C git show "$P68_C1_7:second.txt") > "$WORKDIR/p68_git_uniquecolonshow.txt" 2>&1
+(cd "$P68" && "$SG" show "$P68_C1_7:second.txt") > "$WORKDIR/p68_sg_uniquecolonshow.txt" 2>&1
+check "phase68 review: sg show on the SAME unique prefix's <rev>:<path> form matches git" \
+    cmp -s "$WORKDIR/p68_sg_uniquecolonshow.txt" "$WORKDIR/p68_git_uniquecolonshow.txt"
+
+# The bug's actual reproducer: P68_PREFIX2 (a real commit + a crafted blob,
+# no tag/tree) has exactly ONE tree-ish candidate (the commit) -- git
+# resolves "<amb>:<path>" there, and pre-fix sg wrongly refused it.
+(cd "$P68" && LC_ALL=C git cat-file -p "$P68_PREFIX2:second.txt") > "$WORKDIR/p68_git_treeishresolve.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -p "$P68_PREFIX2:second.txt") > "$WORKDIR/p68_sg_treeishresolve.txt" 2>&1
+check "phase68 review: sg cat-file -p resolves <amb>:<path> when exactly one candidate is tree-ish (the bug's own reproducer), matching git" \
+    cmp -s "$WORKDIR/p68_sg_treeishresolve.txt" "$WORKDIR/p68_git_treeishresolve.txt"
+check "phase68 review oracle: precondition -- git really did resolve (not refuse) the reproducer above" \
+    sh -c "[ -s '$WORKDIR/p68_git_treeishresolve.txt' ] && ! grep -q 'ambiguous' '$WORKDIR/p68_git_treeishresolve.txt'"
+
+# The negative half: P68_PREFIX (tag+commit+tree+blob) has THREE tree-ish
+# candidates, so "<amb>:<path>" must still refuse, with a candidate list
+# NARROWED to exactly those three (tag, commit, tree -- the blob dropped),
+# distinct from both the STRICT (4-row) and COMMITTISH (2-row) lists the
+# same fixture produces under the other two operators (see the three-way
+# block below).
+(cd "$P68" && LC_ALL=C git cat-file -p "$P68_PREFIX:$P68_TREEFILE") > "$WORKDIR/p68_git_treeishamb.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -p "$P68_PREFIX:$P68_TREEFILE") > "$WORKDIR/p68_sg_treeishamb.txt" 2>&1
+sed '$d' "$WORKDIR/p68_git_treeishamb.txt" > "$WORKDIR/p68_git_treeishamb.trimmed"
+sed '$d' "$WORKDIR/p68_sg_treeishamb.txt" > "$WORKDIR/p68_sg_treeishamb.trimmed"
+check "phase68 review: the TREEISH ambiguity block for <amb>:<path> (3-way tag+commit+tree, blob excluded) matches git byte for byte" \
+    cmp -s "$WORKDIR/p68_sg_treeishamb.trimmed" "$WORKDIR/p68_git_treeishamb.trimmed"
+
+# --- the three-way head-on block: STRICT / COMMITTISH / TREEISH on the
+# IDENTICAL 4-way collision fixture, so a future change that collapses
+# three modes into two turns one of these three red BY NAME. ---
+(cd "$P68" && LC_ALL=C git cat-file -t "$P68_PREFIX") > "$WORKDIR/p68_git_3way_strict.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -t "$P68_PREFIX") > "$WORKDIR/p68_sg_3way_strict.txt" 2>&1
+sed '$d' "$WORKDIR/p68_git_3way_strict.txt" > "$WORKDIR/p68_git_3way_strict.trimmed"
+sed '$d' "$WORKDIR/p68_sg_3way_strict.txt" > "$WORKDIR/p68_sg_3way_strict.trimmed"
+check "phase68 review (3-way #1/3): cat-file -t <amb> on the shared fixture is STRICT (4 rows: tag,commit,tree,blob), matches git" \
+    cmp -s "$WORKDIR/p68_sg_3way_strict.trimmed" "$WORKDIR/p68_git_3way_strict.trimmed"
+check "phase68 review (3-way #1/3) oracle: precondition -- the STRICT block really does carry 4 hint lines" \
+    sh -c "[ \$(grep -c '^hint:   ' '$WORKDIR/p68_git_3way_strict.trimmed') -eq 4 ]"
+
+(cd "$P68" && LC_ALL=C git cat-file -t "${P68_PREFIX}~1") > "$WORKDIR/p68_git_3way_committish.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -t "${P68_PREFIX}~1") > "$WORKDIR/p68_sg_3way_committish.txt" 2>&1
+sed '$d' "$WORKDIR/p68_git_3way_committish.txt" > "$WORKDIR/p68_git_3way_committish.trimmed"
+sed '$d' "$WORKDIR/p68_sg_3way_committish.txt" > "$WORKDIR/p68_sg_3way_committish.trimmed"
+check "phase68 review (3-way #2/3): cat-file -t <amb>~1 on the SAME shared fixture is COMMITTISH (2 rows: tag,commit), matches git" \
+    cmp -s "$WORKDIR/p68_sg_3way_committish.trimmed" "$WORKDIR/p68_git_3way_committish.trimmed"
+check "phase68 review (3-way #2/3) oracle: precondition -- the COMMITTISH block really does carry 2 hint lines" \
+    sh -c "[ \$(grep -c '^hint:   ' '$WORKDIR/p68_git_3way_committish.trimmed') -eq 2 ]"
+
+# review round 3: the report function's own filtering path had ZERO
+# coverage -- the STRICT 4-way fixture above is only ever read through
+# `cat-file -t` (never filters), and the only COMMITTISH fixture used
+# elsewhere (P68_PREFIX2) always resolves cleanly, so
+# sg_cli_report_ambiguous_oid's narrowing code was never actually invoked
+# by anything in this file. `sg log -1` on the SAME 4-way fixture (still
+# genuinely ambiguous even under COMMITTISH: tag AND commit both count)
+# drives it for real, through `sg log`'s own top-level COMMITTISH request
+# this time, not the suffix trigger cat-file used above -- a byte-for-byte
+# comparison, not just an exit code.
+(cd "$P68" && LC_ALL=C git log --oneline -1 "$P68_PREFIX") > "$WORKDIR/p68_git_logfilter.txt" 2>&1
+(cd "$P68" && "$SG" log --oneline -1 "$P68_PREFIX") > "$WORKDIR/p68_sg_logfilter.txt" 2>&1
+# NOT `sed '$d'` here (unlike every other phase68 ambiguity-block trim in
+# this group): `git log`'s own "ambiguous argument" refusal is a THREE-line
+# trailing block ("fatal: ..." + a "Use '--' ..." hint + a quoted example),
+# not the single `fatal:` line `git cat-file`/`git show` print -- deleting
+# only the last line would leave the other two still attached and this
+# check red for a reason that has nothing to do with the ambiguity block
+# itself (measured: found this way, the first draft of this exact check
+# failed on exactly that). Extract only the error:/hint: lines instead, on
+# both sides, robust to however many command-specific lines follow.
+grep -E '^(error:|hint:)' "$WORKDIR/p68_git_logfilter.txt" > "$WORKDIR/p68_git_logfilter.trimmed"
+grep -E '^(error:|hint:)' "$WORKDIR/p68_sg_logfilter.txt" > "$WORKDIR/p68_sg_logfilter.trimmed"
+check "phase68 review: sg log -1 <amb> on the 4-way fixture (genuinely ambiguous even under COMMITTISH) drives the report function's filtering path for real, matches git byte for byte" \
+    cmp -s "$WORKDIR/p68_sg_logfilter.trimmed" "$WORKDIR/p68_git_logfilter.trimmed"
+check "phase68 review oracle: precondition -- this really is the 2-row COMMITTISH block, not a clean resolve" \
+    sh -c "[ \$(grep -c '^hint:   ' '$WORKDIR/p68_git_logfilter.trimmed') -eq 2 ]"
+
+(cd "$P68" && LC_ALL=C git cat-file -p "${P68_PREFIX}:${P68_TREEFILE}") > "$WORKDIR/p68_git_3way_treeish.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -p "${P68_PREFIX}:${P68_TREEFILE}") > "$WORKDIR/p68_sg_3way_treeish.txt" 2>&1
+sed '$d' "$WORKDIR/p68_git_3way_treeish.txt" > "$WORKDIR/p68_git_3way_treeish.trimmed"
+sed '$d' "$WORKDIR/p68_sg_3way_treeish.txt" > "$WORKDIR/p68_sg_3way_treeish.trimmed"
+check "phase68 review (3-way #3/3): cat-file -p <amb>:<path> on the SAME shared fixture is TREEISH (3 rows: tag,commit,tree), matches git" \
+    cmp -s "$WORKDIR/p68_sg_3way_treeish.trimmed" "$WORKDIR/p68_git_3way_treeish.trimmed"
+check "phase68 review (3-way #3/3) oracle: precondition -- the TREEISH block really does carry 3 hint lines, distinct from both #1 (4) and #2 (2)" \
+    sh -c "[ \$(grep -c '^hint:   ' '$WORKDIR/p68_git_3way_treeish.trimmed') -eq 3 ]"
+
+# --- round 5 (second cold review): sg_rev_effective_disambig's own
+# priority order -- a "~"/"^"/"@{" suffix (priority 1) beats a ":<path>"
+# colon (priority 2) -- had ZERO fixture combining the two IN ONE STRING.
+# Reviewed further and confirmed: this ordering can only be OBSERVED at
+# sg_cli_report_ambiguous_oid's own call site, which is handed the
+# UNSPLIT original argument text -- resolve_rev_path (the other caller)
+# always strips the ':<path>' half off before ever reaching this decision,
+# so a hypothetical reordering (checking the colon before the suffix)
+# would be invisible everywhere except here. Same 4-way collision fixture,
+# same file the TREEISH check (#3/3) above just used, but with a "~1"
+# suffix ALSO present in the rev half: the correct answer is the
+# COMMITTISH 2-row block (tag, commit) -- a reversed priority would
+# instead produce the TREEISH 3-row block (tag, commit, tree), since the
+# rev half's own base resolution would never even see the string past the
+# colon needed to find the suffix.
+(cd "$P68" && LC_ALL=C git cat-file -p "${P68_PREFIX}~1:${P68_TREEFILE}") > "$WORKDIR/p68_git_suffixcolon.txt" 2>&1
+(cd "$P68" && "$SG" cat-file -p "${P68_PREFIX}~1:${P68_TREEFILE}") > "$WORKDIR/p68_sg_suffixcolon.txt" 2>&1
+sed '$d' "$WORKDIR/p68_git_suffixcolon.txt" > "$WORKDIR/p68_git_suffixcolon.trimmed"
+sed '$d' "$WORKDIR/p68_sg_suffixcolon.txt" > "$WORKDIR/p68_sg_suffixcolon.trimmed"
+check "phase68 review: a suffix ('~1') takes priority over a colon in the SAME string -- <amb>~1:<path> is COMMITTISH (2 rows: tag,commit), NOT TREEISH (3 rows), matches git byte for byte" \
+    cmp -s "$WORKDIR/p68_sg_suffixcolon.trimmed" "$WORKDIR/p68_git_suffixcolon.trimmed"
+check "phase68 review oracle: precondition -- this really is the 2-row COMMITTISH block (a reversed priority would silently produce the 3-row TREEISH block instead, not an error -- this line is what tells the two apart)" \
+    sh -c "[ \$(grep -c '^hint:   ' '$WORKDIR/p68_git_suffixcolon.trimmed') -eq 2 ] && ! grep -q ' tree\$' '$WORKDIR/p68_git_suffixcolon.trimmed'"
+
+# --- the pre-existing, deliberately-NOT-fixed gap: a bare tree (full
+# 40-hex, no abbreviation involved at all) as the <rev> half of
+# "<rev>:<path>" -- git succeeds, sg still refuses (sg_rev_parse_commit_ex
+# only ever yields a commit). Pinned on both sides so a future change
+# cannot silently start agreeing OR silently regress further. ---
+P68_C1_TREE=$(cd "$P68" && LC_ALL=C git rev-parse HEAD^{tree})
+(cd "$P68" && LC_ALL=C git cat-file -p "$P68_C1_TREE:second.txt") > "$WORKDIR/p68_git_baretree.txt" 2>&1
+P68_GIT_BARETREE_RC=$?
+(cd "$P68" && "$SG" cat-file -p "$P68_C1_TREE:second.txt") > "$WORKDIR/p68_sg_baretree.txt" 2>&1
+P68_SG_BARETREE_RC=$?
+check "phase68 review: git DOES resolve a bare 40-hex tree's own <rev>:<path> form" test "$P68_GIT_BARETREE_RC" -eq 0
+check "phase68 review: sg does NOT (pre-existing gap, predates Phase 68 entirely -- sg_rev_parse_commit_ex only ever yields a commit, deliberately not fixed by this phase)" \
+    test "$P68_SG_BARETREE_RC" -ne 0
+
+# --- <amb>@{0}: measured, not guessed. A bare abbreviated prefix has no
+# reflog (sg_rev_parse_ref_path fails to resolve "abcd" as any ref at all,
+# same as real git -- @{N} needs a REACHABLE ref name, not an object id),
+# so this never reaches the ambiguity machinery on either side; both just
+# refuse with their own ordinary "not a valid name" wording. Only the
+# non-crash / non-zero-exit shape is pinned, per instruction not to
+# fabricate byte parity nothing measures. ---
+(cd "$P68" && LC_ALL=C git cat-file -t "${P68_PREFIX}@{0}") > /dev/null 2>&1
+check "phase68 review: git refuses <amb>@{0} (no reflog for an abbreviated id)" test $? -ne 0
+(cd "$P68" && "$SG" cat-file -t "${P68_PREFIX}@{0}") > /dev/null 2>&1
+check "phase68 review: sg refuses <amb>@{0} too, and does not crash" test $? -ne 0
+
+# --- round 4: sg push's own -4 handling (cmd_push.c's resolve_refspec_src)
+# -- measured (by the main conversation, real git blocked a subagent from
+# running `git push` directly, even against a dead URL) to run entirely
+# BEFORE any network round trip, exactly like the Phase 40 detached-HEAD
+# refusal above -- same technique, port 9 (discard) fails fast and
+# identically on macOS and Linux, no server needed. GIT_TERMINAL_PROMPT=0
+# so a misconfigured environment cannot block on a credential prompt.
+# `git push`'s own remote is written directly into .git/config (same as
+# Phase 40's P40_DET fixture), not via `git remote add`.
+P68_PUSH="$WORKDIR/p68_push"
+rm -rf "$P68_PUSH"
+cp -R "$P68" "$P68_PUSH"
+printf '[remote "origin"]\n\turl = http://127.0.0.1:9/\n' >> "$P68_PUSH/.git/config"
+
+(cd "$P68_PUSH" && LC_ALL=C GIT_TERMINAL_PROMPT=0 git push origin "$P68_PREFIX2:refs/heads/x") \
+    > "$WORKDIR/p68_git_pushamb.txt" 2>&1
+P68_GIT_PUSHAMB_RC=$?
+(cd "$P68_PUSH" && GIT_TERMINAL_PROMPT=0 "$SG" push origin "$P68_PREFIX2:refs/heads/x") \
+    > "$WORKDIR/p68_sg_pushamb.txt" 2>&1
+P68_SG_PUSHAMB_RC=$?
+check "phase68 review: sg push origin <amb>:dst's refusal matches git byte for byte (no trailing-line trim needed here -- both sides' per-command lines happen to read identically: 'error: src refspec ... does not match any' + 'error: failed to push some refs to ...')" \
+    cmp -s "$WORKDIR/p68_sg_pushamb.txt" "$WORKDIR/p68_git_pushamb.txt"
+check "phase68 review: git push origin <amb>:dst exits 1 (an EXCEPTION to the general 128-vs-1 divergence -- both tools agree here, pin it explicitly so a future 'fix' toward 128 has a check in its way)" \
+    test "$P68_GIT_PUSHAMB_RC" -eq 1
+check "phase68 review: sg push origin <amb>:dst exits 1 too" \
+    test "$P68_SG_PUSHAMB_RC" -eq 1
+check "phase68 review oracle: precondition -- the refusal above happened BEFORE any connection attempt (no network-failure wording at all)" \
+    sh -c "! grep -qi \"couldn.t connect\|failed to connect\|unable to access\" '$WORKDIR/p68_git_pushamb.txt'"
+
+# Control: the SAME command with a UNIQUE prefix must actually reach the
+# network and fail there instead -- proving the refusal above came from
+# the ambiguity, not from the dead URL. Each side is pinned to its OWN
+# measured behavior (not compared to each other): git uses exit 128 with
+# its own "fatal: unable to access ... Failed to connect" wording; sg's
+# own convention is exit 1, and its OWN measured wording is different
+# ("sg: GET <url>/info/refs?service=git-receive-pack failed: Couldn't
+# connect to server") -- do not assume the two match, they were each
+# measured independently.
+(cd "$P68_PUSH" && LC_ALL=C GIT_TERMINAL_PROMPT=0 git push origin "$P68_C1_7:refs/heads/x") \
+    > "$WORKDIR/p68_git_pushcontrol.txt" 2>&1
+P68_GIT_PUSHCONTROL_RC=$?
+(cd "$P68_PUSH" && GIT_TERMINAL_PROMPT=0 "$SG" push origin "$P68_C1_7:refs/heads/x") \
+    > "$WORKDIR/p68_sg_pushcontrol.txt" 2>&1
+P68_SG_PUSHCONTROL_RC=$?
+check "phase68 review control: git push origin <unique>:dst on the SAME dead URL reaches the network and fails to CONNECT (exit 128, 'Failed to connect' wording), not the ambiguity path" \
+    sh -c "[ '$P68_GIT_PUSHCONTROL_RC' -eq 128 ] && grep -qi 'failed to connect' '$WORKDIR/p68_git_pushcontrol.txt'"
+check "phase68 review control: sg push origin <unique>:dst also reaches the network (its own connection-failure wording, exit 1 per sg's own convention)" \
+    sh -c "[ '$P68_SG_PUSHCONTROL_RC' -eq 1 ] && grep -qi \"couldn.t connect to server\" '$WORKDIR/p68_sg_pushcontrol.txt'"
+check "phase68 review control: ...and neither side's control output mentions the ambiguity block at all" \
+    sh -c "! grep -q 'is ambiguous' '$WORKDIR/p68_git_pushcontrol.txt' && ! grep -q 'is ambiguous' '$WORKDIR/p68_sg_pushcontrol.txt'"
+
+# ============================================================
+# Phase 68c: sequencer/todo accepts an abbreviated (git's own 7-hex) id.
+# parse_todo_line (src/safety/sequencer.c) now scans a hex span, requires a
+# trailing space, and -- when the span is not exactly 40 characters --
+# resolves it as a 4..39-hex prefix via sg_object_find_prefix (Phase 68b),
+# the same resolver sg_rev_parse_object uses. CHERRY_PICK_HEAD/
+# sequencer/head/abort-safety stay fixed at full 40-hex on both sides
+# (measured -- see the Phase 68c section of docs/DESIGN.md), and sg's OWN
+# write_todo_file keeps writing full 40-hex (wide-in, narrow-out). This
+# closes the one-directional interop dead end CLAUDE.md records: a real
+# git pause used to be readable by sg's status/--abort/--quit but NOT by
+# --continue/--skip, because only sequencer/todo was abbreviated.
+# ============================================================
+P68C_DATE="@1700300000 +0000"
+p68c_commit() {
+    ( cd "$1" && GIT_AUTHOR_DATE="$P68C_DATE" GIT_COMMITTER_DATE="$P68C_DATE" \
+      LC_ALL=C git commit -q -m "$2" ) > /dev/null 2>&1
+}
+
+# Same shape as P57_CONFLICT: master and the feature branch edit the SAME
+# line (conflict on the first pick), and the feature branch carries a
+# SECOND, clean commit after that, so --skip's "discard one, apply the
+# rest" behavior and --continue's "resolve one, apply the rest" behavior
+# both have something real to finish.
+P68C_BASE="$WORKDIR/p68c_base"
+mkdir -p "$P68C_BASE"
+(cd "$P68C_BASE" && LC_ALL=C git init -q -b master .) > /dev/null 2>&1
+printf 'line1\nline2\nline3\n' > "$P68C_BASE/r.txt"
+(cd "$P68C_BASE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p68c_commit "$P68C_BASE" "root"
+(cd "$P68C_BASE" && LC_ALL=C git branch p68cfeat) > /dev/null 2>&1
+(cd "$P68C_BASE" && LC_ALL=C git switch -q p68cfeat) > /dev/null 2>&1
+printf 'line1\nFEATURE\nline3\n' > "$P68C_BASE/r.txt"
+(cd "$P68C_BASE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p68c_commit "$P68C_BASE" "feature edit"
+P68C_FEAT1=$(cd "$P68C_BASE" && LC_ALL=C git rev-parse p68cfeat 2>/dev/null)
+printf 'extra\n' > "$P68C_BASE/extra.txt"
+(cd "$P68C_BASE" && LC_ALL=C git add extra.txt) > /dev/null 2>&1
+p68c_commit "$P68C_BASE" "add extra.txt"
+P68C_FEAT2=$(cd "$P68C_BASE" && LC_ALL=C git rev-parse p68cfeat 2>/dev/null)
+(cd "$P68C_BASE" && LC_ALL=C git switch -q master) > /dev/null 2>&1
+printf 'line1\nMASTER\nline3\n' > "$P68C_BASE/r.txt"
+(cd "$P68C_BASE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+p68c_commit "$P68C_BASE" "master edit"
+P68C_MASTER_BEFORE=$(cd "$P68C_BASE" && LC_ALL=C git rev-parse master 2>/dev/null)
+
+# --- ORACLE: entirely real git, start to finish, to compare final tree
+# shape against (author/committer identity is NOT compared -- see the
+# per-check comments below for why). ---
+P68C_ORACLE="$WORKDIR/p68c_oracle"
+rm -rf "$P68C_ORACLE"
+cp -R "$P68C_BASE" "$P68C_ORACLE"
+(cd "$P68C_ORACLE" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+printf 'line1\nRESOLVED\nline3\n' > "$P68C_ORACLE/r.txt"
+(cd "$P68C_ORACLE" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+(cd "$P68C_ORACLE" && LC_ALL=C git cherry-pick --continue) > /dev/null 2>&1
+check "phase68c oracle: precondition -- an all-real-git cherry-pick of both commits finishes cleanly" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_ORACLE"
+P68C_ORACLE_TREE1=$(cd "$P68C_ORACLE" && LC_ALL=C git rev-parse "HEAD~1^{tree}" 2>/dev/null)
+P68C_ORACLE_TREE2=$(cd "$P68C_ORACLE" && LC_ALL=C git rev-parse "HEAD^{tree}" 2>/dev/null)
+(cd "$P68C_ORACLE" && LC_ALL=C git log --format=%s -2) > "$WORKDIR/p68c_oracle_subjects.txt" 2>/dev/null
+
+# --- direction 1 (the dead end this phase closes): a real git pause,
+# finished by sg's --continue. ---
+P68C_SGCONT="$WORKDIR/p68c_sgcont"
+rm -rf "$P68C_SGCONT"
+cp -R "$P68C_BASE" "$P68C_SGCONT"
+(cd "$P68C_SGCONT" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+check "phase68c oracle: precondition -- the real-git pause used for the sg-continue direction really stopped on the conflict" \
+    sh -c 'test -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_SGCONT"
+check "phase68c oracle: precondition -- ...and its sequencer/todo id field really is 7 hex chars (git's own abbreviation)" \
+    sh -c 'awk "{print length(\$2)}" "$0/.git/sequencer/todo" | grep -qx 7' "$P68C_SGCONT"
+
+printf 'line1\nRESOLVED\nline3\n' > "$P68C_SGCONT/r.txt"
+(cd "$P68C_SGCONT" && "$SG" add r.txt) > /dev/null 2>&1
+(cd "$P68C_SGCONT" && "$SG" cherry-pick --continue) > "$WORKDIR/p68c_sgcont.out" 2>&1
+P68C_SGCONT_RC=$?
+
+check "phase68c: sg cherry-pick --continue on a REAL GIT pause (7-hex todo) exits 0 -- the one-directional dead end is closed" \
+    test "$P68C_SGCONT_RC" -eq 0
+check "phase68c sgcont: ...CHERRY_PICK_HEAD is gone after sg's --continue finishes a git-paused pick" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_SGCONT"
+check "phase68c sgcont: ...sequencer/ is gone after sg's --continue finishes a git-paused pick" \
+    sh -c 'test ! -d "$0/.git/sequencer"' "$P68C_SGCONT"
+(cd "$P68C_SGCONT" && LC_ALL=C git log --format=%s -2) > "$WORKDIR/p68c_sgcont_subjects.txt" 2>/dev/null
+check "phase68c sgcont: ...both commits landed (subjects/order match the oracle's)" \
+    cmp -s "$WORKDIR/p68c_sgcont_subjects.txt" "$WORKDIR/p68c_oracle_subjects.txt"
+P68C_SGCONT_TREE1=$(cd "$P68C_SGCONT" && LC_ALL=C git rev-parse "HEAD~1^{tree}" 2>/dev/null)
+P68C_SGCONT_TREE2=$(cd "$P68C_SGCONT" && LC_ALL=C git rev-parse "HEAD^{tree}" 2>/dev/null)
+check "phase68c sgcont: ...the resolved commit's tree matches the oracle's" \
+    test "$P68C_SGCONT_TREE1" = "$P68C_ORACLE_TREE1"
+check "phase68c sgcont: ...the clean follow-on commit's tree matches the oracle's too" \
+    test "$P68C_SGCONT_TREE2" = "$P68C_ORACLE_TREE2"
+
+# --- direction 2 (recorded in CLAUDE.md as already working before this
+# phase; re-pinned here so a future change to parse_todo_line cannot
+# silently break it): an sg pause (sg's own full-40-hex todo), finished by
+# real git's --continue. ---
+P68C_GITCONT="$WORKDIR/p68c_gitcont"
+rm -rf "$P68C_GITCONT"
+cp -R "$P68C_BASE" "$P68C_GITCONT"
+(cd "$P68C_GITCONT" && "$SG" cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+check "phase68c oracle: precondition -- sg's own pause really stopped on the conflict" \
+    sh -c 'test -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_GITCONT"
+check "phase68c oracle: precondition -- ...and its sequencer/todo id field really is 40 hex chars (sg's own divergence)" \
+    sh -c 'awk "{print length(\$2)}" "$0/.git/sequencer/todo" | grep -qx 40' "$P68C_GITCONT"
+
+printf 'line1\nRESOLVED\nline3\n' > "$P68C_GITCONT/r.txt"
+(cd "$P68C_GITCONT" && LC_ALL=C git add r.txt) > /dev/null 2>&1
+(cd "$P68C_GITCONT" && LC_ALL=C git cherry-pick --continue) > /dev/null 2>&1
+P68C_GITCONT_RC=$?
+
+check "phase68c: real git cherry-pick --continue on AN SG pause (40-hex todo) still exits 0 -- the pre-existing direction, unaffected by this phase" \
+    test "$P68C_GITCONT_RC" -eq 0
+check "phase68c gitcont: ...CHERRY_PICK_HEAD is gone after real git's --continue finishes an sg-paused pick" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_GITCONT"
+check "phase68c gitcont: ...sequencer/ is gone after real git's --continue finishes an sg-paused pick" \
+    sh -c 'test ! -d "$0/.git/sequencer"' "$P68C_GITCONT"
+P68C_GITCONT_TREE1=$(cd "$P68C_GITCONT" && LC_ALL=C git rev-parse "HEAD~1^{tree}" 2>/dev/null)
+P68C_GITCONT_TREE2=$(cd "$P68C_GITCONT" && LC_ALL=C git rev-parse "HEAD^{tree}" 2>/dev/null)
+check "phase68c gitcont: ...the resolved commit's tree matches the oracle's" \
+    test "$P68C_GITCONT_TREE1" = "$P68C_ORACLE_TREE1"
+check "phase68c gitcont: ...the clean follow-on commit's tree matches the oracle's too" \
+    test "$P68C_GITCONT_TREE2" = "$P68C_ORACLE_TREE2"
+
+# --- --abort and --quit must stay usable on a real-git pause (Phase 57's
+# escape hatches; a regression here would resurrect exactly the dead end
+# the Phase 68c section of docs/DESIGN.md measured a way out of). ---
+P68C_ABORT="$WORKDIR/p68c_abort"
+rm -rf "$P68C_ABORT"
+cp -R "$P68C_BASE" "$P68C_ABORT"
+(cd "$P68C_ABORT" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+(cd "$P68C_ABORT" && "$SG" cherry-pick --abort) > "$WORKDIR/p68c_abort.out" 2>&1
+P68C_ABORT_RC=$?
+check "phase68c: sg cherry-pick --abort on a real-git pause (with the phase's wider parse_todo_line in place) still exits 0" \
+    test "$P68C_ABORT_RC" -eq 0
+check "phase68c abort: ...and restores HEAD to the pre-pick commit" \
+    sh -c 'test "$(cd "$0" && LC_ALL=C git rev-parse HEAD)" = "$1"' "$P68C_ABORT" "$P68C_MASTER_BEFORE"
+check "phase68c abort: ...CHERRY_PICK_HEAD is gone" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_ABORT"
+
+P68C_QUIT="$WORKDIR/p68c_quit"
+rm -rf "$P68C_QUIT"
+cp -R "$P68C_BASE" "$P68C_QUIT"
+(cd "$P68C_QUIT" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+(cd "$P68C_QUIT" && "$SG" cherry-pick --quit) > "$WORKDIR/p68c_quit.out" 2>&1
+P68C_QUIT_RC=$?
+check "phase68c: sg cherry-pick --quit on a real-git pause still exits 0" \
+    test "$P68C_QUIT_RC" -eq 0
+check "phase68c quit: ...CHERRY_PICK_HEAD is gone" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_QUIT"
+check "phase68c quit: ...HEAD did NOT move (--quit changes nothing but the state directory's existence)" \
+    sh -c 'test "$(cd "$0" && LC_ALL=C git rev-parse HEAD)" = "$1"' "$P68C_QUIT" "$P68C_MASTER_BEFORE"
+
+# --- a below-minimum-abbreviation id in sequencer/todo is a hard failure,
+# same code path an AMBIGUOUS prefix would take (parse_todo_line fails ->
+# require_state fails -> point at --abort). Genuine ambiguity is covered
+# directly by a planted birthday collision in
+# tests/test_sequencer_state.c; forcing a real one through porcelain here
+# would be impractical, so this fixture instead hand-shortens a real
+# git-written todo field to 3 hex characters (below SG_OID_MIN_ABBREV),
+# which exercises the identical failure path. ---
+P68C_SHORT="$WORKDIR/p68c_short"
+rm -rf "$P68C_SHORT"
+cp -R "$P68C_BASE" "$P68C_SHORT"
+(cd "$P68C_SHORT" && LC_ALL=C git cherry-pick "$P68C_FEAT1" "$P68C_FEAT2") > /dev/null 2>&1
+(cd "$P68C_SHORT" && awk '{print $1, substr($2,1,3), "x"}' .git/sequencer/todo > .git/sequencer/todo.tmp && \
+ mv .git/sequencer/todo.tmp .git/sequencer/todo)
+printf 'line1\nRESOLVED\nline3\n' > "$P68C_SHORT/r.txt"
+(cd "$P68C_SHORT" && "$SG" add r.txt) > /dev/null 2>&1
+(cd "$P68C_SHORT" && "$SG" cherry-pick --continue) > "$WORKDIR/p68c_short.out" 2>&1
+P68C_SHORT_RC=$?
+check "phase68c: a below-minimum-abbreviation todo id refuses --continue (exit 1)" \
+    test "$P68C_SHORT_RC" -eq 1
+check "phase68c: ...and the message points at a command that actually works (--abort), not at --continue/--skip again" \
+    grep -q -- "--abort" "$WORKDIR/p68c_short.out"
+(cd "$P68C_SHORT" && "$SG" cherry-pick --abort) > /dev/null 2>&1
+check "phase68c: ...and --abort, as advised, actually clears it" \
+    sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_SHORT"
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

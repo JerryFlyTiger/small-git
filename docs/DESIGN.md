@@ -9881,6 +9881,14 @@ interoperability: a real `git cherry-pick --continue` can finish a sequence
 
 ### 3. The full-hex `sequencer/todo` divergence
 
+> **Superseded in part by Phase 68c.** The DECISION below (sg writes the
+> full 40) still stands, but its stated REASON expired: sg gained
+> abbreviated-object-name resolution in Phase 68 and `parse_todo_line` was
+> widened to 4..40 hex in Phase 68c, so sg can now read a 7-hex todo back.
+> The standing reason is wide-in / narrow-out, not "sg cannot read it".
+> The rest of this section is left as the record of what was true in Phase
+> 57 rather than rewritten.
+
 git abbreviates the id field to 7 hex characters; sg writes the full 40.
 This is deliberate, not an oversight: **sg has no abbreviated-object-name
 resolution anywhere in this project** (a design choice recorded since
@@ -13930,3 +13938,487 @@ for its own reason, results in the table above) and recorded here rather than
 defended. The same applies to the earlier unit row
 `test_now_is_read_in_the_local_zone`, added by the coordinator before the
 review after a mutation showed the file was blind to the mixed-zone rule.
+
+## Phase 68a: object lookup by abbreviated (prefix) id
+
+The enumeration layer only. No CLI is wired to it yet -- `sg_rev_parse_commit`
+/ `sg_rev_parse_object` still reject an abbreviation, and `interop` is
+unchanged at 3401/3401 for exactly that reason. 68b wires it in, 68c widens
+`sequencer/todo`'s parser.
+
+### 1. What the premise measurement settled before any code was written
+
+The project memory named four premises to measure first, and said to change
+subject if any failed. All four held, and two came out narrower or cheaper
+than assumed:
+
+- **The minimum abbreviation is 4, not "whatever is unique".** `git rev-parse`
+  on a 1/2/3-char prefix fails even when that prefix matches exactly one
+  object; `cat-file -t ec` says `Not a valid object name ec`, not "ambiguous".
+- **`core.abbrev` affects OUTPUT ONLY, never resolution** (`-c core.abbrev=40`
+  still resolves a 5-hex prefix). sg reads no config, so this premise costs
+  nothing -- worth recording, because the opposite would have made the whole
+  phase depend on config reading sg deliberately does not do.
+- **git's ambiguity error is a two-part stderr block**, exit 128 (sg: 1, the
+  standing 0-or-1 convention, the same shape as deliberate divergence #3).
+- **`sequencer/todo` really is the ONLY blocker for git-paused -> sg-resumed
+  cherry-pick**, and the blocker is narrower than the memory assumed: a real
+  `git cherry-pick` pause writes `CHERRY_PICK_HEAD`, `sequencer/head` and
+  `sequencer/abort-safety` as full 40-hex; only `todo` is abbreviated. On that
+  state today, `sg status`, `--abort` and `--quit` all work; only
+  `--continue`/`--skip` refuse.
+
+### 2. The three measured rules that contradict the obvious model
+
+Recorded here because an implementation built on the obvious model passes its
+own tests and is wrong:
+
+1. **The commit-ish dwim is PER-COMMAND, not "does this command need a
+   commit".** Measured over 15 commands with one commit and one blob sharing a
+   4-hex prefix: `git log`, `git reset --hard` and `git rebase` resolve to the
+   commit; `rev-parse`, `show`, `merge-base`, `cat-file`, `diff`, `branch`,
+   `tag`, `switch --detach`, `merge`, `cherry-pick`, `revert` and **`rev-list`**
+   refuse. `rev-list` refusing while `log` resolves, and `merge`/`cherry-pick`
+   refusing at all, each falsify a simpler rule.
+2. **A SUFFIX OPERATOR makes the base commit-ish on its own**, independent of
+   the command: under `rev-parse`, which refuses the bare ambiguous prefix,
+   `<amb>~1`, `<amb>^{commit}` and `<amb>:f.txt` all resolve. So the dwim has
+   two triggers, and an implementation keyed only on the command gets every
+   suffixed form wrong.
+3. **Ref-vs-oid resolves in OPPOSITE directions at length 40 and at length 6.**
+   A branch literally named with a 6-hex prefix WINS over the prefix
+   interpretation (git warns `refname ... is ambiguous`); a branch named with a
+   full 40-hex LOSES to the object id. sg's existing order already produces
+   both answers, provided the new prefix branch sits AFTER the ref lookup.
+
+The dwim's own condition is "exactly ONE candidate is commit-ish": two
+colliding commits make all three dwim commands refuse, and **a tag counts as
+commit-ish and is peeled** (a tag colliding with a blob resolves, under `log`,
+to the tag's target commit).
+
+### 3. The candidate list
+
+    error: short object ID <prefix, LOWERCASED> is ambiguous
+    hint: The candidates are:
+    hint:   <7hex> <type>[ <YYYY-MM-DD> - <subject or tag name>]
+
+Ordered by TYPE first -- `tag`, `commit`, `tree`, `blob` -- then by hex within
+a type, measured with all four planted on one prefix at once (`hash-object -t
+tag` / `-t tree` on objects hashed in Python first, since no porcelain can
+make one land on a chosen prefix). The date is the **author** date rendered in
+the **commit's own stored offset**: measured against a commit whose author and
+committer dates fall three years apart, and separately with stored offsets
+`+0900` and `-1000`, where the printed day follows the stored offset in both
+directions while `TZ` changes nothing. That is exactly `sg_date_format_short`.
+The subject is the FOLDED subject (`fold_subject`, Phase 60c) -- measured on
+commits planted through `hash-object -t commit -w`, since `git commit`'s own
+cleanup erases every shape that distinguishes folding from "the first line".
+
+### 4. What this commit actually adds
+
+`sg_hex_prefix_to_sha1` / `sg_sha1_has_prefix` (`util/hash.c`; `sg_hex_to_sha1`
+is fixed at 40 with no length parameter and could not be reused, though
+`hex_nibble`'s existing case-insensitivity is inherited rather than
+re-decided), `sg_oid_list` + `sg_object_find_prefix` (`storage/objstore.c`,
+sorting and DEDUPLICATING -- an object can be both loose and packed),
+`sg_loose_find_prefix` (`storage/loose.c`, opening only the one
+`objects/<xx>/` the prefix's first byte names), and `sg_pack_find_prefix` +
+`idx_find_prefix` (`storage/pack.c`, a SIBLING of `idx_find` rather than a
+widening of it -- `idx_find`'s callers want its exact 0/1/-1 semantics).
+
+**`nibbles >= 2` is a real precondition of the two enumerators**, documented
+in both headers: the pack fanout buckets by a whole byte, so a 1-nibble prefix
+(whose low nibble `sg_hex_prefix_to_sha1` zero-fills) would scan only the
+`0xN0` bucket and silently miss 15 of 16 real matches. `sg_object_find_prefix`
+enforces `>= 4`, so the public path cannot reach it.
+
+### 5. Two defenses whose failure direction is "resolve to the WRONG object"
+
+Both were added after review, and both are worth stating as a pair because the
+naive version of each looks harmless:
+
+- `sg_loose_find_prefix`'s `opendir` failure now discriminates on `errno`:
+  only `ENOENT`/`ENOTDIR` mean "zero matches"; anything else (EACCES, EMFILE)
+  returns -1. Treating "could not look" as "looked and found nothing" is
+  fail-OPEN, and the consequence is not merely "not found": an unscanned loose
+  half can collapse a genuinely AMBIGUOUS prefix into a falsely unique one.
+- `sg_pack_find_prefix` runs the same mtime staleness check
+  `pack_read_depth_inner` uses, and runs it UNCONDITIONALLY rather than only
+  after a miss. An exact lookup knows whether it hit, so a stale cache there
+  just means "worth a rescan before giving up"; enumeration has no equivalent
+  signal, so a stale scan does not fail, it silently returns an INCOMPLETE
+  candidate list -- the same failure direction as the fail-open above.
+
+### 6. Mutation results, and the three green rows classified
+
+Nine mutations, each red on a check that names the property, on a snapshot
+with nothing else moving (see section 7 for why that qualifier is here):
+
+| mutation | red check |
+|---|---|
+| dedup neutralized | `test_dedup_loose_and_packed` |
+| `SG_OID_MIN_ABBREV` -> 1 | `test_malformed_inputs` (3-char) |
+| upper bound widened to allow 40 | `test_malformed_inputs` (40-char) |
+| `sg_sha1_has_prefix` odd-nibble branch off | `test_near_collision_disambiguates_loose` |
+| `cmp_id_to_prefix` odd-nibble branch off | `test_near_collision_disambiguates_pack` |
+| pack forward scan limited to one match | `test_near_collision_disambiguates_pack` |
+| `idx_find_prefix` binary search `<` -> `<=` | five checks |
+| staleness check reverted to `!pd->scanned` | `test_pack_registry_rescans_after_external_pack_write` |
+| `opendir` errno discrimination reverted | `test_loose_opendir_failure_is_fatal` |
+
+The first draft had **two blind spots and three gaps**, all found by mutation
+(the odd-nibble pair independently found by a cold review as well). The
+diagnosis for the odd-nibble pair is worth keeping: neutralizing that
+comparison just makes the prefix one nibble shorter, and no fixture held two
+objects agreeing on the first n-1 nibbles and differing at the nth, so the
+ANSWER never changed. The fix is a deliberate near-collision fixture, and
+**loose and pack each got their own check** -- one check covering both would
+let a break in one hide behind the other's red line.
+
+Three rows stay green and are **not** coverage gaps. Recorded per this
+project's three-way classification, each measured rather than assumed:
+
+- **`l->cap * 2` -> `l->cap`** (the growth FACTOR): green on a plain build,
+  **ASan ABORTING** (heap-buffer-overflow) on a sanitize build. The mutation
+  produces undefined behaviour, not a wrong answer -- any strategy that grows
+  gives the same answers, and the only way to break it is to stop growing.
+  The discriminator is the sanitizer, the same shape `test_fuzz_pack.c` and
+  `test_fuzz_index.c` are documented to have, and `make sanitize` is already
+  mandatory for this code. **Do not add an assertion for the growth factor.**
+- **`cmp_id_to_prefix`'s `nibbles > 40` clamp**: green under `make test` AND
+  under `make sanitize` (verified by inspecting the matched lines, not a grep
+  count -- the two hits were pre-existing test messages that merely contain
+  the word "AddressSanitizer"). Reachable only by violating the documented
+  `nibbles` precondition directly. Kept for symmetry with the sibling rule
+  `sg_sha1_has_prefix` documents and applies; same disposition as
+  `compact_one_side`'s three witness-less sub-conditions. **Do not go add a
+  test for it.**
+- **`scan_may_be_stale` (the "same wall-clock second" sub-clause)**: green,
+  measured. `test_pack_registry_rescans_after_external_pack_write`
+  deliberately sidesteps it -- the parent's only scan happens while
+  `objects/pack/` does not exist yet, so `scan_mtime` is the `(time_t)-1`
+  sentinel and the real mtime differs unconditionally, rather than the test
+  depending on a one-second race. It is a faithful copy of
+  `pack_read_depth_inner`'s own clause; kept, recorded, not chased.
+
+### 7. Three process failures in this phase, all self-inflicted
+
+- **A control whose two arms agreed by construction.** The oracle harness's
+  `sg rebase <40hex>` divergence row used the root commit's oid -- and the
+  fixture creates a BRANCH named with that same 40-hex for the ref-vs-oid pin,
+  so sg resolved it through the branch lookup and agreed with git for a reason
+  unrelated to the claim. The harness reported it as `EXPECTED DIVERGENCE
+  MISSING`, which is precisely why that list asserts divergence instead of
+  skipping those rows.
+- **Mutations run against a moving tree.** A mutation batch overlapped with an
+  implementer editing the same worktree, and `mutate.sh` copies the working
+  tree as it finds it -- so those results were not attributable to any known
+  snapshot and had to be discarded and re-run after `git add -A` fixed the
+  state. Mutation measurement needs a frozen tree, not merely a recent one.
+- **A mutation aimed one function off target.** `s/if (cmp < 0)/if (cmp <= 0)/`
+  matched `idx_find`'s own binary search (the first occurrence in the file)
+  rather than `idx_find_prefix`'s, and stayed green -- which, followed up,
+  turned out to be its own small finding: with a single-object pack, `idx_find`
+  returns from its exact-match branch before ever reaching the mutated line, so
+  that mutation could not have been observed either way. Re-aimed with the
+  `cmp_id_to_prefix` call as context, it goes red on five checks.
+
+And one caught by the implementer rather than by a gate, of exactly the shape
+this project keeps meeting: the first pack-freshness test passed **even under
+the mutation**, not because the check was blind but because `sg_pack_write`
+itself calls `pack_cache_invalidate()`, which reset `scanned` regardless of
+whether the staleness logic under test existed at all. Same outcome, different
+reason. The fixture now creates the pack in a SEPARATE repo (cache
+invalidation is keyed by `git_dir`) and copies the `.pack`/`.idx` in as raw
+files, which also models the real scenario -- an external `git gc` -- more
+honestly than the intermediate fork-based version did.
+
+That fork version is itself worth a line: it was green on all four completion
+gates and made the fifth, opt-in `--leaks` gate hang forever
+(`/usr/bin/leaks --atExit` against a binary that forks; 0.5s normally, still
+running at 60s under `leaks`). `--leaks` is not part of the completion
+criteria, but a permanently red gate is one nobody reads, and CI's ubuntu ASan
+job runs with `detect_leaks=1` where a forking test's behaviour was untested.
+
+### 8. Recorded, deliberately not done here
+
+- **`sg rebase <upstream>` never calls `sg_rev_parse_commit` at all**
+  (`cmd_rebase.c` uses `sg_ref_branch_exists`/`sg_ref_read_branch`), so it
+  accepts only a bare branch name -- no tag, no `refs/heads/x`, no 40-hex, no
+  `HEAD~2`. This is the bug Phase 43 fixed for `sg merge`, never converged to
+  rebase, and it predates this phase. Consequence: git's third dwim command
+  has no sg counterpart to wire in 68b. The oracle harness pins it as a named
+  divergence so the gap has a witness.
+- **`sg chunk-info <blob>` parses 40-hex itself** (`cmd_chunk_info.c`),
+  bypassing revparse entirely, so it will not gain abbreviations in 68b.
+- **git tolerates a 40-hex followed by extra ZEROS** (`<40hex>0` and
+  `<40hex>00` resolve; `<40hex>f` and `<40hex>zz` do not). Not reproduced.
+- **A performance note for 68b**: because the staleness check is
+  unconditional, a caller resolving many abbreviations for one repo inside the
+  same wall-clock second pays a full rescan (release + re-mmap every pack) per
+  call. There is no such caller today; if 68b grows a batch-resolution loop,
+  this needs re-measuring rather than assuming.
+
+## Phase 68b: wiring abbreviated ids into revparse and the CLI
+
+68a's enumeration layer, reached from `sg_rev_parse_commit` /
+`sg_rev_parse_object` and every CLI that resolves a revision. interop
+3401 -> 3454.
+
+### 1. There are THREE disambiguation modes, not two
+
+The spec this phase started from had two (STRICT, and a commit-ish dwim for
+`sg log` / `sg reset --hard`). Measured against git 2.55.0 on ONE fixture
+carrying a 4-way collision (tag + commit + tree + blob on the same 4-hex
+prefix), the ambiguity hint list comes back at three different widths:
+
+| form | rows | mode |
+|---|---|---|
+| `cat-file -t <amb>` | 4 (all) | STRICT -- no filter |
+| `cat-file -t <amb>~1` | 2 (tag, commit) | COMMITTISH |
+| `cat-file -p <amb>:f.txt` | 3 (tag, commit, tree) | **TREEISH** |
+
+`SG_REV_TREEISH` exists because of that third row, and **answering it with
+COMMITTISH is not "one row short", it is a WRONG ANSWER**: on a prefix
+matching one commit, one tree and one blob, git's tree-ish count is 2 and it
+refuses, while a commit-ish count of 1 would RESOLVE. sg giving an answer
+where git refuses is worse than sg missing a feature.
+
+Both dwim triggers, and their priority, live in ONE function
+(`sg_rev_effective_disambig`): a `~`/`^`/`@{` suffix -> COMMITTISH, else a
+`:` -> TREEISH, else the caller's own request. **The suffix wins over the
+colon** (`<amb>~1:f.txt` is COMMITTISH's 2 rows, not TREEISH's 3), and the
+suffix scan is bounded at the colon so a PATH containing a `~` cannot be
+mistaken for a suffix.
+
+### 2. Membership is decided by the PEELED type, never the raw type
+
+A tag counts toward COMMITTISH only if it peels to a commit, and toward
+TREEISH only if it peels to a commit or a tree. The decisive fixture is a
+**tag pointing at a blob, colliding with a real commit**: `cat-file -t <amb>`
+(raw types) lists both, so counting by raw type would be two commit-ish
+candidates and `log -1 <amb>` would refuse -- measured, it RESOLVES to the
+commit. An earlier probe (tag->blob colliding with a plain blob) could not
+tell the two models apart: both predict "refuse".
+
+Narrowing itself is conditional: **at least one candidate must match the
+mode**, otherwise the full list is printed (measured on that same
+tag->blob + blob fixture, which lists both rows under COMMITTISH).
+
+### 3. Where the bugs actually came from
+
+Four independent nets ran against this phase, and **each found something the
+others could not**:
+
+- **The oracle harness** (38 probes, outside the repo, outside `gates.sh`)
+  found `sg cat-file -p <amb>:f.txt` refusing where git resolves, with all
+  five gates green and 22 new interop checks green. Root cause: the spec --
+  this file's own section 7.2 -- claimed `<rev>:<path>` "inherits trigger 2
+  for free" because its rev half goes through `sg_rev_parse_commit`. It
+  inherits the commit PARSE, not the suffix SIGNAL: `sg_rev_parse_object`
+  strips the colon before handing the rev half over, so the suffix scan sees
+  a bare prefix.
+- **Cold review round 1** found a `free()` on a possibly-uninitialized
+  pointer in `cli_args.c` (`sg_object_read` leaves `*content_out` unwritten
+  on every failure path, and the new code merged the read failure and the
+  parse failure into one `||` before freeing unconditionally). Written
+  correctly in `revparse.c` in the same phase -- one rule, two copies, one
+  wrong, again.
+- **Cold review round 2** found that the suffix-over-colon priority had zero
+  coverage, and that a unit test named
+  `test_report_ambiguous_oid_filters_by_peeled_type` could not detect the
+  bug it was written to guard (see section 4).
+- **Direct measurement by the coordinator** turned "tag peeling is
+  unmeasured" (review's finding, correctly flagged as an open question)
+  into "the implementation is wrong", via the decisive fixture in section 2.
+
+### 4. A test that named a guard it did not have
+
+`test_report_ambiguous_oid_filters_by_peeled_type` was added specifically to
+cover the candidate-printing loop's `break` -> `continue` fix (with filtering
+by PEELED type, the excluded candidates are no longer a contiguous tail of
+the raw-type sort, so stopping at the first non-match drops real rows). Its
+first fixture put the excluded candidates at the END of the sort, where
+`break` and `continue` produce identical output.
+
+Measured: reverting `continue` to `break` turned **one interop check** red and
+left the **entire `make test` green**. The fixture was rebuilt so the excluded
+candidate (a tag->blob, raw-type rank 0) sorts FIRST; the same reverse
+mutation now fails that unit test for its own named reason. The rule has two
+witnesses instead of one, and the test's name is true.
+
+### 5. Three things measured inert, each with its reason
+
+Recorded so nobody goes hunting for the missing test:
+
+- **`sg_rev_object_matches_disambig`'s `STRICT -> return 0` early return** is
+  mathematically unobservable: flipping it to `return 1` makes `match_count
+  == list.count`, which turns filtering ON but filters nothing, so the output
+  is byte-identical. Proof, not a guess.
+- **The `free()` fix cannot be witnessed with this project's testing
+  conventions.** The obvious fixture -- corrupt a loose object so the
+  enumeration still sees the filename -- does NOT work, and the reason is
+  worth keeping: `sg_cli_report_ambiguous_oid` reads each candidate twice
+  from the same unchanging bytes, so a statically corrupt object fails the
+  FIRST read and is folded to `SG_OBJ_BLOB` in the candidate loop, never
+  reaching `print_commit_candidate_line` at all. Triggering the bug needs an
+  object that changes state BETWEEN the two reads (a concurrent `git gc`),
+  which no hook in this test suite can stage. What WAS made deterministic
+  instead: a tag pointing at a nonexistent object, witnessing the adjacent
+  "peel chain fails -> candidate excluded" branch.
+- **`resolve_refspec_src` hands `sg_rev_parse_commit_ex` a `src` that may
+  contain an embedded colon**, violating that function's documented "no
+  colon" precondition. Proven unobservable by exhaustion: a base containing a
+  colon fails the pure-hex test before the mode it would have mis-selected is
+  ever consulted. Recorded against a future change to either the hex test or
+  the base scan.
+
+### 6. Process notes
+
+- **A mutation aimed at the wrong gate manufactures a coverage gap.** Three
+  rules whose guard is `interop` were first mutated against
+  `test_revparse_abbrev` alone and came back green; re-aimed with
+  `--interop`, all three go red on named checks. The failure direction of
+  mis-aimed verification is always "already verified".
+- **Subagents in this environment cannot run `git commit`/`git push`**, so
+  both the implementer and a reviewer were unable to build fixtures needing a
+  commit. Both said so plainly and lowered their confidence rather than
+  presenting reasoning as measurement; the measurements were then done by the
+  coordinator. Worth remembering when delegating anything oracle-shaped.
+- **The spec was overturned by measurement four times in this phase**, each
+  time correctly: the hint list narrows (spec said nothing); `:path` is a
+  third mode (spec said two); the colon form does not inherit the suffix
+  trigger (spec said it did); and a statically corrupt object cannot witness
+  the `free()` fix (the coordinator's own proposed fixture).
+
+## Phase 68c: `sequencer/todo` reads 4..40 hex -- the one-directional dead end closes
+
+This is what Phase 68 was for. `parse_todo_line` (`src/safety/sequencer.c`)
+was fixed-width: `strlen(line) < 40 || line[40] != ' '`. git's own
+`sequencer/todo` writes **7-hex**, so every id in it landed inside the
+subject text and the whole state read failed. interop 3454 -> 3481.
+
+### 1. The premise, measured before any code
+
+A real `git cherry-pick` pause writes `CHERRY_PICK_HEAD`, `sequencer/head`
+and `sequencer/abort-safety` as **full 40-hex**; only `sequencer/todo` is
+abbreviated. On that state today `sg status`, `--abort` and `--quit` already
+work (Phase 57's escape-hatch fix); only `--continue`/`--skip` failed, with
+`sg: cherry-pick state is corrupt, run sg cherry-pick --abort to clean up`.
+So exactly one parser needed widening, and `read_hex_file` deliberately did
+NOT change -- widening what those four files accept would enlarge the attack
+surface for no gain.
+
+The new rule: `strspn` a hex run, require a following space, then 40 -> the
+existing exact path, 4..39 -> `sg_object_find_prefix` with **`count != 1`
+rejected**. Ambiguity is a hard failure, never a guess: applying the wrong
+commit on `--continue` is far worse than refusing, and the refusal's message
+names `--abort`, which Phase 57 made independent of `todo` and which is
+therefore verified to work on that same input.
+
+`write_todo_file` still emits the full 40. The old reason ("sg could not read
+a short one back") expired with this commit; the standing reason is
+**wide-in / narrow-out** -- accept anything a real git paused, emit only what
+nothing can resolve to the wrong object.
+
+### 2. `--skip` and `--continue` now behave like git's, measured side by side
+
+Closing the dead end changed two OUTCOMES, not just an error string, so real
+git was re-measured on the identical fixture rather than assumed:
+
+| | git | sg |
+|---|---|---|
+| `--continue`, conflict unresolved | rc 128, refuses, state survives | rc 1, refuses, state survives |
+| `--skip` | rc 0, log `t2 \| master edit \| base`, state cleared | rc 0, **same log**, state cleared |
+
+That check mattered because this project's own Phase 57 spec twice invented
+behaviour git does not have. Six pre-existing `phase57`/`phase57b` checks
+pinned the dead end itself and had to be rewritten; a cold review traced each
+one to confirm no old assertion was quietly guarding an unrelated property on
+the way out.
+
+### 3. The ambiguity test proved nothing, and the reason generalises
+
+`test_ambiguous_prefix_in_todo_rejected` guards the single most important
+property here. Measured: weakening the guard from `count != 1` to `count < 1`
+(i.e. silently taking the first candidate) left it **completely green**.
+
+`sg_sequencer_state_read` has TWO independent failure paths, and the fixture
+set `current` to an unrelated commit -- so even when ambiguity resolved to the
+wrong blob, the later `todo[0] != current` check still returned -1. Same
+outcome, different reason; the test could not tell "ambiguity refused" from
+"ambiguity silently mis-resolved, then rejected for something else". Nothing
+else covered it either: interop's own comment defers all ambiguity coverage
+to this one test, because a real git pause cannot produce an ambiguous
+abbreviation (git widens until unique).
+
+The fixture now sets `current` to whichever of the two colliding ids
+`sg_object_find_prefix` sorts FIRST, so "take the first candidate" makes
+`state_read` SUCCEED where it must fail. The same reverse mutation now fails
+it by name.
+
+### 4. A negative assertion that would have become unconditionally true
+
+Review found `! grep -q -- "--abort" <file>` and asked what happens if the
+`--` is ever dropped. Measured over three files:
+
+| pattern | file containing `--abort` | file without it | empty file |
+|---|---|---|---|
+| `grep -q -- "--abort"` | FAIL (correct) | PASS | PASS |
+| `grep -q "--abort"` | **PASS** | PASS | PASS |
+| `grep -q '[-][-]abort'` | FAIL (correct) | PASS | PASS |
+
+Without `--`, grep exits 2 at argv parsing ("unrecognized option") **before
+reading the file at all**, and `!` turns that into PASS for every input --
+including the one the assertion exists to catch. Not a coincidence to
+document: option parsing always precedes reading.
+
+All five such assertions in `interop.sh` (two new here, three pre-existing in
+the `phase58` group) now use a bracket pattern, which cannot be parsed as an
+option at all -- the project's own rule that undefined behaviour is answered
+by removing the freedom, not by adding a test. Positive assertions need no
+change: a `grep` that exits 2 is a non-zero status, and `check()` already
+counts that as FAIL, so they announce themselves.
+
+Proven by a **directed** mutation, which is the only kind that can prove a
+negative assertion: planting `--abort` into the message turns both checks
+red. A blanket revert cannot do this -- it changes the wording without
+necessarily reintroducing the forbidden string.
+
+### 5. Mutation results
+
+| mutation | result |
+|---|---|
+| prefix branch disabled (dead end reopens) | RED, **8 interop checks**, incl. the end-to-end "a REAL GIT pause ... exits 0" |
+| hex must be followed by a space | RED, `test_todo_hex_without_trailing_space_rejected` |
+| ambiguity guard `!= 1` -> `< 1` | RED (after the fixture fix; GREEN before it) |
+| `--abort` planted in the message | RED, both negative assertions |
+| `hex_len < SG_OID_MIN_ABBREV` | GREEN -- **redundant guard**, not a gap: `sg_object_find_prefix` enforces 4..39 itself, so the `rc != 0` branch still fires |
+| `hex_len > SG_SHA1_HEX_LEN` | GREEN -- same redundant guard |
+
+### 6. Documentation that had gone stale, and how each was handled
+
+Closing this gap falsified claims in five places. They were NOT handled the
+same way, on purpose:
+
+- **`CLAUDE.md`** (two WARNINGs plus "Abbreviated sha is not supported"):
+  rewritten, because that file describes CURRENT behaviour and is the one
+  document later work actually reads. The "one-directional" WARNING now
+  records that the sentence was correct when written and that a code change,
+  not a re-measurement, ended it.
+- **`docs/sg.1`**: rewritten -- user-facing current documentation. The first
+  attempt updated only the first half of the passage and left it
+  self-contradicting ("the reverse direction works too: ... which sg cannot
+  resolve"), the same half-updated shape this phase caught three times in
+  other people's work.
+- **`docs/DESIGN.md`'s Phase 57 section**: NOT rewritten. It is the record of
+  what was true then; it carries a "superseded in part" note saying the
+  DECISION stands and the REASON expired.
+- **`include/sg/sequencer.h`** (three comments) and one stale present-tense
+  comment in `interop.sh`: updated. The interop one is the familiar shape --
+  the same fact stated twice, one copy updated and one not.
+- Four code comments cited "Phase 68 spec section 0 premise 4", a document
+  that **does not exist in the repo** (it lives in the coordinator's
+  scratch directory). The underlying fact is true and pinned by a Phase 57
+  precondition check, but the citation pointed at nothing; all four now cite
+  this section instead.

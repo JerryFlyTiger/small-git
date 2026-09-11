@@ -493,11 +493,9 @@ static size_t fold_subject(const char *msg, char *out)
     return oi;
 }
 
-/* Mallocs a buffer sized to fit, folds msg into it via fold_subject, and
-   returns the buffer (caller-owned, free() when done) with *out_len set to
-   the written length. Returns NULL (and *out_len = 0) for a NULL/empty msg
-   or on allocation failure -- callers treat NULL the same as "0-length". */
-static char *fold_subject_alloc(const char *msg, size_t *out_len)
+/* See the header comment in commit_out.h -- exported (Phase 68b) so the
+   abbreviated-object-id ambiguity report can reuse it. */
+char *sg_commit_out_fold_subject_alloc(const char *msg, size_t *out_len)
 {
     char *buf;
 
@@ -515,7 +513,7 @@ static char *fold_subject_alloc(const char *msg, size_t *out_len)
 static void print_folded_subject(const char *msg)
 {
     size_t len;
-    char *buf = fold_subject_alloc(msg, &len);
+    char *buf = sg_commit_out_fold_subject_alloc(msg, &len);
 
     if (buf != NULL) {
         fwrite(buf, 1, len, stdout);
@@ -1092,7 +1090,7 @@ static void print_pretty_reference(const unsigned char id[SG_SHA1_RAW_LEN],
     sg_sha1_to_hex(id, hex7);
     /* As of Phase 60b, the FOLDED subject (fold_subject above), not just
        the first physical line. */
-    subject_buf = fold_subject_alloc(commit->message, &subject_len);
+    subject_buf = sg_commit_out_fold_subject_alloc(commit->message, &subject_len);
     /* `reference` uses the AUTHOR date (short form, "YYYY-MM-DD" by
        default), NOT the committer's -- measured with a fixture whose two
        dates fall on different days. Phase 64: --date=<name> reaches this
