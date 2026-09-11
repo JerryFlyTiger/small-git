@@ -14422,3 +14422,32 @@ same way, on purpose:
   scratch directory). The underlying fact is true and pinned by a Phase 57
   precondition check, but the citation pointed at nothing; all four now cite
   this section instead.
+
+### 7. What in Phase 68 nobody cold-read
+
+Recorded rather than defended, the same way Phase 67's addendum did.
+
+The **code** was reviewed: 68a got two cold reads (the second scoped to the
+tail of rounds 2-5), 68b got three (initial diff, then the tail of rounds 2-4,
+then the test-only tail of round 5), 68c got two. Every fix a review produced
+was then verified by **reverse mutation** by the coordinator -- undo the fix,
+confirm the intended check goes red for its own named reason -- because a
+review-found fix has no failing test of its own by construction.
+
+What was **not** cold-read by anyone: everything the coordinator wrote after
+the final review of each commit. Specifically the `CLAUDE.md` edits (two
+rewritten WARNINGs plus the new abbreviated-id rules block), the `docs/sg.1`
+rewrite, this file's three Phase 68 sections and the "superseded in part"
+note on Phase 57, and the three commit messages. None of it is product code
+or a test -- so none of it can make a gate lie -- but `CLAUDE.md` is the
+document later work actually reads, so an error there propagates into future
+phases rather than into this binary.
+
+One concrete defect in exactly that un-reviewed batch is worth recording,
+because it is the shape this phase caught three times in other people's work
+and then reproduced in its own: the first `docs/sg.1` edit changed only the
+first half of a passage and left it self-contradicting ("As of Phase 68c the
+reverse direction works too: ... which sg cannot resolve back to an object").
+It was caught by re-reading the rendered passage rather than by any check, and
+the fix rewrote the whole paragraph. Nothing verifies that file but reading
+it.
