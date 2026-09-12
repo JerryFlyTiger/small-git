@@ -2,6 +2,7 @@
 
 #include "sg/apply.h"
 #include "sg/chunk.h"
+#include "sg/cli_args.h"
 #include "sg/hash.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -12,6 +13,7 @@
 #include "sg/rebase.h"
 #include "sg/refs.h"
 #include "sg/repo.h"
+#include "sg/revparse.h"
 #include "sg/sequencer.h"
 #include "sg/similarity.h"
 #include "sg/snapshot.h"
@@ -533,15 +535,23 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         return 1;
     }
 
-    if (!sg_ref_branch_exists(git_dir, upstream_arg)) {
-        fprintf(stderr, "sg: invalid reference: %s\n", upstream_arg);
-        free(current_branch);
-        return 1;
-    }
-    if (sg_ref_read_branch(git_dir, upstream_arg, upstream_commit) != 0) {
-        fprintf(stderr, "sg: failed to read branch '%s'\n", upstream_arg);
-        free(current_branch);
-        return 1;
+    /* git rebase is a COMMITTISH caller, not STRICT -- measured against
+       git 2.55.0 (Phase 69): a prefix with exactly one commit-ish
+       candidate resolves for `git rebase` the same way it does for
+       `git log`/`git reset --hard`, even though `git merge`/`show`/
+       `cherry-pick`/`revert`/`switch --detach` all refuse it. Using
+       sg_rev_parse_commit (STRICT) here would be a wrong answer, not a
+       smaller one. */
+    {
+        int prc = sg_rev_parse_commit_ex(git_dir, upstream_arg, SG_REV_COMMITTISH, upstream_commit);
+
+        if (prc != 0) {
+            if (prc == -4)
+                sg_cli_report_ambiguous_oid(git_dir, upstream_arg, SG_REV_COMMITTISH);
+            fprintf(stderr, "sg: invalid reference: %s\n", upstream_arg);
+            free(current_branch);
+            return 1;
+        }
     }
 
     if (sg_require_clean_workdir(git_dir, repo_root, "sg rebase") != 0) {
@@ -579,7 +589,7 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         char *label;
 
         if (sg_commit_tree_of(git_dir, upstream_commit, upstream_tree) != 0) {
-            fprintf(stderr, "sg: corrupt commit for branch '%s'\n", upstream_arg);
+            fprintf(stderr, "sg: corrupt commit for '%s'\n", upstream_arg);
             free(current_branch);
             return 1;
         }
@@ -1278,6 +1288,14 @@ int sg_cmd_rebase(int argc, char **argv)
             skip_flag = 1;
         } else if (strcmp(argv[i], "--quit") == 0) {
             quit_flag = 1;
+        } else if (argv[i][0] == '-') {
+            /* Unrecognized flag: reject explicitly rather than falling
+               through to the upstream_arg slot, where a typo like
+               "--help" would be reported as "invalid reference: --help"
+               and mislead the user into thinking their rev was wrong.
+               Same idiom as cmd_reset.c's own guard. */
+            fputs(usage, stderr);
+            return 1;
         } else if (upstream_arg == NULL) {
             upstream_arg = argv[i];
         } else {
