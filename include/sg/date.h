@@ -325,4 +325,18 @@ long long sg_date_now(void);
 int sg_date_format_human(long long time_sec, const char *tz, long long now,
                          int local_mode, char *out, size_t out_size);
 
+/* The machine's own UTC offset, in SECONDS, at time_sec's instant --
+   localtime_r on time_sec, never a cached value or "now", so it is
+   DST-sensitive per instant (Phase 72: the ident-date resolver's own
+   "local offset when the *_DATE env var is absent or malformed" rule reuses
+   this exact function rather than deriving a second offset computation; see
+   its own header comment in ident.h). This is the SAME underlying value
+   every `-local` renderer above shifts by; unlike those renderers, this
+   function hands back the raw seconds, not a rounded "+HHMM" string, so a
+   caller that needs the exact offset (not a display string) does not have
+   to round-trip through one. Returns 0 on success, -1 if time_sec does not
+   fit a time_t or localtime_r itself fails (mirrors every other renderer's
+   own failure here). */
+int sg_date_local_offset_seconds(long long time_sec, long *offset_out);
+
 #endif /* SG_DATE_H */

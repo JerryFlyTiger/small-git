@@ -1,6 +1,7 @@
 #include "sg/cli.h"
 
 #include "sg/hash.h"
+#include "sg/ident.h"
 #include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/merge.h"
@@ -16,13 +17,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 /* Prints every distinct path carrying a stage 1/2/3 entry (idx is sorted by
    (path, stage), so duplicates for one path are contiguous). */
@@ -59,8 +53,8 @@ int sg_cmd_commit(int argc, char **argv)
     size_t serialized_len;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
     char commit_hex[SG_SHA1_HEX_LEN + 1];
-    const char *name;
-    const char *email;
+    sg_ident author;
+    sg_ident committer;
     unsigned char merge_head_id[SG_SHA1_RAW_LEN];
     int is_merge_commit;
     size_t i;
@@ -211,8 +205,24 @@ int sg_cmd_commit(int argc, char **argv)
         return 1;
     }
 
-    name = env_or("GIT_AUTHOR_NAME", "small_git");
-    email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+    {
+        const char *bad = NULL;
+
+        if (sg_ident_author(&author, &bad) != 0) {
+            fprintf(stderr, "sg: invalid date format: %s\n", bad);
+            free(branch);
+            free(git_dir);
+            free(cleaned_message);
+            return 1;
+        }
+        if (sg_ident_committer(&committer, &bad) != 0) {
+            fprintf(stderr, "sg: invalid date format: %s\n", bad);
+            free(branch);
+            free(git_dir);
+            free(cleaned_message);
+            return 1;
+        }
+    }
 
     memset(&commit, 0, sizeof(commit));
     memcpy(commit.tree, tree_id, SG_SHA1_RAW_LEN);
@@ -232,14 +242,14 @@ int sg_cmd_commit(int argc, char **argv)
             commit.parent_count = 2;
         }
     }
-    commit.author_name = (char *)name;
-    commit.author_email = (char *)email;
-    commit.author_time = (long long)time(NULL);
-    strcpy(commit.author_tz, "+0000");
-    commit.committer_name = (char *)name;
-    commit.committer_email = (char *)email;
-    commit.committer_time = commit.author_time;
-    strcpy(commit.committer_tz, "+0000");
+    commit.author_name = author.name;
+    commit.author_email = author.email;
+    commit.author_time = author.when;
+    strcpy(commit.author_tz, author.tz);
+    commit.committer_name = committer.name;
+    commit.committer_email = committer.email;
+    commit.committer_time = committer.when;
+    strcpy(commit.committer_tz, committer.tz);
     commit.message = (char *)message;
 
     if (sg_commit_serialize(&commit, &serialized, &serialized_len) != 0) {

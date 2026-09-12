@@ -6,6 +6,7 @@
 #include "sg/diff.h"
 #include "sg/diff_out.h"
 #include "sg/hash.h"
+#include "sg/ident.h"
 #include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/merge.h"
@@ -29,13 +30,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
-
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 /* The report git prints after a fast-forward, measured against git 2.55.0:
 
@@ -363,10 +357,17 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         unsigned char new_commit_id[SG_SHA1_RAW_LEN];
         char *message;
         char *cleaned_message;
-        const char *name = env_or("GIT_AUTHOR_NAME", "small_git");
-        const char *email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+        sg_ident author;
+        sg_ident committer;
+        const char *bad = NULL;
 
         char *merge_name;
+
+        if (sg_ident_author(&author, &bad) != 0 || sg_ident_committer(&committer, &bad) != 0) {
+            fprintf(stderr, "sg: invalid date format: %s\n", bad);
+            rc = 1;
+            goto done;
+        }
 
         merge_name = build_merge_name(git_dir, branch_arg);
         if (merge_name == NULL) {
@@ -415,14 +416,14 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
         memcpy(commit.parents[0], ours_commit, SG_SHA1_RAW_LEN);
         memcpy(commit.parents[1], theirs_commit, SG_SHA1_RAW_LEN);
         commit.parent_count = 2;
-        commit.author_name = (char *)name;
-        commit.author_email = (char *)email;
-        commit.author_time = (long long)time(NULL);
-        strcpy(commit.author_tz, "+0000");
-        commit.committer_name = (char *)name;
-        commit.committer_email = (char *)email;
-        commit.committer_time = commit.author_time;
-        strcpy(commit.committer_tz, "+0000");
+        commit.author_name = author.name;
+        commit.author_email = author.email;
+        commit.author_time = author.when;
+        strcpy(commit.author_tz, author.tz);
+        commit.committer_name = committer.name;
+        commit.committer_email = committer.email;
+        commit.committer_time = committer.when;
+        strcpy(commit.committer_tz, committer.tz);
         commit.message = cleaned_message;
 
         if (sg_commit_serialize(&commit, &serialized, &serialized_len) != 0) {

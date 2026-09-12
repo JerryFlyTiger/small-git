@@ -4,6 +4,7 @@
 #include "sg/chunk.h"
 #include "sg/cli_args.h"
 #include "sg/hash.h"
+#include "sg/ident.h"
 #include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/merge.h"
@@ -27,12 +28,6 @@
 #include <sys/stat.h>
 #include <time.h>
 
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 /* One string, two callers (the fast-forward shortcut and the ordinary
    replay). It was two literals until a directed mutation edited only the
@@ -252,8 +247,14 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
             unsigned char *serialized;
             size_t serialized_len;
             unsigned char new_commit_id[SG_SHA1_RAW_LEN];
-            const char *committer_name = env_or("GIT_AUTHOR_NAME", "small_git");
-            const char *committer_email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+            sg_ident committer;
+            const char *bad = NULL;
+
+            if (sg_ident_committer(&committer, &bad) != 0) {
+                fprintf(stderr, "sg: invalid date format: %s\n", bad);
+                rc = PICK_ERROR;
+                goto done;
+            }
 
             memset(&new_commit, 0, sizeof(new_commit));
             memcpy(new_commit.tree, merged_tree, SG_SHA1_RAW_LEN);
@@ -273,10 +274,10 @@ static pick_rc rebase_pick_one(const char *git_dir, const char *repo_root,
             new_commit.author_email = commit.author_email;
             new_commit.author_time = commit.author_time;
             memcpy(new_commit.author_tz, commit.author_tz, sizeof(new_commit.author_tz));
-            new_commit.committer_name = (char *)committer_name;
-            new_commit.committer_email = (char *)committer_email;
-            new_commit.committer_time = (long long)time(NULL);
-            strcpy(new_commit.committer_tz, "+0000");
+            new_commit.committer_name = committer.name;
+            new_commit.committer_email = committer.email;
+            new_commit.committer_time = committer.when;
+            strcpy(new_commit.committer_tz, committer.tz);
             new_commit.message = commit.message;
 
             if (sg_commit_serialize(&new_commit, &serialized, &serialized_len) != 0) {
@@ -956,8 +957,15 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
         unsigned char *serialized;
         size_t serialized_len;
         unsigned char new_commit_id[SG_SHA1_RAW_LEN];
-        const char *committer_name = env_or("GIT_AUTHOR_NAME", "small_git");
-        const char *committer_email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+        sg_ident committer;
+        const char *bad = NULL;
+
+        if (sg_ident_committer(&committer, &bad) != 0) {
+            fprintf(stderr, "sg: invalid date format: %s\n", bad);
+            sg_commit_free(&orig_commit);
+            sg_rebase_state_free(&state);
+            return 1;
+        }
 
         memset(&new_commit, 0, sizeof(new_commit));
         memcpy(new_commit.tree, tree_id, SG_SHA1_RAW_LEN);
@@ -974,10 +982,10 @@ static int do_rebase_continue(const char *git_dir, const char *repo_root)
         new_commit.author_email = orig_commit.author_email;
         new_commit.author_time = orig_commit.author_time;
         memcpy(new_commit.author_tz, orig_commit.author_tz, sizeof(new_commit.author_tz));
-        new_commit.committer_name = (char *)committer_name;
-        new_commit.committer_email = (char *)committer_email;
-        new_commit.committer_time = (long long)time(NULL);
-        strcpy(new_commit.committer_tz, "+0000");
+        new_commit.committer_name = committer.name;
+        new_commit.committer_email = committer.email;
+        new_commit.committer_time = committer.when;
+        strcpy(new_commit.committer_tz, committer.tz);
         new_commit.message = orig_commit.message;
 
         if (sg_commit_serialize(&new_commit, &serialized, &serialized_len) != 0) {

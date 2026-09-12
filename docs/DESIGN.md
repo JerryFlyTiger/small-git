@@ -15197,3 +15197,411 @@ to a different subsystem's own topic.
    `tags/`-shaped spelling. Fixing it means deciding whether `\` belongs in
    that character set at all, which is Phase 28's grammar, and would move
    `sg diff`/`sg status`/`sg stash` at the same time.
+
+## Phase 72: sg could not reproduce git's object ids, because it never read the date env
+
+### 1. What was wrong
+
+`sg`'s stated goal is bit-for-bit disk-format compatibility with real git.
+Measured 2026-09-12 against git 2.55.0, it failed that for **every object it
+writes**, for three independent reasons:
+
+**A.** `GIT_AUTHOR_DATE` and `GIT_COMMITTER_DATE` were never read anywhere in
+`src/` -- `grep` returned nothing. Every commit, tag and stash got `time(NULL)`.
+
+**B.** The timezone was hardcoded `"+0000"` (e.g. `cmd_tag.c:116`). With no date
+env at all, git writes the machine's local offset; on a `+0800` machine every
+ordinary `sg commit` already differed from what git would write at the same
+instant.
+
+**C.** `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL` were never read. git fills a
+commit's `committer` line AND an annotated tag's `tagger` line from the
+COMMITTER identity; sg used the AUTHOR identity for all three.
+
+### 2. Why 71 phases of gates never saw it
+
+`GIT_AUTHOR_DATE` appears 40+ times in `tests/interop.sh` and **every one of
+them is on the git side**, building a fixture. sg was only ever asked to RENDER
+those dates (Phases 54, 60, 64, 66, 67 are all rendering phases), never to WRITE
+one. The fixture generator and the oracle were the same tool, so the dimension
+sg owns had no witness at all.
+
+Defect C additionally survived the first fixture written to catch A and B,
+because that fixture used the same identity for author and committer -- a
+control whose two arms agree by construction. It only appeared once the two
+idents were deliberately made different.
+
+### 3. What git's date parser actually does (measured, `git commit-tree`)
+
+The discriminator is **not** "does the value start with `@`". It is **"is the
+timestamp followed by a valid explicit offset token"**, and the two timestamp
+forms then behave differently:
+
+|  | valid explicit offset present | no valid offset |
+|---|---|---|
+| `@<digits>` | any digit count, **no 2100 bound**, offset **normalized arithmetically** | needs >= 9 digits, and < 2100 |
+| `<digits>` (bare) | still >= 9 digits, still 2100-bounded, out-of-range offset DISCARDED for local | needs >= 9 digits, and < 2100 |
+
+Arithmetic normalization, `@` form only: `+0060` -> `+0100`, `+0099` -> `+0139`,
+`+9999` -> `+10039`, `-9999` -> `-10039`, `+2400` -> `+2400` (1440 minutes,
+unchanged), `0100` (sign optional) -> `+0100`, `+00:00` -> `+0000`. The token is
+an optional sign plus exactly 4 digits, or `HH:MM`; anything else (`+0`, `+060`,
+`+00000`, `abc`) is not an offset at all and the "no valid offset" column
+applies.
+
+The bare form's offset bound is HH <= 23 and MM <= 59: `+2359` accepted,
+`+2360` / `+0060` / `+9999` discarded for local. **`+1500` and `+2359` are
+accepted** -- the rule is numeric, not geographic; do not "fix" it to a real
+timezone range.
+
+The `>= 9 digit` floor: `99999999` rejected, `100000000` accepted; `@0` rejected
+but `@0 +0000` accepted. The upper bound is epoch `4102444800`
+(2100-01-01T00:00:00Z), applied on every form except `@<digits>` with a valid
+offset. The lower bound needed no work -- sg already rejected a pre-1970 date,
+matching git (only the exit code differs, 128 vs 1, the standing convention).
+
+Accepted calendar forms: `YYYY-MM-DDTHH:MM:SS+HH:MM`,
+`YYYY-MM-DD HH:MM:SS +HHMM`, and RFC2822. Rejected by git itself, so also by sg:
+a date with no time (`2023-11-15`), anything relative (`yesterday`, `2 hours
+ago`, `now`), and garbage. **Note that this is a STRICTER parser than the one
+behind `--date=`**, which does accept relative forms -- git rejects `yesterday`
+here while accepting it there.
+
+The fallback offset is the local offset **at the commit's own instant**, not
+"now"'s: measured under `TZ=America/New_York`, `@1700000000` (November) gives
+`-0500` and `@1688000000` (June) gives `-0400`. `src/util/date.c` already
+computed this for every `--date=*-local` mode, so `sg_date_local_offset_seconds`
+exposes the existing machinery rather than adding a second one.
+
+### 4. The spec was wrong once, and the test inherited the error
+
+The first version of section 3's offset table was measured **exclusively on the
+bare form**, and said an out-of-range offset is always discarded for local. That
+is false for the `@` form. The error propagated spec -> implementation ->
+interop group without resistance, because the interop offset table specified
+from that same spec also only used the bare form: **the check that was supposed
+to cover the rule structurally could not see the one shape that diverges.** A
+cold read found it by probing inputs outside the spec's own tables. The lesson
+is the project's existing one (a rule derived from one-sided examples is a
+guess) applied to a spec rather than to a fixture.
+
+### 4b. The spec was wrong a second time, same shape, caught by re-measuring
+
+Section 3 above still says "the lower bound needed no work -- sg already
+rejected a pre-1970 date, matching git ... only the exit code differs". That
+claim was measured on exactly **one** value,
+`1969-12-31T23:59:59+00:00`, and it passed for the WRONG reason: that instant
+converts to epoch `-1`, which collides with `timegm`'s own error sentinel
+`(time_t)-1` inside `calendar_to_epoch` -- so `if (t == (time_t)-1) return
+-1;` rejected it by accident, not by any actual lower-bound check (there was
+none). Every OTHER pre-1970 instant sailed straight through:
+`1969-12-31T23:59:58+00:00` (epoch -2, one second earlier, no sentinel
+collision) got written as a real commit object with a negative author time,
+and real git rejects it. Measured directly via `git commit-tree` on six rows
+spanning three calendar forms plus a mid-century date, all REJECTED by git,
+five of six ACCEPTED by sg before this fix.
+
+This is the identical failure shape as section 4's `@`-form error: a spec
+claim measured on a single value, inherited by the implementation and by the
+first draft of `docs/DESIGN.md` itself, uncaught because nothing had probed
+a second value in the same family. The fix adds an explicit
+`SG_IDENT_EPOCH_LOWER_BOUND` (epoch 0, inclusive), checked on the same
+computed epoch RESULT the upper bound already checks (not the year field),
+in the same three calendar-form functions, right beside the existing upper-
+bound check -- so a reader sees one symmetric rule, not one real check and
+one accident wearing its clothes. The epoch/`@<digits>` forms need no such
+check: their digit scanner only ever accepts unsigned decimal digits, so a
+negative epoch cannot reach them at all, which matches git's own rejection
+of `@-5` / `-1` (measured, both REJECT).
+
+**This section's own fix was itself incomplete, for the identical underlying
+reason** (section 4c immediately below): it checked the offset-adjusted FINAL
+epoch only, when git checks both the final epoch AND the raw calendar
+reading before the offset is applied. A rule measured along one axis, again.
+
+### 4c. The spec was wrong a THIRD time, same shape again -- raw vs. final
+
+Round 4's cold read found that section 4b's own fix checks only the
+offset-adjusted FINAL instant (`*out` in `calendar_to_epoch`), where git
+rejects if EITHER that final instant OR the RAW calendar reading (the wall
+clock digits read as if they were already UTC, before `offset` is
+subtracted) falls outside `[0, 4102444800)`. Measured directly via
+`git commit-tree`: `"1969-12-31T23:30:00-01:00"` has a raw reading of
+1969-12-31 23:30 UTC (out of range) but a `-01:00` offset that pulls the
+final instant forward to 1970-01-01 00:30 UTC (in range) -- git still
+rejects it; sg, checking only the final value, wrote it as a real object
+(`1800 -0100`). Six rows across all three calendar forms confirmed the same
+one-directional gap (always "raw outside, final pulled inside" -- the
+dangerous direction, rule 2 of the scope line, never the safe one). The
+reverse direction was already correct: a raw reading inside the range whose
+offset pushes the final instant outside was already rejected by the
+final-value check alone, confirmed by two explicit control rows that stay
+rejected after this fix.
+
+The fix adds the identical bound check to `calendar_to_epoch` itself, on
+`t` (the raw `timegm` result) before `offset` is subtracted, using the same
+two constants the final-value check already uses -- one function, one
+symmetric rule, inherited by all three calendar forms and both offset
+branches within each, rather than three more copies of the same two lines
+at the call sites.
+
+**Why round 3's own tests could not have caught this, and it matters more
+than the fix itself:** the pair written to prove "the bound is on a computed
+result, not the year text" (`1970-01-01T08:00:00+08:00` accept /
+`1969-12-31T23:59:59+08:00` reject) uses an offset where the raw reading and
+the final instant point the SAME direction -- both in range, or both out of
+range. That pair is this project's own recorded "a control whose two arms
+agree by construction" shape: it cannot distinguish "checked on the final
+value" from "checked on the raw value" from "checked on both", because all
+three rules give it the same answer. This is now the THIRD time in one
+phase that a rule measured along a single axis (bare-vs-`@` form in section
+4, then the lower bound's existence in section 4b, now raw-vs-final in this
+section) passed review before a fourth cold read found the next axis. The
+round-4 rows are written to be the discriminating ones on purpose: each has
+a raw reading and a final instant on OPPOSITE sides of the bound.
+
+### 4d. Round 5: an explicit decision, not another bug hunt
+
+A fifth cold read found three more things, but this round is different in
+kind from 4/4b/4c: those were each "the rule was measured on too narrow an
+axis, widen it to match git." This one is a genuine DECISION about how far
+to chase git's date parser, made deliberately rather than by continuing to
+narrow the gap.
+
+**What was broken, measured via `git commit-tree` vs `build/sg`:**
+
+1. A calendar form (any of the three) carrying a shape-valid but
+   OUT-OF-RANGE offset (e.g. `+9999`) diverged SILENTLY: sg discarded the
+   offset and read the wall clock as literal UTC; git re-reads the wall
+   clock as LOCAL time. Both exit 0, different epoch, different object id
+   -- on `"2023-11-15 06:13:20 +9999"`, an utterly ordinary date, not a
+   boundary case. Rule 2 of the scope line.
+2. `try_iso_t` alone hard-failed on an out-of-range COLON offset
+   (`"...+99:00"`) where the other two forms fell back to local --
+   `match_offset_token_colon` computed its `out_of_range` result correctly
+   but the only caller never consulted it, unconditionally treating any
+   failure as fatal.
+3. A leap second crossing the 1970 boundary
+   (`"1969-12-31T23:59:60+00:00"`): git REJECTS, sg wrote epoch `0`,
+   because `timegm` normalizes the ss=60 carry into 1970-01-01T00:00:00 UTC
+   BEFORE round 4's raw-epoch check ever runs -- 0 is comfortably inside
+   `[0, upper)`, so the carry masks the truth exactly the way it did for
+   round 4's own bug. An ordinary leap second far from either boundary
+   (`"2023-12-31T23:59:60"`) is unaffected, accepted identically by both.
+
+**The decision (findings 1 and 2): sg REFUSES a calendar form whose offset
+is shape-valid but out of range, uniformly, in all three forms.** git's own
+rule -- reinterpret the wall clock as local time -- is deliberately NOT
+implemented, and the reason needs stating precisely because the obvious
+version of it is not quite true. A wall clock during a DST gap does not
+exist and one during a DST overlap occurs twice, so `localtime_r`-style
+resolution has no single right answer there -- but **git does not fail on
+either** (measured: `2023-03-12 02:30:00` in a gap and `2023-11-05 01:30:00`
+in an overlap both resolve cleanly under `TZ=America/New_York`, exit 0). git
+picks *a* deterministic answer via its own tz arithmetic. So matching git
+here would mean porting that arithmetic rather than leaning on the platform,
+for an input nobody sensible writes (a real UTC offset never exceeds
++/-14:00; `+9999` is nonsense) -- the cost is the port and its own corner
+cases, not an unanswerable question. Refusing is rule 3
+of the scope line -- loud, and a refusal can never write a wrong object.
+This single rule closes finding 1 AND makes finding 2 disappear as an
+inconsistency rather than needing its own fix: once all three forms refuse
+uniformly, `try_iso_t` stops being the odd one out, and the dropped
+`out_of_range` flag stops mattering (fixed anyway, by dropping the
+parameter from `match_offset_token_colon` entirely, so the function's
+signature does not promise to compute something nobody reads).
+
+One consequence worth naming explicitly: `"2099-12-31 23:59:59 +9999"` is
+NOT a rule-3 pin, because git rejects it too (its own local-time
+reinterpretation, under `TZ=America/New_York`, still lands the final
+instant outside `[0, 2100)`) -- with the uniform-refusal rule in place it
+is an ordinary AGREEING row, not a divergence.
+
+**Finding 3's fix is a typed-field year bound**, checked in
+`calendar_to_epoch` on the YEAR AS PARSED, before `timegm` ever runs (so no
+carry has happened yet): `year < 1970` is rejected outright. This closes
+the lower-side gap completely -- every date in year 1969 or earlier has a
+negative epoch for ANY month/day/hour/minute/second combination, so the
+check is not narrower than what round 4 already intended, it just runs
+early enough to see the truth before `timegm` hides it. It needs NO
+matching check on the upper side: measured, `"2099-12-31T23:59:60+00:00"`
+already computes epoch `4102444800` (the carry lands exactly ON the
+excluded upper bound), which round 4's existing final-value check already
+catches -- sg already rejected it before this round, coincidentally
+correctly. git itself ACCEPTS that one anyway, writing the very epoch it
+refuses when typed directly (`"2100-01-01T00:00:00Z"` -- measured, exit
+128) -- git is internally inconsistent on this one input, and this project
+is not reproducing that inconsistency. Pinned as a deliberate divergence.
+
+A side effect worth recording: the typed-year check also changes WHY
+section 5's RFC2822 two-digit-year rejection (`"70"` -> would-be 1970)
+happens. At round 4 it was an accident (a two-digit year computes
+`tm_year = 70 - 1900 = -1830`, colliding with `timegm`'s own error
+sentinel). The new `year < 1970` check now fires FIRST, before `timegm`
+ever runs, so the same three rows (`"70"`, `"04"`, `"99"`) are rejected by
+a deliberate, checked rule now -- the outcome is unchanged, the reason is
+no longer an accident. `tests/test_ident.c` and `tests/interop.sh` both
+carry an inline note recording this, since the comment written at round 4
+would otherwise go stale and silently mislead the next reader.
+
+### 5. The scope line
+
+git's `parse_date` is a large heuristic engine. Reproducing all of it is not
+this phase, and the line is drawn by **whether a divergence is silent**:
+
+1. sg must never **silently** write a different object than git would -- both
+   tools exit 0 and the bytes differ. Exactly one thing was in this class (the
+   `@`-form offset normalization) and it is fixed.
+2. sg must never **accept what git rejects**, which would let it create an
+   object real git could not have produced from the same env. Four things
+   ended up in this class: the `>= 9` digit floor, the 2100 upper bound,
+   the pre-1970 lower bound (found in a third round, section 4b above), and
+   the raw-vs-final gap in that same lower/upper bound -- checking only the
+   offset-adjusted final epoch and missing the raw calendar reading (found
+   in a FOURTH round, section 4c above). All four are fixed.
+3. sg **may reject what git accepts**, provided it does so loudly and the
+   divergence is pinned on both sides. Seven shapes stay rejected: a
+   fractional second, extra internal whitespace before an ISO offset, an
+   RFC2822 named zone (`GMT`), trailing garbage after an otherwise-complete
+   RFC2822 date, RFC2822 two-digit-year century inference (`"70"` -> 1970,
+   `"04"` -> 2004, `"99"` -> 1999, all measured, added in round 4), a
+   calendar form's shape-valid-but-out-of-range offset reinterpreted as
+   local time (round 5, section 4d), and the one specific leap second whose
+   normalized carry lands exactly on git's own excluded upper bound while
+   git itself still accepts it (`"2099-12-31T23:59:60+00:00"`, round 5,
+   section 4d -- a divergence from git's OWN internal inconsistency, not
+   from this project's grammar). Reproducing any of them would mean growing
+   a second, looser date grammar for no bit-compatibility benefit, since
+   refusing outright can never itself write a wrong object. This is the
+   same standing convention as `--patience`, `auto:<name>` and `^{tree}`
+   being refused rather than approximated. Note the two-digit-year
+   rejection is deliberate grammar as of round 5 (it was an accident at
+   round 4) -- see section 4d's closing paragraph and the sibling note in
+   `tests/test_ident.c`/`tests/interop.sh`: the new typed-year bound
+   (`year < 1970`) now fires before `timegm`'s error-sentinel accident ever
+   gets a chance to.
+
+### 6. Two pre-existing bugs found, recorded, deliberately NOT fixed
+
+**`sg stash push`'s subject carries a trailing newline that git's does not.**
+The generated "WIP on ..." / "On ..." subject goes through `sg_message_cleanup`,
+the normalization every ordinary commit message gets; git's stash subject does
+not. So stash object ids still differ. Found while building the parity fixture,
+invisible before it because nothing had ever demanded byte-for-byte stash-object
+equality. `interop.sh`'s `phase72 case3` compares the tree/parent/author/
+committer header lines (what this phase owns) and pins the id MISMATCH by name,
+so a future fix turns that check red rather than silently changing what is
+compared. **This phase therefore claims header-field parity for stash, not full
+object-id parity.**
+
+**A six-byte timezone renders with the wrong clock.** The corrected parser means
+sg can now write `+10039`, where everything else writes five bytes. `parse_tz`
+(`src/util/date.c`) returns -1 for any offset that is not exactly 5 bytes, so
+such a commit renders in UTC while echoing the stored offset string beside it --
+the same self-contradicting shape the pre-Phase-54 `sg log` had. This is
+PRE-EXISTING and not caused by Phase 72: real git writes the identical object
+for the same env, and sg misrenders that one too (measured), because the
+renderer never learns who wrote the object. Phase 72 only made the shape
+reachable through sg's own commands. Fixing it means measuring what git does
+with a 3-digit hours field across every `--date=` mode, `%aI`'s colon insertion,
+`human` and `relative` -- its own phase. Pinned as `phase72 tz6`, four checks: a
+precondition that git really stores `1700000000 +10039`; two LITERAL byte
+pins, one per tool's exact `%ad` output (`Sun Nov 19 02:52:20 2023 +10039` for
+git, `Tue Nov 14 22:13:20 2023 +10039` for sg); and a scope check that sg still
+echoes the offset string so a future reader knows only the clock is wrong. The
+two-literal-pin shape replaced a round-1 draft that only asserted "the two
+differ" -- a cold read found that draft would stay green even if `parse_tz`
+were fixed AND an unrelated divergence were introduced in the same rendered
+field (e.g. a swapped `date.c` weekday-table entry), because it never checked
+WHICH bytes either side actually produced. Same standing convention as
+CLAUDE.md's divergences #6/#7.
+
+### 7. Convergence
+
+The eight byte-identical `env_or()` copies `docs/RULES-duplication.md` listed
+(`storage/reflog.c`, `storage/chunk.c`, `safety/stash.c`, `safety/snapshot.c`,
+`cli/cmd_rebase.c`, `cli/cmd_merge.c`, `cli/cmd_tag.c`, `cli/cmd_commit.c`, plus
+a ninth in `cli/pick.c`) are now one function inside `src/util/ident.c`. A
+pre-existing bug in `chunk.c` fell out of the convergence: it fell the committer
+back to the author's *resolved* value instead of the shared default, which is
+not what git does.
+
+`cli/pick.c` keeps its documented asymmetry -- cherry-pick forwards the picked
+commit's author byte-for-byte and resolves a fresh committer; revert resolves
+both fresh -- verified against real git rather than assumed.
+
+### 8. Verification
+
+`make` 0 warnings (75 TUs recompiled), `make test` 84/84, `interop` 3842/3842
+with 0 skipped, `make sanitize` 84/84 binaries with 0 sanitizer errors. interop
+grew from master's 3698 and no pre-existing check disappeared.
+
+`make sanitize` earned its keep mid-implementation: it caught a
+stack-use-after-scope in `chunk.c` where the `sg_ident` locals were scoped
+inside an inner block while a `sg_commit` still borrowed pointers into them.
+`make test` and interop were both green for it.
+
+Mutation-verified, run from the main conversation rather than by whoever wrote
+the tests. Reintroducing the `@`-form bug (making that branch discard an
+out-of-range offset like the bare form) turns **14 named checks red, all in the
+`@` column**, and the ones that matter say "sg and git produce the identical
+object id" -- proving the object-id comparison, not the exit-code comparison, is
+what catches the silent case. The `phase72 tz6` pin is now two literal byte
+pins (section 6); flipping either one's expected string turns exactly that one
+check red.
+
+**The lower-bound mutation (section 4b) needed a second attempt to be real.**
+The first attempt set `SG_IDENT_EPOCH_LOWER_BOUND` to `-1` (a literal reading
+of "weaken the bound to `< -1`") and produced **zero** red checks -- not
+because the bound is unobservable, but because epoch `-1` is *also* caught by
+`calendar_to_epoch`'s pre-existing `timegm` sentinel collision (section 4b's
+whole subject), so shifting the explicit bound's threshold by exactly one
+changes nothing any test can see: the one value the shifted threshold stops
+catching is the one value the accident was already catching anyway. The
+mutation that actually reproduces "today's bug" has to remove the explicit
+check's effect entirely (matched via `s/\*time_out < SG_IDENT_EPOCH_LOWER_BOUND
+\|\| //` on all six call sites), which turns exactly the five newly-added
+named rows red -- every pre-1970 value except the accidental `-1` one -- while
+`1969-12-31T23:59:59+00:00` (epoch -1) stays green throughout, confirmed at
+both the unit level (`tests/test_ident.c`) and the interop level. Recorded
+here because it is itself an instance of this project's own
+"a caught mutation may verify nothing" / "a green mutation may have tested
+nothing" lesson: the FIRST mutation attempt was green for a reason that had
+nothing to do with coverage, and trusting it would have reported "not real"
+for a bound that is, in fact, real and load-bearing.
+
+**Round 4's raw-vs-final mutation (section 4c) went cleanly on the first
+attempt.** Neutralizing the new bound check inside `calendar_to_epoch`
+(`s/if ((long long)t < SG_IDENT_EPOCH_LOWER_BOUND || (long long)t >=
+SG_IDENT_EPOCH_UPPER_BOUND)/if (0)/`) turns exactly the six newly-added
+named rows red, both at the unit level and the interop level, with every
+other row -- including the round-3 lower-bound rows and the two round-4
+reverse-direction controls -- staying green throughout.
+
+**Round 5's mutation restored the old fallback in ONE calendar form
+(`try_iso_space`)** -- a multi-line substitution (`perl -0pi`, this project's
+mutation harness slurps the whole file, so a multi-line match/replace is
+routine) reinstating the exact three-line `if (out_of_range) { ...
+fill_local_offset ... }` block this round deleted. It turns exactly the
+three named rows that exercise that specific form red (`"2023-11-15
+06:13:20 +9999"`, the TZ=America/New_York row, and the
+`"2099-12-31 23:59:59 +9999"` agreeing-row's sg half), at both the unit and
+interop level, with the colon form, the RFC2822 form, and every leap-second
+row staying green -- confirming the coverage is tied to the specific form
+mutated, not a blanket pass/fail on the whole test file. A build-and-test
+process note from this round, unrelated to date-parsing correctness: the
+first attempt at `p72_deliberate_reject_row`'s TZ-override parameter used
+`${VAR:+TZ=...}` directly as a bare word before a run of `NAME=value`
+assignment-prefix words: POSIX shells decide which words are
+assignment-prefixes SYNTACTICALLY, at parse time, not from what an
+expansion evaluates to, so a parameter expansion in that position
+(regardless of whether it expands to empty or to text shaped like
+`NAME=value`) ends the assignment-prefix region right there and turns
+every literal `NAME=value` word after it into a command name / argument
+instead -- it broke EVERY row in the group, including ones that never touch
+the new TZ parameter, and briefly looked like the whole round-5
+implementation had regressed. Fixed by routing through `env` explicitly
+(`env ${VAR:+TZ=...} NAME=value ... command`), which sidesteps the
+shell's assignment-prefix parsing entirely since `env` interprets its own
+arguments however it likes, at runtime, well after the shell already
+finished deciding what a "word" is.

@@ -2,6 +2,7 @@
 
 #include "sg/cli_args.h"
 #include "sg/hash.h"
+#include "sg/ident.h"
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/refs.h"
@@ -18,13 +19,6 @@ static const char USAGE[] =
     "usage: sg tag [-a] [-m <msg>] [-f|--force] [--] <name> [<rev>]\n"
     "       sg tag -d <name>\n"
     "       sg tag\n";
-
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 static int list_tags(const char *git_dir)
 {
@@ -92,9 +86,17 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         unsigned char *serialized;
         size_t serialized_len;
         unsigned char tag_id[SG_SHA1_RAW_LEN];
-        const char *tagger_name = env_or("GIT_AUTHOR_NAME", "small_git");
-        const char *tagger_email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+        sg_ident tagger;
+        const char *bad = NULL;
         char *cleaned_message;
+
+        /* An annotated tag's tagger line comes from the COMMITTER identity,
+           the same as a commit's committer line -- not the author identity
+           (Phase 72's defect C; measured against real git 2.55.0). */
+        if (sg_ident_committer(&tagger, &bad) != 0) {
+            fprintf(stderr, "sg: invalid date format: %s\n", bad);
+            return 1;
+        }
 
         /* Unlike `git commit`, real `git tag -a -m` does NOT refuse an
            empty (or whitespace-only, which normalizes to empty) message --
@@ -110,10 +112,10 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         memcpy(tag.object, target_id, SG_SHA1_RAW_LEN);
         tag.object_type = SG_OBJ_COMMIT;
         tag.tag_name = (char *)name;
-        tag.tagger_name = (char *)tagger_name;
-        tag.tagger_email = (char *)tagger_email;
-        tag.tagger_time = (long long)time(NULL);
-        strcpy(tag.tagger_tz, "+0000");
+        tag.tagger_name = tagger.name;
+        tag.tagger_email = tagger.email;
+        tag.tagger_time = tagger.when;
+        strcpy(tag.tagger_tz, tagger.tz);
         tag.message = cleaned_message;
 
         if (sg_tag_serialize(&tag, &serialized, &serialized_len) != 0) {
