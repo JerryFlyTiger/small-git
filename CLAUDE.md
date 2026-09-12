@@ -211,16 +211,16 @@ because something slipped past a fully green board. **Before editing any file
 in a row below, read that row's file first.**
 
 **A file can appear in more than one row. Read every row that names it, not
-the first one you hit** -- `cli/cmd_merge.c` and `cli/cmd_diff.c` each have
-rules in three different files, and stopping at the first match is how you miss
-two thirds of them.
+the first one you hit** -- `cli/cmd_merge.c` has rules in three different files
+and `cli/cmd_diff.c` in two, so stopping at the first match loses most of
+them.
 
 | Touching | Read first |
 |---|---|
 | `storage/refs.c`, `storage/revparse.c`, `refs.h`, `revparse.h`, `objstore.h`, `object.h`; detached HEAD; `cli/cmd_merge.c`'s `<rev>`/message/fast-forward output; `cli/cmd_tag.c`; `sg_message_cleanup` | `docs/RULES-refs-revparse.md` |
 | `util/date.c`, `date.h`, `cli/cmd_undo.c`'s own formatter; any `--date=` / `%ad` / `%ar` / `%ah` work | `docs/RULES-date.md` |
 | `cli/cmd_log.c`, `cli/cmd_show.c`, `cli/cmd_cat_file.c`, `cli/commit_out.c`, `cli/log_graph.c`, `commit_out.h`, `log_graph.h` | `docs/RULES-log-show.md` |
-| `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir.h`, `quote.h`, `strfmt.h`; `workdir/apply.c`, `object/tree.c`, `cli/cmd_add.c`, `cli/cmd_restore.c`, `cli/cmd_reset.c`, `storage/repo.c` | `docs/RULES-paths-strings.md` |
+| **any file that joins a path, prints a path to the user, deletes a tracked file, or builds a user-facing string with `snprintf`** -- `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir.h`, `quote.h`, `strfmt.h`; `workdir/apply.c`, `workdir/merge.c`, `object/tree.c`, `storage/refs.c`, `storage/repo.c`, `safety/stash.c`, `cli/pick.c`, `cli/cmd_add.c`, `cli/cmd_restore.c`, `cli/cmd_reset.c`, `cli/cmd_merge.c`, `cli/cmd_rebase.c` | `docs/RULES-paths-strings.md` |
 | `workdir/diff.c`, `cli/diff_out.c`, `cli/cmd_diff.c`, `util/diff_lcs.c`, `diff.h`, `diff_out.h`, `tree_build.h` | `docs/RULES-diff.md` |
 | `workdir/merge.c`, `cli/cmd_merge.c`, `merge.h` | `docs/RULES-merge.md` |
 | `workdir/rename.c`, `util/similarity.c`, `cli/cmd_diff.c`'s `-M`/`-C`/pathspec parsing, `pathspec.h`, `similarity.h` | `docs/RULES-pathspec-rename.md` |
@@ -229,7 +229,7 @@ two thirds of them.
 | `safety/stash.c`, `cli/cmd_stash.c`, `stash.h` | `docs/RULES-stash.md` |
 | `cli/cmd_push.c` | `docs/RULES-push.md` |
 | `cli/pick.c`, `cli/cmd_cherry_pick.c`, `cli/cmd_revert.c`, `cli/cmd_rebase.c`, `cli/cmd_commit.c`, `cli/cmd_switch.c`, `cli/cmd_undo.c`, `safety/sequencer.c`, `safety/rebase.c`, `pick.h`, `sequencer.h` | `docs/RULES-sequencer.md` |
-| `cli/cli_args.c`, `cli_args.h`; and anything at all before writing a second copy of something | `docs/RULES-duplication.md` |
+| `cli/cli_args.c`, `cli_args.h`, `workdir/tree_build.c`, `tree_build.h`, `storage/chunk.c`, `storage/reflog.c`, `safety/snapshot.c`; and anything at all before writing a second copy of something | `docs/RULES-duplication.md` |
 
 **Source comments and `docs/DESIGN.md` still say "CLAUDE.md's X entry"** --
 173 places in `src/`/`include/`/`tests/` and 83 in `docs/DESIGN.md`, as of Phase
@@ -252,28 +252,54 @@ A handful name a lesson that was never in this file at all (e.g. "measure git
 behaviour, never recall it"); those were already wrong before the split and
 are left alone.
 
-**The table itself can go stale silently, so it has a check.** Every sg source
-file named by a rule in a `docs/RULES-*.md` must appear in some row, or the
-table will never send anyone to its rules. To re-check after adding rules:
+**The table itself can go stale silently, so it has a check** -- every sg
+source file named by a rule in a `docs/RULES-*.md` must appear in some row, or
+the table will never send anyone to its rules:
 
 ```
 python3 - <<'EOF'
-import re, glob, collections
-table = "".join(l for l in open("CLAUDE.md") if l.startswith("| `"))
+import re, glob, os, collections
+real = {fn for r in ("src","include") for _,_,fns in os.walk(r) for fn in fns
+        if fn.endswith((".c",".h"))}
+table = "".join(l for l in open("CLAUDE.md") if l.startswith("| "))
 m = collections.defaultdict(set)
 for f in sorted(glob.glob("docs/RULES-*.md")):
-    for n in re.findall(r'\b([a-z_]+\.[ch])\b', open(f).read()):
-        m[n].add(f)
+    for n in re.findall(r'[A-Za-z0-9_]+\.[ch]\b', open(f).read()):
+        if n in real: m[n].add(f.replace("docs/RULES-", ""))
 for n, fs in sorted(m.items()):
-    if n not in table: print(n, sorted(x.replace("docs/RULES-","") for x in fs))
+    if not re.search(r'[`/]' + re.escape(n) + r'`', table): print(n, sorted(fs))
 EOF
 ```
 
-Expected leftovers, all legitimate: git's own sources (`xdiffi.c`,
-`xhistogram.c`, `xprepare.c`, `delta.c`), `tests/test_*.c` (named as evidence
-for a rule, not governed by one), and files whose only mention is in
-`docs/RULES-duplication.md` (`chunk.c`, `reflog.c`, `snapshot.c`), which the
-catch-all row already covers. Anything else is a gap: add it to a row.
+It resolves each name against the files that actually exist under `src/` and
+`include/`, so git's own sources (`xdiffi.c`, `xhistogram.c`, `xprepare.c`,
+`delta.c`) and prose examples (`other/d.c`) never enter the set, and it
+requires a delimiter around the name in the table so a short name cannot be
+absorbed as a substring of a longer one (`d.c` inside `cmd_add.c`). Expected
+leftovers today: none, so ANY output is a gap. Mutation-verified rather than
+assumed: deleting `cli/cmd_tag.c` from its row makes it report `cmd_tag.c`, and
+deleting `storage/repo.c` makes it report `repo.c`. (Both mutations first came
+back green through a shell heredoc that had silently eaten the string being
+removed -- run it from a real script file, not an inline heredoc with
+backticks in the argument.) `tests/test_*.c` are excluded by construction --
+they are named as evidence FOR a rule, not governed BY one.
+
+WARNING: **this check asks "is the name anywhere in the table", NOT "is it on
+the row of every RULES file that has a rule about it", and the second question
+is the one that actually matters.** A file already listed in one row for one
+reason is invisible when it is missing from another row it also needs, and the
+check stays silent. Measured: `cmd_merge.c` and `cmd_rebase.c` sat in the
+refs-revparse/merge and sequencer rows while both were missing from the
+paths-strings row, where a WARNING names them for the `snprintf` truncation
+bug that gave `sg merge` a silently WRONG COMMIT ID -- the check above was
+green for that the whole time, and a cold read is what found it. The per-row
+candidate list is `for each docs/RULES-X.md, every real source file it names
+that is not on X's own row`, which today produces about 40 entries; that list
+**needs manual triage and must not be shipped as a gate**, because most of its
+entries are a file mentioned in passing ("`sg_merge_trees` reuses
+`sg_diff_trees`"), which is not the same as a rule about that file, and no
+regex tells the two apart. When you add a rule naming a file, put it on the row
+yourself -- the automated check is a floor, not a proof.
 
 **Where a new lesson goes**: a newly measured rule or `WARNING:` goes into the
 matching `docs/RULES-*.md`, **never into this file**. This file gains a line
