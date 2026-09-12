@@ -351,48 +351,6 @@ static int resolve_base(const char *git_dir, const char *base, sg_rev_disambig d
     return -1;
 }
 
-/* The revparse-only name gate (Phase 70, section 3.1 of the spec). Blocks a
-   <base> string from becoming a hostile ref path BEFORE any of the six
-   gitrevisions patterns below are tried against it -- deliberately NOT a
-   tightening of sg_ref_branch_name_is_safe (refs.c), which has many other
-   callers (ref writes, transport, branch reads) this project has a
-   recorded lesson about not converging blindly. The hazard here is
-   specific to revparse: turning a user-supplied rev string into a ref
-   path. Rejects an empty name, a leading or trailing '/', any empty path
-   component ("//" anywhere), and any component that IS exactly "." or
-   "..". A '.' INSIDE a component (v1.0, a.b) is legal and must keep
-   working -- only a whole component of "." or ".." is rejected. Measured
-   against real git 2.55.0 (section 2.7): git refuses every one of these
-   spellings, while sg's pre-Phase-70 code resolved some of them (a loose
-   vs. packed-refs inconsistency that predates this phase). */
-static int name_is_safe_for_ref_path_lookup(const char *name)
-{
-    size_t i = 0;
-
-    if (name[0] == '\0')
-        return 0;
-
-    while (name[i] != '\0') {
-        size_t start = i;
-        size_t len;
-
-        while (name[i] != '\0' && name[i] != '/')
-            i++;
-        len = i - start;
-        /* An empty component happens at a leading '/', a trailing '/', or
-           "//" in the middle -- all three are the same check here. */
-        if (len == 0)
-            return 0;
-        if (len == 1 && name[start] == '.')
-            return 0;
-        if (len == 2 && name[start] == '.' && name[start + 1] == '.')
-            return 0;
-        if (name[i] == '/')
-            i++;
-    }
-    return 1;
-}
-
 int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size_t out_size)
 {
     unsigned char tmp[SG_SHA1_RAW_LEN];
@@ -410,7 +368,17 @@ int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size
         return 0;
     }
 
-    if (!name_is_safe_for_ref_path_lookup(name))
+    /* This gate (Phase 70, section 3.1 of the spec) blocks a <base> string
+       from becoming a hostile ref path BEFORE any of the six gitrevisions
+       patterns below are tried against it -- deliberately NOT a tightening
+       of sg_ref_branch_name_is_safe (refs.c), which has many other callers
+       (ref writes, transport, branch reads) this project has a recorded
+       lesson about not converging blindly. sg_ref_path_components_are_safe
+       (refs.h) is the shared, stricter predicate used here AND (Phase 70b)
+       by sg_ref_read_path_resolved's own symref-hop-target check -- see
+       its header comment for why the two call sites are both needed and
+       neither is redundant with the other. */
+    if (!sg_ref_path_components_are_safe(name))
         return -1;
 
     /* git's own gitrevisions lookup order (`ref_rev_parse_rules`), tried in
@@ -596,17 +564,50 @@ int sg_rev_parse_commit_ex(const char *git_dir, const char *rev, sg_rev_disambig
             return -1;
         if (sg_reflog_read(git_dir, ref_path, &log) != 0)
             return -1;
-        /* @{N} names the NEW oid of that log entry -- the value the ref was
-           moved TO, not the value it had before (see sg_reflog_at's header
-           comment; @{0}'s old_id is not "the previous commit", it can be
-           all-zeros for a ref's very first entry). */
+        /* @{N} for N>=1 names the NEW oid of that log entry -- the value the
+           ref was moved TO, not the value it had before (see sg_reflog_at's
+           header comment; @{1}'s old_id is not "the previous commit", it
+           can be all-zeros for a ref's very first entry). The log entry at
+           idx must exist either way -- this is what makes @{0} still refuse
+           when the reflog has been deleted, exactly like every other
+           index. */
         entry = sg_reflog_at(&log, (size_t)idx);
         if (entry == NULL) {
             sg_reflog_free(&log);
             return -1;
         }
-        memcpy(id, entry->new_id, SG_SHA1_RAW_LEN);
-        sg_reflog_free(&log);
+        if (idx == 0) {
+            /* @{0} means the ref's CURRENT value, NOT the log's own last
+               new_id -- these differ whenever the ref file was moved
+               without a matching reflog append (measured against real git
+               2.55.0: a hand-edited ref file, or a moved symref target,
+               both leave the reflog stale while the ref itself points
+               somewhere new). The existence check above is still required
+               (a ref whose log has been deleted entirely must still
+               refuse, matching git) -- only the SOURCE of the oid changes
+               here, never the existence gate.
+
+               Every rule sg_rev_parse_ref_path can return may itself be a
+               symref as of Phase 70 (rules 5/6), so this reads the current
+               value through the same functions every other symref-aware
+               reader in this file uses: sg_ref_resolve_head for "HEAD"
+               (its own detached-vs-symbolic indirection), and
+               sg_ref_read_path_resolved (which follows a symref) for
+               everything else -- never sg_ref_read_path, which does not
+               follow one. */
+            int rc2;
+
+            if (strcmp(ref_path, "HEAD") == 0)
+                rc2 = sg_ref_resolve_head(git_dir, id);
+            else
+                rc2 = sg_ref_read_path_resolved(git_dir, ref_path, id);
+            sg_reflog_free(&log);
+            if (rc2 != 0)
+                return -1;
+        } else {
+            memcpy(id, entry->new_id, SG_SHA1_RAW_LEN);
+            sg_reflog_free(&log);
+        }
     } else {
         rc = resolve_base(git_dir, base, base_disambig, id);
         if (rc != 0)

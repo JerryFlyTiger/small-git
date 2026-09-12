@@ -131,6 +131,24 @@ static void make_annotated_tag_object(const char *git_dir, const char *name,
     free(serialized);
 }
 
+/* Writes a raw "ref: <target>\n" symref file directly, bypassing
+   sg_ref_set_symref's own write-time gate (sg_ref_branch_name_is_safe) --
+   needed for a target sg_ref_set_symref itself would refuse to write
+   (e.g. one containing ".."), to simulate a hand-crafted or third-party
+   file already sitting on disk. */
+static void write_raw_symref(const char *git_dir, const char *rel_path, const char *target)
+{
+    char full_path[SG_PATH_MAX];
+    char content[SG_PATH_MAX + 16];
+    int n;
+
+    n = snprintf(content, sizeof(content), "ref: %s\n", target);
+    CHECK(n > 0 && (size_t)n < sizeof(content), "symref content too long for '%s'", rel_path);
+    snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, rel_path);
+    CHECK(sg_write_file_mkdirs(full_path, (const unsigned char *)content, strlen(content), 0644) == 0,
+         "failed to write raw symref file '%s'", rel_path);
+}
+
 /* Writes ordinary hex-oid content straight to an arbitrary path under
    git_dir, exercising rule 1's general form (any file under $GIT_DIR whose
    first 40 bytes are hex) without going through any of the ref-writing
@@ -482,6 +500,121 @@ static void test_legal_dots_still_resolve(void)
     free(git_dir);
 }
 
+/* ---- Phase 70b: sg_ref_read_path_resolved must gate a SYMREF HOP TARGET
+   with the strict sg_ref_path_components_are_safe check, not just the
+   weaker sg_ref_branch_name_is_safe every iteration already applies. A
+   symref's content is untrusted the same way argv is: a file containing
+   "ref: refs/heads//a/b" would otherwise sail through the weak check and
+   let the OS collapse "//" when the loose file underneath is opened --
+   the exact bug the revparse-side gate was written to close, reached
+   through disk content instead of argv. This is a SEPARATE source from
+   revparse's own gate on `name` (two sources, two guards, per
+   sg_ref_path_components_are_safe's own header comment): calling
+   sg_ref_read_path_resolved directly with a hostile ref_path (no symref
+   involved at all) is deliberately NOT caught here -- that is revparse's
+   job, done before this function is ever called. ---- */
+
+/* A DIRECT witness on sg_ref_path_components_are_safe itself.  It exists
+   because the trailing-'/' half of that predicate's contract has NO
+   end-to-end witness and cannot have one: a ref path ending in '/' is
+   already refused downstream, since fopen() on a regular file with a
+   trailing slash returns ENOTDIR.  So an end-to-end assertion here would
+   pass whether or not the gate does its job -- exactly this project's
+   "same outcome, different reason is false coverage" shape.  Measured: the
+   predicate answered "safe" for every trailing-slash spelling below while
+   its own header comment, docs/DESIGN.md and CLAUDE.md all claimed it
+   rejected them; the walk consumed the final separator and then ended,
+   never running one more round to see the empty component.  Found by a
+   cold read, not by any gate. */
+static void test_path_components_predicate_rejects_a_trailing_slash(void)
+{
+    /* The gap this test was written for. */
+    CHECK(sg_ref_path_components_are_safe("a/") == 0,
+         "a trailing '/' is a final EMPTY component and must be rejected");
+    CHECK(sg_ref_path_components_are_safe("heads/") == 0,
+         "\"heads/\" must be rejected (git refuses this spelling too)");
+    CHECK(sg_ref_path_components_are_safe("heads/master/") == 0,
+         "\"heads/master/\" must be rejected");
+    CHECK(sg_ref_path_components_are_safe("refs/heads/x/") == 0,
+         "an already-refs/-qualified path with a trailing '/' must be rejected");
+
+    /* Controls: the halves that were ALREADY right must stay right -- a
+       fix that rejected a trailing '/' by, say, refusing any name
+       containing '/' at all would pass every assertion above and break
+       every one of these. */
+    CHECK(sg_ref_path_components_are_safe("a/b") == 1,
+         "an ordinary two-component path must stay safe");
+    CHECK(sg_ref_path_components_are_safe("refs/heads/master") == 1,
+         "an ordinary ref path must stay safe");
+    CHECK(sg_ref_path_components_are_safe("v1.0") == 1,
+         "a '.' INSIDE a component is legal and must stay safe");
+    CHECK(sg_ref_path_components_are_safe("a.b/c.d") == 1,
+         "dots inside several components are legal");
+    CHECK(sg_ref_path_components_are_safe("a//b") == 0,
+         "an empty component in the MIDDLE was already rejected (control)");
+    CHECK(sg_ref_path_components_are_safe("/a") == 0,
+         "a leading '/' was already rejected (control)");
+    CHECK(sg_ref_path_components_are_safe("a/./b") == 0,
+         "a '.' component was already rejected (control)");
+    CHECK(sg_ref_path_components_are_safe("a/../b") == 0,
+         "a '..' component was already rejected (control)");
+    CHECK(sg_ref_path_components_are_safe("") == 0,
+         "an empty name was already rejected (control)");
+}
+
+static void test_symref_hop_target_hostile_slash_refused(void)
+{
+    char *git_dir = make_tmp_repo();
+    unsigned char c1[SG_SHA1_RAW_LEN];
+    unsigned char out[SG_SHA1_RAW_LEN];
+
+    make_commit(git_dir, "c1", c1);
+    write_branch(git_dir, "a/b", c1);
+
+    /* Symref content built with sg_ref_set_symref itself -- it only
+       enforces the WEAK sg_ref_branch_name_is_safe on the target at write
+       time, so both of these hostile targets are accepted onto disk, the
+       same way a hand-crafted or third-party-written file would be. */
+    CHECK(sg_ref_set_symref(git_dir, "refs/remotes/s_slash", "refs/heads//a/b", NULL) == 0,
+         "failed to write a symref whose target contains '//'");
+    CHECK(sg_ref_read_path_resolved(git_dir, "refs/remotes/s_slash", out) != 0,
+         "a symref hop target containing '//' must be refused, not silently OS-collapsed to a/b");
+
+    CHECK(sg_ref_set_symref(git_dir, "refs/remotes/s_dot", "refs/heads/a/./b", NULL) == 0,
+         "failed to write a symref whose target contains a '.' component");
+    CHECK(sg_ref_read_path_resolved(git_dir, "refs/remotes/s_dot", out) != 0,
+         "a symref hop target containing a '.' component must be refused");
+
+    /* Reached via rule 6's own shape (a chain of two hops) for good
+       measure: the strict gate must fire on EVERY hop, not just the
+       first. */
+    CHECK(sg_ref_set_symref(git_dir, "refs/remotes/s_chain", "refs/remotes/s_slash", NULL) == 0,
+         "failed to write a symref chain leading to a hostile target");
+    CHECK(sg_ref_read_path_resolved(git_dir, "refs/remotes/s_chain", out) != 0,
+         "a hostile target reached through a second hop must still be refused");
+
+    /* Control: a target containing ".." is ALREADY blocked by the
+       pre-existing sg_ref_branch_name_is_safe -- this is not new coverage
+       for the strict gate, it just confirms the existing layer still
+       works unchanged underneath it. */
+    write_raw_symref(git_dir, "refs/remotes/s_dotdot", "../EVIL");
+    CHECK(sg_ref_read_path_resolved(git_dir, "refs/remotes/s_dotdot", out) != 0,
+         "a symref hop target containing '..' must be refused (pre-existing layer, control)");
+
+    /* Control: the strict gate is deliberately NOT applied to the
+       function's OWN incoming ref_path (no symref involved at all) --
+       that is revparse's job. Calling sg_ref_read_path_resolved directly
+       with a hostile literal still resolves through OS path collapsing,
+       proving this function alone does not (and must not try to) do
+       revparse's job for it. */
+    CHECK(sg_ref_read_path_resolved(git_dir, "refs/heads/a//b", out) == 0 &&
+             memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
+         "the function's own incoming ref_path is deliberately ungated here -- "
+         "sg_rev_parse_ref_path's caller-side gate is what blocks this in practice");
+
+    free(git_dir);
+}
+
 /* ---- truncation: a candidate that would not fit in `out` must count as
    "this rule missed", never probed, never silently cut. ---- */
 
@@ -518,6 +651,8 @@ int main(void)
     test_self_referencing_symref();
     test_hostile_spellings_refused();
     test_legal_dots_still_resolve();
+    test_path_components_predicate_rejects_a_trailing_slash();
+    test_symref_hop_target_hostile_slash_refused();
     test_truncation_is_treated_as_a_miss();
 
     if (failures > 0) {

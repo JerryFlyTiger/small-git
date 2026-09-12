@@ -14937,3 +14937,263 @@ decided.
 tests/interop.sh` (3558/3558 passed, 0 skipped), `make sanitize` (82/82
 binaries, 0 sanitizer errors) -- all green on a from-clean rebuild via
 `bash tests/gates.sh --sanitize --rebuild`.
+
+## Phase 70b: five items found by post-Phase-70 review rounds
+
+All four gates were green after Phase 70 (3558/3558 interop), and a
+separate independent oracle harness (444 probes x 3 comparison dimensions,
+expected values sourced only from real git) went from 244 mismatches
+before Phase 70 to 0 after -- Phase 70's own functional correctness was not
+in question. This section covers five things subsequent COLD REVIEW
+rounds found, none of which any of that measurement touched -- the first
+four from a review of Phase 70 itself, the fifth from a review of the
+tail diff those four fixes produced (a batch that, by construction, no
+reviewer had seen when the first round ran).
+
+### 1. `@{0}` means the ref's CURRENT value, not the reflog's last new_id
+
+Real git's `@{0}` answers "what is this ref right now", not "what did the
+reflog's last entry record" -- the two differ whenever a ref's file was
+moved without a matching reflog append. `sg_rev_parse_commit_ex`'s `@{N}`
+branch used `entry->new_id` for every N including 0; fixed by branching on
+`idx == 0` to read the ref's CURRENT value instead (via `sg_ref_resolve_head`
+for `"HEAD"`, `sg_ref_read_path_resolved` for everything else -- the same
+two functions every other symref-aware reader in `revparse.c` already
+uses), while N>=1 is untouched.
+
+This bug is PRE-EXISTING (reproduced on the pre-Phase-70 binary, byte for
+byte), and was invisible before Phase 70 because reaching it required
+hand-editing a ref file directly -- no `sg` command alone could produce a
+ref whose file disagreed with its own reflog. **Phase 70 made it reachable
+through sg's own commands with no hand-editing at all**: `sg clone` writes
+`refs/remotes/<remote>/HEAD` as a symref via `sg_ref_set_symref` (Phase
+48), and `ref_path_reflog_allowed` (`refs.c`) permits `refs/remotes/` to
+carry a reflog, so that symref gets a real log entry recording whatever the
+target ref pointed at when the clone ran. A later `sg fetch` moves the
+target ref (an ordinary, correct operation) without ever touching the
+symref's own log -- so `sg log origin@{0}` would report the commit at
+CLONE TIME, not the current one. This is the SAME dimension already
+reachable by hand-editing a ref file; Phase 70 only added a second,
+command-only path to it. `tests/test_revparse_at_zero.c`'s
+`test_at_zero_tracks_a_moved_symref_target` is this exact fixture, built
+entirely with `sg_ref_set_symref` + `sg_ref_write_path`, no raw file writes.
+
+Two boundaries deliberately preserved, each with its own dedicated test:
+- **The reflog must still exist.** `@{0}`'s existence check (an
+  `sg_reflog_read` + `sg_reflog_at(0)` call, unchanged) still has to
+  succeed before the value source is even asked; only the SOURCE of the
+  oid changed. Measured directly (a python probe, argv only, no shell):
+  `git branch <name> <commit>` UNEXPECTEDLY creates a one-entry reflog of
+  its own by default (`core.logAllRefUpdates` defaults to true for a
+  non-bare repo) -- so testing "no reflog at all" needs the log file
+  explicitly removed after creation, a freshly-`git branch`-created ref
+  proves nothing. `interop.sh`'s `phase70b` group's "nolog" fixture does
+  this; the first draft of it did not, and its precondition check caught
+  the mistake immediately (git resolved a spelling it was supposed to
+  refuse).
+- **The bare `"@{0}"` spelling's pre-existing divergence from real git,
+  when the CURRENT BRANCH's reflog is missing, is UNCHANGED and
+  deliberately NOT fixed here.** CLAUDE.md already records this
+  ("do not invent an asymmetry between sg's own two spellings"); a NAMED
+  spelling of the same branch (`"master@{0}"`) already agrees with git in
+  that state (both refuse), which is a DIFFERENT rule (the existence
+  check above) from the bare form's own recorded divergence -- pinned as
+  two separate, named checks so neither can be mistaken for the other.
+
+`sg_ref_read_path_resolved` follows a symref (needed when the ref path
+handed to `sg_rev_parse_ref_path` -- or, here, the ref path `@{N}` indexes
+-- is itself a symref), consistent with every other Phase 70 caller;
+`sg_ref_read_path` itself is unaffected.
+
+### 2. `sg_ref_read_path_resolved`'s symref hop target needed its own gate
+
+Phase 70's `sg_ref_read_path_resolved` gated the loop's `current` variable
+with `sg_ref_branch_name_is_safe` every iteration, but that is the WEAK
+check (no leading `/`, no `..`, nothing else) -- a symref whose content is
+`"ref: refs/heads//a/b\n"` sails through it, and the OS collapses the `//`
+when the loose file is opened, resolving to `a/b` in the general case where
+`a/b` genuinely exists as a branch. This is a Phase-70-introduced bug
+(rules 5/6, and the whole `_resolved` function, did not exist before Phase
+70) -- **found by a cold review, not by any gate**, all four having stayed
+green through Phase 70's own landing.
+
+The fix promotes the STRICT path-component check (previously file-local to
+`revparse.c` as `name_is_safe_for_ref_path_lookup`) into a shared, public
+function, `sg_ref_path_components_are_safe` (`refs.c`/`refs.h`), used at
+TWO independent sources, neither redundant with the other (see the
+function's own header comment for the full reasoning, echoing CLAUDE.md's
+"guards belong to a SOURCE, one per source" rule):
+1. `revparse.c` gates the user-typed `<base>` argv string BEFORE trying any
+   of the six gitrevisions patterns (unchanged from Phase 70, just renamed
+   to the shared function).
+2. `sg_ref_read_path_resolved` gates EVERY SYMREF HOP TARGET read off disk
+   (new in Phase 70b) -- deliberately NOT the function's own incoming
+   `ref_path` (its first, non-hop iteration), which stays gated only by
+   the pre-existing weak check: that path is revparse's own job, already
+   done before this function is ever called, and gating it a second time
+   here would make source 2 alone look responsible for the whole
+   property, hiding source 1 from a mutation that only breaks source 2.
+
+Verified disjoint by directed mutation (`bash tests/mutate.sh`, both at the
+unit and interop layer): reverting source 2's gate (the hop-target check)
+turns red exactly `test_symref_hop_target_hostile_slash_refused` and
+`interop.sh`'s `phase70b` "LOOSE symref hop target" check, while
+`test_hostile_spellings_refused` and `phase70`'s "a//b" checks stay green;
+reverting source 1's gate (revparse's own, `sg_ref_path_components_are_safe`
+inside `sg_rev_parse_ref_path`) turns red exactly the opposite set. Neither
+mutation moves the other's checks -- proof the two guards are not
+redundant with each other, not just an assertion that they exist.
+
+The bug is invisible under `git pack-refs`: `read_packed_ref`'s exact
+`strcmp` against the packed-refs file does not collapse `//`, so a packed
+fixture refuses for an ENTIRELY DIFFERENT reason and would silently
+launder a broken gate as passing -- `interop.sh`'s `phase70b` group
+therefore uses a LOOSE fixture as the real evidence and keeps a packed
+control alongside it, named so it cannot be misread as validating the gate
+(exactly the trap the coordinator's own first measurement of this bug fell
+into, before re-measuring on a loose fixture).
+
+### 3. `sg push`'s new dwim `<src>` spelling silently peeled an annotated tag
+
+`resolve_refspec_src` (`cmd_push.c`) tries three literal ref lookups
+(already-`"refs/"`-qualified, `"refs/tags/<src>"`, `"refs/heads/<src>"`)
+before falling back to the peeling `sg_rev_parse_commit`. Phase 70 taught
+`sg_rev_parse_ref_path` a `"tags/<name>"` dwim spelling that none of those
+three literal checks try (they only try `"refs/tags/tags/<name>"` and
+`"refs/heads/tags/<name>"`, both of which are typically absent) -- so that
+new spelling fell straight through to the peeling fallback. Measured on a
+REAL smart-HTTP push, checking the remote's object TYPE
+(`git cat-file -t`), not just exit code (both the broken and fixed answer
+exit 0): `sg push origin tags/atag:refs/tags/x` pushed the tag's underlying
+COMMIT to the remote instead of the tag object -- silently, a byte-
+incompatible answer with real git, introduced by Phase 70 in a file (
+`cmd_push.c`) Phase 70 never touched.
+
+Fixed by trying the REST of git's gitrevisions dwim table -- rules 1, 2, 5,
+6, plus any `"heads/<name>"`/`"tags/<name>"`-shaped spelling landing on
+rules 3/4 that the three literal checks miss -- the same unpeeled way, via
+`sg_rev_parse_ref_path` + `sg_ref_read_path_resolved` (the identical
+pattern `resolve_base` and `sg_rev_parse_object` already use), inserted
+between the three existing literal checks and the peeling fallback. The
+three literal checks are LEFT UNTOUCHED rather than collapsed into the new
+block, because one of them (the tag-vs-branch "matches more than one"
+ambiguity error) has no equivalent in `sg_rev_parse_ref_path`, which is a
+plain first-rule-wins table with no ambiguity detection at all -- collapsing
+would silently drop that error for a bare ambiguous name.
+
+`"sg push origin HEAD:refs/heads/x"` (a boundary CLAUDE.md already records)
+keeps working: `sg_rev_parse_ref_path("HEAD", ...)` returns `"HEAD"`
+verbatim without an existence check, same as always, and the new block's
+`sg_ref_resolve_head` branch handles it exactly the way `resolve_base` and
+`sg_rev_parse_object` already do -- verified on a real smart-HTTP push, not
+just reasoned about (a suffixed src, `"push-ann~0"`, is also pinned as a
+control: `sg_rev_parse_ref_path` correctly misses on it, so it still
+reaches the peeling fallback unchanged, matching git's own peeling there).
+
+Verified by directed mutation: reverting the new block (forcing the
+`sg_rev_parse_ref_path` probe to always miss) turns red exactly the two
+`"tags/<name>"` dwim checks in `interop.sh`'s `phase70b` group, while both
+literal-path controls (`"push-ann"`, `"refs/tags/push-ann"`), the
+`HEAD:dst` boundary, and the suffixed-src control all stay green -- proof
+the fix is not wider than it needs to be.
+
+### 4. Recorded, NOT fixed: `sg tag <new> <annotated-tag>` peels where git does not
+
+A pre-existing, PRE-Phase-70 bug in `cmd_tag.c` (unrelated to this phase's
+own changes): creating a new tag from an existing annotated tag peels it
+to the underlying commit, where real git creates a tag that is itself a
+tag object pointing at the SAME tag object (`refs/tags/<new>` has type
+`tag`, not `commit`). Measured on the pre-Phase-70 binary for the two
+literal spellings (`atag`, `refs/tags/atag`) -- both already wrong before
+this phase existed. Phase 70 only adds a THIRD spelling that reaches the
+identical pre-existing bug (`tags/atag`, previously refused outright,
+now also gives a peeled commit). Two other dimensions were checked and are
+CORRECT: `sg cat-file -t tags/atag` answers `tag` (no peeling), and
+`sg switch --detach tags/atag` lands on the same commit as git on both
+sides.
+
+Deliberately not fixed here, same convention as Phase 69's `heads/<name>`
+gap: pinned by name in `interop.sh` (git side `tag`, sg side `commit`,
+named so closing it later turns this check red rather than silently
+changing what it compares) and recorded in CLAUDE.md's residual-gaps list,
+left for a dedicated future phase that measures `sg tag`'s full matrix
+(`-a`, `-f`, lightweight vs annotated) rather than patched as a side effect
+of this one.
+
+### Gates (Phase 70b)
+
+`make` + `make test` + `bash tests/interop.sh` + `make sanitize`, all via
+`bash tests/gates.sh --sanitize --rebuild` -- see the top-level report for
+the actual printed numbers of this round; this section records the fixes,
+not a duplicate of the gate summary.
+
+### 5. `sg_ref_path_components_are_safe` did not actually reject a trailing `/`
+
+Found by the cold read of items 1-4's own tail diff, and it is the one
+finding in this phase whose correct outcome was already happening for the
+wrong reason.
+
+The predicate walks `name` one component at a time and rejects any EMPTY
+component. A trailing `/` is a final empty component, and the walk could
+not see it: having consumed the separator, `i` points at the terminator, so
+the outer `while (name[i] != '\0')` ends the walk instead of running one
+more (empty) round. Measured directly against the predicate, before the
+fix:
+
+| input | answered | should answer |
+|---|---|---|
+| `a/` | 1 | 0 |
+| `heads/` | 1 | 0 |
+| `heads/master/` | 1 | 0 |
+| `refs/heads/x/` | 1 | 0 |
+
+Everything else was already right (`a//b`, `a/./b`, `a/../b`, `/a`, `.`,
+`..`, `a/.` all 0; `a/b`, `refs/heads/master`, `v1.0`, `a.b` all 1), and
+the algorithm dates from Phase 70 -- Phase 70b only promoted it to a public,
+shared function and re-asserted the trailing-`/` claim in its new header
+comment. Both `include/sg/refs.h` and CLAUDE.md stated the predicate
+rejected a trailing `/`; neither was true.
+
+**Nothing observable changed when this was fixed, and that is the point.**
+A ref path ending in `/` was already refused downstream, because `fopen()`
+on a regular file with a trailing slash returns `ENOTDIR`. So the gate's
+own contribution was invisible: the answer was right, produced by the OS
+rather than by the gate, and a later refactor that stripped the slash
+before opening would have deleted the safety property with every gate
+still green. This is the project's own recorded
+"same outcome, different reason is false coverage" shape, and it is why the
+witness is a DIRECT assertion on the predicate
+(`test_path_components_predicate_rejects_a_trailing_slash`,
+`tests/test_revparse_ref_path.c`) rather than an end-to-end one -- an
+end-to-end check here would pass with or without the fix, i.e. would verify
+nothing. Reverse-mutated: with the fix undone, exactly the four
+trailing-slash assertions go red and all nine control assertions (the
+already-correct halves, which a too-broad fix would break) stay green.
+Interop is unchanged at 3593/3593, as expected for a fix with no observable
+effect; claiming an interop witness for it would have been the lie this
+whole section is about.
+
+### Two PRE-EXISTING divergences this phase's harness surfaced but did not fix
+
+Both were confirmed against the PRE-Phase-70 binary and are unrelated to the
+lookup table; they are recorded here rather than fixed, because each belongs
+to a different subsystem's own topic.
+
+1. **`sg log <rev>:<path>` refuses a blob where `git log` exits 0.** git
+   resolves the blob and then prints nothing, exit 0; sg's `sg log` requires a
+   commit (`SG_REV_COMMITTISH`) and exits 1. Measured on `master:f.txt` --
+   a spelling that resolved long before Phase 70 -- so this is not about the
+   new dwim spellings; they merely reach it too now. Whether `sg log` should
+   accept a non-commit object at all is `cmd_log.c`'s question, not
+   revparse's.
+
+2. **Any argument containing a backslash is silently accepted as a pathspec.**
+   `sg_pathspec_looks_like_spec` counts `\` as a wildcard character, and
+   CLAUDE.md's own disambiguation rule says an argument containing a wildcard
+   SKIPS the existence check -- so `sg log 'nosuch\thing'` exits 0 having
+   matched nothing, while `git log` exits 128 (`ambiguous argument`). Measured
+   identically on `nosuch\thing`, `top\ic` and `master\`, on the
+   pre-Phase-70 binary as well, i.e. it has nothing to do with any `heads/`- or
+   `tags/`-shaped spelling. Fixing it means deciding whether `\` belongs in
+   that character set at all, which is Phase 28's grammar, and would move
+   `sg diff`/`sg status`/`sg stash` at the same time.

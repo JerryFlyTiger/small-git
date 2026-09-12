@@ -12,6 +12,36 @@
    check. */
 int sg_ref_branch_name_is_safe(const char *name);
 
+/* A STRICTER, per-component path-safety check than sg_ref_branch_name_is_safe
+   above -- deliberately given a distinct name so the two are never confused
+   for one another. sg_ref_branch_name_is_safe only blocks an empty name, a
+   leading '/', and any ".." SUBSTRING anywhere; this one additionally
+   rejects a trailing '/', any EMPTY path component ("//" anywhere, which
+   the OS silently collapses when opening a loose ref file but an exact
+   strcmp against packed-refs does not -- the source of a real, measured
+   loose-vs-packed inconsistency), and any component that IS EXACTLY "." or
+   "..". A '.' INSIDE a component ("v1.0", "a.b") stays legal.
+
+   Used at TWO independent sources, each guarding what the other cannot see
+   -- neither is redundant with the other, do not delete either one:
+     1. revparse.c gates a user-typed <base> argv string with it before
+        trying any of sg_rev_parse_ref_path's six gitrevisions patterns
+        (Phase 70).
+     2. sg_ref_read_path_resolved (below) gates every SYMREF HOP TARGET
+        read off disk with it (Phase 70b) -- a symref's content is
+        untrusted the same way argv is: a file containing
+        "ref: refs/heads//a/b" would otherwise sail through
+        sg_ref_branch_name_is_safe's weaker check and let the OS collapse
+        "//" when the loose file is opened, exactly the argv-side bug this
+        function was written to close, just reached through a different
+        input.
+   Deliberately NOT applied to sg_ref_read_path_resolved's OWN incoming
+   ref_path (the first, non-hop iteration) -- that is source 1's job
+   (revparse's gate already ran on whatever produced it), and gating it a
+   second time here would make source 2 look like it is doing the whole
+   job alone, hiding source 1 from any mutation that only breaks source 2. */
+int sg_ref_path_components_are_safe(const char *name);
+
 /* The subset of git-check-ref-format rules that git enforces when CREATING a
    ref, measured against real git (leading '-', "a..b", "a b", "a.lock",
    "HEAD", "a/", "@{x}" all rejected there). Strictly stricter than

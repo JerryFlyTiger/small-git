@@ -674,31 +674,56 @@ static void test_at_notation_tag_has_no_reflog(void)
 }
 
 /* HEAD@{N} and <branch>@{N} read different files (logs/HEAD vs.
-   logs/refs/heads/<branch>) and can legitimately disagree at the same
-   moment -- proven here by giving them independently-built, disjoint
-   histories of entries. */
+   logs/refs/heads/<branch>) and can legitimately disagree -- but only at
+   N>=1. As of Phase 70b, "@{0}" means the ref's CURRENT value, not the
+   log's own last new_id (measured against real git 2.55.0: a ref's
+   current value and its reflog's last entry can disagree, e.g. after a
+   hand-edited ref file or a moved symref target, and @{0} follows the
+   former). Here HEAD is symbolic to master, so HEAD's CURRENT value is
+   simply whatever master currently is (c2) -- the two @{0}s therefore
+   AGREE, regardless of what either log's own last entry says. The
+   "independently-built, disjoint histories" property this test exists to
+   demonstrate is still real, just one index further back: @{1} still reads
+   each ref's own separate log file and disagrees there. */
 static void test_at_notation_head_and_branch_logs_differ(void)
 {
     char *git_dir = make_tmp_repo();
     unsigned char c1[SG_SHA1_RAW_LEN], c2[SG_SHA1_RAW_LEN];
+    unsigned char stale_head[SG_SHA1_RAW_LEN], stale_master[SG_SHA1_RAW_LEN];
     unsigned char zero[SG_SHA1_RAW_LEN];
     unsigned char out[SG_SHA1_RAW_LEN];
 
     memset(zero, 0, SG_SHA1_RAW_LEN);
     make_commit(git_dir, "c1", NULL, 0, c1);
     make_commit(git_dir, "c2", (const unsigned char (*)[SG_SHA1_RAW_LEN])c1, 1, c2);
+    make_commit(git_dir, "stale-head", NULL, 0, stale_head);
+    make_commit(git_dir, "stale-master", NULL, 0, stale_master);
     set_master(git_dir, c2);
 
-    /* logs/HEAD gets one entry (-> c1); logs/refs/heads/master gets a
-       DIFFERENT one (-> c2), so "HEAD@{0}" and "master@{0}" must disagree. */
-    CHECK(sg_reflog_append(git_dir, "HEAD", zero, c1, "head move", NULL) == 0, "HEAD append failed");
+    /* logs/HEAD gets two entries (-> c1, then -> stale_head);
+       logs/refs/heads/master gets two DIFFERENT ones (-> c2, then ->
+       stale_master) -- so "HEAD@{1}" and "master@{1}" must disagree (c1 vs
+       c2), even though "HEAD@{0}" and "master@{0}" now agree (both read
+       the CURRENT value, c2, ignoring either log's own last entry). */
+    CHECK(sg_reflog_append(git_dir, "HEAD", zero, c1, "head move", NULL) == 0, "HEAD append 1 failed");
+    CHECK(sg_reflog_append(git_dir, "HEAD", c1, stale_head, "head move 2", NULL) == 0,
+         "HEAD append 2 failed");
     CHECK(sg_reflog_append(git_dir, "refs/heads/master", zero, c2, "branch move", NULL) == 0,
-         "branch append failed");
+         "branch append 1 failed");
+    CHECK(sg_reflog_append(git_dir, "refs/heads/master", c2, stale_master, "branch move 2", NULL) == 0,
+         "branch append 2 failed");
 
-    CHECK(sg_rev_parse_commit(git_dir, "HEAD@{0}", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
-         "HEAD@{0} should read logs/HEAD (c1)");
+    CHECK(sg_rev_parse_commit(git_dir, "HEAD@{0}", out) == 0 && memcmp(out, c2, SG_SHA1_RAW_LEN) == 0,
+         "HEAD@{0} should be HEAD's CURRENT value (c2, via the symbolic link to master), "
+         "not logs/HEAD's own stale last entry");
     CHECK(sg_rev_parse_commit(git_dir, "master@{0}", out) == 0 && memcmp(out, c2, SG_SHA1_RAW_LEN) == 0,
-         "master@{0} should read logs/refs/heads/master (c2), not logs/HEAD");
+         "master@{0} should also be c2 (master's current value) -- so HEAD@{0} and master@{0} "
+         "AGREE here, unlike before Phase 70b");
+    CHECK(sg_rev_parse_commit(git_dir, "HEAD@{1}", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
+         "HEAD@{1} should still read logs/HEAD's own history (c1) -- @{1} is unaffected by the fix");
+    CHECK(sg_rev_parse_commit(git_dir, "master@{1}", out) == 0 && memcmp(out, c2, SG_SHA1_RAW_LEN) == 0,
+         "master@{1} should still read logs/refs/heads/master's own history (c2), "
+         "disagreeing with HEAD@{1} (c1) -- the two logs are still independent at N>=1");
 
     free(git_dir);
 }
@@ -816,36 +841,66 @@ static void test_at_notation_trailing_garbage_rejected(void)
    and the first one is the counter-intuitive half: "@{N}" reads the CURRENT
    BRANCH's reflog, not HEAD's. The two logs are seeded with different oids
    here for exactly that reason -- with identical logs the test would pass
-   whichever one the implementation picked. */
+   whichever one the implementation picked. As of Phase 70b, that
+   distinction is only observable at N>=1 -- @{0} on either spelling reads
+   the CURRENT value, not either log's own last entry, so "@{0}" and
+   "@@{0}" now agree here (see the comments inline below). */
 static void test_bare_at_brace_reads_the_current_branchs_log(void)
 {
     char *git_dir = make_tmp_repo();
     unsigned char c1[SG_SHA1_RAW_LEN], c2[SG_SHA1_RAW_LEN];
+    unsigned char stale_head[SG_SHA1_RAW_LEN], stale_master[SG_SHA1_RAW_LEN];
     unsigned char zero[SG_SHA1_RAW_LEN];
     unsigned char out[SG_SHA1_RAW_LEN];
 
     memset(zero, 0, SG_SHA1_RAW_LEN);
     make_commit(git_dir, "c1", NULL, 0, c1);
     make_commit(git_dir, "c2", (const unsigned char (*)[SG_SHA1_RAW_LEN])c1, 1, c2);
+    make_commit(git_dir, "stale-head", NULL, 0, stale_head);
+    make_commit(git_dir, "stale-master", NULL, 0, stale_master);
     set_master(git_dir, c2);
 
-    CHECK(sg_reflog_append(git_dir, "HEAD", zero, c1, "head move", NULL) == 0, "HEAD append failed");
+    /* A second, later entry on each log (matching
+       test_at_notation_head_and_branch_logs_differ's own reasoning): as of
+       Phase 70b, @{0} means the CURRENT value, not the log's own last
+       new_id, so both @{0} forms below now read c2 (master's current
+       value, since HEAD is symbolic to master) regardless of these stale
+       entries -- the "reads a distinct per-ref log" property this test
+       exists to demonstrate has moved to @{1}. */
+    CHECK(sg_reflog_append(git_dir, "HEAD", zero, c1, "head move", NULL) == 0, "HEAD append 1 failed");
+    CHECK(sg_reflog_append(git_dir, "HEAD", c1, stale_head, "head move 2", NULL) == 0,
+         "HEAD append 2 failed");
     CHECK(sg_reflog_append(git_dir, "refs/heads/master", zero, c2, "branch move", NULL) == 0,
-         "branch append failed");
+         "branch append 1 failed");
+    CHECK(sg_reflog_append(git_dir, "refs/heads/master", c2, stale_master, "branch move 2", NULL) == 0,
+         "branch append 2 failed");
 
     CHECK(sg_rev_parse_commit(git_dir, "@{0}", out) == 0 && memcmp(out, c2, SG_SHA1_RAW_LEN) == 0,
-         "@{0} should read the current branch's log (c2), not logs/HEAD (c1)");
+         "@{0} should be the current branch's CURRENT value (c2), ignoring either log's own "
+         "stale last entry");
 
     /* The suffix loop below the rewrite has to keep working on it. */
     CHECK(sg_rev_parse_commit(git_dir, "@{0}~1", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
          "@{0}~1 should be c2's parent");
 
     /* "@@{0}" is the two rules composed: the base "@" becomes HEAD, and the
-       reflog lookup then runs on HEAD's own log -- so it must equal
-       HEAD@{0} (c1 here), NOT the bare "@{0}" above (c2). Measured against
-       git 2.55.0, which agrees. */
-    CHECK(sg_rev_parse_commit(git_dir, "@@{0}", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
-         "@@{0} should be HEAD@{0} (c1), not the bare @{0} (c2)");
+       reflog lookup then runs on HEAD's own log -- but as of Phase 70b,
+       @{0} no longer reads the log's last new_id at all, it reads HEAD's
+       CURRENT value, which (HEAD being symbolic to master) is master's
+       current value, c2 -- the SAME as the bare "@{0}" above. Before
+       Phase 70b these disagreed (c1 vs c2); now they agree, matching real
+       git 2.55.0 measured directly against this exact fixture shape. */
+    CHECK(sg_rev_parse_commit(git_dir, "@@{0}", out) == 0 && memcmp(out, c2, SG_SHA1_RAW_LEN) == 0,
+         "@@{0} should now equal the bare @{0} (both c2, HEAD's/master's current value)");
+
+    /* @{1} is unaffected by the fix, and still demonstrates the two logs
+       are read independently: HEAD's own log's entry 1 is c1, the current
+       branch's is c2. */
+    CHECK(sg_rev_parse_commit(git_dir, "@@{1}", out) == 0 && memcmp(out, c1, SG_SHA1_RAW_LEN) == 0,
+         "@@{1} should still read logs/HEAD's own history (c1)");
+    CHECK(sg_rev_parse_commit(git_dir, "@{1}", out) == 0 && memcmp(out, c2, SG_SHA1_RAW_LEN) == 0,
+         "bare @{1} should still read the current branch's own history (c2), disagreeing with "
+         "@@{1} (c1) -- the two logs are still independent at N>=1");
 
     free(git_dir);
 }

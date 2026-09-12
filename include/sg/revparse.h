@@ -232,10 +232,15 @@ int sg_rev_parse_commit_ex(const char *git_dir, const char *rev, sg_rev_disambig
      "refs/remotes/%s" (rule 5), "refs/remotes/%s/HEAD" (rule 6 -- normally
        a symref, e.g. what `sg clone` creates via sg_ref_set_symref).
 
-   name is gated first (a file-local predicate in revparse.c, not
-   sg_ref_branch_name_is_safe) against an empty name, a leading/trailing
-   '/', an empty path component, or a component that IS "." or "..";
-   rejected before any rule is tried. Each candidate is probed with
+   name is gated first -- sg_ref_path_components_are_safe (refs.h), NOT the
+   weaker sg_ref_branch_name_is_safe -- against an empty name, a
+   leading/trailing '/', an empty path component, or a component that IS
+   "." or ".."; rejected before any rule is tried. That predicate was
+   file-local to revparse.c when Phase 70 introduced it and was promoted to
+   refs.c in Phase 70b, when sg_ref_read_path_resolved turned out to need
+   the same check on every symref hop target it reads off disk; the two call
+   sites guard different SOURCES (argv here, disk content there) and neither
+   is redundant with the other. Each candidate is probed with
    sg_ref_read_path_resolved (which follows a symref, needed for rules
    5/6), and the first one that resolves wins. Returns 0 with out filled
    in (truncation, i.e. out_size too small OR a candidate too long to fit
