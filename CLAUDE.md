@@ -215,9 +215,9 @@ in a row below, read that row's file first.**
 | `storage/refs.c`, `storage/revparse.c`, `refs.h`, `revparse.h`; detached HEAD; `sg merge <rev>`; `sg_message_cleanup` | `docs/RULES-refs-revparse.md` |
 | `util/date.c`, `date.h`; any `--date=` / `%ad` / `%ar` / `%ah` work | `docs/RULES-date.md` |
 | `cli/cmd_log.c`, `cli/cmd_show.c`, `cli/commit_out.c`, `cli/log_graph.c`, `commit_out.h` | `docs/RULES-log-show.md` |
-| `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc` | `docs/RULES-paths-strings.md` |
+| `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir/apply.c` | `docs/RULES-paths-strings.md` |
 | `workdir/diff.c`, `cli/diff_out.c`, `util/diff_lcs.c`, `diff.h`, `diff_out.h` | `docs/RULES-diff.md` |
-| `workdir/merge.c`, `merge.h` | `docs/RULES-merge.md` |
+| `workdir/merge.c`, `cli/cmd_merge.c`, `merge.h` | `docs/RULES-merge.md` |
 | `workdir/rename.c`, `util/similarity.c`, `pathspec.h`, `similarity.h`; `-M`/`-C` | `docs/RULES-pathspec-rename.md` |
 | `cli/cmd_status.c`, `workdir/status.c`, `status.h` | `docs/RULES-status.md` |
 | `net/ssh.c`, `net/transport.c`, `ssh.h`, `transport.h` | `docs/RULES-net.md` |
