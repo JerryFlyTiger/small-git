@@ -40,6 +40,9 @@ int sg_cmd_commit(int argc, char **argv)
 {
     static const char usage[] = "usage: sg commit -m <message>\n";
     const char *message = NULL;
+    const char **messages;
+    int message_count = 0;
+    char *joined_message = NULL;
     char *cleaned_message = NULL;
     char *git_dir;
     sg_index idx;
@@ -60,27 +63,51 @@ int sg_cmd_commit(int argc, char **argv)
     size_t i;
     int rc = 0;
 
+    /* Upper-bounded by argc: every -m value comes straight from argv, so
+       there can never be more of them than argv itself. */
+    messages = malloc(sizeof(*messages) * (size_t)(argc > 0 ? argc : 1));
+    if (messages == NULL) {
+        fprintf(stderr, "sg: out of memory\n");
+        return 1;
+    }
+
     for (i = 1; (int)i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0) {
             if ((int)i + 1 >= argc) {
                 fputs(usage, stderr);
+                free(messages);
                 return 1;
             }
-            message = argv[++i];
+            /* Phase 73 addendum: repeated -m is NOT last-one-wins (measured
+               against real git 2.55.0: `-m one -m two` -> commit message
+               "one\n\ntwo", a different object id than "two" alone) -- see
+               sg_message_join's header comment. */
+            messages[message_count++] = argv[++i];
         } else {
             fputs(usage, stderr);
+            free(messages);
             return 1;
         }
     }
-    if (message == NULL) {
+    if (message_count == 0) {
         fputs(usage, stderr);
+        free(messages);
         return 1;
     }
 
-    if (sg_message_cleanup(message, &cleaned_message) != 0) {
+    if (sg_message_join(messages, (size_t)message_count, &joined_message) != 0) {
         fprintf(stderr, "sg: out of memory\n");
+        free(messages);
         return 1;
     }
+    free(messages);
+
+    if (sg_message_cleanup(joined_message, &cleaned_message) != 0) {
+        fprintf(stderr, "sg: out of memory\n");
+        free(joined_message);
+        return 1;
+    }
+    free(joined_message);
     if (cleaned_message[0] == '\0') {
         fprintf(stderr, "sg: aborting commit due to empty commit message\n");
         free(cleaned_message);

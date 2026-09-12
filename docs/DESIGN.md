@@ -15713,3 +15713,350 @@ coincidence that let the original bug ship. Recorded as its own numbered
 finding (section 4e) rather than folded into the mutation paragraph above,
 because it is not evidence about the FIX, it is evidence about why the
 BUG was invisible for five rounds on this exact machine.
+
+## Phase 73: `sg tag`'s five defects, and a duplicate-name refusal fixed across three review rounds
+
+`cmd_tag.c` had five defects: `<rev>` was resolved with `sg_rev_parse_commit`,
+which peels an annotated tag by contract, where git's own `tag <new> <rev>`
+never peels (fixed by switching to `sg_rev_parse_object`, which also makes
+tagging a tree/blob and a `<rev>:<path>` argument work, both real git
+behaviour); `-d` refused more than one name outright; three stdout messages
+(`Deleted tag ...`, `Updated tag ...`) were missing; and a create-only flag
+with no tag name silently listed tags instead of refusing. `sg_message_join`
+(shared with `sg commit`, NOT with `sg stash push`, whose `-m` is measured to
+stay last-one-wins on both tools) fixes a sixth defect found mid-phase:
+repeated `-m` used to be last-one-wins, where git joins each value into its
+own paragraph.
+
+**The `-d` multi-name fix went through three review rounds, and each one
+found a real, reproducible bug the previous round's own interop rows did not
+catch:**
+
+1. Round 1 shipped a plain per-name loop: each name in argv is looked up and
+   deleted independently, reporting `not found` for a missing one. This is
+   correct for git's OWN per-name output shape, but a cold review round 2
+   found it does not implement a real git RULE at all.
+2. Round 2 found that real git refuses the WHOLE `-d` invocation, deleting
+   NOTHING, when the SAME name appears more than once in one call (`git tag
+   -d lw lw` and `git tag -d lw atag lw`, both measured: exit 1, nothing
+   deleted, `error: could not delete references: multiple updates for ref
+   'refs/tags/lw' not allowed`) -- a ref-TRANSACTION property, the same shape
+   `cmd_push.c` already documents for the `refs/sg/chunks` keepalive. The fix
+   added a duplicate-name scan keyed on bare argv-string equality, run BEFORE
+   any deletion. The round-2 interop rows (`case2c`/`case2d`) specifically
+   included the DISCRIMINATING shape `-d lw atag lw`, not just the easy
+   `-d lw lw`: an implementation that checks for the duplicate too late, or
+   skips only the duplicate and deletes the rest, still exits 1 on both rows
+   -- identical to the correct implementation -- while silently deleting
+   `atag` on the harder one. Asserting the SURVIVING TAG LIST (not just the
+   exit code) is what makes the row discriminate at all.
+
+   **The round-2 mutation ("disable the duplicate scan entirely") is worth
+   reading carefully, because of what round 3 found.** It turned exactly the
+   four expected `case2c`/`case2d` checks red and was reported as "the new
+   rows discriminate, coverage is real." That conclusion needed one more
+   sentence a round-3 review supplied: disabling the round-2 scan doesn't
+   just remove round 2's fix, it also REINTRODUCES round 2's original bug
+   report path (the round-1 per-name loop), which is a different bug, not "no
+   bug." The two failure modes (over-deletes vs. over-refuses) trade off
+   against each other along that one mutation's axis, so four red checks
+   proved "scan present" differs observably from "scan absent" -- it did NOT
+   prove the scan's CONDITION (bare argv equality) is the right one. A
+   mutation that flips one bug into another is evidence the check can
+   observe *a* difference, not evidence that the code on the passing side of
+   that difference is correct. That distinction is exactly what round 3
+   exploited to find the next bug for free, on the same code, with the same
+   mutation technique, just aimed differently.
+3. Round 3 found the round-2 scan OVER-refuses: `git tag -d nosuch atag
+   nosuch` (a MISSING name repeated, alongside one real, unrelated existing
+   name) deletes `atag` and reports `not found` twice on real git -- the
+   duplicate-name rule is a transaction property, so it only applies to a
+   name that actually ENTERS the transaction, i.e. one that resolves to an
+   EXISTING tag. `-d nosuch nosuch` alone (both round-2 authors' first
+   instinct for a "missing + duplicate" fixture) cannot catch this: there is
+   nothing to delete either way, so an over-refusing implementation and a
+   correct one produce byte-identical output on that input. The
+   discriminating fixture needs a duplicated MISSING name PLUS a distinct
+   EXISTING one in the SAME call (`-d nosuch atag nosuch`) -- the existing
+   name is what an over-refusing scan wrongly holds hostage. The fix resolves
+   existence for every name FIRST (before any deletion, so an earlier name's
+   deletion in the same call cannot change a later name's existence
+   answer), and only lets an existing-and-repeated name trigger the refusal.
+
+   Round 3 also found and fixed a message-wording bug that could not
+   otherwise be observed with only one duplicated name: when TWO DIFFERENT
+   existing names are each duplicated (`-d lw lw atag2 atag2`), real git's
+   error names the SMALLEST one by `strcmp` ('atag2'), independent of argv
+   order (measured both orderings on the same alpha/mid/zeta-shaped
+   fixture) -- not the first duplicate the scan happens to find while
+   walking argv (which would be 'lw', since it appears first). Both tools
+   still refuse and delete nothing either way, so this is message text
+   only, but this project treats error wording as interface (see the
+   Phase 65 `sg_strfmt_alloc` entry and the general convention note at the
+   top of `CLAUDE.md`), and matching it costs one extra comparison over the
+   set of duplicated-and-existing names, not a redesign.
+
+   Round 3's own mutation re-broadened the guard back to round 2's
+   unconditional argv-equality check and confirmed the NEW `-d nosuch atag
+   nosuch` row goes red while `case2c`/`case2d` stay green -- proving the
+   round-3 fix is additive (narrows round 2's condition) rather than a
+   replacement that could have silently un-fixed round 2's own bug.
+
+**One interop row (`case2e`, round 2's "control: three distinct names, one
+missing, still partially deletes") was deleted in round 3, not kept.** A
+review noted it exercised the exact same three names as the pre-existing
+`case2` (`atag`, `nosuch`, `lw`), just reordered, and asserted a strict
+subset of `case2`'s own assertions -- no mutation of the duplicate-scan code
+(round 2's, or round 3's narrowing of it) can move it independently of
+`case2`, because it never contains a duplicate name at all. It was replaced
+by `case2f`, which exercises the genuinely new dimension (a duplicated
+MISSING name coexisting with a distinct EXISTING one) that `case2`/`case2b`
+could not reach. A row that repeats an existing row's fixture under a new
+name reads like coverage without being any; when a review finds one, drop
+it rather than keep it as a placeholder.
+
+### Phase 73 review round 4: the transaction refusal swallowed the "not found" diagnostics
+
+Round 3's fix decided existence and the transaction refusal in a single
+left-to-right scan that returned as soon as it found a duplicated existing
+name -- which meant it never looked at, let alone reported, any MISSING name
+in the same invocation. `git tag -d nosuch lw lw` prints `error: tag 'nosuch'
+not found.` and THEN the transaction refusal for `lw`, both lines, in that
+order; sg printed only the refusal. Exit code and on-disk state already
+agreed (1, nothing deleted) -- only the diagnostics were missing, which is
+exactly the kind of gap an exit-code-only check cannot see.
+
+The fix splits `delete_tags` into three passes over the whole name list, with
+nothing deleted until the third: pass 1 resolves existence and reports every
+missing (or too-long) name exactly once per occurrence, in argv order, as it
+is encountered; pass 2 (using the existence flags pass 1 recorded, not a
+second disk read) decides the transaction refusal from round 3's rule
+unchanged (a repeated MISSING name still triggers nothing); pass 3 actually
+deletes, only reached if pass 2 found no conflict. A duplicated missing name
+is reported once per occurrence, not once total -- `-d nosuch nosuch lw lw`
+prints `not found` twice before the refusal -- which is why the interop row
+for it asserts the exact line count rather than mere presence: a fix that
+deduplicates the diagnostic passes a naive `grep` and only fails on this
+specific fixture.
+
+The round-4 review also re-attacked several round-3 corners directly and
+found them clean: packed refs are treated as existing by the gate the same
+as loose ones; a corrupt loose ref is treated as "not found" identically by
+both tools; there is no check-then-use gap (pass 1 fully completes, for
+every name, before pass 3 deletes anything); and the `strcmp`-smallest rule
+was re-verified with `v1.9`/`v1.10` (where `strcmp` picks `v1.10`, against
+naive numeric intuition) and a fixture where the smallest name sits LAST in
+argv -- git's choice is genuinely order-independent, confirmed rather than
+assumed a second time.
+
+### Phase 73 review round 5: a pre-existing one-character divergence, found by comparing stderr SHAPE across fixtures
+
+A cold review compared stderr across all eight `-d` fixtures added by rounds
+2-4, with each tool's own prefix (`error: ` / `sg: `) stripped, and found one
+remaining difference: git's "not found" line ends with a period
+(`error: tag 'nosuch' not found.`), sg's did not
+(`sg: tag 'nosuch' not found`). This is PRE-EXISTING -- `git show
+master:src/cli/cmd_tag.c` already has the same string -- not something this
+phase introduced, but it is `sg tag`'s own message and this phase is `sg
+tag`'s matrix, so it was fixed here. Both occurrences in `delete_tags` (pass
+1's report and pass 3's fallback) were given the trailing period; no OTHER
+message was touched in this round, because git is measurably inconsistent
+about this itself (`error: tag 'x' not found.` has the period, `fatal: tag
+'x' already exists` does not) -- reproducing that inconsistency is the
+correct answer, not smoothing it away.
+
+**That last sentence originally read as "the rest of the file's messages were
+individually checked and found to correctly diverge on purpose" -- they were
+not; only the specific pair this round already knew about (`not found.` /
+`already exists`) had been compared.** Round 6's own full audit of every
+remaining message in `cmd_tag.c` (see its own section below) found exactly
+one more period genuinely missing (`is not a valid tag name`), previously
+uncovered by any check. The corrected claim is narrower: round 5 fixed what
+it found and did not widen scope to messages it had not looked at yet: that
+is a smaller, true statement, not the larger, false one a reader would take
+away without this correction.
+
+The reason this survived four review rounds is itself the finding worth
+recording: every round-2 through round-4 interop row for `-d` compared LINE
+COUNT and ORDER (`wc -l`, `sed -n Np | grep`), never the line's own CONTENT,
+so a one-character wording drift was invisible to the whole suite by
+construction, not by oversight in any single row. The fix adds one
+byte-for-byte comparison (`case2h`, prefix stripped from both sides) rather
+than replacing the count/order checks -- both kinds catch a different
+failure (a fix that reports the right THING the wrong number of times still
+passes a content check that only look at one line; a fix that gets the
+WORDING wrong but the count right still passes a count check), so neither is
+redundant with the other. Mutation (drop the period again): exactly the new
+content check goes red, all count/order checks and every other `case2*`
+check stay green -- confirming the new check is measuring content, not
+duplicating what the count checks already covered.
+
+### Phase 73 review round 6: a sibling of round 5's bug, a genuine wording divergence to keep, and a measured-unreachable defensive line
+
+A cold review's full audit of every remaining stderr message in
+`cmd_tag.c` (prompted by round 5's own correction, above) found three
+things, one to fix, one to record as deliberate, and one to record as
+measured-inert.
+
+**1. `is not a valid tag name` was missing the trailing period, exactly
+round 5's bug in a sibling message.** Measured: `git tag 'bad name'` prints
+`fatal: 'bad name' is not a valid tag name.`; sg printed `sg: 'bad name' is
+not a valid tag name`, no period. Reachable through a plain `sg tag <bad
+name>`, and had zero interop coverage before this round (`grep -n "valid tag
+name" tests/interop.sh` returned nothing). Fixed the same way round 5 fixed
+`not found`, and pinned with the identical prefix-stripped `cmp` technique --
+except this message's git-side prefix is `fatal:`, not `error:`, so the
+strip pattern (`sed -e 's/^fatal: //' -e 's/^error: //'`) has to handle both,
+since a pattern hard-coded to only one prefix would silently leave the OTHER
+tool's line unstripped and never match regardless of content. **This
+project's own `cmd_branch.c` has the identical, still-unfixed `is not a
+valid branch name` (also missing a period against real git) -- deliberately
+NOT touched here**, for the same reason round 5 did not "tidy" every message
+in `cmd_tag.c` at once: this phase's scope is `sg tag`'s matrix, not a
+sweep of every CLI error string in the codebase. Recorded so it is not
+mistaken for an oversight of THIS round's own audit.
+
+**2. An unresolvable `<rev>` is a deliberate divergence, kept as-is.**
+Measured: `git tag t nosuchrev` prints `fatal: Failed to resolve 'nosuchrev'
+as a valid ref.`; sg prints `sg: cannot resolve 'nosuchrev'`. Unlike every
+other divergence this phase touched, this is a WHOLE DIFFERENT SENTENCE, not
+a missing period -- `cannot resolve '%s'` is sg's own generic revparse
+wording, shared verbatim across `cmd_show.c`, `cmd_cat_file.c`, and other
+callers of `sg_rev_parse_commit`/`sg_rev_parse_object`. Changing it inside
+`cmd_tag.c` alone would either have to ripple into every sibling (a
+much larger, unbudgeted change) or leave `sg tag` inconsistent with the rest
+of sg's own CLI vocabulary for the identical failure. Recorded as this
+phase's eighth deliberate divergence (see the numbered "Deliberate
+divergences from real git" list in `CLAUDE.md`, item 8) and pinned on BOTH
+sides in interop (`case1i`), so a future
+"unify the wording" edit turns a named check red instead of silently
+agreeing with git by accident.
+
+**3. CORRECTED IN ROUND 7 -- this item originally claimed pass 3's `not
+found.` fallback needs an external race no shell harness can build. That
+claim was wrong, and it was wrong from an analysis that only considered
+BYTE-IDENTICAL duplicate names.** It missed a second way for pass 1 to mark
+two DIFFERENT argv strings as both existing: two names that are not
+byte-identical but name the SAME ref file on a case-FOLDING filesystem.
+`sg tag Foo` followed by `sg tag -d Foo foo` reaches the "unreachable" line
+with two entirely ordinary commands, no concurrency and no external process
+involved: pass 1 reads `refs/tags/Foo` and `refs/tags/foo` -- the SAME file
+on macOS's default APFS/HFS+ -- so both record as existing; pass 2's refusal
+is keyed on `strcmp`, and `"Foo" != "foo"` byte for byte, so it does not
+fire; pass 3 deletes `Foo`, then fails to re-read the now-gone `foo`,
+reaching the exact line round 6 called unreachable. See round 7's own
+section below for the full writeup and the real divergence this exposed.
+The mutation result reported here (dropping the period left interop green)
+was still accurate ON THE FIXTURES THAT EXISTED AT THE TIME -- the claim
+that failed was the GENERALIZATION from "no existing fixture reaches this"
+to "no fixture CAN reach this", which needed either a citation of every path
+that sets `exists[i] = 1` or an attempt to falsify it, neither of which the
+original round did. The general lesson, stated in round 7's own commit
+message: an "unreachable" claim needs the same falsification attempt as a
+behavioural rule, not just "the current test suite doesn't reach it".
+
+### Phase 73 review round 7: two false claims from round 6's own docs, one of them exposing a real, unpinned, data-losing divergence
+
+A cold read found two claims written in round 6 -- one about reachability,
+one about a shared string -- that were both false, and falsifying the first
+one turned up a genuine bug this project had not previously seen.
+
+**1. Round 6's "measured unreachable" claim about pass 3's `not found.`
+fallback was wrong.** It reasoned from byte-identical duplicate names only:
+pass 2 refuses any name that is both duplicated (by `strcmp`) and existing,
+so it assumed the only way pass 3 could still fail to find a name pass 1
+already confirmed existed was an external race. That reasoning has a hole --
+`strcmp` is not the only way for two argv strings to name the same ref file.
+On a case-FOLDING filesystem (macOS's default APFS/HFS+; Linux's ext4 does
+not fold), two ordinary commands reach the "unreachable" line with no
+concurrency at all:
+
+    sg tag Foo
+    sg tag -d Foo foo
+      Deleted tag 'Foo' (was 5831b4a)
+      sg: tag 'foo' not found.        <- pass 3's line, round 6 called this unreachable
+
+Pass 1 reads `refs/tags/Foo` and `refs/tags/foo` -- the SAME file on this
+filesystem -- so both record as existing (`exists[i] = 1` for both entries).
+Pass 2's duplicate scan compares the argv STRINGS, and `"Foo" != "foo"` byte
+for byte, so it never fires. Pass 3 deletes `Foo` first (argv order), then
+tries to re-read `foo` for its own turn -- and finds nothing, because
+`Foo`/`foo` were always the same inode.
+
+**2. Falsifying that claim exposed a real divergence, in the data-losing
+direction, that no existing check pins.** Measured against real git 2.55.0
+on the same fixture (one tag, `Foo`, `tag -d Foo foo`):
+
+    git: exit 1, Foo SURVIVES
+         (error: could not delete references: cannot lock ref 'refs/tags/foo': ... File exists)
+    sg:  exit 1, Foo is DELETED
+
+Identical exit code, opposite effect on the repository -- structurally the
+SAME shape as round 2's duplicate-name bug, one level up: there, two
+byte-identical argv strings should have refused the batch and didn't; here,
+two argv strings that are not byte-identical but alias the same ref FILE
+should refuse the batch (git does, via a per-ref lock take before any
+delete) and sg does not, because sg's refusal test operates on argv text,
+never on the underlying ref path's actual identity.
+
+**This is deliberately NOT fixed this round.** Matching git means
+emulating its per-ref lock acquisition ahead of any deletion, which is a
+real, scoped change to `delete_tags`'s data model (it would need to key
+existence/duplication on something ref-identity-based, e.g. the resolved
+path or inode, not the argv string) and deserves its own phase rather than
+a round-7 patch bolted onto review fatigue. What this round DOES do is make
+the loss impossible to miss: `tests/interop.sh` gained a runtime probe (a
+plain `touch`+`test` in a scratch directory, nothing to do with git or sg)
+that detects whether `$WORKDIR`'s filesystem folds case, and a check
+(`case2j`) that only runs -- and only asserts anything -- when it does;
+on a case-sensitive filesystem (Linux's ext4, which CI's ubuntu runners use)
+the row `skip()`s with a named reason instead of silently not existing, per
+this project's own "an absent row must announce itself" convention for
+platform-gated checks (the same pattern the smart-HTTP interop group uses
+for `HTTP_AVAILABLE`). Recorded as this project's ninth deliberate
+divergence in `CLAUDE.md`, explicitly labeled as a known bug being
+deferred (not a design choice like most of that list) and explicitly
+naming the data-losing direction and the macOS-only reachability, so a
+future reader cannot discover this by actually losing a tag.
+
+**3. `CLAUDE.md` divergence 8's stated justification was fabricated, not
+measured.** It claimed `sg: cannot resolve '%s'` is "shared verbatim across
+every caller of `sg_rev_parse_commit`/`sg_rev_parse_object`". Measured:
+
+    $ grep -rn "cannot resolve '%s'" src/
+    src/cli/cmd_tag.c:105
+
+Exactly one occurrence -- `cmd_tag.c` itself. The claim was invented to
+sound like a reason ("changing it would ripple into siblings") without
+anyone having grepped for the siblings it named. Entry 8 has been rewritten
+to state the real reason for keeping the divergence: there is no single
+existing sibling wording to converge onto, because sg's siblings do not
+agree with EACH OTHER (see next paragraph) -- picking any one of them for
+`cmd_tag.c` would be an arbitrary choice among disagreeing wordings, not a
+move toward consistency.
+
+**The audit that falsified the claim also found something the claim was
+trying to gesture at without ever measuring: sg has four different wordings
+for "this revision argument does not resolve to anything", spread across
+EIGHT call sites in seven different commands.** Measured by `grep`:
+`cannot resolve '%s'` (`cmd_tag.c`, 1 site); `not a valid object name '%s'`
+(`cmd_show.c`, `cmd_cat_file.c`, 2 sites); `not a valid revision '%s'`
+(`cmd_log.c`, 1 site); `'%s' is not a valid object id` (`cmd_cherry_pick.c`,
+`cmd_merge_base.c` x2, `cmd_revert.c`, 4 sites). This is a pre-existing
+inconsistency in sg's own vocabulary that has nothing to do with git
+interop -- fixing it is out of scope for this phase, which is `sg tag`'s
+matrix, not a CLI-wide wording sweep -- but it is recorded here rather than
+left to be rediscovered by a future audit that greps the same four strings
+again from scratch.
+
+**The lesson, stated plainly because it cost real time twice in the same
+round: an "X is unreachable" or "Y is shared verbatim" claim needs the same
+measurement discipline as a behavioural rule about git.** Both false claims
+in round 6 were written with full confidence, in the same review round, by
+the same process that had just spent five rounds insisting on measuring
+everything else -- and one of them was written at this project's own
+explicit request ("record it as measured-unreachable"). Recording a
+negative result ("nothing reaches this", "nothing else uses this string")
+is exactly as falsifiable as a positive one, and needs the same grep or the
+same attempted fixture before it goes in a doc that future rounds will
+trust without re-checking.
