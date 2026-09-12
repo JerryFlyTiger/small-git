@@ -262,7 +262,7 @@ import re, glob, os, collections
 real = {fn for r in ("src","include") for _,_,fns in os.walk(r) for fn in fns
         if fn.endswith((".c",".h"))}
 table = "".join(l for l in open("CLAUDE.md")
-                if re.search(r'\| `docs/RULES-[a-z-]+\.md` \|\s*$', l))
+                if re.search(r'\|\s*`docs/RULES-\S+\.md`\s*\|\s*$', l))
 m = collections.defaultdict(set)
 for f in sorted(glob.glob("docs/RULES-*.md")):
     for n in re.findall(r'[A-Za-z0-9_]+\.[ch]\b', open(f).read()):
@@ -274,7 +274,9 @@ EOF
 
 Three things in it are load-bearing and each was got wrong once. It reads
 ONLY the pointer table's own rows -- the ones whose last cell is a
-`docs/RULES-*.md` link -- because a filter of "every line starting with `| `"
+`docs/RULES-*.md` link, matched loosely on purpose (`\S+` and `\s*`, so a new
+row whose filename carries a digit or an underscore, or whose spacing differs,
+is still scanned) -- because a filter of "every line starting with `| `"
 also swallows the Module layout table above and the Core types cheat sheet
 below, and the module table's `cli/` row happens to name `` `diff_out.c` ``:
 with the looser filter, deleting `cli/diff_out.c` from the row that actually
@@ -284,9 +286,13 @@ git's own sources (`xdiffi.c`, `xhistogram.c`, `xprepare.c`, `delta.c`) and
 prose examples (`other/d.c`) out of the set -- a hand-written allowlist would
 excuse a real gap just as readily. And it requires a delimiter around the name
 in the table, so a short name cannot be absorbed as a substring of a longer one
-(a real `d.c` would otherwise match inside `cmd_add.c`; today `d.c` is already
-excluded one step earlier by the real-file filter, so the delimiter is a guard
-with no current instance, not the thing that handles this example). Expected
+(a real `d.c` would otherwise match inside `cmd_add.c`; `d.c` itself is
+excluded one step earlier by the real-file filter, so it is NOT the example
+this guard handles). The guard is not idle: it changes nothing in the gate's
+own answer today, but it decides one row of the per-row count below --
+`pathspec-rename.md` names `workdir/diff.c` in prose, and without the delimiter
+`diff.c` is found hiding inside that same row's `cli/cmd_diff.c` and wrongly
+suppressed, giving 51 pairs instead of 52. Expected
 leftovers today: none, so ANY output is a gap. Mutation-verified rather than
 assumed: deleting `cli/cmd_tag.c` from its row makes it report `cmd_tag.c`, and
 deleting `storage/repo.c` makes it report `repo.c`. (Both mutations first came
@@ -308,8 +314,9 @@ candidate list is `for each docs/RULES-X.md, every real source file it names
 that is not on X's own row`; measured at Phase 71 with the same real-file and
 delimiter rules as the check above, that is **52 (file, name) pairs, 35 of them
 outside the catch-all duplication row** -- quote the algorithm when you quote a
-number here, because a looser extraction gives well over a hundred and the two
-readings are not comparable. That list **needs manual triage and must not be
+number here: dropping all three of the real-file filter, the delimiter and the
+per-file dedup gives exactly 100 instead, and the two readings are not
+comparable. That list **needs manual triage and must not be
 shipped as a gate**, because most of its entries are a file mentioned in
 passing ("`sg_merge_trees` reuses `sg_diff_trees`"), which is not the same as a
 rule about that file, and no regex tells the two apart. When you add a rule naming a file, put it on the row
