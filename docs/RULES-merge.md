@@ -109,6 +109,12 @@ do not read the whole thing).
   commands. Measured: merge's threshold is exactly `git diff`'s 50%, the
   comparison is `score >= 50%`, and both tools flip at the same input
   (`R050` detected, `R049` missed), so **do not introduce a second constant**.
+  **The machinery it reuses is documented in `docs/RULES-pathspec-rename.md`,
+  not here** -- the three detection passes and their observable ORDER, the
+  `-M<n>` fraction grammar, the 0..60000 score scale, and the `uses`-vs-`used`
+  bug: changing any of those changes merge's answer, and changing merge's
+  rename handling without reading them (or the reverse) is the one direction
+  this split made easy to get wrong.
   Detection itself is not new code: `sg_diff_trees` + `sg_diff_detect_renames`
   are reused as-is, which works only because a tree-vs-tree list is all
   `SG_DIFF_SIDE_BLOB` and `sg_diff_side_read`'s BLOB branch never touches

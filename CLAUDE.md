@@ -210,21 +210,26 @@ each is a list of measured rules and `WARNING:`s, and most of those exist
 because something slipped past a fully green board. **Before editing any file
 in a row below, read that row's file first.**
 
+**A file can appear in more than one row. Read every row that names it, not
+the first one you hit** -- `cli/cmd_merge.c` and `cli/cmd_diff.c` each have
+rules in three different files, and stopping at the first match is how you miss
+two thirds of them.
+
 | Touching | Read first |
 |---|---|
-| `storage/refs.c`, `storage/revparse.c`, `refs.h`, `revparse.h`; detached HEAD; `sg merge <rev>`; `sg_message_cleanup` | `docs/RULES-refs-revparse.md` |
-| `util/date.c`, `date.h`; any `--date=` / `%ad` / `%ar` / `%ah` work | `docs/RULES-date.md` |
-| `cli/cmd_log.c`, `cli/cmd_show.c`, `cli/commit_out.c`, `cli/log_graph.c`, `commit_out.h` | `docs/RULES-log-show.md` |
-| `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir/apply.c` | `docs/RULES-paths-strings.md` |
-| `workdir/diff.c`, `cli/diff_out.c`, `util/diff_lcs.c`, `diff.h`, `diff_out.h` | `docs/RULES-diff.md` |
+| `storage/refs.c`, `storage/revparse.c`, `refs.h`, `revparse.h`, `objstore.h`, `object.h`; detached HEAD; `cli/cmd_merge.c`'s `<rev>`/message/fast-forward output; `cli/cmd_tag.c`; `sg_message_cleanup` | `docs/RULES-refs-revparse.md` |
+| `util/date.c`, `date.h`, `cli/cmd_undo.c`'s own formatter; any `--date=` / `%ad` / `%ar` / `%ah` work | `docs/RULES-date.md` |
+| `cli/cmd_log.c`, `cli/cmd_show.c`, `cli/cmd_cat_file.c`, `cli/commit_out.c`, `cli/log_graph.c`, `commit_out.h`, `log_graph.h` | `docs/RULES-log-show.md` |
+| `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir.h`, `quote.h`, `strfmt.h`; `workdir/apply.c`, `object/tree.c`, `cli/cmd_add.c`, `cli/cmd_restore.c`, `cli/cmd_reset.c`, `storage/repo.c` | `docs/RULES-paths-strings.md` |
+| `workdir/diff.c`, `cli/diff_out.c`, `cli/cmd_diff.c`, `util/diff_lcs.c`, `diff.h`, `diff_out.h`, `tree_build.h` | `docs/RULES-diff.md` |
 | `workdir/merge.c`, `cli/cmd_merge.c`, `merge.h` | `docs/RULES-merge.md` |
-| `workdir/rename.c`, `util/similarity.c`, `pathspec.h`, `similarity.h`; `-M`/`-C` | `docs/RULES-pathspec-rename.md` |
-| `cli/cmd_status.c`, `workdir/status.c`, `status.h` | `docs/RULES-status.md` |
-| `net/ssh.c`, `net/transport.c`, `ssh.h`, `transport.h` | `docs/RULES-net.md` |
+| `workdir/rename.c`, `util/similarity.c`, `cli/cmd_diff.c`'s `-M`/`-C`/pathspec parsing, `pathspec.h`, `similarity.h` | `docs/RULES-pathspec-rename.md` |
+| `cli/cmd_status.c`, `workdir/status.c`, `workdir/tree_build.c`, `status.h` | `docs/RULES-status.md` |
+| `net/ssh.c`, `net/transport.c`, `cli/cmd_clone.c`, `ssh.h`, `transport.h` | `docs/RULES-net.md` |
 | `safety/stash.c`, `cli/cmd_stash.c`, `stash.h` | `docs/RULES-stash.md` |
 | `cli/cmd_push.c` | `docs/RULES-push.md` |
-| `cli/pick.c`, `cli/cmd_cherry_pick.c`, `cli/cmd_revert.c`, `cli/cmd_rebase.c`, `safety/sequencer.c`, `safety/rebase.c` | `docs/RULES-sequencer.md` |
-| anything at all -- before writing a second copy of something | `docs/RULES-duplication.md` |
+| `cli/pick.c`, `cli/cmd_cherry_pick.c`, `cli/cmd_revert.c`, `cli/cmd_rebase.c`, `cli/cmd_commit.c`, `cli/cmd_switch.c`, `cli/cmd_undo.c`, `safety/sequencer.c`, `safety/rebase.c`, `pick.h`, `sequencer.h` | `docs/RULES-sequencer.md` |
+| `cli/cli_args.c`, `cli_args.h`; and anything at all before writing a second copy of something | `docs/RULES-duplication.md` |
 
 **Source comments and `docs/DESIGN.md` still say "CLAUDE.md's X entry"** --
 173 places in `src/`/`include/`/`tests/` and 83 in `docs/DESIGN.md`, as of Phase
@@ -235,9 +240,40 @@ above resolves every one of them: **if the named entry is a module rule, it is
 now in the `docs/RULES-*.md` on the row matching the file the comment lives in.
 If it is not a module rule -- the gates, the exit-code convention, the numbered
 deliberate divergences, the module table, the mutation classification, the
-testing or delegation conventions -- it is still in this file.** A handful name
-a lesson that was never in this file at all (e.g. "measure git behaviour, never
-recall it"); those were already wrong before the split and are left alone.
+testing or delegation conventions -- it is still in this file.** **The file-matching half of that rule only works for a file the table names,
+which is no file under `tests/`** (89 of the 173, 47 of them in
+`tests/interop.sh`) **and not `docs/DESIGN.md` either. From those, match by
+TOPIC, by grepping `docs/RULES-*.md` for a distinctive phrase out of the
+comment -- do NOT infer the file from what the commenting file is about.**
+Measured counterexample: `tests/fuzz_merge_rename.py`'s reference to
+"CLAUDE.md's phase45 note" resolves to `docs/RULES-status.md`, not to either
+of the merge or rename files a reader would guess from that script's subject.
+A handful name a lesson that was never in this file at all (e.g. "measure git
+behaviour, never recall it"); those were already wrong before the split and
+are left alone.
+
+**The table itself can go stale silently, so it has a check.** Every sg source
+file named by a rule in a `docs/RULES-*.md` must appear in some row, or the
+table will never send anyone to its rules. To re-check after adding rules:
+
+```
+python3 - <<'EOF'
+import re, glob, collections
+table = "".join(l for l in open("CLAUDE.md") if l.startswith("| `"))
+m = collections.defaultdict(set)
+for f in sorted(glob.glob("docs/RULES-*.md")):
+    for n in re.findall(r'\b([a-z_]+\.[ch])\b', open(f).read()):
+        m[n].add(f)
+for n, fs in sorted(m.items()):
+    if n not in table: print(n, sorted(x.replace("docs/RULES-","") for x in fs))
+EOF
+```
+
+Expected leftovers, all legitimate: git's own sources (`xdiffi.c`,
+`xhistogram.c`, `xprepare.c`, `delta.c`), `tests/test_*.c` (named as evidence
+for a rule, not governed by one), and files whose only mention is in
+`docs/RULES-duplication.md` (`chunk.c`, `reflog.c`, `snapshot.c`), which the
+catch-all row already covers. Anything else is a gap: add it to a row.
 
 **Where a new lesson goes**: a newly measured rule or `WARNING:` goes into the
 matching `docs/RULES-*.md`, **never into this file**. This file gains a line

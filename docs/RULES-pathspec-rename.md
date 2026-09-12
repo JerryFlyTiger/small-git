@@ -45,6 +45,11 @@ do not read the whole thing).
   nosuch` is a hard error. Use `sg_pathspec_looks_like_spec` to decide "does
   this look like a pathspec", the character set lives in that one place, next
   to the matcher.
+- **`sg_merge_trees` is a consumer of everything below, and its own rules live
+  in `docs/RULES-merge.md`** -- it reuses `sg_diff_trees` +
+  `sg_diff_detect_renames` unchanged, so a change to the three passes, the
+  score scale or the `-M` grammar changes merge's answer too. Read both files
+  when touching either.
 - **Rename detection always goes through `sg_diff_detect_renames`**
   (`include/sg/diff.h`, Phase 29); it is a **pass that runs after the list is
   already built**, not inside the four builders (same reason as
