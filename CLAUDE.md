@@ -2364,9 +2364,14 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
     not a missing row: on a commit+tree+blob prefix git's tree-ish count is
     2 and it refuses, while a commit-ish count of 1 resolves.
   - **TWO dwim triggers, and one of them is not the command.** Per command:
-    only `sg log` and `sg reset` pass COMMITTISH (measured over 15 git
-    commands -- `rev-list` REFUSES while `log` resolves, so the rule is not
-    "this command needs a commit"). Independently, **any `~`/`^`/`@{`
+    `sg log`, `sg reset`, and (Phase 69) `sg rebase`'s `<upstream>` pass
+    COMMITTISH (measured over 15 git commands -- `rev-list` REFUSES while
+    `log` resolves, so the rule is not "this command needs a commit"; `git
+    rebase` was measured separately in Phase 69 and resolves a prefix with
+    exactly one commit-ish candidate the same way `log`/`reset --hard` do,
+    while `merge`/`show`/`cherry-pick`/`revert`/`switch --detach` all
+    refuse it -- using STRICT for `sg rebase` would be a wrong answer, not
+    a smaller one). Independently, **any `~`/`^`/`@{`
     suffix forces COMMITTISH and a `:` forces TREEISH, whatever the caller
     asked for**, with the suffix winning over the colon; the suffix scan is
     bounded at the colon so a PATH containing a `~` is not mistaken for one.
@@ -2391,6 +2396,20 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
     "unifying" it would otherwise go unnoticed).
   - `sequencer/todo` READS 4..40 hex as of Phase 68c and still WRITES 40
     (wide-in / narrow-out); see the cherry-pick bullet above.
+  WARNING: **a `<base>` of the form `heads/<name>` or `tags/<name>` is
+  REFUSED, and this is a real, pinned gap, not a deliberate divergence.**
+  git's gitrevisions lookup order tries `refs/<name>` (so `heads/master`
+  becomes `refs/heads/master`) before the `refs/heads/<name>` and
+  `refs/tags/<name>` rules; sg implements only the LITERAL `refs/...`
+  prefix (pinned since Phase 17c). Measured in Phase 69: `git rev-parse
+  heads/master` exits 0 while `sg log`/`merge`/`reset`/`diff` all exit 1
+  on the identical spelling -- so closing it belongs in **revparse**, at
+  the one place that decides what a `<base>` may look like, NOT in any
+  command. Pinned on both sides in interop's `phase69` group (including
+  an `sg log` check asserting the gap is not rebase-specific), the same
+  way Phase 68 pinned "sg rebase does not accept a 40-hex `<upstream>`"
+  -- so closing it later turns a check red BY NAME. It was found by
+  Phase 69's own out-of-repo oracle harness, not by any gate.
   Do not hand-roll a "branch name or 40-hex" fragment again. To list/delete refs under any
   prefix use `sg_ref_list_under`/`sg_ref_delete_under` (`prefix` must end
   with `/`).
@@ -2881,6 +2900,31 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
   WARNING: **the deliberate divergence list gained a fifth entry**: `sg
   commit` is blocked while a cherry-pick/revert is stopped where real git
   lets it finish the pick. See the numbered list below.
+- **`sg rebase <upstream>` takes any revision since Phase 69** (tag,
+  `refs/...` path, `~N`/`^N`/`@{N}`, 40-hex, abbreviated 4..39-hex), not
+  just a bare branch name -- `do_rebase_start` (`cmd_rebase.c`) now calls
+  `sg_rev_parse_commit_ex(..., SG_REV_COMMITTISH, ...)`, the same template
+  as `cmd_reset.c`'s `<rev>` resolution, **not** `cmd_merge.c`'s (which is
+  STRICT). See the COMMITTISH-callers bullet above for why: git resolves a
+  prefix with exactly one commit-ish candidate for `rebase` the same way it
+  does for `log`/`reset --hard`, and refuses it for `merge`/`show`/
+  `cherry-pick`/`revert`/`switch --detach`. `sg_cli_report_ambiguous_oid`'s
+  disambig argument is COMMITTISH too, so an ambiguous prefix narrows its
+  hint list the same way. **None of the sequencer state or reflog wording
+  needed to change** -- `.git/sg-rebase/onto` already stored the RESOLVED
+  40-hex commit id (never the typed spelling), and git's own
+  `rebase (start): checkout <arg>` reflog convention (which sg already
+  matched) echoes the argument as typed, unpeeled and unexpanded, so a tag
+  or abbreviated hex flows through unchanged. Also gained (independent
+  commit, Phase 69b): an unrecognized `-`-prefixed argument is rejected
+  with the usage line rather than falling into the `<upstream>` slot (same
+  idiom as `cmd_reset.c`'s own guard) -- `sg rebase --help` used to be
+  reported as `sg: invalid reference: --help`.
+  WARNING: **a bare `-` (git's `@{-1}` shorthand) is refused by BOTH
+  spellings sg can reach it through** -- sg's revparse grammar has no
+  `@{-1}` at all, so `sg rebase -` was already going to fail before Phase
+  69b's flag guard; the guard only changes which error message rejects it,
+  a pre-existing grammar gap recorded here rather than "fixed".
 - **`sg rebase --quit` exists as of Phase 58** -- the same escape-hatch
   shape as `sg_pick_quit` above, ported to rebase because rebase had the
   exact same dead end: with `.git/sg-rebase/current`, `onto`, or

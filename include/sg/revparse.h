@@ -38,7 +38,8 @@
         argument is TREEISH even though both commands are otherwise STRICT
         for a bare prefix.
      3. failing both, the CALLER's own top-level request applies (measured
-        per-command: only `sg log` and `sg reset` request COMMITTISH;
+        per-command: `sg log`, `sg reset` and -- since Phase 69 --
+        `sg rebase`'s <upstream> request COMMITTISH;
         CLAUDE.md's `sg log` -pathspec- entry documents the 15-command truth
         table trigger 1 was measured against; nothing requests TREEISH at
         the top level, it only ever arises from trigger 2). */
@@ -181,9 +182,21 @@ int sg_rev_parse_commit(const char *git_dir, const char *rev,
    commit-ish disambiguation policy (sg_rev_disambig) for an abbreviated
    prefix in the BASE position. `sg_rev_parse_commit` itself is always
    SG_REV_STRICT -- git's own default is `get_oid`, not the opt-in
-   `get_oid_committish`, and the measured table is 12 commands strict to 2
-   (only `sg log` and `sg reset` pass SG_REV_COMMITTISH here; `sg rebase`
-   never reaches this function at all, see revparse.c's Phase 68 note).
+   `get_oid_committish`, and the measured table is strict for every caller
+   but three: `sg log`, `sg reset` and (Phase 69) `sg rebase`'s <upstream>
+   pass SG_REV_COMMITTISH here.
+
+   WARNING: this comment said "`sg rebase` never reaches this function at
+   all" until Phase 69, and that sentence was TRUE when written -- rebase
+   resolved its <upstream> with sg_ref_read_branch and took no revision
+   grammar at all. It went stale the moment rebase grew one, which is this
+   project's recurring "one rule copied N times, one copy wrong" shape
+   showing up in a brand-new copy rather than an old one: CLAUDE.md's own
+   caller list was updated in the same commit and this one was not (caught
+   by a cold review, not by any gate -- a stale comment compiles). It also
+   pointed at "revparse.c's Phase 68 note", which never existed; the real
+   write-up is in docs/DESIGN.md's Phase 68a section. If a fourth caller
+   ever opts in, both copies have to move together.
 
    The actual mode used for the BASE is computed by
    sg_rev_effective_disambig(rev, disambig) -- the suffix-priority-1 trigger

@@ -14451,3 +14451,370 @@ reverse direction works too: ... which sg cannot resolve back to an object").
 It was caught by re-reading the rendered passage rather than by any check, and
 the fix rewrote the whole paragraph. Nothing verifies that file but reading
 it.
+
+## Phase 69: `sg rebase <upstream>` accepts any revision, not just a branch name
+
+### 1. The gap
+
+`do_rebase_start` (`src/cli/cmd_rebase.c`) used `sg_ref_branch_exists` /
+`sg_ref_read_branch` for `<upstream>`, so `sg rebase` only ever accepted a
+bare branch name. Measured against git 2.55.0: of 24 spellings git accepts as
+`<upstream>` for `rebase`, sg rejected 21 -- `refs/heads/master`,
+`heads/master`, a lightweight tag, `refs/tags/<tag>`, an annotated tag (which
+git peels), a 40-hex commit or tag object id, abbreviated hex, `HEAD`,
+`<branch>~1`/`^`, `<tag>~1`, `@`, `@{0}`, `<branch>@{0}`, `<branch>^{commit}`,
+etc. Phase 68's own interop group had already recorded this as a named,
+unclosed gap (`phase68: sg rebase does NOT accept a 40-hex <upstream>`) rather
+than leaving it silently untested.
+
+### 2. The fix, and why it is COMMITTISH and not STRICT
+
+`do_rebase_start` now resolves `<upstream>` with
+`sg_rev_parse_commit_ex(git_dir, upstream_arg, SG_REV_COMMITTISH,
+upstream_commit)`, the same idiom `cmd_reset.c`'s `<rev>` argument already
+used -- **not** `cmd_merge.c`'s STRICT `sg_rev_parse_commit`. This is a
+measured fact, not a stylistic preference: using the Phase 68 4-way collision
+fixture (tag+commit+tree+blob on one prefix) and a 2-way collision (a real
+commit plus a same-prefix crafted blob, so exactly one candidate is
+commit-ish), `git rebase` resolves the 2-way case and narrows the 4-way
+error block to 2 hint rows (tag, commit) -- identically to `git log` and
+`git reset --hard`, and unlike `git merge`/`show`/`cherry-pick`/`revert`/
+`switch --detach`, which all refuse both. Writing `sg rebase` as STRICT would
+have been a *smaller* set of accepted spellings than real git's, not a
+faithful implementation with a rough edge -- the 2-way case is exactly the
+input a STRICT implementation gets wrong, and it is the input the interop
+group's control check (`phase69 control`) exists to catch: it runs the
+identical 2-way prefix through `sg merge` (STRICT, correctly refused) and
+`sg rebase` (COMMITTISH, correctly resolved) as a head-on pair, so an
+accidental STRICT implementation of `sg rebase` cannot pass by coincidence
+(see CLAUDE.md's `a-control-whose-arms-already-agree` note for why a lone
+positive check is not enough here).
+
+`sg_cli_report_ambiguous_oid`'s third argument is passed `SG_REV_COMMITTISH`
+too, so the printed hint list narrows the same way `cmd_reset.c`'s does.
+
+Split into two commits per the spec's own instruction, since the second is
+unrelated to revision parsing and independently revertible:
+
+- **69a**: the `sg_rev_parse_commit_ex` swap above, plus the `sg: corrupt
+  commit for '%s'` message wording (was `'... for branch '%s''`, wrong once
+  upstream can be a tag or bare hex -- see section 4 below on whether this
+  message is even reachable).
+- **69b**: `sg_cmd_rebase`'s argv loop gained an unrecognized-flag guard
+  (same shape as `cmd_reset.c`'s own), so `sg rebase --help` is rejected with
+  the usage line instead of being reported as `sg: invalid reference: --help`.
+  Measured: `git rebase --nosuchflag` is rc=129 `unknown option`; **`git
+  rebase -` is rc=0** (`-` is short for `@{-1}`, "the branch before the
+  current one"). sg's revparse grammar has no `@{-1}` at all, so `sg rebase
+  -` was already refused before this commit -- the guard only changes which
+  error message does the refusing (usage line instead of `invalid
+  reference: -`). This is a pre-existing grammar gap, not something this
+  phase closes, and it is deliberately not given an interop check (there is
+  nothing to pin: both the pre- and post-69b sg refuse it, only the message
+  differs, and the message was never contractual).
+
+### 3. What did NOT need to change (all measured, not assumed)
+
+- **`.git/sg-rebase/` sequencer state**: `onto` already stores the RESOLVED
+  40-hex commit id (derived from `upstream_commit` after resolution, never
+  the string the user typed), `orig-branch` comes from `sg_ref_current_branch`/
+  the detached sentinel, `orig-head` comes from `sg_ref_resolve_head`. None
+  of the three ever touched `upstream_arg`'s spelling, so `include/sg/rebase.h`
+  and `src/safety/rebase.c` needed zero changes. Pinned by the new interop
+  checks under the "a conflicting rebase started with a non-branch upstream"
+  heading: `.git/sg-rebase/onto` is asserted to be 40 lowercase hex AND to
+  equal the upstream commit's own id, not the tag spelling used to start it.
+- **reflog wording**: measured across ten spellings (`refs/heads/master`,
+  a lightweight and an annotated tag, 40-hex, a 7-hex abbreviation,
+  `<branch>~1`/`^`/`@{0}`), git's `rebase (start): checkout <arg>` reflog
+  line echoes the argument **exactly as typed** -- unpeeled, unexpanded,
+  unabbreviated. sg's existing `REBASE_START_FMT` already builds this line
+  from `upstream_arg` itself, so it was already correct for every new
+  spelling this phase opens up; the new interop check simply extends
+  Phase 65's existing byte-for-byte reflog pin to a non-branch spelling
+  (an annotated tag) to prove that. Comparing full lines byte for byte
+  risked flaking on the wall-clock timestamp field, so (following the exact
+  technique the Phase 65 checks already use) both sides' `rebase (start)`
+  line is isolated with `grep` and truncated to the tab-delimited message
+  field with `cut -f2-` before the `cmp`.
+- **`--continue`/`--skip`'s own printed messages**: these read `state.onto`'s
+  stored 40-hex and render a 7-hex label (`onto_label`), never
+  `upstream_arg` -- confirmed unaffected, no interop check needed beyond the
+  existing conflict-and-continue coverage.
+- **ordering**: git reports a bad `<upstream>` before checking workdir
+  cleanliness (`git rebase nosuchref` on a dirty tree still says `fatal:
+  invalid upstream`, measured), and sg's existing order (resolve upstream,
+  then `sg_require_clean_workdir`) already matched -- this predates the
+  phase and needed no change.
+
+### 4. `sg: corrupt commit for '%s'` -- reachability was checked, not assumed
+
+The spec asked whether this message (only reachable via the fast-forward
+branch, after `<upstream>` resolves successfully and `sg_commit_tree_of`
+fails on it) can actually fire, since if it can it should get a named
+interop check and if it cannot that should be recorded honestly rather than
+faked.
+
+Measured by attempting to construct it: `sg_commit_tree_of`
+(`src/storage/objstore.c`) fails in exactly two cases -- `sg_object_read`
+failing (object missing/unreadable) or `sg_commit_parse` failing on the
+object's bytes (e.g. no `tree` line). A commit whose `tree` line is
+present but points at a missing/corrupt TREE object does **not** trigger
+it: `sg_commit_tree_of` only copies the 40-hex bytes out of the parsed
+commit, it never dereferences the tree object, so that shape resolves
+cleanly on both sides. So the only candidate is a commit object malformed
+enough to fail the parse (written with `git hash-object --literally -t
+commit -w --stdin`, since git's own object writer would reject it).
+
+Such an object cannot reach this branch, but **not for the reason the
+first draft of this section gave** (a cold review caught that draft, and
+the corrected mechanism is worth writing down because the wrong one is
+the intuitive one). The wrong reason was "`sg_merge_base` parses the same
+object first and reports the failure". It does parse it first, but it does
+**not** report anything: `collect_ancestors` (`src/workdir/merge.c`)
+deliberately treats an unreadable or unparseable node as a dead end --
+`if (sg_object_read(...) != 0 || type != SG_OBJ_COMMIT) continue;` and
+`if (sg_commit_parse(...) != 0) { free(content); continue; }` -- so that a
+partially-packed or shallow history does not make merge-base impossible
+for the reachable part of the graph. The walk returns 0 either way.
+
+What actually happens is that `anc_b` (the upstream's ancestor set) gets
+**truncated to `{upstream_commit}` itself**, because `id_set_add(out,
+start)` seeds it before the walk and the walk then expands nothing. Two
+cases follow, and neither reaches the fast-forward branch:
+
+- The corrupt commit is not reachable from HEAD: the intersection is
+  empty, `sg_merge_base` returns -1 from its `candidates.count == 0`
+  branch, and the caller prints `'%s' has no common history with the
+  current branch` -- the right message, arrived at by a different route
+  than the draft claimed.
+- The corrupt commit IS reachable from HEAD (it appears in `anc_a` as a
+  parent id, which needs no parse of its own): the intersection is exactly
+  `{upstream_commit}`, so `base_commit == upstream_commit` and the
+  **already-up-to-date** check fires -- it is tested *before* the
+  fast-forward check, and the fast-forward branch needs
+  `base_commit == head_commit`, which here would additionally require
+  `head_commit == upstream_commit`, i.e. the up-to-date branch again.
+
+Conclusion: **with a single-process, single-read fixture, this message is
+unreachable** -- the only way to reach it would be corrupting or deleting
+the commit object *between* `sg_merge_base`'s read and this function's own
+read of the identical object, i.e. a deliberate mid-process race, which is
+not a shape this phase attempts to construct (it is not really "testing the
+message", it would be testing a TOCTOU window). No interop check was added
+for it, and none should be added later on the assumption that it must be
+reachable somehow -- it was checked, not skipped.
+
+### 5. Tests
+
+Interop (`tests/interop.sh`, `phase69:` prefix per CLAUDE.md's rule of
+naming the phase that implements a check, not the phase whose fixture it
+reuses): flips Phase 68's recorded-gap check from "does NOT accept" to
+"DOES accept" (renamed `phase68:` -> `phase69:` since the old name's own
+wording, "sg rebase never calls sg_rev_parse_commit at all", would now be
+false); a dedicated 3-commit `$P69` fixture (tag `p69v1`/`p69av1` on the
+middle commit, so `master~1` and the tags are meaningfully different from
+the tip) drives six representative spellings (annotated tag, 40-hex,
+abbreviated 7-hex, `<branch>~1`, `refs/heads/<branch>`, `HEAD`) through both
+git and sg, each comparing exit code, final tree id, AND commit subject
+order -- not just "did it exit 0"; a dedicated positive check that rebasing
+onto the annotated tag produces the identical tree as rebasing onto the
+commit it points at (peeling proven by equal *output*, not by absence of an
+error); a 3-hex abbreviation refused by both tools; a `<40hex>:path`
+blob-ish upstream refused with no `.git/sg-rebase/` left behind; the 4-way
+collision fixture reused from Phase 68 (`$P68`/`P68_PREFIX`, not rebuilt)
+showing sg's ambiguity block is byte-for-byte identical to git's own
+(COMMITTISH's 2 rows, not STRICT's 4), plus the STRICT-vs-COMMITTISH control
+pair described in section 2 above; the reflog extension described in
+section 3; and a conflicting rebase started with a non-branch upstream,
+finished with `--continue`, asserting `.git/sg-rebase/onto` held the
+resolved 40-hex and `orig-branch` was correct throughout.
+
+One bug was found and fixed while writing these checks, entirely local to
+the interop script rather than to sg itself: the `p69_case` shell function's
+loop variable was named `label`, colliding with `check()`'s own global
+`label` variable (this script has no `local`, every "sh"-style function in
+it uses bare global assignment by existing convention) -- each `check` call
+inside the loop silently overwrote the outer `label`, so every filename
+built from it after the first `check` call in a given case referenced the
+*previous check's own message text* instead of the case name, corrupting
+file paths for every check after the first one in each case. Renamed to
+`plabel`. A second, unrelated bug in the same block: the non-branch reflog
+check used `tail -1 .git/logs/HEAD`, which after a full rebase-and-finish
+sequence captures the `rebase (finish)` line, not the `rebase (start)` line
+being tested -- fixed to `grep 'rebase (start)'` piped through the same
+`cut -f2-` field-isolation technique Phase 65's checks already use for this
+exact timestamp-avoidance reason. Both were caught by actually running the
+new checks (both failed clearly, for a reason unrelated to the actual
+product code), not by review -- this section records them because the spec
+this phase followed asks for what was measured to be wrong, not just what
+shipped correct.
+
+### 6. Gates
+
+All five rows below were run by the main conversation itself with
+`bash tests/gates.sh --rebuild --sanitize`, after every fix in sections 4,
+7 and 8 had landed -- not relayed from the implementing agent:
+
+```
+ok   make          5s   0 warnings (74 TU(s) recompiled)
+ok   make test    54s   81/81 binaries all passed, 0 warnings (81 recompiled)
+ok   interop     190s   3538/3538 passed, 0 skipped
+ok   sanitize     76s   81/81 binaries, 0 sanitizer errors
+skip leaks         -    not run
+```
+
+The pre-phase baseline is **3481/3481, 0 skipped**, measured directly by
+building a detached `git worktree` at the pre-phase commit and running
+`tests/interop.sh` there -- so this phase is **+57 checks**, and that
+number is measured rather than derived.
+
+WARNING: **the first draft of this section said "3523/3523 ... up from
+3521/3521 -- 2 net new", and all three numbers were wrong.** It was
+written mid-phase and never revisited, and the arithmetic was not even
+self-consistent: a cold review caught it by counting `check` call sites in
+the diff and noticing that four of them sit inside `p69_case()`, which is
+invoked six times, so the *executed* count cannot possibly match a
++2 delta. This is precisely the failure mode CLAUDE.md's own gate-reading
+section calls this project's worst -- a summary number that no longer
+traces back to a raw log -- reproduced inside the write-up of a phase
+rather than in the reading of a gate. Both the totals and the baseline are
+now measured values with the command that produced them named beside them.
+
+`make sanitize` is not in CLAUDE.md's mandatory-trigger list for a change
+of this shape (CLI argument resolution and error-message text, no memory
+layout and no object-parsing path), and the implementing agent skipped it
+on that reasoning -- correctly, but it then reported "four gates green"
+with sanitize listed as skipped, which is a contradiction whichever way it
+is read. It was run here anyway: the phase adds a new call site of
+`sg_cli_report_ambiguous_oid`, and Phase 68's own review round found an
+uninitialized-pointer `free` inside `cli_args.c`, so a new caller of that
+file is worth the 76 seconds regardless of what the trigger list requires.
+
+### 6b. The mutation battery (run by the main conversation, per-site)
+
+Four directed mutations, each run with `bash tests/mutate.sh ... --interop`
+against the final tree. Per CLAUDE.md's own rule these were written to
+distinguish the SITES rather than to prove "the rule is enforced somewhere"
+-- no `/g`, each expression anchored on its surrounding call so the two
+`SG_REV_COMMITTISH` occurrences could be told apart:
+
+| Mutation | Change | Red |
+|---|---|---|
+| A | `sg_rev_parse_commit_ex(..., SG_REV_COMMITTISH` -> `SG_REV_STRICT` | **1**: `phase69 control: ...while sg rebase on the identical prefix DOES resolve and succeed` |
+| B | `sg_cli_report_ambiguous_oid(..., SG_REV_COMMITTISH` -> `SG_REV_STRICT` | **1**: `phase69: sg rebase on a 4-way collision prefix is refused with a COMMITTISH (2-row) hint block, matching git byte for byte` |
+| C | `corrupt commit for '%s'` -> `corrupt commit for branch '%s'` | **0** (see below) |
+| D | the flag guard's `argv[i][0] == '-'` -> `0` | **2**: both `phase69b` witness rows |
+
+A and B turning **different** checks red is the point of running them
+separately. A leaves the *reporting* call COMMITTISH, so the 4-way
+collision still prints its 2-row block and still matches git byte for
+byte -- only the 2-way control (exactly one commit-ish candidate, which
+STRICT refuses and COMMITTISH resolves) can see it. B leaves *resolution*
+COMMITTISH, so the -4 refusal still happens for the same inputs and only
+the printed candidate list changes, from 2 rows to 4. A single `/g`
+mutation would have turned both red at once and reported "covered"
+without establishing either.
+
+**C is the honest zero.** `tests/mutate.sh` labels a green run
+"a real blind spot: this fix can be broken without anyone noticing", and
+that label is wrong here -- this is the THIRD category in CLAUDE.md's
+three-way classification (unobservable), with the proof written out in
+section 4 above rather than asserted. The mutation was run anyway, and
+this row records what it printed, because "we decided not to test it"
+and "we tested it and it could not go red" are different claims and only
+the second one is backed.
+
+**D found an over-claiming check name.** Three `phase69b` rows plus a
+control; only two went red. The third, originally
+`phase69b: an unrecognized flag to sg rebase exits non-zero`, stays green
+under the very mutation it looks like it should catch, because with the
+guard neutered `--help` falls into the `<upstream>` slot and revparse
+refuses it -- which also exits non-zero. Its two arms agree by
+construction, the same shape Phase 63's `%b` control and Phase 52's
+`test_myers_answer_on_the_recompact_fixture` were caught in. It is
+renamed to say it is a precondition, not a witness. The dash-containing
+control (`p69-dash-name`) correctly stayed green throughout: it exists to
+kill a guard widened from "first byte is `-`" to "contains a `-`", which
+is a different mutation than D.
+
+### 7. What the gates did not find: an out-of-repo oracle harness
+
+Following this project's now-repeated pattern (Phases 57, 62, 63, 64, 66,
+67, 68 all had real findings arrive only *after* a fully green board), the
+main conversation ran a differential harness that is deliberately **not**
+part of `tests/` and shares no fixture, no helper and no assertion with the
+`phase69` interop group: 32 `<upstream>` spellings x three repo shapes
+(clean / conflicting / detached HEAD), 43 comparisons total, each one
+comparing `sg rebase <spelling>` against `git rebase <spelling>` on
+identical copies of the same fixture along six dimensions at once -- exit
+code *class* (not value, since 1-vs-128 is this project's standing
+convention), HEAD attachment, the full post-rebase commit graph as
+`%T %s` per commit, the resulting tree id, every working-tree file's
+bytes (so conflict markers are compared, not just their presence), and the
+`rebase (start)` reflog message.
+
+Result: **2 of 43 differ, and neither is a Phase 69 regression.**
+
+1. `master^{commit}` -- git resolves it, sg refuses. `^{...}` peel syntax
+   is deliberately not implemented (recorded since Phase 56); the refusal
+   is clean by construction rather than by accident, because the base scan
+   stops at the first `~`/`^` and `{commit}` then fails to parse as a
+   decimal suffix.
+2. `heads/<branch>` (and `tags/<tag>`) -- git resolves it via
+   gitrevisions' `refs/<name>` rule, sg refuses. **Pre-existing revparse
+   gap, not rebase's**: measured directly, `sg log`, `sg merge`,
+   `sg reset --hard` and `sg diff` all exit 1 on the identical spelling
+   while `git rev-parse` exits 0. Phase 69 only made it VISIBLE at this
+   call site -- before it, `sg rebase` refused every spelling but a bare
+   branch name, so it had nothing to be inconsistent with. It is now
+   pinned on both sides in the `phase69` group, including one check
+   asserting the gap is NOT rebase-specific (`sg log` refuses it too), so
+   that whoever closes it does so in `revparse` rather than by
+   special-casing `cmd_rebase.c`, and so that closing it turns a check red
+   by name instead of silently changing what these checks compare -- the
+   same treatment Phase 68 gave "sg rebase does not accept a 40-hex
+   `<upstream>`", which is exactly the pin that made this phase's own
+   opening red-to-green transition visible.
+
+Two notes on the harness itself, recorded because the project's own lesson
+is that verification tooling lies silently:
+
+- Its first draft computed the hex spellings from a *different* fixture
+  than the one the conflicting-rebase group actually ran against. The two
+  fixtures' commit ids differ (their `shared.txt` content differs), so
+  every hex row in that group silently degraded into a
+  "nonexistent ref is refused" test -- both tools refused, the row scored
+  green, and it measured nothing about the paused state it was written
+  for. Fixed by computing the ids from the fixture in use and asserting
+  `bc3 != c3` so the degradation cannot come back unnoticed.
+- The `master^{commit}` row doubles as the harness's own control: it is a
+  known divergence, so its appearing as a DIFF is positive evidence that
+  the comparison is actually sensitive, rather than 43 rows of vacuous
+  agreement.
+
+### 8. The planned two-commit split, and why it was abandoned
+
+The phase was specified as two commits -- 69a (the revision acceptance) and
+69b (the unrecognized-flag guard in `sg_cmd_rebase`'s argv loop), on the
+reasoning that the guard has nothing to do with revision resolution and
+should be independently judgeable and revertable.
+
+The split was built and then dropped, for a reason specific to what this
+write-up contains. Sections 6, 6b and 7 are **measurements of the finished
+tree**: the interop totals, the four-mutation battery and the 43-comparison
+oracle run. Putting them in the first commit makes them false there;
+putting all of the documentation in the second commit leaves the first one
+with no design record at all; and splitting the write-up itself would mean
+reporting a partial gate run as if it were the phase's. This project's own
+gate-reading section calls a summary number that no longer traces back to
+its raw log its worst failure mode, and section 6 above already had to fix
+exactly that once in this phase. Manufacturing two commits that each
+misstate something to gain reviewability is the wrong trade.
+
+What the split was for is preserved another way: the guard is one
+self-contained hunk (`cmd_rebase.c`'s `else if (argv[i][0] == '-')` branch)
+and its tests carry their own `phase69b:` prefix, so reverting it remains a
+single-hunk operation that names its own checks. The decision is recorded
+here rather than silently dropped, because it reverses something the spec
+committed to.

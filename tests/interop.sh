@@ -18617,9 +18617,12 @@ cp -R "$P68" "$P68_REFLOSE"
 check "phase68: a branch literally named with a FULL 40-hex oid LOSES to the oid interpretation (mirror image of the 6-hex check above, pinned as a head-on pair)" \
     cmp -s "$WORKDIR/p68_sg_reflose.txt" "$WORKDIR/p68_git_reflose.txt"
 
-# --- sg rebase never reaches sg_rev_parse_commit at all (section 9 of the
-# spec, a pre-existing gap this phase does not close) -- pinned as a named
-# divergence so it has a witness, not just a paragraph in CLAUDE.md. ---
+# --- Phase 69: sg rebase's <upstream> now goes through
+# sg_rev_parse_commit_ex(SG_REV_COMMITTISH), closing the gap Phase 68
+# recorded (section 9 of that phase's spec). The "does NOT accept" check
+# that used to live here is flipped to "DOES accept" below, renamed to a
+# phase69: prefix per CLAUDE.md's own rule (name the phase that implements
+# it, not the phase the fixture came from). ---
 P68_REBASE="$WORKDIR/p68_rebase_gap"
 rm -rf "$P68_REBASE"
 cp -R "$P68" "$P68_REBASE"
@@ -18628,8 +18631,296 @@ cp -R "$P68" "$P68_REBASE"
 check "phase68 oracle: precondition -- real git accepts a 40-hex <upstream> for rebase" test $? -eq 0
 (cd "$P68_REBASE" && git rebase --abort) > /dev/null 2>&1
 (cd "$P68_REBASE" && "$SG" rebase "$P68_C1") > /dev/null 2>&1
-check "phase68: sg rebase does NOT accept a 40-hex <upstream> (recorded gap, section 9 of the Phase 68 spec -- sg rebase never calls sg_rev_parse_commit at all)" \
+check "phase69: sg rebase now accepts a 40-hex <upstream> (Phase 68's recorded gap is closed)" \
+    test $? -eq 0
+
+# --- Phase 69's own fixture: a linear c0->c1->c2 on master (so
+# "master~1"/an ancestor tag are meaningfully different from the tip),
+# a lightweight and an annotated tag on c1, and a side branch off c0 so
+# every rebase in this section actually replays a commit rather than
+# being a trivial fast-forward or no-op. ---
+P69="$WORKDIR/p69"
+mkdir -p "$P69"
+git init -q "$P69"
+(cd "$P69" && git config user.email "p69@example.com" && git config user.name "p69 tester")
+printf 'c0\n' > "$P69/f.txt"
+(cd "$P69" && git add f.txt && git commit -q -m "p69 c0")
+P69_BRANCH=$(cd "$P69" && git symbolic-ref --short HEAD)
+P69_C0=$(cd "$P69" && git rev-parse HEAD)
+printf 'c1\n' > "$P69/f.txt"
+(cd "$P69" && git add f.txt && git commit -q -m "p69 c1")
+P69_C1=$(cd "$P69" && git rev-parse HEAD)
+P69_C1_7=$(printf '%s' "$P69_C1" | cut -c1-7)
+(cd "$P69" && git tag p69v1 "$P69_C1")
+(cd "$P69" && GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" git tag -a p69av1 -m "p69 annotated tag" "$P69_C1")
+printf 'c2\n' > "$P69/f.txt"
+(cd "$P69" && git add f.txt && git commit -q -m "p69 c2")
+P69_C2=$(cd "$P69" && git rev-parse HEAD)
+(cd "$P69" && git checkout -q -b p69side "$P69_C0" && printf 'side\n' > side.txt && git add side.txt && git commit -q -m "p69 side")
+
+# p69_case <label> <upstream-spelling>: runs an identical rebase through
+# real git and through sg, each on its own fresh copy of $P69 (already
+# checked out on p69side), and compares the resulting tree and commit
+# subjects byte for byte -- not just "did it exit 0".
+p69_case() {
+    plabel="$1"
+    spelling="$2"
+    gdir="$WORKDIR/p69_git_$plabel"
+    sdir="$WORKDIR/p69_sg_$plabel"
+    rm -rf "$gdir" "$sdir"
+    cp -R "$P69" "$gdir"
+    cp -R "$P69" "$sdir"
+    (cd "$gdir" && LC_ALL=C git rebase "$spelling") > "$WORKDIR/p69_git_${plabel}.out" 2>&1
+    g_rc=$?
+    (cd "$sdir" && "$SG" rebase "$spelling") > "$WORKDIR/p69_sg_${plabel}.out" 2>&1
+    s_rc=$?
+    check "phase69 oracle: precondition -- real git accepts <upstream>='$spelling' ($plabel) for rebase" \
+        test "$g_rc" -eq 0
+    check "phase69: sg rebase <upstream>='$spelling' ($plabel) exits 0, matching git" \
+        test "$s_rc" -eq 0
+    (cd "$gdir" && LC_ALL=C git rev-parse HEAD^{tree}) > "$WORKDIR/p69_git_${plabel}.tree" 2>/dev/null
+    (cd "$sdir" && LC_ALL=C git rev-parse HEAD^{tree}) > "$WORKDIR/p69_sg_${plabel}.tree" 2>/dev/null
+    check "phase69: sg rebase <upstream>='$spelling' ($plabel) produces the SAME final tree as git" \
+        cmp -s "$WORKDIR/p69_sg_${plabel}.tree" "$WORKDIR/p69_git_${plabel}.tree"
+    (cd "$gdir" && LC_ALL=C git log --format=%s) > "$WORKDIR/p69_git_${plabel}.log" 2>/dev/null
+    (cd "$sdir" && LC_ALL=C git log --format=%s) > "$WORKDIR/p69_sg_${plabel}.log" 2>/dev/null
+    check "phase69: sg rebase <upstream>='$spelling' ($plabel) produces the SAME commit subjects/order as git" \
+        cmp -s "$WORKDIR/p69_sg_${plabel}.log" "$WORKDIR/p69_git_${plabel}.log"
+}
+
+p69_case "annotated_tag" "p69av1"
+p69_case "40hex" "$P69_C1"
+p69_case "7hex" "$P69_C1_7"
+p69_case "branch_tilde1" "${P69_BRANCH}~1"
+p69_case "refs_heads_branch" "refs/heads/$P69_BRANCH"
+p69_case "head" "HEAD"
+
+# --- annotated tag peeling needs POSITIVE evidence, not just "no error":
+# rebasing onto the tag must land on the exact same tree as rebasing onto
+# the commit it points at. ---
+check "phase69: rebasing onto an annotated tag peels to its commit (SAME result as rebasing onto that commit directly, not just 'no error')" \
+    cmp -s "$WORKDIR/p69_sg_annotated_tag.tree" "$WORKDIR/p69_sg_40hex.tree"
+
+# --- a below-minimum abbreviation (3 hex) is refused by both tools. ---
+P69_C1_3=$(printf '%s' "$P69_C1" | cut -c1-3)
+P69_SHORT="$WORKDIR/p69_short"
+rm -rf "$P69_SHORT"
+cp -R "$P69" "$P69_SHORT"
+(cd "$P69_SHORT" && LC_ALL=C git rebase "$P69_C1_3") > "$WORKDIR/p69_git_short3.out" 2>&1
+check "phase69 oracle: precondition -- real git refuses a 3-hex <upstream> for rebase (below the 4-char minimum)" \
     test $? -ne 0
+rm -rf "$P69_SHORT"
+cp -R "$P69" "$P69_SHORT"
+(cd "$P69_SHORT" && "$SG" rebase "$P69_C1_3") > "$WORKDIR/p69_sg_short3.out" 2>&1
+check "phase69: sg rebase also refuses a 3-hex <upstream>, matching git" \
+    test $? -ne 0
+check "phase69: ...and does NOT leave a .git/sg-rebase/ directory behind" \
+    sh -c "[ ! -d '$P69_SHORT/.git/sg-rebase' ]"
+
+# --- a <rev>:<path> (blob-ish) <upstream> is refused, exit 1, no state
+# left behind. ---
+P69_BLOBISH="$WORKDIR/p69_blobish"
+rm -rf "$P69_BLOBISH"
+cp -R "$P69" "$P69_BLOBISH"
+(cd "$P69_BLOBISH" && LC_ALL=C git rebase "${P69_C1}:f.txt") > "$WORKDIR/p69_git_blobish.out" 2>&1
+check "phase69 oracle: precondition -- real git also refuses a blob-ish <upstream> (so sg's refusal is agreement, not an unmeasured sg-only rule)" \
+    test $? -ne 0
+(cd "$P69_BLOBISH" && "$SG" rebase "${P69_C1}:f.txt") > "$WORKDIR/p69_sg_blobish.out" 2>&1
+check "phase69: sg rebase <upstream>='<40hex>:path' (blob-ish, not commit-ish) is refused, exit 1" \
+    test $? -eq 1
+check "phase69: ...and does NOT leave a .git/sg-rebase/ directory behind" \
+    sh -c "[ ! -d '$P69_BLOBISH/.git/sg-rebase' ]"
+
+# --- 4-way ambiguity under rebase is COMMITTISH (2 hint rows: tag+commit),
+# byte for byte identical to git's own error block -- reusing $P68's
+# existing 4-way collision fixture (P68_PREFIX) rather than building a
+# second one, per the spec's own instruction. ---
+P68_REBASE_AMB="$WORKDIR/p68_rebase_amb"
+rm -rf "$P68_REBASE_AMB"
+cp -R "$P68" "$P68_REBASE_AMB"
+(cd "$P68_REBASE_AMB" && git checkout -q -b p68ambside "$P68_C0" && printf 'ambside\n' > ambside.txt && git add ambside.txt && git commit -q -m ambside)
+(cd "$P68_REBASE_AMB" && LC_ALL=C git rebase "$P68_PREFIX") > "$WORKDIR/p68_git_rebase_amb.out" 2>&1
+P68_GIT_REBASE_AMB_RC=$?
+(cd "$P68_REBASE_AMB" && git rebase --abort) > /dev/null 2>&1
+(cd "$P68_REBASE_AMB" && "$SG" rebase "$P68_PREFIX") > "$WORKDIR/p68_sg_rebase_amb.out" 2>&1
+P68_SG_REBASE_AMB_RC=$?
+sed '$d' "$WORKDIR/p68_git_rebase_amb.out" > "$WORKDIR/p68_git_rebase_amb.trimmed"
+sed '$d' "$WORKDIR/p68_sg_rebase_amb.out" > "$WORKDIR/p68_sg_rebase_amb.trimmed"
+check "phase69: sg rebase on a 4-way collision prefix is refused with a COMMITTISH (2-row) hint block, matching git byte for byte" \
+    cmp -s "$WORKDIR/p68_sg_rebase_amb.trimmed" "$WORKDIR/p68_git_rebase_amb.trimmed"
+check "phase69 oracle: precondition -- real git exits 128 and sg exits 1 for this ambiguous rebase (this project's own 0-or-1 exit convention)" \
+    sh -c "[ '$P68_GIT_REBASE_AMB_RC' -eq 128 ] && [ '$P68_SG_REBASE_AMB_RC' -eq 1 ]"
+check "phase69 oracle: precondition -- the block really carries 2 hint lines (COMMITTISH), not the 4 a STRICT command would print" \
+    sh -c "[ \$(grep -c '^hint:   ' '$WORKDIR/p68_git_rebase_amb.trimmed') -eq 2 ]"
+# `sed '$d'` above assumes git's own trailing block after the hint rows is
+# exactly ONE line ("fatal: invalid upstream '<arg>'"). That assumption is
+# NOT free: two blocks below, this same group had to abandon `sed '$d'` for
+# `git log`, whose refusal carries a THREE-line trailing block, and the
+# first draft of that check failed for a reason unrelated to the ambiguity
+# block. Measured for rebase (git 2.55.0) and pinned here, so a future git
+# that grows a second trailing line fails BY NAME instead of turning the
+# cmp above red for an unrelated reason.
+check "phase69 oracle: precondition -- git rebase's refusal has exactly ONE line after the hint block, which is what makes the sed '\$d' trim above correct" \
+    sh -c "[ \$(sed -n '/^hint:/,\$p' '$WORKDIR/p68_git_rebase_amb.out' | grep -vc '^hint:') -eq 1 ]"
+
+# --- control group: the SAME 2-way prefix (exactly one commit-ish
+# candidate) that rebase resolves must still be REFUSED by a STRICT
+# caller (sg merge) -- without this control, an implementation that wrote
+# sg rebase as STRICT instead of COMMITTISH would only resolve fewer
+# things, and the 4-way check above would stay green regardless (see
+# CLAUDE.md's a-control-whose-arms-already-agree lesson). ---
+P68_MERGE_CONTROL="$WORKDIR/p68_rebase_merge_control"
+rm -rf "$P68_MERGE_CONTROL"
+cp -R "$P68" "$P68_MERGE_CONTROL"
+(cd "$P68_MERGE_CONTROL" && git checkout -q -b p68mergeside "$P68_C0" && printf 'mergeside\n' > mergeside.txt && git add mergeside.txt && git commit -q -m mergeside)
+(cd "$P68_MERGE_CONTROL" && "$SG" merge "$P68_PREFIX2") > /dev/null 2>&1
+check "phase69 control: sg merge (STRICT) on the SAME 2-way commit-ish-only prefix that sg rebase resolves is REFUSED -- proving rebase's success above is COMMITTISH dwim, not STRICT resolving anyway" \
+    test $? -ne 0
+(cd "$P68_MERGE_CONTROL" && "$SG" rebase "$P68_PREFIX2") > /dev/null 2>&1
+check "phase69 control: ...while sg rebase on the identical prefix DOES resolve and succeed (head-on pair with the check above)" \
+    test $? -eq 0
+
+# --- Phase 65's byte-for-byte reflog checks stay green, and gain a new
+# non-branch spelling (an annotated tag) proving the reflog line still
+# echoes upstream_arg verbatim, not the resolved/peeled commit. ---
+P69_REFLOG="$WORKDIR/p69_reflog"
+rm -rf "$P69_REFLOG"
+cp -R "$P69" "$P69_REFLOG"
+# The git side gets its OWN copy too. An earlier draft ran this rebase
+# directly in $P69 -- the shared template every later block still copies
+# from -- which happened not to break anything (the only later user reads
+# refs/heads/<default> and $P69_C0, neither of which that rebase moved),
+# but it is the same shared-mutable-state trap as this group's own
+# label/plabel collision, and the next check inserted between the two
+# blocks would have inherited a rebased fixture silently.
+P69_REFLOG_GIT="$WORKDIR/p69_reflog_git"
+rm -rf "$P69_REFLOG_GIT"
+cp -R "$P69" "$P69_REFLOG_GIT"
+(cd "$P69_REFLOG" && "$SG" rebase p69av1) > /dev/null 2>&1
+(cd "$P69_REFLOG_GIT" && LC_ALL=C git rebase p69av1) > /dev/null 2>&1
+check "phase69 oracle: precondition -- real git's rebase (start) reflog line echoes a non-branch <upstream> verbatim" \
+    sh -c "grep -q 'rebase (start): checkout p69av1' '$P69_REFLOG_GIT/.git/logs/HEAD'"
+check "phase69: sg's rebase (start) reflog line for a non-branch <upstream> (annotated tag) matches git byte for byte (message field only, same timestamp-avoidance technique as the phase65 checks)" \
+    sh -c "grep 'rebase (start)' '$P69_REFLOG/.git/logs/HEAD' | cut -f2- > '$WORKDIR/p69_sg_reflog.txt'; grep 'rebase (start)' '$P69_REFLOG_GIT/.git/logs/HEAD' | cut -f2- > '$WORKDIR/p69_git_reflog.txt'; cmp -s '$WORKDIR/p69_sg_reflog.txt' '$WORKDIR/p69_git_reflog.txt'"
+
+# --- a conflicting rebase started with a non-branch upstream: --continue
+# must still finish, and the sequencer state must hold the RESOLVED
+# 40-hex commit id, not the spelling the user typed. ---
+P69_CONFLICT="$WORKDIR/p69_conflict"
+rm -rf "$P69_CONFLICT"
+mkdir -p "$P69_CONFLICT"
+git init -q "$P69_CONFLICT"
+(cd "$P69_CONFLICT" && git config user.email "p69@example.com" && git config user.name "p69 tester")
+printf 'base\n' > "$P69_CONFLICT/g.txt"
+(cd "$P69_CONFLICT" && git add g.txt && git commit -q -m "p69cf base")
+P69CF_BASE=$(cd "$P69_CONFLICT" && git rev-parse HEAD)
+printf 'upstream change\n' > "$P69_CONFLICT/g.txt"
+(cd "$P69_CONFLICT" && git add g.txt && git commit -q -m "p69cf upstream")
+P69CF_UPSTREAM=$(cd "$P69_CONFLICT" && git rev-parse HEAD)
+(cd "$P69_CONFLICT" && GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" git tag -a p69cfav -m "p69cf annotated tag" "$P69CF_UPSTREAM")
+(cd "$P69_CONFLICT" && git checkout -q -b p69cfside "$P69CF_BASE" && printf 'side change\n' > g.txt && git add g.txt && git commit -q -m "p69cf side")
+(cd "$P69_CONFLICT" && "$SG" rebase p69cfav) > /dev/null 2>&1
+check "phase69: a conflicting sg rebase started with a non-branch <upstream> (annotated tag) still pauses (leaves .git/sg-rebase/)" \
+    sh -c "[ -d '$P69_CONFLICT/.git/sg-rebase' ]"
+check "phase69: ...and .git/sg-rebase/onto is a RESOLVED 40-hex commit id, not the typed spelling 'p69cfav'" \
+    sh -c "grep -qE '^[0-9a-f]{40}\$' '$P69_CONFLICT/.git/sg-rebase/onto' && [ \"\$(cat '$P69_CONFLICT/.git/sg-rebase/onto')\" = '$P69CF_UPSTREAM' ]"
+check "phase69: ...and .git/sg-rebase/orig-branch correctly names the side branch" \
+    sh -c "[ \"\$(cat '$P69_CONFLICT/.git/sg-rebase/orig-branch')\" = 'p69cfside' ]"
+printf 'side change\n' > "$P69_CONFLICT/g.txt"
+(cd "$P69_CONFLICT" && "$SG" add g.txt && "$SG" rebase --continue) > "$WORKDIR/p69_conflict_continue.out" 2>&1
+check "phase69: --continue finishes the rebase that was started with a non-branch <upstream>" \
+    test $? -eq 0
+check "phase69: ...and .git/sg-rebase/ is gone afterward" \
+    sh -c "[ ! -d '$P69_CONFLICT/.git/sg-rebase' ]"
+
+# --- Found by Phase 69's own independent sg-vs-git oracle harness (43
+# comparisons over 32 upstream spellings x clean/conflicting/detached
+# fixtures), NOT by any gate: git's gitrevisions lookup order tries
+# "refs/<name>" before "refs/heads/<name>", so a "heads/<branch>" (or
+# "tags/<tag>") spelling resolves for real git and is REFUSED by sg.
+#
+# This is a PRE-EXISTING revparse grammar gap, not a Phase 69 regression:
+# sg implements only the literal "refs/..." fallback (pinned since Phase
+# 17c, see the "refs/<rest> as a fully-qualified <base>" block above), and
+# the same spelling is refused identically by sg log / merge / reset / diff
+# -- measured directly, all four exit 1 while git rev-parse exits 0. Phase
+# 69 only made it VISIBLE here, because until now sg rebase refused every
+# spelling but a bare branch name and so had nothing to be inconsistent
+# with.
+#
+# Pinned on both sides for the same reason Phase 68 pinned "sg rebase does
+# not accept a 40-hex <upstream>": closing it later must turn a check red
+# BY NAME rather than silently changing what these checks compare. ---
+P69_HEADSPFX="$WORKDIR/p69_heads_prefix"
+rm -rf "$P69_HEADSPFX"
+cp -R "$P69" "$P69_HEADSPFX"
+(cd "$P69_HEADSPFX" && LC_ALL=C git rev-parse "heads/$P69_BRANCH") > /dev/null 2>&1
+check "phase69 oracle: precondition -- real git resolves the 'heads/<branch>' spelling (gitrevisions refs/<name> rule)" \
+    test $? -eq 0
+(cd "$P69_HEADSPFX" && git checkout -q -b p69hp "$P69_C0" && printf 'hp\n' > hp.txt && git add hp.txt && git commit -q -m "p69 hp")
+(cd "$P69_HEADSPFX" && LC_ALL=C git rebase "heads/$P69_BRANCH") > /dev/null 2>&1
+check "phase69 oracle: precondition -- real git accepts 'heads/<branch>' as a rebase <upstream>" \
+    test $? -eq 0
+(cd "$P69_HEADSPFX" && git rebase --abort) > /dev/null 2>&1
+(cd "$P69_HEADSPFX" && "$SG" rebase "heads/$P69_BRANCH") > "$WORKDIR/p69_sg_headspfx.out" 2>&1
+check "phase69: sg rebase REFUSES the 'heads/<branch>' spelling (recorded pre-existing revparse gap -- sg implements only the literal 'refs/...' fallback, not git's full gitrevisions lookup order)" \
+    test $? -ne 0
+check "phase69: ...and the refusal is the ordinary invalid-reference message, not a crash or a silent no-op" \
+    grep -q "invalid reference: heads/$P69_BRANCH" "$WORKDIR/p69_sg_headspfx.out"
+check "phase69: ...and the same gap is NOT rebase-specific -- sg log refuses the identical spelling (so closing it belongs in revparse, not in cmd_rebase.c)" \
+    sh -c "! (cd '$P69_HEADSPFX' && \"$SG\" log --oneline -1 'heads/$P69_BRANCH') > /dev/null 2>&1"
+# CLAUDE.md's note on this gap names four commands; pin all four rather
+# than pin two and assert four (a claim wider than its pins is exactly the
+# shape this project has recorded going wrong three times).
+check "phase69: ...and sg merge refuses it too" \
+    sh -c "! (cd '$P69_HEADSPFX' && \"$SG\" merge 'heads/$P69_BRANCH') > /dev/null 2>&1"
+# `reset --hard` gets its OWN copy: the other three commands cannot alter
+# the fixture whether they resolve or refuse, but this one WOULD move HEAD
+# and rewrite the working tree on the day this gap is closed -- and the
+# check below it would then be silently running against a different
+# fixture than the three above it. Order-independence here costs one cp.
+P69_HEADSPFX_RESET="$WORKDIR/p69_heads_prefix_reset"
+rm -rf "$P69_HEADSPFX_RESET"
+cp -R "$P69_HEADSPFX" "$P69_HEADSPFX_RESET"
+check "phase69: ...and sg reset --hard refuses it too" \
+    sh -c "! (cd '$P69_HEADSPFX_RESET' && \"$SG\" reset --hard 'heads/$P69_BRANCH') > /dev/null 2>&1"
+check "phase69: ...and sg diff refuses it too (four commands pinned, matching the four CLAUDE.md names)" \
+    sh -c "! (cd '$P69_HEADSPFX' && \"$SG\" diff 'heads/$P69_BRANCH') > /dev/null 2>&1"
+
+# --- Phase 69b: the unrecognized-flag guard in sg_cmd_rebase's argv loop.
+# This sub-feature shipped with ZERO coverage in the first round (28
+# phase69 checks, not one of them about it) -- found by the main
+# conversation grepping the check names for it, exactly the
+# "batch verification masquerading as per-site coverage" shape this
+# project keeps hitting. Mirrors the wording of the phase12 check that
+# guards cmd_reset.c's own identical guard. ---
+P69_FLAG="$WORKDIR/p69_flagguard"
+rm -rf "$P69_FLAG"
+cp -R "$P69" "$P69_FLAG"
+(cd "$P69_FLAG" && "$SG" rebase --help) > "$WORKDIR/p69_flag_help.out" 2>&1
+# NOTE: this first row is a PRECONDITION, not a witness for the guard, and
+# it is named that way deliberately. Measured with a directed mutation
+# (the guard's condition forced to 0): `sg rebase --help` then falls into
+# the <upstream> slot and revparse refuses it, which ALSO exits non-zero --
+# so this row stays green under the very mutation it looks like it should
+# catch. The two rows below it are the actual witnesses (both went red).
+check "phase69b: an unrecognized flag to sg rebase exits non-zero (precondition only -- the pre-guard behaviour also exited non-zero, so this row cannot witness the guard; see the two below)" \
+    test $? -ne 0
+check "phase69b: ...and is reported as a usage error" \
+    grep -q "^usage: sg rebase <upstream>" "$WORKDIR/p69_flag_help.out"
+check "phase69b: ...and NOT as 'invalid reference' (the misleading pre-Phase-69b message, which blamed the user's rev for a mistyped flag)" \
+    sh -c "! grep -q 'invalid reference' '$WORKDIR/p69_flag_help.out'"
+check "phase69b: ...and it left no .git/sg-rebase/ behind" \
+    sh -c "[ ! -d '$P69_FLAG/.git/sg-rebase' ]"
+# Control: the guard keys on the FIRST byte, so an upstream that merely
+# CONTAINS a dash must still be accepted. Without this, a guard widened to
+# "contains a -" would pass every check above.
+rm -rf "$P69_FLAG"
+cp -R "$P69" "$P69_FLAG"
+(cd "$P69_FLAG" && git branch p69-dash-name "$P69_C1" && git checkout -q -b p69dashside "$P69_C0" && printf 'ds\n' > ds.txt && git add ds.txt && git commit -q -m "p69 ds")
+(cd "$P69_FLAG" && "$SG" rebase p69-dash-name) > "$WORKDIR/p69_flag_dash.out" 2>&1
+check "phase69b control: an <upstream> CONTAINING a dash is still accepted (the guard keys on the first byte, not on the presence of a dash)" \
+    test $? -eq 0
 
 # --- Phase 68b review round: the SG_REV_TREEISH mode for "<rev>:<path>" ---
 # The bug this closes: sg_rev_parse_object used to hand resolve_rev_path's
