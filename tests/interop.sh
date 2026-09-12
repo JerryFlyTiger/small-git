@@ -19826,15 +19826,19 @@ p72_date_row() {
         GIT_COMMITTER_DATE="1650000000 +0000" LC_ALL=C git commit -q -m "phase72 row") > /dev/null 2>&1
     P72_ROW_GIT_RC=$?
     if [ "$P72_ROW_ACCEPT" = "0" ]; then
-        check "phase72 case4 accept \"$P72_ROW_VAL\": sg commit exits 0" test "$P72_ROW_SG_RC" -eq 0
-        check "phase72 case4 accept \"$P72_ROW_VAL\": git commit exits 0" test "$P72_ROW_GIT_RC" -eq 0
+        check "phase72 case4 accept \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: sg commit exits 0" \
+            test "$P72_ROW_SG_RC" -eq 0
+        check "phase72 case4 accept \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: git commit exits 0" \
+            test "$P72_ROW_GIT_RC" -eq 0
         P72_ROW_SG_ID=$(cd "$P72_ROW_SG" && git rev-parse HEAD 2>/dev/null)
         P72_ROW_GIT_ID=$(cd "$P72_ROW_GIT" && git rev-parse HEAD 2>/dev/null)
-        check "phase72 case4 accept \"$P72_ROW_VAL\": sg and git produce the identical object id" \
+        check "phase72 case4 accept \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: sg and git produce the identical object id" \
             test -n "$P72_ROW_SG_ID" -a "$P72_ROW_SG_ID" = "$P72_ROW_GIT_ID"
     else
-        check "phase72 case4 reject \"$P72_ROW_VAL\": sg commit exits 1" test "$P72_ROW_SG_RC" -eq 1
-        check "phase72 case4 reject \"$P72_ROW_VAL\": git commit exits 128" test "$P72_ROW_GIT_RC" -eq 128
+        check "phase72 case4 reject \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: sg commit exits 1" \
+            test "$P72_ROW_SG_RC" -eq 1
+        check "phase72 case4 reject \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: git commit exits 128" \
+            test "$P72_ROW_GIT_RC" -eq 128
     fi
 }
 
@@ -19867,16 +19871,47 @@ p72_date_row "1700000000 +2360" 0
 p72_date_row "1700000000 +1260" 0
 p72_date_row "1700000000 +0860" 0
 p72_date_row "1700000000 +9999" 0
-p72_date_row "1700000000 +08" 0
-p72_date_row "1700000000 +080" 0
-p72_date_row "1700000000 +08000" 0
-p72_date_row "1700000000 0800" 0
+p72_date_row "1700000000 +080" 0 "UTC"
+p72_date_row "1700000000 +080" 0 "Asia/Kolkata"
 # 2.4's whitespace/trailing-junk table
 p72_date_row "1700000000  +0800" 0
 p72_date_row "  1700000000 +0800  " 0
 p72_date_row "1700000000 +0800 x" 0
-p72_date_row "1700000000+0800" 0
 p72_date_row "@1700000000 x" 0
+
+# Round 6 (SPEC-CORRECTION-2.md): every offset table earlier in this phase
+# was measured on a machine whose OWN local zone is +0800. For any offset
+# that PARSES as +0800, "parsed" and "fell back to local" render
+# byte-identical output THERE, and are indistinguishable by an unpinned
+# row's object-id comparison alone -- both tools independently computing
+# "local" and landing on the identical +0800 by machine coincidence passes
+# the exact same check a genuine "both parsed +0800" would. That is
+# precisely how these four rows shipped wrong (CI, which runs on UTC,
+# caught it; this machine's own gates stayed green throughout). Each row
+# below is pinned under BOTH TZ=UTC and TZ=Asia/Kolkata (+0530, equal to
+# no offset value tested anywhere in this phase, so a parsed value can
+# never be mistaken for the local one) -- one zone alone cannot show that
+# an answer tracks the zone, which is the whole discriminator.
+#
+# Recognized tokens (parsed, must be IDENTICAL under both zones):
+p72_date_row "1700000000 +08" 0 "UTC"
+p72_date_row "1700000000 +08" 0 "Asia/Kolkata"
+p72_date_row "1700000000 0800" 0 "UTC"
+p72_date_row "1700000000 0800" 0 "Asia/Kolkata"
+p72_date_row "1700000000+0800" 0 "UTC"
+p72_date_row "1700000000+0800" 0 "Asia/Kolkata"
+# NOT a token (5 digits) -- must TRACK the zone (local fallback):
+p72_date_row "1700000000 +08000" 0 "UTC"
+p72_date_row "1700000000 +08000" 0 "Asia/Kolkata"
+# The @ form's own two-digit rule (measured, added by this round):
+p72_date_row "@1700000000 +08" 0 "UTC"
+p72_date_row "@1700000000 +08" 0 "Asia/Kolkata"
+# Calendar forms share the identical token grammar (measured):
+p72_date_row "2023-11-15 06:13:20 +08" 0 "UTC"
+p72_date_row "2023-11-15 06:13:20 +08" 0 "Asia/Kolkata"
+p72_date_row "2023-11-15 06:13:20 0800" 0 "UTC"
+p72_date_row "Wed, 15 Nov 2023 06:13:20 +08" 0 "UTC"
+p72_date_row "Wed, 15 Nov 2023 06:13:20 0800" 0 "UTC"
 
 # Case 4 correction round (SPEC-CORRECTION.md): section 2.3 above was
 # measured ONLY on the bare `<digits> <offset>` form. The `@<digits>

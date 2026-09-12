@@ -15444,14 +15444,106 @@ no longer an accident. `tests/test_ident.c` and `tests/interop.sh` both
 carry an inline note recording this, since the comment written at round 4
 would otherwise go stale and silently mislead the next reader.
 
+### 4e. Round 6: the fourth one-axis measurement error, and the axis this time was the measuring machine itself
+
+CI went red on four `phase72 case4` rows on every platform it runs, macOS
+included -- the same platform every earlier round of this phase was
+measured on. Local gates stayed green throughout. The cause was not a
+platform difference; it was that **every offset-grammar table in this
+phase, from the very first spec, was measured on a machine whose own local
+zone is +0800.** For any offset that PARSES as +0800, "git parsed it" and
+"git fell back to local" render byte-identical output on such a machine --
+genuinely indistinguishable by inspection -- so several rows recorded the
+wrong rule, and nothing local could ever have caught it.
+
+This is the FOURTH instance in this phase of a rule measured along one
+axis (bare-vs-`@` form in section 4, the lower bound's existence in section
+4b, raw-vs-final in section 4c, and now the measuring machine's own zone).
+The discipline that finally closes this axis: **every row is measured under
+BOTH `TZ=UTC` and `TZ=Asia/Kolkata`** (+0530, equal to no offset value in
+any table in this phase, so a parsed value can never be mistaken for a
+local one) -- a row is "local fallback" only if the answer TRACKS the
+zone, "parsed" only if it is identical under both. Every interop row added
+or touched by this round pins its `TZ` explicitly for exactly this reason;
+an earlier round's rows did not, which is what let the wrong rule ship.
+
+**What was actually wrong**, all silent (both tools exit 0, different
+object ids), all measured under `TZ=UTC` where the coincidence cannot hide
+it:
+
+| value | git | sg (before this round) |
+|---|---|---|
+| `1700000000 +08` | `+0800` (parsed) | `+0000` (fell back to local) |
+| `1700000000 0800` | `+0800` (parsed) | `+0000` (fell back to local) |
+| `1700000000+0800` | `+0800` (parsed) | `+0000` (fell back to local) |
+| `1700000000 +08000` | `+0000` (fell back to local) | `+0800` (misread as a token) |
+
+**The corrected offset-token grammar, shared by every caller in the file**
+(the bare and `@` timestamp forms, and every calendar form, which reuses
+the bare form's range-check policy):
+
+    <sign> <2 digits>        +08     -> +0800   (sign REQUIRED for this shape)
+    [<sign>] <4 digits>      +0800, 0800        (sign optional)
+    [<sign>] <2>:<2>         +08:00, 00:00      (sign optional)
+
+1 digit, 3 digits, 5-or-more digits, and exactly 2 digits with NO sign are
+not tokens at all and fall back to local. The digit-count check must be
+EXACT: a naive "read the first 2 (or 4) digits and ignore the rest" would
+treat `+08000` (5 digits) as `+0800` plus an ignorable trailing digit --
+backwards, since git falls back to local for that value specifically
+because 5 digits is not a recognized shape. `match_offset_shape`
+(`src/util/ident.c`) counts the full digit run before deciding which shape
+(if any) matched, precisely to avoid this. The per-form difference remains
+only the POLICY on a recognized token: the bare/calendar forms range-check
+(HH <= 23, MM <= 59) and discard an out-of-range one for local; the `@`
+form never range-checks, normalizing arithmetically instead (unchanged
+from rounds 2/3). The `@` form needed the 2-digit rule added too
+(`@1700000000 +08` -> `+0800`, measured) -- the rest of its table survived
+re-measurement unchanged.
+
+**A second, larger correction fell out of re-measuring the third row.**
+This project had believed since round 1 that `"1700000000+0800"` (no space
+at all before the offset) falls back to local, "for want of the required
+space" -- literally in the original spec and repeated in this file. That
+belief was ALSO an artifact of the +0800 measuring machine and was simply
+wrong: git PARSES an attached, unspaced offset exactly the same as a
+space-separated one. Whitespace's only remaining role in `try_epoch` is
+deciding what happens when the trailing content does **not** match the
+offset grammar at all: with a space, unrecognized content is tolerated as
+a single token of junk (`"@1700000000 x"`, unaffected by this round); without
+one, it is a hard parse failure (`"2023-11-15"`, where the attached
+`"-11-15"` still matches no offset shape, before or after this round).
+Whether a token is present and shape-valid is now independent of
+whitespace; `try_epoch`'s two branches were unified into one code path
+that checks shape first and only asks about whitespace when the shape did
+NOT match.
+
+**Verification**: mutation 1 (make the matcher reject the signed-2-digit
+shape, i.e. restore the pre-round-6 bug) turns exactly the new named rows
+red, confirmed identically under both `TZ=UTC` and `TZ=Asia/Kolkata`, at
+both the unit level and the interop level. Mutation 2 is not a code
+mutation but a demonstration of the lesson itself: deleting the `TZ=UTC`
+pin from the `"1700000000 +08000"` interop row (a genuine local-fallback
+row, not a parsed one) and re-running interop on this project's own +0800
+development machine -- it stays fully green, 3880/3880, because this
+machine's own ambient zone happens to equal the coincidence that let the
+bug ship in the first place. That is the whole lesson in one number: an
+unpinned row proves nothing, on the exact machine every earlier round of
+this phase was developed and gated on.
+
 ### 5. The scope line
 
 git's `parse_date` is a large heuristic engine. Reproducing all of it is not
 this phase, and the line is drawn by **whether a divergence is silent**:
 
 1. sg must never **silently** write a different object than git would -- both
-   tools exit 0 and the bytes differ. Exactly one thing was in this class (the
-   `@`-form offset normalization) and it is fixed.
+   tools exit 0 and the bytes differ. Two things ended up in this class: the
+   `@`-form offset normalization (round 2), and the offset-token grammar
+   itself failing to recognize a signed 2-digit offset, an unsigned 4-digit
+   offset, and an attached (unspaced) offset, while misreading a 5-digit
+   run as a 4-digit token (round 6, section 4e above -- the whole grammar
+   table had been measured on a machine whose own local zone made "parsed"
+   and "fell back to local" indistinguishable). Both are fixed.
 2. sg must never **accept what git rejects**, which would let it create an
    object real git could not have produced from the same env. Four things
    ended up in this class: the `>= 9` digit floor, the 2100 upper bound,
@@ -15532,7 +15624,7 @@ both fresh -- verified against real git rather than assumed.
 
 ### 8. Verification
 
-`make` 0 warnings (75 TUs recompiled), `make test` 84/84, `interop` 3842/3842
+`make` 0 warnings (75 TUs recompiled), `make test` 84/84, `interop` 3880/3880
 with 0 skipped, `make sanitize` 84/84 binaries with 0 sanitizer errors. interop
 grew from master's 3698 and no pre-existing check disappeared.
 
@@ -15605,3 +15697,19 @@ implementation had regressed. Fixed by routing through `env` explicitly
 shell's assignment-prefix parsing entirely since `env` interprets its own
 arguments however it likes, at runtime, well after the shell already
 finished deciding what a "word" is.
+
+**Round 6's two mutations, both run as specified.** Mutation 1 (restore
+today's bug: make the matcher reject the signed-2-digit shape,
+`s/if (ndigits == 2 && has_sign) {/if (0) {/` in `match_offset_shape`) turns
+exactly the new named rows red -- unit level (both `TZ=UTC` and
+`TZ=Asia/Kolkata`, run as two separate mutation passes to confirm the
+failure is identical under both zones) and interop level alike -- with
+every pre-existing row staying green. Mutation 2 is the lesson itself, not
+a code change: deleting the `TZ=UTC` pin from the `"1700000000 +08000"`
+interop row (a genuine local-fallback row) and re-running interop on this
+project's own +0800 development machine leaves it fully green, 3880/3880 --
+because this machine's own ambient zone happens to equal the exact
+coincidence that let the original bug ship. Recorded as its own numbered
+finding (section 4e) rather than folded into the mutation paragraph above,
+because it is not evidence about the FIX, it is evidence about why the
+BUG was invisible for five rounds on this exact machine.

@@ -78,46 +78,66 @@ int sg_ident_committer(sg_ident *out, const char **bad_value_out);
    CLAUDE.md's Phase 72 section for the full derivation:
 
      - "[@]<digits>[ <tz>]"      -- a unix timestamp, optionally prefixed
-       with '@', optionally followed by (one or more spaces, then) an
-       offset. A missing/malformed/absent offset does NOT fail the parse:
-       the timestamp is still honoured and `*tz_out` becomes the machine's
-       LOCAL offset at that instant. Whitespace matters: with no space at
-       all between the digits and what follows, the tail is honoured only
-       if it looks exactly like an attached "[+-]dddd" offset (still not
-       applied, for want of the required space -- `*tz_out` is still
-       local); anything else immediately attached (no space) is a parse
-       FAILURE, not a fallback -- this is what tells "1700000000+0800"
-       (accepted, local) apart from "2023-11-15" (rejected) despite both
-       being "digits then more stuff with no space". With a space present,
-       a single further token that fails to parse as an offset is tolerated
-       as junk (still local, still honoured); a SECOND space-separated
-       token past that (e.g. "2 hours ago") is a parse FAILURE -- this is
-       what tells "@1700000000 x" (accepted, local) apart from git's
-       relative-date phrases, which this parser deliberately does NOT
-       implement (--date=relative is a RENDERER, Phase 66, a different and
-       looser grammar than this strict ident-date parser; git itself
-       rejects "yesterday"/"now"/"2 hours ago" here while accepting them
-       elsewhere).
+       with '@', optionally followed by (whitespace, or nothing at all,
+       then) an offset. A missing/malformed/out-of-range offset does NOT
+       fail the parse: the timestamp is still honoured and `*tz_out`
+       becomes the machine's LOCAL offset at that instant.
+       WARNING (round 6, SPEC-CORRECTION-2.md): whitespace before the
+       offset is NOT required for it to be RECOGNIZED -- "1700000000+0800"
+       (no space at all) is PARSED (`*tz_out` = "+0800"), not merely
+       tolerated-and-discarded the way an earlier round of this project
+       believed, measured on a machine whose own local zone happens to be
+       +0800, where "parsed +0800" and "fell back to local +0800" render
+       identically and so could not be told apart. Whitespace's only
+       remaining role is what happens when the trailing content does NOT
+       match the offset grammar (below) at ALL: WITH a space, unrecognized
+       content is tolerated as a single token of junk (still local, still
+       honoured -- "@1700000000 x"); a SECOND space-separated token past it
+       (e.g. "2 hours ago") is a parse FAILURE, not junk -- this is what
+       tells that shape apart from git's own relative-date phrases, which
+       this parser deliberately does NOT implement (--date=relative is a
+       RENDERER, Phase 66, a different and looser grammar than this strict
+       ident-date parser; git itself rejects "yesterday"/"now"/
+       "2 hours ago" here while accepting them elsewhere). WITHOUT a space,
+       unrecognized attached content is a hard parse FAILURE (no
+       tolerance) -- this is what tells "2023-11-15" (rejected: "-11-15"
+       matches no offset shape) apart from "1700000000+0800" (parsed).
      - "YYYY-MM-DDTHH:MM:SS[+-]HH:MM"    -- ISO 8601 strict, colon offset.
      - "YYYY-MM-DD HH:MM:SS [+-]HHMM"    -- ISO-ish, space-separated, no
-       colon in the offset.
+       colon in the offset (though the offset token itself may still use a
+       colon -- see the grammar below, shared by every form).
      - "[Www, ]DD Mon YYYY HH:MM:SS [+-]HHMM" -- RFC 2822 (the weekday-and-
        comma prefix, if present at all, is skipped without being validated
        against the actual day of week).
-       All three of the above REQUIRE a syntactically well-formed offset;
-       unlike the timestamp form, there is no "tolerate junk, fall back to
-       local" here.
+       All three of the above REQUIRE a syntactically well-formed, IN-RANGE
+       offset -- unlike the timestamp form, an out-of-range offset is a
+       hard parse FAILURE here (round 5's decision: sg refuses rather than
+       reproduce git's "reinterpret as local time" behaviour for a
+       calendar form, which is ill-defined during a DST gap/overlap).
      - anything else (a bare date with no time-of-day, a relative phrase,
        garbage, a value strtoll cannot hold) -> parse FAILURE.
 
-   The offset field itself, in every form that carries one: exactly
-   sign + 4 digits (optionally with a colon after the first two, ISO-strict
-   only), hours <= 23 and minutes <= 59. Anything outside that numeric
-   range is NOT a hard failure for the timestamp form -- the offset is
-   discarded and the machine's local offset is used instead, the timestamp
-   itself is kept. Do not "fix" the range to a real-world +/-14:00 bound;
-   the rule is purely numeric (measured: "+1500"/"+2359" are accepted
-   verbatim by real git).
+   The offset TOKEN grammar itself, shared by every form above (round 6,
+   SPEC-CORRECTION-2.md -- re-measured under both TZ=UTC and
+   TZ=Asia/Kolkata, since a single +0800 measuring machine cannot tell
+   "parsed +0800" apart from "fell back to local +0800"):
+     - <sign> then EXACTLY 2 digits    ("+08" -> +0800; the sign is
+       REQUIRED for this shape only)
+     - [<sign>] then EXACTLY 4 digits  ("+0800", "0800" -- sign optional)
+     - [<sign>] <2 digits>:<2 digits>  ("+08:00", "00:00" -- sign optional)
+   Anything else -- 1 digit, 3 digits, 5 or more digits, or exactly 2
+   digits with NO sign -- is NOT a token at all, and the value falls back
+   to local the same way a malformed one does. The digit-count check is
+   exact (a run of 5 digits is not "the first 4 of it"): "+08000" is NOT a
+   token and falls back to local, it is not read as "+0800" plus an
+   ignorable trailing digit.
+   Range-checking (hours <= 23, minutes <= 59) and the POLICY on a
+   recognized-but-out-of-range token are the CALLER's -- the timestamp
+   form (bare and calendar alike) discards it for local, the `@` form
+   normalizes it ARITHMETICALLY instead (`+9999` -> `+10039`, HH*60+MM
+   re-rendered, hours width unbounded) and never range-checks at all. Do
+   not "fix" the range to a real-world +/-14:00 bound; the rule is purely
+   numeric (measured: "+1500"/"+2359" are accepted verbatim by real git).
 
    Returns 0 and fills *time_out / tz_out (a caller-supplied buffer of at
    least 8 bytes) on success, -1 on any of the failures above. */

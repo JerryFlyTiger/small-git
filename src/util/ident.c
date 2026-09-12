@@ -74,76 +74,105 @@ static int fill_local_offset(long long time_sec, char tz_out[8])
     return 0;
 }
 
-/* "[+-]dddd", exactly 5 bytes at s (may be followed by more bytes, which
-   the caller decides whether to require absent or ignore). Validates the
-   numeric range (hours <= 23, minutes <= 59) too -- an out-of-range match
-   is reported via *out_of_range so the caller can apply "ignore it, use
-   local" rather than treating it as "did not match at all". */
-static int match_offset_token(const char *s, long *offset_out, int *out_of_range)
+/* Round 6 (SPEC-CORRECTION-2.md): the offset-token GRAMMAR, shared by
+   every caller in this file (both timestamp forms -- bare and `@` -- and
+   every calendar form, which reuses the bare form's policy). Every earlier
+   table in this phase was measured on a machine whose own local zone is
+   +0800; for any offset that PARSES as +0800, "parsed" and "fell back to
+   local" render byte-identical output there, so the two were
+   indistinguishable and half the grammar was recorded wrong. Re-measured
+   under both TZ=UTC and TZ=Asia/Kolkata (+0530, equal to nothing in any
+   table, so a parsed value can never be mistaken for a local one) via
+   `git commit-tree`. The corrected grammar:
+
+       <sign> <2 digits>        +08     (sign REQUIRED for this shape)
+       [<sign>] <4 digits>      +0800, 0800
+       [<sign>] <2>:<2>         +08:00, 00:00
+
+   Anything else -- 1 digit, 3 digits, 5+ digits, or exactly 2 digits with
+   NO sign -- is not a token at all. The 2-vs-4-vs-5-digit distinction is
+   why the digit run is counted in full before deciding which shape (if
+   any) matched: a naive "match the first 2 (or 4) digits and ignore what
+   follows" would treat "+08000" (5 digits, NOT a token, falls back to
+   local) as if it were "+0800" followed by ignorable trailing junk, which
+   is exactly backwards -- git falls back to local for that value.
+
+   Range-checking and the policy on a recognized-but-out-of-range token are
+   the CALLER's job (the two timestamp forms disagree on it: the bare form
+   discards it for local, the `@` form normalizes it arithmetically) --
+   this function only recognizes SHAPE. Returns 0 and fills
+   *negative_out, *hh_out and *mm_out (unreduced -- MM can be entered as high as
+   59 by construction here, but a colon token like "08:99" would still
+   reach this far; range-checking still belongs to the caller) and
+   *len_out (bytes consumed) on a shape match; -1 otherwise. */
+static int match_offset_shape(const char *s, int *negative_out, int *hh_out, int *mm_out,
+                              size_t *len_out)
 {
-    int hh, mm;
+    const char *p = s;
+    int has_sign = 0;
+    int ndigits;
+
+    *negative_out = 0;
+    if (*p == '+') {
+        has_sign = 1;
+        p++;
+    } else if (*p == '-') {
+        has_sign = 1;
+        *negative_out = 1;
+        p++;
+    }
+
+    /* Colon shape checked first: a ':' can only ever appear here, and
+       checking it first keeps the plain-digit-run count below from ever
+       having to special-case it. */
+    if (isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) && p[2] == ':' &&
+       isdigit((unsigned char)p[3]) && isdigit((unsigned char)p[4])) {
+        *hh_out = (p[0] - '0') * 10 + (p[1] - '0');
+        *mm_out = (p[3] - '0') * 10 + (p[4] - '0');
+        *len_out = (size_t)(p - s) + 5;
+        return 0;
+    }
+
+    ndigits = 0;
+    while (isdigit((unsigned char)p[ndigits]))
+        ndigits++;
+    if (ndigits == 2 && has_sign) {
+        *hh_out = (p[0] - '0') * 10 + (p[1] - '0');
+        *mm_out = 0;
+        *len_out = (size_t)(p - s) + 2;
+        return 0;
+    }
+    if (ndigits == 4) {
+        *hh_out = (p[0] - '0') * 10 + (p[1] - '0');
+        *mm_out = (p[2] - '0') * 10 + (p[3] - '0');
+        *len_out = (size_t)(p - s) + 4;
+        return 0;
+    }
+    return -1;
+}
+
+/* The bare/calendar-form POLICY on a shape-matched token: range-checked
+   (HH <= 23, MM <= 59), an out-of-range match reported via *out_of_range
+   so the caller can discard it for local rather than treating it as "did
+   not match at all". `len_out` receives the consumed length so a caller
+   that requires the token to be the LAST thing in the string (every
+   calendar form) can check that; a caller that tolerates trailing junk
+   after a successfully-applied token (the bare epoch form) is free to
+   ignore it. */
+static int match_offset_token(const char *s, long *offset_out, int *out_of_range,
+                              size_t *len_out)
+{
+    int negative, hh, mm;
 
     *out_of_range = 0;
-    if ((s[0] != '+' && s[0] != '-') || !isdigit((unsigned char)s[1]) ||
-       !isdigit((unsigned char)s[2]) || !isdigit((unsigned char)s[3]) ||
-       !isdigit((unsigned char)s[4]))
+    if (match_offset_shape(s, &negative, &hh, &mm, len_out) != 0)
         return -1;
-    hh = (s[1] - '0') * 10 + (s[2] - '0');
-    mm = (s[3] - '0') * 10 + (s[4] - '0');
     if (hh > 23 || mm > 59) {
         *out_of_range = 1;
         return -1;
     }
-    *offset_out = (hh * 3600 + mm * 60) * (s[0] == '-' ? -1 : 1);
+    *offset_out = (hh * 3600 + mm * 60) * (negative ? -1 : 1);
     return 0;
-}
-
-/* Same shape, but also accepts a colon after the first two offset digits
-   ("+08:00"), for ISO-8601 strict. `len_out` receives how many bytes of
-   `s` the token consumed (5 or 6), so the caller can check nothing else
-   follows.
-
-   Round 5: this used to take an `out_of_range` out-parameter and pass it
-   straight through to the nested match_offset_token calls, but its only
-   caller (try_iso_t) never inspected it -- it treated ANY failure
-   (malformed shape or numerically out of range) as fatal, unconditionally.
-   That mismatch between what this function computed and what the caller
-   consulted is exactly what let try_iso_t drift from try_iso_space/
-   try_rfc2822 (which DID inspect it, to fall back to local on an
-   out-of-range offset) into being the odd one out -- see try_iso_t's own
-   comment. Now that ALL THREE calendar forms reject outright on a
-   shape-valid-but-out-of-range offset (the round-5 decision), the
-   distinction this parameter existed to carry is gone; dropped rather than
-   left in place computing something nobody reads, which is what "the code
-   should not lie about what it computes" means here. A local, unread
-   out-parameter is still needed for the nested match_offset_token calls
-   themselves (that function's own signature is unchanged, since its OTHER
-   callers -- try_epoch's bare-form branch -- still rely on the
-   distinction), so this function just discards it into a throwaway. */
-static int match_offset_token_colon(const char *s, long *offset_out, size_t *len_out)
-{
-    char compact[6];
-    int discard_out_of_range;
-
-    if (s[0] != '\0' && (s[0] == '+' || s[0] == '-') && isdigit((unsigned char)s[1]) &&
-       isdigit((unsigned char)s[2]) && s[3] == ':' && isdigit((unsigned char)s[4]) &&
-       isdigit((unsigned char)s[5])) {
-        compact[0] = s[0];
-        compact[1] = s[1];
-        compact[2] = s[2];
-        compact[3] = s[4];
-        compact[4] = s[5];
-        compact[5] = '\0';
-        if (match_offset_token(compact, offset_out, &discard_out_of_range) != 0)
-            return -1;
-        *len_out = 6;
-        return 0;
-    }
-    if (match_offset_token(s, offset_out, &discard_out_of_range) == 0) {
-        *len_out = 5;
-        return 0;
-    }
-    return -1;
 }
 
 /* Renders an offset that has already been reduced to (sign, total minutes)
@@ -160,40 +189,25 @@ static void format_offset_normalized(int negative, long total_minutes, char out[
     snprintf(out, 8, "%c%02ld%02ld", negative ? '-' : '+', hh, mm);
 }
 
-/* SPEC-CORRECTION.md's "@ form only" offset grammar: an OPTIONAL sign,
-   followed by EXACTLY 4 digits, or by "HH:MM" (2 digits, colon, 2 digits).
-   Unlike match_offset_token, the numeric value is never range-checked here
-   -- matching the shape at all is enough for git to treat it as an
-   explicit offset and normalize it arithmetically; "+9999" is just as much
-   a valid TOKEN as "+0800", it renders differently, not "invalidly".
-   Returns 0 and fills *negative and *total_minutes (HH times 60 plus MM, unreduced -- the
-   caller re-derives HH/MM from the sum) on a shape match, -1 otherwise. */
+/* The `@` form's POLICY on a shape-matched token: no range check at all --
+   matching the shape is enough for git to treat it as an explicit offset
+   and normalize it arithmetically; "+9999" is just as much a valid TOKEN
+   as "+0800", it renders differently, not "invalidly". Returns 0 and
+   fills *negative and *total_minutes (HH times 60 plus MM, unreduced --
+   the caller re-derives HH/MM from the sum) on a shape match, -1
+   otherwise. Unlike match_offset_token, trailing content past the token is
+   never tolerated here -- every call site needs the token to be the whole
+   remaining string, so this checks `len_out` against the actual length
+   itself rather than handing it back. */
 static int match_offset_shape_loose(const char *s, int *negative, long *total_minutes)
 {
-    const char *p = s;
     int hh, mm;
+    size_t len;
 
-    *negative = 0;
-    if (*p == '+') {
-        p++;
-    } else if (*p == '-') {
-        *negative = 1;
-        p++;
-    }
-
-    if (isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) && p[2] == ':' &&
-       isdigit((unsigned char)p[3]) && isdigit((unsigned char)p[4]) && p[5] == '\0') {
-        hh = (p[0] - '0') * 10 + (p[1] - '0');
-        mm = (p[3] - '0') * 10 + (p[4] - '0');
-    } else if (isdigit((unsigned char)p[0]) && isdigit((unsigned char)p[1]) &&
-              isdigit((unsigned char)p[2]) && isdigit((unsigned char)p[3]) && p[4] == '\0') {
-        int v = (p[0] - '0') * 1000 + (p[1] - '0') * 100 + (p[2] - '0') * 10 + (p[3] - '0');
-
-        hh = v / 100;
-        mm = v % 100;
-    } else {
+    if (match_offset_shape(s, negative, &hh, &mm, &len) != 0)
         return -1;
-    }
+    if (s[len] != '\0')
+        return -1;
     *total_minutes = (long)hh * 60 + mm;
     return 0;
 }
@@ -241,50 +255,65 @@ static int try_epoch(const char *s, long long *time_out, char tz_out[8])
         return -1;
 
     if (*p != '\0') {
-        if (isspace((unsigned char)*p)) {
-            const char *tail = p;
-            int token_recognized = 0;
+        int had_space = isspace((unsigned char)*p);
+        const char *tail = p;
+        int shape_matched = 0;
+        size_t token_len;
 
-            while (isspace((unsigned char)*tail))
-                tail++;
-            if (*tail != '\0') {
-                if (has_at) {
-                    if (match_offset_shape_loose(tail, &at_negative, &at_total_minutes) == 0) {
-                        at_form_offset_applies = 1;
-                        token_recognized = 1;
-                    }
-                } else if (match_offset_token(tail, &offset, &out_of_range) == 0) {
-                    bare_offset_applies = 1;
-                    bare_offset_seconds = offset;
-                    token_recognized = 1;
-                }
-                if (!token_recognized) {
-                    /* Not a recognized offset (whether malformed, or -- bare
-                       form only -- numerically out of range) -- tolerate it
-                       as junk PROVIDED it is a single token; a second
-                       space-separated token past it (git's own relative-date
-                       phrases: "2 hours ago") is not junk this parser
-                       tolerates, it is a parse failure. */
-                    const char *scan = tail;
+        while (isspace((unsigned char)*tail))
+            tail++;
 
-                    while (*scan != '\0' && !isspace((unsigned char)*scan))
-                        scan++;
-                    while (isspace((unsigned char)*scan))
-                        scan++;
-                    if (*scan != '\0')
-                        return -1;
-                }
+        /* Round 6 (SPEC-CORRECTION-2.md): whitespace before the offset is
+           NOT required for it to be RECOGNIZED -- "1700000000+0800" (no
+           space at all) is PARSED by git, not merely tolerated-and-
+           discarded the way an earlier round of this same phase believed
+           (measured on a +0800 machine, where "parsed +0800" and "fell
+           back to local +0800" render identically and so could not be
+           told apart). Whitespace's only remaining role is deciding what
+           happens when the trailing content does NOT match the offset
+           grammar SHAPE at all: WITH a space, unrecognized content is
+           tolerated as junk (a single token; "@1700000000 x"); WITHOUT
+           one, it is a hard parse failure ("2023-11-15", where the
+           attached "-11-15" never matches any offset shape either, before
+           or after this round). A SHAPE-VALID but numerically
+           out-of-range bare-form token (out_of_range == 1) is a THIRD
+           case, unconditionally tolerated regardless of whitespace -- this
+           was already the pre-round-6 rule for the attached form
+           ("1700000000+9999"-shaped input) and stays that way; only a
+           genuine shape mismatch is newly affected by `had_space`. */
+        if (*tail != '\0') {
+            if (has_at) {
+                shape_matched =
+                    (match_offset_shape_loose(tail, &at_negative, &at_total_minutes) == 0);
+                if (shape_matched)
+                    at_form_offset_applies = 1;
+            } else if (match_offset_token(tail, &offset, &out_of_range, &token_len) == 0) {
+                shape_matched = 1;
+                bare_offset_applies = 1;
+                bare_offset_seconds = offset;
+            } else if (out_of_range) {
+                shape_matched = 1;
             }
-        } else {
-            /* No whitespace at all: tolerated only when what follows looks
-               exactly like an attached (but, for want of the required
-               space, unapplied) BARE-shaped offset -- this is what
-               separates "1700000000+0800" (accepted, local) from
-               "2023-11-15" (rejected). Untouched by this correction: no
-               measured shape exercises an attached, unspaced offset on the
-               `@` form, so this stays bare-only exactly as before. */
-            if (match_offset_token(p, &offset, &out_of_range) != 0 && !out_of_range)
+        }
+
+        if (*tail != '\0' && !shape_matched) {
+            if (!had_space)
                 return -1;
+            /* Preceded by whitespace: tolerate a single token of junk
+               ("@1700000000 x"), but not a second space-separated token
+               past it -- git's own relative-date phrases ("2 hours ago")
+               are not junk this parser tolerates, they are a parse
+               failure. */
+            {
+                const char *scan = tail;
+
+                while (*scan != '\0' && !isspace((unsigned char)*scan))
+                    scan++;
+                while (isspace((unsigned char)*scan))
+                    scan++;
+                if (*scan != '\0')
+                    return -1;
+            }
         }
     }
 
@@ -408,25 +437,31 @@ static int calendar_to_epoch(int year, int mon0, int day, int hh, int mi, int ss
     return 0;
 }
 
-/* "YYYY-MM-DDTHH:MM:SS[+-]HH:MM" -- ISO 8601 strict.
+/* "YYYY-MM-DDTHH:MM:SS[+-]HH:MM" -- ISO 8601 strict. Shares
+   match_offset_token with its two siblings as of round 6 (it used to have
+   its own match_offset_token_colon wrapper, needed only because
+   match_offset_token was hardcoded to the old 5-byte sign+4-digit shape;
+   the unified match_offset_shape underneath handles the colon shape for
+   every caller now, so the wrapper is gone).
 
    Round 5: a shape-valid but numerically out-of-range offset (e.g.
    "+99:00") is REFUSED outright, not discarded for local -- see the
    decision recorded at try_iso_space's own comment, which all three
    calendar forms now share uniformly. This function already refused such
-   an offset before this round, by accident (match_offset_token_colon's
-   own out_of_range result was computed but never consulted here); it is
-   now refused on purpose, and looks identical to its two siblings. */
+   an offset before round 5, by accident (the out_of_range result was
+   computed but never consulted here); it is refused on purpose now, and
+   looks identical to its two siblings. */
 static int try_iso_t(const char *s, long long *time_out, char tz_out[8])
 {
     int year, mon, day, hh, mi, ss;
     int n = 0;
     long offset;
+    int out_of_range;
     size_t tzlen;
 
     if (sscanf(s, "%4d-%2d-%2dT%2d:%2d:%2d%n", &year, &mon, &day, &hh, &mi, &ss, &n) != 6)
         return -1;
-    if (match_offset_token_colon(s + n, &offset, &tzlen) != 0)
+    if (match_offset_token(s + n, &offset, &out_of_range, &tzlen) != 0)
         return -1;
     if (s[(size_t)n + tzlen] != '\0')
         return -1;
@@ -466,6 +501,7 @@ static int try_iso_space(const char *s, long long *time_out, char tz_out[8])
     int n = 0;
     long offset;
     int out_of_range;
+    size_t token_len;
     const char *p;
 
     if (sscanf(s, "%4d-%2d-%2d %2d:%2d:%2d%n", &year, &mon, &day, &hh, &mi, &ss, &n) != 6)
@@ -473,9 +509,9 @@ static int try_iso_space(const char *s, long long *time_out, char tz_out[8])
     p = s + n;
     while (isspace((unsigned char)*p))
         p++;
-    if (match_offset_token(p, &offset, &out_of_range) != 0)
+    if (match_offset_token(p, &offset, &out_of_range, &token_len) != 0)
         return -1;
-    if (p[5] != '\0')
+    if (p[token_len] != '\0')
         return -1;
     if (calendar_to_epoch(year, mon - 1, day, hh, mi, ss, offset, time_out) != 0)
         return -1;
@@ -498,6 +534,7 @@ static int try_rfc2822(const char *s, long long *time_out, char tz_out[8])
     int mon, hh, mi, ss;
     long offset;
     int out_of_range;
+    size_t token_len;
     char *end;
 
     if (strlen(s) >= sizeof(buf))
@@ -551,9 +588,9 @@ static int try_rfc2822(const char *s, long long *time_out, char tz_out[8])
     tok = strtok_r(NULL, " \t", &saveptr);
     if (tok == NULL)
         return -1;
-    if (strlen(tok) != 5)
+    if (match_offset_token(tok, &offset, &out_of_range, &token_len) != 0)
         return -1;
-    if (match_offset_token(tok, &offset, &out_of_range) != 0)
+    if (strlen(tok) != token_len)
         return -1;
 
     tok = strtok_r(NULL, " \t", &saveptr);

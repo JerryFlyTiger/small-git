@@ -343,19 +343,22 @@ static void test_2_3_correction_deliberately_rejected(void)
 }
 
 /* Section 2.4: whitespace and trailing-junk tolerance, reproduced exactly
-   from the measured rows -- the distinction between "1700000000+0800"
-   (accepted, local: the attached content looks like an offset, but is not
-   applied for want of the required space) and "2023-11-15" (rejected: the
-   attached content does not look like an offset at all) is the one that
-   most easily regresses. */
+   from the measured rows. This project's earlier belief that
+   "1700000000+0800" (no space) falls back to LOCAL, discarding the
+   attached offset "for want of the required space", was ITSELF an
+   artifact of measuring on a +0800 machine (round 6,
+   SPEC-CORRECTION-2.md): "parsed +0800" and "fell back to local +0800"
+   render identically there, so the two were indistinguishable. Measured
+   properly under both TZ=UTC and TZ=Asia/Kolkata: git PARSES the attached
+   offset with no space at all -- whitespace is not required for
+   RECOGNITION, only for deciding what happens when the trailing content
+   does NOT match the offset grammar (see test_round6_offset_grammar
+   below, which is where this correction's own new rows live). The
+   remaining distinction this test file guards is "2023-11-15" (rejected:
+   the attached "-11-15" does not look like an offset at ALL, under either
+   round's rule). */
 static void test_2_4_whitespace_and_trailing_junk(void)
 {
-    /* "does the attached content get echoed verbatim" needs a TZ that is
-       NOT +0800, otherwise a machine whose local zone happens to BE +0800
-       (this project's own dev machine, CLAUDE.md's own
-       local-git-is-zh-tw-localized note) makes the discarded-offset
-       assertion pass by coincidence instead of by the parser actually
-       discarding it. */
     const char *old_tz = getenv("TZ");
     char *saved_tz = old_tz != NULL ? strdup(old_tz) : NULL;
 
@@ -365,8 +368,71 @@ static void test_2_4_whitespace_and_trailing_junk(void)
     expect_ok("1700000000  +0800", 1700000000, "+0800");
     expect_ok("  1700000000 +0800  ", 1700000000, "+0800");
     expect_ok("1700000000 +0800 x", 1700000000, "+0800");
-    expect_ok_local_time("1700000000+0800", 1700000000, "+0800");
+    expect_ok("1700000000+0800", 1700000000, "+0800");
     expect_ok_local_time("@1700000000 x", 1700000000, NULL);
+
+    if (saved_tz != NULL) {
+        setenv("TZ", saved_tz, 1);
+        free(saved_tz);
+    } else {
+        unsetenv("TZ");
+    }
+    tzset();
+}
+
+/* Round 6 (SPEC-CORRECTION-2.md): the corrected offset-token grammar,
+   shared by every caller in the file. Every row is checked under BOTH
+   TZ=UTC and TZ=Asia/Kolkata (+0530, equal to no offset value tested
+   anywhere in this phase) -- a PARSED answer must be identical under both
+   zones; a LOCAL-fallback answer must TRACK the zone. This is the same
+   discipline SPEC-CORRECTION-2.md itself used to find the bug: every
+   earlier table in this phase was measured on a single +0800 machine,
+   where "parsed +0800" and "fell back to local +0800" are
+   indistinguishable, and half of the earlier grammar rows recorded the
+   wrong rule as a result. */
+static void test_round6_offset_grammar(void)
+{
+    const char *old_tz = getenv("TZ");
+    char *saved_tz = old_tz != NULL ? strdup(old_tz) : NULL;
+
+    /* Recognized shapes -- must be IDENTICAL under both zones (parsed,
+       not local). */
+    setenv("TZ", "UTC", 1);
+    tzset();
+    expect_ok("1700000000 +08", 1700000000, "+0800"); /* sign + 2 digits */
+    expect_ok("1700000000 0800", 1700000000, "+0800"); /* unsigned 4 digits */
+    expect_ok("1700000000+0800", 1700000000, "+0800"); /* attached, signed 4 digits */
+    expect_ok("@1700000000 +08", 1700000000, "+0800"); /* @ form, sign + 2 digits */
+    expect_ok("2023-11-15 06:13:20 +08", 1700000000, "+0800"); /* calendar form */
+    expect_ok("2023-11-15 06:13:20 0800", 1700000000, "+0800");
+    expect_ok("Wed, 15 Nov 2023 06:13:20 +08", 1700000000, "+0800");
+    expect_ok("Wed, 15 Nov 2023 06:13:20 0800", 1700000000, "+0800");
+
+    setenv("TZ", "Asia/Kolkata", 1);
+    tzset();
+    expect_ok("1700000000 +08", 1700000000, "+0800");
+    expect_ok("1700000000 0800", 1700000000, "+0800");
+    expect_ok("1700000000+0800", 1700000000, "+0800");
+    expect_ok("@1700000000 +08", 1700000000, "+0800");
+    expect_ok("2023-11-15 06:13:20 +08", 1700000000, "+0800");
+    expect_ok("2023-11-15 06:13:20 0800", 1700000000, "+0800");
+    expect_ok("Wed, 15 Nov 2023 06:13:20 +08", 1700000000, "+0800");
+    expect_ok("Wed, 15 Nov 2023 06:13:20 0800", 1700000000, "+0800");
+
+    /* NOT tokens -- must TRACK the zone (local fallback) under both. */
+    setenv("TZ", "UTC", 1);
+    tzset();
+    expect_ok("1700000000 +08000", 1700000000, "+0000"); /* 5 digits */
+    expect_ok("1700000000 +080", 1700000000, "+0000"); /* 3 digits */
+    expect_ok("1700000000 08", 1700000000, "+0000"); /* 2 digits, no sign */
+    expect_ok("1700000000 +8", 1700000000, "+0000"); /* 1 digit */
+
+    setenv("TZ", "Asia/Kolkata", 1);
+    tzset();
+    expect_ok("1700000000 +08000", 1700000000, "+0530");
+    expect_ok("1700000000 +080", 1700000000, "+0530");
+    expect_ok("1700000000 08", 1700000000, "+0530");
+    expect_ok("1700000000 +8", 1700000000, "+0530");
 
     if (saved_tz != NULL) {
         setenv("TZ", saved_tz, 1);
@@ -464,6 +530,7 @@ int main(void)
     test_round5_leap_second_boundary();
     test_2_3_correction_deliberately_rejected();
     test_2_4_whitespace_and_trailing_junk();
+    test_round6_offset_grammar();
     test_local_offset_is_the_instants();
     test_author_committer_independent_fallback();
     test_invalid_date_reports_bad_value();
