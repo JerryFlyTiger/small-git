@@ -2,6 +2,7 @@
 
 #include "sg/apply.h"
 #include "sg/hash.h"
+#include "sg/ident.h"
 #include "sg/index.h"
 #include "sg/loose.h"
 #include "sg/merge.h"
@@ -20,18 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-/* Ninth byte-for-byte copy of this helper (CLAUDE.md's known-duplication
-   list already had eight: reflog.c, chunk.c, safety/stash.c, snapshot.c,
-   cmd_rebase.c, cmd_merge.c, cmd_tag.c, cmd_commit.c). Kept local rather
-   than shared, same call as those eight -- see the CLAUDE.md edit that
-   accompanies this phase. */
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 static const char *op_name(sg_seq_kind kind)
 {
@@ -398,8 +387,29 @@ static attempt_rc attempt_one(const char *git_dir, const char *repo_root, sg_seq
             sg_commit new_commit;
             unsigned char *serialized;
             size_t serialized_len;
-            const char *committer_name = env_or("GIT_AUTHOR_NAME", "small_git");
-            const char *committer_email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+            sg_ident committer_ident;
+            sg_ident author_ident;
+            const char *bad = NULL;
+
+            /* Every new object this function writes needs a resolved
+               COMMITTER identity -- cherry-pick's own author is the one
+               exception (it forwards the picked commit's, byte for byte,
+               a documented rule), revert's author is a freshly resolved
+               AUTHOR identity like any other newly-authored commit (Phase
+               72: this used to reuse the *_AUTHOR_* env vars under the
+               misleading local name "committer_name/_email", which is
+               exactly defect C -- a revert's committer line must come from
+               GIT_COMMITTER_*, not GIT_AUTHOR_*). */
+            if (sg_ident_committer(&committer_ident, &bad) != 0) {
+                fprintf(stderr, "sg: invalid date format: %s\n", bad);
+                rc = ATTEMPT_ERROR;
+                goto done;
+            }
+            if (kind != SG_SEQ_CHERRY_PICK && sg_ident_author(&author_ident, &bad) != 0) {
+                fprintf(stderr, "sg: invalid date format: %s\n", bad);
+                rc = ATTEMPT_ERROR;
+                goto done;
+            }
 
             memset(&new_commit, 0, sizeof(new_commit));
             memcpy(new_commit.tree, merged_tree, SG_SHA1_RAW_LEN);
@@ -418,15 +428,15 @@ static attempt_rc attempt_one(const char *git_dir, const char *repo_root, sg_seq
                 new_commit.author_time = commit.author_time;
                 memcpy(new_commit.author_tz, commit.author_tz, sizeof(new_commit.author_tz));
             } else {
-                new_commit.author_name = (char *)committer_name;
-                new_commit.author_email = (char *)committer_email;
-                new_commit.author_time = (long long)time(NULL);
-                strcpy(new_commit.author_tz, "+0000");
+                new_commit.author_name = author_ident.name;
+                new_commit.author_email = author_ident.email;
+                new_commit.author_time = author_ident.when;
+                strcpy(new_commit.author_tz, author_ident.tz);
             }
-            new_commit.committer_name = (char *)committer_name;
-            new_commit.committer_email = (char *)committer_email;
-            new_commit.committer_time = (long long)time(NULL);
-            strcpy(new_commit.committer_tz, "+0000");
+            new_commit.committer_name = committer_ident.name;
+            new_commit.committer_email = committer_ident.email;
+            new_commit.committer_time = committer_ident.when;
+            strcpy(new_commit.committer_tz, committer_ident.tz);
             new_commit.message = out->message;
 
             if (sg_commit_serialize(&new_commit, &serialized, &serialized_len) != 0) {
@@ -892,9 +902,27 @@ int sg_pick_continue(const char *git_dir, const char *repo_root, sg_seq_kind kin
         unsigned char *serialized;
         size_t serialized_len;
         unsigned char new_commit_id[SG_SHA1_RAW_LEN];
-        const char *committer_name = env_or("GIT_AUTHOR_NAME", "small_git");
-        const char *committer_email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+        sg_ident committer_ident;
+        sg_ident author_ident;
+        const char *bad = NULL;
         char *reflog_msg;
+
+        if (sg_ident_committer(&committer_ident, &bad) != 0) {
+            fprintf(stderr, "sg: invalid date format: %s\n", bad);
+            free(current_branch);
+            free(message);
+            sg_commit_free(&orig_commit);
+            sg_sequencer_state_free(&state);
+            return 1;
+        }
+        if (kind != SG_SEQ_CHERRY_PICK && sg_ident_author(&author_ident, &bad) != 0) {
+            fprintf(stderr, "sg: invalid date format: %s\n", bad);
+            free(current_branch);
+            free(message);
+            sg_commit_free(&orig_commit);
+            sg_sequencer_state_free(&state);
+            return 1;
+        }
 
         memset(&new_commit, 0, sizeof(new_commit));
         memcpy(new_commit.tree, tree_id, SG_SHA1_RAW_LEN);
@@ -916,15 +944,15 @@ int sg_pick_continue(const char *git_dir, const char *repo_root, sg_seq_kind kin
             new_commit.author_time = orig_commit.author_time;
             memcpy(new_commit.author_tz, orig_commit.author_tz, sizeof(new_commit.author_tz));
         } else {
-            new_commit.author_name = (char *)committer_name;
-            new_commit.author_email = (char *)committer_email;
-            new_commit.author_time = (long long)time(NULL);
-            strcpy(new_commit.author_tz, "+0000");
+            new_commit.author_name = author_ident.name;
+            new_commit.author_email = author_ident.email;
+            new_commit.author_time = author_ident.when;
+            strcpy(new_commit.author_tz, author_ident.tz);
         }
-        new_commit.committer_name = (char *)committer_name;
-        new_commit.committer_email = (char *)committer_email;
-        new_commit.committer_time = (long long)time(NULL);
-        strcpy(new_commit.committer_tz, "+0000");
+        new_commit.committer_name = committer_ident.name;
+        new_commit.committer_email = committer_ident.email;
+        new_commit.committer_time = committer_ident.when;
+        strcpy(new_commit.committer_tz, committer_ident.tz);
         new_commit.message = message;
 
         if (sg_commit_serialize(&new_commit, &serialized, &serialized_len) != 0) {

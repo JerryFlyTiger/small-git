@@ -320,6 +320,11 @@ static int local_offset_at(long long time_sec, long *offset_out,
     return 0;
 }
 
+int sg_date_local_offset_seconds(long long time_sec, long *offset_out)
+{
+    return local_offset_at(time_sec, offset_out, NULL, 0);
+}
+
 /* SG_DATE_DEFAULT with `local` set: same shape as sg_date_format_normal,
    but the offset field is omitted entirely -- the one shape none of the
    five original renderers can produce (they all always print a tz). */

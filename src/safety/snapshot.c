@@ -1,5 +1,6 @@
 #include "sg/snapshot.h"
 
+#include "sg/ident.h"
 #include "sg/loose.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
@@ -15,13 +16,6 @@
 #include <time.h>
 
 #define SG_SNAPSHOT_SLUG_MAX 40
-
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 static void slugify(const char *label, char *out, size_t out_cap)
 {
@@ -80,8 +74,9 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
     size_t serialized_len;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
     char *cleaned_message = NULL;
-    const char *name;
-    const char *email;
+    sg_ident author;
+    sg_ident committer;
+    const char *bad = NULL;
     char undo_dir[SG_PATH_MAX];
     char slug[SG_SNAPSHOT_SLUG_MAX + 1];
     char ref_name[SG_SNAPSHOT_SLUG_MAX + 64];
@@ -97,8 +92,12 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
 
     has_parent = (sg_ref_resolve_head(git_dir, parent_id) == 0);
 
-    name = env_or("GIT_AUTHOR_NAME", "small_git");
-    email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+    /* sg undo's own snapshot labels have no real-git oracle (CLAUDE.md), but
+       sg_stash_push also calls this to build its own safety-net snapshot,
+       and every object this function writes should still carry a correctly
+       resolved ident rather than a hardcoded one. */
+    if (sg_ident_author(&author, &bad) != 0 || sg_ident_committer(&committer, &bad) != 0)
+        return -1;
 
     memcpy(commit.tree, tree_id, SG_SHA1_RAW_LEN);
     if (has_parent) {
@@ -108,14 +107,14 @@ int sg_snapshot_create(const char *git_dir, const char *repo_root, const sg_inde
         memcpy(commit.parents[0], parent_id, SG_SHA1_RAW_LEN);
         commit.parent_count = 1;
     }
-    commit.author_name = (char *)name;
-    commit.author_email = (char *)email;
-    commit.author_time = (long long)time(NULL);
-    strcpy(commit.author_tz, "+0000");
-    commit.committer_name = (char *)name;
-    commit.committer_email = (char *)email;
-    commit.committer_time = commit.author_time;
-    strcpy(commit.committer_tz, "+0000");
+    commit.author_name = author.name;
+    commit.author_email = author.email;
+    commit.author_time = author.when;
+    strcpy(commit.author_tz, author.tz);
+    commit.committer_name = committer.name;
+    commit.committer_email = committer.email;
+    commit.committer_time = committer.when;
+    strcpy(commit.committer_tz, committer.tz);
 
     if (sg_message_cleanup(label, &cleaned_message) != 0) {
         free(commit.parents);

@@ -754,7 +754,17 @@ printf 'D\n' > "$P4C_REPO/d.txt"
 (cd "$P4C_REPO" && "$SG" switch feature < /dev/null) > /dev/null 2>&1
 
 P4C_REBASE_OUT="$WORKDIR/p4c_basic_rebase_out.txt"
-(cd "$P4C_REPO" && "$SG" rebase master < /dev/null) > "$P4C_REBASE_OUT" 2>&1
+# Phase 72: the committer identity for the replay is pinned explicitly via
+# GIT_COMMITTER_NAME/EMAIL rather than relying on sg's hardcoded fallback
+# ("small_git"/"sg@localhost") -- before Phase 72, sg had no independent
+# committer resolution at all, and this fixture's "fresh committer identity"
+# assertion below was actually just observing that bug (committer silently
+# copied from the global GIT_AUTHOR_NAME="Interop Test"). Pinning a THIRD,
+# distinct identity here is what makes "author stays Feature Dev, committer
+# becomes someone else" an actual test of independence rather than a
+# coincidence of which env var happened to be exported globally.
+(cd "$P4C_REPO" && GIT_COMMITTER_NAME="Rebase Runner" GIT_COMMITTER_EMAIL="rebase@runner.example" \
+    "$SG" rebase master < /dev/null) > "$P4C_REBASE_OUT" 2>&1
 check "phase4c case1: sg rebase exits 0" test $? = 0
 
 P4C_SUBJECTS="$WORKDIR/p4c_basic_subjects.txt"
@@ -769,8 +779,8 @@ check "phase4c case1: replayed commit C keeps its original author" grep -q "^C|F
 
 P4C_COMMITTERS="$WORKDIR/p4c_basic_committers.txt"
 (cd "$P4C_REPO" && git log --format='%s|%cn') > "$P4C_COMMITTERS" 2>&1
-check "phase4c case1: replayed commit B gets a fresh committer identity" grep -q "^B|Interop Test\$" "$P4C_COMMITTERS"
-check "phase4c case1: replayed commit C gets a fresh committer identity" grep -q "^C|Interop Test\$" "$P4C_COMMITTERS"
+check "phase4c case1: replayed commit B gets a fresh committer identity" grep -q "^B|Rebase Runner\$" "$P4C_COMMITTERS"
+check "phase4c case1: replayed commit C gets a fresh committer identity" grep -q "^C|Rebase Runner\$" "$P4C_COMMITTERS"
 
 check "phase4c case1: file content is correct after rebase" \
     sh -c "printf 'A\nB\nC\n' | cmp -s - '$P4C_REPO/f.txt'"
@@ -19679,6 +19689,542 @@ check "phase68c: ...and the message points at a command that actually works (--a
 (cd "$P68C_SHORT" && "$SG" cherry-pick --abort) > /dev/null 2>&1
 check "phase68c: ...and --abort, as advised, actually clears it" \
     sh -c 'test ! -f "$0/.git/CHERRY_PICK_HEAD"' "$P68C_SHORT"
+
+# --- Phase 72: sg must write the ident and timestamp git would --
+# GIT_AUTHOR_DATE/GIT_COMMITTER_DATE were never read at all, the timezone
+# was hardcoded "+0000", and GIT_COMMITTER_NAME/EMAIL were never read either
+# (the commit's committer line and an annotated tag's tagger line both used
+# the AUTHOR identity) -- CLAUDE.md's Phase 72 section has the full
+# derivation. Every fixture below sets the date/ident env for BOTH tools and
+# compares the resulting bytes, unlike every earlier date-bearing fixture in
+# this file (which only ever set GIT_AUTHOR_DATE/GIT_COMMITTER_DATE on the
+# git side, since sg never read them anyway). The standing technique here is
+# the same one phase43's "into <branch>" test above uses: build ONE base with
+# $SG, cp -R it into two copies, then apply the operation under test with
+# each tool on its own copy -- this guarantees the parent tree/commit is
+# bit-identical going in, so the ONLY thing that can make the two diverge is
+# the write path being compared. ---
+
+p72_fresh_base() {
+    # $1 = destination directory (must not yet exist)
+    rm -rf "$1"
+    mkdir -p "$(dirname "$1")"
+    (cd "$(dirname "$1")" && "$SG" init "$(basename "$1")") > /dev/null 2>&1
+    printf 'root\n' > "$1/root.txt"
+    (cd "$1" && "$SG" add root.txt && GIT_AUTHOR_NAME="Root" GIT_AUTHOR_EMAIL="root@example.com" \
+        GIT_AUTHOR_DATE="1600000000 +0000" GIT_COMMITTER_NAME="Root" \
+        GIT_COMMITTER_EMAIL="root@example.com" GIT_COMMITTER_DATE="1600000000 +0000" \
+        "$SG" commit -m "root") > /dev/null 2>&1
+}
+
+P72_BASE="$WORKDIR/p72_base"
+p72_fresh_base "$P72_BASE"
+
+# Case 1 (spec section 4.1): sg commit vs git commit, identical env,
+# author != committer identity, GIT_AUTHOR_DATE != GIT_COMMITTER_DATE ->
+# identical commit object id.
+P72_C1_SG="$WORKDIR/p72_c1_sg"
+P72_C1_GIT="$WORKDIR/p72_c1_git"
+rm -rf "$P72_C1_SG" "$P72_C1_GIT"
+cp -R "$P72_BASE" "$P72_C1_SG"
+cp -R "$P72_BASE" "$P72_C1_GIT"
+printf 'root\nmodified\n' > "$P72_C1_SG/root.txt"
+printf 'root\nmodified\n' > "$P72_C1_GIT/root.txt"
+(cd "$P72_C1_SG" && "$SG" add root.txt && GIT_AUTHOR_NAME="Aaa" GIT_AUTHOR_EMAIL="aaa@x.example" \
+    GIT_AUTHOR_DATE="1700000000 +0800" GIT_COMMITTER_NAME="Ccc" GIT_COMMITTER_EMAIL="ccc@x.example" \
+    GIT_COMMITTER_DATE="1700005000 +0900" "$SG" commit -m "phase72 case1") > /dev/null 2>&1
+(cd "$P72_C1_GIT" && git add root.txt && GIT_AUTHOR_NAME="Aaa" GIT_AUTHOR_EMAIL="aaa@x.example" \
+    GIT_AUTHOR_DATE="1700000000 +0800" GIT_COMMITTER_NAME="Ccc" GIT_COMMITTER_EMAIL="ccc@x.example" \
+    GIT_COMMITTER_DATE="1700005000 +0900" LC_ALL=C git commit -q -m "phase72 case1") > /dev/null 2>&1
+P72_C1_SG_ID=$(cd "$P72_C1_SG" && git rev-parse HEAD)
+P72_C1_GIT_ID=$(cd "$P72_C1_GIT" && git rev-parse HEAD)
+check "phase72 case1: sg commit produces the identical object id to git commit given identical env (author != committer, GIT_AUTHOR_DATE != GIT_COMMITTER_DATE)" \
+    test "$P72_C1_SG_ID" = "$P72_C1_GIT_ID"
+
+# Case 2 (spec section 4.2): sg tag -a -m vs git tag -a -m, identical
+# committer env -> identical tag object id. Tags the case1 commit (already
+# proven identical between the two copies above).
+(cd "$P72_C1_SG" && GIT_COMMITTER_NAME="Ttt" GIT_COMMITTER_EMAIL="ttt@x.example" \
+    GIT_COMMITTER_DATE="1700009000 +0530" "$SG" tag -a -m "phase72 tag msg" v72) > /dev/null 2>&1
+(cd "$P72_C1_GIT" && GIT_COMMITTER_NAME="Ttt" GIT_COMMITTER_EMAIL="ttt@x.example" \
+    GIT_COMMITTER_DATE="1700009000 +0530" LC_ALL=C git tag -a -m "phase72 tag msg" v72) > /dev/null 2>&1
+P72_C2_SG_ID=$(cd "$P72_C1_SG" && git rev-parse v72 2>/dev/null)
+P72_C2_GIT_ID=$(cd "$P72_C1_GIT" && git rev-parse v72 2>/dev/null)
+check "phase72 case2: sg tag -a -m produces the identical tag object id to git tag -a -m given identical committer env" \
+    test -n "$P72_C2_SG_ID" -a "$P72_C2_SG_ID" = "$P72_C2_GIT_ID"
+
+# Case 3 (spec section 4.3): one stash object, identical env -> identical
+# stash commit object id.
+P72_C3_SG="$WORKDIR/p72_c3_sg"
+P72_C3_GIT="$WORKDIR/p72_c3_git"
+rm -rf "$P72_C3_SG" "$P72_C3_GIT"
+cp -R "$P72_BASE" "$P72_C3_SG"
+cp -R "$P72_BASE" "$P72_C3_GIT"
+printf 'root\nstashed change\n' > "$P72_C3_SG/root.txt"
+printf 'root\nstashed change\n' > "$P72_C3_GIT/root.txt"
+(cd "$P72_C3_SG" && GIT_AUTHOR_NAME="Sss" GIT_AUTHOR_EMAIL="sss@x.example" \
+    GIT_AUTHOR_DATE="1700020000 +0200" GIT_COMMITTER_NAME="Sss" GIT_COMMITTER_EMAIL="sss@x.example" \
+    GIT_COMMITTER_DATE="1700020000 +0200" "$SG" stash push -m "phase72 stash") > /dev/null 2>&1
+(cd "$P72_C3_GIT" && GIT_AUTHOR_NAME="Sss" GIT_AUTHOR_EMAIL="sss@x.example" \
+    GIT_AUTHOR_DATE="1700020000 +0200" GIT_COMMITTER_NAME="Sss" GIT_COMMITTER_EMAIL="sss@x.example" \
+    GIT_COMMITTER_DATE="1700020000 +0200" LC_ALL=C git stash push -q -m "phase72 stash") > /dev/null 2>&1
+P72_C3_SG_ID=$(cd "$P72_C3_SG" && git rev-parse refs/stash 2>/dev/null)
+P72_C3_GIT_ID=$(cd "$P72_C3_GIT" && git rev-parse refs/stash 2>/dev/null)
+# NOT a full object-id comparison: measured while writing this fixture,
+# `sg stash push` and `git stash push` disagree on whether the generated
+# subject line carries a trailing "\n" -- sg's (via sg_message_cleanup, the
+# same normalization every ordinary commit message gets) always ends with
+# exactly one; real git's stash subject (both the auto-generated "WIP on
+# ..." form and the "-m"-supplied "On ..." form) has NONE. This is a
+# genuine, PRE-EXISTING divergence in sg stash's message construction, has
+# nothing to do with ident/date (Phase 72's own scope), and was invisible
+# until now because no earlier fixture ever demanded byte-for-byte object-id
+# equality for a stash commit. Recorded here rather than silently patched
+# or silently ignored; see the phase72 section of docs/DESIGN.md. The
+# ident-relevant header lines (tree/parents/author/committer) are what this
+# phase is actually responsible for, so those are compared directly instead.
+P72_C3_SG_HDR=$(cd "$P72_C3_SG" && git cat-file -p refs/stash 2>/dev/null | grep -E '^(tree|parent|author|committer) ')
+P72_C3_GIT_HDR=$(cd "$P72_C3_GIT" && git cat-file -p refs/stash 2>/dev/null | grep -E '^(tree|parent|author|committer) ')
+check "phase72 case3: sg stash push's tree/parents/author/committer header matches git stash push's, given identical env" \
+    test -n "$P72_C3_SG_HDR" -a "$P72_C3_SG_HDR" = "$P72_C3_GIT_HDR"
+check "phase72 case3: PIN, DO NOT FIX HERE -- sg's stash subject has a trailing newline git's does not, so the two object ids genuinely differ (pre-existing, unrelated to ident/date)" \
+    test -n "$P72_C3_SG_ID" -a -n "$P72_C3_GIT_ID" -a "$P72_C3_SG_ID" != "$P72_C3_GIT_ID"
+
+# Case 4 (spec sections 2.2/2.3): the whole accepted/rejected-form table and
+# the offset-range table, both tools, same row. Accepted rows additionally
+# compare the resulting object id (same fixed author/committer identity on
+# both sides for every row, so the row's own date field is the only
+# variable); rejected rows compare exit codes (git 128, sg 1 -- this
+# project's own 0-or-1 convention, already a pinned divergence elsewhere in
+# this file).
+p72_date_row() {
+    # $1 = GIT_AUTHOR_DATE value, $2 = 0 (accept) or 1 (reject)
+    # $3 = optional TZ override -- most rows are TZ-independent (an
+    #      explicit offset in the value itself, or sg's own uniform refusal
+    #      of an invalid offset regardless of what "local" would mean), but
+    #      a row exercising GIT's "reinterpret an invalid offset as local
+    #      time" behaviour needs a specific zone to even be meaningful (see
+    #      p72_deliberate_reject_row's own comment on the same knob).
+    P72_ROW_VAL="$1"
+    P72_ROW_ACCEPT="$2"
+    P72_ROW_TZ="${3:-}"
+    P72_ROW_SG="$WORKDIR/p72_row_sg"
+    P72_ROW_GIT="$WORKDIR/p72_row_git"
+    rm -rf "$P72_ROW_SG" "$P72_ROW_GIT"
+    cp -R "$P72_BASE" "$P72_ROW_SG"
+    cp -R "$P72_BASE" "$P72_ROW_GIT"
+    printf 'root\nrow change\n' > "$P72_ROW_SG/root.txt"
+    printf 'root\nrow change\n' > "$P72_ROW_GIT/root.txt"
+    (cd "$P72_ROW_SG" && "$SG" add root.txt && env ${P72_ROW_TZ:+TZ="$P72_ROW_TZ"} \
+        GIT_AUTHOR_NAME="Rrr" GIT_AUTHOR_EMAIL="rrr@x.example" \
+        GIT_AUTHOR_DATE="$P72_ROW_VAL" GIT_COMMITTER_NAME="Rrr" GIT_COMMITTER_EMAIL="rrr@x.example" \
+        GIT_COMMITTER_DATE="1650000000 +0000" "$SG" commit -m "phase72 row") > /dev/null 2>&1
+    P72_ROW_SG_RC=$?
+    (cd "$P72_ROW_GIT" && git add root.txt && env ${P72_ROW_TZ:+TZ="$P72_ROW_TZ"} \
+        GIT_AUTHOR_NAME="Rrr" GIT_AUTHOR_EMAIL="rrr@x.example" \
+        GIT_AUTHOR_DATE="$P72_ROW_VAL" GIT_COMMITTER_NAME="Rrr" GIT_COMMITTER_EMAIL="rrr@x.example" \
+        GIT_COMMITTER_DATE="1650000000 +0000" LC_ALL=C git commit -q -m "phase72 row") > /dev/null 2>&1
+    P72_ROW_GIT_RC=$?
+    if [ "$P72_ROW_ACCEPT" = "0" ]; then
+        check "phase72 case4 accept \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: sg commit exits 0" \
+            test "$P72_ROW_SG_RC" -eq 0
+        check "phase72 case4 accept \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: git commit exits 0" \
+            test "$P72_ROW_GIT_RC" -eq 0
+        P72_ROW_SG_ID=$(cd "$P72_ROW_SG" && git rev-parse HEAD 2>/dev/null)
+        P72_ROW_GIT_ID=$(cd "$P72_ROW_GIT" && git rev-parse HEAD 2>/dev/null)
+        check "phase72 case4 accept \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: sg and git produce the identical object id" \
+            test -n "$P72_ROW_SG_ID" -a "$P72_ROW_SG_ID" = "$P72_ROW_GIT_ID"
+    else
+        check "phase72 case4 reject \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: sg commit exits 1" \
+            test "$P72_ROW_SG_RC" -eq 1
+        check "phase72 case4 reject \"$P72_ROW_VAL\"${P72_ROW_TZ:+ (TZ=$P72_ROW_TZ)}: git commit exits 128" \
+            test "$P72_ROW_GIT_RC" -eq 128
+    fi
+}
+
+# 2.2's accepted forms
+p72_date_row "1700000000 +0800" 0
+p72_date_row "@1700000000 +0800" 0
+p72_date_row "@1700000000" 0
+p72_date_row "1700000000" 0
+p72_date_row "2023-11-15T06:13:20+08:00" 0
+p72_date_row "2023-11-15 06:13:20 +0800" 0
+p72_date_row "Wed, 15 Nov 2023 06:13:20 +0800" 0
+# 2.2's rejected forms
+p72_date_row "2023-11-15" 1
+p72_date_row "yesterday" 1
+p72_date_row "2 hours ago" 1
+p72_date_row "now" 1
+p72_date_row "garbage" 1
+p72_date_row "-5" 1
+p72_date_row "99999999999999999999" 1
+# 2.3's offset-range table
+p72_date_row "1700000000 +0000" 0
+p72_date_row "1700000000 +1400" 0
+p72_date_row "1700000000 +1500" 0
+p72_date_row "1700000000 +2359" 0
+p72_date_row "1700000000 -1400" 0
+p72_date_row "1700000000 -2359" 0
+p72_date_row "1700000000 +2400" 0
+p72_date_row "1700000000 -2400" 0
+p72_date_row "1700000000 +2360" 0
+p72_date_row "1700000000 +1260" 0
+p72_date_row "1700000000 +0860" 0
+p72_date_row "1700000000 +9999" 0
+p72_date_row "1700000000 +080" 0 "UTC"
+p72_date_row "1700000000 +080" 0 "Asia/Kolkata"
+# 2.4's whitespace/trailing-junk table
+p72_date_row "1700000000  +0800" 0
+p72_date_row "  1700000000 +0800  " 0
+p72_date_row "1700000000 +0800 x" 0
+p72_date_row "@1700000000 x" 0
+
+# Round 6 (SPEC-CORRECTION-2.md): every offset table earlier in this phase
+# was measured on a machine whose OWN local zone is +0800. For any offset
+# that PARSES as +0800, "parsed" and "fell back to local" render
+# byte-identical output THERE, and are indistinguishable by an unpinned
+# row's object-id comparison alone -- both tools independently computing
+# "local" and landing on the identical +0800 by machine coincidence passes
+# the exact same check a genuine "both parsed +0800" would. That is
+# precisely how these four rows shipped wrong (CI, which runs on UTC,
+# caught it; this machine's own gates stayed green throughout). Each row
+# below is pinned under BOTH TZ=UTC and TZ=Asia/Kolkata (+0530, equal to
+# no offset value tested anywhere in this phase, so a parsed value can
+# never be mistaken for the local one) -- one zone alone cannot show that
+# an answer tracks the zone, which is the whole discriminator.
+#
+# Recognized tokens (parsed, must be IDENTICAL under both zones):
+p72_date_row "1700000000 +08" 0 "UTC"
+p72_date_row "1700000000 +08" 0 "Asia/Kolkata"
+p72_date_row "1700000000 0800" 0 "UTC"
+p72_date_row "1700000000 0800" 0 "Asia/Kolkata"
+p72_date_row "1700000000+0800" 0 "UTC"
+p72_date_row "1700000000+0800" 0 "Asia/Kolkata"
+# NOT a token (5 digits) -- must TRACK the zone (local fallback):
+p72_date_row "1700000000 +08000" 0 "UTC"
+p72_date_row "1700000000 +08000" 0 "Asia/Kolkata"
+# The @ form's own two-digit rule (measured, added by this round):
+p72_date_row "@1700000000 +08" 0 "UTC"
+p72_date_row "@1700000000 +08" 0 "Asia/Kolkata"
+# Calendar forms share the identical token grammar (measured):
+p72_date_row "2023-11-15 06:13:20 +08" 0 "UTC"
+p72_date_row "2023-11-15 06:13:20 +08" 0 "Asia/Kolkata"
+p72_date_row "2023-11-15 06:13:20 0800" 0 "UTC"
+p72_date_row "Wed, 15 Nov 2023 06:13:20 +08" 0 "UTC"
+p72_date_row "Wed, 15 Nov 2023 06:13:20 0800" 0 "UTC"
+
+# Case 4 correction round (SPEC-CORRECTION.md): section 2.3 above was
+# measured ONLY on the bare `<digits> <offset>` form. The `@<digits>
+# <offset>` form is different -- git normalizes the offset ARITHMETICALLY
+# instead of discarding an out-of-range one, and this is the ONE place a
+# divergence used to be SILENT (both tools exit 0, object bytes differ),
+# because the table above never had an `@` column. p72_date_row's own
+# "accept" branch already compares full object ids, not just exit codes --
+# that is exactly the check that catches the silent case, so no new
+# comparison machinery is needed here, only rows that actually exercise it.
+#
+# @ form: offset normalized arithmetically (accept, id compared)
+p72_date_row "@1700000000 +0000" 0
+p72_date_row "@1700000000 0100" 0
+p72_date_row "@1700000000 +0060" 0
+p72_date_row "@1700000000 +00:00" 0
+p72_date_row "@1700000000 +0099" 0
+p72_date_row "@1700000000 +2400" 0
+p72_date_row "@1700000000 +9999" 0
+p72_date_row "@1700000000 -9999" 0
+# @ form: not a valid offset shape at all -> falls back to local (accept)
+p72_date_row "@1700000000 +0" 0
+p72_date_row "@1700000000 +060" 0
+p72_date_row "@1700000000 +00000" 0
+
+# The >= 9 digit rule: a timestamp with NO valid explicit offset needs at
+# least 9 digits, on EITHER form; the one exemption is `@<digits>` WITH a
+# shape-valid offset (already covered above), which has no floor at all.
+p72_date_row "99999999" 1
+p72_date_row "100000000" 0
+p72_date_row "@99999999" 1
+p72_date_row "@100000000" 0
+p72_date_row "99999999 +0000" 1
+p72_date_row "@99999999 +0000" 0
+p72_date_row "@0" 1
+p72_date_row "@0 +0000" 0
+
+# The upper bound (2100-01-01T00:00:00Z, epoch 4102444800): applies to
+# every form EXCEPT `@<digits>` with a valid explicit offset.
+p72_date_row "4102444799 +0000" 0
+p72_date_row "4102444800 +0000" 1
+p72_date_row "@4102444800 +0000" 0
+p72_date_row "@4102444800" 1
+p72_date_row "2100-01-01T00:00:00+00:00" 1
+p72_date_row "2100-01-01 00:00:00 +0000" 1
+p72_date_row "Sat, 1 Jan 2100 00:00:00 +0000" 1
+
+# Round 3: the pre-1970 LOWER bound, missing entirely until now. This
+# phase's own first-pass spec said "needs no work" because sg already
+# rejected "1969-12-31T23:59:59+00:00" -- true, but for the wrong reason:
+# that value converts to epoch -1, which collides with timegm's own error
+# sentinel (time_t)-1 in calendar_to_epoch, so it was rejected BY ACCIDENT.
+# Measured directly against real git via `git commit-tree`: every one of
+# these pre-1970 values is rejected on EVERY calendar form (not just the one
+# this phase happened to probe first), so accepting any of them let sg write
+# an object real git could never produce from the same env -- squarely rule
+# 2 of the scope line above, not rule 3. p72_date_row's own "accept" branch
+# already compares full object ids (not just exit codes), which is what the
+# accepted boundary rows below actually exercise; the bound itself is
+# checked on the computed epoch RESULT, not the year field, which is why the
+# last two rows use the identical wall-clock digits at two different offsets
+# to land on opposite sides of epoch 0.
+p72_date_row "1969-12-31T23:59:59+00:00" 1
+p72_date_row "1969-12-31T23:59:58+00:00" 1
+p72_date_row "1969-12-31 23:59:58 +0000" 1
+p72_date_row "Wed, 31 Dec 1969 23:59:58 +0000" 1
+p72_date_row "1950-06-15T12:00:00+00:00" 1
+p72_date_row "1900-01-01T00:00:00+00:00" 1
+p72_date_row "1970-01-01T00:00:00+00:00" 0
+p72_date_row "1970-01-01 00:00:00 +0000" 0
+p72_date_row "Thu, 1 Jan 1970 00:00:00 +0000" 0
+# This last pair proves the bound is checked on a computed RESULT, not the
+# year text -- but NOT which result: round 4 (below) found that the raw
+# calendar reading (1970-01-01 08:00 UTC / 1969-12-31 23:59:59 UTC) and the
+# final, offset-adjusted instant point the SAME direction here (both in
+# range / both out of range), so a version of this parser checking only one
+# of the two would still pass this exact pair -- a control whose two arms
+# agree by construction, this project's own recorded shape. Kept for what
+# it DOES prove; the round-4 rows below are the ones that actually
+# discriminate.
+p72_date_row "1970-01-01T08:00:00+08:00" 0
+p72_date_row "1969-12-31T23:59:59+08:00" 1
+
+# Round 4: git rejects if EITHER the RAW calendar reading (wall clock as if
+# already UTC) OR the offset-adjusted FINAL instant falls outside
+# [0, 4102444800) -- round 3 above checked only the final value, which
+# missed exactly this direction. Measured directly via `git commit-tree`:
+# each row below has a raw reading outside the bound but an offset that
+# pulls the FINAL instant back inside it, and git still rejects every one;
+# before this round sg wrote a real object for each (rule 2 of the scope
+# line, same class as round 3's own gap). The reverse direction (raw
+# inside, final pulled outside) was already correctly rejected by the
+# final-value check alone -- the last two rows are explicit controls
+# proving that direction is still covered, so the rule reads as two-sided
+# rather than "replaced by" the new one.
+p72_date_row "1969-12-31T23:30:00-01:00" 1
+p72_date_row "1969-12-31T23:50:00-01:00" 1
+p72_date_row "1969-12-31 23:30:00 -0100" 1
+p72_date_row "Wed, 31 Dec 1969 23:30:00 -0100" 1
+p72_date_row "2100-01-01T00:00:30+00:01" 1
+p72_date_row "2100-01-01T00:04:00+09:00" 1
+p72_date_row "1970-01-01T00:00:00+00:01" 1
+p72_date_row "2099-12-31T23:59:00-01:01" 1
+
+# SPEC-CORRECTION.md's "scope line" case 3: sg MAY reject what git accepts,
+# provided it does so loudly (exit 1) and the divergence is pinned on both
+# sides -- the same standing convention as --patience/auto:<name>/^{tree}
+# elsewhere in this file. These FIVE shapes are deliberately NOT implemented
+# (no fractional seconds, no named time zones, no tolerance for extra
+# internal whitespace before an ISO offset or for trailing garbage after an
+# otherwise-complete RFC2822 date, and no RFC2822 two-digit-year century
+# inference); reproducing them would mean growing a second, looser date
+# grammar for no bit-compatibility benefit, since sg refusing outright can
+# never itself write a wrong object.
+p72_deliberate_reject_row() {
+    # $1 = GIT_AUTHOR_DATE value that git ACCEPTS and sg deliberately REFUSES
+    # $2 = optional TZ override (round 5's local-offset-reinterpretation
+    #      rows need a specific zone to be meaningful at all -- git's
+    #      "reinterpret as local" behaviour this rule refuses to reproduce
+    #      only differs from UTC when TZ is not already UTC)
+    P72_DR_VAL="$1"
+    P72_DR_TZ="${2:-}"
+    P72_DR_SG="$WORKDIR/p72_dr_sg"
+    P72_DR_GIT="$WORKDIR/p72_dr_git"
+    rm -rf "$P72_DR_SG" "$P72_DR_GIT"
+    cp -R "$P72_BASE" "$P72_DR_SG"
+    cp -R "$P72_BASE" "$P72_DR_GIT"
+    printf 'root\ndr change\n' > "$P72_DR_SG/root.txt"
+    printf 'root\ndr change\n' > "$P72_DR_GIT/root.txt"
+    (cd "$P72_DR_SG" && "$SG" add root.txt && env ${P72_DR_TZ:+TZ="$P72_DR_TZ"} \
+        GIT_AUTHOR_NAME="Rrr" GIT_AUTHOR_EMAIL="rrr@x.example" \
+        GIT_AUTHOR_DATE="$P72_DR_VAL" GIT_COMMITTER_NAME="Rrr" GIT_COMMITTER_EMAIL="rrr@x.example" \
+        GIT_COMMITTER_DATE="1650000000 +0000" "$SG" commit -m "phase72 deliberate-reject row") \
+        > /dev/null 2>&1
+    P72_DR_SG_RC=$?
+    (cd "$P72_DR_GIT" && git add root.txt && env ${P72_DR_TZ:+TZ="$P72_DR_TZ"} \
+        GIT_AUTHOR_NAME="Rrr" GIT_AUTHOR_EMAIL="rrr@x.example" \
+        GIT_AUTHOR_DATE="$P72_DR_VAL" GIT_COMMITTER_NAME="Rrr" GIT_COMMITTER_EMAIL="rrr@x.example" \
+        GIT_COMMITTER_DATE="1650000000 +0000" LC_ALL=C git commit -q -m "phase72 deliberate-reject row") \
+        > /dev/null 2>&1
+    P72_DR_GIT_RC=$?
+    check "phase72 case4 deliberate divergence \"$P72_DR_VAL\"${P72_DR_TZ:+ (TZ=$P72_DR_TZ)}: git ACCEPTS it (exit 0)" \
+        test "$P72_DR_GIT_RC" -eq 0
+    check "phase72 case4 deliberate divergence \"$P72_DR_VAL\"${P72_DR_TZ:+ (TZ=$P72_DR_TZ)}: sg deliberately REFUSES it (exit 1), pinned, not a silent gap" \
+        test "$P72_DR_SG_RC" -eq 1
+}
+# An `@<epoch> <out-of-range offset>` commit is the first thing sg can WRITE
+# whose timezone field is SIX bytes ("+10039" from "+9999"). sg stores it
+# correctly -- the object id matches git, pinned by case4 above -- but
+# src/util/date.c's parse_tz bails out on any offset that is not exactly 5
+# bytes, so sg RENDERS such a commit in UTC while echoing the stored offset
+# string beside it, i.e. its own output contradicts itself. This is
+# PRE-EXISTING and not caused by Phase 72: a commit written by real git with
+# the same offset misrenders identically (measured), because the renderer
+# never learns who wrote the object. Phase 72 only made the shape reachable
+# through sg's own commands. Pinned as a divergence rather than fixed here --
+# fixing it means measuring what git does with a 3-digit hours field across
+# every --date= mode, %aI's colon insertion, human and relative, which is its
+# own phase. A future fix must turn THIS check red by name.
+P72_TZ6="$WORKDIR/p72_tz6"
+rm -rf "$P72_TZ6"
+cp -R "$P72_BASE" "$P72_TZ6"
+( cd "$P72_TZ6" && GIT_AUTHOR_NAME="A" GIT_AUTHOR_EMAIL="a@x.example" \
+    GIT_COMMITTER_NAME="A" GIT_COMMITTER_EMAIL="a@x.example" \
+    GIT_AUTHOR_DATE="@1700000000 +9999" GIT_COMMITTER_DATE="@1700000000 +9999" \
+    LC_ALL=C git commit -q --allow-empty -m "six-byte offset" ) > /dev/null 2>&1
+P72_TZ6_STORED=$(cd "$P72_TZ6" && git cat-file -p HEAD 2>/dev/null | sed -n 's/^author .*> //p')
+P72_TZ6_GIT=$(cd "$P72_TZ6" && LC_ALL=C git log -1 --format=%ad 2>/dev/null)
+P72_TZ6_SG=$(cd "$P72_TZ6" && "$SG" log -1 --pretty=format:%ad 2>/dev/null)
+check "phase72 tz6: precondition -- git stores the arithmetically normalized six-byte offset" \
+    test "$P72_TZ6_STORED" = "1700000000 +10039"
+# Round 3 (cold read): a bare "the two differ" check would stay green even
+# if someone fixed parse_tz's 5-byte limit AND introduced an unrelated
+# divergence in the same rendered field (e.g. a swapped date.c weekday-table
+# entry) -- it would keep reading as "the documented bug is still here"
+# while actually guarding nothing. Converted to the project's standing shape
+# for a deliberate divergence (CLAUDE.md's #6/#7): two LITERAL byte pins,
+# one per tool, so a future change to EITHER renderer fails by name instead
+# of silently drifting. Both measured directly via `git commit-tree`/`sg
+# log` on this exact fixture, 2026-09-12.
+check "phase72 tz6: PIN, DO NOT FIX HERE -- git's own %ad for the six-byte offset (literal)" \
+    test "$P72_TZ6_GIT" = "Sun Nov 19 02:52:20 2023 +10039"
+check "phase72 tz6: PIN, DO NOT FIX HERE -- sg's own %ad for the six-byte offset (literal, wrong clock, see comment above)" \
+    test "$P72_TZ6_SG" = "Tue Nov 14 22:13:20 2023 +10039"
+check "phase72 tz6: sg still echoes the stored offset string itself, so only the clock is wrong" \
+    test "${P72_TZ6_SG##* }" = "+10039"
+
+p72_deliberate_reject_row "2023-11-15T06:13:20.123+08:00"
+p72_deliberate_reject_row "2023-11-15T06:13:20 +08:00"
+p72_deliberate_reject_row "Wed, 15 Nov 2023 06:13:20 GMT"
+p72_deliberate_reject_row "Wed, 15 Nov 2023 06:13:20 +0800 extra garbage"
+# Fifth shape (round 4): RFC2822 two-digit years -- git infers the century
+# ("70" -> 1970, measured; also "04" -> 2004 and "99" -> 1999, not repeated
+# here since one row is enough to pin the divergence, the other two are
+# unit-tested in tests/test_ident.c). NOTE (round 4): at the time this was
+# written, sg's rejection here was NOT deliberate grammar -- a two-digit
+# year computed tm_year = 70 - 1900 = -1830, which collided with
+# calendar_to_epoch's own `timegm` error sentinel, the same accident
+# section 4b of docs/DESIGN.md documents for the pre-1970 lower bound.
+# UPDATE (round 5): calendar_to_epoch now checks the typed year field
+# against 1970 directly, BEFORE `timegm` ever runs (added to close the
+# leap-second-crossing gap, see the round-5 section below) -- so a
+# two-digit year is REJECTED by that explicit, deliberate check now,
+# before the accident ever gets a chance to fire. The outcome is
+# unchanged, but the reason is no longer an accident.
+p72_deliberate_reject_row "Wed, 15 Nov 70 06:13:20 +0800"
+
+# Round 5: a calendar form carrying a shape-valid but OUT-OF-RANGE offset
+# diverged SILENTLY -- both tools exit 0, but sg discarded the offset and
+# read the wall clock as literal UTC, while git re-reads it as LOCAL time,
+# giving a DIFFERENT epoch and object id (measured, `git commit-tree`; the
+# first row is an utterly ordinary date, not a boundary case). Reproducing
+# git's "reinterpret as local" behaviour is deliberately NOT done: it is
+# ill-defined during a DST gap and ambiguous during a DST overlap, a whole
+# new class of corner cases to gain fidelity on an input nobody sensible
+# writes (a real UTC offset never exceeds +/-14:00). sg now REFUSES a
+# shape-valid-but-out-of-range calendar offset outright, uniformly in all
+# three forms -- rule 3 of the scope line: loud, and a refusal can never
+# write a wrong object. This single rule also closes what looked like a
+# separate finding (try_iso_t alone hard-failing on an out-of-range COLON
+# offset where the other two forms used to fall back to local): all three
+# forms now agree, so there is nothing left to pin as an inconsistency
+# between them, only as a divergence from git.
+p72_deliberate_reject_row "2023-11-15 06:13:20 +9999"
+p72_deliberate_reject_row "1970-01-01 00:00:00 +9999" "America/New_York"
+p72_deliberate_reject_row "Thu, 1 Jan 1970 00:00:00 +9999" "America/New_York"
+p72_deliberate_reject_row "2023-11-15T06:13:20+99:00"
+# NOT evidence for the rule above, and kept here only because it is a real
+# divergence of its own: this RFC2822 string has NO SPACE before the offset,
+# so sg refuses it for a completely different reason -- strtok_r glues
+# "06:13:20+99:00" into one token, sscanf reads the "06:13:20" prefix and
+# silently ignores the rest, and the offset token is then missing entirely.
+# Measured: the same string with an utterly ordinary IN-RANGE offset
+# ("Wed, 15 Nov 2023 06:13:20+08:00") is refused identically, which is what
+# proves the out-of-range value has nothing to do with it. The witness for
+# try_rfc2822's half of the rule above is the well-formed
+# "Thu, 1 Jan 1970 00:00:00 +9999" row; do not use this one for that, and do
+# not read it going green under a mutation as that rule being covered.
+p72_deliberate_reject_row "Wed, 15 Nov 2023 06:13:20+99:00"
+p72_deliberate_reject_row "Wed, 15 Nov 2023 06:13:20+08:00"
+# NOT a rule-3 pin: git rejects this one too (exit 128, measured under
+# TZ=America/New_York -- git's own rejection here comes from its "reinterpret
+# as local" behaviour pushing the final instant past the upper bound, so the
+# specific zone matters for GIT's side even though sg refuses regardless of
+# TZ), so with the same-uniform-refusal rule in place it becomes an ordinary
+# AGREEING row -- both tools refuse a date whose offset is out of range AND
+# whose would-be-reinterpreted final instant is also outside [0, 2100).
+p72_date_row "2099-12-31 23:59:59 +9999" 1 "America/New_York"
+
+# Round 5, finding 3: a leap second (ss == 60) crossing the 1970 boundary.
+# `timegm` normalizes the carry BEFORE the raw-epoch bound check (round 4)
+# ever sees it: "1969-12-31T23:59:60+00:00" computes epoch 0, not -1,
+# because the leap second rolls the wall clock into
+# 1970-01-01T00:00:00 UTC during normalization -- 0 is comfortably inside
+# [0, upper), so it sailed through and sg wrote a real object git refuses.
+# Fixed by checking the TYPED year field itself, before `timegm` ever runs
+# (calendar_to_epoch), so no carry can have happened yet. This needs no
+# matching check on the upper side: "2099-12-31T23:59:60+00:00" already
+# computed epoch 4102444800 (the carry lands exactly ON the excluded upper
+# bound), which round 4's existing final-value check already caught -- sg
+# already rejected it before this round. git itself ACCEPTS that one
+# anyway, writing the very epoch it refuses when typed directly -- an
+# inconsistency in git's OWN parser, not reproduced here; pinned as a
+# deliberate divergence rather than "fixed" into agreement.
+p72_date_row "1969-12-31T23:59:60+00:00" 1
+p72_deliberate_reject_row "2099-12-31T23:59:60+00:00"
+p72_date_row "2023-12-31T23:59:60+00:00" 0
+
+# Case 5 (spec section 4.5): a DST pair under a fixed TZ proving the
+# local-offset fallback is computed at the COMMIT'S OWN instant, not "now"'s
+# -- November and June give different offsets under America/New_York, and
+# sg's and git's answers for each instant must agree with EACH OTHER (not
+# with a hardcoded string), since the whole point is that both tools
+# resolve the SAME local offset independently.
+P72_C5_NOV_SG="$WORKDIR/p72_c5_nov_sg"
+P72_C5_NOV_GIT="$WORKDIR/p72_c5_nov_git"
+P72_C5_JUN_SG="$WORKDIR/p72_c5_jun_sg"
+P72_C5_JUN_GIT="$WORKDIR/p72_c5_jun_git"
+rm -rf "$P72_C5_NOV_SG" "$P72_C5_NOV_GIT" "$P72_C5_JUN_SG" "$P72_C5_JUN_GIT"
+cp -R "$P72_BASE" "$P72_C5_NOV_SG"
+cp -R "$P72_BASE" "$P72_C5_NOV_GIT"
+cp -R "$P72_BASE" "$P72_C5_JUN_SG"
+cp -R "$P72_BASE" "$P72_C5_JUN_GIT"
+printf 'root\nnov\n' > "$P72_C5_NOV_SG/root.txt"
+printf 'root\nnov\n' > "$P72_C5_NOV_GIT/root.txt"
+printf 'root\njun\n' > "$P72_C5_JUN_SG/root.txt"
+printf 'root\njun\n' > "$P72_C5_JUN_GIT/root.txt"
+(cd "$P72_C5_NOV_SG" && "$SG" add root.txt && TZ="America/New_York" GIT_AUTHOR_NAME="Ddd" \
+    GIT_AUTHOR_EMAIL="ddd@x.example" GIT_AUTHOR_DATE="@1700000000" GIT_COMMITTER_NAME="Ddd" \
+    GIT_COMMITTER_EMAIL="ddd@x.example" GIT_COMMITTER_DATE="@1700000000" "$SG" commit -m "nov") \
+    > /dev/null 2>&1
+(cd "$P72_C5_NOV_GIT" && git add root.txt && TZ="America/New_York" GIT_AUTHOR_NAME="Ddd" \
+    GIT_AUTHOR_EMAIL="ddd@x.example" GIT_AUTHOR_DATE="@1700000000" GIT_COMMITTER_NAME="Ddd" \
+    GIT_COMMITTER_EMAIL="ddd@x.example" GIT_COMMITTER_DATE="@1700000000" LC_ALL=C git commit -q \
+    -m "nov") > /dev/null 2>&1
+(cd "$P72_C5_JUN_SG" && "$SG" add root.txt && TZ="America/New_York" GIT_AUTHOR_NAME="Ddd" \
+    GIT_AUTHOR_EMAIL="ddd@x.example" GIT_AUTHOR_DATE="@1688000000" GIT_COMMITTER_NAME="Ddd" \
+    GIT_COMMITTER_EMAIL="ddd@x.example" GIT_COMMITTER_DATE="@1688000000" "$SG" commit -m "jun") \
+    > /dev/null 2>&1
+(cd "$P72_C5_JUN_GIT" && git add root.txt && TZ="America/New_York" GIT_AUTHOR_NAME="Ddd" \
+    GIT_AUTHOR_EMAIL="ddd@x.example" GIT_AUTHOR_DATE="@1688000000" GIT_COMMITTER_NAME="Ddd" \
+    GIT_COMMITTER_EMAIL="ddd@x.example" GIT_COMMITTER_DATE="@1688000000" LC_ALL=C git commit -q \
+    -m "jun") > /dev/null 2>&1
+P72_C5_NOV_SG_ID=$(cd "$P72_C5_NOV_SG" && git rev-parse HEAD)
+P72_C5_NOV_GIT_ID=$(cd "$P72_C5_NOV_GIT" && git rev-parse HEAD)
+P72_C5_JUN_SG_ID=$(cd "$P72_C5_JUN_SG" && git rev-parse HEAD)
+P72_C5_JUN_GIT_ID=$(cd "$P72_C5_JUN_GIT" && git rev-parse HEAD)
+check "phase72 case5: November instant (America/New_York) -- sg and git agree on the resolved local offset (object ids match)" \
+    test "$P72_C5_NOV_SG_ID" = "$P72_C5_NOV_GIT_ID"
+check "phase72 case5: June instant (America/New_York) -- sg and git agree on the resolved local offset (object ids match)" \
+    test "$P72_C5_JUN_SG_ID" = "$P72_C5_JUN_GIT_ID"
+check "phase72 case5: November and June resolve to DIFFERENT offsets (DST), proving this is not a cached single value" \
+    test "$P72_C5_NOV_SG_ID" != "$P72_C5_JUN_SG_ID"
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

@@ -1,5 +1,6 @@
 #include "sg/reflog.h"
 
+#include "sg/ident.h"
 #include "sg/refs.h"
 #include "sg/workdir.h"
 
@@ -17,13 +18,6 @@
    bytes" floor named in the header comment -- cannot possibly hold both
    oid fields, so it is rejected as malformed. */
 #define SG_REFLOG_MIN_LINE 82
-
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 static void free_entries(sg_reflog_entry *entries, size_t count)
 {
@@ -222,8 +216,8 @@ int sg_reflog_append(const char *git_dir, const char *ref_path, const unsigned c
     char full_path[SG_PATH_MAX];
     char old_hex[SG_SHA1_HEX_LEN + 1];
     char new_hex[SG_SHA1_HEX_LEN + 1];
-    const char *name;
-    const char *email;
+    sg_ident ident;
+    const char *bad = NULL;
     char *normalized;
     char *line;
     int line_len;
@@ -244,14 +238,20 @@ int sg_reflog_append(const char *git_dir, const char *ref_path, const unsigned c
     if (normalized == NULL)
         return -1;
 
-    name = env_or("GIT_AUTHOR_NAME", "small_git");
-    email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
+    /* A reflog line's ident is the COMMITTER identity, the same as a
+       commit's own committer line -- not the author identity (Phase 72's
+       defect C; git's reflog-writing code path shares its ident resolution
+       with the commit it is logging). */
+    if (sg_ident_committer(&ident, &bad) != 0) {
+        free(normalized);
+        return -1;
+    }
 
     sg_sha1_to_hex(old_id, old_hex);
     sg_sha1_to_hex(new_id, new_hex);
 
-    line_len = snprintf(NULL, 0, "%s %s %s <%s> %lld +0000\t%s\n", old_hex, new_hex, name, email,
-                        (long long)time(NULL), normalized);
+    line_len = snprintf(NULL, 0, "%s %s %s <%s> %lld %s\t%s\n", old_hex, new_hex, ident.name,
+                        ident.email, ident.when, ident.tz, normalized);
     if (line_len < 0) {
         free(normalized);
         return -1;
@@ -261,8 +261,8 @@ int sg_reflog_append(const char *git_dir, const char *ref_path, const unsigned c
         free(normalized);
         return -1;
     }
-    snprintf(line, (size_t)line_len + 1, "%s %s %s <%s> %lld +0000\t%s\n", old_hex, new_hex, name, email,
-             (long long)time(NULL), normalized);
+    snprintf(line, (size_t)line_len + 1, "%s %s %s <%s> %lld %s\t%s\n", old_hex, new_hex, ident.name,
+             ident.email, ident.when, ident.tz, normalized);
     free(normalized);
 
     f = fopen(full_path, "ab");

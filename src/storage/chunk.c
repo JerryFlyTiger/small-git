@@ -1,5 +1,6 @@
 #include "sg/chunk.h"
 
+#include "sg/ident.h"
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
@@ -17,12 +18,6 @@
 #include <time.h>
 #include <unistd.h>
 
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 /* Precomputed with a fixed seed (splitmix64(0x736D616C6C5F676974)) -- never
    generate this at runtime with rand()/a PRNG, since differing PRNGs across
@@ -601,6 +596,8 @@ static int keep_alive_add(const char *git_dir, unsigned char (*new_ids)[SG_SHA1_
     size_t tree_len = 0;
     unsigned char tree_id[SG_SHA1_RAW_LEN];
     sg_commit commit;
+    sg_ident commit_author;
+    sg_ident commit_committer;
     unsigned char *commit_content = NULL;
     size_t commit_len = 0;
     unsigned char commit_id[SG_SHA1_RAW_LEN];
@@ -691,18 +688,39 @@ static int keep_alive_add(const char *git_dir, unsigned char (*new_ids)[SG_SHA1_
     if (sg_loose_write(git_dir, SG_OBJ_TREE, tree_content, tree_len, tree_id) != 0)
         goto done;
 
-    memset(&commit, 0, sizeof(commit));
-    memcpy(commit.tree, tree_id, SG_SHA1_RAW_LEN);
-    commit.parents = NULL;
-    commit.parent_count = 0;
-    commit.author_name = (char *)env_or("GIT_AUTHOR_NAME", "small_git");
-    commit.author_email = (char *)env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
-    commit.author_time = (long long)time(NULL);
-    strcpy(commit.author_tz, "+0000");
-    commit.committer_name = (char *)env_or("GIT_COMMITTER_NAME", commit.author_name);
-    commit.committer_email = (char *)env_or("GIT_COMMITTER_EMAIL", commit.author_email);
-    commit.committer_time = commit.author_time;
-    strcpy(commit.committer_tz, "+0000");
+    {
+        const char *bad = NULL;
+
+        /* Phase 72: this used to fall back GIT_COMMITTER_NAME/EMAIL to
+           whatever the AUTHOR side resolved to, which is wrong on its own
+           terms (real git's committer identity does not derive from the
+           author's when only one of the two env pairs is set -- both
+           independently fall back to the same underlying default) quite
+           apart from never having read either *_DATE var at all.
+           commit_author/commit_committer are declared at FUNCTION scope
+           (not in this inner block) deliberately: `commit`'s author_name/
+           author_email etc. below point INTO these structs' arrays, and
+           `commit` is read again much later by sg_commit_serialize, well
+           after this block would otherwise have ended -- ASan's
+           stack-use-after-scope caught this the first time it was written
+           with the ident structs scoped to this block alone. */
+        if (sg_ident_author(&commit_author, &bad) != 0 ||
+           sg_ident_committer(&commit_committer, &bad) != 0)
+            goto done;
+
+        memset(&commit, 0, sizeof(commit));
+        memcpy(commit.tree, tree_id, SG_SHA1_RAW_LEN);
+        commit.parents = NULL;
+        commit.parent_count = 0;
+        commit.author_name = commit_author.name;
+        commit.author_email = commit_author.email;
+        commit.author_time = commit_author.when;
+        strcpy(commit.author_tz, commit_author.tz);
+        commit.committer_name = commit_committer.name;
+        commit.committer_email = commit_committer.email;
+        commit.committer_time = commit_committer.when;
+        strcpy(commit.committer_tz, commit_committer.tz);
+    }
 
     if (sg_message_cleanup("sg chunk keep-alive\n", &cleaned_message) != 0)
         goto done;

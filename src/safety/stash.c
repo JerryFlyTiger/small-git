@@ -2,6 +2,7 @@
 
 #include "sg/apply.h"
 #include "sg/chunk.h"
+#include "sg/ident.h"
 #include "sg/ignore.h"
 #include "sg/index.h"
 #include "sg/loose.h"
@@ -29,12 +30,6 @@
 #include <time.h>
 #include <unistd.h>
 
-static const char *env_or(const char *name, const char *fallback)
-{
-    const char *v = getenv(name);
-
-    return (v != NULL && v[0] != '\0') ? v : fallback;
-}
 
 /* Reads commit_id's commit object and fills short_hex_out (7 hex chars +
    NUL) and *subject_out (malloc'd, the first line of the commit message,
@@ -79,8 +74,8 @@ static int get_short_and_subject(const char *git_dir, const unsigned char commit
 
 static int build_and_write_commit(const char *git_dir, const unsigned char tree[SG_SHA1_RAW_LEN],
                                   const unsigned char parents[][SG_SHA1_RAW_LEN], size_t parent_count,
-                                  const char *cleaned_message, const char *name, const char *email,
-                                  long long when, unsigned char id_out[SG_SHA1_RAW_LEN])
+                                  const char *cleaned_message, const sg_ident *author,
+                                  const sg_ident *committer, unsigned char id_out[SG_SHA1_RAW_LEN])
 {
     sg_commit commit;
     unsigned char *serialized;
@@ -97,14 +92,14 @@ static int build_and_write_commit(const char *git_dir, const unsigned char tree[
         memcpy(commit.parents, parents, parent_count * sizeof(*commit.parents));
     }
     commit.parent_count = parent_count;
-    commit.author_name = (char *)name;
-    commit.author_email = (char *)email;
-    commit.author_time = when;
-    strcpy(commit.author_tz, "+0000");
-    commit.committer_name = (char *)name;
-    commit.committer_email = (char *)email;
-    commit.committer_time = when;
-    strcpy(commit.committer_tz, "+0000");
+    commit.author_name = (char *)author->name;
+    commit.author_email = (char *)author->email;
+    commit.author_time = author->when;
+    strcpy(commit.author_tz, author->tz);
+    commit.committer_name = (char *)committer->name;
+    commit.committer_email = (char *)committer->email;
+    commit.committer_time = committer->when;
+    strcpy(commit.committer_tz, committer->tz);
     commit.message = (char *)cleaned_message;
 
     if (sg_commit_serialize(&commit, &serialized, &serialized_len) != 0) {
@@ -544,9 +539,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     size_t stash_parent_count;
     unsigned char old_stash_id[SG_SHA1_RAW_LEN];
     long long appended_at = 0;
-    long long when;
-    const char *name;
-    const char *email;
+    sg_ident author;
+    sg_ident committer;
     size_t i;
     int rc = -1;
 
@@ -643,9 +637,19 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         return -1;
     }
 
-    name = env_or("GIT_AUTHOR_NAME", "small_git");
-    email = env_or("GIT_AUTHOR_EMAIL", "sg@localhost");
-    when = (long long)time(NULL);
+    {
+        const char *bad = NULL;
+
+        if (sg_ident_author(&author, &bad) != 0 || sg_ident_committer(&committer, &bad) != 0) {
+            for (i = 0; i < untracked_path_count; i++)
+                free(untracked_paths[i]);
+            free(untracked_paths);
+            free(branch);
+            free(head_subject);
+            sg_index_free(&idx);
+            return -1;
+        }
+    }
 
     /* index commit (parent 2): always the "index on" form, independent of
        the user-supplied message. Phase 65: heap, not a fixed 512-byte
@@ -669,7 +673,7 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
     subj_buf = NULL;
 
     memcpy(index_parents[0], head_commit, SG_SHA1_RAW_LEN);
-    if (build_and_write_commit(git_dir, index_tree, index_parents, 1, cleaned_index_msg, name, email, when,
+    if (build_and_write_commit(git_dir, index_tree, index_parents, 1, cleaned_index_msg, &author, &committer,
                                index_commit_id) != 0) {
         free(cleaned_index_msg);
         free(head_subject);
@@ -715,8 +719,8 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         }
         free(subj_buf);
         subj_buf = NULL;
-        if (build_and_write_commit(git_dir, untracked_tree, NULL, 0, cleaned_untracked_msg, name, email,
-                                   when, untracked_commit_id) != 0) {
+        if (build_and_write_commit(git_dir, untracked_tree, NULL, 0, cleaned_untracked_msg, &author, &committer,
+                                   untracked_commit_id) != 0) {
             free(cleaned_untracked_msg);
             free(head_subject);
             for (i = 0; i < untracked_path_count; i++)
@@ -769,7 +773,7 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
         stash_parent_count = 3;
     }
     if (build_and_write_commit(git_dir, worktree_tree, stash_parents, stash_parent_count, cleaned_subject,
-                               name, email, when, stash_commit_id) != 0) {
+                               &author, &committer, stash_commit_id) != 0) {
         free(cleaned_subject);
         free(subj_buf);
         for (i = 0; i < untracked_path_count; i++)
