@@ -118,6 +118,26 @@ void sg_commit_free(sg_commit *commit);
    case *out is left untouched. */
 int sg_message_cleanup(const char *msg, char **out);
 
+/* Joins `count` separately-given `-m <msg>` values into one message, the
+   way `sg commit`/`sg tag` must combine repeated `-m` -- measured against
+   real git 2.55.0: `-m one -m two` is NOT "last one wins" (a comment in
+   this project's own cmd_tag.c once claimed exactly that, and was wrong),
+   each value becomes its own paragraph, joined with a blank line ("one",
+   "two" -> "one\n\ntwo"; three values -> "one\n\ntwo\n\nthree"). The
+   result is meant to be fed to sg_message_cleanup afterward, same as a
+   single -m value already is -- this function does no cleanup itself, it
+   only joins.
+
+   Deliberately NOT the same rule everywhere: `sg stash push -m one -m
+   two` keeps last-one-wins on both tools (measured), and is NOT routed
+   through this function -- do not "converge" cmd_stash.c onto this
+   without re-measuring it first.
+
+   *out is malloc'd, caller frees. Returns 0 on success (count == 0 yields
+   an empty string, distinguishable from OOM the same way
+   sg_message_cleanup's empty-result case is), -1 only on OOM. */
+int sg_message_join(const char **messages, size_t count, char **out);
+
 /* ---- tag (annotated) ---- */
 
 typedef struct {

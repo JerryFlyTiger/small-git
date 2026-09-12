@@ -331,12 +331,22 @@ point where the harness warns that it is too large to keep in context.
 
 ## Deliberate divergences from real git
 
-Seven places where sg's answer differs from real git **on purpose**, not by
-oversight -- each was measured against git 2.55.0, each is pinned on both
-sides by an interop check (so accidentally "fixing" one back into silent
-agreement with git would itself go undetected without the pin), and none of
-them should be "fixed" without first re-reading the WARNING that explains
-why the divergence exists.
+Nine places where sg's answer differs from real git. Each was measured
+against git 2.55.0 and each is pinned on both sides by an interop check, so
+accidentally "fixing" one back into silent agreement with git would itself go
+undetected without the pin.
+
+**They are not all the same kind, and the question that separates them is
+"is sg's answer one we ACCEPT", not "why does it differ".** Entries 1-8 are
+answers this project keeps: some because matching git would be wrong or needs
+a knob sg does not have, others because converging would cost more than the
+difference is worth. Do not "fix" one of those without first reading the
+WARNING that says why it is there. Entry 9 is different in kind: sg's answer
+is simply WRONG and it LOSES DATA. It is pinned so the wrong behaviour stays
+visible until someone fixes it, not to protect it. **When adding an entry,
+say which of the two it is** -- a reader who applies "none of these should be
+fixed" to a deferred defect will leave it in place on the strength of this
+list's own framing, and entry 9 can destroy a tag.
 
 (This list used to have a fifth entry, `-C -C` / `--find-copies-harder`
 being rejected outright -- **implemented as of Phase 51**, see
@@ -444,6 +454,61 @@ no longer a divergence, so it is gone from this list rather than marked
    `human` (non-local) does NOT diverge there (measured:
    `Mon 12:00 +0000` on both). Pinned on both sides in interop's `phase67`
    group, same two-literal-pin shape as the rest of this entry.
+8. **`sg tag <name> <unresolvable-rev>` reports a whole different SENTENCE
+   than git, not a wording tweak** (Phase 73 review round 6, justification
+   corrected in round 7). git: `fatal: Failed to resolve 'x' as a valid
+   ref.`; sg: `sg: cannot resolve 'x'`. **This entry originally claimed
+   sg's wording is "shared verbatim across every caller of
+   `sg_rev_parse_commit`/`sg_rev_parse_object`" -- measured false**:
+   `grep -rn "cannot resolve '%s'" src/` finds exactly ONE occurrence,
+   `cmd_tag.c` itself. The REAL reason to keep it is different and
+   narrower: `sg tag` is not being asked to converge onto any one
+   existing sibling wording, because there isn't a consistent one to
+   converge onto -- see the very next note for the measurement. Kept and
+   pinned instead of unified because picking any one of sg's four
+   existing wordings for `cmd_tag.c` would be an arbitrary choice among
+   siblings that already disagree with EACH OTHER, not a move toward
+   consistency. Pinned on both sides in interop's `phase73` group
+   (`case1i`); see Phase 73's review round 7 section of `docs/DESIGN.md`
+   for the correction and the measurement behind it.
+
+   **Wider finding, recorded here rather than fixed**: sg has (at least)
+   FOUR different wordings for "this revision argument does not resolve
+   to anything", across EIGHT call sites in seven different commands,
+   measured by `grep`: `cannot resolve '%s'` (`cmd_tag.c`); `not a valid
+   object name '%s'` (`cmd_show.c`, `cmd_cat_file.c`); `not a valid
+   revision '%s'` (`cmd_log.c`); `'%s' is not a valid object id`
+   (`cmd_cherry_pick.c`, `cmd_merge_base.c` x2, `cmd_revert.c`). This is a
+   pre-existing inconsistency in sg's OWN vocabulary, unrelated to git
+   interop and out of scope to fix in this phase -- recorded so it is not
+   rediscovered from scratch by a future audit.
+9. **`sg tag -d <Name> <name>` (two argv spellings differing only in
+   case) can DELETE a tag where git refuses the whole batch and deletes
+   nothing -- a KNOWN, UNFIXED BUG being deferred to its own phase, not a
+   design choice, and it is MACOS-ONLY** (Phase 73 review round 7).
+   Reachable with two ordinary commands on a case-FOLDING filesystem
+   (macOS's default APFS/HFS+; Linux ext4 does not fold, so this cannot
+   occur there): `sg tag Foo` then `sg tag -d Foo foo` -- both argv
+   spellings name the SAME ref file, `delete_tags`'s pass 1 reads each
+   separately and both come back existing, pass 2's refusal is keyed on
+   `strcmp` and `"Foo" != "foo"` byte for byte so it never fires, and
+   pass 3 deletes `Foo` then fails to re-read the now-gone `foo`. Real
+   git instead takes a per-ref LOCK for every name before deleting
+   anything, and the second lock collides with the first
+   (`cannot lock ref 'refs/tags/foo': ... File exists`), refusing the
+   whole batch and leaving `Foo` untouched -- **git: exit 1, tag
+   SURVIVES; sg: exit 1, tag DELETED. Identical exit code, opposite
+   effect on the repository, in the DATA-LOSING direction.** Matching
+   git means emulating its per-ref lock acquisition before any deletion
+   in `delete_tags` -- a real change to the delete path, deliberately
+   NOT attempted this round. Pinned in interop's `phase73` group
+   (`case2j`), gated on a runtime case-fold probe (a plain `touch`+`test`,
+   unrelated to git/sg) so the check only runs -- and only claims
+   anything -- on a filesystem where it is actually reachable; `skip()`'d
+   on a case-sensitive one so the row is honest about not having run
+   rather than silently absent. See Phase 73's review round 7 section of
+   `docs/DESIGN.md` for the full writeup, including how round 6's own
+   "measured unreachable" claim about this exact code path was wrong.
 
 ## Core types cheat sheet
 

@@ -163,6 +163,46 @@ int sg_message_cleanup(const char *msg, char **out)
     return 0;
 }
 
+int sg_message_join(const char **messages, size_t count, char **out)
+{
+    size_t total = 0;
+    size_t pos = 0;
+    size_t i;
+    char *buf;
+
+    if (count == 0) {
+        buf = malloc(1);
+        if (buf == NULL)
+            return -1;
+        buf[0] = '\0';
+        *out = buf;
+        return 0;
+    }
+
+    for (i = 0; i < count; i++)
+        total += strlen(messages[i]);
+    total += (count - 1) * 2; /* one "\n\n" separator between each pair */
+
+    buf = malloc(total + 1);
+    if (buf == NULL)
+        return -1;
+
+    for (i = 0; i < count; i++) {
+        size_t len = strlen(messages[i]);
+
+        if (i > 0) {
+            buf[pos++] = '\n';
+            buf[pos++] = '\n';
+        }
+        memcpy(buf + pos, messages[i], len);
+        pos += len;
+    }
+    buf[pos] = '\0';
+
+    *out = buf;
+    return 0;
+}
+
 int sg_object_parse_header(const unsigned char *data, size_t data_len, sg_obj_type *type_out,
                            size_t *header_len_out, size_t *declared_size_out)
 {

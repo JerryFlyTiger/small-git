@@ -3682,18 +3682,30 @@ check "phase12 case2: -m without -a still creates an annotated tag object" test 
 (cd "$P12_REPO" && "$SG" tag -a noamsg) > /dev/null 2>&1
 check "phase12 case2: sg tag -a without -m is rejected" test $? = 1
 
-# case 3: reverse direction -- a real-git-made annotated tag is listed by sg
-# and resolvable as a revision (sg_rev_parse_commit must peel it). Exercised
-# through `sg tag <newname> <rev>`, which is the only CLI surface for
-# sg_rev_parse_commit today: a lightweight tag created FROM the real-git
-# annotated tag must land on the peeled commit, not the tag object's own id.
+# case 3: reverse direction -- a real-git-made annotated tag is listed by
+# sg and resolvable. THIS CHECK USED TO ENCODE A BUG (Phase 73's own
+# section 1): it asserted that `sg tag <newname> <rev>` PEELS an annotated
+# <rev> to its underlying commit, because at the time that was the only
+# CLI surface exercising sg_rev_parse_commit's peeling at all. Real git's
+# `tag <newname> <existing-annotated-tag>` does NOT peel -- it makes a
+# lightweight ref straight to the TAG OBJECT -- so Phase 73 fixed
+# cmd_tag.c to use sg_rev_parse_object (which does not peel) instead, and
+# this check has to move onto a command that genuinely still needs to
+# peel. Do not restore the old assertion: it was pinning the bug, not the
+# fix.
 (cd "$P12_REPO" && git tag -a -m "git made this" gitmade) 2>/dev/null
 (cd "$P12_REPO" && "$SG" tag) 2>/dev/null | grep -q "^gitmade\$"
 check "phase12 case3: sg tag lists a tag created by real git" test $? = 0
 (cd "$P12_REPO" && "$SG" tag from-gitmade gitmade) > /dev/null 2>&1
 check "phase12 case3: sg tag <name> <rev> using a real-git annotated tag as <rev> exits 0" test $? = 0
-check "phase12 case3: sg peeled the real-git annotated tag to the tagged commit, not the tag object id" \
-    test "$(cd "$P12_REPO" && git rev-parse from-gitmade)" = "$P12_HEAD"
+check "phase12 case3 (Phase 73 fix): sg tag does NOT peel -- the new ref names the TAG OBJECT itself, same id as the source tag" \
+    test "$(cd "$P12_REPO" && git rev-parse from-gitmade)" = "$(cd "$P12_REPO" && git rev-parse gitmade)"
+check "phase12 case3 (Phase 73 fix) oracle: precondition -- 'from-gitmade' really is a TAG object, not a ref straight to the commit" \
+    test "$(cd "$P12_REPO" && git cat-file -t refs/tags/from-gitmade)" = "tag"
+(cd "$P12_REPO" && "$SG" switch --detach gitmade) > /dev/null 2>&1
+check "phase12 case3 (moved intent): sg CAN still peel a real-git-made annotated tag, via a command that genuinely peels (sg switch --detach)" \
+    test "$(cd "$P12_REPO" && git rev-parse HEAD)" = "$P12_HEAD"
+(cd "$P12_REPO" && "$SG" switch master) > /dev/null 2>&1
 
 # case 4: listing order matches git tag -l (byte-wise sort)
 P12_SG_LIST="$WORKDIR/p12_sg_list.txt"
@@ -3779,16 +3791,21 @@ check "phase12 case10: -d --force rejection did not delete the tag" test $? = 0
 check "phase12 case10: real git also rejects tag -d --force <name> (sanity check on the test itself)" \
     test $? != 0
 
-# case 11: -d with a second name argument is a usage error, not a silent
-# partial delete (this project doesn't support multi-name delete, but must
-# not silently drop the second name and delete only the first).
+# case 11 (Phase 73 fix): -d with a second name argument is NOW SUPPORTED --
+# this used to assert the opposite (a usage error rejecting both names,
+# "this project doesn't support multi-name delete"). Phase 73 measured
+# real git: `git tag -d name1 name2` deletes BOTH, in argv order, not a
+# usage error -- so multi-name -d is no longer special-cased as an error
+# here either. Do not restore the old assertion; it pinned the old gap,
+# not the fix. See the phase73 section below for the per-name
+# partial-failure semantics (a name that does NOT exist among several).
 (cd "$P12_REPO" && "$SG" tag dmulti1 && "$SG" tag dmulti2) > /dev/null 2>&1
 (cd "$P12_REPO" && "$SG" tag -d dmulti1 dmulti2) > /dev/null 2>&1
-check "phase12 case11: sg tag -d <name1> <name2> is rejected" test $? = 1
+check "phase12 case11 (Phase 73 fix): sg tag -d <name1> <name2> now succeeds (exit 0), matching git" test $? = 0
 (cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dmulti1\$"
-check "phase12 case11: rejection did not delete the first name either" test $? = 0
+check "phase12 case11 (Phase 73 fix): the first name was deleted" test $? != 0
 (cd "$P12_REPO" && git tag -l) 2>/dev/null | grep -q "^dmulti2\$"
-check "phase12 case11: rejection did not delete the second name" test $? = 0
+check "phase12 case11 (Phase 73 fix): the second name was also deleted" test $? != 0
 
 # --- Phase 9: gitignore conformance sweep -- sg status vs git status -------
 # The strongest oracle in this phase: one tree whose paths exercise every
@@ -19282,18 +19299,14 @@ cp -R "$P70B_SYM" "$P70B_SYM_PACKED"
 check "phase70b control: a PACKED equivalent also refuses, but for packed-refs' own exact strcmp, not the new gate -- not evidence the gate itself works" \
     test $? -ne 0
 
-# --- Phase 70b (4): PIN, DO NOT FIX -- a pre-existing gap in cmd_tag.c's
-# own topic, unrelated to revparse: "sg tag <new> <existing-annotated-tag>"
-# PEELS the source tag to its underlying commit, where real git creates
-# ANOTHER tag object pointing at the same target. Measured on the
-# PRE-Phase-70 binary for the two literal spellings (bare name,
-# "refs/tags/<name>") -- both were ALREADY wrong before this phase
-# existed; Phase 70 only adds a third spelling ("tags/<name>") that
-# reaches the identical bug (previously refused outright). Not this
-# phase's fix to make -- cmd_tag.c needs sg tag's full matrix (-a, -f,
-# lightweight vs annotated) measured first, in its own phase. Pinned by
-# name so closing it later turns this red rather than silently changing
-# what it compares (same convention as Phase 69's heads/<name> gap). ---
+# --- Phase 70b (4), FIXED BY PHASE 73: this used to PIN a pre-existing
+# gap in cmd_tag.c's own topic, unrelated to revparse -- "sg tag <new>
+# <existing-annotated-tag>" used to PEEL the source tag to its underlying
+# commit, where real git creates ANOTHER tag object pointing at the same
+# target. Phase 73 fixed cmd_tag.c to resolve <rev> via sg_rev_parse_object
+# (which does not peel) instead of sg_rev_parse_commit, closing this gap
+# for all three spellings (bare name, "refs/tags/<name>", "tags/<name>").
+# Do not restore the old assertion -- it pinned the bug, not the fix. ---
 P70B_TAGPEEL="$WORKDIR/p70b_tagpeel"
 rm -rf "$P70B_TAGPEEL"
 mkdir -p "$P70B_TAGPEEL"
@@ -19307,9 +19320,17 @@ printf 'x\n' > "$P70B_TAGPEEL/x.txt"
 check "phase70b oracle: precondition -- real git's 'tag new tags/<annotated-tag>' creates a TAG object, not a peeled commit" \
     sh -c "test \"\$(cd '$P70B_TAGPEEL' && git cat-file -t refs/tags/new_git)\" = 'tag'"
 (cd "$P70B_TAGPEEL" && "$SG" tag new_sg tags/atag) > /dev/null 2>&1
-check "phase70b: pre-existing gap, NOT fixed here (cmd_tag.c's own topic) -- sg tag PEELS 'tags/<annotated-tag>' to a commit where git creates a tag object; closing it later must turn this check red by name" \
-    sh -c "test \"\$(cd '$P70B_TAGPEEL' && git cat-file -t refs/tags/new_sg)\" = 'commit'"
-check "phase70b control: sg cat-file -t on the SAME 'tags/<name>' spelling does NOT peel (this dimension is correct)" \
+check "phase70b (Phase 73 fix): sg tag no longer peels 'tags/<annotated-tag>' -- it now creates a TAG object too, matching git" \
+    sh -c "test \"\$(cd '$P70B_TAGPEEL' && git cat-file -t refs/tags/new_sg)\" = 'tag'"
+# Both new_git and new_sg are LIGHTWEIGHT tags (no -a/-m) -- unlike
+# section 1e's ANNOTATED case, a lightweight tag creates no new object at
+# all, it is just a second ref to whatever id it names. So new_sg's own
+# id must equal atag's own (unpeeled) id directly -- comparing the two
+# taggers does not apply here (there is no new tagger; there is no new
+# object).
+check "phase70b (Phase 73 fix): ...and new_sg's id is exactly atag's own (unpeeled) tag object id, same as new_git's" \
+    sh -c "test \"\$(cd '$P70B_TAGPEEL' && git rev-parse refs/tags/new_sg)\" = \"\$(cd '$P70B_TAGPEEL' && git rev-parse refs/tags/atag)\""
+check "phase70b control: sg cat-file -t on the SAME 'tags/<name>' spelling does NOT peel (this dimension was already correct)" \
     sh -c "test \"\$(cd '$P70B_TAGPEEL' && \"$SG\" cat-file -t tags/atag)\" = 'tag'"
 
 # --- Phase 68b review round: the SG_REV_TREEISH mode for "<rev>:<path>" ---
@@ -20225,6 +20246,558 @@ check "phase72 case5: June instant (America/New_York) -- sg and git agree on the
     test "$P72_C5_JUN_SG_ID" = "$P72_C5_JUN_GIT_ID"
 check "phase72 case5: November and June resolve to DIFFERENT offsets (DST), proving this is not a cached single value" \
     test "$P72_C5_NOV_SG_ID" != "$P72_C5_JUN_SG_ID"
+
+echo ""
+
+# --- Phase 73: sg tag matrix ------------------------------------------------
+# Review round 7: whether refs/tags/Foo and refs/tags/foo alias the SAME
+# file is a FILESYSTEM property (macOS's default APFS/HFS+ fold case,
+# Linux's ext4 does not), and one interop check below is only meaningful
+# -- and only reachable at all -- where the filesystem folds. Probe it at
+# runtime with a plain touch+test, unrelated to git/sg entirely, rather
+# than assuming "this machine" one way or the other.
+P73_CASEFOLD_PROBE="$WORKDIR/phase73_casefold_probe"
+rm -rf "$P73_CASEFOLD_PROBE"
+mkdir -p "$P73_CASEFOLD_PROBE"
+touch "$P73_CASEFOLD_PROBE/CaseProbe"
+if [ -f "$P73_CASEFOLD_PROBE/caseprobe" ]; then
+    P73_FS_CASE_INSENSITIVE=1
+else
+    P73_FS_CASE_INSENSITIVE=0
+fi
+
+# Fixture used throughout: two commits on master, a branch topic, a
+# lightweight tag lw -> c2, an annotated tag atag -> c2, and an annotated
+# tag atag2 -> atag (a tag of a tag). Every case below copies this pristine
+# repo fresh, so cases cannot interfere with each other's tag namespace.
+P73_PRISTINE="$WORKDIR/phase73_pristine"
+rm -rf "$P73_PRISTINE"
+mkdir -p "$P73_PRISTINE"
+git init -q -b master "$P73_PRISTINE" > /dev/null 2>&1
+(cd "$P73_PRISTINE" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+    > /dev/null 2>&1
+printf 'line1\n' > "$P73_PRISTINE/f.txt"
+(cd "$P73_PRISTINE" && git add f.txt && GIT_AUTHOR_DATE="@1700000000 +0000" \
+    GIT_COMMITTER_DATE="@1700000000 +0000" git commit -q -m c1) > /dev/null 2>&1
+printf 'line1\nline2\n' > "$P73_PRISTINE/f.txt"
+(cd "$P73_PRISTINE" && git add f.txt && GIT_AUTHOR_DATE="@1700000100 +0000" \
+    GIT_COMMITTER_DATE="@1700000100 +0000" git commit -q -m c2) > /dev/null 2>&1
+(cd "$P73_PRISTINE" && git branch topic) > /dev/null 2>&1
+(cd "$P73_PRISTINE" && git tag lw) > /dev/null 2>&1
+(cd "$P73_PRISTINE" && GIT_AUTHOR_DATE="@1700000200 +0000" GIT_COMMITTER_DATE="@1700000200 +0000" \
+    git tag -a -m "annotated msg" atag) > /dev/null 2>&1
+(cd "$P73_PRISTINE" && GIT_AUTHOR_DATE="@1700000300 +0000" GIT_COMMITTER_DATE="@1700000300 +0000" \
+    git tag -a -m "outer" atag2 atag) > /dev/null 2>&1
+# A THIRD level (atag3 -> atag2 -> atag -> commit) is a separate
+# discriminator from the two-level atag2 case above, not a redundant
+# extra: an implementation that peels ONE level too few (rather than not
+# peeling at all) would still pass "tag t atag2" by landing on atag's own
+# id, since that is only one hop short of atag2's id. Only a chain three
+# deep tells "peels one fewer level" apart from "does not peel at all" --
+# do not delete either row on the assumption they test the same thing.
+(cd "$P73_PRISTINE" && GIT_AUTHOR_DATE="@1700000400 +0000" GIT_COMMITTER_DATE="@1700000400 +0000" \
+    git tag -a -m "outermost" atag3 atag2) > /dev/null 2>&1
+P73_C1=$(cd "$P73_PRISTINE" && git rev-parse HEAD~1)
+P73_C2=$(cd "$P73_PRISTINE" && git rev-parse HEAD)
+P73_ATAG_ID=$(cd "$P73_PRISTINE" && git rev-parse refs/tags/atag)
+P73_ATAG2_ID=$(cd "$P73_PRISTINE" && git rev-parse refs/tags/atag2)
+P73_ATAG3_ID=$(cd "$P73_PRISTINE" && git rev-parse refs/tags/atag3)
+
+# section 1: <rev> must NOT be peeled ----------------------------------------
+
+# 1a/1b/1c: lightweight of an annotated tag, all three spellings -- must
+# land on the TAG OBJECT itself, not the commit it names.
+for spelling in atag refs/tags/atag tags/atag; do
+    P73_1_SG="$WORKDIR/phase73_1_sg_$(echo "$spelling" | tr / _)"
+    rm -rf "$P73_1_SG"
+    cp -R "$P73_PRISTINE" "$P73_1_SG"
+    (cd "$P73_1_SG" && "$SG" tag t "$spelling") > /dev/null 2>&1
+    check "phase73 case1: sg tag t '$spelling' exits 0" test $? = 0
+    check "phase73 case1: sg tag t '$spelling' lands on the TAG OBJECT, not the peeled commit" \
+        test "$(cd "$P73_1_SG" && git rev-parse refs/tags/t)" = "$P73_ATAG_ID"
+    check "phase73 case1: ...and git cat-file -t agrees it is a tag, not a commit" \
+        test "$(cd "$P73_1_SG" && git cat-file -t refs/tags/t)" = "tag"
+done
+
+# 1d: lightweight of a tag-of-a-tag -- lands on the OUTER tag object,
+# two levels of peeling both skipped.
+P73_1D="$WORKDIR/phase73_1d"
+rm -rf "$P73_1D"
+cp -R "$P73_PRISTINE" "$P73_1D"
+(cd "$P73_1D" && "$SG" tag t atag2) > /dev/null 2>&1
+check "phase73 case1d: sg tag t atag2 exits 0" test $? = 0
+check "phase73 case1d: sg tag t atag2 lands on the OUTER tag object (atag2), not the commit two levels down" \
+    test "$(cd "$P73_1D" && git rev-parse refs/tags/t)" = "$P73_ATAG2_ID"
+
+# 1d2: a THIRD level (atag3 -> atag2 -> atag -> commit). This is not
+# redundant with 1d: an implementation that peels one level too few (e.g.
+# stops after following a tag's OWN "object" field exactly once) would
+# still pass 1d by coincidence, landing on atag's id when the test only
+# checks it is not the commit -- it takes a chain three deep to tell
+# "peels one fewer level" apart from "does not peel at all".
+P73_1D2="$WORKDIR/phase73_1d2"
+rm -rf "$P73_1D2"
+cp -R "$P73_PRISTINE" "$P73_1D2"
+(cd "$P73_1D2" && "$SG" tag t atag3) > /dev/null 2>&1
+check "phase73 case1d2: sg tag t atag3 exits 0" test $? = 0
+check "phase73 case1d2: sg tag t atag3 lands on the OUTERMOST tag object (atag3), not one-level-peeled (atag2) or fully peeled (the commit)" \
+    test "$(cd "$P73_1D2" && git rev-parse refs/tags/t)" = "$P73_ATAG3_ID"
+
+# 1e: annotated tag OF an annotated tag -- type "tag", object == atag's
+# own id, not the commit.
+P73_1E="$WORKDIR/phase73_1e"
+rm -rf "$P73_1E"
+cp -R "$P73_PRISTINE" "$P73_1E"
+(cd "$P73_1E" && "$SG" tag -a -m m t atag) > /dev/null 2>&1
+check "phase73 case1e: sg tag -a -m m t atag exits 0" test $? = 0
+check "phase73 case1e: the new annotated tag's type header is 'tag', not 'commit'" \
+    test "$(cd "$P73_1E" && git cat-file -p refs/tags/t | sed -n 's/^type //p')" = "tag"
+check "phase73 case1e: ...and its object header names atag's own id, not the commit underneath" \
+    test "$(cd "$P73_1E" && git cat-file -p refs/tags/t | sed -n 's/^object //p')" = "$P73_ATAG_ID"
+
+# 1f: a tree or blob can be tagged now, lightweight and annotated alike --
+# "<rev>:<path>" reaches a blob, and "<rev>:" (empty path) reaches the
+# commit's own tree.
+P73_1F="$WORKDIR/phase73_1f"
+rm -rf "$P73_1F"
+cp -R "$P73_PRISTINE" "$P73_1F"
+P73_TREE_ID=$(cd "$P73_1F" && git rev-parse HEAD^{tree})
+P73_BLOB_ID=$(cd "$P73_1F" && git rev-parse HEAD:f.txt)
+(cd "$P73_1F" && "$SG" tag tt "HEAD:") > /dev/null 2>&1
+check "phase73 case1f: sg tag tt HEAD: (empty path -> the commit's own tree) exits 0" test $? = 0
+check "phase73 case1f: ...and lands on the commit's own tree id" \
+    test "$(cd "$P73_1F" && git rev-parse refs/tags/tt)" = "$P73_TREE_ID"
+(cd "$P73_1F" && "$SG" tag bt "HEAD:f.txt") > /dev/null 2>&1
+check "phase73 case1f: sg tag bt HEAD:f.txt (a blob) exits 0 -- sg used to answer 'cannot resolve'" test $? = 0
+check "phase73 case1f: ...and lands on the blob id" \
+    test "$(cd "$P73_1F" && git rev-parse refs/tags/bt)" = "$P73_BLOB_ID"
+(cd "$P73_1F" && "$SG" tag -a -m m abt "HEAD:f.txt") > /dev/null 2>&1
+check "phase73 case1f: sg tag -a -m m abt HEAD:f.txt exits 0" test $? = 0
+check "phase73 case1f: ...and the annotated tag's type header reads 'blob'" \
+    test "$(cd "$P73_1F" && git cat-file -p refs/tags/abt | sed -n 's/^type //p')" = "blob"
+
+# 1g: the nested-tag hint block is git's own vocabulary (advice.nestedTag) --
+# sg does not reproduce it, deliberately. Both exit 0; git's stderr is
+# non-empty, sg's is empty.
+P73_1G_GIT="$WORKDIR/phase73_1g_git"
+P73_1G_SG="$WORKDIR/phase73_1g_sg"
+rm -rf "$P73_1G_GIT" "$P73_1G_SG"
+cp -R "$P73_PRISTINE" "$P73_1G_GIT"
+cp -R "$P73_PRISTINE" "$P73_1G_SG"
+(cd "$P73_1G_GIT" && git tag -a -m m t atag) > "$WORKDIR/p73_1g_git.out" 2> "$WORKDIR/p73_1g_git.err"
+check "phase73 case1g: git tag -a of an annotated tag exits 0" test $? = 0
+check "phase73 case1g oracle: precondition -- git's nested-tag hint really is on stderr" \
+    test -s "$WORKDIR/p73_1g_git.err"
+(cd "$P73_1G_SG" && "$SG" tag -a -m m t atag) > "$WORKDIR/p73_1g_sg.out" 2> "$WORKDIR/p73_1g_sg.err"
+check "phase73 case1g: sg tag -a of an annotated tag also exits 0" test $? = 0
+check "phase73 case1g (deliberate divergence, pinned both sides): sg prints NO nested-tag hint -- it reads no config, so it could not honour advice.nestedTag" \
+    test ! -s "$WORKDIR/p73_1g_sg.err"
+
+# case1h (review round 6): an invalid tag name's error message was missing
+# git's trailing period ("fatal: 'bad name' is not a valid tag name." vs
+# sg's "sg: 'bad name' is not a valid tag name") -- the same sibling of
+# round 5's "not found" fix, in the same file, previously uncovered by any
+# check (`grep -n "valid tag name" tests/interop.sh` returned nothing
+# before this). Note git's prefix here is `fatal:`, not `error:` (the
+# `-d` messages' prefix) -- the strip pattern has to handle both.
+P73_1H_GIT="$WORKDIR/phase73_1h_git"
+P73_1H_SG="$WORKDIR/phase73_1h_sg"
+rm -rf "$P73_1H_GIT" "$P73_1H_SG"
+cp -R "$P73_PRISTINE" "$P73_1H_GIT"
+cp -R "$P73_PRISTINE" "$P73_1H_SG"
+(cd "$P73_1H_GIT" && LC_ALL=C git tag 'bad name') > "$WORKDIR/p73_1h_git.out" 2>&1
+P73_1H_GIT_RC=$?
+(cd "$P73_1H_SG" && "$SG" tag 'bad name') > "$WORKDIR/p73_1h_sg.out" 2>&1
+P73_1H_SG_RC=$?
+check "phase73 case1h: sg tag 'bad name' is rejected, same as git (exit codes differ by this project's own 128-vs-1 convention)" \
+    test "$P73_1H_GIT_RC" = 128 -a "$P73_1H_SG_RC" = 1
+sed -e 's/^fatal: //' -e 's/^error: //' "$WORKDIR/p73_1h_git.out" > "$WORKDIR/p73_1h_git.stripped"
+sed -e 's/^sg: //' "$WORKDIR/p73_1h_sg.out" > "$WORKDIR/p73_1h_sg.stripped"
+check "phase73 case1h: sg's message matches git's byte for byte with each tool's own prefix stripped (the trailing period, in particular)" \
+    cmp -s "$WORKDIR/p73_1h_sg.stripped" "$WORKDIR/p73_1h_git.stripped"
+
+# case1i (review round 6, deliberate divergence -- record, do not unify):
+# an UNRESOLVABLE <rev> produces a whole different SENTENCE, not just
+# punctuation. git: "Failed to resolve 'x' as a valid ref."; sg:
+# "cannot resolve 'x'". sg's wording is the generic revparse message
+# shared across several commands (cmd_show.c, cmd_cat_file.c, ...) --
+# changing it here alone would either ripple into those or make sg tag
+# inconsistent with its own siblings, so this is pinned as a named,
+# deliberate divergence (see docs/DESIGN.md's Phase 73 section) rather
+# than "fixed" into byte agreement.
+P73_1I_GIT="$WORKDIR/phase73_1i_git"
+P73_1I_SG="$WORKDIR/phase73_1i_sg"
+rm -rf "$P73_1I_GIT" "$P73_1I_SG"
+cp -R "$P73_PRISTINE" "$P73_1I_GIT"
+cp -R "$P73_PRISTINE" "$P73_1I_SG"
+(cd "$P73_1I_GIT" && LC_ALL=C git tag t nosuchrev) > "$WORKDIR/p73_1i_git.out" 2>&1
+P73_1I_GIT_RC=$?
+(cd "$P73_1I_SG" && "$SG" tag t nosuchrev) > "$WORKDIR/p73_1i_sg.out" 2>&1
+P73_1I_SG_RC=$?
+check "phase73 case1i: both tools reject an unresolvable <rev> (exit codes differ by this project's own 128-vs-1 convention)" \
+    test "$P73_1I_GIT_RC" = 128 -a "$P73_1I_SG_RC" = 1
+check "phase73 case1i oracle: precondition -- git's own wording is 'Failed to resolve ... as a valid ref.'" \
+    grep -q "Failed to resolve 'nosuchrev' as a valid ref\." "$WORKDIR/p73_1i_git.out"
+check "phase73 case1i (deliberate divergence, pinned both sides, NOT unified): sg's wording is its own generic revparse message 'cannot resolve', a different sentence, not just punctuation" \
+    grep -q "cannot resolve 'nosuchrev'" "$WORKDIR/p73_1i_sg.out"
+
+# section 2/3: -d takes many names, per-name partial failure, and the ------
+# "Deleted tag"/"Updated tag" stdout messages ---------------------------
+
+P73_23_GIT="$WORKDIR/phase73_23_git"
+P73_23_SG="$WORKDIR/phase73_23_sg"
+rm -rf "$P73_23_GIT" "$P73_23_SG"
+cp -R "$P73_PRISTINE" "$P73_23_GIT"
+cp -R "$P73_PRISTINE" "$P73_23_SG"
+(cd "$P73_23_GIT" && LC_ALL=C git -c core.abbrev=7 tag -d atag nosuch lw) > "$WORKDIR/p73_23_git.out" 2>&1
+P73_23_GIT_RC=$?
+(cd "$P73_23_SG" && "$SG" tag -d atag nosuch lw) > "$WORKDIR/p73_23_sg.out" 2>&1
+P73_23_SG_RC=$?
+check "phase73 case2: sg tag -d atag nosuch lw exits 1 (partial failure), same as git" \
+    test "$P73_23_GIT_RC" = 1 -a "$P73_23_SG_RC" = 1
+check "phase73 case2/3: the two successful 'Deleted tag ... (was <7hex>)' lines match git byte for byte (core.abbrev=7 pinned on git's side)" \
+    sh -c "grep '^Deleted tag' '$WORKDIR/p73_23_sg.out' > '$WORKDIR/p73_23_sg.deleted' ; \
+           grep '^Deleted tag' '$WORKDIR/p73_23_git.out' > '$WORKDIR/p73_23_git.deleted' ; \
+           cmp -s '$WORKDIR/p73_23_sg.deleted' '$WORKDIR/p73_23_git.deleted'"
+check "phase73 case2: atag was actually deleted (not all-or-nothing)" \
+    sh -c "! (cd '$P73_23_SG' && git rev-parse --verify refs/tags/atag) > /dev/null 2>&1"
+check "phase73 case2: lw was actually deleted (not all-or-nothing)" \
+    sh -c "! (cd '$P73_23_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+check "phase73 case2: atag2 (not named) survives" \
+    sh -c "(cd '$P73_23_SG' && git rev-parse --verify refs/tags/atag2) > /dev/null 2>&1"
+
+# -d with every name missing: still exit 1, nothing deleted.
+P73_2B_SG="$WORKDIR/phase73_2b_sg"
+rm -rf "$P73_2B_SG"
+cp -R "$P73_PRISTINE" "$P73_2B_SG"
+(cd "$P73_2B_SG" && "$SG" tag -d nosuch1 nosuch2) > /dev/null 2>&1
+check "phase73 case2b: -d with every name missing exits 1" test $? = 1
+check "phase73 case2b: ...and nothing at all was deleted" \
+    sh -c "(cd '$P73_2B_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+
+# case2c (review round 2): a name repeated in the SAME invocation refuses
+# the WHOLE batch and deletes NOTHING -- this is a ref-transaction property
+# in real git ("could not delete references: multiple updates for ref
+# '<path>' not allowed", the same shape cmd_push.c documents for the
+# refs/sg/chunks keepalive), not a per-name one. "-d lw lw" is the easy
+# case; "-d lw atag lw" is the DISCRIMINATING row -- an implementation that
+# checks for the duplicate too late (after the first deletion, or skips
+# just the duplicate and deletes the rest) still exits 1 on both rows,
+# identical to the correct one, while silently deleting atag on the
+# second. So every row here asserts the SURVIVING TAG LIST, not just the
+# exit code.
+P73_2C_GIT="$WORKDIR/phase73_2c_git"
+P73_2C_SG="$WORKDIR/phase73_2c_sg"
+rm -rf "$P73_2C_GIT" "$P73_2C_SG"
+cp -R "$P73_PRISTINE" "$P73_2C_GIT"
+cp -R "$P73_PRISTINE" "$P73_2C_SG"
+(cd "$P73_2C_GIT" && LC_ALL=C git tag -d lw lw) > "$WORKDIR/p73_2c_git.out" 2>&1
+P73_2C_GIT_RC=$?
+(cd "$P73_2C_SG" && "$SG" tag -d lw lw) > "$WORKDIR/p73_2c_sg.out" 2>&1
+P73_2C_SG_RC=$?
+check "phase73 case2c: sg tag -d lw lw (name repeated) exits 1, same as git" \
+    test "$P73_2C_GIT_RC" = 1 -a "$P73_2C_SG_RC" = 1
+check "phase73 case2c: git deleted NOTHING (lw survives)" \
+    sh -c "(cd '$P73_2C_GIT' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+check "phase73 case2c: sg ALSO deleted nothing (lw survives) -- not 'delete once, ignore the repeat'" \
+    sh -c "(cd '$P73_2C_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+check "phase73 case2c: sg's error message matches git's shape (only the 'sg: ' prefix convention differs)" \
+    test "$(cat "$WORKDIR/p73_2c_sg.out")" = "sg: $(sed -n 's/^error: //p' "$WORKDIR/p73_2c_git.out")"
+
+P73_2D_GIT="$WORKDIR/phase73_2d_git"
+P73_2D_SG="$WORKDIR/phase73_2d_sg"
+rm -rf "$P73_2D_GIT" "$P73_2D_SG"
+cp -R "$P73_PRISTINE" "$P73_2D_GIT"
+cp -R "$P73_PRISTINE" "$P73_2D_SG"
+(cd "$P73_2D_GIT" && LC_ALL=C git tag -d lw atag lw) > /dev/null 2>&1
+P73_2D_GIT_RC=$?
+(cd "$P73_2D_SG" && "$SG" tag -d lw atag lw) > /dev/null 2>&1
+P73_2D_SG_RC=$?
+check "phase73 case2d (the discriminating row): sg tag -d lw atag lw exits 1, same as git" \
+    test "$P73_2D_GIT_RC" = 1 -a "$P73_2D_SG_RC" = 1
+check "phase73 case2d oracle: precondition -- git's surviving tag list is unchanged (atag, atag2, lw all present)" \
+    sh -c "(cd '$P73_2D_GIT' && git rev-parse --verify refs/tags/atag) > /dev/null 2>&1 && \
+           (cd '$P73_2D_GIT' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+check "phase73 case2d: sg's surviving tag list is ALSO unchanged -- atag survives (a late or per-name duplicate check would have deleted it)" \
+    sh -c "(cd '$P73_2D_SG' && git rev-parse --verify refs/tags/atag) > /dev/null 2>&1"
+check "phase73 case2d: ...and lw also survives" \
+    sh -c "(cd '$P73_2D_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+
+# case2f (review round 3): the duplicate-name refusal is a property of
+# git's ref TRANSACTION, so it only applies to a name that actually
+# ENTERS that transaction -- i.e. one that resolves to an EXISTING tag. A
+# repeated name that does NOT exist blocks nothing; it is just reported
+# "not found" once per occurrence (measured: `git tag -d nosuch atag
+# nosuch` deletes atag and prints "not found" twice). "-d nosuch nosuch"
+# alone cannot catch a scan keyed on bare argv equality, because there is
+# nothing to delete either way -- the discriminating input needs a
+# duplicated MISSING name PLUS a distinct EXISTING one, which is exactly
+# this fixture. Assert the surviving tag list, not just the exit code:
+# both the correct and the over-refusing implementation exit 1 here.
+P73_2F_GIT="$WORKDIR/phase73_2f_git"
+P73_2F_SG="$WORKDIR/phase73_2f_sg"
+rm -rf "$P73_2F_GIT" "$P73_2F_SG"
+cp -R "$P73_PRISTINE" "$P73_2F_GIT"
+cp -R "$P73_PRISTINE" "$P73_2F_SG"
+(cd "$P73_2F_GIT" && LC_ALL=C git tag -d nosuch atag nosuch) > /dev/null 2>&1
+P73_2F_GIT_RC=$?
+(cd "$P73_2F_SG" && "$SG" tag -d nosuch atag nosuch) > /dev/null 2>&1
+P73_2F_SG_RC=$?
+check "phase73 case2f: sg tag -d nosuch atag nosuch exits 1, same as git" \
+    test "$P73_2F_GIT_RC" = 1 -a "$P73_2F_SG_RC" = 1
+check "phase73 case2f oracle: precondition -- git DELETED atag despite the repeated missing name (a repeated MISSING name blocks nothing)" \
+    sh -c "! (cd '$P73_2F_GIT' && git rev-parse --verify refs/tags/atag) > /dev/null 2>&1"
+check "phase73 case2f: sg ALSO deleted atag -- a scan keyed on bare argv equality would have wrongly refused the whole batch here" \
+    sh -c "! (cd '$P73_2F_SG' && git rev-parse --verify refs/tags/atag) > /dev/null 2>&1"
+check "phase73 case2f: ...and atag2/lw (untouched by this call) both survive on sg's side" \
+    sh -c "(cd '$P73_2F_SG' && git rev-parse --verify refs/tags/atag2) > /dev/null 2>&1 && \
+           (cd '$P73_2F_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+
+# case2g (review round 3): when two DIFFERENT existing names are each
+# duplicated, real git's message names the SMALLEST one by strcmp
+# ('atag2'), independent of argv order -- not the first duplicate found
+# while scanning argv (which would name 'lw' here, since it appears
+# first). Both tools refuse and delete nothing either way, so this is
+# message text only -- but this project treats error wording as
+# interface, and a divergence here would be a divergence for no reason.
+P73_2G_GIT="$WORKDIR/phase73_2g_git"
+P73_2G_SG="$WORKDIR/phase73_2g_sg"
+rm -rf "$P73_2G_GIT" "$P73_2G_SG"
+cp -R "$P73_PRISTINE" "$P73_2G_GIT"
+cp -R "$P73_PRISTINE" "$P73_2G_SG"
+(cd "$P73_2G_GIT" && LC_ALL=C git tag -d lw lw atag2 atag2) > "$WORKDIR/p73_2g_git.out" 2>&1
+(cd "$P73_2G_SG" && "$SG" tag -d lw lw atag2 atag2) > "$WORKDIR/p73_2g_sg.out" 2>&1
+check "phase73 case2g oracle: precondition -- git's message names the SMALLEST duplicated name (atag2), not the first-seen (lw)" \
+    grep -q "refs/tags/atag2" "$WORKDIR/p73_2g_git.out"
+check "phase73 case2g: sg's message ALSO names atag2, not lw (matching git's strcmp-smallest rule, not argv order)" \
+    grep -q "refs/tags/atag2" "$WORKDIR/p73_2g_sg.out"
+check "phase73 case2g: ...and nothing at all was deleted" \
+    sh -c "(cd '$P73_2G_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1 && \
+           (cd '$P73_2G_SG' && git rev-parse --verify refs/tags/atag2) > /dev/null 2>&1"
+
+# case2h (review round 4): the "not found" diagnostics for a MISSING name
+# and the transaction refusal for a DUPLICATED EXISTING name are not
+# alternatives -- both fire in the SAME invocation, and round 3's
+# early-return design swallowed the "not found" line entirely (it decided
+# existence and refused in one pass that returned before ever printing
+# anything for a missing name). Measured: `git tag -d nosuch lw lw`
+# prints "not found" for nosuch, THEN the refusal for lw -- both lines,
+# in that order. Assert both lines are present AND in that order, not
+# just that the refusal fires (which a naive grep for the refusal alone
+# would already pass, hiding the swallowed line).
+P73_2H_GIT="$WORKDIR/phase73_2h_git"
+P73_2H_SG="$WORKDIR/phase73_2h_sg"
+rm -rf "$P73_2H_GIT" "$P73_2H_SG"
+cp -R "$P73_PRISTINE" "$P73_2H_GIT"
+cp -R "$P73_PRISTINE" "$P73_2H_SG"
+(cd "$P73_2H_GIT" && LC_ALL=C git tag -d nosuch lw lw) > "$WORKDIR/p73_2h_git.out" 2>&1
+(cd "$P73_2H_SG" && "$SG" tag -d nosuch lw lw) > "$WORKDIR/p73_2h_sg.out" 2>&1
+check "phase73 case2h oracle: precondition -- git prints exactly two stderr lines, 'not found' then the refusal, in that order" \
+    sh -c "test \"\$(wc -l < "$WORKDIR/p73_2h_git.out")\" -eq 2 && \
+           sed -n 1p '$WORKDIR/p73_2h_git.out' | grep -q 'nosuch' && \
+           sed -n 2p '$WORKDIR/p73_2h_git.out' | grep -q 'refs/tags/lw'"
+check "phase73 case2h: sg ALSO prints exactly two lines, 'not found' then the refusal, in that order (round 3's early return swallowed the first line entirely)" \
+    sh -c "test \"\$(wc -l < "$WORKDIR/p73_2h_sg.out")\" -eq 2 && \
+           sed -n 1p '$WORKDIR/p73_2h_sg.out' | grep -q 'nosuch' && \
+           sed -n 2p '$WORKDIR/p73_2h_sg.out' | grep -q 'refs/tags/lw'"
+# review round 5: the two checks above compare LINE COUNT and ORDER, not
+# the lines' own CONTENT -- they would not have caught (and did not catch)
+# a pre-existing one-character divergence found by a cold review: git's
+# "not found" line ends with a period ("error: tag 'nosuch' not found."),
+# sg's did not ("sg: tag 'nosuch' not found"). Strip each tool's own
+# prefix ("error: " / "sg: ") and compare the remainder BYTE FOR BYTE, so
+# a future wording drift on either line fails this check by name instead
+# of hiding behind a count/order assertion that cannot see it.
+sed -e 's/^error: //' "$WORKDIR/p73_2h_git.out" > "$WORKDIR/p73_2h_git.stripped"
+sed -e 's/^sg: //' "$WORKDIR/p73_2h_sg.out" > "$WORKDIR/p73_2h_sg.stripped"
+check "phase73 case2h (content, not just count/order): both stderr lines match git byte for byte with each tool's own prefix stripped" \
+    cmp -s "$WORKDIR/p73_2h_sg.stripped" "$WORKDIR/p73_2h_git.stripped"
+check "phase73 case2h: nothing was deleted (lw survives)" \
+    sh -c "(cd '$P73_2H_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+
+# case2i (review round 4): a MISSING name repeated within the same
+# invocation is reported ONCE PER OCCURRENCE, not once total -- a fix
+# that deduplicates the diagnostic (prints "not found" a single time no
+# matter how many times the name repeats) would pass a naive grep on
+# case2h above and fail here, since case2h's missing name (nosuch) only
+# occurs once. Assert the exact line count, not just presence.
+P73_2I_GIT="$WORKDIR/phase73_2i_git"
+P73_2I_SG="$WORKDIR/phase73_2i_sg"
+rm -rf "$P73_2I_GIT" "$P73_2I_SG"
+cp -R "$P73_PRISTINE" "$P73_2I_GIT"
+cp -R "$P73_PRISTINE" "$P73_2I_SG"
+(cd "$P73_2I_GIT" && LC_ALL=C git tag -d nosuch nosuch lw lw) > "$WORKDIR/p73_2i_git.out" 2>&1
+(cd "$P73_2I_SG" && "$SG" tag -d nosuch nosuch lw lw) > "$WORKDIR/p73_2i_sg.out" 2>&1
+check "phase73 case2i oracle: precondition -- git prints 'not found' TWICE (once per occurrence), then the refusal (3 lines total)" \
+    sh -c "test \"\$(wc -l < "$WORKDIR/p73_2i_git.out")\" -eq 3 && \
+           test \"\$(grep -c 'nosuch' "$WORKDIR/p73_2i_git.out")\" -eq 2 && \
+           sed -n 3p '$WORKDIR/p73_2i_git.out' | grep -q 'refs/tags/lw'"
+check "phase73 case2i: sg ALSO prints 'not found' twice then the refusal (3 lines total) -- not deduplicated to once" \
+    sh -c "test \"\$(wc -l < "$WORKDIR/p73_2i_sg.out")\" -eq 3 && \
+           test \"\$(grep -c 'nosuch' "$WORKDIR/p73_2i_sg.out")\" -eq 2 && \
+           sed -n 3p '$WORKDIR/p73_2i_sg.out' | grep -q 'refs/tags/lw'"
+check "phase73 case2i: nothing was deleted (lw survives)" \
+    sh -c "(cd '$P73_2I_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
+
+# case2j (review round 7, KNOWN DIVERGENCE, macOS-only, DATA-LOSING --
+# see CLAUDE.md's "Deliberate divergences from real git" list and this
+# phase's own review round 7 section in docs/DESIGN.md). On a
+# case-FOLDING filesystem (macOS default, NOT Linux ext4),
+# `refs/tags/Foo` and `refs/tags/foo` are the SAME underlying file. Pass
+# 1 reads each argv spelling separately and both come back existing;
+# pass 2's refusal is keyed on `strcmp`, and "Foo" != "foo" byte for
+# byte, so it does not fire; pass 3 deletes 'Foo' and then fails to
+# re-read the now-gone 'foo'. Real git instead acquires a per-ref LOCK
+# for every name before deleting anything, and the second lock attempt
+# on the SAME underlying file collides with the first ("cannot lock ref
+# ... File exists"), refusing the whole batch and leaving Foo untouched.
+# Identical exit code (1), OPPOSITE effect on the repository -- the same
+# shape as round 2's duplicate-name bug, one level up: case-aliased
+# names instead of byte-identical ones.
+#
+# Reproducing git's per-ref lock acquisition is a real change to the
+# delete path and is explicitly OUT OF SCOPE for this round -- this
+# check exists to make the loss OBSERVABLE and NAMED, not to claim it is
+# fixed. skip()'d entirely on a case-sensitive filesystem (e.g. Linux
+# ext4, which CI also runs), where "Foo" and "foo" are two distinct refs
+# and sg's answer already agrees with git's.
+if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
+    P73_2J_BASE="$WORKDIR/phase73_2j_base"
+    rm -rf "$P73_2J_BASE"
+    mkdir -p "$P73_2J_BASE"
+    git init -q -b master "$P73_2J_BASE" > /dev/null 2>&1
+    (cd "$P73_2J_BASE" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+        > /dev/null 2>&1
+    printf 'x\n' > "$P73_2J_BASE/x.txt"
+    (cd "$P73_2J_BASE" && git add x.txt && GIT_AUTHOR_DATE="@1700000500 +0000" \
+        GIT_COMMITTER_DATE="@1700000500 +0000" git commit -q -m c1) > /dev/null 2>&1
+    (cd "$P73_2J_BASE" && git tag Foo) > /dev/null 2>&1
+
+    P73_2J_GIT="$WORKDIR/phase73_2j_git"
+    P73_2J_SG="$WORKDIR/phase73_2j_sg"
+    rm -rf "$P73_2J_GIT" "$P73_2J_SG"
+    cp -R "$P73_2J_BASE" "$P73_2J_GIT"
+    cp -R "$P73_2J_BASE" "$P73_2J_SG"
+    (cd "$P73_2J_GIT" && LC_ALL=C git tag -d Foo foo) > /dev/null 2>&1
+    P73_2J_GIT_RC=$?
+    (cd "$P73_2J_SG" && "$SG" tag -d Foo foo) > /dev/null 2>&1
+    P73_2J_SG_RC=$?
+    check "phase73 case2j oracle: precondition -- on this case-folding filesystem, git's per-ref lock refuses the whole batch (exit 1, Foo survives)" \
+        sh -c "test '$P73_2J_GIT_RC' = 1 && (cd '$P73_2J_GIT' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
+    check "phase73 case2j (KNOWN DIVERGENCE, NOT fixed this round -- pinned so the loss stays visible): sg tag -d Foo foo also exits 1, but DELETES Foo where git does not" \
+        sh -c "test '$P73_2J_SG_RC' = 1 && ! (cd '$P73_2J_SG' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
+else
+    skip "phase73 case2j: filesystem is case-sensitive (not macOS-default) -- refs/tags/Foo and refs/tags/foo do not alias here, so this divergence cannot occur"
+fi
+
+# -f actually moving a tag's value prints "Updated tag ... (was <7hex>)";
+# -f that changes nothing prints nothing at all -- keyed on the VALUE
+# moving, not on -f having replaced something.
+P73_3A_GIT="$WORKDIR/phase73_3a_git"
+P73_3A_SG="$WORKDIR/phase73_3a_sg"
+rm -rf "$P73_3A_GIT" "$P73_3A_SG"
+cp -R "$P73_PRISTINE" "$P73_3A_GIT"
+cp -R "$P73_PRISTINE" "$P73_3A_SG"
+(cd "$P73_3A_GIT" && LC_ALL=C git -c core.abbrev=7 tag -f atag "$P73_C1") > "$WORKDIR/p73_3a_git.out" 2>&1
+(cd "$P73_3A_SG" && "$SG" tag -f atag "$P73_C1") > "$WORKDIR/p73_3a_sg.out" 2>&1
+check "phase73 case3a: sg tag -f atag <older rev> (value actually moves) prints 'Updated tag', matching git byte for byte" \
+    cmp -s "$WORKDIR/p73_3a_sg.out" "$WORKDIR/p73_3a_git.out"
+check "phase73 case3a oracle: precondition -- git's own output really is non-empty here" \
+    test -s "$WORKDIR/p73_3a_git.out"
+
+P73_3B_SG="$WORKDIR/phase73_3b_sg"
+rm -rf "$P73_3B_SG"
+cp -R "$P73_PRISTINE" "$P73_3B_SG"
+(cd "$P73_3B_SG" && "$SG" tag -f lw "$P73_C2") > "$WORKDIR/p73_3b_sg.out" 2>&1
+check "phase73 case3b: sg tag -f lw <rev it already names> prints nothing (an implementation keyed on '-f replaced something' would print here)" \
+    test ! -s "$WORKDIR/p73_3b_sg.out"
+
+P73_3C_SG="$WORKDIR/phase73_3c_sg"
+rm -rf "$P73_3C_SG"
+cp -R "$P73_PRISTINE" "$P73_3C_SG"
+(cd "$P73_3C_SG" && "$SG" tag -f brandnew "$P73_C2") > "$WORKDIR/p73_3c_sg.out" 2>&1
+check "phase73 case3c: sg tag -f brandnew HEAD (did not exist before) prints nothing" \
+    test ! -s "$WORKDIR/p73_3c_sg.out"
+
+# section 4: a create-only flag with no tag name is a usage error -----------
+P73_4_SG="$WORKDIR/phase73_4_sg"
+rm -rf "$P73_4_SG"
+cp -R "$P73_PRISTINE" "$P73_4_SG"
+(cd "$P73_4_SG" && "$SG" tag -m hi) > /dev/null 2>&1
+check "phase73 case4: sg tag -m hi (create-only flag, no name) is a usage error, exit 1" test $? = 1
+(cd "$P73_4_SG" && "$SG" tag -f) > /dev/null 2>&1
+check "phase73 case4: sg tag -f (create-only flag, no name) is a usage error, exit 1" test $? = 1
+(cd "$P73_4_SG" && "$SG" tag -a -m hi) > /dev/null 2>&1
+check "phase73 case4: sg tag -a -m hi (create-only flags, no name) is a usage error, exit 1" test $? = 1
+(cd "$P73_4_SG" && "$SG" tag -f -a -m hi) > /dev/null 2>&1
+check "phase73 case4: sg tag -f -a -m hi (create-only flags, no name) is a usage error, exit 1" test $? = 1
+(cd "$P73_4_SG" && git -c core.abbrev=7 tag -m hi) > /dev/null 2>&1
+check "phase73 case4 oracle: precondition -- git itself refuses 'tag -m hi' (exit 129)" test $? = 129
+(cd "$P73_4_SG" && "$SG" tag) > /dev/null 2>&1
+check "phase73 case4: bare 'sg tag' with no arguments at all still lists (unaffected by the fix)" test $? = 0
+
+# section 6 (addendum): repeated -m JOINS with a blank line, not last-one-wins
+P73_6_SG="$WORKDIR/phase73_6_sg"
+rm -rf "$P73_6_SG"
+cp -R "$P73_PRISTINE" "$P73_6_SG"
+(cd "$P73_6_SG" && "$SG" tag -m one -m two joined2) > /dev/null 2>&1
+check "phase73 case6: sg tag -m one -m two exits 0" test $? = 0
+check "phase73 case6: sg tag joins two -m values with a blank line ('one\\n\\ntwo'), not last-one-wins" \
+    sh -c "test \"\$(cd '$P73_6_SG' && git cat-file -p refs/tags/joined2 | tail -n +6)\" = \"\$(printf 'one\n\ntwo')\""
+(cd "$P73_6_SG" && "$SG" tag -m one -m two -m three joined3) > /dev/null 2>&1
+check "phase73 case6: sg tag -m one -m two -m three joins all three ('one\\n\\ntwo\\n\\nthree')" \
+    sh -c "test \"\$(cd '$P73_6_SG' && git cat-file -p refs/tags/joined3 | tail -n +6)\" = \"\$(printf 'one\n\ntwo\n\nthree')\""
+
+P73_6_COMMIT="$WORKDIR/phase73_6_commit"
+rm -rf "$P73_6_COMMIT"
+mkdir -p "$P73_6_COMMIT"
+(cd "$WORKDIR" && "$SG" init phase73_6_commit) > /dev/null 2>&1
+printf 'x\n' > "$P73_6_COMMIT/x.txt"
+(cd "$P73_6_COMMIT" && "$SG" add x.txt) > /dev/null 2>&1
+(cd "$P73_6_COMMIT" && "$SG" commit -m one -m two) > /dev/null 2>&1
+check "phase73 case6: sg commit -m one -m two exits 0" test $? = 0
+check "phase73 case6: sg commit also joins repeated -m with a blank line, not last-one-wins (a different -m policy here produces a DIFFERENT object id)" \
+    sh -c "test \"\$(cd '$P73_6_COMMIT' && git log -1 --format=%B)\" = \"\$(printf 'one\n\ntwo\n')\""
+
+# control: sg stash push -m keeps LAST-ONE-WINS on both tools -- the join
+# rule above is not universal, and this is the boundary that proves it.
+P73_6_STASH_GIT="$WORKDIR/phase73_6_stash_git"
+P73_6_STASH_SG="$WORKDIR/phase73_6_stash_sg"
+rm -rf "$P73_6_STASH_GIT" "$P73_6_STASH_SG"
+mkdir -p "$P73_6_STASH_GIT"
+git init -q -b master "$P73_6_STASH_GIT" > /dev/null 2>&1
+(cd "$P73_6_STASH_GIT" && git config user.email "p73@example.com" && git config user.name "p73 tester")
+printf 'a\n' > "$P73_6_STASH_GIT/a.txt"
+(cd "$P73_6_STASH_GIT" && git add a.txt && git commit -q -m c1) > /dev/null 2>&1
+cp -R "$P73_6_STASH_GIT" "$P73_6_STASH_SG"
+printf 'a\nb\n' > "$P73_6_STASH_GIT/a.txt"
+printf 'a\nb\n' > "$P73_6_STASH_SG/a.txt"
+(cd "$P73_6_STASH_GIT" && git stash push -m one -m two) > "$WORKDIR/p73_6_stash_git.out" 2>&1
+(cd "$P73_6_STASH_SG" && "$SG" stash push -m one -m two) > /dev/null 2>&1
+check "phase73 case6 control: sg stash push -m one -m two exits 0" test $? = 0
+check "phase73 case6 control: git stash push -m one -m two is ALSO last-one-wins (message ends in 'two'), unlike tag/commit" \
+    sh -c "grep -q 'two\$' '$WORKDIR/p73_6_stash_git.out' && ! grep -q '^.*one' '$WORKDIR/p73_6_stash_git.out'"
+(cd "$P73_6_STASH_SG" && "$SG" stash list) > "$WORKDIR/p73_6_stash_sg_list.out" 2>&1
+check "phase73 case6 control: sg stash list also shows 'two', matching git's own last-one-wins -- cmd_stash.c is deliberately NOT converged onto sg_message_join" \
+    grep -q "two$" "$WORKDIR/p73_6_stash_sg_list.out"
+
+# section 7 (addendum): -d with NO names at all is NOT a usage error --
+# the opposite direction from section 4 (a create-only flag with no name
+# IS one). Deliberately not unified.
+P73_7_GIT="$WORKDIR/phase73_7_git"
+P73_7_SG="$WORKDIR/phase73_7_sg"
+rm -rf "$P73_7_GIT" "$P73_7_SG"
+cp -R "$P73_PRISTINE" "$P73_7_GIT"
+cp -R "$P73_PRISTINE" "$P73_7_SG"
+(cd "$P73_7_GIT" && git tag -d) > "$WORKDIR/p73_7_git.out" 2> "$WORKDIR/p73_7_git.err"
+check "phase73 case7 oracle: precondition -- git tag -d with no names exits 0" test $? = 0
+check "phase73 case7 oracle: precondition -- git tag -d with no names prints nothing" \
+    sh -c "test ! -s '$WORKDIR/p73_7_git.out' -a ! -s '$WORKDIR/p73_7_git.err'"
+(cd "$P73_7_SG" && "$SG" tag -d) > "$WORKDIR/p73_7_sg.out" 2> "$WORKDIR/p73_7_sg.err"
+check "phase73 case7: sg tag -d with no names ALSO exits 0 (opposite direction from section 4's create-only-flag rule)" \
+    test $? = 0
+check "phase73 case7: ...and prints nothing" \
+    sh -c "test ! -s '$WORKDIR/p73_7_sg.out' -a ! -s '$WORKDIR/p73_7_sg.err'"
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
