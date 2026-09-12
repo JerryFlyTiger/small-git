@@ -213,14 +213,41 @@ int sg_rev_parse_commit_ex(const char *git_dir, const char *rev, sg_rev_disambig
 /* Resolves a short <base> name (see sg_rev_parse_commit's grammar --
    "HEAD", a branch name, or a tag name; deliberately NOT a 40-hex object id,
    since an object id has no reflog) to the full ref path under git_dir that
-   a reflog reader (sg_reflog_read, or sg_ref_read_path for anything other
-   than "HEAD") would need: "HEAD" itself, "refs/tags/<name>",
-   "refs/heads/<name>", or -- if name already starts with "refs/" -- name
-   unchanged, PROVIDED that path actually exists. Tried in that order (same
-   disambiguation order as resolve_base in revparse.c, minus the 40-hex
-   case); the first that resolves wins. Returns 0 with out filled in
-   (truncation, i.e. out_size too small, is a failure, not a silent cut), -1
-   if name matches nothing. */
+   a reflog reader (sg_reflog_read, or sg_ref_read_path_resolved for
+   anything other than "HEAD") would need.
+
+   "HEAD" itself is returned first and unchanged, without requiring the ref
+   to exist (see sg_ref_resolve_head's own indirection for why). Everything
+   else goes through git's own gitrevisions lookup table
+   (ref_rev_parse_rules), tried IN ORDER with NO early return -- a miss at
+   any one rule falls through to the next, e.g. a "refs/foo" that is not
+   itself a ref can still resolve via "refs/tags/refs/foo":
+
+     "%s" (rule 1: name is itself a literal path under git_dir -- ANY file
+       whose first 40 bytes are hex, not just a ref; this is what makes
+       MERGE_HEAD/ORIG_HEAD/CHERRY_PICK_HEAD/REVERT_HEAD resolve),
+     "refs/%s" (rule 2 -- sits BEFORE rules 3/4: a name colliding with a
+       literal refs/<name> resolves there, not to a same-named tag/branch),
+     "refs/tags/%s" (rule 3), "refs/heads/%s" (rule 4),
+     "refs/remotes/%s" (rule 5), "refs/remotes/%s/HEAD" (rule 6 -- normally
+       a symref, e.g. what `sg clone` creates via sg_ref_set_symref).
+
+   name is gated first (a file-local predicate in revparse.c, not
+   sg_ref_branch_name_is_safe) against an empty name, a leading/trailing
+   '/', an empty path component, or a component that IS "." or "..";
+   rejected before any rule is tried. Each candidate is probed with
+   sg_ref_read_path_resolved (which follows a symref, needed for rules
+   5/6), and the first one that resolves wins. Returns 0 with out filled
+   in (truncation, i.e. out_size too small OR a candidate too long to fit
+   its own scratch buffer, is a failure -- never a silent cut and never
+   probed), -1 if name matches nothing or fails the gate.
+
+   Callers that then read the id at the returned path must use
+   sg_ref_read_path_resolved, not the plain sg_ref_read_path -- the
+   returned path may itself be a symref (rules 5/6), and sg_ref_read_path
+   does not follow one (resolve_base and sg_rev_parse_object both do this
+   already; HEAD is the one exception, resolved via sg_ref_resolve_head
+   instead). */
 int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size_t out_size);
 
 /* Resolves any object name -- a full 40-hex id, a ref (HEAD, branch, tag),

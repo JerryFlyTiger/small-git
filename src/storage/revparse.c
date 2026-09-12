@@ -330,13 +330,19 @@ static int resolve_base(const char *git_dir, const char *base, sg_rev_disambig d
     if (sg_rev_parse_ref_path(git_dir, base, ref_path, sizeof(ref_path)) == 0) {
         /* "HEAD" is a symref ("ref: refs/heads/<branch>\n"), not a raw oid
            file, so it needs sg_ref_resolve_head's indirection rather than
-           sg_ref_read_path (which would try to hex-decode the "ref: ..."
-           line and fail). Every other path sg_rev_parse_ref_path can
-           return (refs/tags/<n>, refs/heads/<n>, or an already-"refs/..."
-           name) is an ordinary oid file. */
+           sg_ref_read_path_resolved (which would follow it exactly the
+           same way, but HEAD's own indirection has its own detached-HEAD
+           handling that sg_ref_resolve_head owns). Every other path
+           sg_rev_parse_ref_path can return may ITSELF be a symref as of
+           Phase 70 (rules 5/6 -- refs/remotes/<name>[/HEAD] -- ordinarily
+           point through refs/remotes/<name>/HEAD), so this must follow
+           through it with sg_ref_read_path_resolved, not the
+           non-following sg_ref_read_path: for every other, ordinary oid
+           ref path the two read identically, so this is not a behavior
+           change for anything but a symref result. */
         if (strcmp(ref_path, "HEAD") == 0)
             return sg_ref_resolve_head(git_dir, id_out);
-        return sg_ref_read_path(git_dir, ref_path, id_out);
+        return sg_ref_read_path_resolved(git_dir, ref_path, id_out);
     }
 
     if (looks_like_oid_prefix(base, len))
@@ -345,11 +351,58 @@ static int resolve_base(const char *git_dir, const char *base, sg_rev_disambig d
     return -1;
 }
 
+/* The revparse-only name gate (Phase 70, section 3.1 of the spec). Blocks a
+   <base> string from becoming a hostile ref path BEFORE any of the six
+   gitrevisions patterns below are tried against it -- deliberately NOT a
+   tightening of sg_ref_branch_name_is_safe (refs.c), which has many other
+   callers (ref writes, transport, branch reads) this project has a
+   recorded lesson about not converging blindly. The hazard here is
+   specific to revparse: turning a user-supplied rev string into a ref
+   path. Rejects an empty name, a leading or trailing '/', any empty path
+   component ("//" anywhere), and any component that IS exactly "." or
+   "..". A '.' INSIDE a component (v1.0, a.b) is legal and must keep
+   working -- only a whole component of "." or ".." is rejected. Measured
+   against real git 2.55.0 (section 2.7): git refuses every one of these
+   spellings, while sg's pre-Phase-70 code resolved some of them (a loose
+   vs. packed-refs inconsistency that predates this phase). */
+static int name_is_safe_for_ref_path_lookup(const char *name)
+{
+    size_t i = 0;
+
+    if (name[0] == '\0')
+        return 0;
+
+    while (name[i] != '\0') {
+        size_t start = i;
+        size_t len;
+
+        while (name[i] != '\0' && name[i] != '/')
+            i++;
+        len = i - start;
+        /* An empty component happens at a leading '/', a trailing '/', or
+           "//" in the middle -- all three are the same check here. */
+        if (len == 0)
+            return 0;
+        if (len == 1 && name[start] == '.')
+            return 0;
+        if (len == 2 && name[start] == '.' && name[start + 1] == '.')
+            return 0;
+        if (name[i] == '/')
+            i++;
+    }
+    return 1;
+}
+
 int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size_t out_size)
 {
     unsigned char tmp[SG_SHA1_RAW_LEN];
     char candidate[SG_PATH_MAX];
+    size_t i;
 
+    /* "HEAD" is a symref ("ref: refs/heads/<branch>\n"), not a raw oid
+       file -- returned without requiring the ref to exist, since @{N} on
+       an unborn or detached HEAD depends on that (resolve_base handles the
+       indirection separately). This stays first and unchanged. */
     if (strcmp(name, "HEAD") == 0) {
         if (out_size < 5)
             return -1;
@@ -357,30 +410,37 @@ int sg_rev_parse_ref_path(const char *git_dir, const char *name, char *out, size
         return 0;
     }
 
-    /* Already a full ref path (e.g. "refs/heads/topic" passed straight
-       through by a caller that already qualified it): used as-is, but only
-       if it actually exists -- otherwise this would let a bogus
-       "refs/nonsense/foo" through unchallenged. */
-    if (strncmp(name, "refs/", 5) == 0) {
-        if (sg_ref_read_path(git_dir, name, tmp) != 0)
-            return -1;
-        if (strlen(name) >= out_size)
-            return -1;
-        strcpy(out, name);
-        return 0;
-    }
+    if (!name_is_safe_for_ref_path_lookup(name))
+        return -1;
 
-    if (snprintf(candidate, sizeof(candidate), "refs/tags/%s", name) < (int)sizeof(candidate) &&
-       sg_ref_read_path(git_dir, candidate, tmp) == 0) {
+    /* git's own gitrevisions lookup order (`ref_rev_parse_rules`), tried in
+       order, first hit wins. No early return between rules: a miss at any
+       one of them falls through to the next (measured, section 2.4 -- e.g.
+       a "refs/foo" that does not exist as a literal ref must still be
+       tried as "refs/refs/foo", "refs/tags/refs/foo", etc). Each candidate
+       is probed with sg_ref_read_path_resolved, which follows symrefs (rules
+       5/6 need this: refs/remotes/<name>/HEAD is ordinarily a symref, and
+       sg clone itself creates exactly this shape via sg_ref_set_symref). */
+    static const char *const patterns[] = {
+        "%s",
+        "refs/%s",
+        "refs/tags/%s",
+        "refs/heads/%s",
+        "refs/remotes/%s",
+        "refs/remotes/%s/HEAD",
+    };
+
+    for (i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        int len = snprintf(candidate, sizeof(candidate), patterns[i], name);
+
+        /* A truncated candidate must count as "this rule missed", never as
+           "found something else" -- the project's standing sg_path_join
+           rule -- so it must not even be probed. */
+        if (len < 0 || (size_t)len >= sizeof(candidate))
+            continue;
+        if (sg_ref_read_path_resolved(git_dir, candidate, tmp) != 0)
+            continue;
         if (strlen(candidate) >= out_size)
-            return -1;
-        strcpy(out, candidate);
-        return 0;
-    }
-
-    if (sg_ref_read_branch(git_dir, name, tmp) == 0) {
-        if (snprintf(candidate, sizeof(candidate), "refs/heads/%s", name) >= (int)sizeof(candidate) ||
-           strlen(candidate) >= out_size)
             return -1;
         strcpy(out, candidate);
         return 0;
@@ -755,12 +815,16 @@ int sg_rev_parse_object(const char *git_dir, const char *arg,
 
         /* HEAD is a symref, not a raw-oid file -- same special case
            sg_rev_parse_commit's own caller makes above, for the same
-           reason: sg_ref_read_path would try to hex-decode the
-           "ref: ..." line and fail. */
+           reason: sg_ref_read_path_resolved would follow it fine but
+           HEAD's own detached-HEAD handling belongs to sg_ref_resolve_head.
+           Every other ref_path may itself be a symref as of Phase 70
+           (rules 5/6), so this must follow through it rather than use the
+           non-following sg_ref_read_path -- see resolve_base's identical
+           comment above. */
         if (strcmp(ref_path, "HEAD") == 0)
             rc = sg_ref_resolve_head(git_dir, id_out);
         else
-            rc = sg_ref_read_path(git_dir, ref_path, id_out);
+            rc = sg_ref_read_path_resolved(git_dir, ref_path, id_out);
 
         if (rc == 0) {
             unsigned char *content;

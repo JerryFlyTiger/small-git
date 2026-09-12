@@ -501,6 +501,68 @@ int sg_ref_read_path(const char *git_dir, const char *ref_path, unsigned char id
     return rc;
 }
 
+/* See header comment (include/sg/refs.h): follows a symref chain, bounded
+   at 5 reads total / 4 hops, matching real git's measured dangling-symref
+   cutoff. */
+#define SG_REF_RESOLVE_MAX_READS 5
+
+int sg_ref_read_path_resolved(const char *git_dir, const char *ref_path, unsigned char id_out[SG_SHA1_RAW_LEN])
+{
+    char current[SG_PATH_MAX];
+    int reads;
+
+    if (strlen(ref_path) >= sizeof(current))
+        return -1;
+    strcpy(current, ref_path);
+
+    for (reads = 0; reads < SG_REF_RESOLVE_MAX_READS; reads++) {
+        char full_path[SG_PATH_MAX];
+        unsigned char *content;
+        size_t content_len;
+
+        if (!sg_ref_branch_name_is_safe(current))
+            return -1;
+
+        snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, current);
+        if (sg_read_file(full_path, &content, &content_len) != 0)
+            return read_packed_ref(git_dir, current, id_out); /* terminal: packed refs are never symrefs */
+
+        if (content_len >= strlen(HEAD_PREFIX) &&
+           strncmp((const char *)content, HEAD_PREFIX, strlen(HEAD_PREFIX)) == 0) {
+            const char *target = (const char *)content + strlen(HEAD_PREFIX);
+            size_t target_len = content_len - strlen(HEAD_PREFIX);
+            const char *nl = memchr(target, '\n', target_len);
+            size_t copy_len = nl != NULL ? (size_t)(nl - target) : target_len;
+
+            if (copy_len == 0 || copy_len >= sizeof(current)) {
+                free(content);
+                return -1;
+            }
+            memcpy(current, target, copy_len);
+            current[copy_len] = '\0';
+            free(content);
+            continue;
+        }
+
+        if (content_len < SG_SHA1_HEX_LEN) {
+            free(content);
+            return -1;
+        }
+        {
+            char hex[SG_SHA1_HEX_LEN + 1];
+            int rc;
+
+            memcpy(hex, content, SG_SHA1_HEX_LEN);
+            hex[SG_SHA1_HEX_LEN] = '\0';
+            rc = sg_hex_to_sha1(hex, id_out);
+            free(content);
+            return rc;
+        }
+    }
+
+    return -1; /* chain too deep -- same answer as a dangling/cyclic symref */
+}
+
 /* ---- branch enumeration and deletion -------------------------------------
    Both must treat loose refs/heads files and packed-refs as ONE store:
    listing that only walks the directory goes blind right after `git

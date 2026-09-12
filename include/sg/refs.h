@@ -105,6 +105,31 @@ int sg_ref_write_path(const char *git_dir, const char *ref_path,
 int sg_ref_read_path(const char *git_dir, const char *ref_path,
                      unsigned char id_out[SG_SHA1_RAW_LEN]);
 
+/* Like sg_ref_read_path, but follows a symref chain instead of failing on
+   one: reads ref_path exactly the way sg_ref_read_path does (loose file
+   first, then packed-refs), and when the loose file's content begins with
+   "ref: " (HEAD_PREFIX), takes the target ref path -- gated through
+   sg_ref_branch_name_is_safe, the same check sg_ref_read_path itself
+   applies to ref_path -- and reads THAT instead, repeating as needed.
+   Packed-refs entries are never symrefs (the packed-refs format has no
+   syntax for one), so hitting the packed fallback always ends the chain,
+   one way or the other.
+
+   Bounded at 5 reads total (4 symref hops), matching real git's own
+   dangling-symref cutoff measured against a 7-deep chain (Phase 70): a
+   4-hop chain resolves, a 5-hop one does not. This bound also doubles as
+   cycle detection -- a ref that points at itself, directly or through a
+   longer loop, simply runs out of hops and fails at -1 rather than
+   spinning forever; there is no separate visited-set.
+
+   sg_ref_read_path ITSELF IS UNCHANGED and does not follow symrefs -- every
+   existing caller keeps its current non-following behavior. This is a new,
+   separate entry point, not a widening of the old one. Returns 0 with
+   id_out filled in, -1 on any failure (including exceeding the hop bound,
+   an unsafe target, or a malformed line partway through the chain). */
+int sg_ref_read_path_resolved(const char *git_dir, const char *ref_path,
+                              unsigned char id_out[SG_SHA1_RAW_LEN]);
+
 /* Enumerates every branch, merging the loose refs/heads/ files with the
    packed-refs entries (loose wins on duplicates -- the same precedence
    sg_ref_read_branch applies when reading a single branch, and packed-only

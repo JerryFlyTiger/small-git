@@ -14818,3 +14818,122 @@ and its tests carry their own `phase69b:` prefix, so reverting it remains a
 single-hunk operation that names its own checks. The decision is recorded
 here rather than silently dropped, because it reverses something the spec
 committed to.
+
+## Phase 70: `sg_rev_parse_ref_path` implements git's full six-rule gitrevisions lookup table
+
+### 1. The gap
+
+`sg_rev_parse_ref_path` (`src/storage/revparse.c`) is the one function both
+`resolve_base` (the commit path) and `sg_rev_parse_object` (the object path)
+use to turn a `<base>` string into a ref path. It implemented only three of
+git's six `ref_rev_parse_rules` (`refs/tags/<name>`, `refs/heads/<name>`, and
+a literal `refs/<rest>` passthrough with no fallthrough), in a shape that
+also early-returned the moment `name` started with `"refs/"`. Phase 69's own
+interop group had already recorded the resulting gap by name
+(`heads/<branch>` resolving in git but refused by sg).
+
+### 2. Measured precedence changes (not just new capability)
+
+Measured against git 2.55.0 with a 4-way collision fixture (`refs/x`, tag
+`x`, branch `x`, `refs/remotes/x` each pointing at a different commit): git's
+bare `x` resolves to `refs/x` (rule 2), because rule 2 is tried BEFORE rules
+3/4. sg's old code only ever tried rule 3 (the tag), so it answered the tag
+-- with exit 0, silently giving a different commit than git for the same
+input. A second, independent collision (a branch literally named
+`"tags/v1"` vs. an ordinary tag `v1`) demonstrated the same misordering from
+the other rule: sg's old code found the literal branch via
+`sg_ref_read_branch` before rule 2 (`refs/tags/v1`, the tag) was ever tried.
+Both are pinned in interop's `phase70` group, each as an oracle precondition
+plus a byte-for-byte `sg log --oneline -1 <name>` comparison against git.
+
+### 3. The name gate is revparse-only, not a tightening of `sg_ref_branch_name_is_safe`
+
+A `<base>` string is user-typed and this phase widens what shapes reach a
+filesystem path through it, so a hostile spelling needed a harder gate than
+before -- but `sg_ref_branch_name_is_safe` (`refs.c`) has many other callers
+(ref writes, transport, branch reads), and this project has a recorded
+lesson (CLAUDE.md's "converging a predicate changes unconverged callers")
+about not tightening a shared predicate for one caller's hazard. The fix is
+a new, file-local predicate in `revparse.c`, applied to `name` once, before
+any of the six rules is tried: reject an empty name, a leading or trailing
+`/`, any empty path component, and any component that IS exactly `.` or
+`..` (a `.` INSIDE a component -- `v1.0`, `a.b` -- stays legal).
+
+This closes a real, PRE-EXISTING bug, not just a new hardening: with a
+branch literally named `a/b`, sg's old code resolved `"a//b"` to that
+branch when the ref was LOOSE (the OS collapses `//` when `fopen` opens the
+path) but refused it once the same ref was PACKED (`read_packed_ref`'s exact
+`strcmp` does not collapse `//`) -- the same spelling in the same repository
+gave two different answers depending on whether `git pack-refs` had run.
+Measured and pinned in interop's `phase70` group, including the `git
+pack-refs --all` step that proves the inconsistency is gone.
+
+### 4. Rules 5/6 need a new, symref-following reader
+
+`refs/remotes/<name>/HEAD` is ordinarily a symref -- exactly the shape `sg
+clone` itself creates via `sg_ref_set_symref` (Phase 48) -- and
+`sg_ref_read_path` (the function every other ref-reading call site already
+uses) does not follow one; it hex-decodes the file's first 40 bytes and
+fails on `"ref: ..."`. Rules 5 and 6 are therefore probed with a new sibling
+function, `sg_ref_read_path_resolved` (`refs.c`): reads exactly like
+`sg_ref_read_path` (loose file first, then `packed-refs`, which can never
+itself be a symref), but follows a `"ref: "`-prefixed target through the
+SAME `sg_ref_branch_name_is_safe` gate `sg_ref_read_path` already applies,
+repeating up to a bound.
+
+The bound is 5 reads total (4 hops), measured directly against git: a
+hand-built chain `s1 -> s2 -> ... -> s7 -> target` resolves through `s1`..`s4`
+and refuses at `s5` with `warning: ignoring dangling symref refs/remotes/s5`.
+The bound doubles as cycle detection -- a self-referencing symref simply
+runs out of hops -- so there is no separate visited-set. `sg_ref_read_path`
+itself is UNCHANGED; every existing caller keeps its current, non-following
+behavior. This is a new entry point, not a widening of the old one.
+
+### 5. A bug found only by writing the implementation, not anticipated by the spec
+
+The written spec for this phase said `sg_rev_parse_ref_path`'s probe step
+should use `sg_ref_read_path_resolved`, but said nothing about what happens
+to the ref path it hands back. Both existing callers -- `resolve_base` and
+`sg_rev_parse_object` -- re-read that returned path a SECOND time, and both
+were still calling the old, non-following `sg_ref_read_path` on it. Once
+rules 5/6 can hand back a path that is ITSELF a symref (e.g.
+`refs/remotes/origin/HEAD`), that second read fails the exact same way the
+first one would have without `_resolved` -- so a rule-6 match would probe
+successfully, get selected as the answer, and then fail to actually resolve
+one line later. This is not a divergence from the written spec so much as a
+gap the spec didn't cover; per this project's own standing instruction
+("if a measurement contradicts the spec, the measurement is right"), both
+call sites were changed to use `sg_ref_read_path_resolved` for their
+downstream re-read (HEAD keeps its own `sg_ref_resolve_head` special case
+unchanged, in both).
+
+The bug was caught by a directed mutation, not by first-draft testing: a
+unit test pointing the symref chain at an ordinary COMMIT passed even with
+the fix reverted, because the broken direct path in `sg_rev_parse_object`
+silently falls through to `sg_rev_parse_commit`'s own (already-fixed)
+fallback, which happens to land on the identical commit id -- for a commit
+target, the two paths are unobservably different. Only a target that a
+peeling and a non-peeling read disagree about -- an ANNOTATED TAG OBJECT --
+makes the two paths distinguishable: `sg_rev_parse_object` must return the
+tag itself, unpeeled, while the accidental fallback through
+`sg_rev_parse_commit` peels it to the underlying commit. Rewriting the test
+against a tag target turned the mutation red.
+
+### 6. Deliberately out of scope: the ambiguity warning
+
+git prints `warning: refname '<x>' is ambiguous.` to stderr whenever more
+than one rule matches; sg's answer is silent either way, which is not new
+here (measured: sg was already silent on an ordinary tag-vs-branch
+collision before this phase). sg has no warning vocabulary anywhere in its
+CLI, and one interop check (`phase70`) pins both sides of this specific
+non-difference so a future change is visible. Whether this belongs on
+CLAUDE.md's numbered deliberate-divergence list is a judgement call left to
+the project owner rather than decided here; recorded as measured, not
+decided.
+
+### 7. Gates
+
+`make` (0 warnings, 74 TUs), `make test` (82/82 binaries), `bash
+tests/interop.sh` (3558/3558 passed, 0 skipped), `make sanitize` (82/82
+binaries, 0 sanitizer errors) -- all green on a from-clean rebuild via
+`bash tests/gates.sh --sanitize --rebuild`.

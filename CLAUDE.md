@@ -2396,21 +2396,50 @@ Dependencies flow bottom-up. `src/<mod>/*.c` corresponds to `include/sg/*.h`.
     "unifying" it would otherwise go unnoticed).
   - `sequencer/todo` READS 4..40 hex as of Phase 68c and still WRITES 40
     (wide-in / narrow-out); see the cherry-pick bullet above.
-  WARNING: **a `<base>` of the form `heads/<name>` or `tags/<name>` is
-  REFUSED, and this is a real, pinned gap, not a deliberate divergence.**
-  git's gitrevisions lookup order tries `refs/<name>` (so `heads/master`
-  becomes `refs/heads/master`) before the `refs/heads/<name>` and
-  `refs/tags/<name>` rules; sg implements only the LITERAL `refs/...`
-  prefix (pinned since Phase 17c). Measured in Phase 69: `git rev-parse
-  heads/master` exits 0 while `sg log`/`merge`/`reset`/`diff` all exit 1
-  on the identical spelling -- so closing it belongs in **revparse**, at
-  the one place that decides what a `<base>` may look like, NOT in any
-  command. Pinned on both sides in interop's `phase69` group (including
-  an `sg log` check asserting the gap is not rebase-specific), the same
-  way Phase 68 pinned "sg rebase does not accept a 40-hex `<upstream>`"
-  -- so closing it later turns a check red BY NAME. It was found by
-  Phase 69's own out-of-repo oracle harness, not by any gate.
-  Do not hand-roll a "branch name or 40-hex" fragment again. To list/delete refs under any
+  WARNING: **`sg_rev_parse_ref_path` implements git's full six-rule
+  gitrevisions lookup table as of Phase 70** -- this used to say a `<base>`
+  of the form `heads/<name>` or `tags/<name>` was REFUSED (a real, pinned
+  gap found by Phase 69's out-of-repo oracle harness); it is gone from
+  this list rather than marked "fixed" in place, the same convention this
+  file uses everywhere else for a closed gap. The table, tried in order
+  with NO early return (a miss at any rule falls through to the next):
+  `"%s"` (any file under `$GIT_DIR` whose first 40 bytes are hex --
+  general rule 1, closes `MERGE_HEAD`/`ORIG_HEAD`/`CHERRY_PICK_HEAD`/
+  `REVERT_HEAD` spellings for free), `"refs/%s"`, `"refs/tags/%s"`,
+  `"refs/heads/%s"`, `"refs/remotes/%s"`, `"refs/remotes/%s/HEAD"`. Rule 2
+  sits BEFORE rules 3/4 and changes answers sg used to give with exit 0
+  (measured, Phase 70 spec section 2.2): a bare name that collides with a
+  same-named ref literally living at `refs/<name>` used to resolve to the
+  tag or branch instead. A file-local name gate in `revparse.c` (NOT a
+  tightening of `sg_ref_branch_name_is_safe`, which has too many other
+  callers to converge blindly) rejects an empty name, a leading/trailing
+  `/`, any empty path component, and any component that IS `.` or `..`
+  BEFORE any rule is tried -- this closes a real pre-existing bug where a
+  loose ref's `//`/`/./ ` collapsed at the OS level while a packed ref's
+  exact `strcmp` did not, giving two different answers for the same
+  spelling depending on whether `git pack-refs` had run.
+  Rules 5/6 need `sg_ref_read_path_resolved` (`refs.c`), a NEW,
+  symref-following sibling of `sg_ref_read_path` (which stays
+  non-following, unchanged, for every existing caller) -- because
+  `refs/remotes/<name>/HEAD` is ordinarily a symref, exactly the shape
+  `sg clone` itself creates via `sg_ref_set_symref`. Bounded at 5 reads
+  total (4 hops), matching real git's own measured dangling-symref cutoff;
+  this bound doubles as cycle detection, no separate visited-set. **Both
+  `resolve_base` and `sg_rev_parse_object` had to switch their own
+  downstream re-read of the resolved ref path from `sg_ref_read_path` to
+  `sg_ref_read_path_resolved`** -- found only by writing the implementation,
+  not anticipated by the spec: `sg_rev_parse_ref_path` can now hand back a
+  ref path that is ITSELF a symref (e.g. `refs/remotes/origin/HEAD`), and
+  re-reading it with the non-following function fails to hex-decode the
+  `"ref: ..."` line. `sg_rev_parse_object`'s own copy needed the identical
+  fix for the identical reason, one call site down; a mutation reverting
+  either one alone is caught (the former by `sg_rev_parse_commit("origin")`
+  resolving through a symref chain, the latter only by pointing the chain
+  at an ANNOTATED TAG OBJECT rather than a commit -- a commit target lets
+  the broken direct path silently fall through to `sg_rev_parse_commit`'s
+  own already-fixed fallback and land on the same answer by coincidence,
+  since that fallback peels tags and `sg_rev_parse_object` must not).
+  Pinned on both sides in interop's `phase70` group. To list/delete refs under any
   prefix use `sg_ref_list_under`/`sg_ref_delete_under` (`prefix` must end
   with `/`).
   **Exception: `sg push`'s explicit-dst refspec `<src>` (Phase 39,
