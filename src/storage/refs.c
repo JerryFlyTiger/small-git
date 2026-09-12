@@ -24,6 +24,55 @@ int sg_ref_branch_name_is_safe(const char *name)
     return 1;
 }
 
+/* See header comment (include/sg/refs.h) for the two independent call
+   sites this guards and why neither is redundant with the other. */
+int sg_ref_path_components_are_safe(const char *name)
+{
+    size_t i = 0;
+
+    if (name[0] == '\0')
+        return 0;
+
+    while (name[i] != '\0') {
+        size_t start = i;
+        size_t len;
+
+        while (name[i] != '\0' && name[i] != '/')
+            i++;
+        len = i - start;
+        /* An empty component happens at a leading '/', a trailing '/', or
+           "//" in the middle -- all three are the same check here. */
+        if (len == 0)
+            return 0;
+        if (len == 1 && name[start] == '.')
+            return 0;
+        if (len == 2 && name[start] == '.' && name[start + 1] == '.')
+            return 0;
+        if (name[i] == '/') {
+            i++;
+            /* A TRAILING '/' is a final empty component, and the loop above
+               cannot see it: having just consumed the separator, i points at
+               the terminator, so the outer condition ends the walk instead of
+               running one more (empty) round. Without this the function
+               answered "safe" for "a/", "heads/", "refs/heads/x/" -- measured
+               directly against the predicate, while its own header comment
+               and CLAUDE.md both claimed it rejected a trailing '/'.
+               Nothing OBSERVABLE changes at either call site: such a path was
+               already refused downstream, because fopen() on a regular file
+               with a trailing slash returns ENOTDIR. That is the whole reason
+               this had to be caught by reading, not by a test -- the outcome
+               was right for a reason that belongs to the OS rather than to
+               this gate, and a refactor that stripped the slash before
+               opening would have silently deleted the safety property. The
+               witness is therefore a DIRECT assertion on this predicate, not
+               an end-to-end one. */
+            if (name[i] == '\0')
+                return 0;
+        }
+    }
+    return 1;
+}
+
 int sg_ref_name_valid_for_create(const char *name)
 {
     size_t len = strlen(name);
@@ -499,6 +548,76 @@ int sg_ref_read_path(const char *git_dir, const char *ref_path, unsigned char id
     rc = sg_hex_to_sha1(hex, id_out);
     free(content);
     return rc;
+}
+
+/* See header comment (include/sg/refs.h): follows a symref chain, bounded
+   at 5 reads total / 4 hops, matching real git's measured dangling-symref
+   cutoff. */
+#define SG_REF_RESOLVE_MAX_READS 5
+
+int sg_ref_read_path_resolved(const char *git_dir, const char *ref_path, unsigned char id_out[SG_SHA1_RAW_LEN])
+{
+    char current[SG_PATH_MAX];
+    int reads;
+
+    if (strlen(ref_path) >= sizeof(current))
+        return -1;
+    strcpy(current, ref_path);
+
+    for (reads = 0; reads < SG_REF_RESOLVE_MAX_READS; reads++) {
+        char full_path[SG_PATH_MAX];
+        unsigned char *content;
+        size_t content_len;
+
+        if (!sg_ref_branch_name_is_safe(current))
+            return -1;
+
+        snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, current);
+        if (sg_read_file(full_path, &content, &content_len) != 0)
+            return read_packed_ref(git_dir, current, id_out); /* terminal: packed refs are never symrefs */
+
+        if (content_len >= strlen(HEAD_PREFIX) &&
+           strncmp((const char *)content, HEAD_PREFIX, strlen(HEAD_PREFIX)) == 0) {
+            const char *target = (const char *)content + strlen(HEAD_PREFIX);
+            size_t target_len = content_len - strlen(HEAD_PREFIX);
+            const char *nl = memchr(target, '\n', target_len);
+            size_t copy_len = nl != NULL ? (size_t)(nl - target) : target_len;
+
+            if (copy_len == 0 || copy_len >= sizeof(current)) {
+                free(content);
+                return -1;
+            }
+            memcpy(current, target, copy_len);
+            current[copy_len] = '\0';
+            free(content);
+            /* This hop's target is DISK content, not the caller's own
+               ref_path (that is revparse's job, see sg_ref_path_components_are_safe's
+               header comment) -- gate it with the stricter check so a
+               symref containing "ref: refs/heads//a/b" cannot ride the OS's
+               own "//" collapsing past the weaker sg_ref_branch_name_is_safe
+               the top of this loop still applies. */
+            if (!sg_ref_path_components_are_safe(current))
+                return -1;
+            continue;
+        }
+
+        if (content_len < SG_SHA1_HEX_LEN) {
+            free(content);
+            return -1;
+        }
+        {
+            char hex[SG_SHA1_HEX_LEN + 1];
+            int rc;
+
+            memcpy(hex, content, SG_SHA1_HEX_LEN);
+            hex[SG_SHA1_HEX_LEN] = '\0';
+            rc = sg_hex_to_sha1(hex, id_out);
+            free(content);
+            return rc;
+        }
+    }
+
+    return -1; /* chain too deep -- same answer as a dangling/cyclic symref */
 }
 
 /* ---- branch enumeration and deletion -------------------------------------

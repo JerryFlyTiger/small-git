@@ -1888,6 +1888,60 @@ if [ "$HTTP_AVAILABLE" = 1 ]; then
     check "phase39: git fsck still passes on the bare repo after refspec pushes" \
         sh -c "git -C '$HTTP_SERVERROOT/repo.git' fsck > /dev/null 2>&1"
 
+    # --- Phase 70b: resolve_refspec_src's new dwim fallback must not peel
+    # an annotated tag. Bug: Phase 70 taught sg_rev_parse_ref_path a
+    # "tags/<name>" spelling that none of resolve_refspec_src's three
+    # EXISTING literal checks try (they only try "refs/tags/tags/<name>"
+    # and "refs/heads/tags/<name>"), so that new spelling fell straight
+    # into the peeling sg_rev_parse_commit fallback -- pushing the tag's
+    # underlying COMMIT to the remote instead of the tag object, silently,
+    # exit 0. Reused fixture: $PUSH_ANN_TAG_ID / refs/tags/push-ann, the
+    # annotated tag already created and pushed earlier in this phase5c
+    # group. Asserted by the remote ref's OBJECT TYPE via `git cat-file -t`
+    # -- exit code alone is 0 on both the broken and the fixed answer. ---
+    (cd "$HTTP_DEST" && "$SG" push origin "push-ann:refs/tags/p70b_bare") > "$WORKDIR/p70b_push_bare.out" 2>&1
+    check "phase70b oracle/control: sg push of the bare 'push-ann' spelling (pre-existing literal path) still exits 0" \
+        test $? -eq 0
+    check "phase70b control: ...and the remote ref is still the TAG object, unpeeled (proves the fix does not widen peeling anywhere)" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git cat-file -t refs/tags/p70b_bare)\" = 'tag'"
+    check "phase70b control: ...and it is the SAME tag object id as the source" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/p70b_bare)\" = '$PUSH_ANN_TAG_ID'"
+
+    (cd "$HTTP_DEST" && "$SG" push origin "refs/tags/push-ann:refs/tags/p70b_qualified") > "$WORKDIR/p70b_push_qualified.out" 2>&1
+    check "phase70b control: sg push of the already-'refs/'-qualified spelling (pre-existing literal path) still exits 0" \
+        test $? -eq 0
+    check "phase70b control: ...and the remote ref is still the TAG object, unpeeled" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git cat-file -t refs/tags/p70b_qualified)\" = 'tag'"
+
+    (cd "$HTTP_DEST" && "$SG" push origin "tags/push-ann:refs/tags/p70b_dwim") > "$WORKDIR/p70b_push_dwim.out" 2>&1
+    check "phase70b: sg push of the 'tags/<name>' dwim spelling (Phase 70's new capability) exits 0" \
+        test $? -eq 0
+    check "phase70b: ...and the remote ref is the TAG object, NOT peeled to the underlying commit (the bug this closes)" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git cat-file -t refs/tags/p70b_dwim)\" = 'tag'"
+    check "phase70b: ...and it is the SAME tag object id as the two literal-path controls above" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/tags/p70b_dwim)\" = '$PUSH_ANN_TAG_ID'"
+
+    # CLAUDE.md's own recorded boundary: "sg push origin HEAD:refs/heads/x"
+    # must keep working -- sg_rev_parse_ref_path returns "HEAD" verbatim
+    # (no existence check), so this exercises the sg_ref_resolve_head branch
+    # of the new dwim block specifically.
+    HTTP_DEST_HEAD=$(cd "$HTTP_DEST" && git rev-parse HEAD)
+    (cd "$HTTP_DEST" && "$SG" push origin "HEAD:refs/heads/p70b_head") > "$WORKDIR/p70b_push_head.out" 2>&1
+    check "phase70b: sg push origin HEAD:refs/heads/x still works (CLAUDE.md's recorded boundary)" \
+        test $? -eq 0
+    check "phase70b: ...and lands on HEAD's current commit" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git rev-parse refs/heads/p70b_head)\" = '$HTTP_DEST_HEAD'"
+
+    # A suffixed src ("topic~1"-shaped) must still fall through to the
+    # peeling sg_rev_parse_commit -- sg_rev_parse_ref_path correctly misses
+    # on it (no ref is literally named "push-ann~0"), so this must resolve
+    # to the annotated tag's PEELED commit, not the tag object.
+    (cd "$HTTP_DEST" && "$SG" push origin "push-ann~0:refs/tags/p70b_suffix") > "$WORKDIR/p70b_push_suffix.out" 2>&1
+    check "phase70b control: a suffixed src ('push-ann~0') still resolves (falls through to sg_rev_parse_commit)" \
+        test $? -eq 0
+    check "phase70b control: ...and is peeled to the commit, unlike the bare tag spellings above" \
+        sh -c "test \"\$(cd '$HTTP_SERVERROOT/repo.git' && git cat-file -t refs/tags/p70b_suffix)\" = 'commit'"
+
     kill "$HTTP_SERVER_PID" 2>/dev/null
     HTTP_SERVER_PID=""
 else
@@ -18837,20 +18891,15 @@ check "phase69: ...and .git/sg-rebase/ is gone afterward" \
 # comparisons over 32 upstream spellings x clean/conflicting/detached
 # fixtures), NOT by any gate: git's gitrevisions lookup order tries
 # "refs/<name>" before "refs/heads/<name>", so a "heads/<branch>" (or
-# "tags/<tag>") spelling resolves for real git and is REFUSED by sg.
+# "tags/<tag>") spelling resolves for real git and used to be REFUSED by sg.
 #
-# This is a PRE-EXISTING revparse grammar gap, not a Phase 69 regression:
-# sg implements only the literal "refs/..." fallback (pinned since Phase
-# 17c, see the "refs/<rest> as a fully-qualified <base>" block above), and
-# the same spelling is refused identically by sg log / merge / reset / diff
-# -- measured directly, all four exit 1 while git rev-parse exits 0. Phase
-# 69 only made it VISIBLE here, because until now sg rebase refused every
-# spelling but a bare branch name and so had nothing to be inconsistent
-# with.
-#
-# Pinned on both sides for the same reason Phase 68 pinned "sg rebase does
-# not accept a 40-hex <upstream>": closing it later must turn a check red
-# BY NAME rather than silently changing what these checks compare. ---
+# Phase 70 closes this: sg_rev_parse_ref_path now implements the full
+# six-rule gitrevisions table, so every one of the checks below INVERTS
+# from "refuses" to "resolves, and matches git's own answer" -- a straight
+# exit-code inversion would verify strictly less than this project's own
+# interop convention requires (it would prove sg no longer refuses, not
+# that it now agrees with git), so each check below compares an actual
+# result, not just an exit code. ---
 P69_HEADSPFX="$WORKDIR/p69_heads_prefix"
 rm -rf "$P69_HEADSPFX"
 cp -R "$P69" "$P69_HEADSPFX"
@@ -18861,31 +18910,72 @@ check "phase69 oracle: precondition -- real git resolves the 'heads/<branch>' sp
 (cd "$P69_HEADSPFX" && LC_ALL=C git rebase "heads/$P69_BRANCH") > /dev/null 2>&1
 check "phase69 oracle: precondition -- real git accepts 'heads/<branch>' as a rebase <upstream>" \
     test $? -eq 0
+P69_HEADSPFX_GIT_TREE=$(cd "$P69_HEADSPFX" && git rev-parse HEAD^{tree})
 (cd "$P69_HEADSPFX" && git rebase --abort) > /dev/null 2>&1
+# Snapshot the pre-rebase state (p69hp still sitting at its own "hp" commit
+# off c0, untouched by the git oracle rebase+abort above) BEFORE sg's own
+# rebase mutates $P69_HEADSPFX -- log/merge/diff/reset each need this same
+# starting point, not whatever sg's rebase leaves behind.
+P69_HEADSPFX_PRE="$WORKDIR/p69_heads_prefix_pre"
+rm -rf "$P69_HEADSPFX_PRE"
+cp -R "$P69_HEADSPFX" "$P69_HEADSPFX_PRE"
 (cd "$P69_HEADSPFX" && "$SG" rebase "heads/$P69_BRANCH") > "$WORKDIR/p69_sg_headspfx.out" 2>&1
-check "phase69: sg rebase REFUSES the 'heads/<branch>' spelling (recorded pre-existing revparse gap -- sg implements only the literal 'refs/...' fallback, not git's full gitrevisions lookup order)" \
-    test $? -ne 0
-check "phase69: ...and the refusal is the ordinary invalid-reference message, not a crash or a silent no-op" \
-    grep -q "invalid reference: heads/$P69_BRANCH" "$WORKDIR/p69_sg_headspfx.out"
-check "phase69: ...and the same gap is NOT rebase-specific -- sg log refuses the identical spelling (so closing it belongs in revparse, not in cmd_rebase.c)" \
-    sh -c "! (cd '$P69_HEADSPFX' && \"$SG\" log --oneline -1 'heads/$P69_BRANCH') > /dev/null 2>&1"
+check "phase70: sg rebase RESOLVES the 'heads/<branch>' spelling (gitrevisions refs/<name> rule, closed in Phase 70)" \
+    test $? -eq 0
+check "phase70: ...and the rebase result matches real git's (same resulting tree)" \
+    sh -c "[ \"\$(cd '$P69_HEADSPFX' && git rev-parse HEAD^{tree})\" = '$P69_HEADSPFX_GIT_TREE' ]"
+
+# sg log: resolve heads/<branch> to the same commit git does, and print the
+# same --oneline line for it (byte-for-byte, same technique used everywhere
+# else in this file).
+(cd "$P69_HEADSPFX_PRE" && "$SG" log --oneline -1 "heads/$P69_BRANCH") > "$WORKDIR/p69_sg_log_headspfx.out" 2>&1
+check "phase70: sg log RESOLVES the 'heads/<branch>' spelling (so closing the gap is not rebase-specific)" \
+    test $? -eq 0
+(cd "$P69_HEADSPFX_PRE" && LC_ALL=C git log --oneline -1 "heads/$P69_BRANCH") > "$WORKDIR/p69_git_log_headspfx.out" 2>&1
+check "phase70: ...and prints the same commit as real git, byte for byte" \
+    cmp -s "$WORKDIR/p69_sg_log_headspfx.out" "$WORKDIR/p69_git_log_headspfx.out"
+
+# sg merge: p69hp (c0 + "hp") and heads/master (c0..c2) genuinely diverged,
+# so this is a real, non-fast-forward merge -- own copies for sg and for
+# the git oracle so the two do not observe each other's side effects.
 # CLAUDE.md's note on this gap names four commands; pin all four rather
 # than pin two and assert four (a claim wider than its pins is exactly the
 # shape this project has recorded going wrong three times).
-check "phase69: ...and sg merge refuses it too" \
-    sh -c "! (cd '$P69_HEADSPFX' && \"$SG\" merge 'heads/$P69_BRANCH') > /dev/null 2>&1"
-# `reset --hard` gets its OWN copy: the other three commands cannot alter
-# the fixture whether they resolve or refuse, but this one WOULD move HEAD
-# and rewrite the working tree on the day this gap is closed -- and the
-# check below it would then be silently running against a different
-# fixture than the three above it. Order-independence here costs one cp.
+P69_HEADSPFX_MERGE_SG="$WORKDIR/p69_heads_prefix_merge_sg"
+P69_HEADSPFX_MERGE_GIT="$WORKDIR/p69_heads_prefix_merge_git"
+rm -rf "$P69_HEADSPFX_MERGE_SG" "$P69_HEADSPFX_MERGE_GIT"
+cp -R "$P69_HEADSPFX_PRE" "$P69_HEADSPFX_MERGE_SG"
+cp -R "$P69_HEADSPFX_PRE" "$P69_HEADSPFX_MERGE_GIT"
+(cd "$P69_HEADSPFX_MERGE_SG" && "$SG" merge "heads/$P69_BRANCH") > "$WORKDIR/p69_sg_merge_headspfx.out" 2>&1
+check "phase70: sg merge RESOLVES the 'heads/<branch>' spelling" \
+    test $? -eq 0
+(cd "$P69_HEADSPFX_MERGE_GIT" && LC_ALL=C git merge -q "heads/$P69_BRANCH" -m "p70 merge") > /dev/null 2>&1
+check "phase70 oracle: precondition -- real git's merge of 'heads/<branch>' on the same fixture succeeds too" \
+    test $? -eq 0
+check "phase70: ...and sg merge's result matches real git's (same resulting tree)" \
+    sh -c "[ \"\$(cd '$P69_HEADSPFX_MERGE_SG' && git rev-parse HEAD^{tree})\" = \"\$(cd '$P69_HEADSPFX_MERGE_GIT' && git rev-parse HEAD^{tree})\" ]"
+
+# sg reset --hard: own copy, since this one moves HEAD and rewrites the
+# working tree (the other checks in this group are read-only or use their
+# own copies already).
 P69_HEADSPFX_RESET="$WORKDIR/p69_heads_prefix_reset"
 rm -rf "$P69_HEADSPFX_RESET"
-cp -R "$P69_HEADSPFX" "$P69_HEADSPFX_RESET"
-check "phase69: ...and sg reset --hard refuses it too" \
-    sh -c "! (cd '$P69_HEADSPFX_RESET' && \"$SG\" reset --hard 'heads/$P69_BRANCH') > /dev/null 2>&1"
-check "phase69: ...and sg diff refuses it too (four commands pinned, matching the four CLAUDE.md names)" \
-    sh -c "! (cd '$P69_HEADSPFX' && \"$SG\" diff 'heads/$P69_BRANCH') > /dev/null 2>&1"
+cp -R "$P69_HEADSPFX_PRE" "$P69_HEADSPFX_RESET"
+(cd "$P69_HEADSPFX_RESET" && "$SG" reset --hard "heads/$P69_BRANCH") > /dev/null 2>&1
+check "phase70: sg reset --hard RESOLVES the 'heads/<branch>' spelling" \
+    test $? -eq 0
+check "phase70: ...and lands on the same commit as real git (heads/\$P69_BRANCH == \$P69_C2)" \
+    sh -c "[ \"\$(cd '$P69_HEADSPFX_RESET' && git rev-parse HEAD)\" = '$P69_C2' ]"
+
+# sg diff: heads/<branch> against the (clean) working tree of p69hp is an
+# ordinary tree-to-tree diff once resolved; compare full output byte for
+# byte against real git on the same fixture.
+(cd "$P69_HEADSPFX_PRE" && "$SG" diff "heads/$P69_BRANCH") > "$WORKDIR/p69_sg_diff_headspfx.out" 2>&1
+check "phase70: sg diff RESOLVES the 'heads/<branch>' spelling (four commands pinned, matching the four CLAUDE.md names)" \
+    test $? -eq 0
+(cd "$P69_HEADSPFX_PRE" && LC_ALL=C git -c core.quotepath=false diff "heads/$P69_BRANCH") > "$WORKDIR/p69_git_diff_headspfx.out" 2>&1
+check "phase70: ...and sg diff's output matches real git's, byte for byte" \
+    cmp -s "$WORKDIR/p69_sg_diff_headspfx.out" "$WORKDIR/p69_git_diff_headspfx.out"
 
 # --- Phase 69b: the unrecognized-flag guard in sg_cmd_rebase's argv loop.
 # This sub-feature shipped with ZERO coverage in the first round (28
@@ -18921,6 +19011,296 @@ cp -R "$P69" "$P69_FLAG"
 (cd "$P69_FLAG" && "$SG" rebase p69-dash-name) > "$WORKDIR/p69_flag_dash.out" 2>&1
 check "phase69b control: an <upstream> CONTAINING a dash is still accepted (the guard keys on the first byte, not on the presence of a dash)" \
     test $? -eq 0
+
+# --- Phase 70: sg_rev_parse_ref_path implements git's full six-rule
+# gitrevisions lookup table (`"%s"`, `"refs/%s"`, `"refs/tags/%s"`,
+# `"refs/heads/%s"`, `"refs/remotes/%s"`, `"refs/remotes/%s/HEAD"`, first
+# hit wins, no early return), instead of three rules with an early return
+# on any name already starting with "refs/". See CLAUDE.md's
+# sg_rev_parse_commit bullet and docs/DESIGN.md's Phase 70 section for the
+# full measured tables this fixture is drawn from. ---
+P70="$WORKDIR/p70"
+rm -rf "$P70"
+mkdir -p "$P70"
+git init -q "$P70"
+(cd "$P70" && git config user.email "p70@example.com" && git config user.name "p70 tester")
+printf 'c1\n' > "$P70/f.txt"
+(cd "$P70" && git add f.txt && git commit -q -m "p70 c1")
+P70_C1=$(cd "$P70" && git rev-parse HEAD)
+printf 'c2\n' > "$P70/f.txt"
+(cd "$P70" && git add f.txt && git commit -q -m "p70 c2")
+P70_C2=$(cd "$P70" && git rev-parse HEAD)
+printf 'c3\n' > "$P70/f.txt"
+(cd "$P70" && git add f.txt && git commit -q -m "p70 c3")
+P70_C3=$(cd "$P70" && git rev-parse HEAD)
+printf 'c4\n' > "$P70/f.txt"
+(cd "$P70" && git add f.txt && git commit -q -m "p70 c4")
+P70_C4=$(cd "$P70" && git rev-parse HEAD)
+
+# Section 2.2 precedence: refs/x=c4, tag x=c3, branch x=c2,
+# refs/remotes/x=c1. git's bare "x" resolves to refs/x (rule 2, beats
+# refs/tags/<name> and refs/heads/<name>); sg used to answer the tag (c3),
+# because it only ever tried rule 3.
+(cd "$P70" && git update-ref refs/x "$P70_C4")
+(cd "$P70" && git tag x "$P70_C3")
+(cd "$P70" && git branch x "$P70_C2")
+(cd "$P70" && git update-ref refs/remotes/x "$P70_C1")
+(cd "$P70" && LC_ALL=C git log --oneline -1 x) > "$WORKDIR/p70_git_x.out" 2>/dev/null
+check "phase70 oracle: precondition -- real git's bare 'x' resolves to refs/x (rule 2), not the tag or the branch" \
+    grep -q "^$(printf '%s' "$P70_C4" | cut -c1-7) " "$WORKDIR/p70_git_x.out"
+(cd "$P70" && "$SG" log --oneline -1 x) > "$WORKDIR/p70_sg_x.out" 2>&1
+check "phase70: sg's bare 'x' now also resolves to refs/x (rule 2 beats rule 3's tag; previously answered the tag, matching git byte for byte now)" \
+    cmp -s "$WORKDIR/p70_sg_x.out" "$WORKDIR/p70_git_x.out"
+(cd "$P70" && LC_ALL=C git rev-parse x) > /dev/null 2> "$WORKDIR/p70_git_x_warn.out"
+check "phase70 oracle: precondition -- real git warns 'refname .x. is ambiguous' on this 4-way collision" \
+    grep -q "warning: refname 'x' is ambiguous" "$WORKDIR/p70_git_x_warn.out"
+(cd "$P70" && "$SG" log --oneline -1 x) > /dev/null 2> "$WORKDIR/p70_sg_x_warn.out"
+check "phase70: ...sg prints no such warning (deliberately out of scope, see docs/DESIGN.md's Phase 70 section -- sg has no warning vocabulary anywhere, and this is not a new divergence, section 6)" \
+    sh -c "[ ! -s '$WORKDIR/p70_sg_x_warn.out' ]"
+
+# Section 2.2 second collision: tag "v1" (refs/tags/v1) vs a branch
+# LITERALLY named "tags/v1" (refs/heads/tags/v1). git's rule 2
+# ("refs/tags/v1") lands on the tag; sg used to answer the literal branch,
+# because sg_ref_read_branch("tags/v1") found refs/heads/tags/v1 before
+# rule 2 was ever tried.
+(cd "$P70" && git tag v1 "$P70_C1")
+(cd "$P70" && git branch tags/v1 "$P70_C2")
+(cd "$P70" && LC_ALL=C git log --oneline -1 tags/v1) > "$WORKDIR/p70_git_tagsv1.out" 2>/dev/null
+check "phase70 oracle: precondition -- real git's 'tags/v1' resolves to the TAG (refs/tags/v1, rule 2), not the literally-named branch" \
+    grep -q "^$(printf '%s' "$P70_C1" | cut -c1-7) " "$WORKDIR/p70_git_tagsv1.out"
+(cd "$P70" && "$SG" log --oneline -1 tags/v1) > "$WORKDIR/p70_sg_tagsv1.out" 2>&1
+check "phase70: sg's 'tags/v1' now also resolves to the tag, matching git byte for byte (previously answered the literal branch)" \
+    cmp -s "$WORKDIR/p70_sg_tagsv1.out" "$WORKDIR/p70_git_tagsv1.out"
+
+# Section 2.4: rule 1 must not early-return. "refs/foo" doesn't exist as a
+# literal ref, but "refs/tags/refs/foo" does -- git falls through to rule 3
+# and finds it; sg used to hard-refuse the moment it saw a "refs/" prefix.
+(cd "$P70" && git update-ref refs/tags/refs/foo "$P70_C3")
+(cd "$P70" && LC_ALL=C git log --oneline -1 refs/foo) > "$WORKDIR/p70_git_refsfoo.out" 2>/dev/null
+check "phase70 oracle: precondition -- real git's 'refs/foo' falls through to refs/tags/refs/foo (rule 3)" \
+    grep -q "^$(printf '%s' "$P70_C3" | cut -c1-7) " "$WORKDIR/p70_git_refsfoo.out"
+(cd "$P70" && "$SG" log --oneline -1 refs/foo) > "$WORKDIR/p70_sg_refsfoo.out" 2>&1
+check "phase70: sg's 'refs/foo' now falls through the same way, matching git byte for byte (previously a hard refusal, no fallthrough)" \
+    cmp -s "$WORKDIR/p70_sg_refsfoo.out" "$WORKDIR/p70_git_refsfoo.out"
+
+# Section 2.5/2.6: rule 6 (refs/remotes/<name>/HEAD) is ordinarily a
+# symref, and the resolver must follow it -- this is exactly the shape
+# `sg clone` itself creates via sg_ref_set_symref. Built here with plain
+# git plumbing (no network fixture needed): refs/remotes/origin/HEAD is a
+# symref to refs/remotes/origin/rmt; base "origin" only matches at rule 6.
+(cd "$P70" && git update-ref refs/remotes/origin/rmt "$P70_C2")
+(cd "$P70" && git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/rmt)
+(cd "$P70" && LC_ALL=C git log --oneline -1 origin) > "$WORKDIR/p70_git_origin.out" 2>/dev/null
+check "phase70 oracle: precondition -- real git's bare 'origin' resolves through the refs/remotes/origin/HEAD symref (rule 6)" \
+    grep -q "^$(printf '%s' "$P70_C2" | cut -c1-7) " "$WORKDIR/p70_git_origin.out"
+(cd "$P70" && "$SG" log --oneline -1 origin) > "$WORKDIR/p70_sg_origin.out" 2>&1
+check "phase70: sg's bare 'origin' resolves through the same symref, matching git byte for byte (rule 6 -- previously unimplemented, hard refusal)" \
+    cmp -s "$WORKDIR/p70_sg_origin.out" "$WORKDIR/p70_git_origin.out"
+
+# The same rule-6 symref, reached through sg_rev_parse_object instead of
+# resolve_base -- a SEPARATE code path with its own copy of the
+# "re-read the resolved ref path with the FOLLOWING reader" fix. A directed
+# mutation reverting only sg_rev_parse_object's copy left interop fully
+# green (3590/3590) while one unit assertion went red, so this group had a
+# real single-point-of-failure at the interop layer; this closes it.
+# The target MUST be an ANNOTATED TAG OBJECT, not a commit: sg_rev_parse_object
+# does not peel, but its fallback (sg_rev_parse_commit) does, so with a commit
+# target the broken direct path falls through and lands on the same answer by
+# coincidence -- the two paths are only distinguishable where peeling matters.
+(cd "$P70" && git tag -a -m "p70 obj symref" p70objtag "$P70_C3")
+P70_OBJTAG=$(cd "$P70" && git rev-parse p70objtag)
+(cd "$P70" && git update-ref refs/remotes/origin2/atag "$P70_OBJTAG")
+(cd "$P70" && git symbolic-ref refs/remotes/origin2/HEAD refs/remotes/origin2/atag)
+(cd "$P70" && LC_ALL=C git cat-file -t origin2) > "$WORKDIR/p70_git_obj_symref.out" 2>/dev/null
+check "phase70 oracle: precondition -- real git's bare 'origin2' reaches an ANNOTATED TAG through the rule-6 symref and does NOT peel it" \
+    grep -qx "tag" "$WORKDIR/p70_git_obj_symref.out"
+(cd "$P70" && "$SG" cat-file -t origin2) > "$WORKDIR/p70_sg_obj_symref.out" 2>&1
+check "phase70: sg cat-file (sg_rev_parse_object's own path) follows the rule-6 symref too and keeps the tag UNPEELED, matching git byte for byte" \
+    cmp -s "$WORKDIR/p70_sg_obj_symref.out" "$WORKDIR/p70_git_obj_symref.out"
+(cd "$P70" && LC_ALL=C git cat-file -p origin2) > "$WORKDIR/p70_git_obj_symref_p.out" 2>/dev/null
+(cd "$P70" && "$SG" cat-file -p origin2) > "$WORKDIR/p70_sg_obj_symref_p.out" 2>&1
+check "phase70: ...and prints the tag object's own body, not the commit's, byte for byte" \
+    cmp -s "$WORKDIR/p70_sg_obj_symref_p.out" "$WORKDIR/p70_git_obj_symref_p.out"
+
+# Section 2.7: hostile spellings. git refuses "a//b" and "refs/heads/a//b"
+# outright; sg's pre-Phase-70 code resolved both (loose refs collapse "//"
+# at the OS level when opening the file) -- and gave a DIFFERENT answer
+# once the same ref was packed (read_packed_ref's exact strcmp does not
+# collapse "//"). The Phase 70 name gate rejects both spellings before any
+# rule is tried, so the loose/packed inconsistency disappears too.
+(cd "$P70" && git branch a/b "$P70_C4")
+(cd "$P70" && LC_ALL=C git rev-parse "a//b") > /dev/null 2>&1
+check "phase70 oracle: precondition -- real git refuses 'a//b'" \
+    test $? -ne 0
+(cd "$P70" && "$SG" log --oneline -1 "a//b") > /dev/null 2>&1
+check "phase70: sg now refuses 'a//b' too (previously resolved to the branch via OS path collapsing)" \
+    test $? -ne 0
+(cd "$P70" && "$SG" log --oneline -1 "refs/heads/a//b") > /dev/null 2>&1
+check "phase70: ...and 'refs/heads/a//b' is refused the same way" \
+    test $? -ne 0
+(cd "$P70" && git pack-refs --all)
+(cd "$P70" && "$SG" log --oneline -1 "a//b") > /dev/null 2>&1
+check "phase70: ...and packing the refs does not change the answer (the loose/packed inconsistency this predates is gone)" \
+    test $? -ne 0
+
+# Control: an ordinary '.' INSIDE a path component (not a whole component)
+# must keep resolving -- the gate rejects a component that IS "." or "..",
+# not any component merely containing a dot.
+(cd "$P70" && git tag v1.0 "$P70_C1")
+(cd "$P70" && LC_ALL=C git log --oneline -1 v1.0) > "$WORKDIR/p70_git_v1dot0.out" 2>/dev/null
+(cd "$P70" && "$SG" log --oneline -1 v1.0) > "$WORKDIR/p70_sg_v1dot0.out" 2>&1
+check "phase70 control: a legal dotted name ('v1.0') still resolves, matching git byte for byte" \
+    cmp -s "$WORKDIR/p70_sg_v1dot0.out" "$WORKDIR/p70_git_v1dot0.out"
+
+# --- Phase 70b (1): "@{0}" means the ref's CURRENT value, not the
+# reflog's own last new_id -- found by the coordinator's own review round,
+# not by any gate. Reachable via nothing more than a hand-edited ref file:
+# @{0}'s existence check (the reflog must still exist) is untouched, only
+# the VALUE source changes. Built with real commit objects so both tools
+# see the SAME divergence: master's ref file is overwritten directly to a
+# commit its own reflog never recorded. ---
+P70B="$WORKDIR/p70b"
+rm -rf "$P70B"
+mkdir -p "$P70B"
+git init -q "$P70B"
+(cd "$P70B" && git config user.email "p70b@example.com" && git config user.name "p70b tester")
+printf 'c1\n' > "$P70B/f.txt"
+(cd "$P70B" && git add f.txt && git commit -q -m "p70b c1")
+P70B_C1=$(cd "$P70B" && git rev-parse HEAD)
+printf 'c2\n' > "$P70B/f.txt"
+(cd "$P70B" && git add f.txt && git commit -q -m "p70b c2")
+P70B_C2=$(cd "$P70B" && git rev-parse HEAD)
+printf 'c3\n' > "$P70B/f.txt"
+(cd "$P70B" && git add f.txt && git commit -q -m "p70b c3")
+P70B_C3=$(cd "$P70B" && git rev-parse HEAD)
+printf 'c4\n' > "$P70B/f.txt"
+(cd "$P70B" && git add f.txt && git commit -q -m "p70b c4")
+P70B_C4=$(cd "$P70B" && git rev-parse HEAD)
+printf 'c5\n' > "$P70B/f.txt"
+(cd "$P70B" && git add f.txt && git commit -q -m "p70b c5")
+P70B_C5=$(cd "$P70B" && git rev-parse HEAD)
+P70B_TREE=$(cd "$P70B" && git rev-parse HEAD^{tree})
+# c6/c7: independent commit objects, created with commit-tree so NEITHER
+# any ref NOR any reflog is touched building them.
+P70B_C6=$(cd "$P70B" && git commit-tree "$P70B_TREE" -p "$P70B_C1" -m "p70b c6")
+P70B_C7=$(cd "$P70B" && git commit-tree "$P70B_TREE" -p "$P70B_C2" -m "p70b c7")
+
+# --- symbolic HEAD: hand-edit master's ref file straight to c6. logs/HEAD
+# and logs/refs/heads/master both still end at c5 -- c6 is not logged
+# ANYWHERE. HEAD is symbolic to master, so all three spellings' @{0} must
+# agree on c6. ---
+printf '%s\n' "$P70B_C6" > "$P70B/.git/refs/heads/master"
+(cd "$P70B" && LC_ALL=C git log --oneline -1 master) > "$WORKDIR/p70b_git_bare.out" 2>/dev/null
+check "phase70b oracle: precondition -- real git's bare 'master' reads the hand-edited current value (c6), not c5" \
+    grep -q "^$(printf '%s' "$P70B_C6" | cut -c1-7) " "$WORKDIR/p70b_git_bare.out"
+for spelling in "master@{0}" "HEAD@{0}" "@{0}"; do
+    (cd "$P70B" && LC_ALL=C git log --oneline -1 "$spelling") > "$WORKDIR/p70b_git_$$.out" 2>/dev/null
+    check "phase70b oracle: precondition -- real git's '$spelling' is the CURRENT value (c6), not the reflog's stale last entry (c5)" \
+        grep -q "^$(printf '%s' "$P70B_C6" | cut -c1-7) " "$WORKDIR/p70b_git_$$.out"
+    (cd "$P70B" && "$SG" log --oneline -1 "$spelling") > "$WORKDIR/p70b_sg_$$.out" 2>&1
+    check "phase70b: sg's '$spelling' now also reads the CURRENT value (c6), matching git byte for byte (previously read the reflog's stale c5)" \
+        cmp -s "$WORKDIR/p70b_sg_$$.out" "$WORKDIR/p70b_git_$$.out"
+done
+# Control: N>=1 is completely unaffected by the fix.
+(cd "$P70B" && LC_ALL=C git log --oneline -1 "master@{1}") > "$WORKDIR/p70b_git_m1.out" 2>/dev/null
+(cd "$P70B" && "$SG" log --oneline -1 "master@{1}") > "$WORKDIR/p70b_sg_m1.out" 2>&1
+check "phase70b control: 'master@{1}' (N>=1, unaffected by the fix) still matches git byte for byte" \
+    cmp -s "$WORKDIR/p70b_sg_m1.out" "$WORKDIR/p70b_git_m1.out"
+
+# --- detached HEAD: hand-edit .git/HEAD's raw content straight to c7,
+# past the one reflog entry the detach itself created. ---
+(cd "$P70B" && git checkout -q --detach "$P70B_C4") > /dev/null 2>&1
+printf '%s\n' "$P70B_C7" > "$P70B/.git/HEAD"
+for spelling in "HEAD@{0}" "@{0}"; do
+    (cd "$P70B" && LC_ALL=C git log --oneline -1 "$spelling") > "$WORKDIR/p70b_git_$$.out" 2>/dev/null
+    check "phase70b oracle: precondition -- real git's detached '$spelling' is the CURRENT value (c7), not the logged detach target (c4)" \
+        grep -q "^$(printf '%s' "$P70B_C7" | cut -c1-7) " "$WORKDIR/p70b_git_$$.out"
+    (cd "$P70B" && "$SG" log --oneline -1 "$spelling") > "$WORKDIR/p70b_sg_$$.out" 2>&1
+    check "phase70b: sg's detached '$spelling' now also reads the CURRENT value (c7), matching git byte for byte" \
+        cmp -s "$WORKDIR/p70b_sg_$$.out" "$WORKDIR/p70b_git_$$.out"
+done
+
+# --- Boundary #1 (must survive): the reflog must still be required to
+# EXIST. A branch with no reflog at all still refuses "<branch>@{0}", in
+# both tools -- measured directly (python probe, argv only): `git branch
+# <name> <commit>` UNEXPECTEDLY creates a reflog entry of its own by
+# default (core.logAllRefUpdates defaults to true for a non-bare repo), so
+# testing this boundary needs the log file explicitly REMOVED after
+# creation, not merely a freshly-`git branch`-created ref -- the latter
+# would prove nothing (both tools would just read the branch's own,
+# real, single-entry log and resolve it). ---
+(cd "$P70B" && git branch nolog "$P70B_C1") > /dev/null 2>&1
+rm -f "$P70B/.git/logs/refs/heads/nolog"
+(cd "$P70B" && LC_ALL=C git rev-parse "nolog@{0}") > /dev/null 2>&1
+check "phase70b oracle: precondition -- real git refuses '<branch>@{0}' when the branch's reflog does not exist at all" \
+    test $? -ne 0
+(cd "$P70B" && "$SG" log --oneline -1 "nolog@{0}") > /dev/null 2>&1
+check "phase70b: sg also refuses 'nolog@{0}' -- the existence check survives the fix, only the value source changed" \
+    test $? -ne 0
+
+# --- Phase 70b (2): sg_ref_read_path_resolved must gate a SYMREF HOP
+# TARGET with the strict path-component check, not just the weaker
+# sg_ref_branch_name_is_safe -- a Phase-70-introduced bug (rules 5/6 did
+# not exist before Phase 70, so this shape was unreachable before it).
+# The fixture MUST be a LOOSE branch/symref (no `git pack-refs`) -- a
+# packed comparison uses an exact strcmp and would refuse for an entirely
+# different reason, which would silently launder a broken gate as passing. ---
+P70B_SYM="$WORKDIR/p70b_symgate"
+rm -rf "$P70B_SYM"
+mkdir -p "$P70B_SYM"
+git init -q "$P70B_SYM"
+(cd "$P70B_SYM" && git config user.email "p70b@example.com" && git config user.name "p70b tester")
+printf 'x\n' > "$P70B_SYM/x.txt"
+(cd "$P70B_SYM" && git add x.txt && git commit -q -m "p70b_sym c1") > /dev/null 2>&1
+(cd "$P70B_SYM" && git branch a/b) > /dev/null 2>&1
+mkdir -p "$P70B_SYM/.git/refs/remotes/origin"
+printf 'ref: refs/heads//a/b\n' > "$P70B_SYM/.git/refs/remotes/origin/HEAD"
+(cd "$P70B_SYM" && LC_ALL=C git rev-parse origin) > /dev/null 2>&1
+check "phase70b oracle: precondition -- real git refuses a symref target containing '//' (loose)" \
+    test $? -ne 0
+(cd "$P70B_SYM" && "$SG" log --oneline -1 origin) > /dev/null 2>&1
+check "phase70b: sg now also refuses a LOOSE symref hop target containing '//' (previously resolved via OS path collapsing -- the bug this closes)" \
+    test $? -ne 0
+# Packed control: this is NOT the same evidence as the loose check above --
+# note the reason (exact strcmp) so this check cannot be misread as
+# validating the new gate. Kept as a named control, not a validation.
+P70B_SYM_PACKED="$WORKDIR/p70b_symgate_packed"
+rm -rf "$P70B_SYM_PACKED"
+cp -R "$P70B_SYM" "$P70B_SYM_PACKED"
+(cd "$P70B_SYM_PACKED" && git pack-refs --all) > /dev/null 2>&1
+(cd "$P70B_SYM_PACKED" && "$SG" log --oneline -1 origin) > /dev/null 2>&1
+check "phase70b control: a PACKED equivalent also refuses, but for packed-refs' own exact strcmp, not the new gate -- not evidence the gate itself works" \
+    test $? -ne 0
+
+# --- Phase 70b (4): PIN, DO NOT FIX -- a pre-existing gap in cmd_tag.c's
+# own topic, unrelated to revparse: "sg tag <new> <existing-annotated-tag>"
+# PEELS the source tag to its underlying commit, where real git creates
+# ANOTHER tag object pointing at the same target. Measured on the
+# PRE-Phase-70 binary for the two literal spellings (bare name,
+# "refs/tags/<name>") -- both were ALREADY wrong before this phase
+# existed; Phase 70 only adds a third spelling ("tags/<name>") that
+# reaches the identical bug (previously refused outright). Not this
+# phase's fix to make -- cmd_tag.c needs sg tag's full matrix (-a, -f,
+# lightweight vs annotated) measured first, in its own phase. Pinned by
+# name so closing it later turns this red rather than silently changing
+# what it compares (same convention as Phase 69's heads/<name> gap). ---
+P70B_TAGPEEL="$WORKDIR/p70b_tagpeel"
+rm -rf "$P70B_TAGPEEL"
+mkdir -p "$P70B_TAGPEEL"
+git init -q "$P70B_TAGPEEL"
+(cd "$P70B_TAGPEEL" && git config user.email "p70b@example.com" && git config user.name "p70b tester")
+printf 'x\n' > "$P70B_TAGPEEL/x.txt"
+(cd "$P70B_TAGPEEL" && git add x.txt && git commit -q -m "p70b_tagpeel c1") > /dev/null 2>&1
+(cd "$P70B_TAGPEEL" && GIT_AUTHOR_DATE="@1700000000 +0000" GIT_COMMITTER_DATE="@1700000000 +0000" \
+    git tag -a atag -m "p70b annotated tag") > /dev/null 2>&1
+(cd "$P70B_TAGPEEL" && git tag new_git tags/atag) > /dev/null 2>&1
+check "phase70b oracle: precondition -- real git's 'tag new tags/<annotated-tag>' creates a TAG object, not a peeled commit" \
+    sh -c "test \"\$(cd '$P70B_TAGPEEL' && git cat-file -t refs/tags/new_git)\" = 'tag'"
+(cd "$P70B_TAGPEEL" && "$SG" tag new_sg tags/atag) > /dev/null 2>&1
+check "phase70b: pre-existing gap, NOT fixed here (cmd_tag.c's own topic) -- sg tag PEELS 'tags/<annotated-tag>' to a commit where git creates a tag object; closing it later must turn this check red by name" \
+    sh -c "test \"\$(cd '$P70B_TAGPEEL' && git cat-file -t refs/tags/new_sg)\" = 'commit'"
+check "phase70b control: sg cat-file -t on the SAME 'tags/<name>' spelling does NOT peel (this dimension is correct)" \
+    sh -c "test \"\$(cd '$P70B_TAGPEEL' && \"$SG\" cat-file -t tags/atag)\" = 'tag'"
 
 # --- Phase 68b review round: the SG_REV_TREEISH mode for "<rev>:<path>" ---
 # The bug this closes: sg_rev_parse_object used to hand resolve_rev_path's

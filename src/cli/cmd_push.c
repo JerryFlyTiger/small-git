@@ -1021,8 +1021,32 @@ out:
    "refs/tags/<src>", "refs/heads/<src>", or src itself if it already
    starts with "refs/" -- is looked up by EXACT ref read, id NOT peeled, so
    an annotated tag given as src stays a tag object all the way to the
-   remote. Anything else (HEAD, "~"/"^"/"@{N}" suffixes, a full hex id)
-   falls back to the full sg_rev_parse_commit grammar, which does peel.
+   remote. Then (Phase 70b) the rest of git's gitrevisions dwim table --
+   rules 1, 2, 5, 6 (a bare $GIT_DIR file, "refs/<src>", "refs/remotes/<src>",
+   "refs/remotes/<src>/HEAD"), plus "heads/<src>"/"tags/<src>"-style
+   spellings landing on rules 3/4 that the three literal checks above did
+   not already cover -- is tried the SAME unpeeled way, via
+   sg_rev_parse_ref_path + sg_ref_read_path_resolved, before ever falling
+   back to the peeling sg_rev_parse_commit. Anything left ("~"/"^"/"@{N}"
+   suffixes, a full or abbreviated hex id) falls back to the full
+   sg_rev_parse_commit grammar, which does peel -- sg_rev_parse_ref_path
+   correctly misses on those (no ref is literally named "topic~1"), so they
+   reach the fallback unchanged.
+
+   Bug this closes (Phase 70b, found by the coordinator's own review, not
+   by any gate): Phase 70 taught sg_rev_parse_ref_path a "tags/<name>" dwim
+   spelling that used to be flatly refused. Before this fix, that new
+   spelling missed all three literal checks below (none of them try
+   "refs/tags/tags/<name>" or "refs/heads/tags/<name>") and fell straight
+   into the peeling sg_rev_parse_commit fallback -- so `sg push origin
+   tags/atag:refs/tags/x` pushed atag's underlying COMMIT to the remote
+   instead of the tag object itself, silently, with exit 0. The three
+   PRE-EXISTING literal checks are deliberately left untouched (they are
+   measured, in the fix's own interop group, to give byte-identical
+   answers with or without this new block; see docs/DESIGN.md's Phase 70b
+   section for why a literal ref's own "matches more than one" ambiguity
+   rule is NOT reproducible by a plain sg_rev_parse_ref_path call, and so
+   must not be collapsed into it).
 
    Returns 0 with id_out and *exact_ref_path_out (malloc'd, or NULL if src
    was resolved via the sg_rev_parse_commit fallback rather than a literal
@@ -1070,6 +1094,32 @@ static int resolve_refspec_src(const char *git_dir, const char *src,
         memcpy(id_out, br_id, SG_SHA1_RAW_LEN);
         *exact_ref_path_out = strdup(br_path);
         return *exact_ref_path_out != NULL ? 0 : -3;
+    }
+
+    {
+        char ref_path[SG_PATH_MAX];
+
+        if (sg_rev_parse_ref_path(git_dir, src, ref_path, sizeof(ref_path)) == 0) {
+            int rc;
+
+            /* HEAD is a symref, not a raw-oid file -- same special case
+               every other sg_rev_parse_ref_path caller in this codebase
+               makes (resolve_base, sg_rev_parse_object): sg_ref_resolve_head
+               owns HEAD's own detached-vs-symbolic indirection.
+               "sg push origin HEAD:refs/heads/x" must keep working
+               (CLAUDE.md) -- HEAD can never itself be a tag, so peeled or
+               not gives the identical commit id either way, but this
+               keeps the "never peel a dwim ref path" rule uniform rather
+               than carving out an exception. */
+            if (strcmp(ref_path, "HEAD") == 0)
+                rc = sg_ref_resolve_head(git_dir, id_out);
+            else
+                rc = sg_ref_read_path_resolved(git_dir, ref_path, id_out);
+            if (rc == 0) {
+                *exact_ref_path_out = strdup(ref_path);
+                return *exact_ref_path_out != NULL ? 0 : -3;
+            }
+        }
     }
 
     {
