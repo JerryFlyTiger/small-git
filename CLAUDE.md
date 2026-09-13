@@ -337,23 +337,66 @@ accidentally "fixing" one back into silent agreement with git would itself go
 undetected without the pin.
 
 **They are not all the same kind, and the question that separates them is
-"is sg's answer one we ACCEPT", not "why does it differ".** Entries 1-8 are
-answers this project keeps: some because matching git would be wrong or needs
-a knob sg does not have, others because converging would cost more than the
-difference is worth. Do not "fix" one of those without first reading the
-WARNING that says why it is there. Entry 9 is different in kind: sg's answer
-is simply WRONG and it LOSES DATA. It is pinned so the wrong behaviour stays
-visible until someone fixes it, not to protect it. **When adding an entry,
-say which of the two it is** -- a reader who applies "none of these should be
-fixed" to a deferred defect will leave it in place on the strength of this
-list's own framing, and entry 9 can destroy a tag.
+"is sg's answer one we ACCEPT", not "why does it differ".** Every entry below
+is an answer this project keeps: some because matching git would be wrong or
+needs a knob sg does not have, others because converging would cost more than
+the difference is worth. Do not "fix" one of those without first reading the
+WARNING that says why it is there. **No entry currently on this list is a
+deferred defect** -- the one that WAS on this list (`sg tag -d` deleting a
+tag on a case-aliased argv pair where git refused the whole batch, which
+briefly occupied the number 9 below) is fixed; see the parenthetical after
+this preamble for where it went. The current entry 9 is a NEW, unrelated
+entry, added after that number was freed up -- do not confuse the two by
+number alone. **When adding a future entry, still say which of the two
+kinds it is** -- a reader who applies "none of these should be fixed" to a
+deferred defect will leave it in place on the strength of this list's own
+framing, which is exactly what let the old entry 9 sit here labelled a bug
+rather than a protected answer.
 
 (This list used to have a fifth entry, `-C -C` / `--find-copies-harder`
 being rejected outright -- **implemented as of Phase 51**, see
 `docs/RULES-pathspec-rename.md`'s `-C -C` WARNING and the Phase 51 section of
-`docs/DESIGN.md`. It is
-no longer a divergence, so it is gone from this list rather than marked
-"fixed" in place, to keep the numbering meaning what it says.)
+`docs/DESIGN.md`. It also used to have a ninth entry, `sg tag -d <Name>
+<name>` deleting a tag where git refused the whole batch -- **fixed as of
+Phase 74**, which reproduces git's OWN mechanism: before deleting anything,
+it creates `refs/tags/<name>.lock` (`O_CREAT|O_EXCL`) for every name in argv
+order, exactly as git does, and treats `EEXIST` as the collision. (Phase
+74's round 1 tried an `(st_dev, st_ino)` compare of the two names' REF files
+instead and was measured wrong in both directions -- it missed a pair that
+is entirely packed-refs, since a packed ref has no loose file to `lstat`,
+and it over-refused two ref files deliberately hardlinked to one inode,
+since their LOCK paths are unrelated strings that never alias even though
+the refs do. Round 2 replaced it with the lock mechanism above. Round 3
+found the `EEXIST` branch printed the in-batch aliasing message even when
+the colliding lock belonged to nobody in the batch -- a stale lock from a
+crashed process said "'refs/tags/foo' and 'refs/tags/foo' are the same
+ref", which is false (a ref cannot alias itself); it now checks whether the
+colliding lock is one this batch holds and, if not, prints git's own
+"cannot lock ref" wording instead, keeping the aliasing message only for
+the case it is actually true. Round 3 also filtered `.lock` entries out of
+`sg_ref_list_under`'s enumerator, shared by `sg tag`'s and `sg branch`'s
+listings, which had been listing a `.lock` file as a phantom ref -- a
+pre-existing gap round 2 made newly reachable, since it is the first code
+under `src/` to ever create one. Round 3's own filter was itself a
+regression: it tested the bare dirent name before checking `S_ISDIR`/
+`S_ISREG`, so a DIRECTORY whose name ended in ".lock" took its entire
+subtree with it (not just a lock file directly inside it) -- fixed by
+moving the check to after `stat()`, gated on `S_ISREG`, so a directory is
+always recursed into regardless of its own name. That regression exposed a
+pre-existing gap one layer down: `sg_ref_name_valid_for_create`'s ".lock"
+check only ever inspected the WHOLE name's last 5 bytes (equivalent to
+checking just the last path component), so a MIDDLE component ending in
+".lock" was creatable when real git's check-ref-format rejects it at any
+component -- round 4 walks every component. Round 4 also fixed the
+stale-lock message to match git's singular/plural boundary (one existing
+ref in the transaction: "could not delete reference X:"; two or more:
+"could not delete references:", keyed on existence, not raw argv count),
+and replaced a self-referential test check (comparing sg's output against
+a second hardcoded copy of the same literal) with one that derives the
+expected wording from git's own output.) See `docs/DESIGN.md`'s Phase 74,
+"Phase 74 round 2", "Phase 74 round 3", and "Phase 74 round 4" sections.
+Both entries are gone from this list rather than marked "fixed" in place,
+to keep the numbering meaning what it says.)
 
 1. **`* Unmerged path` stays unquoted regardless of `core.quotePath`**
    (Phase 34) -- real git leaves this one line unquoted even when every
@@ -482,33 +525,52 @@ no longer a divergence, so it is gone from this list rather than marked
    pre-existing inconsistency in sg's OWN vocabulary, unrelated to git
    interop and out of scope to fix in this phase -- recorded so it is not
    rediscovered from scratch by a future audit.
-9. **`sg tag -d <Name> <name>` (two argv spellings differing only in
-   case) can DELETE a tag where git refuses the whole batch and deletes
-   nothing -- a KNOWN, UNFIXED BUG being deferred to its own phase, not a
-   design choice, and it is MACOS-ONLY** (Phase 73 review round 7).
-   Reachable with two ordinary commands on a case-FOLDING filesystem
-   (macOS's default APFS/HFS+; Linux ext4 does not fold, so this cannot
-   occur there): `sg tag Foo` then `sg tag -d Foo foo` -- both argv
-   spellings name the SAME ref file, `delete_tags`'s pass 1 reads each
-   separately and both come back existing, pass 2's refusal is keyed on
-   `strcmp` and `"Foo" != "foo"` byte for byte so it never fires, and
-   pass 3 deletes `Foo` then fails to re-read the now-gone `foo`. Real
-   git instead takes a per-ref LOCK for every name before deleting
-   anything, and the second lock collides with the first
-   (`cannot lock ref 'refs/tags/foo': ... File exists`), refusing the
-   whole batch and leaving `Foo` untouched -- **git: exit 1, tag
-   SURVIVES; sg: exit 1, tag DELETED. Identical exit code, opposite
-   effect on the repository, in the DATA-LOSING direction.** Matching
-   git means emulating its per-ref lock acquisition before any deletion
-   in `delete_tags` -- a real change to the delete path, deliberately
-   NOT attempted this round. Pinned in interop's `phase73` group
-   (`case2j`), gated on a runtime case-fold probe (a plain `touch`+`test`,
-   unrelated to git/sg) so the check only runs -- and only claims
-   anything -- on a filesystem where it is actually reachable; `skip()`'d
-   on a case-sensitive one so the row is honest about not having run
-   rather than silently absent. See Phase 73's review round 7 section of
-   `docs/DESIGN.md` for the full writeup, including how round 6's own
-   "measured unreachable" claim about this exact code path was wrong.
+9. **`sg tag`/`sg branch` LIST a ref reachable only through a
+   `.lock`-suffixed path component; real git refuses to even resolve one**
+   (Phase 74 round 5). WARNING: **this number was previously something
+   else.** Entry 9 used to be `sg tag -d Foo foo` deleting a tag git
+   refuses to touch, which Phase 74 round 2 FIXED and removed from this
+   list; the number was then reused here. A reference to "divergence 9"
+   written before Phase 74 means the deleted one, not this one -- check
+   the date before trusting such a pointer. Built by hand (no git porcelain command produces
+   this shape, since check-ref-format already rejects creating a name with
+   such a component -- see `sg_ref_name_valid_for_create`'s own per-component
+   fix, same phase): a loose ref file at `refs/tags/sub.lock/inner`, put
+   there directly rather than through any tool's own create path. Measured:
+   `git rev-parse --verify refs/tags/sub.lock/inner` fails outright (not
+   merely "not listed" -- git's ref resolution refuses the path at every
+   layer), and `git tag`/`git for-each-ref` show nothing for it; `sg tag`
+   lists `sub.lock/inner` right alongside an ordinary sibling tag. **This is
+   the same split this project already applies to a broken tree object**
+   (see the module notes above: real git's object store accepts one as-is
+   and `cat-file -p` can still read it out, precisely so there is a way to
+   inspect and recover from something a stricter reader would simply
+   refuse to touch) -- sg is deliberately STRICT at CREATION (the
+   validator rejects the name going forward) and deliberately TOLERANT when
+   READING whatever already exists on disk, regardless of how it got there
+   (an older sg build before this fix, or another tool entirely). `sg
+   tag -d` is the recovery tool for exactly this shape, and hiding it from
+   the listing would remove the only way a user finds out such a ref
+   exists at all.
+
+   **Why this needs a list entry despite needing a hand-built fixture to
+   reach**: the question a list entry answers is not "will anyone
+   encounter this", it is "could a future edit silently un-fix a real bug
+   by chasing agreement with git here". Concretely: `list_loose_branches`
+   (`src/storage/refs.c`) used to prune any directory entry ending in
+   ".lock" before ever checking whether it was a directory at all, which
+   took an entire subtree with it -- a real bug, closed the same round
+   this entry was added, where a ref sg could delete by name was invisible
+   to its own listing. Restoring that prune (e.g. to "match git" for this
+   exact fixture) would silently reintroduce that bug. **The prune must
+   not come back**; if this shape's sg-side behavior is ever revisited, it
+   should be revisited on its own terms, not because this entry's git-side
+   pin looked like something to converge onto. Pinned on both sides in
+   interop's `phase74 case2p` group: a precondition asserting git's
+   listing does NOT contain the nested ref (while an ordinary sibling tag
+   still does), and a second check asserting sg's listing DOES contain it,
+   for both `sg tag` and `sg branch` (both share `sg_ref_list_under`'s one
+   enumerator).
 
 ## Core types cheat sheet
 

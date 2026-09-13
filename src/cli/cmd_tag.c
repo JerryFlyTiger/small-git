@@ -10,10 +10,14 @@
 #include "sg/revparse.h"
 #include "sg/workdir.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 static const char USAGE[] =
     "usage: sg tag [-a] [-m <msg>] [-f|--force] [--] <name> [<rev>]\n"
@@ -263,6 +267,7 @@ static int delete_tags(const char *git_dir, const char **names, int count)
     int i;
     int had_failure = 0;
     int *exists;
+    int existing_count;
     const char *smallest_dup = NULL;
 
     /* Upper-bounded by argc via the caller's own positional array. */
@@ -295,6 +300,22 @@ static int delete_tags(const char *git_dir, const char **names, int count)
         exists[i] = 1;
     }
 
+    /* Phase 74 round 4: how many names actually ENTER git's ref
+       transaction -- i.e. how many exist -- decides singular vs plural
+       wording in the stray-lock message below (pass 2b). Measured against
+       real git 2.55.0, this is keyed on the EXISTING count, not raw argv
+       count: `tag -d nosuch foo` (nosuch missing, foo has a stale lock)
+       still gets the SINGULAR "could not delete reference refs/tags/foo: "
+       form, because only foo ever entered the transaction; `tag -d foo
+       bar` (foo locked, bar a normal existing tag) gets the PLURAL
+       "could not delete references: " form with two existing names,
+       regardless of which one collides or survives. */
+    existing_count = 0;
+    for (i = 0; i < count; i++) {
+        if (exists[i])
+            existing_count++;
+    }
+
     /* Pass 2: a repeated name only triggers the transaction refusal when
        it EXISTS (round 3's rule, unchanged here) -- a repeated MISSING
        name already got its "not found" line above, once per occurrence,
@@ -319,6 +340,212 @@ static int delete_tags(const char *git_dir, const char **names, int count)
                smallest_dup);
         free(exists);
         return 1;
+    }
+
+    /* Pass 2b (Phase 74 round 2): reproduce git's OWN mechanism, not a
+       heuristic approximation of it. git takes a per-ref LOCK
+       (`refs/tags/<name>.lock`, created with O_CREAT|O_EXCL) for every
+       name in the batch before deleting anything; two names collide iff
+       their LOCK PATHS resolve to the same file. That is a property of
+       the lock path string on disk (case-folding merges 'Foo.lock' and
+       'foo.lock' into one directory entry), and it is INDEPENDENT of
+       whether the underlying ref itself is loose or lives only in
+       packed-refs -- git still creates the lock file either way, because
+       the lock's job is to serialize the delete, not to touch the ref's
+       own storage. An inode comparison of the REF files themselves (this
+       function's round-1 approach) got both of these wrong, measured:
+       two names that are BOTH packed-only never alias by that test (a
+       packed ref has no loose file to `lstat` at all), so sg deleted both
+       and exited 0 where git refuses; two ref files deliberately
+       hardlinked to the SAME inode DO alias by that test even though
+       their `.lock` paths are two unrelated strings, so sg over-refused
+       where git deletes both. Locking is what git actually does, so it
+       gets both right with one mechanism.
+
+       This is still a different rule from pass 2 above, not a
+       generalization of it: git's message names the ref by ARGV ORDER
+       here (the first name creates the lock; the first LATER name whose
+       lock creation collides is the one reported), where pass 2 names the
+       strcmp-SMALLEST string regardless of argv order. Measured against
+       real git 2.55.0: `Foo foo` -> names 'foo', `foo Foo` -> names
+       'Foo', `FOO foo Foo` -> names 'foo', `zz ZZ` -> names 'ZZ' (all
+       names[1]). Measured priority when both rules could apply to the
+       same call (`Foo foo lw lw`, `lw lw Foo foo`): pass 2's
+       literal-duplicate rule always wins, independent of which pair sits
+       first in argv -- so this pass only runs once pass 2 has found
+       nothing, unchanged from round 1.
+
+       sg has no ref transaction and no lock file format of its own to
+       borrow, so this pass creates ordinary `O_CREAT|O_EXCL` lock files
+       purely as a COLLISION DETECTOR, exactly mirroring git's own
+       mechanism, and removes every one of them again before returning
+       from this pass by ANY exit path (collision, mid-loop error, or
+       reaching the end clean) -- a lock file surviving past this pass
+       would make the NEXT invocation see a stale lock it cannot explain.
+       The message still does not claim "cannot lock ref" (sg's lock is
+       an internal detection mechanism only, not a durable feature), and
+       still names BOTH colliding ref paths rather than one, matching
+       round 1's wording -- attributing the message to the earlier
+       colliding name uses an (st_dev, st_ino) compare of the LOCK FILES
+       themselves (not the refs), which is safe precisely because lock
+       files are always ordinary loose files this function just created,
+       whether or not the underlying ref is packed. */
+    {
+        struct held_lock {
+            char *path; /* owned; git_dir + "/" + ref_path + ".lock" */
+            const char *name;
+        } *locks;
+        int lock_count = 0;
+        int collision = 0;
+
+        locks = malloc(sizeof(*locks) * (size_t)(count > 0 ? count : 1));
+        if (locks == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            free(exists);
+            return 1;
+        }
+
+        for (i = 0; i < count && !collision; i++) {
+            char ref_path[SG_PATH_MAX];
+            char *lock_path;
+            int fd;
+
+            if (!exists[i])
+                continue;
+            if (snprintf(ref_path, sizeof(ref_path), "refs/tags/%s.lock", names[i]) >= (int)sizeof(ref_path))
+                continue; /* already reported as too-long in pass 1 */
+            lock_path = malloc(strlen(git_dir) + 1 + strlen(ref_path) + 1);
+            if (lock_path == NULL || sg_path_join(lock_path, strlen(git_dir) + 1 + strlen(ref_path) + 1,
+                                                   git_dir, ref_path) != 0) {
+                /* Phase 74 round 3: this used to `free(); continue;` with
+                   no failure flag, silently dropping this name out of
+                   collision detection while the batch proceeded to
+                   delete anyway -- fail-OPEN in a function whose entire
+                   purpose is fail-closed, and inconsistent with the
+                   open() failure below, which already aborts. An OOM or
+                   a path-join failure here is at least as serious as a
+                   permission error on open(), so it gets the same
+                   treatment: abort the whole batch, delete nothing. */
+                fprintf(stderr, "sg: out of memory\n");
+                free(lock_path);
+                collision = 1;
+                continue;
+            }
+            /* A nested tag name (e.g. "release/v1") needs its parent
+               directory to exist before the lock file can be created --
+               same reason sg_ref_write_path calls this before its own
+               fopen. An ordinary top-level tag name is already inside the
+               pre-existing refs/tags/ directory, so this is a no-op then. */
+            if (sg_mkdir_parents(lock_path) != 0) {
+                /* Same fail-closed treatment as the malloc/path-join
+                   failure just above, for the same reason. */
+                fprintf(stderr, "sg: failed to lock ref 'refs/tags/%s': could not create lock directory\n",
+                        names[i]);
+                free(lock_path);
+                collision = 1;
+                continue;
+            }
+
+            fd = open(lock_path, O_CREAT | O_EXCL | O_WRONLY, 0666);
+            if (fd < 0) {
+                if (errno == EEXIST) {
+                    struct stat new_st;
+                    const char *other_name = NULL;
+                    int k;
+
+                    if (lstat(lock_path, &new_st) == 0) {
+                        for (k = 0; k < lock_count; k++) {
+                            struct stat held_st;
+
+                            if (lstat(locks[k].path, &held_st) == 0 &&
+                                held_st.st_dev == new_st.st_dev && held_st.st_ino == new_st.st_ino) {
+                                other_name = locks[k].name;
+                                break;
+                            }
+                        }
+                    }
+                    /* Two different messages for two different causes
+                       (Phase 74 round 3): if the colliding lock is one
+                       THIS batch already holds, it really is the in-batch
+                       aliasing case (case-folding, a hardlink, etc.) and
+                       naming both paths is the useful answer -- git only
+                       ever names one, but sg can do better since it just
+                       created both locks itself. If `other_name` is NULL,
+                       nothing in THIS batch owns the colliding lock file:
+                       it is a stray `.lock` left by a crashed process or
+                       another tool entirely, and "'refs/tags/foo' and
+                       'refs/tags/foo' are the same ref" would be a false,
+                       self-contradictory statement (a ref cannot alias
+                       itself) that misdirects a debugging user toward
+                       aliasing when the real cause is unrelated. For that
+                       branch, sg genuinely could not take the lock, so
+                       git's own "cannot lock ref" wording is now the true
+                       description -- round 2's objection to using it (sg
+                       had no lock mechanism to describe) no longer holds,
+                       since this pass IS that mechanism. The absolute
+                       path git includes is left out as an implementation
+                       detail sg does not need to expose. */
+                    if (other_name != NULL) {
+                        /* An in-batch alias always involves at least two
+                           EXISTING names by construction (two different
+                           strings both had to resolve to collide), so this
+                           branch never needs the singular/plural choice
+                           below -- it is unconditionally the "two or more"
+                           shape, matching git's own plural "references:"
+                           wording in every case that can reach here. */
+                        fprintf(stderr,
+                                "sg: could not delete references: 'refs/tags/%s' and "
+                                "'refs/tags/%s' are the same ref\n",
+                                other_name, names[i]);
+                    } else if (existing_count == 1) {
+                        /* Phase 74 round 4: git's singular form when
+                           exactly one ref entered the transaction --
+                           measured `could not delete reference
+                           refs/tags/foo: cannot lock ref 'refs/tags/foo':
+                           ...` (no quotes around the outer ref path, and
+                           "reference" without an 's'). This is keyed on
+                           EXISTENCE, not argv position or count: a batch
+                           of `nosuch foo` (nosuch missing, foo the only
+                           one that resolves) still gets this singular
+                           form, because 'nosuch' never entered the
+                           transaction at all. */
+                        fprintf(stderr,
+                                "sg: could not delete reference refs/tags/%s: cannot lock ref "
+                                "'refs/tags/%s': File exists\n",
+                                names[i], names[i]);
+                    } else {
+                        fprintf(stderr,
+                                "sg: could not delete references: cannot lock ref 'refs/tags/%s': "
+                                "File exists\n",
+                                names[i]);
+                    }
+                    collision = 1;
+                } else {
+                    fprintf(stderr, "sg: failed to lock ref 'refs/tags/%s': %s\n", names[i], strerror(errno));
+                    collision = 1; /* abort the whole batch -- cannot safely proceed unlocked */
+                }
+                free(lock_path);
+                continue;
+            }
+            close(fd);
+            locks[lock_count].path = lock_path;
+            locks[lock_count].name = names[i];
+            lock_count++;
+        }
+
+        /* Every lock this pass created is released here, on every exit
+           path -- collision, an open()/mkdir_parents error, or falling
+           through clean. None of them are meant to outlive this pass. */
+        for (i = 0; i < lock_count; i++) {
+            unlink(locks[i].path);
+            free(locks[i].path);
+        }
+        free(locks);
+
+        if (collision) {
+            free(exists);
+            return 1;
+        }
     }
 
     /* Pass 3: no transaction conflict -- actually delete every name that

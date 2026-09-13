@@ -16060,3 +16060,433 @@ negative result ("nothing reaches this", "nothing else uses this string")
 is exactly as falsifiable as a positive one, and needs the same grep or the
 same attempted fixture before it goes in a doc that future rounds will
 trust without re-checking.
+
+## Phase 74: `sg tag -d` no longer deletes when two argv spellings alias one ref file
+
+Closed CLAUDE.md's former deliberate-divergence entry 9: on a case-folding
+filesystem (macOS default), `sg tag -d Foo foo` deleted `Foo` where real git
+refuses the whole batch and deletes nothing. Same exit code (1), opposite
+effect on the repository.
+
+**WARNING (round 2, below): this round's detection mechanism -- an
+`(st_dev, st_ino)` compare of the two names' REF files -- was measured WRONG
+by a cold review and was replaced.** It is left in place in this section
+rather than rewritten, per this project's own convention of correcting a
+claim rather than silently editing history (see the Phase 64/70b entries
+that do the same); read the "Phase 74 round 2" section below for what
+replaced it and why. The two paragraphs immediately below describe the
+round-1 mechanism as it was believed to work at the time.
+
+**Detection is by `(st_dev, st_ino)` of each name's resolved LOOSE ref file,
+not by case-folding a string.** This was the spec's explicit instruction and
+is also the only portable choice: it catches case folding today and a
+hardlink or any other aliasing cause tomorrow, and it degrades correctly on
+a case-sensitive filesystem (two different inodes, nothing fires). A name
+whose ref lives only in `packed-refs` is skipped by this check -- packed-refs
+stores each ref's name as a literal string inside one shared file, so every
+packed ref's "file" is trivially the same inode as every other packed ref;
+there is no portable way to tell "two packed entries happen to share a file"
+(they always do) from a real collision, so the check simply does not apply
+there. Case folding is a property of directory entries, not of a text file's
+contents, so this is not a gap case folding can reach anyway.
+
+**There are two rules, not one, and they were kept separate on purpose** --
+merging them was tried mentally and rejected before writing code, because
+they answer to different measured shapes:
+
+- The literal-duplicate rule (`-d lw lw`, already correct since Phase 73)
+  fires on the SAME STRING appearing twice and names the strcmp-SMALLEST
+  colliding name, independent of argv order.
+- The new aliasing rule fires on two DIFFERENT strings resolving to the SAME
+  ref file and names the FIRST LATER name in argv order to collide with an
+  already-"locked" file -- measured in all four combinations git 2.55.0
+  offers: `Foo foo` -> `foo`; `foo Foo` -> `Foo`; `FOO foo Foo` -> `foo`;
+  `zz ZZ` -> `ZZ`. Every case names `names[1]`, the position after the first
+  occupant of that inode.
+
+**Priority when both rules could apply to the same call was measured, not
+assumed**: `Foo foo lw lw` and `lw lw Foo foo` both hit git's
+literal-duplicate refusal (naming `lw`), never the aliasing one, regardless
+of which pair sits first in argv. sg's pass order reproduces this by running
+the existing literal-duplicate pass first and returning immediately if it
+fires, so the new aliasing pass (pass 2b) only ever runs once pass 2 has
+found nothing.
+
+**sg's message does not claim a lock.** sg has no ref lock files at all
+(`grep '\.lock' src/storage/refs.c` finds only the name validator rejecting
+a `.lock` suffix in a ref name); printing "cannot lock ref" would describe a
+mechanism sg does not have -- the same class of mistake CLAUDE.md's own
+entry 8 write-up warns about for invented justifications. sg instead prints
+one line naming both colliding ref paths and saying they are the same ref,
+keeping git's `could not delete references: ` prefix since that half really
+is shared vocabulary:
+
+    sg: could not delete references: 'refs/tags/Foo' and 'refs/tags/foo' are the same ref
+
+Pinned as a genuine divergence in wording (not behaviour) in interop's
+`phase74 case2j` group: git's first line is asserted up to and including the
+ref name it blames (`cannot lock ref 'refs/tags/foo'`), sg's full line is
+asserted as an exact match, and a third check asserts sg's line contains no
+`lock` substring at all -- so a future "helpful" wording change that
+reintroduces the word `lock` fails by name.
+
+**Verification**: `tests/interop.sh`'s former `case2j` (which used to pin the
+bug, comment updated to say so rather than deleted) now asserts `Foo`
+survives; two new cases (`case2j2`, reversed spelling order; `case2j3`, a
+third unrelated name in the same batch) cover the argv-order rule from the
+other direction and the "whole batch, not just the pair" requirement. A new
+`case2k` builds a fixture no case-folding filesystem can produce at all --
+two ref files hardlinked to each other under `refs/tags/` -- and has no git
+side to compare against (hand-hardlinking two ref files is not a shape any
+git porcelain command produces, so there is no oracle invocation to run);
+it stands alone as a targeted proof that the mechanism is inode-based, not
+string-based, `skip()`'d if the filesystem/user cannot hardlink. All of
+Phase 73's own `-d` rows (`case2a` through `case2i`) were re-run unchanged
+and are unaffected, including the literal-duplicate-vs-aliasing priority
+rows added this phase. `make sanitize` was run because this touches a
+delete path; `sys/stat.h`'s `lstat` is the only new external call, no new
+heap allocation shape beyond a `malloc` already sized and freed the same way
+the existing `exists` array is.
+
+## Phase 74 round 2: the inode compare was measured wrong in both directions -- replaced with git's own lock mechanism
+
+A cold review of round 1's fix reproduced two real bugs, both against real
+git 2.55.0, and both a direct consequence of testing the wrong thing:
+round 1 compared the two ARGV NAMES' underlying REF FILES by inode, but
+that is not what decides collision in git at all.
+
+**What git actually does**: for every name in the `-d` batch, in argv
+order, it creates `refs/tags/<name>.lock` with `O_CREAT|O_EXCL`. Two names
+collide iff their LOCK PATHS resolve to the same file -- a property of the
+lock path STRING on disk, entirely independent of where or whether the
+underlying ref itself is stored. Case folding merges `Foo.lock` and
+`foo.lock` into one directory entry regardless of whether `Foo`/`foo` are
+loose files, packed entries, or a mix of both, because the lock is always
+an ordinary loose file that this code creates fresh. A hardlink between two
+DIFFERENT ref files changes nothing about this: `one.lock` and `two.lock`
+are two unrelated path strings, so they never alias, however much the refs
+themselves share an inode.
+
+**Two findings, both measured, both real, both reachable with an ordinary
+repository**:
+
+1. **Packed-only pair, worse than the original bug.** Built with
+   `git tag Foo; git pack-refs --all; git tag foo; git pack-refs --all` --
+   both `refs/tags/Foo` and `refs/tags/foo` end up as lines in
+   `packed-refs` with no loose file for either. Real git: `tag -d Foo foo`
+   exits 1, both survive. Round 1's sg: exits **0**, both **deleted**.
+   Round 1's inode check `lstat`s the loose ref path and finds nothing for
+   either name (packed refs have no loose file), so the whole pass 2b
+   silently no-ops and pass 3 deletes both. This is a worse failure than
+   the bug the round existed to fix: the original bug at least exited 1;
+   this one reports SUCCESS while destroying two tags git refuses to touch.
+2. **Hardlinked pair, over-refusal.** Two ref files hardlinked to the same
+   inode by hand (`ln refs/tags/one refs/tags/two`, a shape no git
+   porcelain command produces, but a valid on-disk state). Real git:
+   `tag -d one two` exits 0, both deleted -- their `.lock` paths are two
+   unrelated strings, no collision. Round 1's sg: exits **1**, both
+   **survive** -- the inode compare of the ref files sees one shared
+   inode and refuses a batch git would happily complete.
+
+**The fix drops the ref-file inode compare entirely** and instead performs
+the same `O_CREAT|O_EXCL` lock creation git does, purely as a collision
+detector (`delete_tags`'s pass 2b in `src/cli/cmd_tag.c`): for each
+existing name in argv order, build `refs/tags/<name>.lock`, call
+`sg_mkdir_parents` (needed for a nested tag name, a no-op for an ordinary
+top-level one since `refs/tags/` already exists), then
+`open(path, O_CREAT|O_EXCL|O_WRONLY, 0666)`.
+
+- **`EEXIST`** is the collision. The message still names BOTH colliding ref
+  paths (round 1's wording, unchanged: sg has no durable lock file format
+  to claim, so it does not print "cannot lock ref" the way git does) --
+  attributing the message to the EARLIER colliding name uses an
+  `(st_dev, st_ino)` compare of the LOCK FILES this pass itself created,
+  which is safe precisely because a lock file is always an ordinary loose
+  file, whatever the underlying ref's own storage is. This reproduces
+  git's argv-order naming rule for free, since the locks are taken in the
+  same argv order git takes them in.
+- **Any other `open()` failure** (permission, `ENOSPC`, etc.) aborts the
+  whole batch too, with its own message naming the failing ref and
+  `strerror(errno)` -- proceeding to delete while unable to lock some
+  other name would be worse than refusing.
+- **Every lock this pass creates is `unlink()`'d before the pass returns,
+  on every exit path** -- collision, a non-`EEXIST` error, or falling
+  through clean -- because a lock file surviving past this pass would make
+  the NEXT invocation refuse for a reason with no visible cause. This is
+  the one property round 1 never had to worry about (an `lstat` has no
+  file to clean up) and is now interop-pinned directly: every refusal
+  fixture asserts `find .git/refs/tags -name '*.lock'` finds nothing
+  afterward.
+
+**Verification, round 2**: `tests/interop.sh` gained `case2l` (both
+spellings packed-only, built via the exact porcelain recipe above -- the
+regression round 1 introduced) and `case2m` (one spelling packed, the
+other loose -- a separate discriminator from both `case2l`, packed/packed,
+and `case2j`, loose/loose, since an implementation could special-case one
+representation and still miss the mixed one). `case2k` (the hardlink pair)
+was rewritten from an sg-only proof into a genuine git-vs-sg comparison --
+round 1's version claimed "git would refuse this identically" without
+running git; measured, git deletes both, exit 0, so `case2k` now asserts
+BOTH tools delete both names. Every loose-only row from round 1 (`case2j`,
+`case2j2`, `case2j3`) is unchanged and still passes, plus each gained a
+no-stale-lock assertion. All of Phase 73's pre-existing `-d` rows
+(`case2a` through `case2i`) were re-run unaffected.
+
+**Mutation, as specified**: skipping the lock-creation pass (short-circuit
+it to a no-op) turned `case2l`/`case2m` (the packed shapes) red while
+`case2j`/`case2j2`/`case2j3` (the loose shapes) stayed green -- exactly the
+round-1 blind spot, now caught. Separately, leaving one lock file
+un-`unlink()`'d on the refusal path turned the new no-stale-lock checks red
+without affecting any other row, confirming that assertion is load-bearing
+rather than decorative.
+
+**CLAUDE.md's entry 9 removal, re-verified**: the packed shape was the
+missing case that would have made the earlier "entry 9 is closed" sentence
+wrong the same way the round-1 fix itself was wrong. It is genuinely closed
+now -- both the packed-only and mixed packed/loose shapes are covered by
+`case2l`/`case2m` above, not merely assumed to follow from the loose case.
+
+## Phase 74 round 3: a self-contradictory message, a phantom tag, and a fail-open failure mode -- all three created by round 2's lock mechanism
+
+Round 2's lock-file mechanism was the right replacement for round 1's inode
+compare, but a further cold review found it introduced three new defects of
+its own, none of which existed before round 2 because nothing under `src/`
+had ever created a `.lock` file until then.
+
+**1. A stray `.lock` produced a false "are the same ref" message.**
+`delete_tags`'s `EEXIST` branch assumed every collision was between two
+names in the CURRENT batch and searched only the locks this pass had itself
+created (`locks[0..lock_count)`). When the colliding lock belongs to none of
+them -- a crashed prior process, or any other tool, left `refs/tags/foo.lock`
+behind, and the user runs a plain single-name `sg tag -d foo` -- the search
+finds nothing and `other_name` stays NULL, so the fallback printed
+`names[i]` on both sides: `'refs/tags/foo' and 'refs/tags/foo' are the same
+ref`. A ref cannot be the same ref as itself; the refusal was correct but the
+stated reason was false, and it points a debugging user at case-folding or a
+hardlink when the real cause is an unrelated stray file. Measured against
+real git on the identical fixture: `cannot lock ref 'refs/tags/foo': Unable
+to create '<path>': File exists.` -- a single name, the true cause.
+
+The fix keeps the aliasing message for the real in-batch case (naming both
+paths is more useful than git's single name, and it is true there) and adds
+a second branch for a lock owned by nobody in this batch, printing git's
+"cannot lock ref" wording minus the absolute path:
+
+    sg: could not delete references: cannot lock ref 'refs/tags/foo': File exists
+
+**This directly reverses round 2's own stated reason for never printing
+"cannot lock ref" at all.** That objection ("sg has no lock files, so saying
+so would describe a mechanism it does not have") was true through round 1
+and became false the moment round 2 gave `delete_tags` an actual
+`O_CREAT|O_EXCL` lock. For the stray-lock branch specifically, sg genuinely
+could not take the lock, so git's own wording is now the accurate one --
+the earlier instruction was correct when given and needed to be corrected
+by the same source that gave it, not silently reproduced across rounds.
+
+**2. `sg tag`/`sg branch` listed a `.lock` file as a phantom entry.**
+`list_loose_branches` (`src/storage/refs.c`, the sole enumerator behind
+`sg_ref_list_under`, shared verbatim by `sg_ref_list_branches` and every
+`sg_ref_list_under` caller including `cmd_tag.c`'s listing path) lists every
+regular file under the ref directory with no suffix filter at all. This gap
+predates Phase 74 -- it was always theoretically present -- but round 2 made
+it newly REACHABLE: before round 2, nothing in `src/` ever created a
+`refs/**/*.lock` file, so the gap had no trigger; `delete_tags` is now the
+first code that does, and it holds every lock in a multi-name batch open for
+the length of the whole pass, so a concurrent listing (by another process,
+or simply a stale lock left over from an earlier crash) sees the phantom.
+Measured: `git tag` filters `.lock` entries in its own files-backend for
+exactly this reason; sg did not.
+
+Fixed in the enumerator itself, not in `cmd_tag.c`: `list_loose_branches`
+now skips any directory entry whose name ends in `.lock` before it is
+`stat()`'d at all (a 5-byte suffix compare, checked against `.` and `..`
+in the same early-continue spot). **`sg branch` shares this fix for free**
+-- `cmd_branch.c`'s listing goes through `sg_ref_list_branches`, which is a
+one-line wrapper over the exact same `sg_ref_list_under`/
+`list_loose_branches` pair `cmd_tag.c` uses, confirmed by both a `grep` for
+every caller and a new interop check (`case2o`'s branch row) that plants a
+stray `refs/heads/master.lock` and asserts `sg branch` does not list it, with
+zero changes to `cmd_branch.c`. Fixing the shared enumerator rather than
+patching `cmd_tag.c` was the explicit instruction, for the correct reason:
+every OTHER caller of `sg_ref_list_under` (present or future, under any ref
+prefix) has the identical exposure, and a stray lock from any source should
+never read back as a ref regardless of which command asked.
+
+**3. A `malloc`/`sg_mkdir_parents` failure inside the lock loop was
+fail-OPEN.** Round 2's loop had three failure branches at three different
+points, and only the third (`open()` itself) aborted the batch
+(`collision = 1`); the first two (allocation/path-join failure, and
+`sg_mkdir_parents` failure) did `free(); continue;` with no failure flag at
+all, silently dropping that name out of collision detection while the batch
+proceeded to delete anyway. `delete_tags`'s entire purpose from Phase 73 on
+is fail-closed (a refusal on ambiguity, never a silent partial success), and
+this was the opposite: an out-of-memory condition or a directory-creation
+failure -- both at least as serious as the `open()` permission failure two
+lines below that already aborts -- would make the function behave as though
+collision detection had simply succeeded with nothing to report. Both
+branches now print a message and set `collision = 1`, aborting the whole
+batch the same way `open()`'s failure does. No interop row exercises this
+directly (there is no portable way to force `malloc`/`mkdir` to fail on
+demand from a shell fixture), so this is verified by code inspection and the
+symmetry with the adjacent `open()` branch, not by a new check.
+
+**Verification**: two new interop cases, needing no case-fold guard at all
+(a stray `.lock` reproduces on ANY filesystem, with a single ordinary tag
+name and no second spelling): `case2n` (a stale `refs/tags/foo.lock`, a
+single-name `-d foo`) asserts sg's message names the ref exactly once via
+"cannot lock ref" and never claims two names are the same ref, that the
+pre-existing lock file itself survives untouched (sg never owned it, so it
+must not delete someone else's lock), and that both tools refuse identically
+(git: exit 1, "cannot lock ref"; sg: exit 1, foo survives). `case2o` (the
+same stale lock, no delete at all, just a listing) asserts neither `sg tag`
+nor `git tag` shows the `.lock` as a phantom entry, that the two real tags
+still show (the filter did not over-hide anything), and a fourth row plants
+a SEPARATE stray `refs/heads/master.lock` and asserts `sg branch` filters it
+too, through the identical enumerator, with no branch-specific code. Every
+pre-existing row (round 1's loose cases, round 2's packed/hardlink cases) is
+unchanged and still passes: `interop: 3996/3996 passed, 0 skipped` (up from
+3988, the net of 2 new cases x 4 checks each = 8).
+
+**Mutation, as specified**: reverting the two-branch dispatch back to
+round 2's single aliasing message (forcing the `if (other_name != NULL)`
+branch unconditionally) turned exactly ONE row red --
+`case2n: sg's message names the ref ONCE ... and does NOT claim two names
+are the same ref` -- while every aliasing row (`case2j`, `case2j2`,
+`case2j3`, `case2l`, `case2m`) stayed green. That is the discriminating
+pair this mutation exists to prove: the two branches are genuinely
+distinguished by which case is under test, not merged into one path that
+happens to satisfy both by coincidence.
+
+## Phase 74 round 4: the `.lock` filter pruned directories, a pre-existing name-validation gap made that worse, and a self-referential test message check
+
+Round 3's `.lock` filter was itself a regression, found by a cold review
+that also uncovered a pre-existing gap underneath it, plus a self-checking
+test that was found separately.
+
+**1. The filter pruned DIRECTORIES, not just files.** Round 3's check
+tested the bare dirent name and `continue`'d BEFORE the `S_ISDIR`/`S_ISREG`
+branch ever ran, so a directory whose own name happened to end in ".lock"
+(e.g. `refs/tags/sub.lock/`) took its ENTIRE SUBTREE with it -- not just a
+lock file living directly inside it, every ref nested arbitrarily deep
+under it. Measured: `sg tag "sub.lock/inner"` created a real loose ref at
+`refs/tags/sub.lock/inner` (nothing rejected the name -- see finding 2), but
+`sg tag`'s own listing showed only "plain", with "sub.lock/inner" invisible;
+`sg tag -d "sub.lock/inner"` could still delete it directly by name, since
+deletion doesn't go through the listing enumerator at all -- so the ref
+existed, was deletable, and simply could not be SEEN. **This is the exact
+failure shape CLAUDE.md already documents for `.git` detection during a
+working-directory walk**: a leaf-level marker heuristic ("does this name
+look like a lock file") applied to directory TRAVERSAL under-reports,
+because the heuristic was never meant to answer "should I recurse into
+this" -- it was only ever supposed to answer "is this one leaf a lock
+file". The fix moves the `.lock` suffix test from before `stat()` (tested
+against the bare name) to after it, gated on `S_ISREG` -- a same-named
+directory is now always recursed into, regardless of its own name.
+
+**2. Underneath it, sg accepted a ref name real git rejects, at ANY nesting
+level.** `sg_ref_name_valid_for_create`'s existing ".lock" check
+(pre-existing, predates Phase 74 entirely) was `strcmp(name + len - 5,
+".lock")` against the WHOLE name string -- equivalent to checking only the
+LAST '/'-separated component, so a name whose MIDDLE component ended in
+".lock" (`sub.lock/inner`) passed it and was creatable. This gap existed
+before Phase 74 touched anything, but round 3's filter turned it from
+"creatable and merely odd" into "creatable and invisible", a strictly worse
+combination -- which is why fixing the validator belongs in THIS phase even
+though the gap itself is not this phase's own regression.
+
+Measured with `git check-ref-format` (a read-only syntax check, needs no
+repository) BEFORE writing the fix, across three shapes rather than
+assuming the rule from the one example given: a MIDDLE component ending in
+".lock" (`a.lock/b`) and an END component (`a/b.lock`) are both REJECTED
+(exit 1); a component that merely CONTAINS ".lock" without it being the
+component's own tail (`a.lockx/b`) is ACCEPTED (exit 0). So the rule is "does
+ANY '/'-separated component end with .lock", not "does the whole name
+contain .lock anywhere" -- `sg_ref_name_valid_for_create` now walks every
+component with the same style of loop `sg_ref_path_components_are_safe`
+already uses for `.`/`..`, checking each one's own tail rather than the
+whole string's.
+
+**Neither fix alone is sufficient, and this was the explicit design
+question, not an afterthought**: the validator stops NEW ones being
+created going forward, but does nothing for a ref that ALREADY exists on
+disk with such a component -- written by another tool, or by an older sg
+build before this fix. The `S_ISREG`-gated filter is what keeps THAT ref
+visible to `sg tag`/`sg branch` regardless of how it got there. Fixing the
+validator does not make the filter fix redundant, and vice versa.
+
+**A genuinely surprising measurement, recorded rather than glossed over**:
+real git's OWN loose-ref resolution refuses to even READ a path through a
+".lock"-suffixed component, not just to create or list one --
+`git rev-parse --verify refs/tags/sub.lock/inner` fails outright
+(`fatal: needed a single revision`) on a hand-built fixture where that
+loose file genuinely exists and holds a valid sha, and `git tag`/`git
+for-each-ref` show nothing for it either. So for this exact pathological
+shape, sg's fixed behavior (list it) and real git's behavior (refuse to
+even resolve it) genuinely diverge, and this is NOT a bug to chase: it
+follows directly from this project's existing, deliberate design split
+between validation-at-creation and tolerant reading of whatever already
+exists on disk (the same split CLAUDE.md documents for a broken tree
+object -- real git's object store accepts one as-is and `cat-file -p` can
+still read it out, precisely so a user has a way to inspect and recover
+from something a stricter reader would simply refuse to touch). `sg
+tag -d` is the recovery tool for exactly this shape; making the LISTING
+refuse to show it as thoroughly as `git rev-parse` does would remove the
+only way a user finds out such a ref exists at all. No new deliberate-
+divergence list entry was added for this, since it requires a hand-built,
+never-git-created fixture to reach and only affects visibility of an
+already-invalid name, not any output git and sg both agree is meaningful.
+
+**3. The stale-lock message's singular/plural boundary, and a
+self-referential test.** Two more things were found in the SAME message
+this phase's round 3 already touched: git says "could not delete
+REFERENCE refs/tags/foo:" (singular, no quotes on the outer path) when
+exactly ONE ref enters the transaction, and "could not delete REFERENCES:"
+(plural) when two or more do -- measured across three shapes: a single
+existing name with a stale lock (singular); two existing names, one
+locked (plural, and BOTH survive the refusal regardless of which one was
+locked); and a MISSING name plus one existing, locked name (still
+SINGULAR, because the missing name never enters the transaction at all --
+this is the one that rules out "keyed on raw argv count"). `delete_tags`
+now counts `existing_count` right after pass 1 (the same existence flags
+the rest of the function already relies on) and picks the wording from
+that count, not from `count` (raw argv length) -- a mutation swapping the
+two would still pass the first two measured shapes and only the third
+(missing-plus-one) would catch it, which is exactly why that shape has its
+own named interop row (`case2n3`) rather than being folded into `case2n`
+or `case2n2`.
+
+Separately: `case2n`'s message assertion used to be `grep -qx` against a
+string typed directly into the test, copied from `cmd_tag.c`'s own
+literal -- self-referential, since the "expected" text was never anything
+but a second copy of the implementation. It could never catch a wording
+drift, and (worse) it could never have caught the ORIGINAL wrong wording
+either, which is exactly the failure mode CLAUDE.md's testing-conventions
+section warns about for an empty test that can never fail, one layer up:
+this test COULD fail, but only for reasons unrelated to whether the
+wording was ever correct. Rewritten to derive sg's expected line FROM
+git's own output at runtime (the same convention `case2c`/`case2h` already
+use in this function): a `sed -E` capture pulls out git's own
+"reference X" / "references" choice and its locked ref path, and the test
+builds the ONE line sg should print by substituting those into sg's own
+prefix -- so what is being checked is "does sg's wording track git's
+actual message", not "does sg's wording match itself".
+
+**Verification**: `case2p` (a `.lock`-suffixed directory holding a nested
+ref, built by hand since the validator fix now blocks creating it through
+`sg tag` itself, checked for both `sg tag` and `sg branch` via the shared
+enumerator) and `case2q` (the three validator shapes above, each pinned
+against `git check-ref-format` on both sides) are new. `case2n` was
+rewritten as described above rather than extended; `case2n2` (plural, two
+existing names) and `case2n3` (singular despite two argv names, one
+missing) are new siblings needed because `case2n` alone -- a single-name
+batch -- can only ever exercise the singular branch. Every prior row
+(rounds 1-3) is unchanged: `interop: 4007/4007 passed, 0 skipped` (up from
+3996, the net of case2n2/case2n3/case2p's two rows/case2q's three rows,
+plus case2n growing from 3 checks to 4 and losing none).
+
+**Mutation, as specified**: reverting the filter to test the bare dirent
+name before `S_ISDIR`/`S_ISREG` (round 3's original shape) turned exactly
+the two `case2p` rows red (`sg tag` and `sg branch` both stopped seeing the
+nested ref) while `case2o` (the leaf lock file case) and every other row
+stayed green -- proving the fix's file/directory distinction is what
+`case2p` actually exercises, not incidental to some other change.
