@@ -86,8 +86,42 @@ int sg_ref_name_valid_for_create(const char *name)
         return 0;
     if (strcmp(name, "HEAD") == 0)
         return 0;
-    if (len >= 5 && strcmp(name + len - 5, ".lock") == 0)
-        return 0;
+    /* Phase 74 round 4: a ".lock" suffix is rejected on EVERY '/'-separated
+       component, not just the last one -- measured against real git 2.55.0
+       via `git check-ref-format` (read-only; no repo needed): a MIDDLE
+       component ending in ".lock" ("a.lock/b") and an END component
+       ("a/b.lock") are both rejected (exit 1), while a component that
+       merely CONTAINS ".lock" without it being the component's own tail
+       ("a.lockx/b") is accepted (exit 0) -- so this is a per-component
+       "does this segment END WITH .lock" test, not a substring search.
+       It replaces a PRE-EXISTING check (predates Phase 74 entirely) that
+       was a single `strcmp(name + len - 5, ".lock")` against the WHOLE
+       string -- equivalent to checking only the LAST component, so a name
+       whose MIDDLE component ended in ".lock" ("a.lock/b") passed it and
+       was creatable. That gap existed before this phase touched anything,
+       but Phase 74 round 3's listing filter (now fixed separately, see
+       list_loose_branches) turned it from "creatable and merely odd" into
+       "creatable and invisible" -- a strictly worse combination, which is
+       why fixing the validator belongs in this phase even though the gap
+       itself is not this phase's own regression. Fixing the validator does
+       not make the listing fix redundant, or vice versa: an
+       already-existing ref with such a component (written by another
+       tool, or an older sg build before this fix) must still be listed
+       correctly regardless of how it got there; the validator only stops
+       sg from creating a NEW one going forward. */
+    {
+        size_t start = 0;
+
+        for (i = 0; i <= len; i++) {
+            if (name[i] == '/' || name[i] == '\0') {
+                size_t comp_len = i - start;
+
+                if (comp_len >= 5 && strncmp(name + i - 5, ".lock", 5) == 0)
+                    return 0;
+                start = i + 1;
+            }
+        }
+    }
     if (strstr(name, "//") != NULL || strstr(name, "..") != NULL ||
        strstr(name, "@{") != NULL)
         return 0;
@@ -666,7 +700,36 @@ static void name_list_free(name_list *list)
 /* Recursively collects every regular file under dir_path as a branch name
    relative to refs/heads (subdirectories become slash-separated name
    segments, e.g. refs/heads/feature/x -> "feature/x"). A missing directory
-   is an empty result, not an error. */
+   is an empty result, not an error.
+
+   Phase 74 round 3: a REGULAR FILE ending in ".lock" is skipped, the same
+   filter git's own files-backend applies when iterating refs/. This
+   enumerator is shared by every caller of sg_ref_list_under (branches AND
+   tags, and any future prefix), so the filter belongs here rather than in
+   one command -- a stray lock under any ref namespace should never be
+   listed as a ref by ANY of them. Reachable as of Phase 74's own
+   delete_tags: it is now the first code under src/ that ever creates a
+   *.lock file at all, and it holds every lock in a multi-name batch open
+   for the length of the whole pass, so a concurrent `sg tag`/`sg branch`
+   can observe one. A crashed prior process (or any other tool) leaving a
+   stale lock behind hits the same gap with no batch in progress at all.
+
+   Phase 74 round 4: the filter MUST run only on regular files, checked
+   AFTER stat(), never on the bare dirent name before it -- round 3's first
+   version tested the name and `continue`'d before the S_ISDIR/S_ISREG
+   branch even ran, which prunes a DIRECTORY whose name happens to end in
+   ".lock" along with its entire subtree. Measured: a tag named
+   "sub.lock/inner" creates a real, valid loose ref at
+   refs/tags/sub.lock/inner (nothing rejects that name -- see the round-4
+   validator note below, a separate bug), but round 3's filter made
+   `sg tag`/`sg branch` silently omit it and everything else that would
+   ever live under sub.lock/. This is the identical failure shape CLAUDE.md
+   already documents for ".git" detection during a working-directory walk:
+   a leaf-level marker heuristic (does this NAME look like a lock file)
+   applied to directory TRAVERSAL under-reports, because the heuristic was
+   never meant to answer "should I recurse into this". The fix moves the
+   check to after stat() and gates it on S_ISREG, so a same-named directory
+   is always recursed into regardless of its name. */
 static int list_loose_branches(const char *dir_path, const char *rel_prefix, name_list *acc)
 {
     DIR *dir;
@@ -681,6 +744,7 @@ static int list_loose_branches(const char *dir_path, const char *rel_prefix, nam
         char child_path[SG_PATH_MAX];
         char child_rel[SG_PATH_MAX];
         struct stat st;
+        size_t name_len;
 
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
             continue;
@@ -693,10 +757,14 @@ static int list_loose_branches(const char *dir_path, const char *rel_prefix, nam
             continue;
         if (stat(child_path, &st) != 0)
             continue;
-        if (S_ISDIR(st.st_mode))
+        if (S_ISDIR(st.st_mode)) {
             rc = list_loose_branches(child_path, child_rel, acc);
-        else if (S_ISREG(st.st_mode))
+        } else if (S_ISREG(st.st_mode)) {
+            name_len = strlen(ent->d_name);
+            if (name_len >= 5 && strcmp(ent->d_name + name_len - 5, ".lock") == 0)
+                continue; /* a lock file, never a real ref -- see the comment above */
             rc = name_list_push(acc, child_rel);
+        }
     }
     closedir(dir);
     return rc;

@@ -20639,28 +20639,30 @@ check "phase73 case2i: sg ALSO prints 'not found' twice then the refusal (3 line
 check "phase73 case2i: nothing was deleted (lw survives)" \
     sh -c "(cd '$P73_2I_SG' && git rev-parse --verify refs/tags/lw) > /dev/null 2>&1"
 
-# case2j (review round 7, KNOWN DIVERGENCE, macOS-only, DATA-LOSING --
-# see CLAUDE.md's "Deliberate divergences from real git" list and this
-# phase's own review round 7 section in docs/DESIGN.md). On a
-# case-FOLDING filesystem (macOS default, NOT Linux ext4),
-# `refs/tags/Foo` and `refs/tags/foo` are the SAME underlying file. Pass
-# 1 reads each argv spelling separately and both come back existing;
-# pass 2's refusal is keyed on `strcmp`, and "Foo" != "foo" byte for
-# byte, so it does not fire; pass 3 deletes 'Foo' and then fails to
-# re-read the now-gone 'foo'. Real git instead acquires a per-ref LOCK
-# for every name before deleting anything, and the second lock attempt
-# on the SAME underlying file collides with the first ("cannot lock ref
-# ... File exists"), refusing the whole batch and leaving Foo untouched.
-# Identical exit code (1), OPPOSITE effect on the repository -- the same
-# shape as round 2's duplicate-name bug, one level up: case-aliased
-# names instead of byte-identical ones.
-#
-# Reproducing git's per-ref lock acquisition is a real change to the
-# delete path and is explicitly OUT OF SCOPE for this round -- this
-# check exists to make the loss OBSERVABLE and NAMED, not to claim it is
-# fixed. skip()'d entirely on a case-sensitive filesystem (e.g. Linux
-# ext4, which CI also runs), where "Foo" and "foo" are two distinct refs
-# and sg's answer already agrees with git's.
+# case2j -- USED TO pin the data-losing divergence this exact block's
+# comment described at length (Phase 73 review round 7: sg deleted 'Foo'
+# and left 'foo' half-read, where git's per-ref lock refused the whole
+# batch). Phase 74 round 1 closed it with an (st_dev, st_ino) compare of
+# the REF files -- measured WRONG in round 2 (a cold review found it):
+# that test never fires for a pair that is entirely packed-refs (a packed
+# ref has no loose file to `lstat`, so sg deleted both and exited 0 where
+# git refuses -- worse than the original bug, since it now claims
+# success), and it OVER-fires for two ref files deliberately hardlinked
+# to the same inode (git deletes both there; sg's inode test refused
+# both). Round 2 replaced the ref-inode compare with git's own actual
+# mechanism: creating `refs/tags/<name>.lock` with O_CREAT|O_EXCL for
+# every name before deleting anything, exactly as git does -- two names
+# collide iff their LOCK FILE paths alias (case-folding merges
+# 'Foo.lock'/'foo.lock' into one directory entry regardless of whether
+# the underlying ref is loose or packed, since the lock is always an
+# ordinary loose file). See the deliberate-divergence entry that Phase 74
+# REMOVED from CLAUDE.md by fixing it -- it was numbered 9, and that number
+# has since been reused for an unrelated divergence, so go by the
+# description rather than the number -- and this phase's own two sections
+# in docs/DESIGN.md (round 1 and round 2). Still skip()'d entirely on a case-sensitive filesystem
+# (e.g. Linux ext4, which CI also runs), where "Foo" and "foo" are two
+# distinct refs and an ordinary two-name delete of two DIFFERENT tags is
+# the right answer, not this check's concern.
 if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
     P73_2J_BASE="$WORKDIR/phase73_2j_base"
     rm -rf "$P73_2J_BASE"
@@ -20678,17 +20680,444 @@ if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
     rm -rf "$P73_2J_GIT" "$P73_2J_SG"
     cp -R "$P73_2J_BASE" "$P73_2J_GIT"
     cp -R "$P73_2J_BASE" "$P73_2J_SG"
-    (cd "$P73_2J_GIT" && LC_ALL=C git tag -d Foo foo) > /dev/null 2>&1
+    (cd "$P73_2J_GIT" && LC_ALL=C git tag -d Foo foo) > "$WORKDIR/p73_2j_git.out" 2>&1
     P73_2J_GIT_RC=$?
-    (cd "$P73_2J_SG" && "$SG" tag -d Foo foo) > /dev/null 2>&1
+    (cd "$P73_2J_SG" && "$SG" tag -d Foo foo) > "$WORKDIR/p73_2j_sg.out" 2>&1
     P73_2J_SG_RC=$?
-    check "phase73 case2j oracle: precondition -- on this case-folding filesystem, git's per-ref lock refuses the whole batch (exit 1, Foo survives)" \
+    check "phase74 case2j oracle: precondition -- on this case-folding filesystem, git's per-ref lock refuses the whole batch (exit 1, Foo survives)" \
         sh -c "test '$P73_2J_GIT_RC' = 1 && (cd '$P73_2J_GIT' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
-    check "phase73 case2j (KNOWN DIVERGENCE, NOT fixed this round -- pinned so the loss stays visible): sg tag -d Foo foo also exits 1, but DELETES Foo where git does not" \
-        sh -c "test '$P73_2J_SG_RC' = 1 && ! (cd '$P73_2J_SG' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
+    check "phase74 case2j (FIXED, used to pin the data-losing divergence): sg tag -d Foo foo also exits 1, and Foo now SURVIVES like git's does" \
+        sh -c "test '$P73_2J_SG_RC' = 1 && (cd '$P73_2J_SG' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
+    # Note: 'refs/tags/foo' cannot be asserted absent here as a SEPARATE
+    # check on this filesystem -- Foo and foo are the SAME loose file
+    # (that is the whole premise of this fixture), so `git rev-parse
+    # --verify refs/tags/foo` trivially succeeds as long as Foo exists,
+    # regardless of anything sg did. "nothing was deleted" is already
+    # fully covered by the Foo-survives assertion above.
+    # git's first line matches up to and including the ref name it blames
+    # ('foo', the argv-order rule from section 3), then diverges: git
+    # claims a lock, sg has none and says so instead (spec section 4).
+    check "phase74 case2j oracle: precondition -- git's message names 'refs/tags/foo' (the SECOND/later colliding spelling), not 'Foo'" \
+        grep -q "cannot lock ref 'refs/tags/foo'" "$WORKDIR/p73_2j_git.out"
+    check "phase74 case2j: sg's message names both colliding paths and says they are the same ref, without claiming a lock sg does not have" \
+        grep -qx "sg: could not delete references: 'refs/tags/Foo' and 'refs/tags/foo' are the same ref" "$WORKDIR/p73_2j_sg.out"
+    check "phase74 case2j: sg's message does NOT claim to lock anything (sg has no ref lock files)" \
+        sh -c "! grep -q 'lock' '$WORKDIR/p73_2j_sg.out'"
+    check "phase74 case2j: no stale .lock file survives the refusal (sg cleans up every lock it created)" \
+        sh -c "! find '$P73_2J_SG/.git/refs/tags' -name '*.lock' 2>/dev/null | grep -q ."
+
+    # Section 3's argv-order rule, reversed spelling order: 'foo Foo' must
+    # name 'Foo' (the LATER spelling), not 'foo' -- the same rule as above,
+    # from the other direction, so a fixed-first-name implementation would
+    # get this row backwards while passing the row above by coincidence.
+    P73_2J2_GIT="$WORKDIR/phase73_2j2_git"
+    P73_2J2_SG="$WORKDIR/phase73_2j2_sg"
+    rm -rf "$P73_2J2_GIT" "$P73_2J2_SG"
+    cp -R "$P73_2J_BASE" "$P73_2J2_GIT"
+    cp -R "$P73_2J_BASE" "$P73_2J2_SG"
+    (cd "$P73_2J2_GIT" && LC_ALL=C git tag -d foo Foo) > "$WORKDIR/p73_2j2_git.out" 2>&1
+    (cd "$P73_2J2_SG" && "$SG" tag -d foo Foo) > "$WORKDIR/p73_2j2_sg.out" 2>&1
+    check "phase74 case2j2 oracle: precondition -- 'tag -d foo Foo' (reversed spelling order) makes git name 'refs/tags/Foo', the LATER one" \
+        grep -q "cannot lock ref 'refs/tags/Foo'" "$WORKDIR/p73_2j2_git.out"
+    check "phase74 case2j2: sg also names 'Foo' (the later spelling), and Foo survives" \
+        sh -c "grep -qx \"sg: could not delete references: 'refs/tags/foo' and 'refs/tags/Foo' are the same ref\" '$WORKDIR/p73_2j2_sg.out' && \
+               (cd '$P73_2J2_SG' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
+    check "phase74 case2j2: no stale .lock file survives the refusal" \
+        sh -c "! find '$P73_2J2_SG/.git/refs/tags' -name '*.lock' 2>/dev/null | grep -q ."
+
+    # A THIRD, unrelated name in the same batch must survive too (section
+    # 1's second and third table rows) -- proves this is a whole-batch
+    # refusal, not "delete everything except the colliding pair".
+    P73_2J3_SG="$WORKDIR/phase73_2j3_sg"
+    rm -rf "$P73_2J3_SG"
+    cp -R "$P73_2J_BASE" "$P73_2J3_SG"
+    (cd "$P73_2J3_SG" && git tag other) > /dev/null 2>&1
+    (cd "$P73_2J3_SG" && "$SG" tag -d Foo foo other) > /dev/null 2>&1
+    check "phase74 case2j3: sg exits 1 and 'other' -- unrelated to the Foo/foo collision -- ALSO survives" \
+        sh -c "test $? = 1 && (cd '$P73_2J3_SG' && git rev-parse --verify refs/tags/other) > /dev/null 2>&1 && \
+               (cd '$P73_2J3_SG' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
+    check "phase74 case2j3: no stale .lock file survives the refusal" \
+        sh -c "! find '$P73_2J3_SG/.git/refs/tags' -name '*.lock' 2>/dev/null | grep -q ."
+
+    # case2l -- BOTH argv spellings live ONLY in packed-refs, no loose file
+    # at all (round 1's inode-of-the-ref-file test cannot fire here: a
+    # packed ref has no loose file to `lstat`). Built with the same
+    # porcelain recipe measured to reproduce this shape against real git:
+    # `git tag Foo; git pack-refs --all; git tag foo; git pack-refs --all`.
+    # This is the round-1 fix's WORSE failure mode -- round 1 deleted BOTH
+    # names here and exited 0, i.e. it reported SUCCESS while destroying
+    # two tags git refuses to touch. The lock-file mechanism refuses this
+    # exactly like the loose case, because the LOCK it creates is always
+    # an ordinary loose file regardless of where the ref itself lives.
+    P74_2L_BASE="$WORKDIR/phase74_2l_base"
+    rm -rf "$P74_2L_BASE"
+    mkdir -p "$P74_2L_BASE"
+    git init -q -b master "$P74_2L_BASE" > /dev/null 2>&1
+    (cd "$P74_2L_BASE" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+        > /dev/null 2>&1
+    printf 'x\n' > "$P74_2L_BASE/x.txt"
+    (cd "$P74_2L_BASE" && git add x.txt && GIT_AUTHOR_DATE="@1700000600 +0000" \
+        GIT_COMMITTER_DATE="@1700000600 +0000" git commit -q -m c1) > /dev/null 2>&1
+    (cd "$P74_2L_BASE" && git tag Foo && git pack-refs --all) > /dev/null 2>&1
+    (cd "$P74_2L_BASE" && git tag foo && git pack-refs --all) > /dev/null 2>&1
+
+    P74_2L_GIT="$WORKDIR/phase74_2l_git"
+    P74_2L_SG="$WORKDIR/phase74_2l_sg"
+    rm -rf "$P74_2L_GIT" "$P74_2L_SG"
+    cp -R "$P74_2L_BASE" "$P74_2L_GIT"
+    cp -R "$P74_2L_BASE" "$P74_2L_SG"
+    check "phase74 case2l oracle: precondition -- BOTH spellings really are packed-only (no loose file for either)" \
+        sh -c "! test -e '$P74_2L_GIT/.git/refs/tags/Foo' && ! test -e '$P74_2L_GIT/.git/refs/tags/foo' && \
+               grep -q 'refs/tags/Foo' '$P74_2L_GIT/.git/packed-refs' && grep -q 'refs/tags/foo' '$P74_2L_GIT/.git/packed-refs'"
+    (cd "$P74_2L_GIT" && LC_ALL=C git tag -d Foo foo) > "$WORKDIR/p74_2l_git.out" 2>&1
+    P74_2L_GIT_RC=$?
+    (cd "$P74_2L_SG" && "$SG" tag -d Foo foo) > "$WORKDIR/p74_2l_sg.out" 2>&1
+    P74_2L_SG_RC=$?
+    check "phase74 case2l oracle: precondition -- git ALSO refuses a packed-only aliased pair (exit 1, Foo survives)" \
+        sh -c "test '$P74_2L_GIT_RC' = 1 && (cd '$P74_2L_GIT' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
+    check "phase74 case2l (round-1 regression, now fixed): sg refuses the packed-only pair too -- round 1 deleted BOTH and exited 0" \
+        sh -c "test '$P74_2L_SG_RC' = 1 && (cd '$P74_2L_SG' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1 && \
+               (cd '$P74_2L_SG' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1"
+    check "phase74 case2l: sg's packed-refs file is untouched (nothing was deleted from it)" \
+        sh -c "grep -q 'refs/tags/Foo' '$P74_2L_SG/.git/packed-refs' && grep -q 'refs/tags/foo' '$P74_2L_SG/.git/packed-refs'"
+    check "phase74 case2l: no stale .lock file survives the refusal" \
+        sh -c "! find '$P74_2L_SG/.git/refs/tags' -name '*.lock' 2>/dev/null | grep -q ."
+
+    # case2m -- one spelling packed, the OTHER loose: the mixed shape, a
+    # separate discriminator from case2l (which is packed/packed) and
+    # case2j (which is loose/loose). The lock mechanism does not care
+    # which side is packed, since it always creates a loose .lock file
+    # for both names regardless of where the ref itself lives -- but an
+    # implementation that only checks "is the EXISTING file's inode
+    # aliased" for one representation and not the other could still get
+    # this shape wrong even after case2l and case2j both pass.
+    # NOTE: P74_2L_BASE's own `git pack-refs --all` packed refs/heads/master
+    # too, not just the two tags -- so master's SHA must be captured BEFORE
+    # packed-refs is rewritten below, or HEAD (a symref to refs/heads/master,
+    # which would then have no loose file AND no packed-refs line) becomes
+    # unresolvable. The rewritten packed-refs keeps master's own line
+    # (dropped nothing master needs) alongside Foo's, and only 'foo' moves
+    # from packed to loose.
+    P74_2M_BASE="$WORKDIR/phase74_2m_base"
+    rm -rf "$P74_2M_BASE"
+    cp -R "$P74_2L_BASE" "$P74_2M_BASE"
+    P74_2M_SHA=$(cd "$P74_2M_BASE" && git rev-parse HEAD)
+    printf '# pack-refs with: peeled fully-peeled sorted \n%s refs/heads/master\n%s refs/tags/Foo\n' \
+        "$P74_2M_SHA" "$P74_2M_SHA" > "$P74_2M_BASE/.git/packed-refs"
+    printf '%s\n' "$P74_2M_SHA" > "$P74_2M_BASE/.git/refs/tags/foo"
+
+    P74_2M_GIT="$WORKDIR/phase74_2m_git"
+    P74_2M_SG="$WORKDIR/phase74_2m_sg"
+    rm -rf "$P74_2M_GIT" "$P74_2M_SG"
+    cp -R "$P74_2M_BASE" "$P74_2M_GIT"
+    cp -R "$P74_2M_BASE" "$P74_2M_SG"
+    (cd "$P74_2M_GIT" && LC_ALL=C git tag -d Foo foo) > /dev/null 2>&1
+    P74_2M_GIT_RC=$?
+    (cd "$P74_2M_SG" && "$SG" tag -d Foo foo) > /dev/null 2>&1
+    P74_2M_SG_RC=$?
+    check "phase74 case2m oracle: precondition -- git refuses the mixed packed/loose aliased pair too (exit 1, Foo survives)" \
+        sh -c "test '$P74_2M_GIT_RC' = 1 && (cd '$P74_2M_GIT' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
+    check "phase74 case2m: sg refuses the mixed packed/loose pair the same way" \
+        sh -c "test '$P74_2M_SG_RC' = 1 && (cd '$P74_2M_SG' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1 && \
+               (cd '$P74_2M_SG' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1"
+    check "phase74 case2m: no stale .lock file survives the refusal" \
+        sh -c "! find '$P74_2M_SG/.git/refs/tags' -name '*.lock' 2>/dev/null | grep -q ."
 else
-    skip "phase73 case2j: filesystem is case-sensitive (not macOS-default) -- refs/tags/Foo and refs/tags/foo do not alias here, so this divergence cannot occur"
+    skip "phase74 case2j: filesystem is case-sensitive (not macOS-default) -- refs/tags/Foo and refs/tags/foo do not alias here, so this divergence cannot occur"
+    skip "phase74 case2l: filesystem is case-sensitive -- a packed-only aliased pair cannot occur here"
+    skip "phase74 case2m: filesystem is case-sensitive -- a mixed packed/loose aliased pair cannot occur here"
 fi
+
+# case2k -- two DIFFERENTLY-NAMED loose ref files hardlinked to the SAME
+# inode, independent of any filesystem's case-folding policy (this case
+# does not need the case-fold guard at all: a hardlink is created by hand
+# either way). Round 1 measured this WRONG: an inode compare of the ref
+# files sees 'one' and 'two' sharing an inode and refuses, but their LOCK
+# paths ('one.lock', 'two.lock') are two unrelated strings that never
+# alias, so real git creates both locks without conflict and deletes
+# both. This is a real git-vs-sg comparison (unlike round 1's version of
+# this case, which had no oracle for a hand-hardlinked ref file and
+# stood alone as an sg-only proof) -- round 2's fix makes sg agree with
+# git here instead of diverging from it.
+P74_2K_GIT="$WORKDIR/phase74_2k_git"
+P74_2K_SG="$WORKDIR/phase74_2k_sg"
+rm -rf "$P74_2K_GIT" "$P74_2K_SG"
+mkdir -p "$P74_2K_GIT"
+git init -q -b master "$P74_2K_GIT" > /dev/null 2>&1
+(cd "$P74_2K_GIT" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P74_2K_GIT/x.txt"
+(cd "$P74_2K_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700000500 +0000" \
+    GIT_COMMITTER_DATE="@1700000500 +0000" git commit -q -m c1) > /dev/null 2>&1
+(cd "$P74_2K_GIT" && git tag one) > /dev/null 2>&1
+if ln "$P74_2K_GIT/.git/refs/tags/one" "$P74_2K_GIT/.git/refs/tags/two" 2>/dev/null; then
+    cp -R "$P74_2K_GIT" "$P74_2K_SG"
+    # POSIX test's -ef is exactly "same device and inode" and needs no stat
+    # at all. The previous form was `stat -f %i ... || stat -c %i ...`, which
+    # is a portability trap CI caught on all three Linux runners: BSD stat's
+    # -f is the format flag, GNU stat's -f is --file-system, so on Linux the
+    # first command printed a filesystem block to stdout AND failed, the
+    # fallback then printed the inode, and $(...) captured both concatenated.
+    check "phase74 case2k oracle: precondition -- the two ref files really do share one inode after the hardlink" \
+        test "$P74_2K_GIT/.git/refs/tags/one" -ef "$P74_2K_GIT/.git/refs/tags/two"
+    (cd "$P74_2K_GIT" && git tag -d one two) > /dev/null 2>&1
+    P74_2K_GIT_RC=$?
+    (cd "$P74_2K_SG" && "$SG" tag -d one two) > /dev/null 2>&1
+    P74_2K_SG_RC=$?
+    check "phase74 case2k oracle: precondition -- git DELETES both hardlinked names (their .lock paths do not alias), exit 0" \
+        sh -c "test '$P74_2K_GIT_RC' = 0 && \
+               ! (cd '$P74_2K_GIT' && git rev-parse --verify refs/tags/one) > /dev/null 2>&1 && \
+               ! (cd '$P74_2K_GIT' && git rev-parse --verify refs/tags/two) > /dev/null 2>&1"
+    check "phase74 case2k (round-1 regression, now fixed): sg ALSO deletes both hardlinked names, exit 0 -- round 1 refused both" \
+        sh -c "test '$P74_2K_SG_RC' = 0 && \
+               ! (cd '$P74_2K_SG' && git rev-parse --verify refs/tags/one) > /dev/null 2>&1 && \
+               ! (cd '$P74_2K_SG' && git rev-parse --verify refs/tags/two) > /dev/null 2>&1"
+    check "phase74 case2k: no stale .lock file survives (this is a clean delete, not a refusal, but the lock is still created-then-removed)" \
+        sh -c "! find '$P74_2K_SG/.git/refs/tags' -name '*.lock' 2>/dev/null | grep -q ."
+else
+    skip "phase74 case2k: filesystem/user does not support hardlinking a file to itself under refs/tags (ln failed)"
+fi
+
+# case2n (round 3): a STALE .lock file (left by a crashed prior process, or
+# any other tool -- nothing to do with THIS invocation's own batch) must NOT
+# be reported as an in-batch aliasing collision. Round 2's EEXIST branch
+# assumed every collision was between two names in the same batch and
+# searched only the locks it had itself created; when the colliding lock
+# belongs to nobody in this batch, it fell back to printing `names[i]`
+# twice -- "'refs/tags/foo' and 'refs/tags/foo' are the same ref", a
+# self-contradictory statement (a ref cannot alias itself) that points a
+# debugging user at aliasing when the real cause is an unrelated stray
+# file. No case-fold guard needed here: this reproduces on ANY filesystem,
+# with a single ordinary tag name and no second spelling at all.
+P74_2N_GIT="$WORKDIR/phase74_2n_git"
+P74_2N_SG="$WORKDIR/phase74_2n_sg"
+rm -rf "$P74_2N_GIT" "$P74_2N_SG"
+mkdir -p "$P74_2N_GIT"
+git init -q -b master "$P74_2N_GIT" > /dev/null 2>&1
+(cd "$P74_2N_GIT" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P74_2N_GIT/x.txt"
+(cd "$P74_2N_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700000700 +0000" \
+    GIT_COMMITTER_DATE="@1700000700 +0000" git commit -q -m c1) > /dev/null 2>&1
+(cd "$P74_2N_GIT" && git tag foo) > /dev/null 2>&1
+touch "$P74_2N_GIT/.git/refs/tags/foo.lock"
+cp -R "$P74_2N_GIT" "$P74_2N_SG"
+(cd "$P74_2N_GIT" && LC_ALL=C git tag -d foo) > "$WORKDIR/p74_2n_git.out" 2>&1
+P74_2N_GIT_RC=$?
+(cd "$P74_2N_SG" && "$SG" tag -d foo) > "$WORKDIR/p74_2n_sg.out" 2>&1
+P74_2N_SG_RC=$?
+check "phase74 case2n oracle: precondition -- git also refuses on a stale .lock (exit 1), and its own message names 'refs/tags/foo' ONCE, via 'cannot lock ref'" \
+    sh -c "test '$P74_2N_GIT_RC' = 1 && grep -q \"cannot lock ref 'refs/tags/foo'\" '$WORKDIR/p74_2n_git.out' && \
+           (cd '$P74_2N_GIT' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1"
+check "phase74 case2n: sg also refuses (exit 1), foo survives" \
+    sh -c "test '$P74_2N_SG_RC' = 1 && (cd '$P74_2N_SG' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1"
+# round 4: this used to be `grep -qx` against a literal copied straight out
+# of cmd_tag.c's own source -- self-referential, since the "expected" text
+# was never anything but a second copy of the implementation, so it could
+# never catch a wording drift OR tell you the original wording was ever
+# wrong (which it was, for four rounds, in exactly this function -- see
+# case2c/case2h's own history). Derived from GIT's ACTUAL output instead,
+# the same convention case2c/case2h use: extract git's own
+# "reference X" / "references" choice and its locked ref path via sed,
+# then build the ONE line sg is expected to print by substituting into
+# sg's OWN prefix and dropping the absolute path/advisory text git adds
+# and sg deliberately does not (an acknowledged, intentional wording
+# difference, not something this check is trying to paper over).
+P74_2N_GIT_REASON_PATH=$(sed -E -n \
+    "s/^error: could not delete (reference [^:]*|references): cannot lock ref '([^']*)':.*/\\1|\\2/p" \
+    "$WORKDIR/p74_2n_git.out")
+P74_2N_EXPECT_REASON="${P74_2N_GIT_REASON_PATH%%|*}"
+P74_2N_EXPECT_LOCKPATH="${P74_2N_GIT_REASON_PATH##*|}"
+check "phase74 case2n oracle: precondition -- git's own message actually parses into a (reference-clause, locked-path) pair (sanity check on the sed above, not on sg)" \
+    test -n "$P74_2N_GIT_REASON_PATH" -a "$P74_2N_EXPECT_REASON" != "$P74_2N_GIT_REASON_PATH"
+check "phase74 case2n: sg's message equals git's own reference-clause and locked path, with sg's prefix and no absolute path/advisory text -- derived from git's output, not a second hardcoded copy" \
+    test "$(cat "$WORKDIR/p74_2n_sg.out")" = \
+    "sg: could not delete ${P74_2N_EXPECT_REASON}: cannot lock ref '${P74_2N_EXPECT_LOCKPATH}': File exists"
+check "phase74 case2n: sg's message does NOT claim two names are the same ref" \
+    sh -c "! grep -q 'are the same ref' '$WORKDIR/p74_2n_sg.out'"
+check "phase74 case2n: the pre-existing stale .lock file itself is left exactly as it was (sg never owned it, so it must not delete someone else's lock)" \
+    test -e "$P74_2N_SG/.git/refs/tags/foo.lock"
+
+# case2n2 (round 4): the PLURAL boundary, from the other side -- a batch
+# with TWO existing names where only one has a stale lock. Measured against
+# real git: still refuses the WHOLE batch (both survive), and the message
+# is PLURAL ("could not delete references:") even though only one of the
+# two names is the one actually holding a stray lock. Needed as a separate
+# fixture from case2n: a single-name batch can only ever exercise the
+# singular form, so without this row the plural branch of the round-4 fix
+# has no witness at all.
+P74_2N2_GIT="$WORKDIR/phase74_2n2_git"
+P74_2N2_SG="$WORKDIR/phase74_2n2_sg"
+rm -rf "$P74_2N2_GIT" "$P74_2N2_SG"
+mkdir -p "$P74_2N2_GIT"
+git init -q -b master "$P74_2N2_GIT" > /dev/null 2>&1
+(cd "$P74_2N2_GIT" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P74_2N2_GIT/x.txt"
+(cd "$P74_2N2_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700000750 +0000" \
+    GIT_COMMITTER_DATE="@1700000750 +0000" git commit -q -m c1) > /dev/null 2>&1
+(cd "$P74_2N2_GIT" && git tag foo && git tag bar) > /dev/null 2>&1
+touch "$P74_2N2_GIT/.git/refs/tags/foo.lock"
+cp -R "$P74_2N2_GIT" "$P74_2N2_SG"
+(cd "$P74_2N2_GIT" && LC_ALL=C git tag -d foo bar) > "$WORKDIR/p74_2n2_git.out" 2>&1
+P74_2N2_GIT_RC=$?
+(cd "$P74_2N2_SG" && "$SG" tag -d foo bar) > "$WORKDIR/p74_2n2_sg.out" 2>&1
+P74_2N2_SG_RC=$?
+check "phase74 case2n2 oracle: precondition -- git refuses the whole batch (exit 1, both foo and bar survive) and its message is PLURAL ('could not delete references:')" \
+    sh -c "test '$P74_2N2_GIT_RC' = 1 && grep -q '^error: could not delete references:' '$WORKDIR/p74_2n2_git.out' && \
+           (cd '$P74_2N2_GIT' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1 && \
+           (cd '$P74_2N2_GIT' && git rev-parse --verify refs/tags/bar) > /dev/null 2>&1"
+check "phase74 case2n2: sg also refuses the whole batch, both survive, and ITS message is ALSO plural ('could not delete references:'), not the singular form" \
+    sh -c "test '$P74_2N2_SG_RC' = 1 && \
+           (cd '$P74_2N2_SG' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1 && \
+           (cd '$P74_2N2_SG' && git rev-parse --verify refs/tags/bar) > /dev/null 2>&1 && \
+           grep -qx \"sg: could not delete references: cannot lock ref 'refs/tags/foo': File exists\" '$WORKDIR/p74_2n2_sg.out'"
+
+# case2n3 (round 4): the plural boundary is keyed on EXISTENCE, not raw
+# argv count -- a batch of a MISSING name plus one existing, stale-locked
+# name must still get the SINGULAR form, because only one name ever enters
+# git's transaction. Without this row, "existing_count" could be silently
+# replaced by "count" (raw argv length) and every other case2n/case2n2 row
+# would still pass, since neither of them mixes a missing name in.
+P74_2N3_GIT="$WORKDIR/phase74_2n3_git"
+P74_2N3_SG="$WORKDIR/phase74_2n3_sg"
+rm -rf "$P74_2N3_GIT" "$P74_2N3_SG"
+mkdir -p "$P74_2N3_GIT"
+git init -q -b master "$P74_2N3_GIT" > /dev/null 2>&1
+(cd "$P74_2N3_GIT" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P74_2N3_GIT/x.txt"
+(cd "$P74_2N3_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700000760 +0000" \
+    GIT_COMMITTER_DATE="@1700000760 +0000" git commit -q -m c1) > /dev/null 2>&1
+(cd "$P74_2N3_GIT" && git tag foo) > /dev/null 2>&1
+touch "$P74_2N3_GIT/.git/refs/tags/foo.lock"
+cp -R "$P74_2N3_GIT" "$P74_2N3_SG"
+(cd "$P74_2N3_GIT" && LC_ALL=C git tag -d nosuch foo) > "$WORKDIR/p74_2n3_git.out" 2>&1
+(cd "$P74_2N3_SG" && "$SG" tag -d nosuch foo) > "$WORKDIR/p74_2n3_sg.out" 2>&1
+check "phase74 case2n3 oracle: precondition -- git's message is SINGULAR ('could not delete reference refs/tags/foo:') even with TWO argv names, since 'nosuch' never entered the transaction" \
+    grep -q "^error: could not delete reference refs/tags/foo:" "$WORKDIR/p74_2n3_git.out"
+check "phase74 case2n3: sg's message is ALSO singular here -- keyed on existence, not argv count" \
+    grep -qx "sg: could not delete reference refs/tags/foo: cannot lock ref 'refs/tags/foo': File exists" "$WORKDIR/p74_2n3_sg.out"
+
+# case2o (round 3): the SAME stale .lock file must not be listed as a
+# phantom tag by `sg tag`. `list_loose_branches` (src/storage/refs.c, shared
+# by sg_ref_list_under -- both `sg tag` and `sg branch` go through it) lists
+# every regular file under the ref directory with no suffix filter; this gap
+# predates Phase 74, but round 2 made it newly reachable, since delete_tags
+# is the first code under src/ that ever creates a *.lock file at all, and a
+# multi-name batch holds every one of them open for the length of the whole
+# pass -- a concurrent listing (by this same test, or a real concurrent `sg
+# tag`) would see the phantom.
+P74_2O_GIT="$WORKDIR/phase74_2o_git"
+P74_2O_SG="$WORKDIR/phase74_2o_sg"
+rm -rf "$P74_2O_GIT" "$P74_2O_SG"
+mkdir -p "$P74_2O_GIT"
+git init -q -b master "$P74_2O_GIT" > /dev/null 2>&1
+(cd "$P74_2O_GIT" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P74_2O_GIT/x.txt"
+(cd "$P74_2O_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700000800 +0000" \
+    GIT_COMMITTER_DATE="@1700000800 +0000" git commit -q -m c1) > /dev/null 2>&1
+(cd "$P74_2O_GIT" && git tag foo && git tag other) > /dev/null 2>&1
+touch "$P74_2O_GIT/.git/refs/tags/foo.lock"
+cp -R "$P74_2O_GIT" "$P74_2O_SG"
+check "phase74 case2o oracle: precondition -- git's own listing does not show the stale .lock as a tag" \
+    sh -c "! (cd '$P74_2O_GIT' && git tag) | grep -q '\\.lock'"
+check "phase74 case2o: sg tag's listing ALSO does not show the stale .lock as a phantom tag" \
+    sh -c "! (cd '$P74_2O_SG' && '$SG' tag) | grep -q '\\.lock'"
+check "phase74 case2o: sg tag's listing still shows the two REAL tags (the filter did not over-hide anything)" \
+    sh -c "(cd '$P74_2O_SG' && '$SG' tag) | grep -qx 'foo' && (cd '$P74_2O_SG' && '$SG' tag) | grep -qx 'other'"
+# sg branch shares the same enumerator (sg_ref_list_under), so a stray
+# .lock under refs/heads/ must be filtered there too, with no separate fix.
+touch "$P74_2O_SG/.git/refs/heads/master.lock"
+check "phase74 case2o: sg branch's listing (SAME enumerator, sg_ref_list_under) also filters a stray .lock, with no command-specific fix needed" \
+    sh -c "! (cd '$P74_2O_SG' && '$SG' branch) | grep -q '\\.lock'"
+
+# case2p (round 4, git-side pin added round 5): a DIRECTORY whose name
+# ends in ".lock" must NOT be pruned from the listing -- round 3's filter
+# tested the bare dirent name and `continue`'d before ever checking
+# S_ISDIR/S_ISREG, so an intermediate directory ending in ".lock" took its
+# entire subtree with it. This can no longer be reached through `sg tag`
+# itself now that section 2's validator fix rejects any component ending
+# in ".lock" at creation time, so the fixture is built by hand -- exactly
+# the shape an OLDER sg build (before this fix) or another tool entirely
+# could still have left on disk, which is precisely why the listing side
+# of this fix cannot be dropped just because the creation side is now
+# closed.
+#
+# Round 5: this is a DELIBERATE, PINNED divergence (CLAUDE.md's list), not
+# a shape with no oracle -- real git's own loose-ref resolution refuses ANY
+# path through a ".lock"-suffixed component at every layer, not just
+# listing, so the git-side precondition below asserts ABSENCE, not
+# agreement. Round 4 asserted only sg's own side of this and left git's
+# unchecked; a one-sided pin is how a divergence quietly becomes silent
+# agreement (or the reverse) without anything noticing -- if `sg tag`'s fix
+# were ever "simplified" back to pruning the directory, this row would
+# still need a git-side row to know which of the two behaviors just
+# changed.
+P74_2P_GIT="$WORKDIR/phase74_2p_git"
+P74_2P_SG="$WORKDIR/phase74_2p_sg"
+rm -rf "$P74_2P_GIT" "$P74_2P_SG"
+mkdir -p "$P74_2P_GIT"
+git init -q -b master "$P74_2P_GIT" > /dev/null 2>&1
+(cd "$P74_2P_GIT" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P74_2P_GIT/x.txt"
+(cd "$P74_2P_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700000900 +0000" \
+    GIT_COMMITTER_DATE="@1700000900 +0000" git commit -q -m c1) > /dev/null 2>&1
+P74_2P_SHA=$(cd "$P74_2P_GIT" && git rev-parse HEAD)
+mkdir -p "$P74_2P_GIT/.git/refs/tags/sub.lock"
+printf '%s\n' "$P74_2P_SHA" > "$P74_2P_GIT/.git/refs/tags/sub.lock/inner"
+printf '%s\n' "$P74_2P_SHA" > "$P74_2P_GIT/.git/refs/tags/plain"
+cp -R "$P74_2P_GIT" "$P74_2P_SG"
+check "phase74 case2p oracle: precondition -- git's OWN listing does NOT show the ref nested under the .lock-suffixed directory (it refuses to resolve through such a component at all), while the sibling 'plain' tag still shows" \
+    sh -c "! (cd '$P74_2P_GIT' && git tag) | grep -qx 'sub.lock/inner' && (cd '$P74_2P_GIT' && git tag) | grep -qx 'plain'"
+check "phase74 case2p: sg tag's listing shows the nested ref UNDER a .lock-suffixed DIRECTORY (not pruned as a whole subtree) -- this is sg's deliberate half of the divergence from the row above" \
+    sh -c "(cd '$P74_2P_SG' && '$SG' tag) | grep -qx 'sub.lock/inner' && (cd '$P74_2P_SG' && '$SG' tag) | grep -qx 'plain'"
+# sg branch shares the same enumerator; a nested branch under a
+# .lock-suffixed directory must not be pruned there either.
+mkdir -p "$P74_2P_SG/.git/refs/heads/feat.lock"
+printf '%s\n' "$P74_2P_SHA" > "$P74_2P_SG/.git/refs/heads/feat.lock/inner"
+check "phase74 case2p: sg branch's listing (SAME enumerator) also shows a nested branch under a .lock-suffixed directory" \
+    sh -c "(cd '$P74_2P_SG' && '$SG' branch) | grep -q 'feat.lock/inner'"
+
+# case2q (round 4): the validator gap underneath case2p -- sg used to let
+# `sg tag <name>` CREATE a name with a ".lock"-suffixed component at all,
+# where real git's check-ref-format refuses it. `sg_ref_name_valid_for_create`
+# only ever inspected the WHOLE string's last 5 bytes, equivalent to
+# checking just the LAST '/'-separated component; a MIDDLE component ending
+# in ".lock" slipped through. Measured with `git check-ref-format` (a
+# read-only syntax check, no repository needed) BEFORE writing the fix,
+# across three shapes rather than assuming the rule from the coordinator's
+# one example: a MIDDLE component ending in ".lock" and an END component
+# both REJECTED (exit 1); a component that merely CONTAINS ".lock" without
+# it being the component's own tail is ACCEPTED (exit 0) -- so the rule is
+# "does any component END WITH .lock", not "does the name contain .lock
+# anywhere". All three rows are pinned against git on both sides.
+for p74_2q_case in "sub.lock/inner:middle component ending in .lock" \
+                   "plain/tip.lock:end component ending in .lock" \
+                   "sub.lockx/inner:component merely CONTAINS .lock, does not end with it"; do
+    p74_2q_name="${p74_2q_case%%:*}"
+    p74_2q_desc="${p74_2q_case#*:}"
+    P74_2Q_GIT_RC=0
+    if ! git check-ref-format "refs/tags/$p74_2q_name" > /dev/null 2>&1; then
+        P74_2Q_GIT_RC=1
+    fi
+    P74_2Q_SG="$WORKDIR/phase74_2q_sg_$(echo "$p74_2q_name" | tr '/.' '__')"
+    rm -rf "$P74_2Q_SG"
+    mkdir -p "$P74_2Q_SG"
+    git init -q -b master "$P74_2Q_SG" > /dev/null 2>&1
+    (cd "$P74_2Q_SG" && git config user.email "p73@example.com" && git config user.name "p73 tester") \
+        > /dev/null 2>&1
+    printf 'x\n' > "$P74_2Q_SG/x.txt"
+    (cd "$P74_2Q_SG" && git add x.txt && GIT_AUTHOR_DATE="@1700000950 +0000" \
+        GIT_COMMITTER_DATE="@1700000950 +0000" git commit -q -m c1) > /dev/null 2>&1
+    (cd "$P74_2Q_SG" && "$SG" tag "$p74_2q_name") > /dev/null 2>&1
+    P74_2Q_SG_RC=$?
+    if [ "$P74_2Q_SG_RC" != 0 ]; then P74_2Q_SG_RC=1; fi
+    check "phase74 case2q ($p74_2q_desc): sg's accept/reject decision for '$p74_2q_name' matches git check-ref-format's" \
+        test "$P74_2Q_GIT_RC" = "$P74_2Q_SG_RC"
+done
 
 # -f actually moving a tag's value prints "Updated tag ... (was <7hex>)";
 # -f that changes nothing prints nothing at all -- keyed on the VALUE
