@@ -103,12 +103,24 @@ int sg_ident_committer(sg_ident *out, const char **bad_value_out);
        tolerance) -- this is what tells "2023-11-15" (rejected: "-11-15"
        matches no offset shape) apart from "1700000000+0800" (parsed).
      - "YYYY-MM-DDTHH:MM:SS[+-]HH:MM"    -- ISO 8601 strict, colon offset.
+       The offset must be ATTACHED, no space -- this was already true
+       before Phase 75a ("no extra internal whitespace before an ISO
+       offset", a deliberate rejection) and Phase 75a does NOT carve out
+       an exception for the zone-NAME spellings: "...00:00:00 Z" (a space
+       before the name) is measured as accepted by git but stays REFUSED
+       by this parser, pinned in tests/test_ident.c and interop's
+       phase75a group. "...00:00:00Z" (no space) IS accepted.
      - "YYYY-MM-DD HH:MM:SS [+-]HHMM"    -- ISO-ish, space-separated, no
        colon in the offset (though the offset token itself may still use a
        colon -- see the grammar below, shared by every form).
      - "[Www, ]DD Mon YYYY HH:MM:SS [+-]HHMM" -- RFC 2822 (the weekday-and-
        comma prefix, if present at all, is skipped without being validated
-       against the actual day of week).
+       against the actual day of week). The offset is ordinarily its own
+       whitespace-separated token, but Phase 75a adds ONE attached
+       exception: a zone NAME (only) glued directly onto the seconds with
+       no space, e.g. "...06:13:20Z" -- measured, git accepts it. An
+       attached DIGIT offset in this form ("...06:13:20+0800") is not
+       measured and stays unimplemented.
        All three of the above REQUIRE a syntactically well-formed, IN-RANGE
        offset -- unlike the timestamp form, an out-of-range offset is a
        hard parse FAILURE here (round 5's decision: sg refuses rather than
@@ -125,12 +137,21 @@ int sg_ident_committer(sg_ident *out, const char **bad_value_out);
        REQUIRED for this shape only)
      - [<sign>] then EXACTLY 4 digits  ("+0800", "0800" -- sign optional)
      - [<sign>] <2 digits>:<2 digits>  ("+08:00", "00:00" -- sign optional)
-   Anything else -- 1 digit, 3 digits, 5 or more digits, or exactly 2
-   digits with NO sign -- is NOT a token at all, and the value falls back
-   to local the same way a malformed one does. The digit-count check is
-   exact (a run of 5 digits is not "the first 4 of it"): "+08000" is NOT a
-   token and falls back to local, it is not read as "+0800" plus an
-   ignorable trailing digit.
+     - "Z" / "UTC" / "GMT", case-insensitive (Phase 75a, measured against
+       real git 2.55.0) -- a WHOLE-WORD match worth +0000. The matched
+       name must be the entire remaining token: "ZULU"/"ZZ"/"UTC1"/
+       "UTC+1"/"GMT0"/"GMT+0" are NOT this token (git's own answer for
+       every one of those is either "falls back to local" or "ignores the
+       trailing junk", both different from a clean +0000, and this parser
+       refuses rather than guess -- see docs/RULES-date.md's phase75a
+       table). No other zone name git implements (EST, PST, CET, JST,
+       ...) is recognized here, deliberately -- same table.
+   Anything else -- 1 digit, 3 digits, 5 or more digits, exactly 2 digits
+   with NO sign, or a name not in the list just above -- is NOT a token at
+   all, and the value falls back to local the same way a malformed one
+   does. The digit-count check is exact (a run of 5 digits is not "the
+   first 4 of it"): "+08000" is NOT a token and falls back to local, it is
+   not read as "+0800" plus an ignorable trailing digit.
    Range-checking (hours <= 23, minutes <= 59) and the POLICY on a
    recognized-but-out-of-range token are the CALLER's -- the timestamp
    form (bare and calendar alike) discards it for local, the `@` form

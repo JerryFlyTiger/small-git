@@ -105,12 +105,62 @@ static int fill_local_offset(long long time_sec, char tz_out[8])
    59 by construction here, but a colon token like "08:99" would still
    reach this far; range-checking still belongs to the caller) and
    *len_out (bytes consumed) on a shape match; -1 otherwise. */
+/* Phase 75a: the UTC-only zone-NAME spellings git accepts as an offset
+   token -- "Z", "UTC", "GMT", matched case-insensitively (cast to
+   `unsigned char` before `tolower`, never a plain `char`: a byte >= 0x80
+   read as a negative `char` is undefined behaviour). Every other zone name
+   git implements (EST, PST, CET, JST, ...) is deliberately NOT recognized
+   here -- see docs/RULES-date.md's phase75a table.
+
+   Whole-word only: the matched name must be the ENTIRE remaining string
+   (s[len] == '\0'), never a prefix. This is what keeps "ZULU"/"ZZ"/"UTC1"/
+   "UTC+1"/"GMT0"/"GMT+0" from ever being silently read as the shorter name
+   -- git's own answer for every one of those is either "falls back to
+   local" or "ignores the trailing junk", both DIFFERENT from a clean
+   +0000, and this project's rule 3 (a refusal never writes a wrong object
+   id) means sg keeps refusing them rather than guessing. Requiring full
+   consumption INSIDE this shared function, rather than leaving it to each
+   caller, is what makes that hold everywhere: the bare (non-'@') epoch
+   form's own caller in try_epoch does not itself check that a matched
+   token consumed the whole tail (a pre-existing, unrelated gap in the
+   digit-shape path, out of scope here), so a name check that only checked
+   its OWN prefix would leak through exactly there. */
+static int match_zone_name(const char *s, size_t *len_out)
+{
+    static const char *const NAMES[] = { "z", "utc", "gmt" };
+    size_t i;
+
+    for (i = 0; i < sizeof(NAMES) / sizeof(NAMES[0]); i++) {
+        size_t n = strlen(NAMES[i]);
+        size_t j;
+
+        for (j = 0; j < n; j++) {
+            if ((char)tolower((unsigned char)s[j]) != NAMES[i][j])
+                break;
+        }
+        if (j == n && s[n] == '\0') {
+            *len_out = n;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int match_offset_shape(const char *s, int *negative_out, int *hh_out, int *mm_out,
                               size_t *len_out)
 {
     const char *p = s;
     int has_sign = 0;
     int ndigits;
+    size_t zlen;
+
+    if (match_zone_name(s, &zlen) == 0) {
+        *negative_out = 0;
+        *hh_out = 0;
+        *mm_out = 0;
+        *len_out = zlen;
+        return 0;
+    }
 
     *negative_out = 0;
     if (*p == '+') {
@@ -582,20 +632,61 @@ static int try_rfc2822(const char *s, long long *time_out, char tz_out[8])
     tok = strtok_r(NULL, " \t", &saveptr);
     if (tok == NULL)
         return -1;
-    if (sscanf(tok, "%2d:%2d:%2d", &hh, &mi, &ss) != 3)
-        return -1;
+    {
+        int time_n = 0;
+        int attached_zone;
 
-    tok = strtok_r(NULL, " \t", &saveptr);
-    if (tok == NULL)
-        return -1;
-    if (match_offset_token(tok, &offset, &out_of_range, &token_len) != 0)
-        return -1;
-    if (strlen(tok) != token_len)
-        return -1;
+        if (sscanf(tok, "%2d:%2d:%2d%n", &hh, &mi, &ss, &time_n) != 3)
+            return -1;
+        attached_zone = 0;
+        if (tok[time_n] != '\0') {
+            /* Phase 75a: a UTC zone name glued directly onto the seconds
+               with no separating space -- "00:00:00Z" (measured: git
+               accepts this exact shape). This is the ONE place in RFC2822
+               an offset can appear attached rather than as its own
+               whitespace-separated token, because the grammar otherwise
+               always space-separates it; restricted to match_zone_name
+               specifically (not the general match_offset_token) so an
+               attached DIGIT offset here ("00:00:00+0800", never
+               measured) stays out of scope rather than falling out of
+               this for free.
 
-    tok = strtok_r(NULL, " \t", &saveptr);
-    if (tok != NULL)
-        return -1;
+               WARNING: when the attached content is NOT a zone name this
+               must FALL THROUGH to the ordinary path, not fail. Phase
+               75a's first version returned -1 here, and that was a
+               REGRESSION a cold read found: "Thu, 1 Jan 2026 06:13:20foo
+               +0500" is accepted by git AND was accepted identically by sg
+               before this phase (measured on master: 1767230000 +0500,
+               byte-identical to git's), because sscanf's "%n" simply
+               stopped at the junk and the offset came from the NEXT token.
+               Refusing it wrote no wrong object id, but it removed an
+               agreement with git that this phase was not asked to touch,
+               and no test covered it -- the phase's own new rows all use
+               shapes where the attached content IS a zone name. */
+            size_t zlen;
+
+            if (match_zone_name(tok + time_n, &zlen) == 0) {
+                offset = 0;
+                attached_zone = 1;
+                tok = strtok_r(NULL, " \t", &saveptr);
+                if (tok != NULL)
+                    return -1;
+            }
+        }
+        if (!attached_zone) {
+            tok = strtok_r(NULL, " \t", &saveptr);
+            if (tok == NULL)
+                return -1;
+            if (match_offset_token(tok, &offset, &out_of_range, &token_len) != 0)
+                return -1;
+            if (strlen(tok) != token_len)
+                return -1;
+
+            tok = strtok_r(NULL, " \t", &saveptr);
+            if (tok != NULL)
+                return -1;
+        }
+    }
 
     if (calendar_to_epoch((int)year, mon, (int)day, hh, mi, ss, offset, time_out) != 0)
         return -1;

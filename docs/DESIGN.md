@@ -17313,3 +17313,60 @@ the reviewer's own words. Recorded because "the fix was wrong four times" is
 the useful part -- a claim about which test watches what is exactly as
 load-bearing as the code, is invisible to every gate, and a cold read is the
 only defence line it has.
+
+### Phase 75b: the overflow oracle was measured on one platform, and CI said so
+
+`bash tests/gates.sh` was green on macOS and CI went red on the first push, in
+two jobs, on exactly one check: the record-and-pin for
+`git reflog HEAD@{99999999999999999999}`, where N overflows. Measured on
+macOS with git 2.55.0 that exits 0 printing nothing, which is what the check
+asserted. CI's ubuntu runners disagree -- with **git 2.55.0 as well**, checked
+in the run's own log, so this is not a version difference. The same input,
+the same git, a different C library.
+
+This project already has a rule about declaring an oracle measurement's
+environment, and a list of the axes that had bitten it: locale, git config,
+and (Phase 72) the measuring machine's own timezone. **The C library is a
+fourth axis, and an overflowing integer argument is exactly the shape that
+finds it** -- everything upstream of the overflow is identical, so nothing
+about the test looks platform-sensitive until it fails.
+
+The fix is not to pin the other shape: it is to stop pinning git's side of
+this one cell at all. The check now asserts only that git neither crashes nor
+hangs (exit 0 or 128), the sg side keeps its full assertion (exit 1 with its
+own out-of-range sentence, which is stable on every platform), and the
+observed git shape is echoed into interop's own output as a `note:` line so
+the difference is recorded as data the next time someone reads the log. An
+input whose oracle answer is not portable does not get a portable-looking
+pin.
+
+### Phase 75a's own regression, and why nothing in the phase could see it
+
+The cold read of Phase 75a found that its new RFC 2822 branch -- "a UTC zone
+name glued straight onto the seconds, `00:00:00Z`" -- returned a hard failure
+whenever the attached content was NOT a zone name. Measured against master's
+own binary, that took away an agreement with git the phase was never asked to
+touch:
+
+```
+GIT_AUTHOR_DATE="Thu, 1 Jan 2026 06:13:20foo +0500"
+  git            1767230000 +0500
+  sg, master     1767230000 +0500      (agreed)
+  sg, Phase 75a  REJECT                (regression)
+```
+
+`sscanf`'s `%n` had always simply stopped at the junk, with the offset coming
+from the NEXT token, and that is what git does too. The fix is to fall
+through instead of failing, which restores master's answer for every
+attached-junk shape measured (the other five all stay refusals on both
+master and now, a pre-existing divergence from git that this phase does not
+touch).
+
+**Why no test caught it**: every row Phase 75a added attaches a zone NAME, so
+the phase's own tests all take the new branch's success path. The failure
+path was reachable only through a shape the phase had no reason to write down
+-- which is the general shape of a regression introduced by a narrow feature:
+the new code's own tests cover the new case, and the case it broke belongs to
+nobody. The pin added now is the accepted row plus the three refusals around
+it, so the fall-through cannot quietly widen either; a mutation restoring the
+hard failure turns exactly the accepted row red.

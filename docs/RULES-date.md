@@ -262,3 +262,77 @@ do not read the whole thing).
   the largest output reachable through the CLI is about 14 MiB, roughly
   19x below the cap. **Do not "simplify" this back toward a constant-size
   buffer, and do not add a second cap.**
+- **The ident-date parser (`src/util/ident.c`, `include/sg/ident.h`) gained
+  UTC-only zone-name recognition in Phase 75a** -- found while gating Phase
+  75: `tests/fuzz_diff.py` and `tests/fuzz_rename.py` set
+  `GIT_AUTHOR_DATE=...Z` and had been dying in their own fixture setup,
+  unrun, since Phase 72 (the phase that first taught sg to read that env
+  var at all). `sg_ident_parse_date`'s shared offset-TOKEN grammar
+  (`match_offset_shape` in `ident.c`) now additionally recognizes `Z`,
+  `UTC`, `GMT`, case-insensitive, as a whole-word token worth `+0000`, in
+  every place that grammar is already consulted (bare/`@` epoch form
+  attached or after whitespace, ISO-T attached, ISO-space attached-or-
+  after-whitespace, RFC2822 as its own whitespace token). Measured against
+  real git 2.55.0, `LC_ALL=C`, argv passed directly (no shell), `TZ`
+  declared explicitly on each row (measured under `TZ=Asia/Taipei` on
+  purpose: the machine's own local offset is `+0800`, so a result of
+  `+0000` proves the token was PARSED while `+0800` would prove it fell
+  back to local -- a `+0000`-local machine cannot tell those two apart,
+  the same trap round 6 of SPEC-CORRECTION-2.md already hit once).
+
+  | value | git | sg (post-75a) |
+  |---|---|---|
+  | `2026-01-01T00:00:00Z` | `1767225600 +0000` | `+0000` |
+  | `2026-01-01T00:00:00z` | `1767225600 +0000` | `+0000` |
+  | `2026-01-01T00:00:00 Z` | `1767225600 +0000` | **REFUSED, unchanged** |
+  | `2026-01-01 00:00:00Z` | `1767225600 +0000` | `+0000` |
+  | `Thu, 1 Jan 2026 00:00:00Z` | `1767225600 +0000` | `+0000` |
+  | `1767225600 Z` | `1767225600 +0000` | `+0000` (was: silently local) |
+  | `1767225600Z` | `1767225600 +0000` | `+0000` |
+  | `@1767225600 Z` | `1767225600 +0000` | `+0000` (was: silently local) |
+  | `@1767225600Z` | `1767225600 +0000` | `+0000` |
+
+  WARNING: **the ISO-T form's own pre-existing deliberate rejection ("no
+  extra internal whitespace before an ISO offset",
+  `tests/test_ident.c`'s `expect_fail("2023-11-15T06:13:20 +08:00")`)
+  is NOT carved out for zone names.** `"2026-01-01T00:00:00 Z"` (a space
+  between the seconds and the name) is measured as accepted by git and
+  stays REFUSED by sg -- this is a genuine, newly-discovered conflict
+  between the Phase 75a spec's own "every form" wording and an
+  already-pinned Phase 2/round-6 rule, resolved in favor of the older
+  pinned rule rather than by adding a second, narrower carve-out for one
+  spelling. Pinned in `tests/test_ident.c`'s
+  `test_phase75a_utc_zone_names` and in interop's `phase75a` group as a
+  head-on git-accepts/sg-refuses pair, same shape as the rest of that
+  older deliberate-rejection list.
+
+  WARNING: **RFC2822's offset is ordinarily its own whitespace-separated
+  token; Phase 75a adds exactly one exception, and only for a NAME.** A
+  zone name glued directly onto the seconds with no space
+  (`"...06:13:20Z"`) is measured as accepted by git and is now
+  implemented, restricted deliberately to `match_zone_name` rather than
+  the general `match_offset_token` -- an attached DIGIT offset in this
+  form (`"...06:13:20+0800"`) was never measured and stays unimplemented,
+  so reusing the general matcher there would have silently implemented an
+  un-oracled shape instead of the one actually asked for.
+
+  Out of scope, each pinned as "leave sg's current answer, whatever it
+  measures as". Every row below was measured under `TZ=Asia/Taipei` (local
+  +0800, so a `+0000` in the written object proves the zone NAME was parsed
+  rather than falling back to local) on the BARE-EPOCH form, e.g.
+  `1767225600 EST` -- not the ISO form an earlier version of this sentence
+  claimed, which was a copy-paste from the in-scope table above and named a
+  shape none of these rows use:
+
+  | spelling | git | sg |
+  |---|---|---|
+  | `EST` `est` `Est` | `-0500` | falls back to local (unimplemented) |
+  | `EDT` -0400, `PST` -0800, `PDT` -0700, `CET` +0100, `JST` +0900, `IST` +0800 | as shown | falls back to local (unimplemented) |
+  | `ZULU` `zulu` `UT` `A` `M` `Y` `QQQ` `UTC1` `GMT0` | accepted by git, falls back to LOCAL there too | falls back to local (unaffected by this phase) |
+  | `UTC+1` `Z+1` `GMT0` `GMT+0` `ZZ` `Zx` (attached, no space) | git ignores the trailing junk (or falls to local) | **REFUSED outright** -- a refusal never writes a wrong object id (rule 3 of SPEC-CORRECTION.md's scope line) |
+  | `UTC+1` `Z+1` `GMT+0` `ZZ` `Zx` (preceded by whitespace) | same as above | falls back to local (the pre-existing "tolerate one token of junk after whitespace" rule, unaffected) |
+
+  **Do not** extend `match_zone_name` to the other named offsets (EST,
+  PST, CET, JST, IST, EDT, PDT) without a fresh oracle measurement for
+  each -- they are a real git feature this project simply does not
+  implement, not an oversight of this phase.

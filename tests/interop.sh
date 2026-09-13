@@ -20055,13 +20055,14 @@ p72_date_row "2099-12-31T23:59:00-01:01" 1
 # SPEC-CORRECTION.md's "scope line" case 3: sg MAY reject what git accepts,
 # provided it does so loudly (exit 1) and the divergence is pinned on both
 # sides -- the same standing convention as --patience/auto:<name>/^{tree}
-# elsewhere in this file. These FIVE shapes are deliberately NOT implemented
-# (no fractional seconds, no named time zones, no tolerance for extra
-# internal whitespace before an ISO offset or for trailing garbage after an
-# otherwise-complete RFC2822 date, and no RFC2822 two-digit-year century
-# inference); reproducing them would mean growing a second, looser date
-# grammar for no bit-compatibility benefit, since sg refusing outright can
-# never itself write a wrong object.
+# elsewhere in this file. These shapes are deliberately NOT implemented (no
+# fractional seconds, no named time zones OTHER THAN the Phase 75a UTC
+# spellings Z/UTC/GMT -- see that phase's own "phase75a" group below, no
+# tolerance for extra internal whitespace before an ISO offset or for
+# trailing garbage after an otherwise-complete RFC2822 date, and no RFC2822
+# two-digit-year century inference); reproducing them would mean growing a
+# second, looser date grammar for no bit-compatibility benefit, since sg
+# refusing outright can never itself write a wrong object.
 p72_deliberate_reject_row() {
     # $1 = GIT_AUTHOR_DATE value that git ACCEPTS and sg deliberately REFUSES
     # $2 = optional TZ override (round 5's local-offset-reinterpretation
@@ -20137,7 +20138,11 @@ check "phase72 tz6: sg still echoes the stored offset string itself, so only the
 
 p72_deliberate_reject_row "2023-11-15T06:13:20.123+08:00"
 p72_deliberate_reject_row "2023-11-15T06:13:20 +08:00"
-p72_deliberate_reject_row "Wed, 15 Nov 2023 06:13:20 GMT"
+# "Wed, 15 Nov 2023 06:13:20 GMT" used to be pinned right here as a
+# deliberate divergence (sg refuses, git accepts) -- Phase 75a implements
+# the UTC zone-name spellings, so this exact row moved to the "phase75a"
+# group below as an ACCEPTED row instead, rather than being duplicated in
+# both shapes.
 p72_deliberate_reject_row "Wed, 15 Nov 2023 06:13:20 +0800 extra garbage"
 # Fifth shape (round 4): RFC2822 two-digit years -- git infers the century
 # ("70" -> 1970, measured; also "04" -> 2004 and "99" -> 1999, not repeated
@@ -21948,9 +21953,23 @@ P75R4_HEAD_COUNT=$(cd "$P75R4" && LC_ALL=C git reflog HEAD | wc -l | tr -d ' ')
 P75R4_GIT_OVERFLOW_RC=$?
 (cd "$P75R4" && "$SG" reflog "HEAD@{99999999999999999999}") > "$WORKDIR/p75r4_sg_overflow.txt" 2>&1
 P75R4_SG_OVERFLOW_RC=$?
-check "phase75 round4 record-and-pin oracle: git reflog HEAD@{99999999999999999999} (N overflows) exits 0 with EMPTY output" \
-    sh -c "test $P75R4_GIT_OVERFLOW_RC -eq 0 && ! test -s '$WORKDIR/p75r4_git_overflow.txt'"
-check "phase75 round4 record-and-pin: sg reflog HEAD@{99999999999999999999} still exits 1 with its own out-of-range sentence (deliberately NOT reproducing git's silent success)" \
+# WARNING: git's OWN answer to this one input is PLATFORM-DEPENDENT, with
+# the identical git version on both sides. Measured macOS, git 2.55.0: exit
+# 0 with empty output. CI (ubuntu, git 2.55.0 as well -- checked in the run's
+# own log) disagreed, and the first version of this check asserted the macOS
+# shape as if it were git's answer everywhere: green locally, red on CI run
+# 34742027876, in both the clang and the ASan jobs. That is this project's
+# standing lesson about declaring the oracle's environment, one axis further
+# out than the ones already recorded (locale, config, timezone): the C
+# library is an axis too, and an overflowing integer is exactly where it
+# shows. So the git side is deliberately NOT pinned to one shape here --
+# it asserts only that git neither crashes nor hangs, and the observed shape
+# is echoed into the log so the platform difference is visible as data
+# rather than inferred. The line below is intentionally not a check.
+echo "note: phase75 overflow oracle -- git exit $P75R4_GIT_OVERFLOW_RC, first line: $(head -1 "$WORKDIR/p75r4_git_overflow.txt" 2>/dev/null)"
+check "phase75 round4 record-and-pin oracle: git reflog HEAD@{99999999999999999999} (N overflows) neither crashes nor hangs -- its exact shape is platform-dependent, see the WARNING above" \
+    sh -c "test $P75R4_GIT_OVERFLOW_RC -eq 0 -o $P75R4_GIT_OVERFLOW_RC -eq 128"
+check "phase75 round4 record-and-pin: sg reflog HEAD@{99999999999999999999} exits 1 with its own out-of-range sentence, on every platform" \
     sh -c "test $P75R4_SG_OVERFLOW_RC -eq 1 && grep -qxF \"sg: log for 'HEAD' only has $P75R4_HEAD_COUNT entries\" '$WORKDIR/p75r4_sg_overflow.txt'"
 
 # --- merge-base (both positions name the same wording) ---
@@ -22123,6 +22142,124 @@ p75_reflog_silent "an annotated tag's name" "p75atag" \
 p75_reflog_silent "a lightweight tag's name" "p75light" \
     "phase75 NOT fix2 coverage (a lightweight tag's own ref path has an empty reflog) oracle: git reflog exits 0 with EMPTY output" \
     "phase75 NOT fix2 coverage (a lightweight tag's own ref path has an empty reflog): sg reflog exits 0 with EMPTY output too"
+
+# ============================================================
+# Phase 75a: the UTC zone-name spellings (Z/UTC/GMT) sg's ident-date parser
+# now accepts. Found while gating Phase 75: tests/fuzz_diff.py and
+# tests/fuzz_rename.py set GIT_AUTHOR_DATE=...Z and had been dying in their
+# own fixture setup, unrun, since Phase 72. Reuses p72_date_row (defined
+# above, same fixture/comparison shape: identical env on both sides,
+# accepted rows compare the resulting commit object id, rejected rows
+# compare exit codes). TZ=Asia/Taipei on every row, on purpose: the zone's
+# own offset is +0800, so a resulting +0000 id proves the token was PARSED
+# rather than falling back to local -- see docs/RULES-date.md's phase75a
+# section for the full derivation.
+# ============================================================
+p72_date_row "2026-01-01T00:00:00Z" 0 "Asia/Taipei"
+p72_date_row "2026-01-01T00:00:00z" 0 "Asia/Taipei"
+p72_date_row "2026-01-01 00:00:00Z" 0 "Asia/Taipei"
+p72_date_row "Thu, 1 Jan 2026 00:00:00Z" 0 "Asia/Taipei"
+p72_date_row "1767225600 Z" 0 "Asia/Taipei"
+p72_date_row "1767225600Z" 0 "Asia/Taipei"
+p72_date_row "@1767225600 Z" 0 "Asia/Taipei"
+p72_date_row "@1767225600Z" 0 "Asia/Taipei"
+p72_date_row "1767225600 UTC" 0 "Asia/Taipei"
+p72_date_row "1767225600 GMT" 0 "Asia/Taipei"
+p72_date_row "Wed, 15 Nov 2023 06:13:20 GMT" 0 "Asia/Taipei"
+# ATTACHED UTC/GMT (no space). A cold read pointed out that the shared
+# matcher accepts all three names in every form, but only attached `Z` had
+# ever been measured -- these spellings were live and un-oracled, which is
+# how a silent wrong object id gets in. Measured after the fact against git
+# 2.55.0 under TZ=Asia/Taipei (local +0800, so a +0000 in the object proves
+# the NAME was parsed rather than falling back): all of them agree, so they
+# are pinned rather than merely asserted to be "the same as Z".
+p72_date_row "1767225600UTC" 0 "Asia/Taipei"
+p72_date_row "1767225600GMT" 0 "Asia/Taipei"
+p72_date_row "@1767225600UTC" 0 "Asia/Taipei"
+p72_date_row "1767225600utc" 0 "Asia/Taipei"
+p72_date_row "2026-01-01T00:00:00UTC" 0 "Asia/Taipei"
+p72_date_row "2026-01-01T00:00:00GMT" 0 "Asia/Taipei"
+p72_date_row "2026-01-01T00:00:00gmt" 0 "Asia/Taipei"
+p72_date_row "2026-01-01 00:00:00UTC" 0 "Asia/Taipei"
+p72_date_row "Thu, 1 Jan 2026 00:00:00UTC" 0 "Asia/Taipei"
+p72_date_row "Thu, 1 Jan 2026 00:00:00GMT" 0 "Asia/Taipei"
+# REGRESSION PIN (see tests/test_ident.c's own note): the attached-name
+# branch must fall THROUGH for attached content that is not a zone name.
+# git accepts this row and sg did too before Phase 75a; the phase's first
+# version refused it, and none of its own new rows could tell, because they
+# all attach a zone NAME.
+p72_date_row "Thu, 1 Jan 2026 06:13:20foo +0500" 0 "Asia/Taipei"
+
+# --- WARNING: this row is a genuine, newly-discovered conflict between the
+# Phase 75a spec's own "every form" wording and an already-pinned Phase
+# 2/round-6 rule ("no extra internal whitespace before an ISO offset").
+# git ACCEPTS a SPACE before the zone name here (exit 0); sg's ISO-T form
+# has never tolerated a space before ANY offset token (digit or name) and
+# this phase does not carve out a name-only exception, so sg still
+# REFUSES it (exit 1) -- an asymmetric divergence, not a symmetric
+# rejection, hence p72_deliberate_reject_row rather than p72_date_row
+# (which demands BOTH sides reject and would misreport git's own exit
+# code as a bug in this test). Same shape as this project's other
+# deliberate-rejection pins, pinned rather than "fixed" into silent
+# agreement. ---
+p72_deliberate_reject_row "2026-01-01T00:00:00 Z" "Asia/Taipei"
+
+# --- Out of scope, pinned so sg's CURRENT answer (unaffected by this
+# phase) cannot silently drift. These are not accept/reject rows for
+# p72_date_row's own binary shape (both tools fall back to local, or git
+# resolves a name sg does not implement), so compared directly instead. ---
+P75A_ZONE="$WORKDIR/p75a_zone"
+rm -rf "$P75A_ZONE"
+(cd "$(dirname "$P75A_ZONE")" && "$SG" init "$(basename "$P75A_ZONE")") > /dev/null 2>&1
+printf 'root\n' > "$P75A_ZONE/root.txt"
+p75a_zone_row() {
+    # $1 = GIT_AUTHOR_DATE value, $2 = label
+    P75AZ_VAL="$1"
+    P75AZ_LABEL="$2"
+    P75AZ_SG="$WORKDIR/p75az_sg"
+    P75AZ_GIT="$WORKDIR/p75az_git"
+    rm -rf "$P75AZ_SG" "$P75AZ_GIT"
+    cp -R "$P75A_ZONE" "$P75AZ_SG"
+    cp -R "$P75A_ZONE" "$P75AZ_GIT"
+    printf 'root\nrow\n' > "$P75AZ_SG/root.txt"
+    printf 'root\nrow\n' > "$P75AZ_GIT/root.txt"
+    (cd "$P75AZ_SG" && "$SG" add root.txt && env TZ="Asia/Taipei" \
+        GIT_AUTHOR_NAME="Rrr" GIT_AUTHOR_EMAIL="rrr@x.example" \
+        GIT_AUTHOR_DATE="$P75AZ_VAL" GIT_COMMITTER_NAME="Rrr" GIT_COMMITTER_EMAIL="rrr@x.example" \
+        GIT_COMMITTER_DATE="1650000000 +0000" "$SG" commit -m "phase75a zone row") > /dev/null 2>&1
+    P75AZ_SG_RC=$?
+    (cd "$P75AZ_GIT" && git add root.txt && env TZ="Asia/Taipei" \
+        GIT_AUTHOR_NAME="Rrr" GIT_AUTHOR_EMAIL="rrr@x.example" \
+        GIT_AUTHOR_DATE="$P75AZ_VAL" GIT_COMMITTER_NAME="Rrr" GIT_COMMITTER_EMAIL="rrr@x.example" \
+        GIT_COMMITTER_DATE="1650000000 +0000" LC_ALL=C git commit -q -m "phase75a zone row") > /dev/null 2>&1
+    P75AZ_GIT_RC=$?
+    check "phase75a out-of-scope \"$P75AZ_LABEL\": git still exits 0 (accepts, resolves the name however it does)" \
+        test "$P75AZ_GIT_RC" -eq 0
+    check "phase75a out-of-scope \"$P75AZ_LABEL\": sg still exits 0 too (falls back to local, unaffected by this phase)" \
+        test "$P75AZ_SG_RC" -eq 0
+}
+# A real named offset git implements and sg does not.
+p75a_zone_row "1767225600 EST" "EST"
+# A name git itself resolves to local.
+p75a_zone_row "1767225600 ZULU" "ZULU"
+p75a_zone_row "1767225600 UTC1" "UTC1"
+# Trailing junk after a recognized name, preceded by whitespace: tolerated
+# by both tools (git ignores/falls back, sg's pre-existing "one token of
+# junk after whitespace" rule, unaffected).
+p75a_zone_row "1767225600 UTC+1" "UTC+1, space-separated"
+
+# --- Attached trailing junk on a recognized name must still be a hard sg
+# refusal (exit 1), never a silent guess -- unlike the space-separated
+# case above, there is no git side to compare against here (this specific
+# byte sequence, glued with no space, is not one of the measured oracle
+# rows), so this checks sg's OWN rule only: "Z followed by more bytes must
+# never silently read as Z". ---
+(cd "$P75A_ZONE" && "$SG" add root.txt) > /dev/null 2>&1
+P75AZ_ATTACHED_RC=0
+(cd "$P75A_ZONE" && GIT_AUTHOR_DATE="1767225600ZZ" GIT_COMMITTER_DATE="1650000000 +0000" \
+    "$SG" commit -m "phase75a attached junk") > /dev/null 2>&1 || P75AZ_ATTACHED_RC=$?
+check "phase75a attached trailing junk (\"1767225600ZZ\", no space): sg refuses (exit 1)" \
+    test "$P75AZ_ATTACHED_RC" -eq 1
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
