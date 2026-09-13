@@ -20852,9 +20852,14 @@ printf 'x\n' > "$P74_2K_GIT/x.txt"
 (cd "$P74_2K_GIT" && git tag one) > /dev/null 2>&1
 if ln "$P74_2K_GIT/.git/refs/tags/one" "$P74_2K_GIT/.git/refs/tags/two" 2>/dev/null; then
     cp -R "$P74_2K_GIT" "$P74_2K_SG"
+    # POSIX test's -ef is exactly "same device and inode" and needs no stat
+    # at all. The previous form was `stat -f %i ... || stat -c %i ...`, which
+    # is a portability trap CI caught on all three Linux runners: BSD stat's
+    # -f is the format flag, GNU stat's -f is --file-system, so on Linux the
+    # first command printed a filesystem block to stdout AND failed, the
+    # fallback then printed the inode, and $(...) captured both concatenated.
     check "phase74 case2k oracle: precondition -- the two ref files really do share one inode after the hardlink" \
-        sh -c "test \"\$(stat -f %i "$P74_2K_GIT/.git/refs/tags/one" 2>/dev/null || stat -c %i "$P74_2K_GIT/.git/refs/tags/one")\" = \
-               \"\$(stat -f %i "$P74_2K_GIT/.git/refs/tags/two" 2>/dev/null || stat -c %i "$P74_2K_GIT/.git/refs/tags/two")\""
+        test "$P74_2K_GIT/.git/refs/tags/one" -ef "$P74_2K_GIT/.git/refs/tags/two"
     (cd "$P74_2K_GIT" && git tag -d one two) > /dev/null 2>&1
     P74_2K_GIT_RC=$?
     (cd "$P74_2K_SG" && "$SG" tag -d one two) > /dev/null 2>&1
