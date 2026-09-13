@@ -21954,11 +21954,17 @@ P75R4_GIT_OVERFLOW_RC=$?
 (cd "$P75R4" && "$SG" reflog "HEAD@{99999999999999999999}") > "$WORKDIR/p75r4_sg_overflow.txt" 2>&1
 P75R4_SG_OVERFLOW_RC=$?
 # WARNING: git's OWN answer to this one input is PLATFORM-DEPENDENT, with
-# the identical git version on both sides. Measured macOS, git 2.55.0: exit
-# 0 with empty output. CI (ubuntu, git 2.55.0 as well -- checked in the run's
-# own log) disagreed, and the first version of this check asserted the macOS
-# shape as if it were git's answer everywhere: green locally, red on CI run
-# 34742027876, in both the clang and the ASan jobs. That is this project's
+# the identical git version on both sides -- but NOT in the way the first
+# version of this check assumed. Both platforms exit 0. What differs is
+# stderr: macOS prints nothing, Linux prints "warning: log for 'HEAD' only
+# goes back to <date>". That warning names the mechanism: an N this large
+# overflows git's integer parse and falls into its DATE selector instead
+# ("@{<approxidate>}"), the date lands before the log starts, and git warns
+# and succeeds. The first version asserted "exit 0 AND empty output" as one
+# thing and so went red on CI run 34742027876 for the half that is not
+# portable, in both the clang and the ASan jobs; the exit code was never the
+# problem. The shape above was harvested from the `note:` line below on CI
+# run 34746130450 rather than guessed. That is this project's
 # standing lesson about declaring the oracle's environment, one axis further
 # out than the ones already recorded (locale, config, timezone): the C
 # library is an axis too, and an overflowing integer is exactly where it
@@ -21967,8 +21973,10 @@ P75R4_SG_OVERFLOW_RC=$?
 # is echoed into the log so the platform difference is visible as data
 # rather than inferred. The line below is intentionally not a check.
 echo "note: phase75 overflow oracle -- git exit $P75R4_GIT_OVERFLOW_RC, first line: $(head -1 "$WORKDIR/p75r4_git_overflow.txt" 2>/dev/null)"
-check "phase75 round4 record-and-pin oracle: git reflog HEAD@{99999999999999999999} (N overflows) neither crashes nor hangs -- its exact shape is platform-dependent, see the WARNING above" \
-    sh -c "test $P75R4_GIT_OVERFLOW_RC -eq 0 -o $P75R4_GIT_OVERFLOW_RC -eq 128"
+check "phase75 round4 record-and-pin oracle: git reflog HEAD@{99999999999999999999} (N overflows) exits 0 on every platform -- what differs is whether it also warns, see the WARNING above" \
+    sh -c "test $P75R4_GIT_OVERFLOW_RC -eq 0"
+check "phase75 round4 record-and-pin oracle: git's stderr there is either empty (macOS) or its date-fallback warning (Linux), and nothing else" \
+    sh -c "! test -s '$WORKDIR/p75r4_git_overflow.txt' || grep -q \"log for 'HEAD' only goes back to\" '$WORKDIR/p75r4_git_overflow.txt'"
 check "phase75 round4 record-and-pin: sg reflog HEAD@{99999999999999999999} exits 1 with its own out-of-range sentence, on every platform" \
     sh -c "test $P75R4_SG_OVERFLOW_RC -eq 1 && grep -qxF \"sg: log for 'HEAD' only has $P75R4_HEAD_COUNT entries\" '$WORKDIR/p75r4_sg_overflow.txt'"
 

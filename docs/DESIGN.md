@@ -17331,8 +17331,29 @@ fourth axis, and an overflowing integer argument is exactly the shape that
 finds it** -- everything upstream of the overflow is identical, so nothing
 about the test looks platform-sensitive until it fails.
 
-The fix is not to pin the other shape: it is to stop pinning git's side of
-this one cell at all. The check now asserts only that git neither crashes nor
+**Follow-up, and the reason the fix included a diagnostic rather than only a
+loosened assertion**: the replacement check echoed git's observed exit code
+and first stderr line into interop's own output as a `note:` line, and the
+next CI run (34746130450, all six cells green) brought the missing half of the
+measurement back:
+
+```
+macOS:  git exit 0, first line: (empty)
+Linux:  git exit 0, first line: warning: log for 'HEAD' only goes back to Sun, 13 Sep 2026 07:50:18 +0000
+```
+
+So the exit code was never the divergent part -- both platforms exit 0 -- and
+the first version of the check went red only because it asserted "exit 0 AND
+empty stderr" as a single condition. The warning also names the mechanism: an
+N that large overflows git's integer parse and falls through to its DATE
+selector (`@{<approxidate>}`), the resulting date lands before the log
+starts, and git warns and succeeds. With that in hand the pin was tightened
+again, from "exit 0 or 128" to "exit 0 on every platform, and stderr is
+either empty or exactly that warning" -- which is both portable and
+meaningfully stronger than what it replaced.
+
+The fix was not to pin the other shape: it was to stop pinning git's side of
+this one cell to one platform's bytes. The check now asserts only that git neither crashes nor
 hangs (exit 0 or 128), the sg side keeps its full assertion (exit 1 with its
 own out-of-range sentence, which is stable on every platform), and the
 observed git shape is echoed into interop's own output as a `note:` line so
