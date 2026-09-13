@@ -117,4 +117,59 @@ int sg_cli_arg_exists_in_worktree(const char *arg);
 int sg_cli_split_revs_and_paths(const char *git_dir, char **pos, int n_pos, const char *cmd_name,
                                 sg_rev_disambig disambig);
 
+/* Phase 75: the "this revision does not resolve" message matrix. git uses
+   at least ten different wordings for this, each STABLE per (command,
+   input class) -- see docs/DESIGN.md's Phase 75 section for the full
+   measured table. This is the single reporter every command's revision-
+   resolution failure goes through; do not fprintf a new one-off wording at
+   a call site, add a row to the table in cli_args.c instead. */
+typedef enum {
+    SG_REV_ERR_NOT_A_REV,     /* class R: not a revision, not a path */
+    SG_REV_ERR_MISSING_OBJ,   /* class O: well-formed 40-hex, object absent */
+    SG_REV_ERR_MISSING_PATH,  /* class P: <rev>:<path>, rev resolves, path does not */
+    SG_REV_ERR_BOTH,          /* class D: both a revision and an existing path */
+} sg_rev_err_kind;
+
+/* Classifies a revision-resolution failure into one of the four cells
+   above. Does its own (separate) sg_rev_parse_object call purely to decide
+   which wording applies -- callers keep resolving through whatever
+   function actually suits them (sg_rev_parse_commit(_ex), ...); this
+   never returns anything for the -4 (ambiguous short id) case, callers
+   already have to special-case -4 themselves via
+   sg_cli_report_ambiguous_oid before ever reaching here. `bad_path` (a
+   buffer of size `bad_path_size`) is filled in for SG_REV_ERR_MISSING_PATH
+   only, matching sg_rev_parse_object's own -2 contract; untouched
+   otherwise. */
+sg_rev_err_kind sg_cli_classify_rev_error(const char *git_dir, const char *arg,
+                                          char *bad_path, size_t bad_path_size);
+
+/* Prints the "sg: ..." diagnostic for a revision-resolution failure,
+   choosing the exact wording git itself uses for `cmd`+`kind` (see the
+   table in cli_args.c). `cmd` is the sg subcommand name as typed by this
+   table ("log", "diff", "reset", "reflog", "show", "tag", "cat-file-p",
+   "cat-file-ts", "merge-base", "cherry-pick", "revert" -- cat-file's two
+   modes have different O wordings, so they are two distinct rows, not one
+   command name with an internal switch). `arg` is the argument exactly as
+   typed. `detail` means different things depending on (cmd, kind):
+     - SG_REV_ERR_MISSING_PATH: the <path> half of `arg` (what
+       sg_cli_classify_rev_error filled `bad_path` with) -- the <rev> half
+       is re-derived from `arg` by truncating at the first ':'.
+     - `cmd` == "tag" and kind == SG_REV_ERR_MISSING_OBJ: the tag name
+       being created (git's wording names the ref, not just the object).
+     - every other (cmd, kind): unused, pass NULL.
+   `dashdash` is 1 when argv contained a "--" separator (this changes the
+   wording for `log`/`diff`/`show`/`reflog`/`reset`; a "--"-present class P
+   also collapses into the dashdash R wording with the WHOLE `arg`, per
+   git's own "path 'nosuchfile' does not exist" -> "bad revision
+   'HEAD:nosuchfile'" behavior once "--" is present).
+   Every embedded argument is run through the control-byte sanitizer (every
+   byte 0x01-0x08/0x0b-0x1f/0x7f becomes '?', tab/newline/space and every
+   byte >= 0x80 pass through raw) -- this reporter's own private rule, not
+   sg_quote_path_delimited's (git prints these arguments RAW, no C-quoting,
+   see docs/RULES-paths-strings.md). An unrecognized `cmd` name is a
+   programmer error, not a possible user input -- see cli_args.c's own
+   comment on why this is asserted rather than silently defaulted. */
+void sg_cli_report_rev_error(const char *cmd, sg_rev_err_kind kind, const char *arg,
+                             const char *detail, int dashdash);
+
 #endif

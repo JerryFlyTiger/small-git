@@ -84,29 +84,22 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         bad_path[0] = '\0';
         prc = sg_rev_parse_object(git_dir, rev_or_head, target_id, &target_type, bad_path,
                                   sizeof(bad_path));
-        /* A well-formed id whose object cannot be read is missing or
-           corrupt, NOT an invalid name -- same distinction cmd_cat_file.c
-           and cmd_show.c make for the identical -3 return. */
+        /* Phase 75: git's own wordings, measured against real git 2.55.0 --
+           see the "tag" row of the table in cli_args.c. class O names the
+           REF being created (git's own line does too), so `name` is
+           threaded through as the reporter's `detail`; class P is NOT the
+           standard "path does not exist" message here -- git answers with
+           its class-R wording instead ("Failed to resolve ... as a valid
+           ref."), which is why -2 is folded into the same branch as the
+           generic failure rather than getting its own. */
         if (prc == -3) {
-            fprintf(stderr, "sg: object '%s' not found or corrupt\n", rev_or_head);
-            return 1;
-        }
-        if (prc == -2) {
-            const char *colon = strchr(rev_or_head, ':');
-            char rev_part[SG_PATH_MAX];
-            size_t rev_len = colon != NULL ? (size_t)(colon - rev_or_head) : 0;
-
-            if (rev_len >= sizeof(rev_part))
-                rev_len = sizeof(rev_part) - 1;
-            memcpy(rev_part, rev_or_head, rev_len);
-            rev_part[rev_len] = '\0';
-            fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", bad_path, rev_part);
+            sg_cli_report_rev_error("tag", SG_REV_ERR_MISSING_OBJ, rev_or_head, name, 0);
             return 1;
         }
         if (prc != 0) {
             if (prc == -4)
                 sg_cli_report_ambiguous_oid(git_dir, rev_or_head, SG_REV_STRICT);
-            fprintf(stderr, "sg: cannot resolve '%s'\n", rev_or_head);
+            sg_cli_report_rev_error("tag", SG_REV_ERR_NOT_A_REV, rev_or_head, NULL, 0);
             return 1;
         }
     }

@@ -83,35 +83,25 @@ int sg_cmd_cat_file(int argc, char **argv)
     {
         char bad_path[SG_PATH_MAX];
         int resolve_rc;
+        /* -p and -t/-s disagree on the class-O wording (measured against
+           real git 2.55.0: -p says "Not a valid object name", identical to
+           class R; -t/-s say "git cat-file: could not get object info"
+           instead) -- see the phase75 table in cli_args.c, rows
+           "cat-file-p" and "cat-file-ts". */
+        const char *report_cmd = strcmp(mode, "-p") == 0 ? "cat-file-p" : "cat-file-ts";
 
         bad_path[0] = '\0';
         resolve_rc = sg_rev_parse_object(git_dir, hex_arg, id, &type, bad_path, sizeof(bad_path));
-        /* A well-formed id whose object cannot be read is missing or
-           corrupt, NOT an invalid name -- interop pins the wording,
-           because naming the wrong problem sends the reader to the
-           wrong place (a packed REF_DELTA with a vanished base). */
-        if (resolve_rc == -3) {
-            fprintf(stderr, "sg: object '%s' not found or corrupt\n", hex_arg);
-            free(git_dir);
-            return 1;
-        }
-        if (resolve_rc == -2) {
-            const char *colon = strchr(hex_arg, ':');
-            char rev[SG_PATH_MAX];
-            size_t rev_len = colon != NULL ? (size_t)(colon - hex_arg) : 0;
-
-            if (rev_len >= sizeof(rev))
-                rev_len = sizeof(rev) - 1;
-            memcpy(rev, hex_arg, rev_len);
-            rev[rev_len] = '\0';
-            fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", bad_path, rev);
-            free(git_dir);
-            return 1;
-        }
         if (resolve_rc != 0) {
             if (resolve_rc == -4)
                 sg_cli_report_ambiguous_oid(git_dir, hex_arg, SG_REV_STRICT);
-            fprintf(stderr, "sg: not a valid object name '%s'\n", hex_arg);
+            if (resolve_rc == -2) {
+                sg_cli_report_rev_error(report_cmd, SG_REV_ERR_MISSING_PATH, hex_arg, bad_path, 0);
+            } else if (resolve_rc == -3) {
+                sg_cli_report_rev_error(report_cmd, SG_REV_ERR_MISSING_OBJ, hex_arg, NULL, 0);
+            } else {
+                sg_cli_report_rev_error(report_cmd, SG_REV_ERR_NOT_A_REV, hex_arg, NULL, 0);
+            }
             free(git_dir);
             return 1;
         }

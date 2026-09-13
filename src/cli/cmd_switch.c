@@ -251,9 +251,13 @@ int sg_cmd_switch(int argc, char **argv)
         int prc = sg_rev_parse_commit(git_dir, branch_arg, target_commit_id);
 
         if (prc != 0) {
+            char bad_path[SG_PATH_MAX];
+            sg_rev_err_kind kind;
+
             if (prc == -4)
                 sg_cli_report_ambiguous_oid(git_dir, branch_arg, SG_REV_STRICT);
-            fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
+            kind = sg_cli_classify_rev_error(git_dir, branch_arg, bad_path, sizeof(bad_path));
+            sg_cli_report_rev_error("switch", kind, branch_arg, bad_path, 0);
             free(checkout_msg);
             free(old_branch);
             free(git_dir);
@@ -277,9 +281,14 @@ int sg_cmd_switch(int argc, char **argv)
                        "To point HEAD directly at it (detached HEAD), use sg switch --detach %s\n",
                        branch_arg, branch_arg);
             else {
+                char bad_path[SG_PATH_MAX];
+                sg_rev_err_kind kind;
+
                 if (prc == -4)
                     sg_cli_report_ambiguous_oid(git_dir, branch_arg, SG_REV_STRICT);
-                fprintf(stderr, "sg: invalid reference: %s\n", branch_arg);
+                kind = sg_cli_classify_rev_error(git_dir, branch_arg, bad_path,
+                                                 sizeof(bad_path));
+                sg_cli_report_rev_error("switch", kind, branch_arg, bad_path, 0);
             }
             free(checkout_msg);
             free(old_branch);

@@ -1032,7 +1032,23 @@ static int render_id(const char *git_dir, const char *display_arg,
 /* Resolves `arg` to an object id/type via the shared sg_rev_parse_object
    (see revparse.h for the exact grammar and order). Returns 0 with *id_out
    and *type_out filled in, -1 having already printed a diagnostic. */
-static int resolve_object(const char *git_dir, const char *arg,
+/* Phase 75: also the ambiguity check ("both a revision and an existing
+   working-tree path" -- class D, AMBIG-BOTH) that `sg log`/`sg diff` have
+   had since Phase 62 via sg_cli_split_revs_and_paths, but `sg show` never
+   did. Measured against real git 2.55.0: `git show <dual>` refuses with
+   the AMBIG-BOTH block rather than picking one reading, same as log/diff;
+   sg used to silently print the commit. See the "show" row of the phase75
+   table in cli_args.c for every other wording used here.
+   `is_default` is 1 when `arg` is this function's own internal "HEAD"
+   substitute for a bare `sg show` (no argument typed at all), not
+   something the user actually wrote -- the D check must only ever apply
+   to an argument the user typed (`sg log` already gets this right, it
+   only ever calls sg_cli_split_revs_and_paths over argv's own positional
+   list, never over a synthetic default). Measured: in a repo whose
+   working tree happens to contain a file named "HEAD", `git show` (no
+   args) still prints the commit; before this fix sg refused with a false
+   "ambiguous argument 'HEAD': both revision and filename". */
+static int resolve_object(const char *git_dir, const char *arg, int is_default,
                           unsigned char id_out[SG_SHA1_RAW_LEN], sg_obj_type *type_out)
 {
     char bad_path[SG_PATH_MAX];
@@ -1040,31 +1056,27 @@ static int resolve_object(const char *git_dir, const char *arg,
 
     bad_path[0] = '\0';
     rc = sg_rev_parse_object(git_dir, arg, id_out, type_out, bad_path, sizeof(bad_path));
-    if (rc == 0)
+    if (rc == 0) {
+        if (!is_default && sg_cli_arg_exists_in_worktree(arg)) {
+            sg_cli_report_rev_error("show", SG_REV_ERR_BOTH, arg, NULL, 0);
+            return -1;
+        }
         return 0;
-    /* A well-formed id whose object cannot be read is missing or corrupt,
-       NOT an invalid name -- interop pins this wording, because naming the
-       wrong problem sends the reader to the wrong place (the fixture is a
-       packed REF_DELTA whose base object is gone). */
-    if (rc == -3) {
-        fprintf(stderr, "sg: object '%s' not found or corrupt\n", arg);
+    }
+    if (rc == -4) {
+        sg_cli_report_ambiguous_oid(git_dir, arg, SG_REV_STRICT);
+        sg_cli_report_rev_error("show", SG_REV_ERR_NOT_A_REV, arg, NULL, 0);
         return -1;
     }
     if (rc == -2) {
-        const char *colon = strchr(arg, ':');
-        char rev[SG_PATH_MAX];
-        size_t rev_len = colon != NULL ? (size_t)(colon - arg) : 0;
-
-        if (rev_len >= sizeof(rev))
-            rev_len = sizeof(rev) - 1;
-        memcpy(rev, arg, rev_len);
-        rev[rev_len] = '\0';
-        fprintf(stderr, "sg: path '%s' does not exist in '%s'\n", bad_path, rev);
+        sg_cli_report_rev_error("show", SG_REV_ERR_MISSING_PATH, arg, bad_path, 0);
         return -1;
     }
-    if (rc == -4)
-        sg_cli_report_ambiguous_oid(git_dir, arg, SG_REV_STRICT);
-    fprintf(stderr, "sg: not a valid object name '%s'\n", arg);
+    if (rc == -3) {
+        sg_cli_report_rev_error("show", SG_REV_ERR_MISSING_OBJ, arg, NULL, 0);
+        return -1;
+    }
+    sg_cli_report_rev_error("show", SG_REV_ERR_NOT_A_REV, arg, NULL, 0);
     return -1;
 }
 
@@ -1074,6 +1086,7 @@ int sg_cmd_show(int argc, char **argv)
     show_flags flags;
     const char *objects[256];
     int object_count = 0;
+    int defaulted_head;
     int shown = 0;
     seen_ids seen;
     int rc = 0;
@@ -1181,20 +1194,35 @@ int sg_cmd_show(int argc, char **argv)
     if (git_dir == NULL)
         return 1;
 
-    if (object_count == 0)
+    defaulted_head = object_count == 0;
+    if (defaulted_head)
         objects[object_count++] = "HEAD";
 
-    for (i = 0; i < object_count; i++) {
-        unsigned char id[SG_SHA1_RAW_LEN];
-        sg_obj_type type;
+    /* Phase 75: validate every argument BEFORE printing anything. Measured
+       against real git 2.55.0: `git show HEAD nosuch` exits 128 with EMPTY
+       stdout -- git resolves the whole argument list up front. sg used to
+       resolve and render one argument at a time, so `sg show HEAD nosuch`
+       printed HEAD's commit to stdout and only then failed on the second
+       argument (exit 1, partial output). ids[]/types[] cache each
+       resolution's result so the render loop below does not re-resolve
+       (and cannot re-diagnose differently the second time around). */
+    {
+        unsigned char ids[256][SG_SHA1_RAW_LEN];
+        sg_obj_type types[256];
 
-        if (resolve_object(git_dir, objects[i], id, &type) != 0) {
-            rc = 1;
-            break;
+        for (i = 0; i < object_count; i++) {
+            if (resolve_object(git_dir, objects[i], defaulted_head && i == 0, ids[i], &types[i]) != 0) {
+                seen_ids_free(&seen);
+                free(git_dir);
+                return 1;
+            }
         }
-        if (render_id(git_dir, objects[i], id, &flags, 0, 0, &shown, &seen) != 0) {
-            rc = 1;
-            break;
+
+        for (i = 0; i < object_count; i++) {
+            if (render_id(git_dir, objects[i], ids[i], &flags, 0, 0, &shown, &seen) != 0) {
+                rc = 1;
+                break;
+            }
         }
     }
 

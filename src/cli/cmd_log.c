@@ -408,9 +408,16 @@ int sg_cmd_log(int argc, char **argv)
         int prc = sg_rev_parse_commit_ex(git_dir, rev, SG_REV_COMMITTISH, id);
 
         if (prc != 0) {
-            if (prc == -4)
+            char bad_path[SG_PATH_MAX];
+
+            if (prc == -4) {
                 sg_cli_report_ambiguous_oid(git_dir, rev, SG_REV_COMMITTISH);
-            fprintf(stderr, "sg: not a valid revision '%s'\n", rev);
+                sg_cli_report_rev_error("log", SG_REV_ERR_NOT_A_REV, rev, NULL, dashdash >= 0);
+            } else {
+                sg_cli_report_rev_error("log",
+                                        sg_cli_classify_rev_error(git_dir, rev, bad_path, sizeof(bad_path)),
+                                        rev, bad_path, dashdash >= 0);
+            }
             sg_pathspec_free(&pathspec);
             free(git_dir);
             return 1;

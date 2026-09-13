@@ -305,9 +305,15 @@ static void test_round5_leap_second_boundary(void)
 
 /* SPEC-CORRECTION.md section "the scope line", case 3: sg MAY reject what
    git accepts, provided it is loud (exit 1) and pinned. Deliberately NOT
-   implemented -- no fractional seconds, no named time zones, no extra
-   internal whitespace before an ISO offset, no tolerance for trailing
-   garbage after an otherwise-complete RFC2822 date, no RFC2822
+   implemented -- no fractional seconds, no named time zones OTHER THAN the
+   Phase 75a UTC spellings (Z/UTC/GMT -- see test_phase75a_utc_zone_names
+   below; "Wed, 15 Nov 2023 06:13:20 GMT" used to be pinned right here as a
+   rejection and is now one of that function's accepted rows instead, moved
+   rather than duplicated), no extra internal whitespace before an ISO
+   offset (this one is UNCHANGED by Phase 75a: "T...HH:MM:SS Z", offset
+   token preceded by a space in the strict ISO-T form, stays refused --
+   see test_phase75a_utc_zone_names's own note on why), no tolerance for
+   trailing garbage after an otherwise-complete RFC2822 date, no RFC2822
    two-digit-year century inference, and (round 5) no reinterpretation of
    an out-of-range calendar offset as local time (which also covers the
    2099-12-31T23:59:60 leap-second divergence -- see
@@ -319,7 +325,6 @@ static void test_2_3_correction_deliberately_rejected(void)
 {
     expect_fail("2023-11-15T06:13:20.123+08:00");
     expect_fail("2023-11-15T06:13:20 +08:00");
-    expect_fail("Wed, 15 Nov 2023 06:13:20 GMT");
     expect_fail("Wed, 15 Nov 2023 06:13:20 +0800 extra garbage");
     /* Round 4, fifth deliberate rejection: RFC2822 two-digit years. git
        infers the century ("70" -> 1970, "04" -> 2004, "99" -> 1999, all
@@ -517,6 +522,147 @@ static void test_invalid_date_reports_bad_value(void)
     unsetenv("GIT_AUTHOR_DATE");
 }
 
+/* Phase 75a: the UTC-only zone-NAME spellings, measured against real git
+   2.55.0 -- see docs/phase75a-spec.md and docs/RULES-date.md's own
+   phase75a table for the full oracle. Motivated by tests/fuzz_diff.py and
+   tests/fuzz_rename.py, which set GIT_AUTHOR_DATE=...Z and had been dying
+   in their own fixture setup, unrun, since Phase 72. Every row here is one
+   the fuzzers' own value or a shape from the same measured table -- not
+   re-derived. */
+static void test_phase75a_utc_zone_names(void)
+{
+    /* In scope: Z/UTC/GMT, case-insensitive, in every form where sg
+       already recognizes an offset token. */
+    expect_ok("2026-01-01T00:00:00Z", 1767225600, "+0000");
+    expect_ok("2026-01-01T00:00:00z", 1767225600, "+0000");
+    expect_ok("2026-01-01 00:00:00Z", 1767225600, "+0000");
+    expect_ok("Thu, 1 Jan 2026 00:00:00Z", 1767225600, "+0000");
+    expect_ok("1767225600 Z", 1767225600, "+0000");
+    expect_ok("1767225600Z", 1767225600, "+0000");
+    expect_ok("@1767225600 Z", 1767225600, "+0000");
+    expect_ok("@1767225600Z", 1767225600, "+0000");
+    expect_ok("1767225600 UTC", 1767225600, "+0000");
+    expect_ok("1767225600 utc", 1767225600, "+0000");
+    expect_ok("1767225600 Utc", 1767225600, "+0000");
+    expect_ok("1767225600 GMT", 1767225600, "+0000");
+    expect_ok("1767225600 gmt", 1767225600, "+0000");
+    /* Moved here from test_2_3_correction_deliberately_rejected, where it
+       used to be pinned as a refusal (see that function's own updated
+       comment). */
+    expect_ok("Wed, 15 Nov 2023 06:13:20 GMT", 1700028800, "+0000");
+
+    /* WARNING: "2026-01-01T00:00:00 Z" (a SPACE between the seconds and
+       the zone name, strict ISO-T form) is deliberately NOT implemented,
+       even though it is in scope by the letter of "every form" above and
+       measured (git accepts it as +0000) -- it collides head-on with a
+       PRE-EXISTING, already-pinned deliberate rejection one function up
+       ("no extra internal whitespace before an ISO offset",
+       expect_fail("2023-11-15T06:13:20 +08:00")): the strict ISO-T
+       grammar has never tolerated ANY offset token, digit or name,
+       preceded by a space, and this phase does not carve out an exception
+       for names only. Pinned here as a refusal, and pinned again in
+       interop's phase75a group as a head-on git-accepts/sg-refuses pair,
+       same shape as every other entry in that older deliberate-rejection
+       list. */
+    expect_fail("2026-01-01T00:00:00 Z");
+
+    /* Out of scope, pinned so a future change does not "converge" these
+       by accident. Every other zone name git implements: sg still has no
+       table for it, so EST-shaped input falls through to the ordinary
+       "unrecognized trailing content after a space is tolerated as junk"
+       rule and resolves to LOCAL time, exactly as before this phase. */
+    /* TZ is pinned for this one, the way every other local-offset-sensitive
+       test in this file already pins it, and for a reason a cold read had
+       to reproduce before anyone believed it: epoch 1767225600 is
+       2026-01-01 00:00:00 UTC, i.e. winter, so on a machine whose own zone
+       IS US Eastern the local offset really is -0500 -- the exact string
+       this assertion demands NOT be echoed back. The first version of this
+       line left TZ alone and failed on demand under
+       `TZ=America/New_York ./build/tests/test_ident`, while passing on CI
+       (UTC) and on the author's machine. A contributor in New York would
+       have read it as a real regression. */
+    {
+        char *saved_tz = getenv("TZ");
+        char *saved_copy = saved_tz != NULL ? strdup(saved_tz) : NULL;
+
+        setenv("TZ", "Asia/Taipei", 1);
+        tzset();
+        expect_ok_local_time("1767225600 EST", 1767225600, "-0500");
+        /* Names git accepts but itself resolves to local: unaffected,
+           still local here too. Each one names the offset it must NOT
+           echo back, so a broken whole-word boundary (Z matching inside
+           ZULU, UTC inside UTC1) turns them red -- passing NULL here, as
+           the first version did, made all of them inspect nothing but the
+           timestamp, which the offset never feeds. */
+        expect_ok_local_time("1767225600 ZULU", 1767225600, "+0000");
+        expect_ok_local_time("1767225600 UTC1", 1767225600, "+0000");
+        expect_ok_local_time("1767225600 GMT0", 1767225600, "+0000");
+    /* Trailing junk glued onto a recognized name: git ignores it (or
+       falls back to local); sg keeps REFUSING rather than guess -- a
+       refusal can never write a wrong object id (rule 3 of the scope
+       line). Attached (no space): a hard parse failure, same rule as
+       every other attached-and-unrecognized case in this file. */
+    expect_fail("1767225600ZZ");
+    expect_fail("1767225600Zx");
+    expect_fail("1767225600UTC+1");
+    /* Preceded by whitespace: tolerated as a single token of junk,
+       falling back to local -- the SAME pre-existing rule
+       test_2_4_whitespace_and_trailing_junk already pins for a numeric
+       token ("@1700000000 x"), now confirmed to also cover a
+       name-shaped one. "Z followed by more bytes must never silently
+       read as Z" -- these still fall back to local, not to +0000. */
+        expect_ok_local_time("1767225600 ZZ", 1767225600, "+0000");
+        expect_ok_local_time("1767225600 Zx", 1767225600, "+0000");
+        expect_ok_local_time("1767225600 UTC+1", 1767225600, "+0000");
+        expect_ok_local_time("1767225600 GMT+0", 1767225600, "+0000");
+        expect_ok_local_time("1767225600 Z+1", 1767225600, "+0000");
+
+        if (saved_copy != NULL) {
+            setenv("TZ", saved_copy, 1);
+            free(saved_copy);
+        } else {
+            unsetenv("TZ");
+        }
+        tzset();
+    }
+
+    /* Attached (no space) UTC and GMT, measured after a cold read pointed
+       out that only attached `Z` had ever been: the shared matcher accepts
+       all three names in every form, so these were live and untested.
+       Measured against git 2.55.0 under TZ=Asia/Taipei (local +0800, so
+       +0000 proves the NAME was parsed): all ten spellings agree with git. */
+    expect_ok("1767225600UTC", 1767225600, "+0000");
+    expect_ok("1767225600GMT", 1767225600, "+0000");
+    expect_ok("@1767225600UTC", 1767225600, "+0000");
+    expect_ok("1767225600utc", 1767225600, "+0000");
+    expect_ok("2026-01-01T00:00:00UTC", 1767225600, "+0000");
+    expect_ok("2026-01-01T00:00:00GMT", 1767225600, "+0000");
+    expect_ok("2026-01-01T00:00:00gmt", 1767225600, "+0000");
+    expect_ok("2026-01-01 00:00:00UTC", 1767225600, "+0000");
+    expect_ok("Thu, 1 Jan 2026 00:00:00UTC", 1767225600, "+0000");
+    expect_ok("Thu, 1 Jan 2026 00:00:00GMT", 1767225600, "+0000");
+
+    /* REGRESSION PIN. The attached-zone-name branch above must FALL
+       THROUGH when the attached content is not a zone name, not fail:
+       this row is accepted by git (measured, 1767230000 +0500) and was
+       accepted identically by sg BEFORE Phase 75a -- sscanf's "%n" stops
+       at the junk and the offset comes from the next token. Phase 75a's
+       first version returned -1 there and silently took this agreement
+       away; a cold read found it, and every one of the phase's own new
+       rows used shapes where the attached content IS a zone name, so
+       nothing else here would have caught it. */
+    expect_ok("Thu, 1 Jan 2026 06:13:20foo +0500", 1767230000, "+0500");
+    /* ...and the shapes around it that sg refuses, pinned so the fall-
+       through cannot quietly widen either: junk with no following offset
+       token at all, a name with junk glued to it (the whole-word rule),
+       and junk as its own space-separated token. All three were refusals
+       before Phase 75a too -- measured on master -- and git accepts all
+       three, a pre-existing divergence this phase does not change. */
+    expect_fail("Thu, 1 Jan 2026 06:13:20foo");
+    expect_fail("Thu, 1 Jan 2026 06:13:20Zfoo");
+    expect_fail("Thu, 1 Jan 2026 06:13:20 foo +0500");
+}
+
 int main(void)
 {
     test_2_2_accepted_and_rejected_forms();
@@ -534,6 +680,7 @@ int main(void)
     test_local_offset_is_the_instants();
     test_author_committer_independent_fallback();
     test_invalid_date_reports_bad_value();
+    test_phase75a_utc_zone_names();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

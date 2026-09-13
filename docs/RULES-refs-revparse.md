@@ -207,6 +207,21 @@ do not read the whole thing).
   both, rather than inventing an asymmetry between its own two spellings.
   It is not on the deliberate-divergence list (reaching it takes deleting a
   log file by hand); see Phase 48 of `docs/DESIGN.md`.
+
+  WARNING: **this rule governs revision RESOLUTION only, and as of Phase 75
+  `sg reflog`'s LISTING deliberately goes the other way** -- it reproduces
+  git's asymmetry rather than rejecting uniformly: with the current branch's
+  log file deleted, `sg reflog @{0}` exits 0 printing nothing and
+  `sg reflog @{1}` says `log for refs/heads/<branch> is empty`, while the
+  spelled-out `sg reflog <branch>@{0}` still refuses. So in that one state
+  `sg log @{0}` refuses where `sg reflog @{0}` succeeds, and that is
+  intentional: here the fallback decides which COMMIT a revision means and
+  git's answer drags in branch-tip semantics this project does not want,
+  whereas for the listing git's answer is only what to print and costs
+  nothing to match. Do not "unify" the two layers on the strength of either
+  rule alone -- each is pinned at its own answer (interop's `phase75 round6`
+  group for the listing), and Phase 75's own section of `docs/DESIGN.md`
+  records the measurement for both.
   **Abbreviated (prefix) object ids are supported as of Phase 68** -- this
   line used to say they deliberately were not; it is gone rather than marked
   "fixed", the same convention this project uses for every closed gap. The
