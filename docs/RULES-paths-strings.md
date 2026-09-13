@@ -130,3 +130,19 @@ do not read the whole thing).
   theirs label fails to allocate. It predates this phase (the hand-rolled
   version leaked identically) and is reachable only under OOM; recorded in
   `docs/DESIGN.md` rather than fixed inside a phase about a different bug.
+
+- **Phase 75's revision-error reporter is a deliberate exception to this
+  file's default quoting rule.** `sg_cli_report_rev_error`
+  (`cli/cli_args.c`) embeds arguments RAW inside `'...'`, never through
+  `sg_quote_path_delimited` (which always C-quotes and always emits
+  `"..."`) -- measured against real git 2.55.0: a tab, a space, a double
+  quote, a backslash, and a UTF-8 byte all pass through an argument
+  UNMODIFIED in git's own `fatal: ...`/hint lines. The oracle here is
+  git's own line, not this project's usual "quote anything embedded in a
+  sentence" convention. It DOES still sanitize control bytes (every byte
+  0x01-0x08/0x0b-0x1f/0x7f becomes `?`; tab/newline/space/>=0x80 pass
+  through raw, matching git's `vreportf`), just not through the C-quoting
+  path -- see the reporter's own header comment and `docs/DESIGN.md`'s
+  Phase 75 section. Do not "fix" this call site to use
+  `sg_quote_path_delimited` for consistency with the rest of this file;
+  that would produce a wording git itself does not use.

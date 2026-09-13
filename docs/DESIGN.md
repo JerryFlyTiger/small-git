@@ -16490,3 +16490,826 @@ the two `case2p` rows red (`sg tag` and `sg branch` both stopped seeing the
 nested ref) while `case2o` (the leaf lock file case) and every other row
 stayed green -- proving the fix's file/directory distinction is what
 `case2p` actually exercises, not incidental to some other change.
+
+## Phase 75: the "this revision does not resolve" message matrix
+
+**Premise correction, measured before writing any code**: the plan recorded
+in the project notes was "sg has four wordings for this, converge them into
+one". Measured against real git 2.55.0 (`LC_ALL=C`, argv passed directly, no
+shell): git itself uses at least ten different wordings for "this argument
+does not resolve to anything", but each is STABLE per (command, input
+class). Converging sg onto one sentence would move sg AWAY from git. The
+actual job is per-command alignment to git's own sentence, not convergence
+onto sg's own.
+
+**Input classes** (same four used throughout, plus a fifth that reuses
+existing machinery): R (neither a revision nor a path), O (well-formed
+40-hex id, object absent), P (`<rev>:<path>`, rev resolves, path does not),
+D (both a valid revision AND an existing working-tree path), and S (a short
+id matching more than one object -- sg already reproduces git's
+`error:`/`hint:` block byte for byte; only the trailing line differs, and it
+is the class-R line for the calling command).
+
+**Design**: one reporter, `sg_cli_report_rev_error` (`src/cli/cli_args.c`,
+declared in `include/sg/cli_args.h`), keyed by an array of structs
+(`REV_ERR_TABLE`) indexed by command name via a linear search
+(`find_rev_err_row`) -- a missing command is a missing row, not a silently
+inherited default (an unrecognized name hits `assert(row != NULL)` and
+falls back to a pinned generic wording in a release build). A companion
+classifier, `sg_cli_classify_rev_error`, does its own (separate)
+`sg_rev_parse_object` call purely to decide which of R/O/P applies --
+`sg_rev_parse_object`'s existing -2/-3 return codes ARE the O/P
+distinction, already built for `cmd_cat_file.c`/`cmd_show.c`/`cmd_tag.c`;
+this phase's only new piece is exposing that classification to every OTHER
+caller too, instead of re-deriving it ad hoc at each call site.
+
+The control-byte sanitizer (git's `vreportf`: every byte 0x01-0x08,
+0x0b-0x1f, and 0x7f becomes '?'; tab, newline, space, and every byte >=
+0x80 pass through raw) takes an EXPLICIT caller-owned buffer, not a static
+one -- `"path '%s' does not exist in '%s'"` embeds two independently-
+sanitized arguments in one fprintf, and a single shared buffer would alias
+them. Proven with a directed mutation (see Verification below).
+
+**The per-command table** (git's exact wording; `sg: ` replaces `fatal: `;
+the two hint lines keep no prefix; `<command>` in the hint's third line is
+a LITERAL string in git's own line too, never substituted with the actual
+subcommand name):
+
+| command | class R | class O | class P | class D |
+|---|---|---|---|---|
+| `tag <name> <rev>` | `Failed to resolve 'X' as a valid ref.` | `trying to write ref 'refs/tags/<name>' with nonexistent object X` | same as R (NOT a path message) | no check, exits 0 |
+| `show` | AMBIG-UNKNOWN | `bad object X` | `path 'p' does not exist in 'r'` | AMBIG-BOTH |
+| `cat-file -p` | `Not a valid object name X` (no quotes) | same as R | `path 'p' does not exist in 'r'` | no check |
+| `cat-file -t`/`-s` | `Not a valid object name X` | `git cat-file: could not get object info` (no argument named at all) | `path 'p' does not exist in 'r'` | no check |
+| `log` | AMBIG-UNKNOWN | `bad object X` | `path 'p' does not exist in 'r'` | AMBIG-BOTH |
+| `diff` | AMBIG-UNKNOWN | `bad object X` | `path 'p' does not exist in 'r'` | AMBIG-BOTH |
+| `reset` (`--soft`/`--mixed`/`--hard`) | AMBIG-UNKNOWN | `Could not parse object 'X'.` | `path 'p' does not exist in 'r'` | AMBIG-BOTH |
+| `reflog [show]` | AMBIG-UNKNOWN | `bad object X` | `path 'p' does not exist in 'r'` | AMBIG-BOTH |
+| `merge-base` | `Not a valid object name X` | `Not a valid commit name X` | same as R | no check |
+| `cherry-pick`/`revert` | `bad revision 'X'` | `bad object X` | same as R | no check |
+| `rebase <upstream>` | `invalid upstream 'X'` (same text for all three classes -- no per-class table row needed, just a direct wording fix in `cmd_rebase.c`) | | | no check |
+
+AMBIG-UNKNOWN is the three-line block ending `... : unknown revision or
+path not in the working tree.` + the two hint lines; AMBIG-BOTH is
+identical except the first line ends `... : both revision and filename`
+(no trailing period).
+
+With a `--` separator present, `log`/`diff`/`reset` (the only three whose
+grammar reaches this: `show`/`reflog`/`cherry-pick` reject a trailing `--`
+outright today as a usage error, see Out of scope below) change wording:
+R becomes `bad revision 'X'` (`reset`: `Failed to resolve 'X' as a valid
+revision.`); O is UNCHANGED from the no-`--` row (measured, including
+`reset`'s O-with-`--` cell, which was the one blank spot in the original
+spec -- confirmed identical to the no-`--` line for all three modes); and
+class P COLLAPSES into the dashdash-R wording using the WHOLE argument
+(`log HEAD:nosuchfile --` -> `bad revision 'HEAD:nosuchfile'`, not a path
+message at all).
+
+**Behavior changes, not just wording** (the important half, all three the
+dangerous direction: sg used to act where git refuses):
+
+1. `sg reset [--soft|--mixed|--hard] <dual>` used to perform the reset
+   (exit 0) where git refuses with AMBIG-BOTH -- with `--hard` this
+   overwrote the working tree on an argument git considers ambiguous.
+   Checked only when `--` was NOT given (`saw_dashdash` forces the
+   revision reading unambiguously, matching `git reset dual --`, exit 0
+   on both sides).
+2. `sg show <dual>` used to print the commit where git refuses.
+3. `sg reflog <dual>` used to print the log where git refuses -- checked
+   AFTER the ref itself resolves successfully (a dual name's ref side
+   always resolves fine; the ambiguity is with the working-tree path, not
+   with resolution failure).
+4. `sg show HEAD nosuch` used to print HEAD's commit to stdout and only
+   THEN fail on the second argument (exit 1, partial output). git
+   validates every argument before printing anything (measured: exit 128,
+   empty stdout). `sg_cmd_show` now resolves every argument into a cached
+   `ids[]`/`types[]` array in a first pass, printing nothing until every
+   argument has been proven to resolve.
+5. `sg reset --soft|--hard <path>` (a plain existing path, not also a
+   revision) used to try to resolve it as a revision and fail with a
+   generic error. git has a dedicated refusal: `Cannot do soft/hard reset
+   with paths.` -- implemented for `--soft`/`--hard`; `--mixed` is left as
+   a functional gap (git performs a path-limited reset there; sg has no
+   pathspec support for `reset` without `--` at all, see Out of scope).
+
+**Out of scope** (recorded, not fixed -- functional gaps, not wording):
+- `sg branch <name> <start-point>` (not supported, prints usage).
+- `sg restore --source <rev> <path>` (`--source` not recognized).
+- `sg show|reflog|reset <path>` / `sg show -- <path>` (git treats a path
+  argument as a pathspec and exits 0; sg has no pathspec support in these
+  three commands at all without `--`, except reset's dedicated refusal
+  above).
+- `sg cat-file -e` (unsupported, prints usage).
+- `sg show|reflog|cherry-pick <rev> --` (a trailing `--` with nothing
+  after it is rejected as a usage error by all three; git accepts it).
+  This is why those three commands' with-`--` table rows are unreachable
+  in sg today and have no interop pin on sg's side.
+- `sg log 'a\b'` still exits 0 where git exits 128 (Phase 70b, unchanged;
+  `sg_pathspec_looks_like_spec` counts `\` as a wildcard) -- class-R
+  fixtures in this phase's interop checks deliberately avoid a backslash.
+- git's control-byte sanitization is process-wide (`vreportf`); sg's is
+  scoped to this one reporter. Every other sg message still prints raw
+  control bytes.
+
+**`docs/RULES-paths-strings.md` departure, recorded there too**: these
+messages embed the argument RAW inside `'...'` (measured: a tab, a space,
+a double quote, a backslash, and a UTF-8 byte all pass through
+unmodified), never through `sg_quote_path_delimited` (which always
+C-quotes) -- the oracle here is git's own line, not this project's usual
+path-quoting convention.
+
+**Divergence #8 removed**: `sg tag <name> <unresolvable-rev>`'s wording
+mismatch (CLAUDE.md's old entry 8) is fixed by this phase -- `cmd_tag.c`
+now reports git's own `Failed to resolve 'X' as a valid ref.` instead of
+its former `cannot resolve 'X'`. The "wider finding" that entry also
+recorded (four wordings across eight call sites, none of them a git-
+compatibility requirement, all mutually inconsistent) is what this WHOLE
+phase resolves, per-command, against git's own answer rather than against
+each other.
+
+**Verification**:
+- `tests/test_cli_rev_err.c` (new): the AMBIG-UNKNOWN/AMBIG-BOTH block
+  shapes, `cat-file-p`/`cat-file-ts` diverging on class O, `tag`'s O
+  wording taking (detail, arg) in that order, `reset`'s dashdash P->R
+  collapse, `merge-base`'s P-uses-R oddity, the sanitizer's byte rules,
+  and `sg_cli_classify_rev_error` against a real fixture repo (R/O/P all
+  three). Mutation-verified: reverting the AMBIG-BOTH line's missing
+  trailing period turns `test_ambig_both_block` red; aliasing the two
+  sanitize buffers in the class-P branch (simulating the exact "single
+  static buffer" bug the header comment warns against) turns
+  `test_sanitizer_is_reentrant_across_two_embedded_args` red.
+- `tests/interop.sh` group `phase75`: one named check per (command,
+  class) cell from the table above (both the no-`--` and with-`--`
+  rows), plus the `show` validate-all-first behavior change (both "first
+  argument still works" and "a later argument's ambiguity is also caught
+  before printing"), plus `reset`'s dedicated path refusal for
+  `--soft`/`--hard` and the `reset dual --` positive control. Full run:
+  `interop: 4117/4117 passed, 0 skipped` (up from 4008 before this phase).
+- Three pre-existing interop checks pinned wordings this phase changes,
+  rewritten rather than deleted: the REF_DELTA-with-missing-base
+  fixture's expected line (was sg's own invented "not found or corrupt";
+  measured against real git on the IDENTICAL fixture, git says exactly
+  the same "Not a valid object name X" it says for a plain absent object
+  -- git does not distinguish "never had a packfile entry" from "entry
+  present, content unresolvable" in its own wording either, so sg's new
+  answer is not just changed, it is MORE correct); `phase28`'s D-class
+  check (`sg diff --name-only a.txt` where `a.txt` is both a branch and a
+  file), rewritten from the old one-line wording to the new AMBIG-BOTH
+  first line; and `phase73 case1i`, which used to pin `sg tag`'s old
+  wording as a NAMED deliberate divergence -- rewritten to assert the new
+  git-aligned wording instead, since the divergence it recorded no longer
+  exists.
+
+### Phase 75 review round: four defects found by a cold read
+
+A cold read of the phase (before any interop check had actually been run
+against these specific shapes) found four real defects, all fixed in the
+same round:
+
+1. **`cmd_reflog.c` swallowed the class-S (ambiguous short id) case.**
+   Every other converted call site special-cases `prc == -4` and calls
+   `sg_cli_report_ambiguous_oid` BEFORE `sg_cli_classify_rev_error`
+   (`sg_cli_classify_rev_error`'s own header comment documents this as the
+   caller's job -- it folds -1 and -4 into the same `SG_REV_ERR_NOT_A_REV`
+   and cannot tell them apart). `cmd_reflog.c` called `classify()` directly
+   on `sg_rev_parse_ref_path`'s failure without probing for -4 first, so a
+   4-hex prefix shared by two objects lost git's `error:`/`hint:` block
+   entirely (measured: `git reflog 59b7` on a repo with two blobs sharing
+   that prefix prints the block then `fatal: ambiguous argument
+   '59b7': ...`, `sg reflog 59b7` printed only the three AMBIG-UNKNOWN
+   lines). Fixed by probing `sg_rev_parse_object` directly (the same call
+   `classify()` makes internally) before falling through to `classify()`,
+   matching the pattern every sibling call site already uses.
+2. **The same probe exposed a second, previously-unreachable bug**: `sg
+   reflog HEAD~1` made a FALSE claim. `sg_rev_parse_ref_path` has no
+   `~N`/`^N` support, so `HEAD~1` fails to resolve as a ref; the old code
+   then reported the class-R AMBIG-UNKNOWN block ("unknown revision or
+   path not in the working tree") about a revision that resolves
+   perfectly well as a commit. Measured: `git reflog HEAD~1` exits 0 with
+   EMPTY output (the resolved commit simply has no reflog of its own);
+   `git reflog HEAD~99` (out of range) still exits 128 with the
+   AMBIG-UNKNOWN block, so "print nothing for anything unresolvable"
+   would be wrong too -- the fix has to distinguish the two. Implemented:
+   when `sg_rev_parse_ref_path` fails, `sg_rev_parse_object` is tried;
+   `rc == 0` (fully resolves, just not as a ref -- e.g. `HEAD~1`) prints
+   nothing and exits 0; `rc == -4` reports the ambiguity block (item 1);
+   anything else classifies normally (R keeps the AMBIG-UNKNOWN block, O/P
+   keep their existing wordings, unchanged from before this round -- only
+   the R-for-a-resolvable-revision case was ever wrong). `HEAD~99` is
+   pinned as the control in `tests/interop.sh`'s `phase75` group.
+3. **The class-D check fired on the commands' own internal "HEAD"
+   default**, not just on an argument the user typed. `cmd_show.c`,
+   `cmd_reset.c`, and `cmd_reflog.c` each substitute the literal string
+   `"HEAD"` when no revision argument is given, and did so BEFORE the
+   `sg_cli_arg_exists_in_worktree` ambiguity check ran over it. In a
+   repository whose working tree happens to contain an untracked file
+   named `HEAD`, all three refused with a false "ambiguous argument
+   'HEAD': both revision and filename" on a bare invocation (`sg show`,
+   `sg reset`, `sg reflog`), while `git show`/`git reset`/`git reflog`
+   (no args) all still succeed. `sg log` was never affected -- its split
+   (`sg_cli_split_revs_and_paths`) only ever runs over argv's own
+   positional list, never over a synthetic default, which is the pattern
+   the fix generalizes: `resolve_object` (`cmd_show.c`) now takes an
+   explicit `is_default` flag skipped only for its own internal "HEAD"
+   slot; `cmd_reset.c` and `cmd_reflog.c` each gained a `rev_arg_typed`/
+   `ref_arg_typed` boolean recorded before the `NULL -> "HEAD"`
+   substitution, guarding the same check. Pinned on both sides in
+   `tests/interop.sh`'s `phase75` group, one fresh fixture directory per
+   command (`reset --hard`-adjacent commands mutate the repo, so reusing
+   one directory across the three would leak state between them).
+4. **Interop coverage gaps against the phase's own test plan**: `revert`
+   only had its class-R cell checked even though `cmd_revert.c` shares
+   `pick.c` with `cmd_cherry_pick.c` (which had all three) -- "shares a
+   function" is not "shares a test", the two are still independent call
+   sites with independent chances to regress. Added `revert O`/`revert P`
+   with the same wordings cherry-pick already pins. Also, the
+   `merge-base` group's own comment claimed both argument POSITIONS give
+   the same wording, but every existing case put the bad argument first
+   -- added the position-2 triple (`merge-base HEAD <bad>`) to actually
+   verify the claim the comment was making.
+
+**Two additional findings recorded, not fixed** (this round's own scope
+was defects, not hardening):
+- `src/cli/cli_args.c`: `char bad_path[4096]` in
+  `sg_cli_split_revs_and_paths` converged onto `SG_PATH_MAX`
+  (`docs/RULES-duplication.md`'s standing rule against a bare `4096`
+  reappearing). `SG_REV_ERR_ARG_MAX` was deliberately left as its OWN
+  named constant, not converged onto `SG_PATH_MAX`: it bounds a
+  sanitized COPY of an arbitrary revision argument (sized to match git's
+  own `vreportf` message buffer, see the long-argument-truncation note
+  below), not a filesystem path -- the two concepts happening to share
+  the number 4096 is not a reason to share the same name.
+  `sanitize_rev_err_arg` also wrote `buf[0]` unconditionally after its
+  loop (a one-byte overflow if ever called with `buflen == 0`); no call
+  site can reach this today, but the function now returns immediately on
+  `buflen == 0` rather than leaving it as an implicit invariant.
+- The `"cat-file-ts"` row's O string (`"sg cat-file: could not get object
+  info"`) contains no `%s` at all, so its `o_literal` flag is
+  UNOBSERVABLE for that row: both branches of the flag print
+  byte-identical output. This is the "mathematically unobservable" bucket
+  of this project's three-way mutation classification (see CLAUDE.md's
+  Testing conventions), not a coverage gap -- recorded so a future audit
+  does not go hunting for a test that cannot exist.
+- **Long-argument truncation, measured**: git formats its whole message
+  into a fixed 4096-byte buffer and truncates there -- a 4100-byte bogus
+  revision produces exactly 4096 bytes of git stderr. sg instead
+  truncates the ARGUMENT itself at `SG_REV_ERR_ARG_MAX - 1` (4095) bytes
+  and then builds the rest of the message around it, producing 4124
+  bytes of stderr for the same input. The two diverge for an argument of
+  roughly 4060 bytes or more. Byte equality is not achievable in that
+  regime regardless of where either side truncates, because the two
+  tools' prefixes are different lengths (`fatal: ` is 7 bytes, `sg: ` is
+  4) -- the surviving text is offset by three bytes no matter what.
+  Recorded as a known, permanent divergence in this narrow regime rather
+  than "fixed", since there is no truncation point that produces
+  agreement.
+- `src/cli/cmd_reset.c`'s class-D block deliberately excludes `prc == -4`
+  (an ambiguous short id), so an argument that is BOTH an existing path
+  AND an ambiguous short id reports only the ambiguity, never the path
+  collision. This is the existing, narrower behavior from the phase's
+  first round, carried forward unchanged -- recorded here rather than
+  given a second branch, since real git's own precedence for this
+  doubly-degenerate input was never measured.
+
+### Phase 75, main-conversation verification: one cell the phase missed, and one check of mine that verified nothing
+
+Three things came out of verifying this phase rather than writing it, and
+each is a different kind of hole.
+
+**An independent differential checker found a cell nobody had tested.**
+Before dispatching the work, the same oracle used to write the spec was
+turned into a standalone checker (142 cells: 6 input classes x every
+command with a revision argument, plus the `--`-present, class-D and
+control-byte rows). Its expectation is derived from git's own stderr, put
+through the phase's translation rules -- it reads neither sg's source nor
+`tests/interop.sh`, so a wrong target string in sg cannot make it agree
+with itself. Baseline before the phase: **16/142** cells aligned. After
+the phase's own work: **135/142**, with one genuine MISMATCH the phase had
+silently skipped -- `sg switch --detach <40-hex-with-no-object>` still said
+`invalid reference:` where git says `unable to read tree (<hex>)`.
+`src/cli/cmd_switch.c` had never been touched, and the phase's report did
+not mention switch at all. Fixed here (a `"switch"` row in `REV_ERR_TABLE`
+plus both `cmd_switch.c` call sites), taking the checker to **136/142**
+with the remaining six all named out-of-scope functional gaps.
+Also measured while fixing it: `git restore --source <same hex>` and
+`git checkout <same hex>` print the identical `unable to read tree` line,
+which is why the row's comment names the tree read rather than switch.
+
+Two directed mutations, both run, with disjoint red sets -- this is what
+tells "the cell is pinned" apart from "something in the area is pinned":
+reverting the O wording to the old `invalid reference: %s` turns exactly
+the two `switch O` checks red; making the R column *also* say
+`unable to read tree` (the over-broad direction) turns exactly the three
+`switch R`/`switch P` checks red.
+
+**A check of mine looked like coverage and had none.** The phase's
+`reset D` check only greps the message, which cannot distinguish "refused"
+from "reset the index and then complained", so a side-effect check was
+added: HEAD unchanged, working file unchanged. Its first fixture dirtied
+the tracked file -- and with the entire class-D guard deleted, all three
+new checks stayed **green**, because `sg_safe_apply_tree`'s own
+dirty-worktree confirmation refused the reset for a completely unrelated
+reason. Same outcome, different reason, zero discriminating power (see
+CLAUDE.md's three reasons a mutation can stay green -- this is none of
+them, it is the fixture answering a different question). Rebuilt with a
+clean working tree, where a reset that went through would visibly move
+HEAD and rewrite the file: the same mutation now turns all three red. The
+fixture carries a WARNING saying so, because the broken version looks more
+thorough than the working one.
+
+**The phase could not run one of its own gates, for a reason older than
+the phase.** `tests/fuzz_diff.py` and `tests/fuzz_rename.py` both set
+`GIT_AUTHOR_DATE=2026-01-01T00:00:00Z`, and sg rejects that value
+(`sg: invalid date format: 2026-01-01T00:00:00Z`), so both die in their own
+fixture setup on the first round. Reproduced on a clean worktree of
+`master` at `8cb61ff`, so it is not this phase: it starts at **Phase 72**,
+the phase that taught sg to read `GIT_AUTHOR_DATE` at all (before that the
+variable was ignored, so the value never reached a parser).
+`tests/fuzz_combined.py` sets the same variable but does not reach a
+failing path (measured: 3 rounds pass); `fuzz_ignore.py` and
+`fuzz_merge.py` do not set it. **`fuzz_diff.py` is named in CLAUDE.md's own
+completion criteria for diff work, so two differential gates have silently
+not run for three phases** -- the failure mode this project calls its
+worst. Phase 75a fixes it; the measured oracle for the `Z` spelling is in
+that section, and it includes two rows where sg does not refuse but
+silently writes a DIFFERENT timezone than git (`1767225600 Z` and
+`@1767225600 Z` both take sg's "unrecognized trailing junk, stay local"
+path).
+
+### Phase 75 round 3: reflog ordering, `<ref>@{N}` listing, two mislabeled interop checks
+
+Two defects found by a second cold read of round 2's `cmd_reflog.c`, plus
+one found by mutation.
+
+**Fix A**: round 2's "resolves as an object but names no ref" branch
+(`orc == 0`, printing nothing and exiting 0) sat BEFORE the class-D
+(`sg_cli_arg_exists_in_worktree`) ambiguity check inside the
+`sg_rev_parse_ref_path` failure branch, so an argument like `HEAD~1` or a
+full 40-hex sha could never be reported as ambiguous even when a
+same-named untracked file existed -- `sg log`/`sg show` already ran this
+check first, `sg reflog` did not. Moved the same class-D check to the top
+of that branch, gated on `ref_arg_typed` exactly like the existing
+success-path check just below it.
+
+**Fix B**: implemented `sg reflog <ref>@{N}`, which real git resolves to
+LISTING `<ref>`'s own reflog starting at entry N (`@{0}` == the bare ref),
+not to a single commit -- the previous code let `sg_rev_parse_object`
+swallow the whole expression via its own `@{N}` grammar, landing in the
+`orc == 0` branch and printing nothing. Added `parse_reflog_at_n` (splits
+`<base>@{<digits>}`, deliberately narrower than revparse.h's own grammar:
+no bare `@{N}` shorthand, no trailing `~`/`^` suffix, since neither shape
+was in the measured oracle) and a small listing loop reusing
+`sg_reflog_at` for the from-newest indexing. Out-of-range N reports git's
+own sentence, `fatal: log for '<base>' only has <N> entries`, verbatim,
+under sg's own 0/1 exit-code convention (1, not git's 128).
+
+Both fixes are pinned in interop's `phase75 round3` group: fix A against a
+3-commit fixture with untracked files named `HEAD~1` and the full 40-hex
+current HEAD; fix B by comparing `sg reflog`'s output against real git
+BYTE-FOR-BYTE (rather than a hardcoded literal, since the abbreviated
+hashes have to match too) across `HEAD`, `HEAD@{0}`, `HEAD@{1}`,
+`master@{0}`, `master`, and the out-of-range `HEAD@{9}`. `HEAD@{1}` is the
+one that actually distinguishes "starts at the newest entry" from "starts
+at the reversed index" -- `@{0}` cannot tell the two apart. Confirmed by
+directed mutation: reverting fix A's ambiguity check to `if (0)` turns red
+exactly the two new fixA checks; reverting fix B's dispatch condition to
+`if (0)` turns red exactly the four fixB checks that need real listing
+output (three BYTE-FOR-BYTE checks -- `HEAD@{0}`, `HEAD@{1}`, `master@{0}`
+-- plus the out-of-range `HEAD@{9}` sg-side sentence check).
+
+WARNING (round4 cold read): **the sentence this replaced miscounted which
+checks this mutation leaves green, twice over.** It said "the two
+out-of-range/exit-code checks... stay green", naming only two candidates and
+conflating "out-of-range" with "exit-code". Measured (round4): what actually
+stays green is THREE exit-code-match checks -- the "sg and git exit with the
+same code" half of `p75r3_reflog_cmp` for the three IN-RANGE labels
+(`HEAD@{0}`, `HEAD@{1}`, `master@{0}`), because falling through to the old
+`orc == 0` path still exits 0 the same way the real listing does for those
+cells. The OUT-OF-RANGE `HEAD@{9}` pair is not two greens at all: its oracle
+check (git-only, never touches sg) stays green as it always does, but its
+sg-side sentence check is one of the four RED ones above, not a fifth green
+one. "The cold read counts three such sub-checks, not two" is that
+correction: three exit-code checks stay green, not "two out-of-range" ones.
+
+And swapping fix B's `sg_reflog_at(&at_log, at_shown)` for the un-reversed
+`&at_log.entries[at_shown]` does **NOT** turn red "exactly the three cells
+whose N != 0" as the original text claimed -- measured (round4): it turns
+red **all three** BYTE-FOR-BYTE checks, `HEAD@{0}` included:
+
+```
+interop: 4182/4185 passed, 0 skipped
+FAIL: phase75 round3 fixB (HEAD@{0}): sg reflog HEAD@{0} output matches git byte-for-byte
+FAIL: phase75 round3 fixB (HEAD@{1}): sg reflog HEAD@{1} output matches git byte-for-byte
+FAIL: phase75 round3 fixB (master@{0}): sg reflog master@{0} output matches git byte-for-byte
+```
+
+The claim was wrong on the count (only one of the three cells has N != 0)
+and on the mechanism: un-reversing the index doesn't leave `@{0}` alone, it
+RELABELS every entry except a self-mapping middle one, so for a 3-entry log
+even `@{0}` now points at a different line than git's. `@{0}` cannot
+distinguish "starts at the newest entry" from "starts at the reversed
+index" on its own (that half of the original claim is still true, and is
+exactly why `HEAD@{1}` was added as the label that CAN), but that is a
+property of what the checks are FOR, not a prediction of which checks a
+whole-log reversal happens to spare -- this mutation reverses the whole
+log, not just index N, so it was never going to spare `@{0}`. **One
+over-broad mutation on fix A's ambiguity check
+(dropping `ref_arg_typed`) produced no observable difference** -- that
+branch is only ever reached via an argument that failed
+`sg_rev_parse_ref_path`, and the untyped default (`ref_arg = "HEAD"`)
+always succeeds there in a valid repo, so `ref_arg_typed` is unreachable
+dead weight in this specific branch (kept anyway, for symmetry with the
+sibling check on the success path, which IS reachable untyped and IS
+covered -- confirmed by mutating that copy instead, which fix3's own
+`sg reflog` with no args" check catches). A second over-broad mutation,
+dropping the whole `sg_cli_arg_exists_in_worktree` condition so the branch
+fires on any typed argument, is caught broadly (11 pre-existing phase75
+checks plus 4 of the new fixB ones).
+
+**Fix C**: two round-2 interop checks (`phase75 fix2 oracle/... (an
+annotated/lightweight tag's name)`) were named as fix2 coverage but are
+not -- measured by mutation (`if (orc == 0)` -> `if (0)`, disabling fix2's
+branch entirely): the `<rev>:<path>` and `HEAD~1` checks turn red, both tag
+checks stay green, because a tag NAME resolves via `sg_rev_parse_ref_path`
+(`refs/tags/<name>` is a real ref path, same as a branch name) and never
+reaches the `orc == 0` branch at all -- its reflog is simply empty, same
+reason a branch with no log is silent. Kept (they pin real, correct
+behaviour) and renamed to say what they actually cover, per this file's
+"same outcome, different reason" rule.
+
+**Fix D (no behaviour change)**: `src/cli/cli_args.c`'s sanitizer comment
+pointed at a nonexistent `tests/test_cli_args.c`; the real file is
+`tests/test_cli_rev_err.c`. `cmd_switch.c`'s wrapped
+`sg_cli_classify_rev_error` call had its continuation indented one column
+short of the call's own argument column. And: `cmd_reflog.c` calls
+`sg_rev_parse_object` directly (to special-case `-4`/`0` before
+`sg_cli_classify_rev_error` would fold them together) and then, for the
+remaining error classes, calls `sg_cli_classify_rev_error`, which calls
+`sg_rev_parse_object` again internally. This double call is deliberate,
+not an oversight: the alternative is re-deriving `classify()`'s own R/O/P
+logic at the call site, which is exactly what the shared reporter exists
+to prevent (see `cli_args.h`'s own comment on `sg_cli_classify_rev_error`).
+
+### Phase 75 round 4: the rest of the `@{N}` family, found by boundary probing
+
+Boundary probing of round 3's `<ref>@{N}` feature against real git 2.55.0
+found two more shapes the same "resolves as an object, print nothing, exit
+0" branch was silently swallowing, one shape it mishandled by inventing a
+sentence git never uses, and (Fix 4 above) two wrong mutation claims in
+round 3's own write-up.
+
+**Fix 1 -- a BARE `@{N}`.** `sg reflog @{0}`/`@{N}` used to fall into the
+`orc == 0` branch and print nothing, because `sg_rev_parse_object`'s own
+"@{N}" grammar resolves a bare form just fine (as a single commit).
+`include/sg/revparse.h` already documents that a bare `@{N}` reads the
+CURRENT BRANCH's log, a measurably different value from `HEAD@{N}` -- so
+`parse_reflog_at_n` (the round3 helper) was widened to recognize `base_len
+== 0` as a match too, with a `bare_out` flag so the caller never collapses
+the two operations into one code path. The entry lines for the bare form
+are labeled with the branch's FULL ref path (`refs/heads/master@{N}`,
+measured against git), while the out-of-range sentence names the branch's
+SHORT name (`master`) -- two different fields, both measured separately.
+A DETACHED HEAD has no current branch to fall back to; git was not measured
+for that combination (not reachable with `sg`'s own vocabulary without
+inventing a fixture, and out of this phase's scope to measure by hand), so
+sg makes its own decision: refuse outright with the same class-R
+(AMBIG-UNKNOWN) message any other unresolvable argument gets, via a
+DELIBERATE early return rather than falling through to the generic
+classification -- falling through would let `ref_arg` ("@{0}") resolve via
+`sg_rev_parse_object`'s own detached-HEAD fallback to `logs/HEAD` and land
+back in the silent `orc == 0` branch, the exact round2 bug reached from a
+new angle. Pinned as an sg-only check (no git oracle line).
+
+**Fix 2 -- a `~`/`^` suffix after `@{N}`.** `sg reflog HEAD@{1}^` and
+`sg reflog HEAD@{0}~1` also fell into the silent `orc == 0` branch. Measured
+against git: the suffix is IGNORED ENTIRELY for the listing -- output is
+byte-identical to the same argument without it. `parse_reflog_at_n`'s
+closing-brace check was widened from requiring immediate end-of-string to
+recognizing (and discarding) a `~`/`^` run, each optionally followed by
+decimal digits, chained/repeated any number of times; the function does not
+WALK the suffix, only recognizes its shape. Any other trailing text (a
+second `@{`, a stray character, a trailing space) is not this shape at all
+and the whole match fails, which is what keeps `HEAD@{2}@{1}` refusing
+(class-R, ambiguous argument) exactly as before, and `HEAD@{1 }` (git's own
+"@{<date>}" grammar, not implemented) refusing too.
+
+WARNING: **round3's own fixture never actually pinned `HEAD@{2}@{1}`
+anywhere in interop.sh**, despite round4's own "already correct, do not
+touch" oracle table listing it -- there was no check with that literal
+argument in the whole test suite. Found by running the over-broad mutation
+the round4 spec itself asked for (loosen the suffix scan to swallow ANY
+trailing character, including a second `@{...}`): interop stayed fully
+green, `4209/4209`. A `phase75 round4 fix2 control` check was added
+specifically to close this (both a git oracle line and an sg line for
+`HEAD@{2}@{1}`); the same over-broad mutation now turns exactly that one
+check red. This is the shape CLAUDE.md's own delegation section describes
+as "a caught mutation may verify nothing" pointed the other way: not a
+false positive, but a name for a genuine, pre-existing blind spot a
+mutation surfaced rather than one it accidentally created.
+
+**Fix 3 -- a ref whose log is EMPTY.** Round 3's out-of-range branch fired
+whenever `at_n >= at_log.count`, including `count == 0` -- so `sg reflog
+lighttag@{0}` (a tag, which never has a reflog), `sg reflog anntag@{0}`
+(same, annotated), and `sg reflog nolog@{0}` (a branch whose log file was
+deleted by hand -- `sg_reflog_read` reports a missing file as `count == 0`,
+by its own documented contract, same as any other empty log) all printed
+`sg: log for '<ref>' only has 0 entries` and exited 1. Measured against
+git: all three instead refuse OUTRIGHT with the class-R AMBIG-UNKNOWN
+block, exit 128 -- the exact thing `sg log <ref>@{0}` already prints for
+the same three inputs, and the exact invariant
+`docs/RULES-refs-revparse.md` already states ("the reflog must still EXIST
+for `@{0}`... which is what keeps `<branch>@{0}` refusing when the log has
+been deleted, matching git") -- round3's branch bypassed that rule for its
+own new code path. Fixed by treating `count == 0` as "does not resolve",
+falling through to the ordinary classification exactly like a `base` that
+never resolved to a ref at all, rather than returning early with an
+invented sentence. The other half of the same rule -- a NON-empty log with
+`N >= count` still prints `log for '<ref>' only has <count> entries` -- is
+unchanged and kept pinned side-by-side (`side@{1}`, a 1-entry log) as a
+control, so the two halves are visibly different checks and a future fix
+cannot accidentally collapse "empty" and "out-of-range" back into one
+sentence.
+
+**Record-and-pin, not fixed** (each is sg's own decision, not a bug):
+`HEAD@{+1}` and `HEAD@{ 1}` (git accepts both; sg's shared `@{N}` grammar
+refuses both, and making `sg reflog` alone more tolerant than `sg log`
+would be a new internal inconsistency); `HEAD@{1 }` (a trailing space --
+git reads this as its `@{<date>}` selector, which `revparse.h` already
+documents sg does not implement; the pin is about the date grammar, not
+whitespace); and `HEAD@{99999999999999999999}` (N overflows an `unsigned
+long`, `strtoul` saturates to `ULONG_MAX` -- git silently exits 0 with
+empty output, which would mean reproducing "an absurd index silently
+succeeds" as a feature; sg keeps its ordinary out-of-range sentence, the
+same answer any other out-of-range N gets). All three are pinned in
+interop's `phase75 round4` group as sg-only checks except the overflow one,
+which also pins git's side (exit 0, empty output) as a control showing sg's
+divergence is deliberate, not accidental.
+
+**Verification.** All four fixes plus both requested over-broad directions
+were confirmed by `bash tests/mutate.sh --interop`, each against the
+`phase75round4` fixture (three commits on `master`, a `side` branch with a
+1-entry log, `lighttag`/`anntag` tags, a `nolog` branch with its log file
+deleted, and two `side`/detached-HEAD checkout round-trips landing extra
+entries in `logs/HEAD` that never touch `logs/refs/heads/master` --
+needed so a mutation that reads HEAD's log instead of the branch's own is
+actually observable):
+
+- Disabling fix 1's whole `if (at_bare)` branch (`if (0) { ... }`) turns red
+  the fix1 checks (`@{0}`, `@{2}` byte-for-byte, `@{9}` out-of-range
+  sentence, and the detached-HEAD pin).
+  WARNING: this bullet said "exactly the four" and named the detached-HEAD
+  pin as an *sg-only* one; round 5 turned that pin into a both-sides `cmp`
+  and added two more checks under the same "fix1" name, so the count is
+  stale and a reader should go by the names, not the number. Round 5 also
+  measured that the unborn-HEAD check under that name does NOT go red for
+  this mutation -- see round 5's own section for why (the answer comes from
+  `sg_rev_parse_commit`'s pre-existing bare-`@{N}` handling, one layer
+  down).
+- Disabling fix 2's suffix recognition (reverting to "no trailing content
+  at all") turns red exactly the two fix2 checks (`HEAD@{1}^`,
+  `HEAD@{0}~1`).
+- Disabling fix 3 (`if (at_log.count == 0)` -> `if (0)`) turns red exactly
+  the three fix3 checks (`lighttag@{0}`, `anntag@{0}`, `nolog@{0}`); the
+  `side@{1}` control stays green, confirming fix3 did not turn EVERY
+  out-of-range case into the class-R message.
+- Over-broad direction for fix 1 (resolve the bare form via `"HEAD"`
+  instead of the current branch): turns red the same three
+  git-comparison-dependent fix1 checks (`@{0}`, `@{2}` byte-for-byte,
+  `@{9}` sentence -- the fixture's checkout round-trips are what makes this
+  observable at all, since without them HEAD's log and the branch's own
+  log would coincide and the mutation would be invisible).
+- Over-broad direction for fix 2 (swallow ANY trailing text as a suffix,
+  including a second `@{...}`): stayed fully green before the
+  `fix2 control` check existed (a real, pre-existing blind spot, not
+  created by this phase -- see the WARNING under Fix 2 above); after adding
+  it, the same mutation turns exactly that one check red.
+
+`make`, `make test` (85/85 ran), and `bash tests/interop.sh` (4211/4211
+passed, 0 skipped) were run after every fix; the mutations above were run
+against the resulting green tree. As with every phase, these gates are
+re-run and judged independently by the main conversation, not taken on the
+implementer's word.
+
+### Phase 75 round 5: a pin that recorded a guess, and two pre-existing gaps it exposed
+
+Round 4 implemented the bare `@{N}` form and had to decide what it means on a
+DETACHED HEAD, where there is no current branch to read. It refused, and
+pinned that refusal **on sg's side only**, with a comment saying git had not
+been measured for the combination. The comment was accurate about the spec --
+the spec did say so -- but the underlying claim was never true: git has a
+perfectly definite answer there, and it took one command to get it.
+
+Measured (3 commits, then `switch --detach`, so HEAD's log has 4 entries):
+
+| argument | git | sg (round 4) |
+|---|---|---|
+| `reflog @{0}` | exit 0, 4 lines, labeled `HEAD@{0}:` ... | exit 1, class-R refusal |
+| `reflog @{1}` | exit 0, 3 lines | exit 1, class-R refusal |
+| `reflog @{9}` | exit 128, `fatal: log for 'HEAD' only has 4 entries` | exit 1, class-R refusal |
+
+So the fallback is HEAD -- for the log that gets read, for the entry LABEL
+(`HEAD@{N}`, not `refs/heads/...@{N}`) and for the name in the out-of-range
+sentence. sg now does that, and the pin is a byte-for-byte `cmp` on both
+sides plus a separate check on the out-of-range sentence, because the label
+is its own field and a message-only check would let it drift.
+
+**The lesson is about the pin, not the behaviour.** "Not measured, so sg
+decides and we pin sg's side" is a legitimate move -- this project uses it
+whenever git has no comparable answer. But it is only legitimate when the
+absence has been verified, and here the absence came from a spec's silence,
+which is not evidence. A one-sided pin built on a spec's silence looks
+exactly like a one-sided pin built on a measurement, and it freezes the guess
+into the test suite. See CLAUDE.md's Phase 64 note for the same shape in the
+other direction (a documented negative result that was simply wrong).
+
+The corrupt/unborn HEAD path that the same code has to handle was measured
+too, and the two answers are NOT the same:
+
+- **Unborn HEAD** (a fresh repo, no commits): `git reflog @{0}` gives the
+  ambiguous-argument block, exit 128; sg gives the identical sentence at exit
+  1. Pinned.
+
+  Round 5 first defended this with an explicit guard, on the reasoning that
+  falling through would let `@{0}` resolve as a commit through
+  `sg_rev_parse_object`'s own `logs/HEAD` fallback and land in the "resolves
+  as an object, print nothing" branch -- silence with exit 0. **A mutation
+  that deleted that guard turned ZERO checks red**, and measuring the two
+  states it was supposed to cover explains why: on an unborn HEAD
+  `sg_rev_parse_object` fails on `@{0}` as well (there is no log to read), so
+  the fall-through produces the identical class-R message one layer down; and
+  a corrupt HEAD never reaches the guard at all, because the `"HEAD"`
+  fallback's own `sg_rev_parse_ref_path` succeeds there and `logs/HEAD` is
+  listed. So it was a **redundant guard** in this project's own three-reasons
+  sense, and the rule for that case is to delete it rather than keep a
+  duplicate of a defence line that already works -- deleted, with the
+  measurement recorded in the code where the guard used to be. Behaviour
+  verified unchanged afterwards in all three HEAD states. The pinned check is
+  on the ANSWER, not on the mechanism, which is why it survives the
+  deletion.
+- **A bare `sg reflog` on an unborn branch** diverges, and it is
+  **pre-existing** (Phase 17's scope, untouched here): git says
+  `fatal: your current branch 'master' does not have any commits yet` and
+  exits 128, sg prints nothing and exits 0 (an existing ref with no log is
+  indistinguishable, to this code, from a branch that does not exist yet).
+  Recorded, not fixed, and NOT on CLAUDE.md's divergence list -- it is a gap
+  to close, not an answer to keep.
+- **A corrupt HEAD** (`.git/HEAD` holding garbage): git refuses the whole
+  repository (`fatal: not a git repository`), sg reads `logs/HEAD` and prints
+  the entries. Also pre-existing and much wider than reflog -- sg's stance on
+  a corrupt HEAD is deliberate tolerance in several places (see
+  `docs/RULES-refs-revparse.md`), so this is recorded here only so a future
+  reader does not read the reflog code as the cause.
+
+### Phase 75 round 6: git's own asymmetry between a bare `@{N}` and the spelled-out form
+
+The last cell of the `@{N}` family, found by a cold read asking for the one
+combination rounds 4 and 5 had not pinned: a BARE `@{N}` when the CURRENT
+branch's reflog file has been deleted. Measured (current branch `nolog`, its
+`logs/refs/heads/nolog` removed), and all four answers differ from each
+other:
+
+| argument | git | sg before round 6 |
+|---|---|---|
+| `reflog @{0}` | exit 0, prints NOTHING | exit 1, ambiguous-argument block |
+| `reflog @{1}` | exit 128, `fatal: log for refs/heads/nolog is empty` | exit 1, ambiguous-argument block |
+| `reflog nolog@{0}` (spelled out) | exit 128, ambiguous-argument block | exit 1, same (already agreed) |
+| `reflog` (bare, no selector) | exit 0, logs/HEAD's 3 entries | exit 0, same (already agreed) |
+
+Two things are worth naming. First, `log for refs/heads/nolog is empty` is a
+**fifth** sentence in this phase's matrix, and the only one that names the
+FULL ref path -- every other one uses a short name. Second, the bare form and
+the spelled-out form are answered differently by git for the identical
+underlying state, and reproducing that asymmetry in the LISTING is a
+deliberate choice that **splits sg's two layers apart**, which a cold read
+caught this section originally claiming the opposite of.
+
+To be exact, because the original sentence here was wrong and the correction
+matters more than the claim did: `include/sg/revparse.h` and
+`docs/RULES-refs-revparse.md` record that for REVISION resolution sg
+deliberately rejects BOTH spellings in this state, on the stated grounds that
+"inventing an asymmetry between the two spellings is a worse answer than a
+uniform rejection" -- itself a divergence from git, which accepts the bare
+form there by falling back to the branch tip. Round 6 did the opposite for
+the reflog LISTING: it reproduced git's asymmetry exactly. So after this
+round `sg log @{0}` still refuses in a state where `sg reflog @{0}` succeeds,
+and the two layers are LESS consistent with each other than before, not more.
+
+That is accepted rather than smoothed over, for a reason specific to each
+layer: the revparse decision is about which COMMIT a revision means, where
+git's fallback drags in the branch-tip semantics sg does not want, while the
+listing has no such cost -- git's answer is simply what to print, and
+matching it is free. Both layers are pinned at their own answers, and
+`docs/RULES-refs-revparse.md` carries a WARNING naming the split so a reader
+of either rule does not assume the other one followed.
+
+Both cells are now sg's answers too, and all four are pinned, the last two
+deliberately as **controls**: they are what distinguishes "sg reproduced
+git's asymmetry" from "sg made this whole area silent", which is the failure
+direction this phase kept finding in itself.
+
+Also corrected in this round, from the same cold read: a comment in the bare
+branch claimed that a corrupt and an unborn HEAD both reach it through
+`sg_rev_parse_ref_path(git_dir, "HEAD", ...)`. They do not, and the
+difference matters for anyone auditing that branch --
+`sg_ref_current_branch` returns `"master"` for an unborn HEAD (it checks only
+the `ref: refs/heads/` prefix, never whether the target exists), so the
+failing call there is on the BRANCH name; only a corrupt HEAD takes the
+`"HEAD"` route, and there the call SUCCEEDS, which is why sg lists
+`logs/HEAD` in a state where git refuses the whole repository.
+
+The same empty-log shape one HEAD state over was measured after a cold read
+asked for it -- a DETACHED HEAD whose `logs/HEAD` was deleted -- and sg's code
+already answered all four cells correctly (`@{0}` silent and exit 0, `@{1}`
+`log for HEAD is empty`, the spelled-out `HEAD@{0}` refusing with the
+ambiguous-argument block, a bare `reflog` silent). Pinned anyway: "happens to
+be right" and "cannot silently stop being right" are different properties,
+and only the second one survives the next edit. Note what that state does NOT
+test, recorded in the check's own comment so nobody counts it twice: HEAD is
+both the short name and the full ref path, so those cells cannot discriminate
+the full-path-vs-short-name field that `log for refs/heads/nolog is empty`
+does -- the `nolog` cells are the only ones that pin it.
+
+Round 6's four mutations, all run, each with a disjoint red set:
+
+- Reverting the `!at_bare` split (let the bare form fall through like a named
+  base) -> exactly the two round-6 bare cells; both controls stay green.
+- Making `@{0}` error like `@{1}` -> exactly the `@{0}` cell.
+- Making EVERY N silent (the over-broad direction) -> exactly the `@{1}` cell.
+- Naming the short name instead of the full ref path in the new sentence ->
+  exactly the `@{1}` cell.
+
+The last two landing on the same single check is the point of having both:
+one says the silence is not too wide, the other says the sentence names the
+right field, and a single mutation could not have told those apart.
+
+Round 6's own gate run, read the way CLAUDE.md's "Build and verification"
+section says to read it (the `make` row's warning count is meaningful here
+because 75 TUs actually recompiled, and `interop`'s `0 skipped` is the part
+that matters most):
+
+```
+ok   make          3s   0 warnings (75 TU(s) recompiled)
+ok   make test   101s   85/85 binaries all passed, 0 warnings (85 recompiled)
+ok   interop     142s   4233/4233 passed, 0 skipped
+ok   sanitize     99s   85/85 binaries, 0 sanitizer errors
+```
+
+The detached-HEAD-with-`logs/HEAD`-deleted block described above was already
+IN that 4233 (it was added before the run, not after) -- spelling that out
+because a cold read of the diff alone could not tell, and read one way the
+count looked eight checks short. Only the block below came after it.
+
+Two cells were added after that run, from the same cold read's remaining
+finding -- a corrupt HEAD whose `logs/HEAD` is ALSO empty, the one
+`(bare form, HEAD fallback, count == 0)` combination none of the other
+fixtures reach (the corrupt-HEAD fixture commits first, so its log is not
+empty). Measured both ways to build that state (no commits at all, and one
+commit with `logs/HEAD` deleted afterwards) and the answers are identical:
+git refuses the repository outright, sg gives the same two answers its
+empty-log rule gives everywhere else. Nothing to fix, but it was a code path
+with no check looking at it at all, which is a blind spot rather than a
+redundant guard -- now pinned.
+
+A later cold read found that this block's git-side check ran only `@{0}`
+while its NAME claimed "for either selector" -- true when written, but
+unpinned for `@{1}`, so a future git that changed only that selector in this
+state would have passed a check asserting it covered both. Each selector has
+its own git-side check now. Same round, the same cold read found the
+"keeps the two layers consistent" falsehood STILL PRESENT in
+`cmd_reflog.c`'s own comment, even though `docs/DESIGN.md` and
+`docs/RULES-refs-revparse.md` had both been corrected -- the comment is the
+first thing the next editor of that function reads, and correcting the docs
+while leaving it in place would have re-misled them. Fixed there too, with
+the correction named as such rather than silently rewritten.
+
+Final count: interop 4008 -> 4237, 0 skipped.
+
+**Where this phase's review loop stopped, and why it is worth naming.** The
+sentence "reproducing git's asymmetry keeps sg's two layers consistent" was
+wrong, and each fix of it was wrong again, in a new way, four times:
+
+1. `docs/DESIGN.md` said it. A cold read showed the layers became LESS
+   consistent, not more.
+2. The correction went into `docs/DESIGN.md` and a WARNING into
+   `docs/RULES-refs-revparse.md` -- and the identical sentence was still
+   sitting in `src/cli/cmd_reflog.c`'s own comment, which is the first thing
+   the next editor of that function reads. Caught by the next cold read.
+3. That comment's rewrite then claimed "both are pinned (interop's phase75
+   round6 group here, phase48's group for resolution)". There is no such
+   interop group: the resolution side is covered ONLY by a unit test with no
+   git oracle (`tests/test_revparse_at_zero.c`'s
+   `test_bare_at_zero_still_refuses_when_current_branch_log_missing`), which
+   is deliberate -- `include/sg/revparse.h` says that divergence is not even
+   on CLAUDE.md's list "because reaching it requires deleting a log file by
+   hand". `docs/RULES-refs-revparse.md`'s own WARNING had been careful to say
+   only that DESIGN.md "records the measurement" for the resolution side; the
+   comment collapsed that distinction. Caught by the next cold read.
+4. Fixed as written above, naming what actually watches each side.
+
+The loop was stopped there deliberately, not because it converged on its own:
+the remaining diff is one comment clause whose content was dictated by the
+review that found it, so another round would be reviewing a transcription of
+the reviewer's own words. Recorded because "the fix was wrong four times" is
+the useful part -- a claim about which test watches what is exactly as
+load-bearing as the code, is invisible to every gate, and a cold read is the
+only defence line it has.

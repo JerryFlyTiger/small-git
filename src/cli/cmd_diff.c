@@ -26,15 +26,23 @@ static const char USAGE[] =
    the one path every rev argument in this command goes through, per
    CLAUDE.md's "use sg_rev_parse_commit, don't hand-roll rev resolution"
    rule. Prints its own error and returns -1 on failure. */
-static int resolve_rev_tree(const char *git_dir, const char *rev, unsigned char tree_id_out[SG_SHA1_RAW_LEN])
+static int resolve_rev_tree(const char *git_dir, const char *rev, int dashdash,
+                            unsigned char tree_id_out[SG_SHA1_RAW_LEN])
 {
     unsigned char commit_id[SG_SHA1_RAW_LEN];
     int prc = sg_rev_parse_commit(git_dir, rev, commit_id);
 
     if (prc != 0) {
-        if (prc == -4)
+        char bad_path[SG_PATH_MAX];
+
+        if (prc == -4) {
             sg_cli_report_ambiguous_oid(git_dir, rev, SG_REV_STRICT);
-        fprintf(stderr, "sg: invalid reference: %s\n", rev);
+            sg_cli_report_rev_error("diff", SG_REV_ERR_NOT_A_REV, rev, NULL, dashdash);
+        } else {
+            sg_cli_report_rev_error("diff",
+                                    sg_cli_classify_rev_error(git_dir, rev, bad_path, sizeof(bad_path)),
+                                    rev, bad_path, dashdash);
+        }
         return -1;
     }
     if (sg_commit_tree_of(git_dir, commit_id, tree_id_out) != 0) {
@@ -320,7 +328,7 @@ int sg_cmd_diff(int argc, char **argv)
         unsigned char old_tree[SG_SHA1_RAW_LEN];
         unsigned char new_tree[SG_SHA1_RAW_LEN];
 
-        if (resolve_rev_tree(git_dir, rev1, old_tree) != 0 || resolve_rev_tree(git_dir, rev2, new_tree) != 0)
+        if (resolve_rev_tree(git_dir, rev1, dashdash >= 0, old_tree) != 0 || resolve_rev_tree(git_dir, rev2, dashdash >= 0, new_tree) != 0)
             goto done;
         rc = sg_diff_trees(git_dir, old_tree, new_tree, &list, bad_path, copies_harder);
     } else if (cached) {
@@ -329,7 +337,7 @@ int sg_cmd_diff(int argc, char **argv)
         sg_index idx;
 
         if (rev1 != NULL) {
-            if (resolve_rev_tree(git_dir, rev1, tree_id) != 0)
+            if (resolve_rev_tree(git_dir, rev1, dashdash >= 0, tree_id) != 0)
                 goto done;
             tree_ptr = tree_id;
         } else {
@@ -350,7 +358,7 @@ int sg_cmd_diff(int argc, char **argv)
     } else if (rev1 != NULL) {
         unsigned char tree_id[SG_SHA1_RAW_LEN];
 
-        if (resolve_rev_tree(git_dir, rev1, tree_id) != 0)
+        if (resolve_rev_tree(git_dir, rev1, dashdash >= 0, tree_id) != 0)
             goto done;
         if (sg_index_read(git_dir, &rev_idx) != 0) {
             fprintf(stderr, "sg: failed to read index (corrupt?)\n");

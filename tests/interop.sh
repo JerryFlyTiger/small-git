@@ -3473,8 +3473,16 @@ check "REF_DELTA with an unresolvable base: sg cat-file fails instead of succeed
     test "$MISSING_BASE_RC" != 0
 check "REF_DELTA with an unresolvable base: exit status is a clean failure, not a signal/crash" \
     test "$MISSING_BASE_RC" -lt 128
-check "REF_DELTA with an unresolvable base: reports it as not found rather than emitting content" \
-    grep -q "not found or corrupt" "$MISSING_BASE_OUT"
+# Phase 75: measured against real git 2.55.0 on the IDENTICAL fixture
+# (crafted, no git tooling involved in building it) -- git does not
+# distinguish "well-formed id, never had a packfile entry" from "well-
+# formed id, entry present but content unresolvable" in its own wording
+# either; both say "Not a valid object name X" for -p. sg used to have its
+# own invented wording here ("not found or corrupt"); it is now the same
+# class-O line every other well-formed-but-unreadable id gets (see the
+# "cat-file-p" row of the phase75 table in cli_args.c).
+check "REF_DELTA with an unresolvable base: reports it as not a valid object name, matching real git's own wording for the identical fixture" \
+    grep -q "Not a valid object name $MISSING_BASE_ID" "$MISSING_BASE_OUT"
 
 echo ""
 
@@ -10001,8 +10009,11 @@ done
 
 # --- diff: the default (patch) format, byte for byte -----------------------
 # The default format can't join the loop above -- an empty "$_fmt" argument
-# is itself a value ("sg diff --cached ''" fails with "invalid reference: "),
-# not an absent one -- so the three comparison directions are spelled out.
+# is itself a value ("sg diff --cached ''" fails, as of Phase 75 with the
+# three-line AMBIG-UNKNOWN block rather than the older "invalid reference: "
+# this comment used to name -- see the phase75 section's "diff R" case for
+# the current wording), not an absent one -- so the three comparison
+# directions are spelled out.
 (cd "$P25" && "$SG" diff --cached) 2>/dev/null > "$WORKDIR/p26_pc_sg.txt"
 (cd "$P25" && LC_ALL=C git -c core.quotepath=false diff --cached) 2>/dev/null \
     > "$WORKDIR/p26_pc_git.txt"
@@ -10603,8 +10614,12 @@ check "phase28 oracle: real git refuses that ordering too" \
 (cd "$P28" && "$SG" branch a.txt) > /dev/null 2>&1
 (cd "$P28" && "$SG" diff --name-only a.txt) > "$P28_ERR" 2>&1
 check "phase28: an argument that is both a revision and a file is refused" test $? != 0
+# Phase 75: sg's D-class wording is now git's own AMBIG-BOTH block --
+# "both revision and filename", no trailing period (distinct from the
+# AMBIG-UNKNOWN block's "unknown revision or path not in the working
+# tree." two checks up, which DOES end in a period).
 check "phase28: and the message says it is both" \
-    grep -q 'could be both a revision and a file' "$P28_ERR"
+    grep -q "ambiguous argument 'a.txt': both revision and filename" "$P28_ERR"
 check "phase28 oracle: real git refuses it too" \
     sh -c "! (cd '$P28' && git diff --name-only a.txt) > /dev/null 2>&1"
 p28_cmp "$P28" "--name-only -- a.txt (ambiguous name, after --)" --name-only -- a.txt
@@ -20416,15 +20431,13 @@ sed -e 's/^sg: //' "$WORKDIR/p73_1h_sg.out" > "$WORKDIR/p73_1h_sg.stripped"
 check "phase73 case1h: sg's message matches git's byte for byte with each tool's own prefix stripped (the trailing period, in particular)" \
     cmp -s "$WORKDIR/p73_1h_sg.stripped" "$WORKDIR/p73_1h_git.stripped"
 
-# case1i (review round 6, deliberate divergence -- record, do not unify):
-# an UNRESOLVABLE <rev> produces a whole different SENTENCE, not just
-# punctuation. git: "Failed to resolve 'x' as a valid ref."; sg:
-# "cannot resolve 'x'". sg's wording is the generic revparse message
-# shared across several commands (cmd_show.c, cmd_cat_file.c, ...) --
-# changing it here alone would either ripple into those or make sg tag
-# inconsistent with its own siblings, so this is pinned as a named,
-# deliberate divergence (see docs/DESIGN.md's Phase 73 section) rather
-# than "fixed" into byte agreement.
+# case1i (review round 6, ORIGINALLY a deliberate divergence -- FIXED by
+# Phase 75, which resolved the wider "sg has four wordings for this"
+# finding this case's own comment used to point at; see docs/DESIGN.md's
+# Phase 75 section and CLAUDE.md's deliberate-divergences preamble for
+# where entry 8 went). git: "Failed to resolve 'x' as a valid ref."; sg now
+# says exactly that (byte for byte, prefix aside) instead of its own former
+# generic "cannot resolve 'x'".
 P73_1I_GIT="$WORKDIR/phase73_1i_git"
 P73_1I_SG="$WORKDIR/phase73_1i_sg"
 rm -rf "$P73_1I_GIT" "$P73_1I_SG"
@@ -20438,8 +20451,8 @@ check "phase73 case1i: both tools reject an unresolvable <rev> (exit codes diffe
     test "$P73_1I_GIT_RC" = 128 -a "$P73_1I_SG_RC" = 1
 check "phase73 case1i oracle: precondition -- git's own wording is 'Failed to resolve ... as a valid ref.'" \
     grep -q "Failed to resolve 'nosuchrev' as a valid ref\." "$WORKDIR/p73_1i_git.out"
-check "phase73 case1i (deliberate divergence, pinned both sides, NOT unified): sg's wording is its own generic revparse message 'cannot resolve', a different sentence, not just punctuation" \
-    grep -q "cannot resolve 'nosuchrev'" "$WORKDIR/p73_1i_sg.out"
+check "phase73 case1i (Phase 75: fixed, no longer a divergence): sg's wording now matches git's own sentence, not just its punctuation" \
+    grep -q "Failed to resolve 'nosuchrev' as a valid ref\." "$WORKDIR/p73_1i_sg.out"
 
 # section 2/3: -d takes many names, per-name partial failure, and the ------
 # "Deleted tag"/"Updated tag" stdout messages ---------------------------
@@ -21227,6 +21240,889 @@ check "phase73 case7: sg tag -d with no names ALSO exits 0 (opposite direction f
     test $? = 0
 check "phase73 case7: ...and prints nothing" \
     sh -c "test ! -s '$WORKDIR/p73_7_sg.out' -a ! -s '$WORKDIR/p73_7_sg.err'"
+
+# ============================================================
+# Phase 75: the "this revision does not resolve" message matrix. git uses
+# at least ten different wordings for this, each stable per (command,
+# input class) -- see docs/DESIGN.md's Phase 75 section for the full
+# measured oracle table this mirrors. One named check per (command, class)
+# cell, both sides pinned as their OWN literal (not a cmp between git and
+# sg -- the "fatal:"/"sg:" prefix and the exit code differ by this
+# project's own convention, same shape as divergences 6 and 7).
+# ============================================================
+
+P75="$WORKDIR/phase75"
+rm -rf "$P75"
+mkdir -p "$P75"
+(cd "$WORKDIR" && "$SG" init phase75) > /dev/null 2>&1
+printf 'hi\n' > "$P75/f.txt"
+(cd "$P75" && "$SG" add f.txt && "$SG" commit -m init) > /dev/null 2>&1
+# "dual": a name that is BOTH a branch and an existing working-tree path,
+# the fixture every class-D (AMBIG-BOTH) check below needs.
+(cd "$P75" && "$SG" branch dual) > /dev/null 2>&1
+printf 'x\n' > "$P75/dual"
+printf 'y\n' > "$P75/plain.txt"
+P75_HEX="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+# $1 = label, $2 = git's expected literal substring, $3 = sg's expected
+# literal substring, $4... = the args (identical for both tools; every
+# phase75 case below happens to share this shape -- only the program name
+# differs). Asserts git exits 128 with its own line, sg exits 1 with its
+# own translated line -- never a cmp between the two.
+p75case() {
+    p75_label="$1"; p75_gexp="$2"; p75_sexp="$3"; shift 3
+    (cd "$P75" && LC_ALL=C git "$@") > "$WORKDIR/p75_git.out" 2>&1
+    p75_grc=$?
+    (cd "$P75" && "$SG" "$@") > "$WORKDIR/p75_sg.out" 2>&1
+    p75_src=$?
+    check "phase75 $p75_label oracle: git exits 128 and says the expected line" \
+        sh -c "test $p75_grc -eq 128 && grep -qF -- \"\$0\" '$WORKDIR/p75_git.out'" "$p75_gexp"
+    check "phase75 $p75_label: sg exits 1 and matches git's wording (translated per the phase75 rules)" \
+        sh -c "test $p75_src -eq 1 && grep -qF -- \"\$0\" '$WORKDIR/p75_sg.out'" "$p75_sexp"
+}
+
+# --- tag <name> <rev> (no "--" grammar exists for this command) ---
+p75case "tag R" "Failed to resolve 'nosuch' as a valid ref." "Failed to resolve 'nosuch' as a valid ref." \
+    tag p75t1 nosuch
+p75case "tag O" "trying to write ref 'refs/tags/p75t2' with nonexistent object $P75_HEX" \
+    "trying to write ref 'refs/tags/p75t2' with nonexistent object $P75_HEX" \
+    tag p75t2 "$P75_HEX"
+p75case "tag P (git answers with its R wording, not a path message)" \
+    "Failed to resolve 'HEAD:nosuchfile' as a valid ref." "Failed to resolve 'HEAD:nosuchfile' as a valid ref." \
+    tag p75t3 HEAD:nosuchfile
+
+# --- show ---
+p75case "show R" \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    show nosuch
+p75case "show O" "bad object $P75_HEX" "bad object $P75_HEX" show "$P75_HEX"
+p75case "show P" "path 'nosuchfile' does not exist in 'HEAD'" "path 'nosuchfile' does not exist in 'HEAD'" \
+    show HEAD:nosuchfile
+p75case "show D" "ambiguous argument 'dual': both revision and filename" \
+    "ambiguous argument 'dual': both revision and filename" show dual
+
+# --- show: validate every argument before printing anything (Phase 75
+# behavior change, not just wording) -- `sg show HEAD nosuch` used to
+# print HEAD's commit to stdout and only then fail on the second
+# argument; measured against real git 2.55.0: exit 128, EMPTY stdout. ---
+(cd "$P75" && LC_ALL=C git show HEAD nosuch) > "$WORKDIR/p75_showall_git.out" 2>"$WORKDIR/p75_showall_git.err"
+P75_SHOWALL_GIT_RC=$?
+(cd "$P75" && "$SG" show HEAD nosuch) > "$WORKDIR/p75_showall_sg.out" 2>"$WORKDIR/p75_showall_sg.err"
+P75_SHOWALL_SG_RC=$?
+check "phase75 show validate-all oracle: git exits 128 with empty stdout" \
+    sh -c "test $P75_SHOWALL_GIT_RC -eq 128 -a ! -s '$WORKDIR/p75_showall_git.out'"
+check "phase75 show validate-all: sg exits 1 with EMPTY stdout (used to print HEAD's commit first)" \
+    sh -c "test $P75_SHOWALL_SG_RC -eq 1 -a ! -s '$WORKDIR/p75_showall_sg.out'"
+# ...and a later (not just the first) argument is validated too.
+(cd "$P75" && "$SG" show HEAD dual) > "$WORKDIR/p75_showall2_sg.out" 2>"$WORKDIR/p75_showall2_sg.err"
+check "phase75 show validate-all: a SECOND argument's ambiguity (dual) is also caught before printing anything" \
+    sh -c "test $? -eq 1 -a ! -s '$WORKDIR/p75_showall2_sg.out' && grep -qF \"both revision and filename\" '$WORKDIR/p75_showall2_sg.err'"
+
+# --- cat-file -p ---
+p75case "cat-file -p R" "Not a valid object name nosuch" "Not a valid object name nosuch" \
+    cat-file -p nosuch
+p75case "cat-file -p O" "Not a valid object name $P75_HEX" "Not a valid object name $P75_HEX" \
+    cat-file -p "$P75_HEX"
+p75case "cat-file -p P" "path 'nosuchfile' does not exist in 'HEAD'" "path 'nosuchfile' does not exist in 'HEAD'" \
+    cat-file -p HEAD:nosuchfile
+
+# --- cat-file -t / -s: same R/P as -p, but a DIFFERENT class-O wording ---
+p75case "cat-file -t R" "Not a valid object name nosuch" "Not a valid object name nosuch" \
+    cat-file -t nosuch
+p75case "cat-file -t O" "git cat-file: could not get object info" "sg cat-file: could not get object info" \
+    cat-file -t "$P75_HEX"
+p75case "cat-file -t P" "path 'nosuchfile' does not exist in 'HEAD'" "path 'nosuchfile' does not exist in 'HEAD'" \
+    cat-file -t HEAD:nosuchfile
+
+# --- log ---
+p75case "log R" \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    log nosuch
+p75case "log O" "bad object $P75_HEX" "bad object $P75_HEX" log "$P75_HEX"
+p75case "log P" "path 'nosuchfile' does not exist in 'HEAD'" "path 'nosuchfile' does not exist in 'HEAD'" \
+    log HEAD:nosuchfile
+p75case "log D" "ambiguous argument 'dual': both revision and filename" \
+    "ambiguous argument 'dual': both revision and filename" log dual
+p75case "log R --" "bad revision 'nosuch'" "bad revision 'nosuch'" log nosuch --
+p75case "log O --" "bad object $P75_HEX" "bad object $P75_HEX" log "$P75_HEX" --
+p75case "log P -- (P collapses into R using the WHOLE argument)" \
+    "bad revision 'HEAD:nosuchfile'" "bad revision 'HEAD:nosuchfile'" log HEAD:nosuchfile --
+
+# --- diff ---
+p75case "diff R" \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    diff nosuch
+p75case "diff O" "bad object $P75_HEX" "bad object $P75_HEX" diff "$P75_HEX"
+p75case "diff P" "path 'nosuchfile' does not exist in 'HEAD'" "path 'nosuchfile' does not exist in 'HEAD'" \
+    diff HEAD:nosuchfile
+p75case "diff D" "ambiguous argument 'dual': both revision and filename" \
+    "ambiguous argument 'dual': both revision and filename" diff dual
+p75case "diff R --" "bad revision 'nosuch'" "bad revision 'nosuch'" diff nosuch --
+p75case "diff O --" "bad object $P75_HEX" "bad object $P75_HEX" diff "$P75_HEX" --
+p75case "diff P -- (P collapses into R using the WHOLE argument)" \
+    "bad revision 'HEAD:nosuchfile'" "bad revision 'HEAD:nosuchfile'" diff HEAD:nosuchfile --
+
+# --- reset ---
+p75case "reset R" \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    reset --hard nosuch
+p75case "reset O" "Could not parse object '$P75_HEX'." "Could not parse object '$P75_HEX'." \
+    reset --hard "$P75_HEX"
+p75case "reset P" "path 'nosuchfile' does not exist in 'HEAD'" "path 'nosuchfile' does not exist in 'HEAD'" \
+    reset --hard HEAD:nosuchfile
+p75case "reset D" "ambiguous argument 'dual': both revision and filename" \
+    "ambiguous argument 'dual': both revision and filename" reset --soft dual
+p75case "reset R --" "Failed to resolve 'nosuch' as a valid revision." "Failed to resolve 'nosuch' as a valid revision." \
+    reset --hard nosuch --
+p75case "reset O -- (measured: same line as without --)" "Could not parse object '$P75_HEX'." \
+    "Could not parse object '$P75_HEX'." reset --hard "$P75_HEX" --
+p75case "reset P -- (collapses into R using the WHOLE argument)" \
+    "Failed to resolve 'HEAD:nosuchfile' as a valid revision." "Failed to resolve 'HEAD:nosuchfile' as a valid revision." \
+    reset --hard HEAD:nosuchfile --
+
+# --- reset: git's dedicated "Cannot do soft/hard reset with paths" refusal
+# for a PLAIN existing path (not also a revision) -- in scope, unlike the
+# --mixed case (a functional gap: sg has no pathspec-limited reset). ---
+p75case "reset --hard <plain existing path>" "Cannot do hard reset with paths." "Cannot do hard reset with paths." \
+    reset --hard plain.txt
+p75case "reset --soft <plain existing path>" "Cannot do soft reset with paths." "Cannot do soft reset with paths." \
+    reset --soft plain.txt
+# ...and `reset dual --` is UNAMBIGUOUS (forced revision by "--") and
+# succeeds on both sides -- the positive control for the D check above.
+(cd "$P75" && LC_ALL=C git reset dual --) > "$WORKDIR/p75_reset_dual_dd_git.out" 2>&1
+P75_RESET_DUAL_DD_GIT_RC=$?
+(cd "$P75" && "$SG" reset dual --) > "$WORKDIR/p75_reset_dual_dd_sg.out" 2>&1
+P75_RESET_DUAL_DD_SG_RC=$?
+check "phase75 reset dual -- oracle: git exits 0 (unambiguous once \"--\" forces the revision reading)" \
+    test "$P75_RESET_DUAL_DD_GIT_RC" = 0
+check "phase75 reset dual --: sg also exits 0" test "$P75_RESET_DUAL_DD_SG_RC" = 0
+
+# --- reset --hard's class-D refusal must have NO side effect, which the
+# message check above cannot see: an exit code of 1 is equally consistent
+# with "refused" and with "reset the index, then complained". The fixture
+# above cannot show the difference either -- its `dual` branch points at
+# the same commit HEAD is on, so a reset that DID go through would be a
+# no-op. This one gives `dual` an OLDER commit whose content differs, so
+# going through is visible in both HEAD and the file.
+#
+# WARNING: the working tree here is deliberately CLEAN apart from the
+# untracked `dual` file the ambiguity needs. A first version of this
+# fixture also dirtied the tracked file, and every one of these three
+# checks then stayed GREEN under a mutation that deleted the class-D
+# guard entirely -- because sg_safe_apply_tree's own dirty-worktree
+# confirmation refused the reset for a completely different reason, and a
+# refusal is a refusal from the outside. Same outcome, different reason,
+# zero discriminating power. Verified after the fix: the same mutation
+# turns all three red. ---
+P75S="$WORKDIR/phase75side"
+rm -rf "$P75S"
+(cd "$WORKDIR" && "$SG" init phase75side) > /dev/null 2>&1
+printf 'old\n' > "$P75S/f"
+(cd "$P75S" && "$SG" add f && "$SG" commit -m c1) > /dev/null 2>&1
+(cd "$P75S" && "$SG" branch dual) > /dev/null 2>&1
+printf 'new\n' > "$P75S/f"
+(cd "$P75S" && "$SG" add f && "$SG" commit -m c2) > /dev/null 2>&1
+P75S_HEAD_BEFORE=$(cd "$P75S" && "$SG" log -n 1 --pretty=format:%H)
+printf 'blocker\n' > "$P75S/dual"     # now also an existing path (untracked)
+(cd "$P75S" && "$SG" reset --hard dual) > "$WORKDIR/p75s_sg.out" 2>&1
+P75S_RC=$?
+P75S_HEAD_AFTER=$(cd "$P75S" && "$SG" log -n 1 --pretty=format:%H)
+check "phase75 reset --hard D: sg exits 1" test "$P75S_RC" = 1
+check "phase75 reset --hard D: HEAD did not move" \
+    test "$P75S_HEAD_BEFORE" = "$P75S_HEAD_AFTER"
+check "phase75 reset --hard D: the working file still holds HEAD's content, not dual's" \
+    sh -c "test \"\$(cat '$P75S/f')\" = new"
+# The same shape on git, as the oracle for "refusing is what git does here"
+# (and not, say, "git resets and sg refuses").
+P75SG="$WORKDIR/phase75sideg"
+rm -rf "$P75SG"
+mkdir -p "$P75SG"
+(cd "$P75SG" && LC_ALL=C git init -q .) > /dev/null 2>&1
+printf 'old\n' > "$P75SG/f"
+(cd "$P75SG" && git add f && git commit -qm c1) > /dev/null 2>&1
+(cd "$P75SG" && git branch dual) > /dev/null 2>&1
+printf 'new\n' > "$P75SG/f"
+(cd "$P75SG" && git add f && git commit -qm c2) > /dev/null 2>&1
+P75SG_HEAD_BEFORE=$(cd "$P75SG" && git rev-parse HEAD)
+printf 'blocker\n' > "$P75SG/dual"
+(cd "$P75SG" && LC_ALL=C git reset --hard dual) > "$WORKDIR/p75s_git.out" 2>&1
+P75SG_RC=$?
+P75SG_HEAD_AFTER=$(cd "$P75SG" && git rev-parse HEAD)
+check "phase75 reset --hard D oracle: git exits 128" test "$P75SG_RC" = 128
+check "phase75 reset --hard D oracle: git's HEAD did not move either" \
+    test "$P75SG_HEAD_BEFORE" = "$P75SG_HEAD_AFTER"
+check "phase75 reset --hard D oracle: git left the working file at HEAD's content too" \
+    sh -c "test \"\$(cat '$P75SG/f')\" = new"
+
+# --- reflog ('show' subcommand form measured identical to the bare form) ---
+p75case "reflog R" \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    reflog nosuch
+p75case "reflog show R" \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    "ambiguous argument 'nosuch': unknown revision or path not in the working tree." \
+    reflog show nosuch
+p75case "reflog O" "bad object $P75_HEX" "bad object $P75_HEX" reflog "$P75_HEX"
+p75case "reflog P" "path 'nosuchfile' does not exist in 'HEAD'" "path 'nosuchfile' does not exist in 'HEAD'" \
+    reflog HEAD:nosuchfile
+p75case "reflog D" "ambiguous argument 'dual': both revision and filename" \
+    "ambiguous argument 'dual': both revision and filename" reflog dual
+p75case "reflog show D" "ambiguous argument 'dual': both revision and filename" \
+    "ambiguous argument 'dual': both revision and filename" reflog show dual
+
+# --- reflog fix1: an ambiguous short id must get the SAME error:/hint:
+# block every other converted call site already reproduces byte for byte
+# (cmd_reflog.c used to call classify() directly without special-casing
+# -4 first, and lost the block entirely). Reuses $P68's existing 4-way
+# tag+commit+tree+blob collision fixture (P68_PREFIX) rather than building
+# a second one, same as phase69's rebase reuse above. ---
+(cd "$P68" && LC_ALL=C git reflog "$P68_PREFIX") > "$WORKDIR/p68_git_reflogamb.txt" 2>&1
+P68_GIT_REFLOGAMB_RC=$?
+(cd "$P68" && "$SG" reflog "$P68_PREFIX") > "$WORKDIR/p68_sg_reflogamb.txt" 2>&1
+P68_SG_REFLOGAMB_RC=$?
+check "phase75 fix1 oracle: precondition -- git reflog on a 4-way ambiguous prefix exits 128 with the error:/hint: block" \
+    sh -c "test $P68_GIT_REFLOGAMB_RC -eq 128 && grep -q '^error: short object ID $P68_PREFIX is ambiguous\$' '$WORKDIR/p68_git_reflogamb.txt' && grep -q '^hint: The candidates are:\$' '$WORKDIR/p68_git_reflogamb.txt'"
+check "phase75 fix1: sg reflog on the SAME ambiguous prefix now also prints the error:/hint: block (used to swallow it and print only the generic ambiguous-argument message)" \
+    sh -c "test $P68_SG_REFLOGAMB_RC -eq 1 && grep -q '^error: short object ID $P68_PREFIX is ambiguous\$' '$WORKDIR/p68_sg_reflogamb.txt' && grep -q '^hint: The candidates are:\$' '$WORKDIR/p68_sg_reflogamb.txt' && grep -qF \"ambiguous argument '$P68_PREFIX': unknown revision or path not in the working tree.\" '$WORKDIR/p68_sg_reflogamb.txt'"
+
+# --- reflog fix2: an argument that resolves fine as a REVISION but names
+# no REF (sg_rev_parse_ref_path has no ~N/^N support) must not be reported
+# as unresolvable at all -- git's own answer is not a message, an empty
+# reflog and exit 0 (the resolved commit simply has no reflog of its own).
+# HEAD~99 is the control: an out-of-range walk still IS class R and must
+# still report the AMBIG-UNKNOWN block -- without this control, "exit 0
+# for everything unresolvable" would pass too. $P75 has only ONE commit
+# (HEAD~1 would not resolve there at all), so this needs its own fixture
+# with a real parent commit. ---
+P75HT="$WORKDIR/phase75headtilde"
+rm -rf "$P75HT"
+mkdir -p "$P75HT"
+(cd "$WORKDIR" && "$SG" init phase75headtilde) > /dev/null 2>&1
+printf 'one\n' > "$P75HT/f.txt"
+(cd "$P75HT" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'two\n' > "$P75HT/f.txt"
+(cd "$P75HT" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+(cd "$P75HT" && LC_ALL=C git reflog HEAD~1) > "$WORKDIR/p75_git_reflog_head1.txt" 2>&1
+P75_GIT_REFLOG_HEAD1_RC=$?
+(cd "$P75HT" && "$SG" reflog HEAD~1) > "$WORKDIR/p75_sg_reflog_head1.txt" 2>&1
+P75_SG_REFLOG_HEAD1_RC=$?
+check "phase75 fix2 oracle: precondition -- git reflog HEAD~1 exits 0 with EMPTY output (the resolved commit has no reflog)" \
+    sh -c "test $P75_GIT_REFLOG_HEAD1_RC -eq 0 -a ! -s '$WORKDIR/p75_git_reflog_head1.txt'"
+check "phase75 fix2: sg reflog HEAD~1 also exits 0 with EMPTY output (used to falsely report the AMBIG-UNKNOWN block)" \
+    sh -c "test $P75_SG_REFLOG_HEAD1_RC -eq 0 -a ! -s '$WORKDIR/p75_sg_reflog_head1.txt'"
+(cd "$P75HT" && LC_ALL=C git reflog HEAD~99) > "$WORKDIR/p75_git_reflog_head99.txt" 2>&1
+P75_GIT_REFLOG_HEAD99_RC=$?
+(cd "$P75HT" && "$SG" reflog HEAD~99) > "$WORKDIR/p75_sg_reflog_head99.txt" 2>&1
+P75_SG_REFLOG_HEAD99_RC=$?
+check "phase75 fix2 control oracle: precondition -- git reflog HEAD~99 (out of range) exits 128 with the AMBIG-UNKNOWN block" \
+    sh -c "test $P75_GIT_REFLOG_HEAD99_RC -eq 128 && grep -qF \"ambiguous argument 'HEAD~99': unknown revision or path not in the working tree.\" '$WORKDIR/p75_git_reflog_head99.txt'"
+check "phase75 fix2 control: sg reflog HEAD~99 (out of range) still exits 1 with the AMBIG-UNKNOWN block (proves fix2 did not just make everything silent)" \
+    sh -c "test $P75_SG_REFLOG_HEAD99_RC -eq 1 && grep -qF \"ambiguous argument 'HEAD~99': unknown revision or path not in the working tree.\" '$WORKDIR/p75_sg_reflog_head99.txt'"
+
+# --- Phase75 round3 fix A: the class-D ambiguity check must win over the
+# round2 "resolves as object but names no ref" branch, for BOTH shapes that
+# reach it (a "~N" walk and a full 40-hex sha, since neither is a literal
+# ref path). $P75R3 needs a real THIRD commit (fix B below needs a
+# 3-entry reflog too, so one fixture serves both). ---
+P75R3="$WORKDIR/phase75round3"
+rm -rf "$P75R3"
+(cd "$WORKDIR" && "$SG" init phase75round3) > /dev/null 2>&1
+printf 'one\n' > "$P75R3/f.txt"
+(cd "$P75R3" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'two\n' > "$P75R3/f.txt"
+(cd "$P75R3" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+printf 'three\n' > "$P75R3/f.txt"
+(cd "$P75R3" && "$SG" add f.txt && "$SG" commit -m c3) > /dev/null 2>&1
+P75R3_HEX=$(cd "$P75R3" && git rev-parse HEAD)
+printf 'not a ref\n' > "$P75R3/HEAD~1"
+printf 'not a ref\n' > "$P75R3/$P75R3_HEX"
+
+(cd "$P75R3" && LC_ALL=C git reflog "HEAD~1") > "$WORKDIR/p75r3_git_amb1.txt" 2>&1
+P75R3_GIT_AMB1_RC=$?
+(cd "$P75R3" && "$SG" reflog "HEAD~1") > "$WORKDIR/p75r3_sg_amb1.txt" 2>&1
+P75R3_SG_AMB1_RC=$?
+check "phase75 round3 fixA oracle: git reflog HEAD~1 refuses (ambiguous, exit 128) once an untracked file named HEAD~1 exists" \
+    sh -c "test $P75R3_GIT_AMB1_RC -eq 128 && grep -qF \"ambiguous argument 'HEAD~1': both revision and filename\" '$WORKDIR/p75r3_git_amb1.txt'"
+check "phase75 round3 fixA: sg reflog HEAD~1 also refuses (used to silently exit 0 with empty output, pre-empting the ambiguity check)" \
+    sh -c "test $P75R3_SG_AMB1_RC -eq 1 && grep -qF \"ambiguous argument 'HEAD~1': both revision and filename\" '$WORKDIR/p75r3_sg_amb1.txt'"
+
+(cd "$P75R3" && LC_ALL=C git reflog "$P75R3_HEX") > "$WORKDIR/p75r3_git_amb2.txt" 2>&1
+P75R3_GIT_AMB2_RC=$?
+(cd "$P75R3" && "$SG" reflog "$P75R3_HEX") > "$WORKDIR/p75r3_sg_amb2.txt" 2>&1
+P75R3_SG_AMB2_RC=$?
+check "phase75 round3 fixA oracle: git reflog <full-sha> refuses (ambiguous, exit 128) once an untracked file with that exact name exists" \
+    sh -c "test $P75R3_GIT_AMB2_RC -eq 128 && grep -qF \"ambiguous argument '$P75R3_HEX': both revision and filename\" '$WORKDIR/p75r3_git_amb2.txt'"
+check "phase75 round3 fixA: sg reflog <full-sha> also refuses" \
+    sh -c "test $P75R3_SG_AMB2_RC -eq 1 && grep -qF \"ambiguous argument '$P75R3_HEX': both revision and filename\" '$WORKDIR/p75r3_sg_amb2.txt'"
+rm -f "$P75R3/HEAD~1" "$P75R3/$P75R3_HEX"
+
+# --- Phase75 round3 fix B: "<ref>@{N}" lists that ref's reflog starting at
+# entry N. Compares sg's output against real git BYTE-FOR-BYTE (the two
+# write bit-identical objects, so the abbreviated hashes must match too),
+# rather than a hardcoded literal -- git's own output is the oracle. HEAD@{1}
+# is included specifically because @{0} cannot tell "starts at the newest
+# entry" apart from "starts at the reversed index" (CLAUDE.md's own note on
+# sg_reflog_at); the reversed-index bug would still pass an @{0}-only test. ---
+p75r3_reflog_cmp() {
+    p75r3_label="$1"; p75r3_arg="$2"
+    (cd "$P75R3" && LC_ALL=C git reflog "$p75r3_arg") > "$WORKDIR/p75r3_cmp_git.txt" 2>&1
+    p75r3_cmp_grc=$?
+    (cd "$P75R3" && "$SG" reflog "$p75r3_arg") > "$WORKDIR/p75r3_cmp_sg.txt" 2>&1
+    p75r3_cmp_src=$?
+    check "phase75 round3 fixB ($p75r3_label): sg and git exit with the same code" \
+        test "$p75r3_cmp_grc" -eq "$p75r3_cmp_src"
+    check "phase75 round3 fixB ($p75r3_label): sg reflog $p75r3_arg output matches git byte-for-byte" \
+        cmp -s "$WORKDIR/p75r3_cmp_git.txt" "$WORKDIR/p75r3_cmp_sg.txt"
+}
+p75r3_reflog_cmp "bare HEAD (control)" "HEAD"
+p75r3_reflog_cmp "HEAD@{0}" "HEAD@{0}"
+p75r3_reflog_cmp "HEAD@{1}" "HEAD@{1}"
+p75r3_reflog_cmp "master@{0}" "master@{0}"
+p75r3_reflog_cmp "bare master (control)" "master"
+
+(cd "$P75R3" && LC_ALL=C git reflog "HEAD@{9}") > "$WORKDIR/p75r3_git_oob.txt" 2>&1
+P75R3_GIT_OOB_RC=$?
+(cd "$P75R3" && "$SG" reflog "HEAD@{9}") > "$WORKDIR/p75r3_sg_oob.txt" 2>&1
+P75R3_SG_OOB_RC=$?
+check "phase75 round3 fixB oracle: git reflog HEAD@{9} (out of range) exits 128 with \"log for 'HEAD' only has 3 entries\"" \
+    sh -c "test $P75R3_GIT_OOB_RC -eq 128 && grep -qF \"fatal: log for 'HEAD' only has 3 entries\" '$WORKDIR/p75r3_git_oob.txt'"
+# The sg side pins the WHOLE line, "sg: " prefix included, precisely
+# because the first version of this code printed "sg: fatal: log for ..." --
+# two prefixes for the same field. A check that greps only for the sentence
+# is blind to that, which is how it shipped through a green interop run.
+check "phase75 round3 fixB: sg reflog HEAD@{9} exits 1 with git's sentence under sg's OWN prefix, not a doubled \"sg: fatal: \" (used to silently exit 0 with empty output)" \
+    sh -c "test $P75R3_SG_OOB_RC -eq 1 && grep -qxF \"sg: log for 'HEAD' only has 3 entries\" '$WORKDIR/p75r3_sg_oob.txt' && ! grep -q 'sg: fatal:' '$WORKDIR/p75r3_sg_oob.txt'"
+
+# --- Phase75 round4: the rest of the "@{N}" family found by boundary
+# probing round3's own feature -- a BARE "@{N}" (fix 1), a "~"/"^" suffix
+# after "@{N}" (fix 2), and a ref whose log is EMPTY: a tag (which never has
+# one) or a branch's log file deleted by hand (fix 3). $P75R4's current
+# branch (master) picks up two "checkout: moving ..." round-trips AFTER its
+# three commits, which land ONLY in logs/HEAD, never in logs/refs/heads/
+# master -- this is what makes an over-broad fix (the bare form reading
+# HEAD's log instead of the current branch's own) actually turn a check red
+# below: HEAD's @{0} would be a "checkout: moving ..." line, the branch's
+# own @{0} is "commit: c3". ---
+P75R4="$WORKDIR/phase75round4"
+rm -rf "$P75R4"
+(cd "$WORKDIR" && "$SG" init phase75round4) > /dev/null 2>&1
+printf 'one\n' > "$P75R4/f.txt"
+(cd "$P75R4" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'two\n' > "$P75R4/f.txt"
+(cd "$P75R4" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+printf 'three\n' > "$P75R4/f.txt"
+(cd "$P75R4" && "$SG" add f.txt && "$SG" commit -m c3) > /dev/null 2>&1
+(cd "$P75R4" && "$SG" branch side) > /dev/null 2>&1
+(cd "$P75R4" && "$SG" tag lighttag) > /dev/null 2>&1
+(cd "$P75R4" && "$SG" tag -a anntag -m anntag) > /dev/null 2>&1
+(cd "$P75R4" && "$SG" branch nolog) > /dev/null 2>&1
+rm -f "$P75R4/.git/logs/refs/heads/nolog"
+(cd "$P75R4" && "$SG" switch side) > /dev/null 2>&1
+(cd "$P75R4" && "$SG" switch master) > /dev/null 2>&1
+
+# fix 1: a bare "@{N}" reads the CURRENT branch's log, byte-for-byte
+# comparison against real git (same convention as round3 fixB, and for the
+# same reason -- the abbreviated hashes have to match too).
+p75r4_reflog_cmp() {
+    p75r4_label="$1"; p75r4_arg="$2"
+    (cd "$P75R4" && LC_ALL=C git reflog "$p75r4_arg") > "$WORKDIR/p75r4_cmp_git.txt" 2>&1
+    p75r4_cmp_grc=$?
+    (cd "$P75R4" && "$SG" reflog "$p75r4_arg") > "$WORKDIR/p75r4_cmp_sg.txt" 2>&1
+    p75r4_cmp_src=$?
+    check "phase75 round4 fix1 ($p75r4_label): sg and git exit with the same code" \
+        test "$p75r4_cmp_grc" -eq "$p75r4_cmp_src"
+    check "phase75 round4 fix1 ($p75r4_label): sg reflog $p75r4_arg output matches git byte-for-byte" \
+        cmp -s "$WORKDIR/p75r4_cmp_git.txt" "$WORKDIR/p75r4_cmp_sg.txt"
+}
+p75r4_reflog_cmp "@{0}" "@{0}"
+p75r4_reflog_cmp "@{2}" "@{2}"
+
+(cd "$P75R4" && LC_ALL=C git reflog "@{9}") > "$WORKDIR/p75r4_git_bare_oob.txt" 2>&1
+P75R4_GIT_BARE_OOB_RC=$?
+(cd "$P75R4" && "$SG" reflog "@{9}") > "$WORKDIR/p75r4_sg_bare_oob.txt" 2>&1
+P75R4_SG_BARE_OOB_RC=$?
+check "phase75 round4 fix1 oracle: git reflog @{9} (out of range) exits 128 with \"log for 'master' only has 3 entries\" (names the BRANCH, not HEAD)" \
+    sh -c "test $P75R4_GIT_BARE_OOB_RC -eq 128 && grep -qF \"fatal: log for 'master' only has 3 entries\" '$WORKDIR/p75r4_git_bare_oob.txt'"
+check "phase75 round4 fix1: sg reflog @{9} exits 1 with the same sentence under sg's own prefix (used to silently exit 0 with empty output)" \
+    sh -c "test $P75R4_SG_BARE_OOB_RC -eq 1 && grep -qxF \"sg: log for 'master' only has 3 entries\" '$WORKDIR/p75r4_sg_bare_oob.txt'"
+
+# fix1, detached HEAD. Round 4 pinned this on sg's side only, believing git
+# had not been measured for the combination; it has been since, and git DOES
+# have an answer -- on a detached HEAD a bare "@{N}" reads HEAD's own log,
+# labels the entries "HEAD@{N}" (not "refs/heads/...@{N}"), and names HEAD in
+# the out-of-range sentence. So this is a both-sides pin now, and the
+# sg-only refusal it replaced is gone. A byte-for-byte cmp is the check:
+# every field here (the label, the abbreviated ids, the messages) comes from
+# the same reflog both tools wrote, so anything less than cmp would let the
+# label field drift.
+P75R4_DETACHED_TARGET=$(cd "$P75R4" && "$SG" log --format=%H -1 master)
+(cd "$P75R4" && "$SG" switch --detach "$P75R4_DETACHED_TARGET") > /dev/null 2>&1
+(cd "$P75R4" && LC_ALL=C git reflog "@{0}") > "$WORKDIR/p75r4_git_bare_detached.txt" 2>&1
+P75R4_GIT_BARE_DETACHED_RC=$?
+(cd "$P75R4" && "$SG" reflog "@{0}") > "$WORKDIR/p75r4_sg_bare_detached.txt" 2>&1
+P75R4_SG_BARE_DETACHED_RC=$?
+check "phase75 round4 fix1 oracle (detached HEAD): git reflog @{0} exits 0 and prints HEAD's own log, labeled HEAD@{N}" \
+    sh -c "test $P75R4_GIT_BARE_DETACHED_RC -eq 0 -a -s '$WORKDIR/p75r4_git_bare_detached.txt' && grep -q 'HEAD@{0}:' '$WORKDIR/p75r4_git_bare_detached.txt' && ! grep -q 'refs/heads/' '$WORKDIR/p75r4_git_bare_detached.txt'"
+check "phase75 round4 fix1 (detached HEAD): sg reflog @{0} matches git byte-for-byte (round 4 refused here instead, on a guess about git)" \
+    sh -c "test $P75R4_SG_BARE_DETACHED_RC -eq 0 && cmp -s '$WORKDIR/p75r4_git_bare_detached.txt' '$WORKDIR/p75r4_sg_bare_detached.txt'"
+# ...and the out-of-range sentence on a detached HEAD names HEAD, not a
+# branch -- the field that tells the fallback apart from the attached case.
+(cd "$P75R4" && LC_ALL=C git reflog "@{99}") > "$WORKDIR/p75r4_git_det_oob.txt" 2>&1
+P75R4_GIT_DET_OOB_RC=$?
+(cd "$P75R4" && "$SG" reflog "@{99}") > "$WORKDIR/p75r4_sg_det_oob.txt" 2>&1
+P75R4_SG_DET_OOB_RC=$?
+check "phase75 round4 fix1 oracle (detached HEAD): git reflog @{99} names HEAD in the out-of-range sentence" \
+    sh -c "test $P75R4_GIT_DET_OOB_RC -eq 128 && grep -q \"^fatal: log for 'HEAD' only has [0-9]* entries\$\" '$WORKDIR/p75r4_git_det_oob.txt'"
+check "phase75 round4 fix1 (detached HEAD): sg reflog @{99} names HEAD too, under sg's own prefix" \
+    sh -c "test $P75R4_SG_DET_OOB_RC -eq 1 && grep -q \"^sg: log for 'HEAD' only has [0-9]* entries\$\" '$WORKDIR/p75r4_sg_det_oob.txt'"
+(cd "$P75R4" && "$SG" switch master) > /dev/null 2>&1
+
+# ...and an UNBORN HEAD (a fresh repo, no commits) is the third state this
+# branch has to handle. Measured: both tools refuse with the
+# ambiguous-argument block. This is the check the explicit guard in the bare
+# branch exists for -- without it, "@{0}" resolves as a commit through
+# sg_rev_parse_object's own detached-HEAD fallback to logs/HEAD and lands in
+# the "resolves as an object, print nothing" branch, i.e. exit 0 with empty
+# output, which no message check would notice.
+P75R4U="$WORKDIR/phase75round4unborn"
+rm -rf "$P75R4U"
+mkdir -p "$P75R4U"
+(cd "$P75R4U" && LC_ALL=C git init -q .) > /dev/null 2>&1
+(cd "$P75R4U" && LC_ALL=C git reflog "@{0}") > "$WORKDIR/p75r4u_git.txt" 2>&1
+P75R4U_GIT_RC=$?
+P75R4USG="$WORKDIR/phase75round4unbornsg"
+rm -rf "$P75R4USG"
+(cd "$WORKDIR" && "$SG" init phase75round4unbornsg) > /dev/null 2>&1
+(cd "$P75R4USG" && "$SG" reflog "@{0}") > "$WORKDIR/p75r4u_sg.txt" 2>&1
+P75R4U_SG_RC=$?
+check "phase75 round4 fix1 oracle (unborn HEAD): git reflog @{0} refuses with the ambiguous-argument block" \
+    sh -c "test $P75R4U_GIT_RC -eq 128 && grep -qF \"ambiguous argument '@{0}': unknown revision or path not in the working tree.\" '$WORKDIR/p75r4u_git.txt'"
+check "phase75 round4 fix1 (unborn HEAD): sg reflog @{0} refuses with the same sentence, and does NOT exit 0 with empty output" \
+    sh -c "test $P75R4U_SG_RC -eq 1 && grep -qF \"ambiguous argument '@{0}': unknown revision or path not in the working tree.\" '$WORKDIR/p75r4u_sg.txt'"
+
+# round6: the BARE form on a current branch whose log file was DELETED is
+# git's own asymmetry, and all four cells below disagree with each other --
+# which is exactly why each one needs its own check. Measured (current branch
+# `nolog`, its logs/refs/heads/nolog removed): `@{0}` exits 0 printing
+# nothing; `@{1}` exits 128 with "log for refs/heads/nolog is empty", the
+# only sentence in this phase's whole matrix that names a FULL ref path; the
+# spelled-out `nolog@{0}` refuses with the ambiguous-argument block instead;
+# and a bare `sg reflog` still prints logs/HEAD's own three entries. The
+# last two are the controls: they are what tell "sg reproduced git's
+# asymmetry" apart from "sg made the whole area silent".
+P75R6="$WORKDIR/phase75round6"
+rm -rf "$P75R6"
+(cd "$WORKDIR" && "$SG" init phase75round6) > /dev/null 2>&1
+printf 'one\n' > "$P75R6/f.txt"
+(cd "$P75R6" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'two\n' > "$P75R6/f.txt"
+(cd "$P75R6" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+(cd "$P75R6" && "$SG" branch nolog && "$SG" switch nolog) > /dev/null 2>&1
+rm -f "$P75R6/.git/logs/refs/heads/nolog"
+p75r6case() {
+    p75r6_label="$1"; p75r6_expect_rc="$2"; p75r6_expect_line="$3"; shift 3
+    (cd "$P75R6" && LC_ALL=C git "$@") > "$WORKDIR/p75r6_git.out" 2>&1
+    p75r6_grc=$?
+    (cd "$P75R6" && "$SG" "$@") > "$WORKDIR/p75r6_sg.out" 2>&1
+    p75r6_src=$?
+    if [ -z "$p75r6_expect_line" ]; then
+        check "phase75 round6 oracle ($p75r6_label): git exits 0 with EMPTY output" \
+            sh -c "test $p75r6_grc -eq 0 -a ! -s '$WORKDIR/p75r6_git.out'"
+        check "phase75 round6 ($p75r6_label): sg exits 0 with EMPTY output too" \
+            sh -c "test $p75r6_src -eq 0 -a ! -s '$WORKDIR/p75r6_sg.out'"
+    else
+        check "phase75 round6 oracle ($p75r6_label): git exits 128 saying \"$p75r6_expect_line\"" \
+            sh -c "test $p75r6_grc -eq 128 && grep -qxF \"fatal: $p75r6_expect_line\" '$WORKDIR/p75r6_git.out'"
+        check "phase75 round6 ($p75r6_label): sg exits 1 with the same sentence under its own prefix" \
+            sh -c "test $p75r6_src -eq $p75r6_expect_rc && grep -qxF \"sg: $p75r6_expect_line\" '$WORKDIR/p75r6_sg.out'"
+    fi
+}
+# ...and the CORRUPT-HEAD state, which the bare branch also has to handle and
+# which nothing else in this group reaches. This is a DIVERGENCE pinned on
+# both sides, not an agreement: git validates HEAD at startup and refuses the
+# whole repository ("not a git repository"), while sg reads logs/HEAD and
+# lists it -- sg's deliberate tolerance of a corrupt HEAD, which is wider
+# than reflog (see docs/RULES-refs-revparse.md) and is NOT this phase's to
+# change. The pin exists so that a future edit to the bare-@{N} branch cannot
+# silently turn sg's answer here into the "resolves as an object, print
+# nothing" silence without a named check going red.
+P75R6C="$WORKDIR/phase75round6corrupt"
+rm -rf "$P75R6C"
+(cd "$WORKDIR" && "$SG" init phase75round6corrupt) > /dev/null 2>&1
+printf 'one\n' > "$P75R6C/f.txt"
+(cd "$P75R6C" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'garbage not a ref\n' > "$P75R6C/.git/HEAD"
+(cd "$P75R6C" && LC_ALL=C git reflog "@{0}") > "$WORKDIR/p75r6c_git.out" 2>&1
+P75R6C_GIT_RC=$?
+(cd "$P75R6C" && "$SG" reflog "@{0}") > "$WORKDIR/p75r6c_sg.out" 2>&1
+P75R6C_SG_RC=$?
+check "phase75 round6 oracle (corrupt HEAD, divergence): git refuses the whole repository" \
+    sh -c "test $P75R6C_GIT_RC -eq 128 && grep -q 'not a git repository' '$WORKDIR/p75r6c_git.out'"
+check "phase75 round6 (corrupt HEAD, divergence): sg tolerates it and lists logs/HEAD instead of going silent" \
+    sh -c "test $P75R6C_SG_RC -eq 0 -a -s '$WORKDIR/p75r6c_sg.out' && grep -q 'HEAD@{0}:' '$WORKDIR/p75r6c_sg.out'"
+
+# The blind spot a cold read named: corrupt HEAD AND an empty logs/HEAD --
+# the one (at_bare, HEAD-fallback, count==0) combination nothing else here
+# reaches, because the fixture above deliberately commits first so its
+# logs/HEAD is NOT empty. Measured both ways in (no commits at all / one
+# commit then logs/HEAD deleted) and the answers are identical, so one
+# fixture covers it: git refuses the repository outright, while sg gives the
+# same two answers its empty-log rule gives anywhere else (`@{0}` silent and
+# exit 0, `@{1}` naming HEAD). The pin is the point -- before it, that state
+# was a code path with no check looking at it at all, which is not the same
+# thing as a redundant guard.
+P75R6CE="$WORKDIR/phase75round6corruptempty"
+rm -rf "$P75R6CE"
+(cd "$WORKDIR" && "$SG" init phase75round6corruptempty) > /dev/null 2>&1
+printf 'garbage not a ref\n' > "$P75R6CE/.git/HEAD"
+(cd "$P75R6CE" && LC_ALL=C git reflog "@{0}") > "$WORKDIR/p75r6ce_git0.out" 2>&1
+P75R6CE_GIT0_RC=$?
+(cd "$P75R6CE" && "$SG" reflog "@{0}") > "$WORKDIR/p75r6ce_sg0.out" 2>&1
+P75R6CE_SG0_RC=$?
+(cd "$P75R6CE" && "$SG" reflog "@{1}") > "$WORKDIR/p75r6ce_sg1.out" 2>&1
+P75R6CE_SG1_RC=$?
+(cd "$P75R6CE" && LC_ALL=C git reflog "@{1}") > "$WORKDIR/p75r6ce_git1.out" 2>&1
+P75R6CE_GIT1_RC=$?
+# Both selectors get their OWN git-side check. The first version of this
+# block ran only "@{0}" on the git side while its check's NAME claimed "for
+# either selector" -- true today, but unpinned, so a future git that changed
+# only "@{1}" in this state would have slipped through a check that says it
+# covers both. A cold read caught the over-claim.
+check "phase75 round6 oracle (corrupt HEAD + empty log, @{0}): git refuses the repository" \
+    sh -c "test $P75R6CE_GIT0_RC -eq 128 && grep -q 'not a git repository' '$WORKDIR/p75r6ce_git0.out'"
+check "phase75 round6 oracle (corrupt HEAD + empty log, @{1}): git refuses the repository for this selector too" \
+    sh -c "test $P75R6CE_GIT1_RC -eq 128 && grep -q 'not a git repository' '$WORKDIR/p75r6ce_git1.out'"
+check "phase75 round6 (corrupt HEAD + empty log): sg's @{0} is silent with exit 0, the same as its empty-log rule everywhere else" \
+    sh -c "test $P75R6CE_SG0_RC -eq 0 -a ! -s '$WORKDIR/p75r6ce_sg0.out'"
+check "phase75 round6 (corrupt HEAD + empty log): sg's @{1} names HEAD, and does NOT fall into the silent branch" \
+    sh -c "test $P75R6CE_SG1_RC -eq 1 && grep -qxF 'sg: log for HEAD is empty' '$WORKDIR/p75r6ce_sg1.out'"
+
+p75r6case "bare @{0}, current branch's log deleted" 0 "" reflog "@{0}"
+p75r6case "bare @{1}, same branch (names the FULL ref path)" 1 "log for refs/heads/nolog is empty" reflog "@{1}"
+
+# The same empty-log shape one state over: a DETACHED HEAD whose logs/HEAD
+# was deleted. This is the state a cold read asked about, and sg's code
+# turned out to answer it correctly already -- which is exactly why it needs
+# pinning: "happens to be right" and "cannot silently stop being right" are
+# different things. Measured, all four cells: `@{0}` exit 0 and silent;
+# `@{1}` exit 128 "fatal: log for HEAD is empty" (HEAD is both the short name
+# and the full path here, so this cell does NOT discriminate the
+# full-path-vs-short-name field -- the nolog cells above are the ones that
+# do); the spelled-out `HEAD@{0}` refuses with the ambiguous-argument block;
+# a bare `reflog` is silent too.
+P75R6D="$WORKDIR/phase75round6detempty"
+rm -rf "$P75R6D"
+(cd "$WORKDIR" && "$SG" init phase75round6detempty) > /dev/null 2>&1
+printf 'one\n' > "$P75R6D/f.txt"
+(cd "$P75R6D" && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+printf 'two\n' > "$P75R6D/f.txt"
+(cd "$P75R6D" && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+P75R6D_SHA=$(cd "$P75R6D" && "$SG" log --format=%H -1)
+(cd "$P75R6D" && "$SG" switch --detach "$P75R6D_SHA") > /dev/null 2>&1
+rm -f "$P75R6D/.git/logs/HEAD"
+p75r6dcase() {
+    p75r6d_label="$1"; p75r6d_line="$2"; shift 2
+    (cd "$P75R6D" && LC_ALL=C git "$@") > "$WORKDIR/p75r6d_git.out" 2>&1
+    p75r6d_grc=$?
+    (cd "$P75R6D" && "$SG" "$@") > "$WORKDIR/p75r6d_sg.out" 2>&1
+    p75r6d_src=$?
+    if [ -z "$p75r6d_line" ]; then
+        check "phase75 round6 oracle (detached, logs/HEAD deleted, $p75r6d_label): git exits 0 with EMPTY output" \
+            sh -c "test $p75r6d_grc -eq 0 -a ! -s '$WORKDIR/p75r6d_git.out'"
+        check "phase75 round6 (detached, logs/HEAD deleted, $p75r6d_label): sg exits 0 with EMPTY output too" \
+            sh -c "test $p75r6d_src -eq 0 -a ! -s '$WORKDIR/p75r6d_sg.out'"
+    else
+        check "phase75 round6 oracle (detached, logs/HEAD deleted, $p75r6d_label): git exits 128 saying \"$p75r6d_line\"" \
+            sh -c "test $p75r6d_grc -eq 128 && grep -qF \"fatal: $p75r6d_line\" '$WORKDIR/p75r6d_git.out'"
+        check "phase75 round6 (detached, logs/HEAD deleted, $p75r6d_label): sg exits 1 with the same sentence" \
+            sh -c "test $p75r6d_src -eq 1 && grep -qF \"sg: $p75r6d_line\" '$WORKDIR/p75r6d_sg.out'"
+    fi
+}
+p75r6dcase "bare @{0}" "" reflog "@{0}"
+p75r6dcase "bare @{1}" "log for HEAD is empty" reflog "@{1}"
+p75r6dcase "spelled-out HEAD@{0} still refuses" "ambiguous argument 'HEAD@{0}': unknown revision" reflog "HEAD@{0}"
+p75r6dcase "a bare reflog is silent too" "" reflog
+# control 1: the spelled-out form refuses instead of being silent or "empty"
+(cd "$P75R6" && LC_ALL=C git reflog nolog@{0}) > "$WORKDIR/p75r6_git_named.out" 2>&1
+P75R6_GIT_NAMED_RC=$?
+(cd "$P75R6" && "$SG" reflog nolog@{0}) > "$WORKDIR/p75r6_sg_named.out" 2>&1
+P75R6_SG_NAMED_RC=$?
+check "phase75 round6 control oracle: git reflog nolog@{0} (spelled out) refuses with the ambiguous-argument block, NOT \"is empty\"" \
+    sh -c "test $P75R6_GIT_NAMED_RC -eq 128 && grep -qF \"ambiguous argument 'nolog@{0}': unknown revision\" '$WORKDIR/p75r6_git_named.out'"
+check "phase75 round6 control: sg reflog nolog@{0} refuses the same way (the bare form and the spelled-out form must NOT converge)" \
+    sh -c "test $P75R6_SG_NAMED_RC -eq 1 && grep -qF \"ambiguous argument 'nolog@{0}': unknown revision\" '$WORKDIR/p75r6_sg_named.out'"
+# control 2: a bare `reflog` still reads logs/HEAD, which is NOT empty
+(cd "$P75R6" && LC_ALL=C git reflog) > "$WORKDIR/p75r6_git_bare.out" 2>&1
+(cd "$P75R6" && "$SG" reflog) > "$WORKDIR/p75r6_sg_bare.out" 2>&1
+check "phase75 round6 control: a bare sg reflog still lists logs/HEAD's entries, byte-for-byte with git (nothing about this fixture made the command silent)" \
+    sh -c "cmp -s '$WORKDIR/p75r6_git_bare.out' '$WORKDIR/p75r6_sg_bare.out' && test -s '$WORKDIR/p75r6_sg_bare.out'"
+
+# fix 2: a "~"/"^" suffix after "@{N}" is IGNORED entirely for the listing
+# (byte-identical to the same argument without it) -- do NOT walk it.
+p75r4_reflog_cmp "HEAD@{1}^ (fix2)" "HEAD@{1}^"
+p75r4_reflog_cmp "HEAD@{0}~1 (fix2)" "HEAD@{0}~1"
+
+# fix 2 control -- "already correct" per this phase's own spec, but this
+# project had NO check anywhere pinning it before this line (measured: a
+# mutation loosening the suffix scan to swallow ANY trailing text, including
+# a second "@{...}", stayed fully green across the whole interop suite
+# without this check). Two "@{N}" occurrences must NOT collapse into
+# "the first one is the real one, the rest is an ignorable suffix" --
+# real git treats a second "@{" as making the whole thing an unresolvable,
+# ambiguous argument, not as a suffix to discard.
+(cd "$P75R4" && LC_ALL=C git reflog "HEAD@{2}@{1}") > "$WORKDIR/p75r4_git_dualat.txt" 2>&1
+P75R4_GIT_DUALAT_RC=$?
+(cd "$P75R4" && "$SG" reflog "HEAD@{2}@{1}") > "$WORKDIR/p75r4_sg_dualat.txt" 2>&1
+P75R4_SG_DUALAT_RC=$?
+check "phase75 round4 fix2 control oracle: git reflog HEAD@{2}@{1} (a second \"@{\") refuses (ambiguous argument, exit 128), NOT read as a suffix to discard" \
+    sh -c "test $P75R4_GIT_DUALAT_RC -eq 128 && grep -qF \"ambiguous argument 'HEAD@{2}@{1}': unknown revision or path not in the working tree.\" '$WORKDIR/p75r4_git_dualat.txt'"
+check "phase75 round4 fix2 control: sg reflog HEAD@{2}@{1} also refuses with the same sentence (proves fix2's suffix grammar does not over-swallow a second \"@{\")" \
+    sh -c "test $P75R4_SG_DUALAT_RC -eq 1 && grep -qF \"ambiguous argument 'HEAD@{2}@{1}': unknown revision or path not in the working tree.\" '$WORKDIR/p75r4_sg_dualat.txt'"
+
+# fix 3: a ref whose log is EMPTY (a tag, which never has one, or a
+# branch's log file deleted by hand) does not resolve as "@{N}" at all --
+# the class-R AMBIG-UNKNOWN block, the same thing "sg log <ref>@{0}"
+# already prints, NOT a made-up "only has 0 entries" sentence.
+for p75r4_empty in lighttag anntag nolog; do
+    (cd "$P75R4" && LC_ALL=C git reflog "${p75r4_empty}@{0}") > "$WORKDIR/p75r4_git_empty.txt" 2>&1
+    p75r4_empty_grc=$?
+    (cd "$P75R4" && "$SG" reflog "${p75r4_empty}@{0}") > "$WORKDIR/p75r4_sg_empty.txt" 2>&1
+    p75r4_empty_src=$?
+    check "phase75 round4 fix3 oracle ($p75r4_empty@{0}): git refuses (ambiguous argument, exit 128) rather than reading a nonexistent log" \
+        sh -c "test $p75r4_empty_grc -eq 128 && grep -qF \"ambiguous argument '${p75r4_empty}@{0}': unknown revision or path not in the working tree.\" '$WORKDIR/p75r4_git_empty.txt'"
+    check "phase75 round4 fix3 ($p75r4_empty@{0}): sg also refuses with the same class-R message (used to invent \"log for '$p75r4_empty' only has 0 entries\")" \
+        sh -c "test $p75r4_empty_src -eq 1 && grep -qF \"ambiguous argument '${p75r4_empty}@{0}': unknown revision or path not in the working tree.\" '$WORKDIR/p75r4_sg_empty.txt'"
+done
+
+# fix3 control: a REAL out-of-range "@{N}" on a NON-empty log still prints
+# git's "only has N entries" sentence -- keeps the two halves of the rule
+# (empty log vs. non-empty-but-out-of-range) as visibly different checks.
+(cd "$P75R4" && LC_ALL=C git reflog "side@{1}") > "$WORKDIR/p75r4_git_side1.txt" 2>&1
+P75R4_GIT_SIDE1_RC=$?
+(cd "$P75R4" && "$SG" reflog "side@{1}") > "$WORKDIR/p75r4_sg_side1.txt" 2>&1
+P75R4_SG_SIDE1_RC=$?
+check "phase75 round4 fix3 control oracle: git reflog side@{1} (1-entry log, N=1 out of range) exits 128 with \"log for 'side' only has 1 entries\"" \
+    sh -c "test $P75R4_GIT_SIDE1_RC -eq 128 && grep -qF \"fatal: log for 'side' only has 1 entries\" '$WORKDIR/p75r4_git_side1.txt'"
+check "phase75 round4 fix3 control: sg reflog side@{1} also exits 1 with the same sentence (proves fix3 did not turn EVERY out-of-range case into the class-R message)" \
+    sh -c "test $P75R4_SG_SIDE1_RC -eq 1 && grep -qxF \"sg: log for 'side' only has 1 entries\" '$WORKDIR/p75r4_sg_side1.txt'"
+
+# record-and-pin (not fixed): "HEAD@{+1}"/"HEAD@{ 1}" -- sg's own "@{N}"
+# grammar (revparse.h) refuses both while git accepts them; matching git
+# here would make "sg reflog" alone more tolerant than "sg log", a new
+# internal inconsistency judged worse than the divergence. Pinned as an
+# sg-only check (no git oracle line -- the point being pinned is sg's OWN
+# refusal, not agreement with git).
+for p75r4_tolerant in "HEAD@{+1}" "HEAD@{ 1}"; do
+    (cd "$P75R4" && "$SG" reflog "$p75r4_tolerant") > "$WORKDIR/p75r4_sg_tolerant.txt" 2>&1
+    p75r4_tolerant_rc=$?
+    check "phase75 round4 record-and-pin ($p75r4_tolerant, sg-only): sg refuses with the class-R message rather than adopting git's more tolerant grammar" \
+        sh -c "test $p75r4_tolerant_rc -eq 1 && grep -qF \"ambiguous argument '$p75r4_tolerant': unknown revision or path not in the working tree.\" '$WORKDIR/p75r4_sg_tolerant.txt'"
+done
+
+# record-and-pin (not fixed): "HEAD@{1 }" is git's OWN "@{<date>}" grammar
+# (a trailing space makes git read the braces' content as a date selector),
+# which revparse.h already documents sg does not implement. The pin is
+# about the DATE grammar, not about whitespace tolerance.
+(cd "$P75R4" && "$SG" reflog "HEAD@{1 }") > "$WORKDIR/p75r4_sg_date.txt" 2>&1
+P75R4_SG_DATE_RC=$?
+check "phase75 round4 record-and-pin (HEAD@{1 }, sg-only, date grammar not whitespace): sg refuses with the class-R message" \
+    sh -c "test $P75R4_SG_DATE_RC -eq 1 && grep -qF \"ambiguous argument 'HEAD@{1 }': unknown revision or path not in the working tree.\" '$WORKDIR/p75r4_sg_date.txt'"
+
+# record-and-pin (not fixed): N overflows an unsigned long. git silently
+# exits 0 with no output; reproducing that would be reproducing a bug (an
+# absurd index silently "succeeding"). sg keeps its own out-of-range
+# sentence, the SAME answer any other out-of-range N gets -- naming
+# whatever HEAD's ACTUAL entry count is at this point in the fixture (it is
+# no longer 3: the fix1/fix2 checks above added checkout round-trips to
+# logs/HEAD that never touch logs/refs/heads/master), read from git's own
+# `reflog HEAD` line count rather than hardcoded, so this check does not
+# quietly go stale the next time an earlier step in this fixture changes
+# how many checkouts happen before it.
+P75R4_HEAD_COUNT=$(cd "$P75R4" && LC_ALL=C git reflog HEAD | wc -l | tr -d ' ')
+(cd "$P75R4" && LC_ALL=C git reflog "HEAD@{99999999999999999999}") > "$WORKDIR/p75r4_git_overflow.txt" 2>&1
+P75R4_GIT_OVERFLOW_RC=$?
+(cd "$P75R4" && "$SG" reflog "HEAD@{99999999999999999999}") > "$WORKDIR/p75r4_sg_overflow.txt" 2>&1
+P75R4_SG_OVERFLOW_RC=$?
+check "phase75 round4 record-and-pin oracle: git reflog HEAD@{99999999999999999999} (N overflows) exits 0 with EMPTY output" \
+    sh -c "test $P75R4_GIT_OVERFLOW_RC -eq 0 && ! test -s '$WORKDIR/p75r4_git_overflow.txt'"
+check "phase75 round4 record-and-pin: sg reflog HEAD@{99999999999999999999} still exits 1 with its own out-of-range sentence (deliberately NOT reproducing git's silent success)" \
+    sh -c "test $P75R4_SG_OVERFLOW_RC -eq 1 && grep -qxF \"sg: log for 'HEAD' only has $P75R4_HEAD_COUNT entries\" '$WORKDIR/p75r4_sg_overflow.txt'"
+
+# --- merge-base (both positions name the same wording) ---
+p75case "merge-base R" "Not a valid object name nosuch" "Not a valid object name nosuch" \
+    merge-base nosuch HEAD
+p75case "merge-base O" "Not a valid commit name $P75_HEX" "Not a valid commit name $P75_HEX" \
+    merge-base "$P75_HEX" HEAD
+p75case "merge-base P" "Not a valid object name HEAD:nosuchfile" "Not a valid object name HEAD:nosuchfile" \
+    merge-base HEAD:nosuchfile HEAD
+
+# --- merge-base fix4: the comment above claims both argument POSITIONS
+# give the same wording, but every case above put the bad argument
+# first -- add position 2 to actually make that comment true. ---
+p75case "merge-base R (position 2)" "Not a valid object name nosuch" "Not a valid object name nosuch" \
+    merge-base HEAD nosuch
+p75case "merge-base O (position 2)" "Not a valid commit name $P75_HEX" "Not a valid commit name $P75_HEX" \
+    merge-base HEAD "$P75_HEX"
+p75case "merge-base P (position 2)" "Not a valid object name HEAD:nosuchfile" "Not a valid object name HEAD:nosuchfile" \
+    merge-base HEAD HEAD:nosuchfile
+
+# --- cherry-pick / revert (identical mechanism -- pick.c is shared, but
+# "shares a function" is not "shares a test" -- fix4: revert only had its
+# R cell checked, add O and P too, same wordings as cherry-pick's. ---
+p75case "cherry-pick R" "bad revision 'nosuch'" "bad revision 'nosuch'" cherry-pick nosuch
+p75case "cherry-pick O" "bad object $P75_HEX" "bad object $P75_HEX" cherry-pick "$P75_HEX"
+p75case "cherry-pick P" "bad revision 'HEAD:nosuchfile'" "bad revision 'HEAD:nosuchfile'" \
+    cherry-pick HEAD:nosuchfile
+p75case "revert R" "bad revision 'nosuch'" "bad revision 'nosuch'" revert nosuch
+p75case "revert O" "bad object $P75_HEX" "bad object $P75_HEX" revert "$P75_HEX"
+p75case "revert P" "bad revision 'HEAD:nosuchfile'" "bad revision 'HEAD:nosuchfile'" \
+    revert HEAD:nosuchfile
+
+# --- rebase <upstream>: ONE wording regardless of class (measured) ---
+p75case "rebase R" "invalid upstream 'nosuch'" "invalid upstream 'nosuch'" rebase nosuch
+p75case "rebase O" "invalid upstream '$P75_HEX'" "invalid upstream '$P75_HEX'" rebase "$P75_HEX"
+p75case "rebase P" "invalid upstream 'HEAD:nosuchfile'" "invalid upstream 'HEAD:nosuchfile'" \
+    rebase HEAD:nosuchfile
+
+# --- switch: R and P already matched git before this phase, O did NOT.
+# The R/P checks are the CONTROL here: they are what tells a future
+# "switch now reports everything as a tree read" mistake apart from the
+# one cell that actually had to change. `git restore --source` and `git
+# checkout` were measured to give the identical O line; sg has neither. ---
+p75case "switch R" "invalid reference: nosuch" "invalid reference: nosuch" \
+    switch --detach nosuch
+p75case "switch O (the cell this phase fixed: was 'invalid reference')" \
+    "unable to read tree ($P75_HEX)" "unable to read tree ($P75_HEX)" \
+    switch --detach "$P75_HEX"
+p75case "switch P" "invalid reference: HEAD:nosuchfile" "invalid reference: HEAD:nosuchfile" \
+    switch --detach HEAD:nosuchfile
+p75case "switch O without --detach (same line: the tree read happens either way)" \
+    "unable to read tree ($P75_HEX)" "unable to read tree ($P75_HEX)" \
+    switch "$P75_HEX"
+p75case "switch R without --detach" "invalid reference: nosuch" "invalid reference: nosuch" \
+    switch nosuch
+
+# --- fix3: the new class-D check (`sg_cli_arg_exists_in_worktree`) must
+# only ever fire on a <rev> the user actually TYPED, never on `show`'s/
+# `reset`'s/`reflog`'s own internal "HEAD" substitute for a bare
+# invocation -- in a repo whose working tree happens to contain a file
+# literally named "HEAD", all three used to refuse with a false
+# "ambiguous argument 'HEAD': both revision and filename". `sg log`
+# already got this right (it only ever checks argv's own positional
+# list), included here as the same kind of positive control the
+# switch section above uses. Each command gets its OWN fresh directory --
+# `reset --hard` mutates the repo, and reusing one directory across these
+# three would let that mutation leak into the next command's fixture. ---
+p75_headfile_fixture() {
+    p75hf_dir="$1"
+    rm -rf "$p75hf_dir"
+    mkdir -p "$p75hf_dir"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$p75hf_dir")") > /dev/null 2>&1
+    printf 'hi\n' > "$p75hf_dir/f.txt"
+    (cd "$p75hf_dir" && "$SG" add f.txt && "$SG" commit -m init) > /dev/null 2>&1
+    printf 'not a ref\n' > "$p75hf_dir/HEAD"
+}
+
+P75HF_SHOW="$WORKDIR/phase75headfile_show"
+p75_headfile_fixture "$P75HF_SHOW"
+(cd "$P75HF_SHOW" && LC_ALL=C git show) > "$WORKDIR/p75hf_show_git.out" 2>&1
+check "phase75 fix3 oracle: precondition -- git show with no args still succeeds when the working tree has an untracked file named HEAD" \
+    test $? = 0
+(cd "$P75HF_SHOW" && "$SG" show) > "$WORKDIR/p75hf_show_sg.out" 2>&1
+check "phase75 fix3: sg show with no args also succeeds (used to falsely refuse with 'ambiguous argument HEAD')" \
+    test $? = 0
+
+P75HF_RESET="$WORKDIR/phase75headfile_reset"
+p75_headfile_fixture "$P75HF_RESET"
+(cd "$P75HF_RESET" && LC_ALL=C git reset) > "$WORKDIR/p75hf_reset_git.out" 2>&1
+check "phase75 fix3 oracle: precondition -- git reset with no args still succeeds when the working tree has an untracked file named HEAD" \
+    test $? = 0
+(cd "$P75HF_RESET" && "$SG" reset) > "$WORKDIR/p75hf_reset_sg.out" 2>&1
+check "phase75 fix3: sg reset with no args also succeeds (used to falsely refuse with 'ambiguous argument HEAD')" \
+    test $? = 0
+
+P75HF_REFLOG="$WORKDIR/phase75headfile_reflog"
+p75_headfile_fixture "$P75HF_REFLOG"
+(cd "$P75HF_REFLOG" && LC_ALL=C git reflog) > "$WORKDIR/p75hf_reflog_git.out" 2>&1
+check "phase75 fix3 oracle: precondition -- git reflog with no args still succeeds when the working tree has an untracked file named HEAD" \
+    test $? = 0
+(cd "$P75HF_REFLOG" && "$SG" reflog) > "$WORKDIR/p75hf_reflog_sg.out" 2>&1
+check "phase75 fix3: sg reflog with no args also succeeds (used to falsely refuse with 'ambiguous argument HEAD')" \
+    test $? = 0
+
+# ...and the OTHER half of fix3, which is what makes it a distinction rather
+# than a blanket exemption: a "HEAD" the user TYPED must still be refused.
+# Measured (same fixture shape, real git 2.55.0): `git show HEAD`,
+# `git reset HEAD`, `git reflog HEAD` and `git log -n 1 HEAD` all exit 128
+# with "ambiguous argument 'HEAD': both revision and filename" once an
+# untracked file named HEAD exists. Without these four checks, a "fix" that
+# simply deleted the class-D check from all three commands would pass every
+# check above. `log` is in here because it is the command that was already
+# right, so it must not have been broken while generalizing its pattern. ---
+p75_headfile_typed() {
+    p75hft_cmd="$1"; shift
+    p75hft_dir="$WORKDIR/phase75headfile_typed_$p75hft_cmd"
+    p75_headfile_fixture "$p75hft_dir"
+    (cd "$p75hft_dir" && LC_ALL=C git "$@") > "$WORKDIR/p75hft_git.out" 2>&1
+    p75hft_grc=$?
+    (cd "$p75hft_dir" && "$SG" "$@") > "$WORKDIR/p75hft_sg.out" 2>&1
+    p75hft_src=$?
+    check "phase75 fix3 typed oracle: git $p75hft_cmd HEAD still refuses (exit 128, both revision and filename)" \
+        sh -c "test $p75hft_grc -eq 128 && grep -qF \"ambiguous argument 'HEAD': both revision and filename\" '$WORKDIR/p75hft_git.out'"
+    check "phase75 fix3 typed: sg $p75hft_cmd HEAD still refuses too (exit 1, same sentence)" \
+        sh -c "test $p75hft_src -eq 1 && grep -qF \"ambiguous argument 'HEAD': both revision and filename\" '$WORKDIR/p75hft_sg.out'"
+}
+p75_headfile_typed show show HEAD
+p75_headfile_typed reset reset HEAD
+p75_headfile_typed reflog reflog HEAD
+p75_headfile_typed log log -n 1 HEAD
+
+# --- fix2 is not only about `~N`: measured, `git reflog` exits 0 with empty
+# output for EVERY argument that resolves to any object but names no ref --
+# a blob reached through <rev>:<path>, an annotated tag's own name, a
+# lightweight tag. `HEAD^{tree}` is deliberately NOT here: sg does not
+# implement ^{tree} peeling at all (a pinned, pre-existing divergence), so
+# it is class R for sg and exit 0 for git, which belongs to that divergence
+# and not to this phase.
+#
+# round3 correction: only the <rev>:<path> case actually exercises fix2's
+# rc==0 branch. A tag NAME resolves through sg_rev_parse_ref_path
+# (refs/tags/<name> is a real ref path, same as a branch name) and never
+# reaches that branch at all -- its own reflog is simply empty, the same
+# reason `git reflog <branch-with-no-log>` is silent. Measured by mutation
+# (`if (orc == 0)` -> `if (0)`, disabling fix2's branch entirely): the
+# <rev>:<path> check below turns red, but BOTH tag checks stay green. They
+# are kept (they pin real, correct behaviour) but renamed to say what they
+# actually cover, per CLAUDE.md's "same outcome, different reason" trap --
+# a check whose name misdescribes it is worse than no check, since it stops
+# a later reader from looking further. ---
+p75_reflog_silent() {
+    p75rs_label="$1"; p75rs_arg="$2"; p75rs_oracle_name="$3"; p75rs_sg_name="$4"
+    (cd "$P75HT" && LC_ALL=C git reflog "$p75rs_arg") > "$WORKDIR/p75rs_git.out" 2>&1
+    p75rs_grc=$?
+    (cd "$P75HT" && "$SG" reflog "$p75rs_arg") > "$WORKDIR/p75rs_sg.out" 2>&1
+    p75rs_src=$?
+    check "$p75rs_oracle_name" \
+        sh -c "test $p75rs_grc -eq 0 -a ! -s '$WORKDIR/p75rs_git.out'"
+    check "$p75rs_sg_name" \
+        sh -c "test $p75rs_src -eq 0 -a ! -s '$WORKDIR/p75rs_sg.out'"
+}
+(cd "$P75HT" && "$SG" tag -a p75atag -m msg) > /dev/null 2>&1
+(cd "$P75HT" && "$SG" tag p75light) > /dev/null 2>&1
+p75_reflog_silent "a blob via <rev>:<path>" "HEAD:f.txt" \
+    "phase75 fix2 oracle (a blob via <rev>:<path>): git reflog exits 0 with EMPTY output" \
+    "phase75 fix2 (a blob via <rev>:<path>): sg reflog exits 0 with EMPTY output too"
+p75_reflog_silent "an annotated tag's name" "p75atag" \
+    "phase75 NOT fix2 coverage (an annotated tag's own ref path has an empty reflog) oracle: git reflog exits 0 with EMPTY output" \
+    "phase75 NOT fix2 coverage (an annotated tag's own ref path has an empty reflog): sg reflog exits 0 with EMPTY output too"
+p75_reflog_silent "a lightweight tag's name" "p75light" \
+    "phase75 NOT fix2 coverage (a lightweight tag's own ref path has an empty reflog) oracle: git reflog exits 0 with EMPTY output" \
+    "phase75 NOT fix2 coverage (a lightweight tag's own ref path has an empty reflog): sg reflog exits 0 with EMPTY output too"
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

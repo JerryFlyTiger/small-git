@@ -37,6 +37,7 @@ int sg_cmd_reset(int argc, char **argv)
     sg_reset_mode mode = RESET_MIXED;
     int force = 0;
     const char *rev_arg = NULL;
+    int rev_arg_typed;
     int saw_dashdash = 0;
     int pathspec_given = 0;
     char *git_dir;
@@ -98,6 +99,7 @@ int sg_cmd_reset(int argc, char **argv)
                "use `sg restore --staged <path>` instead\n");
         return 1;
     }
+    rev_arg_typed = rev_arg != NULL;
     if (rev_arg == NULL)
         rev_arg = "HEAD";
 
@@ -125,13 +127,63 @@ int sg_cmd_reset(int argc, char **argv)
         return 1;
     }
 
+    /* Phase 75 behavior changes (in scope, not just wording):
+       - `sg reset [--soft|--mixed|--hard] <dual>` used to perform the
+         reset where git refuses with AMBIG-BOTH (a name that is both a
+         valid revision and an existing working-tree path) -- with
+         --hard this used to overwrite the working tree on an argument
+         git considers ambiguous. Checked only when "--" was NOT given
+         (saw_dashdash forces the revision reading unambiguously, same as
+         `git reset dual --`, measured exit 0).
+       - `sg reset --soft|--hard <path>` (a plain existing path, not also
+         a revision) used to try to resolve it as a revision and fail
+         with a generic error; git has a dedicated refusal, "Cannot do
+         soft/hard reset with paths." -- --mixed is a functional gap left
+         alone (git does a path-limited reset there; sg has no pathspec
+         support for reset without "--", see docs/DESIGN.md's Phase 75
+         section).
+       - This ambiguity check must only ever apply to a <rev> the user
+         actually typed, never to this function's own internal "HEAD"
+         substitute for a bare `sg reset` -- `rev_arg_typed` guards it.
+         Measured: in a repo whose working tree happens to contain a file
+         named "HEAD", `git reset` (no args) still succeeds; before this
+         fix sg refused with a false "ambiguous argument 'HEAD': both
+         revision and filename" (see `sg log`'s own split, which already
+         gets this right by only ever checking argv's own positional
+         list). */
+    if (rev_arg_typed && !saw_dashdash && sg_cli_arg_exists_in_worktree(rev_arg)) {
+        int prc = sg_rev_parse_commit_ex(git_dir, rev_arg, SG_REV_COMMITTISH, target_commit_id);
+
+        if (prc == 0) {
+            sg_cli_report_rev_error("reset", SG_REV_ERR_BOTH, rev_arg, NULL, 0);
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+        if (prc != -4 && (mode == RESET_SOFT || mode == RESET_HARD)) {
+            fprintf(stderr, "sg: Cannot do %s reset with paths.\n", mode == RESET_SOFT ? "soft" : "hard");
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+    }
+
     {
         int prc = sg_rev_parse_commit_ex(git_dir, rev_arg, SG_REV_COMMITTISH, target_commit_id);
 
         if (prc != 0) {
-            if (prc == -4)
+            char bad_path[SG_PATH_MAX];
+
+            if (prc == -4) {
                 sg_cli_report_ambiguous_oid(git_dir, rev_arg, SG_REV_COMMITTISH);
-            fprintf(stderr, "sg: invalid reference: %s\n", rev_arg);
+                sg_cli_report_rev_error("reset", SG_REV_ERR_NOT_A_REV, rev_arg, NULL, saw_dashdash);
+            } else {
+                sg_cli_report_rev_error("reset",
+                                        sg_cli_classify_rev_error(git_dir, rev_arg, bad_path, sizeof(bad_path)),
+                                        rev_arg, bad_path, saw_dashdash);
+            }
             free(current_branch);
             free(git_dir);
             free(repo_root);

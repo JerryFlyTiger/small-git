@@ -96,3 +96,17 @@ do not read the whole thing).
   taking a `cmd_name` parameter so its `use sg <cmd> -- <path>` suggestion
   names the actual caller). Verified as a pure refactor: `interop:
   2720/2720` both immediately before and immediately after this commit.
+
+- **Phase 75 added a second shared reporter to `cli_args.c`**:
+  `sg_cli_report_rev_error` + `sg_cli_classify_rev_error`, the single place
+  every command's "this revision does not resolve" diagnostic goes through
+  (see `docs/DESIGN.md`'s Phase 75 section for the full measured table).
+  Ten call sites (`cmd_tag.c`, `cmd_show.c`, `cmd_cat_file.c`, `cmd_log.c`,
+  `cmd_diff.c`, `cmd_reset.c`, `cmd_reflog.c`, `cmd_merge_base.c`,
+  `cmd_cherry_pick.c`, `cmd_revert.c`) were converged onto it; `cmd_rebase.c`
+  was NOT, on purpose -- its `invalid upstream 'X'` wording is identical
+  across every input class (measured), so there is no per-class table row
+  for it to share, just a plain wording fix at its one call site. **Do not
+  add a second per-class rev-error table** -- a new command that needs this
+  kind of diagnostic gets a new row in `REV_ERR_TABLE`, not a new switch
+  statement at its own call site.

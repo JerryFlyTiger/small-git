@@ -549,7 +549,13 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         if (prc != 0) {
             if (prc == -4)
                 sg_cli_report_ambiguous_oid(git_dir, upstream_arg, SG_REV_COMMITTISH);
-            fprintf(stderr, "sg: invalid reference: %s\n", upstream_arg);
+            /* Phase 75: git's own wording for `<upstream>` is a single
+               "invalid upstream 'X'" regardless of WHY it failed to
+               resolve (measured: identical for a nonexistent name, a
+               well-formed absent 40-hex id, and a "<rev>:<path>" whose
+               path is missing) -- there is no per-class table row here,
+               unlike log/diff/show/reset/reflog. */
+            fprintf(stderr, "sg: invalid upstream '%s'\n", upstream_arg);
             free(current_branch);
             return 1;
         }

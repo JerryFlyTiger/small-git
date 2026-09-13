@@ -331,7 +331,9 @@ point where the harness warns that it is too large to keep in context.
 
 ## Deliberate divergences from real git
 
-Nine places where sg's answer differs from real git. Each was measured
+Eight places where sg's answer differs from real git (the numbering still
+runs 1-9, with entry 8 retired -- see the parenthetical below for where it
+went; do not renumber the rest into a lie). Each was measured
 against git 2.55.0 and each is pinned on both sides by an interop check, so
 accidentally "fixing" one back into silent agreement with git would itself go
 undetected without the pin.
@@ -396,7 +398,16 @@ a second hardcoded copy of the same literal) with one that derives the
 expected wording from git's own output.) See `docs/DESIGN.md`'s Phase 74,
 "Phase 74 round 2", "Phase 74 round 3", and "Phase 74 round 4" sections.
 Both entries are gone from this list rather than marked "fixed" in place,
-to keep the numbering meaning what it says.)
+to keep the numbering meaning what it says. Entry 8, `sg tag
+<name> <unresolvable-rev>` reporting a different sentence than git
+(`cannot resolve 'x'` vs git's `Failed to resolve 'x' as a valid ref.`) --
+**fixed as of Phase 75**, which resolved the "wider finding" that entry's
+own text recorded (sg had four different wordings for "this revision does
+not resolve", across eight call sites, none of them consistent with each
+other) by aligning every one of those call sites to git's own per-command
+wording instead of picking one sg sentence to converge onto. See
+`docs/DESIGN.md`'s Phase 75 section. Gone from this list rather than
+marked "fixed" in place, same as the other two retired entries above.)
 
 1. **`* Unmerged path` stays unquoted regardless of `core.quotePath`**
    (Phase 34) -- real git leaves this one line unquoted even when every
@@ -497,34 +508,6 @@ to keep the numbering meaning what it says.)
    `human` (non-local) does NOT diverge there (measured:
    `Mon 12:00 +0000` on both). Pinned on both sides in interop's `phase67`
    group, same two-literal-pin shape as the rest of this entry.
-8. **`sg tag <name> <unresolvable-rev>` reports a whole different SENTENCE
-   than git, not a wording tweak** (Phase 73 review round 6, justification
-   corrected in round 7). git: `fatal: Failed to resolve 'x' as a valid
-   ref.`; sg: `sg: cannot resolve 'x'`. **This entry originally claimed
-   sg's wording is "shared verbatim across every caller of
-   `sg_rev_parse_commit`/`sg_rev_parse_object`" -- measured false**:
-   `grep -rn "cannot resolve '%s'" src/` finds exactly ONE occurrence,
-   `cmd_tag.c` itself. The REAL reason to keep it is different and
-   narrower: `sg tag` is not being asked to converge onto any one
-   existing sibling wording, because there isn't a consistent one to
-   converge onto -- see the very next note for the measurement. Kept and
-   pinned instead of unified because picking any one of sg's four
-   existing wordings for `cmd_tag.c` would be an arbitrary choice among
-   siblings that already disagree with EACH OTHER, not a move toward
-   consistency. Pinned on both sides in interop's `phase73` group
-   (`case1i`); see Phase 73's review round 7 section of `docs/DESIGN.md`
-   for the correction and the measurement behind it.
-
-   **Wider finding, recorded here rather than fixed**: sg has (at least)
-   FOUR different wordings for "this revision argument does not resolve
-   to anything", across EIGHT call sites in seven different commands,
-   measured by `grep`: `cannot resolve '%s'` (`cmd_tag.c`); `not a valid
-   object name '%s'` (`cmd_show.c`, `cmd_cat_file.c`); `not a valid
-   revision '%s'` (`cmd_log.c`); `'%s' is not a valid object id`
-   (`cmd_cherry_pick.c`, `cmd_merge_base.c` x2, `cmd_revert.c`). This is a
-   pre-existing inconsistency in sg's OWN vocabulary, unrelated to git
-   interop and out of scope to fix in this phase -- recorded so it is not
-   rediscovered from scratch by a future audit.
 9. **`sg tag`/`sg branch` LIST a ref reachable only through a
    `.lock`-suffixed path component; real git refuses to even resolve one**
    (Phase 74 round 5). WARNING: **this number was previously something

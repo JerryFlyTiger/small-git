@@ -5,6 +5,7 @@
 #include "sg/merge.h"
 #include "sg/repo.h"
 #include "sg/revparse.h"
+#include "sg/workdir.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,9 +31,16 @@ int sg_cmd_merge_base(int argc, char **argv)
         int prc = sg_rev_parse_commit(git_dir, argv[1], a);
 
         if (prc != 0) {
-            if (prc == -4)
+            char bad_path[SG_PATH_MAX];
+
+            if (prc == -4) {
                 sg_cli_report_ambiguous_oid(git_dir, argv[1], SG_REV_STRICT);
-            fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[1]);
+                sg_cli_report_rev_error("merge-base", SG_REV_ERR_NOT_A_REV, argv[1], NULL, 0);
+            } else {
+                sg_cli_report_rev_error("merge-base",
+                                        sg_cli_classify_rev_error(git_dir, argv[1], bad_path, sizeof(bad_path)),
+                                        argv[1], bad_path, 0);
+            }
             free(git_dir);
             return 1;
         }
@@ -41,9 +49,16 @@ int sg_cmd_merge_base(int argc, char **argv)
         int prc = sg_rev_parse_commit(git_dir, argv[2], b);
 
         if (prc != 0) {
-            if (prc == -4)
+            char bad_path[SG_PATH_MAX];
+
+            if (prc == -4) {
                 sg_cli_report_ambiguous_oid(git_dir, argv[2], SG_REV_STRICT);
-            fprintf(stderr, "sg: '%s' is not a valid object id\n", argv[2]);
+                sg_cli_report_rev_error("merge-base", SG_REV_ERR_NOT_A_REV, argv[2], NULL, 0);
+            } else {
+                sg_cli_report_rev_error("merge-base",
+                                        sg_cli_classify_rev_error(git_dir, argv[2], bad_path, sizeof(bad_path)),
+                                        argv[2], bad_path, 0);
+            }
             free(git_dir);
             return 1;
         }

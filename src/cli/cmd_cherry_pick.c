@@ -123,9 +123,17 @@ int sg_cmd_cherry_pick(int argc, char **argv)
             int prc = sg_rev_parse_commit(git_dir, commit_args[i], ids[i]);
 
             if (prc != 0) {
-                if (prc == -4)
+                char bad_path[SG_PATH_MAX];
+
+                if (prc == -4) {
                     sg_cli_report_ambiguous_oid(git_dir, commit_args[i], SG_REV_STRICT);
-                fprintf(stderr, "sg: '%s' is not a valid object id\n", commit_args[i]);
+                    sg_cli_report_rev_error("cherry-pick", SG_REV_ERR_NOT_A_REV, commit_args[i], NULL, 0);
+                } else {
+                    sg_cli_report_rev_error("cherry-pick",
+                                            sg_cli_classify_rev_error(git_dir, commit_args[i], bad_path,
+                                                                      sizeof(bad_path)),
+                                            commit_args[i], bad_path, 0);
+                }
                 free(ids);
                 free(git_dir);
                 free(repo_root);
