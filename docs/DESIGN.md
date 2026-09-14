@@ -17391,3 +17391,1543 @@ the new code's own tests cover the new case, and the case it broke belongs to
 nobody. The pin added now is the accepted row plus the three refusals around
 it, so the fall-through cannot quietly widen either; a mutation restoring the
 hard failure turns exactly the accepted row red.
+
+## Phase 76: `sg branch` create-with-start-point, -f, and git's batch delete
+
+Extends `sg branch` from a bare create/delete of one name at HEAD to the
+full shape measured against real git 2.55.0: `<start-point>` on create,
+`-f`/`-D`, and git's own multi-name batch-delete semantics (the same
+per-ref-lock transaction Phase 74 built for `sg tag -d`).
+
+**Round 0 baseline and count** (this phase's own acceptance oracle,
+`oracle.py`, 310 in-scope probes across five fixtures -- loose, packed,
+detached HEAD, unborn, ambiguous-abbrev). **`oracle.py` itself is NOT part
+of this repository** -- it lives only in the main conversation's
+scratchpad (a throwaway differential-testing script written for this one
+milestone's acceptance gate, not a project fixture), so a reader of this
+file should not go looking for it under `tests/`; every one of its
+findings that matters long-term is captured here as prose, and permanent
+regression coverage for the same properties lives in `tests/interop.sh`
+instead. Counts: 57/310 before, 307/310 after.
+`tests/interop.sh`'s own running total: 4313/4313 before this phase touched
+anything, 4351/4351 after round 0 (38 new phase76 checks plus 3 phase9
+checks rewritten in place to match the new correct behavior, not deleted).
+
+**Round 0's "4313/4313 unchanged by the pure extraction" claim, made in an
+earlier draft of this section, overstated what that number can prove --
+corrected here, not deleted, so the mistake stays visible.** A count that
+does not change only proves the extraction did not break any of the paths
+`tests/interop.sh` ALREADY exercises; it says nothing about a path the
+suite has never walked. Round 1's own review found exactly that shape:
+`ref_delete.c`'s "too long"/"delete failed" messages had silently drifted
+from tag's original wording (item 4 below) with the interop count still
+reading 4313/4313 the whole time, because no existing check ever exercised
+an over-length name or a delete-syscall failure. The right claim is
+narrower: the extraction did not regress any BEHAVIOR THE SUITE COVERS,
+which is the most any fixed-count comparison can ever prove -- new
+coverage is what closes the gap between that and "unchanged," not a
+repeated count.
+
+**Round 1 (this reviewer round) added a fourth fixture-based oracle
+comparison and a divergence, growing the acceptance oracle to 334
+probes (57 new ones: `stale`, `tagalias`, `tagalias-packed`), and found
+four separate defects in round 0's own work -- see the four numbered
+subsections below.** Final state: oracle 330/334 (4 explained mismatches,
+none a defect -- 3 are the pre-existing `^{tree}` gap unchanged from round
+0, one is deliberate divergence #10, added this round); `tests/interop.sh`
+4367/4367 (16 new phase76/phase74 checks: branch-side EEXIST raw wording
+singular/plural, an in-batch literal-duplicate delete, a PACKED D/F
+blocker in both directions, a STRICT-vs-COMMITTISH head-on reusing the
+Phase 68 2-way collision fixture, detached-HEAD create/`-f`, unborn-HEAD
+create/delete, plus five existing phase74 tag checks rewritten from a
+field-extraction comparison to a full byte-for-byte one).
+
+**The three `^{tree}` oracle mismatches remain the one pre-existing,
+cross-cutting, already-documented gap, unrelated to Phase 76**: `sg branch
+new HEAD^{tree}` (and the packed/detached twins). `revparse.h` already
+states `^{tree}`/`^{commit}`/`^{blob}` peel syntax is unsupported
+project-wide, predating this phase; `sg_rev_parse_object` never resolves it
+to an actual tree/blob object, so `cmd_branch.c`'s type-mismatch detection
+(which needs that resolved type to print git's "error: object <hex> is a
+tree, not a commit" line) never gets a chance to run, and the generic "not
+a valid object name" fallback fires instead. Fixing it means teaching peel
+syntax to `sg_rev_parse_object` for every caller project-wide (`cat-file`,
+`show`, `diff`, `log`, `reset`, ...), not just branch's start-point -- out
+of scope here. See `docs/RULES-refs-revparse.md`'s own bullet for the
+fuller writeup and the interop pin.
+
+### Round 1 defect 1: `git tag -d`'s EEXIST wording was never "the same
+ref" -- that was sg's own Phase 74 round 1 literal, re-measured wrong
+
+Round 0 invented an `sg_ref_delete_eexist_style` split (`ALIAS` for tag,
+`RAW` for branch) on the belief that `git tag -d Foo foo` prints "'X' and
+'Y' are the same ref" while `git branch -d Merged merged` prints git's raw
+lockfile.c sentence. Re-measured directly against real git 2.55.0
+(LC_ALL=C, case-insensitive loose refs): `git tag -d Foo foo` prints the
+EXACT SAME raw lockfile.c sentence branch does -- "could not delete
+reference(s): cannot lock ref '<ref>': Unable to create '<abs-lock-path>':
+File exists.\n\nAnother git process seems to be running in this
+repository, or the lock file may be stale" -- for both an in-batch
+case-fold alias and a foreign stale lock alike. There is no "same ref"
+sentence anywhere in real git for either command. The "same ref" wording
+pinned by `tests/interop.sh`'s phase74 case2j/case2j2 checks was an
+SG-AUTHORED literal invented in Phase 74 round 1 (when sg had no lock
+files of its own and needed some wording for the case), and nothing had
+re-measured git's actual `tag -d` EEXIST wording since -- round 0 read
+that pin as evidence of git's behavior instead of sg's own.
+
+Fixed by deleting `sg_ref_delete_eexist_style` entirely: `ref_delete.c`
+now prints ONE EEXIST wording, git's raw lockfile.c sentence, for both
+tag and branch, in-batch alias and foreign stale lock alike. `tests/
+interop.sh`'s case2j, case2j2, case2n, case2n2, and case2n3 were rewritten
+from a hardcoded-string/field-extraction comparison to a full git-vs-sg
+byte comparison (a new `p74_norm_eexist_msg` helper, folding each side's
+own absolute repo path -- both the raw form and its symlink-resolved form,
+e.g. macOS's `/var` -> `/private/var` -- to one `<REPO>` placeholder before
+comparing), preserving each check's original intent (whole-batch refusal,
+argv-order naming of the LATER spelling, no stale lock left behind by sg,
+a foreign stale lock left untouched). New branch-side checks
+(`phase76 delete EEXIST`) exercise the identical wording for `sg branch -d`
+against a fresh git-vs-sg fixture, singular and plural.
+
+**A second, purely mechanical bug was found and fixed while building this
+comparison**: the first draft of `p74_norm_eexist_msg` substituted the RAW
+repo path before the REAL (symlink-resolved) one; on a platform where the
+raw path is a SUBSTRING of the real one (macOS's `/var/folders/...` inside
+`/private/var/folders/...`), substituting the shorter string first leaves
+a stray `/private` prefix the second substitution can no longer match,
+producing `"/private<REPO>"` instead of `"<REPO>"` and a spurious
+byte-mismatch FAIL on every EEXIST check. Fixed by substituting the
+LONGER (real) path first.
+
+**A third bug, this one in test-harness discipline itself, was found and
+fixed while verifying the above with the mutation battery**: the new
+`p74_norm_eexist_msg` function was originally defined next to its first
+Phase 73/74 use, far later in the file than the NEW Phase 76 EEXIST checks
+that also call it. Shell function definitions take effect only once the
+defining statement has been EXECUTED, not hoisted -- so every earlier
+caller silently ran a nonexistent command (`p74_norm_eexist_msg: command
+not found`, printed to stderr but never checked), and the redirect
+`> "$WORKDIR/....norm"` still created an EMPTY output file regardless.
+`cmp -s empty empty` succeeds, so the check reported PASS while comparing
+two empty files -- a self-inflicted instance of this project's own
+"a green mutation may have tested nothing" lesson, caught only because
+mutation (d) below was run to confirm the new checks could go red at all,
+and didn't. Fixed by moving the function definition to the top of the
+file, immediately after `check`/`skip`.
+
+### Round 1 defect 2: deliberate divergence #10, a case-aliased spelling
+of the checked-out branch
+
+New, not present in round 0: real git's `git branch -d Master` (or `-D`,
+or `-f Master <rev>`) on a case-insensitive filesystem with `master`
+checked out exits 0 and actually deletes/moves `refs/heads/master` (the
+SAME loose file, since the filesystem folds "Master" and "master" to one
+path), leaving `HEAD` symreffed to a now-nonexistent branch -- the repo
+looks like "No commits yet" afterward. Git's own checked-out-branch safety
+check is a plain string compare against the current branch's name, which
+"Master" does not textually equal, so it never fires; the delete/move
+itself then goes through the OS, which does not care about case.
+
+**Decision (main conversation, recorded as deliberate divergence #10 in
+CLAUDE.md): sg REFUSES this instead** -- a refusal is a strictly safer
+answer than leaving `HEAD` dangling. Detecting the alias needed a
+mechanism that is neither `strcasecmp` (wrong on a case-SENSITIVE
+filesystem, where "Master" and "master" are genuinely two different
+branches) nor an inode compare of the ref files themselves (Phase 74 round
+1 measured that wrong in both directions for an unrelated collision, see
+that phase's own history). `cmd_branch.c`'s `branch_aliases_current` asks
+the filesystem the SAME question git's own ref-transaction lock would:
+does creating `refs/heads/<current>.lock` and then
+`refs/heads/<typed-name>.lock` (both `O_CREAT|O_EXCL`) collide? Every lock
+it creates is removed again before returning, on every path.
+
+**One measured refinement was needed beyond the plain lock-probe, found via
+the oracle's own `stale` fixture (a foreign stale `.lock` on an UNRELATED
+branch name)**: an EEXIST on the typed name's lock file has two different
+causes that must not be confused -- a TRUE filesystem alias (the typed
+lock path and the current branch's lock path are literally the SAME FILE,
+same `st_dev`/`st_ino`), or a genuinely different, pre-existing foreign
+lock that just happens to already sit at the typed path, unrelated to the
+current branch entirely. The `stale` fixture plants exactly the second
+shape (a stale `refs/heads/merged.lock` while `master`, not `merged`, is
+checked out) and an early version of `branch_aliases_current` that treated
+ANY EEXIST as aliasing misdiagnosed it, wrongly refusing to delete
+`merged` with a worktree message that named the wrong branch. Fixed by
+comparing the two lock files' `stat()` results before concluding aliasing.
+
+Also measured: a PACKED-ONLY current branch cannot alias this way (packed-
+refs lookup is an exact string match, unaffected by filesystem
+case-folding), so `branch_aliases_current` is gated on
+`is_loose_branch_ref(git_dir, current)` first -- confirmed by the oracle's
+`packed` fixture's `-d Master` cell, which still mismatches nothing (both
+sides answer "not found", unaffected by this divergence).
+
+**Oracle cells expected to diverge by design, and why (exactly one)**:
+`loose` fixture, `["-d", "Master"]` -- `master` is the checked-out branch
+there and is backed by a loose ref, so the alias fires; git deletes (exit
+0), sg refuses (exit 1, the checked-out-branch worktree message, nothing
+changed). The `packed` and `detached` fixtures' identical probe does NOT
+diverge: `packed` because `master` is packed-only there (no loose file to
+alias through), `detached` because `current_branch` is `NULL` when `HEAD`
+is detached (the precheck's very first condition already requires a
+non-NULL current branch).
+
+### Round 1 defect 3: coverage gaps -- 38 phase76 checks, one fixture
+
+A cold review found all of round 0's `phase76` interop checks reused a
+single loose/attached/unambiguous fixture. Round 1 added: branch-side
+EEXIST raw wording (singular from a foreign stale lock, plural from a
+batch of two where only one holds the lock); `sg branch -d X X` (a literal
+in-batch duplicate, sharing the transaction-layer refusal with tag);
+D/F conflict with a PACKED blocker in both directions (forward and
+reverse, confirming the loose/packed wording split is keyed on the
+BLOCKING ref's own storage, not on the new name); a STRICT-vs-COMMITTISH
+head-on reusing the Phase 68 fixture's 2-way (real commit + crafted blob)
+prefix collision -- `sg log` resolves it, `sg branch` must refuse it with
+the full STRICT ambiguity block on the exact same repo; detached HEAD (no
+start point defaults to the literal `HEAD`, since there is no branch name
+to fall back to; `-f` on a branch that is NOT the current one while
+detached is allowed); and unborn HEAD (`sg branch new` names the current
+branch, not `HEAD`, in its failure; `sg branch -d master` is the WORKTREE
+refusal, not "not found").
+
+**Mutation verification** (`bash tests/mutate.sh ... --interop`), each run
+individually against the pre-mutation binary and confirmed to turn red
+only the checks that discriminate the property being broken:
+  - (a) `SG_REV_STRICT` -> `SG_REV_COMMITTISH` in `resolve_branch_point`:
+    4 checks red (all four `phase76 STRICT` checks -- the refusal itself,
+    the ambiguity-block wording, the two-candidate list, and "no branch
+    created").
+  - (b) `report_df_conflict`'s loose/packed branch forced to always take
+    the LOOSE wording: 2 checks red (both `phase76 create: D/F conflict
+    ... PACKED-ONLY blocker` checks, forward and reverse).
+  - (c) the same branch forced to always take the PACKED wording: 1 check
+    red (the LOOSE-blocker D/F check's "naming the new ref in the 'cannot
+    lock ref' prefix" assertion).
+  - (d) `ref_delete.c`'s `existing_count == 1` inverted to `!= 1`: 7 checks
+    red (both new `phase76 delete EEXIST` singular/plural checks, plus all
+    five phase74 tag EEXIST checks -- confirming the wording really is
+    shared code, not independently duplicated per command).
+  - (e) `cmd_branch.c`'s delete precheck disabled
+    (`spec.precheck = branch_delete_precheck;` -> `spec.precheck = 0;`):
+    16 checks red, spanning both the pre-existing phase9 case5 group
+    (checked-out-branch refusal, unmerged-without-force refusal and its
+    `-D` hint, forced unmerged delete) and the new phase76 group (mixed-
+    batch argv-order interleaving, quiet-mode delete, the in-batch literal
+    duplicate, and the unborn-HEAD worktree refusal) -- confirming the
+    precheck is load-bearing for both the ORIGINAL Phase 76 behavior and
+    the round-1 additions, not just the new unborn case it was built for.
+
+### Round 1 defect 4: the extraction was not byte-identical for tag after
+all
+
+`ref_delete.c`'s generic "ref name too long: '%s'" and "failed to delete
+ref '%s%s'" silently replaced tag's original "tag name too long: '%s'" and
+"failed to delete tag '%s'" wording during the round-0 extraction --
+missed because `tests/interop.sh`'s 4313/4313-unchanged count (see the
+correction at the top of this section) never exercised either path: no
+existing check creates an over-length tag name or forces the delete
+syscall itself to fail. Fixed by adding `too_long_fmt`/`delete_fail_fmt`
+to `sg_ref_delete_spec`, restoring tag's exact original strings and giving
+branch its own analogous (sg-only, no git oracle) wording. `ref_delete.c`'s
+three remaining fixed-size-buffer paths that could silently pick a WRONG
+answer once a name got long enough (`check_df_conflict`'s per-component
+prefix, `is_loose_branch_ref`'s stat path, and the `.lock`-path build in
+pass 2b) were converted to `sg_strfmt_alloc` in the same round -- see
+`docs/RULES-paths-strings.md`'s own Phase 76 bullet for the full reasoning
+(a length-based silent skip is a different, worse failure than a length
+limit, because it silently CHOOSES the wrong branch of a check rather than
+just refusing).
+
+### Check-order (create), measured against real git 2.55.0
+
+1. Name validity (`sg_ref_name_valid_for_create`) -- git's advice hint
+   lines are not reproduced (sg has no advice config), the "not a valid
+   branch name" wording is sg's own, pre-existing.
+2. Existing name, no `-f` -> `a branch named '<name>' already exists`.
+3. `-f` targeting the CHECKED-OUT branch (HEAD a symref to it; never fires
+   detached, since sg has no multi-worktree and this is the only worktree
+   check that applies) -> `cannot force update the branch '<name>' used by
+   worktree at '<path>'`, UNCONDITIONALLY -- measured: force-updating to
+   the value it ALREADY has still refuses, git does not special-case a
+   no-op here the way it does for the reflog-suppression rule below.
+4. `<start-point>` resolution, STRICT disambiguation (see the module rule
+   for why this diverges from `sg log`/`sg reset`'s COMMITTISH).
+5. D/F (directory/file) conflict in `refs/heads/`, both directions (see the
+   module rule for the loose-vs-packed wording split).
+
+### Check-order (delete), measured against real git 2.55.0
+
+Per name, in argv order, ALL THREE of the following interleaved (not as
+three separate passes -- see `ref_delete.c`'s own comment on why: `sg
+branch -d master topic nope merged` on a fixture where master is checked
+out, topic is unmerged, nope does not exist, and merged is eligible prints
+master's worktree refusal, THEN topic's not-merged refusal, THEN nope's
+not-found line, in that exact argv order, and still deletes merged):
+
+1. Checked-out/worktree refusal -- fires even under `-D`, and even when the
+   name does not exist as a ref at all yet (measured: on an UNBORN repo,
+   `sg branch -d master` prints the worktree message, not "not found",
+   because "is this the checked-out branch" is a pure NAME comparison
+   against `HEAD`'s symref target, independent of whether that ref has
+   ever been written). This is why `sg_ref_delete_batch` gained a
+   `precheck` stage that runs before existence is even tested -- `sg tag
+   -d` has no equivalent (tags cannot be checked out), so its own call
+   passes `precheck = NULL`.
+2. Existence (`branch '<name>' not found`, no trailing period -- tag's own
+   wording has one, branch's does not, measured).
+3. Without `-f`/`-D`, not-fully-merged -> refusal (no interactive prompt at
+   all any more, see below) with a rewritten hint naming `-D` instead of
+   `--force` (`cmd_switch.c`'s precedent for translating a hint into sg's
+   own terms).
+
+Names that survive all three go through the SAME Phase 74 lock/transaction
+engine `sg tag -d` uses (literal in-batch duplicate refusal, then the
+per-ref `.lock` collision detector), including the EEXIST wording, which
+IS fully shared with tag -- see round 1 defect 1 below for how this
+section's own first draft got that backwards (it invented a wording split
+that round 1 measured did not exist in real git at all).
+
+### Why the interactive confirmation was removed rather than kept
+
+The pre-Phase-76 `delete_branch` prompted (`sg_confirm_dangerous`) for an
+unmerged branch and let `--force` skip the prompt. Real git does not
+prompt at all here -- it refuses outright without `-D`/`--force`, full
+stop, on both a tty and a non-tty stdin. A refusal is a strictly SAFER
+answer than a confirm-with-bypass shape reached by a different route (a
+prompt defaults to "no" on EOF, but a script piping `yes` or redirecting
+`/dev/null` in a way that happens to answer differently would behave
+unlike either an interactive git user or a real git script), so this phase
+removed the prompt entirely rather than preserving it as a code path
+`-D`/`--force` happens to also satisfy.
+
+### Reflog wording
+
+Measured against real git 2.55.0: creating logs `branch: Created from
+<start-point>`; force-resetting an EXISTING branch logs `branch: Reset to
+<start-point>` instead. Both use the start point EXACTLY as typed by the
+user, or -- when none was given -- the CURRENT BRANCH's own name (not the
+literal string "HEAD"), falling back to "HEAD" only when HEAD is detached.
+This default is not merely a reflog-message convenience: it is also the
+literal string actually fed to revision resolution, which is how an
+UNBORN HEAD's error message reveals it (`sg branch new` on a fresh repo
+with no start point argument says "not a valid object name: 'master'",
+naming the branch, not "HEAD" -- `sg branch new HEAD` with the explicit
+argument says "...: 'HEAD'" instead). `cmd_branch.c`'s `create_branch`
+therefore computes ONE `start_str` up front and reuses it for resolution,
+every error message, and the reflog line, rather than tracking the
+"as-typed-or-defaulted" string in three separate places that could drift
+apart. A force-reset to the value the branch ALREADY has logs nothing new
+-- this falls out of `sg_ref_update`'s own pre-existing old-vs-new
+no-op-suppression rule for free, no special-casing needed here.
+
+### Extraction: `cli/ref_delete.c`
+
+`cmd_tag.c`'s Phase 74 `delete_tags` moved to `cli/ref_delete.c`
+(`sg_ref_delete_batch`), parameterized by namespace prefix, per-kind
+message strings, and an optional `precheck`/`gate` pair. `sg tag -d`'s own
+behavior was NOT byte-identical after this step, despite `tests/
+interop.sh` reading the same 4313/4313 count immediately after it as
+before -- see round 1 defect 4 below for the two message strings that
+drifted, invisible to that count because nothing in the suite exercised
+either path (see also this section's own top-of-file correction on what a
+repeated count can and cannot prove).
+
+## Phase 76 fix round 2: divergence #10 had no interop pin, an OOM fail-open, and coverage gaps
+
+Round 2 count: oracle 330/334 (same 3 `^{tree}` mismatches as round 1, plus
+one NEW expected mismatch, divergence #10's `loose ['-d', 'Master']` cell --
+see CLAUDE.md's entry 10 for exactly which cells diverge and why, unchanged
+from round 1's own writeup there). `tests/interop.sh` 4411/4411 (44 new
+checks: 7 EEXIST-precondition checks, R4's detached-`-f` and STRICT-
+candidate nits, and R1/K1/K2's full divergence-#10 pin set).
+
+### R1: divergence #10 shipped in round 1 with NO interop coverage at all
+
+Confirmed empirically, not just by grep: the main conversation's mutation
+battery ran M3 (drop `branch_aliases_current` at create's `-f` gate) and M4
+(drop it at the delete precheck) against round 1's tree, and BOTH stayed
+fully green (4367/4367) -- CLAUDE.md's round-1 text claimed a pin ("Pinned
+on both sides in interop... plus a check that the alias probe leaves no
+`.lock` file behind") that did not exist. Fixed with a full pin set (see
+CLAUDE.md's entry 10, "What is actually pinned, precisely", for the exact
+shape) and re-verified: M3 now turns red exactly the 6 `f-*` checks (all
+three cwd variants' refusal-exit and full-line-literal checks), M4 turns red
+12 DIFFERENT checks (`d-*`/`D-root` variants, the untouched-ref/reflog
+checks, and K1's NFD checks) -- confirmed by re-running both after this
+round's fix, not merely asserted.
+
+**A design correction made while building these checks**: the K2 full-line
+assertion is NOT a git-vs-sg byte comparison the way the EEXIST checks are.
+Real git prints NO message at all for the cases divergence #10 is about (it
+silently succeeds) -- comparing "git's output" against "sg's output" here
+would be comparing an empty string against sg's refusal and calling that
+"byte-identical," which is meaningless. Each `p76_alias_check` call
+therefore asserts git's OWN precondition (exit 0, the ref actually gone for
+`-d`/`-D`, or moved to the captured pre-op target for `-f` -- captured
+BEFORE running the command, since `-f`'s own effect changes what `HEAD~1`
+means afterward) separately from a LITERAL-STRING assertion of sg's exact
+expected line, computed independently via `pwd -P` rather than reusing any
+of sg's own code.
+
+### R2: `is_loose_branch_ref`'s OOM path was a real fail-open
+
+`cmd_branch.c:is_loose_branch_ref` returned a plain 0 ("not loose") on its
+own `sg_strfmt_alloc` failure; its one safety-critical caller,
+`branch_aliases_current`, read that 0 as "packed-only, cannot alias" and let
+a force-update or delete of the checked-out branch through on the strength
+of an OOM -- exactly the fail-OPEN direction `docs/RULES-paths-strings.md`'s
+own OOM rule forbids, and a real bug despite the low trigger probability.
+Fixed by making the helper genuinely tri-state (`sg_loose_check`:
+YES/NO/ERROR) and threading a matching tri-state through
+`branch_aliases_current` and the new `branch_is_current_or_alias` (factored
+out so both of `cmd_branch.c`'s two call sites combine the exact-name
+compare with the alias probe identically): ERROR now fails CLOSED with its
+own "sg: out of memory" diagnostic, never as "no alias".
+`check_df_conflict`'s two call sites (a wording choice made only AFTER a
+conflict has already been proven to exist by other means) still fold ERROR
+into "not loose", which is fine there -- that decision is cosmetic, not
+safety-critical.
+
+**Not mutation-verifiable**: there is no fault-injection mechanism in this
+project for `malloc`/`sg_strfmt_alloc` failure, so this fix has no automated
+red/green proof the way the rest of this phase's fixes do. Verified by
+inspection only (the tri-state's ERROR arm is now checked at both call
+sites, `grep`-confirmed no remaining 0/1-collapsing call site for this
+helper).
+
+### R3: the new EEXIST byte-comparisons lacked a git-side precondition
+
+`p76_eex`/`p76_eex2`'s `cmp -s` calls had no prior assertion that git's raw
+capture was even non-empty -- this project's OWN round-1 incident (two
+empty `.norm` files comparing equal, see the round-1 section above) is
+exactly the failure mode a missing precondition here would reproduce
+invisibly. Added the same precondition shape `case2j`/`case2n` already use
+(git's capture non-empty AND contains `cannot lock ref`), plus a matching
+non-empty assertion on sg's own capture.
+
+### R4: nits
+
+- Detached-HEAD `-f master HEAD~1` (interop.sh) now also asserts
+  `refs/heads/master` actually moved to `HEAD~1`'s id and the reflog's last
+  line is `branch: Reset to HEAD~1`, not just exit 0.
+- The STRICT-vs-COMMITTISH candidate-list check now asserts the REAL
+  commit's own 7-hex prefix appears next to `commit`, not just the bare
+  substring `' commit'` (which could not distinguish "the right commit is
+  listed" from "some line merely contains the word").
+- `ref_delete.c`'s `held_lock.name` field was write-only after round 1's
+  own EEXIST-wording unification removed the one branch that ever read it
+  (the "other_name" in-batch-alias lookup) -- removed.
+- `ref_delete.c`'s pass 3 OOM path (an allocation failure on a name pass 1
+  already read successfully) used to report `not_found_fmt`, which is a
+  factually wrong diagnostic for an allocation failure on an already-
+  confirmed-existing name -- now reports "sg: out of memory" instead.
+- Round 1's own text ("a branch or tag name has no length limit in this
+  project") overstated what its own fix proved -- corrected in
+  `cmd_branch.c`, `ref_delete.c`, and `docs/RULES-paths-strings.md` to "no
+  SILENT truncation before the shared `SG_PATH_MAX` ceiling
+  `sg_mkdir_parents` already enforces with an explicit failure", which is
+  what the fix actually changed. `sg_mkdir_parents` itself is UNCHANGED
+  this phase.
+- This file's own citation of `oracle.py` now says explicitly that the
+  script is not part of this repository (see this section's own top note,
+  added the same round for the same reason).
+
+### K1: divergence #10 also covers Unicode-normalization aliasing
+
+Measured 2026-09-14, git 2.55.0, macOS APFS, `LC_ALL=C`, 3 identical
+trials per row. Fixture: `git init -b café` (NFC bytes `caf\xc3\xa9`),
+one commit, HEAD on it. Command: `git branch -d café` with the NFD
+spelling (`cafe\xcc\x81`).
+
+| `core.precomposeUnicode` | rc | effect |
+|---|---|---|
+| true (what `git init` writes on macOS) | 1 | `error: cannot delete branch 'caf\xc3\xa9' used by worktree at '<WT>'` (NFC bytes in message); ref kept |
+| false | 0 | `Deleted branch cafe\xcc\x81 (was c11f16d).` -- checked-out branch DELETED |
+| unset | 0 | same as false |
+
+With `true`, `git branch x<NFD>` also creates the ref with NFC bytes.
+
+Mechanism: `precomposeUnicode=true` NFC-normalizes argv before any
+comparison, so the refusal is the ordinary exact-name worktree check.
+false/unset is the same data-losing shape as the case-fold alias
+(divergence #10). An earlier run showed "false -> refuses"; that was a
+scaffold bug in the measurement script itself (not reproduced in 3 clean
+trials with a fresh copy per row) and is not cited anywhere in this
+project.
+
+sg side: `grep -rni 'precompose|ignorecase'` over `src/`/`include/` is
+zero references -- sg never reads `core.precomposeUnicode`, and `sg init`
+(`storage/repo.c:71-73`) does not write `ignorecase`/`precomposeunicode`
+either. Measured with the round-1 binary, argv bytes asserted NFD
+(`cafe\xcc\x81`) before every run. A first attempt typed the NFD literal
+into a shell heredoc and it arrived as NFC -- that run tested the exact
+name, not the alias, and is void; the NFD form must be built with an
+escape and the bytes asserted, exactly as the interop fixture below does
+with a `printf` octal escape.
+
+| knob | cmd (NFD arg) | git | sg (round 1) |
+|---|---|---|---|
+| false | `-d` / `-D` | rc 0, `Deleted branch cafe\xcc\x81`, checked-out ref GONE | rc 1, `sg: cannot delete branch 'cafe\xcc\x81' used by worktree at '<WT>'`, ref intact, no `.lock` left |
+| false | `-f <nfd> HEAD` | rc 0 | rc 1, `cannot force update the branch 'cafe\xcc\x81' ...` |
+| true | `-d` / `-D` | rc 1, message names NFC `caf\xc3\xa9` | rc 1, message names NFD `cafe\xcc\x81` |
+| true | `-f <nfd> HEAD` | rc 128, message names NFC | rc 1, message names NFD |
+| true | create `x<nfd>` | ref stored NFC `xcaf\xc3\xa9` | ref stored NFD `xcafe\xcc\x81` |
+| false | create `x<nfd>` | ref stored NFD | ref stored NFD (match) |
+
+Conclusions: divergence #10's lock probe DOES catch the normalization
+alias (the `knob=false` rows) -- CLAUDE.md's entry 10 says "case or
+Unicode-normalization alias", pinned by this measurement, not only case.
+The `knob=true` rows (the macOS `git init` default) diverge in message
+bytes and in the STORED REF NAME, caused by sg never reading
+`core.precomposeUnicode` -- pre-existing, affects every sg command taking
+a path/ref argv on macOS, out of Phase 76 scope (see K3 below).
+
+One thing worth recording that CLAUDE.md's entry does not have room for:
+the NFD argument in the interop fixture is built with a `printf` octal
+escape (`printf 'cafe\314\201'`), never a typed literal -- an earlier
+measurement attempt typed the NFD form directly into a shell heredoc and
+it silently arrived as NFC (the heredoc's own text encoding normalized
+it), which would have tested the EXACT name rather than the alias and
+produced a false "sg matches" result. The interop fixture's own
+case-folding vs normalization-folding probes are deliberately SEPARATE
+(`P73_FS_CASE_INSENSITIVE` vs a new NFC/NFD-specific probe) even though
+both are true on the one filesystem (APFS) this was measured on -- they
+are independent filesystem properties in general, and conflating them
+would make a future case-sensitive-but-normalization-folding (or the
+reverse) filesystem's result unexplainable by either probe alone.
+
+### K2: the worktree path inside the refusal message had no assertion at all
+
+`grep`-confirmed: round 1's checks asserted only the SUBSTRING `used by
+worktree at`, never the path that follows it. Fixed as part of R1's pin set
+above (three cwd contexts per command). One measurement worth recording:
+`worktree_root_display`'s own `realpath()` call was found, empirically, to
+be UNOBSERVABLE through the actual `sg branch` entry point on this
+machine -- `sg_find_git_dir` (`storage/repo.c`) resolves the repository root
+via a single `getcwd()` call, and POSIX `getcwd()` already returns the
+kernel's canonicalized (symlink-resolved) path, not a shell-style logical
+`$PWD`; every `git_dir` `cmd_branch.c` ever receives is therefore already
+fully resolved BEFORE `worktree_root_display`'s own `realpath()` call ever
+runs, from the repo root, a subdirectory, or a path reached through a
+symlink alike. Confirmed directly: mutation M11 (replacing the `realpath()`
+branch with an unconditional no-op fallback) was re-run after this round's
+K2 checks were added and STAYED FULLY GREEN (4411/4411) -- not because the
+checks are missing (all three cwd variants, symlink included, are
+exercised, and all pass on the un-mutated binary), but because the mutated
+code path is provably dead on this machine given the current call graph.
+This is a "mathematically unobservable" result in this project's own
+established taxonomy (see the memory note on that shape), not a coverage
+gap: proving it would need a `git_dir` string that is valid but NOT already
+canonical, which nothing in the current call graph can produce. The
+`realpath()` call is left in place regardless (defensive: `sg_find_git_dir`
+changing its own resolution strategy in the future should not silently
+un-fix this), and this finding is recorded rather than the check being
+declared successful without qualification.
+
+### K3: residual, NOT fixed this phase -- sg never reads `core.precomposeUnicode`
+
+Measured (see K1's table above): with `core.precomposeUnicode` true (git's own
+default on macOS, written by `git init`), real git NFC-normalizes argv
+before using it as a ref name or in a message -- `git branch x<NFD>` stores
+`refs/heads/x<NFC>` and a refusal message names the NFC spelling. sg does
+neither: `grep -rni 'precompose'` over `src/`/`include/` is empty, and
+`sg init` (`storage/repo.c`) never writes the `core.ignorecase`/
+`core.precomposeUnicode` keys real git's own `init` writes on this
+platform. This is PRE-EXISTING and project-wide (every sg command that
+takes a path or ref name from argv on macOS is affected, not just `sg
+branch`), so it is explicitly OUT of Phase 76's scope -- recorded here as a
+residual and a candidate for its own future phase, not silently left
+unmeasured.
+
+| `core.precomposeUnicode` | git's ref name for `branch x<NFD>` | sg's ref name |
+|---|---|---|
+| true (macOS `git init` default) | NFC | NFD (unchanged from argv) |
+| false | NFD | NFD (matches) |
+
+Table 76.K3: measured on one commit, one platform (macOS/APFS); not claimed
+to generalize to Linux, where no normalization-folding is expected at all.
+
+## Phase 76 fix round 3: create/-f bypassed every lock, M11 deleted, and check counts made per-filesystem
+
+Round 3 acceptance: `SG_BIN=<path> python3 oracle.py` (main conversation's
+scratchpad, not in this repo -- see this section's own earlier note) reaches
+**346/350** (up from round 2's 330/334; the oracle grew by 16 probes via a
+new `lockcreate` fixture). All 4 remaining mismatches are explained and
+unchanged in KIND from round 2: the 3 `^{tree}` cells (pre-existing,
+cross-cutting, out of scope) and the one `loose ['-d', 'Master']` divergence
+#10 cell (git deletes, sg refuses, by design).
+
+**`tests/interop.sh` counts are FILESYSTEM-CONDITIONAL, and round 2's own
+"4411/4411" framing did not say so** (round 2 review finding) -- fixed by
+reporting both numbers everywhere a Phase 76 count is cited:
+  - **macOS (case-insensitive, and this project's normalization-folding
+    filesystem)**: 4449/4449 passed, 0 skipped.
+  - **Case-sensitive filesystem (e.g. Linux CI)**: 4366 passed + 6 `skip()`
+    calls = 4372 total distinct checks; 0 failed. The GAP is 83 checks
+    (4449 - 4366) that exist in the script but never execute there --
+    divergence #10 (both case- and Unicode-normalization-aliasing, since
+    NEITHER can occur on a filesystem that does not fold names at all) plus
+    the pre-existing Phase 73/74 tag case2j/case2l/case2m group. Measured
+    by simulation (forcing both of this file's own runtime probes,
+    `P73_CASEFOLD_PROBE` and the Phase 76 `P76_NFD_PROBE`, to their
+    case-sensitive/non-folding branch and re-running the whole suite), not
+    an actual Linux run -- recorded as a simulation, not claimed as a CI
+    measurement.
+
+### L1: create/-f wrote through ANY foreign ref lock -- a real hole in divergence #10, closed as git parity
+
+Measured against the round-2 binary: `sg branch new HEAD~1` with a foreign
+`refs/heads/new.lock` present created the branch anyway (git refuses,
+`fatal: cannot lock ref ...`); `sg branch -f topic HEAD~1` with a foreign
+`topic.lock` moved topic anyway; and -- the case that matters for
+divergence #10 -- `sg branch -f Master HEAD~1` with a foreign
+`refs/heads/master.lock` moved the CHECKED-OUT `master` anyway, because
+round 2's own alias probe cannot safely tell when the current branch's own
+lock path is already held by something else (its documented "ambiguous,
+fall through" case) and the create path had no lock of its own to catch it
+a second way. **This is git PARITY, not a new divergence**: real git refuses
+all three rows identically, so closing the gap needed no new sg-specific
+decision, only a lock sg had simply never taken.
+
+Fixed by making the create/-f write hold `refs/heads/<name>.lock` (name AS
+TYPED) as the LAST step before the ref write -- measured check order
+against real git 2.55.0: name validity -> exists-without-force -> exact-name
+worktree refusal -> start-point resolution -> D/F conflict -> LOCK -> write.
+On EEXIST, sg prints git's own wording with `sg: ` in place of `fatal: `,
+exits 1, changes nothing, and leaves the foreign lock exactly as it was.
+
+**No third copy of the O_EXCL lock mechanism**: `include/sg/refs.h`/
+`storage/refs.c` gained `sg_ref_lock_try`/`sg_ref_lock_release`, the ONE
+acquire/release implementation now shared by three call sites that
+previously had (or, for create, needed) their own: `cli/ref_delete.c`'s
+batch-delete transaction, `cmd_branch.c`'s divergence-#10 alias probe, and
+this new create-path lock. `ref_delete.c`'s own messages and control flow
+are BYTE-IDENTICAL after the move (verified: `tests/interop.sh`'s
+phase73/74/76 EEXIST-wording groups, which pin that file's output
+byte-for-byte against real git, stayed green across the refactor) -- only
+the mechanism producing the acquired/EEXIST/ERROR distinction and the lock
+path moved out from under it.
+
+**Where the alias probe still matters after L1**: with NO foreign lock
+present at all (the ordinary divergence #10 case), the new create-lock
+always succeeds instantly, and it is `branch_aliases_current` -- not the
+lock -- that refuses `-f Master HEAD~1` on a case-insensitive filesystem.
+Both mechanisms are pinned separately in interop and are expected to fail
+DIFFERENT named checks under a mutation that disables each one
+independently: dropping the create lock reds the `phase76 L1 (*)` group
+(new/topic/master-alias rows, all newly added this round); dropping the
+alias probe reds the `phase76 divergence #10 (*)` group (unchanged from
+round 2, no foreign lock involved at all).
+
+**A regression found and fixed while building the L1 fixtures**: the very
+FIRST attempt at `-d merged/` (a pre-existing, ALREADY-PASSING oracle
+probe, part of the original MAIN list since before this phase started)
+started answering "sg: out of memory" instead of git's own "branch
+'merged/' not found" once `branch_aliases_current` started using the new
+shared lock helper. **Root cause, corrected (reviewer round 3, R3-5 --
+this section originally named the wrong failing call)**: for the typed
+lock path `refs/heads/merged/.lock`, `sg_mkdir_parents` does NOT fail --
+it calls `mkdir("refs/heads/merged")`, gets `EEXIST` (the path already
+exists, as an ordinary loose ref FILE), and TOLERATES that `EEXIST`
+without checking `S_ISDIR` first, so it reports SUCCESS. The actual
+failure is one step later: `open("refs/heads/merged/.lock", ...)` fails
+with `ENOTDIR`, because a path component ("merged") that the open() call
+needs to be a directory is actually a regular file. `sg_ref_lock_try`
+maps that `ENOTDIR` to `SG_REFLOCK_ERROR`, and round 2/3's own R2-2
+fail-closed branch (correctly, for every OTHER errno) turned it into a
+resource-failure refusal. The identical shape existed in round 2's own
+hand-rolled lock code (same `sg_mkdir_parents` EEXIST-without-`S_ISDIR`
+gap, same subsequent `ENOTDIR`), so this was a PRE-EXISTING round-2 bug
+this round's own testing exposed, not a new one introduced by the
+refactor -- round 2's fixtures never happened to probe a
+structurally-malformed delete target against a real branch collision.
+**Round 3 fixed it with a guard at the TOP of `branch_aliases_current`**:
+`sg_ref_path_components_are_safe(name)` (already existed in `refs.h`,
+rejects a trailing `/`, an empty component, and `.`/`..`) returns `0`
+("not aliased") immediately for a name that cannot be a well-formed ref
+path component, before any lock is attempted -- `sg_ref_read_path`
+downstream already answers "not found" correctly for such a name on its
+own, matching git. **This guard covered only the trailing-slash spelling
+of the problem, not the problem itself -- round 4 found the SAME
+`ENOTDIR` shape reachable through a structurally VALID sibling name
+(`-d merged/sub`, `-d heads/x/y`) that the guard cannot see at all, since
+nothing about "merged/sub" is malformed. See round 4's own D1b/D1c/R3-1
+section: the guard became REDUNDANT once the alias probe was made a pure
+query that classifies `ENOENT`/`ENOTDIR` as "not aliased" directly, and
+was deleted rather than kept alongside the more general fix.**
+
+### R2-2: the SECOND open() in the alias probe had the same fail-open round 2 claimed to have closed
+
+`branch_aliases_current`'s typed-lock `open()` handled only `fd < 0 &&
+errno == EEXIST` (aliasing) and `fd >= 0` (acquired then released); any
+OTHER errno (`ENOSPC`, `EMFILE`, `EACCES`, `EROFS`, `ENAMETOOLONG`, ...)
+fell through with `aliases` still `0` -- "not aliased" on a REAL failure,
+the exact fail-open direction R2 (round 2) said it had already closed.
+Audited the FIRST open() (the current branch's own lock) for the identical
+shape while fixing this: its EEXIST fall-through (a foreign stale lock on
+the CURRENT branch's own path) is intentional and unchanged -- see L1's own
+note on why a foreign lock there is now caught a second way, by the create
+path's own lock -- but any OTHER failure on that first open must ALSO fail
+closed, which it did not before this round either. Both are now routed
+through `sg_ref_lock_try`'s tri-state result: `SG_REFLOCK_ERROR` on either
+open returns -1 from `branch_aliases_current` (fail closed), with EEXIST
+kept as the one deliberately ambiguous, non-error fall-through on the FIRST
+lock only. **Not mutation-verifiable by fault injection** -- this project
+has no way to force `open()`/`sg_mkdir_parents` to fail a specific call, so
+this fix (like round 2's R2 before it) is verified by inspection only: both
+`open()` call sites in `branch_aliases_current` were grepped and confirmed
+to route every non-EEXIST failure through the same `SG_REFLOCK_ERROR` arm.
+
+### M11 decision: DELETE `worktree_root_display`'s realpath call
+
+Round 2 classified the `realpath()` call as unobservable through every
+repo-discovery path today and left it in place, citing CLAUDE.md's own
+option to leave a mathematically-unobservable mutation site alone. Round 3
+re-examined the SAME finding against CLAUDE.md's OTHER, more specific rule
+-- "a redundant guard: delete the guard so the mutation lands one layer
+down" -- and that rule is the correct one to apply here, not the
+leave-it-alone option: the guard is not merely untested, it is PROVABLY
+DEAD given the current call graph. `sg_find_git_dir` (`storage/repo.c`)
+obtains the repository root via exactly one `getcwd()` call, and POSIX
+`getcwd()` already returns the kernel's canonicalized (symlink-free) path,
+never a shell-style logical `$PWD` -- there is no code path today by which
+`worktree_root_display` could ever receive a `git_dir` that its own
+`realpath()` call would still need to resolve further. Confirmed
+empirically: `M11r2` (replacing the `realpath()` branch with an
+unconditional failure fallback) stayed fully green (4411/4411) even under
+round 2's own root/subdirectory/symlinked-cwd full-line path checks, which
+DO exercise every discovery path sg has today.
+
+Deleted the `realpath()` call and its fallback branch; kept round 2's path
+checks unchanged (they now exercise `sg_repo_root`'s own, always-correct
+answer directly). **The condition under which this stops holding, written
+down so a future change does not silently reopen the gap**: the day sg
+gains `GIT_DIR` environment support, a `-C <path>` flag, or `.git`-as-a-file
+(gitdir/worktree) support, `sg_find_git_dir` will no longer be the ONLY
+source of `git_dir` reaching this function, and a symlinked-path fixture
+must be re-run before trusting this section again.
+
+### R2-4 / R2-5: coverage nits
+
+- **R2-4**: the ref/reflog byte-identity check used to cover only ONE of
+  divergence #10's seven alias scenarios (`d-root`). Extended to all seven
+  (`d-root`/`d-subdir`/`d-symlink`/`D-root`/`f-root`/`f-subdir`/
+  `f-symlink`), and widened from "ref + reflog" to "ref + reflog +
+  `logs/HEAD`" -- the reviewer's own finding (round 2 review) is that a
+  bypassed alias write updates the branch's OWN reflog via an exact
+  strcmp while `logs/HEAD` stays untouched, so the two disagree; a
+  regression that still writes but "only a little" (one reflog updated,
+  not the other) needs both asserted to be caught by name.
+- **R2-5**: K1's NFC/NFD check used to be `test -f
+  .git/refs/heads/<NFC-name>`, which passes for EITHER stored spelling on a
+  filesystem that folds normalization -- it could not actually see a
+  regression that silently renamed the ref to NFD. Replaced with a
+  hex-byte comparison of the ACTUAL directory listing
+  (`ls .git/refs/heads | od -An -tx1`) against the expected NFC byte
+  sequence, so the check's own failure output shows the real stored bytes
+  rather than a string a terminal would render identically either way.
+
+### L2 (residual, NOT fixed this phase): `sg_ref_update` takes no lock, project-wide
+
+Measured against the round-2 binary, same foreign-`.lock` technique as L1,
+on commands OTHER than `sg branch`:
+
+| lock present | command | git | sg |
+|---|---|---|---|
+| `refs/heads/new.lock` | `switch -c new` | rc 128, refused | rc 0, branch created and HEAD switched |
+| `refs/heads/master.lock` | `reset --soft HEAD~1` | rc 1, `error: update_ref failed for ref 'HEAD': cannot lock ref 'HEAD': ...master.lock...` | rc 0, master moved |
+| `refs/tags/nt.lock` | `tag nt HEAD~1` | rc 128, refused | rc 0, tag created |
+| `HEAD.lock` | `switch topic` | rc 128, `error: cannot lock ref 'HEAD': ...HEAD.lock...` | rc 0, HEAD switched |
+| `refs/heads/master.lock` | `commit` | rc 128, `cannot lock ref 'HEAD'` | NOT MEASURED -- the probe used `--allow-empty`, which `sg commit` does not accept, so the row exercised sg's own usage-error path instead of the lock question it was meant to test |
+
+`grep O_EXCL src/` (after this round's extraction): only `storage/refs.c`
+(`sg_ref_lock_try`, used by `cmd_tag.c`/`cmd_branch.c`/`ref_delete.c`) and
+`storage/chunk.c`. `sg_ref_update` itself (`storage/refs.c`) takes no lock
+at all -- pre-existing, affects every ref-writing command in this project
+(`switch`, `reset`, `tag`, `commit`, `merge`, `rebase`, `cherry-pick`,
+`stash`, ...), not just `sg branch`. A concurrent git process's lock is
+silently overridden by every one of them. **Recorded here as the
+RECOMMENDED NEXT PHASE, `sg_ref_update` is deliberately UNCHANGED this
+phase** -- Phase 76 is scoped to `sg branch`, and threading locking through
+the one function every ref write in this project ultimately calls is a
+project-wide behavior change that needs its own measurement pass (starting
+with the one unmeasured row above, `sg commit` under a `HEAD.lock`, using a
+real content change rather than `--allow-empty`).
+
+## Phase 76 fix round 4: fd exhaustion regressed shipped `sg tag -d`, and the alias probe leaked empty directories
+
+Round 4 acceptance: `SG_BIN=<path> python3 oracle.py` (main conversation's
+scratchpad, not in this repo) reaches **406/413**. Every one of the 7
+remaining mismatches is one of the accepted cells: the 3 `new HEAD^{tree}`
+cells (pre-existing, out of scope), `loose ['-d', 'Master']` (divergence
+#10, by design), and the 3 D1a `emptydir` cells (`nope HEAD~1`, `nope`,
+`-f nope HEAD~1` -- recorded residual below, fixed together with L2 in the
+next phase). `tests/interop.sh`: **macOS 4488/4488, 0 skipped**; simulated
+case-sensitive filesystem (same simulation method as round 3: forcing both
+runtime folding probes to their negative branch) **4401 executed + 7
+`skip()` = 4408 total distinct checks, a gap of 87** (round 3's own 83-check
+gap plus round 4's new `d-Master-x` R3-2 row, which needs case-folding to
+reproduce, minus the corresponding `skip()` line change).
+
+### R3-4 (HIGH -- a regression of SHIPPED master behavior): batch delete held every lock's fd open
+
+`cli/ref_delete.c`'s `locks[lock_count] = lock` kept every ACQUIRED lock's
+file descriptor open until the whole batch's loop finished, ever since
+round 1's extraction. Measured against real behavior: with the platform
+default `RLIMIT_NOFILE` (256 on macOS), `sg tag -d` on 400 names failed the
+WHOLE batch with "Too many open files" and deleted 0/400, where BOTH
+master's pre-extraction `sg tag -d` (which closed each fd right after
+acquiring) and real git delete all 400. This is a regression of a SHIPPED
+command, not a resource-footprint note -- the gate environment's own
+`RLIMIT_NOFILE` is 1048576, which is why none of the four earlier rounds'
+gates could ever see it.
+
+Fixed in `sg_ref_lock_try` (`storage/refs.c`): close the fd immediately
+after a successful `O_CREAT|O_EXCL` -- the lock IS the file's existence,
+not the open descriptor, so holding it open past acquisition cost nothing
+except fds. `lock->fd` is set to `-1` afterward so no caller can mistake it
+for a still-open descriptor (grepped: no caller ever read `lock.fd` at
+all). Verified directly (400 names, `RLIMIT_NOFILE` set to 256 via a
+`preexec_fn`): `sg tag -d` now deletes 400/400. Pinned in interop under an
+explicit `ulimit -n 256` (declared on the command line for both git and sg,
+not just sg) for both `sg tag -d` and `sg branch -D` at 400 names each,
+comparing exit code, deleted count (via stdout line count), and that no
+target ref survives on either side.
+
+**Why no gate saw it, recorded as a gate blind spot**: `bash tests/
+gates.sh` inherits its own shell's `RLIMIT_NOFILE` (1048576 in this
+environment), and nothing in the gate script lowers it -- an fd-exhaustion
+regression is invisible to the whole gate suite unless a specific check
+sets its own limit, which is exactly what this round's new pin does and no
+earlier one did.
+
+### R3-1 / D1b / D1c (HIGH, a round-3 regression): the alias probe leaked empty directories and misreported an ordinary not-found
+
+Round 3's `branch_aliases_current` used the directory-creating
+`sg_ref_lock_try` for its typed-name probe, which runs for EVERY name in a
+delete batch regardless of whether that name even exists. Two measured
+consequences:
+
+- **D1b**: `sg branch -d nope/sub` (correctly answering "not found") also
+  planted an empty `refs/heads/nope/` directory -- `sg_mkdir_parents`
+  creating the lock path's parent directories for a name that turns out
+  not to exist at all. Real git creates NO directory on any refusal.
+  Reachable through several shapes: `-d nope/sub`, `-D Nope/Sub`,
+  `-d deep/a/b`, `-d refs/heads/merged`.
+- **D1c**: `sg branch -d heads/x/y` and `-d Master/x` (a parent PATH
+  COMPONENT that is itself an existing, ordinary loose ref FILE, e.g.
+  "heads" or "master") printed "sg: out of memory" instead of git's
+  "branch '<name>' not found". Same root cause as round 3's own `-d
+  merged/` fix (see that section's corrected mechanism sentence,
+  R3-5): `sg_mkdir_parents` tolerates `EEXIST` on `mkdir("refs/heads/
+  heads")` without checking `S_ISDIR`, reports success, and the
+  subsequent `open("refs/heads/heads/x/y.lock", ...)` then fails with
+  `ENOTDIR` -- which round 2/3's own (otherwise correct) fail-closed
+  R2-2 branch turned into a resource-failure refusal. Round 3's
+  path-safety guard (`sg_ref_path_components_are_safe`) covered only the
+  STRUCTURALLY MALFORMED spelling of this shape (a trailing `/`); it is
+  blind to a structurally VALID sibling name like "merged/sub", which is
+  exactly what D1c's own probes are.
+
+**Fixed by making the alias probe a pure query, not by patching the
+existing guard further**: `sg_ref_lock_try_query` (`storage/refs.c`), a
+new sibling of `sg_ref_lock_try` sharing the same underlying
+`ref_lock_try_impl` (factored out so the R3-4 fd-close fix and any future
+change to the `open()` call itself is made once, not twice), skips
+`sg_mkdir_parents` entirely. `branch_aliases_current` now uses it for BOTH
+of its locks (the current branch's own, and the typed name's), and
+classifies an `ENOENT`/`ENOTDIR` failure on the TYPED lock as a clean "not
+aliased" -- NOT a resource failure -- since either errno means "this
+spelling cannot resolve to anything on disk at all". This decision belongs
+to `branch_aliases_current` specifically (documented on
+`sg_ref_lock_try_query`'s own header comment), not to the lock primitive:
+a hypothetical second caller of the query variant might legitimately want
+`ENOENT` to be an error.
+
+**Round 3's `sg_ref_path_components_are_safe` guard is now REDUNDANT and
+was deleted**: the pure-query fix handles the trailing-slash shape the
+guard existed for (`refs/heads/merged/.lock` for a `merged/` argument
+fails with `ENOTDIR` for the identical "sibling is a file" reason as
+`merged/sub`, both now classified as "not aliased" by the same code path)
+as a special case of the GENERAL fix, not a separate one. No mutation
+needs to prove this negatively (deleting a guard cannot itself be proven
+correct by a mutation, only by the coverage of the code that replaced
+it) -- the `-d merged/` interop probe (round 3's own regression fixture)
+and R3-2's new `-d merged/sub` probe (below) both exercise the exact
+mechanism now responsible for the answer.
+
+**The current branch's own lock also switched to the query variant**,
+even though `is_loose_branch_ref` already confirmed it exists (so its
+directory chain necessarily exists too, making `sg_mkdir_parents` there
+always a no-op): this keeps the whole probe consistently "creates nothing,
+ever" rather than "creates nothing for the typed name, but still could for
+the current branch's name under an unreached code path".
+
+### D1d (MEDIUM, pre-existing, fixed because Phase 76's own delete engine is the only thing that creates the poisoned directories): delete does not prune empty parent directories
+
+Measured against real git 2.55.0 (see the round-4 spec draft's own
+stopping-rule table, not reproduced here in full): deleting a nested ref
+name prunes each now-EMPTY ancestor directory, on BOTH the ref side and
+the reflog side INDEPENDENTLY, stopping at the first non-empty ancestor
+(plain `rmdir` semantics -- never recurses, never touches a sibling or an
+unrelated empty directory), and NEVER removes the namespace root
+(`refs/heads/`, `refs/tags/`, `logs/refs/heads/`) even when it becomes
+empty. This is pre-existing (`sg_ref_delete_under` already left these
+directories behind before Phase 76 touched anything), but Phase 76's own
+`ref_delete.c` is the ONLY code in this project that can currently create
+one of these poisoned directories at all (see D1a below) after D1b/D1c
+closed the alias probe's own leak, so fixing the prune here closes the
+loop Phase 76 itself is responsible for reopening.
+
+Fixed by reusing `sg_prune_empty_parents` (`workdir.h`) -- no second
+pruner. It already implements exactly this stopping rule (`rmdir` until
+the first failure) for the working tree; the "namespace root" it must
+never cross is simply the `repo_root` argument, set here to
+`<git_dir>/refs/heads` (or `refs/tags`) and `<git_dir>/logs/refs/heads`
+rather than the worktree root, so it structurally cannot remove either
+namespace root: a single-component name has no `/` left after the first
+strip, and `sg_prune_empty_parents` returns immediately in that case
+("its parent IS repo_root, never removed"). Called from `ref_delete.c`'s
+pass 3 immediately after a successful `sg_ref_delete_under`, for the ref
+chain and the log chain independently, applying to `sg tag -d` too (same
+shared engine). Verified directly: `sg branch -d heads/x` now removes
+`refs/heads/heads/` and `logs/refs/heads/heads/`; a sibling `heads/x`/
+`a/b` `a/x` keeps `refs/heads/a/`; `sg tag -d t1/t2` removes
+`refs/tags/t1/`.
+
+### D1e (LOW, two disk-state/wording cells introduced by the NEW `-f` feature)
+
+- **No-op force-update on a PACKED-only branch materialized a needless
+  loose file**: `sg branch -f topic topic` (topic packed-only, forced to
+  the value it already has) used to write a loose `refs/heads/topic`
+  identical in content to the packed entry -- `sg_ref_update`'s own
+  no-op rule only suppresses the REFLOG line, not the ref write itself,
+  and that is by design for every OTHER caller (see L2: changing
+  `sg_ref_update`'s own contract is out of scope). Fixed IN
+  `create_branch` instead: before building the lock/write, if the
+  branch already exists and the resolved commit id equals its CURRENT
+  tip (read via `sg_ref_read_branch`, which merges loose+packed), return
+  0 immediately, touching nothing at all -- matching git's real
+  behavior of leaving a genuine no-op completely alone.
+- **Packed, case-folded D/F conflict gave the wrong wording and leaked a
+  directory**: `sg branch -f Master/x HEAD~1` against a PACKED-only
+  "master" used to skip `check_df_conflict` entirely (its existence test,
+  `sg_ref_branch_exists`, is an EXACT-STRING packed lookup -- correct in
+  general, see divergence #10's own reasoning for why an exact match is
+  the right answer for the ordinary "does this ref exist" question, but
+  wrong for D/F detection specifically) and then fail deep inside
+  `sg_ref_update` with the SAME `EEXIST`-without-`S_ISDIR`/`ENOTDIR`
+  mechanism as R3-1/D1c above, this time on the REFLOG side:
+  `logs/refs/heads/master` is an ordinary FILE (every non-bare repo logs
+  its first commit) that exists independent of whether `master` itself is
+  packed, and `mkdir("logs/refs/heads/Master")` case-folds onto it.
+  Measured: git's own message names the REAL STORED ref
+  (`refs/heads/master`, lowercase) in BOTH halves of the D/F sentence,
+  including the "cannot create" half (`'refs/heads/master/x'`, not
+  `.../Master/x`) -- git appears to build that path from the RESOLVED
+  conflicting prefix plus whatever followed it in the typed name, not
+  from the typed name verbatim. Fixed with two additions to
+  `check_df_conflict`'s forward-direction loop: `logs_component_is_file`
+  (a plain `stat()` on the LOGS-side path, filesystem-native the same way
+  `is_loose_branch_ref`'s own `stat()` is -- it only ever fires on a
+  filesystem that itself folds the spelling, no separate "is this
+  filesystem case-insensitive" gate needed) as a second existence test
+  alongside `sg_ref_branch_exists`, and `find_casefold_branch` (a
+  case-insensitive scan of the real branch listing, used ONLY for
+  message wording after the filesystem stat already made the real
+  existence decision, with the same "not a security decision" caveat
+  divergence #10's own comment already makes for why `strcasecmp` is
+  unsafe for THAT purpose but fine for this one) to recover the real
+  stored name and rebuild the "cannot create" path around it. Verified
+  directly: byte-identical to git's own message, and no directory left
+  behind.
+
+### D1a (residual, recorded together with L2 -- NOT fixed this phase): sg cannot write a ref where an empty directory sits
+
+Measured on an EXTERNALLY-planted empty `.git/refs/heads/nope/` (the
+oracle's own `emptydir` fixture): `sg branch nope HEAD~1`, `sg branch
+nope`, and `sg branch -f nope HEAD~1` all exit 1 with "sg: cannot create
+branch 'nope'"; real git exits 0, silently removing the empty directory
+itself and creating the ref. `sg switch -c nope` has the identical gap
+(both are `sg_ref_update` callers). **After D1b/D1c/D1d, Phase 76's OWN
+code no longer creates such a directory itself** -- reaching D1a now needs
+an externally created empty directory (another tool, a crashed process, or
+a manually constructed fixture), not anything `sg branch` does on its own;
+before this round, `sg branch -d heads/x` (D1d) followed by `sg branch
+heads` could poison sg's own namespace with no external actor involved at
+all. Fixing D1a itself means teaching `sg_ref_update` (or its caller, for
+every ref-writing command, not just `branch`) to tolerate/remove an empty
+directory sitting where it wants to write a file -- the identical
+"`sg_ref_update`, every ref-writing command" scope as L2 below, so it is
+recorded and deferred alongside it rather than fixed as a
+`cmd_branch.c`-only patch.
+
+### L2 (residual, unchanged from round 3, NOT fixed this phase): `sg_ref_update` still takes no lock, project-wide
+
+See round 3's own L2 section for the measured table; unchanged this round.
+`sg tag -d`/`sg branch -d`/the create/`-f` write are still the only three
+`O_EXCL`-guarded call sites in this project (via the shared
+`sg_ref_lock_try`/`sg_ref_lock_try_query`); `switch`, `reset`, plain `tag`
+(create), and `commit` all still silently override a concurrent git
+process's lock, and none of them tolerate an empty directory the way D1a
+above needs. Both residuals point at the same function and the same next
+phase.
+
+## Phase 76 fix round 5: a shipped destructive bug, a deleted guard that still guarded a side effect, and an inferred mechanism that only matched one fixture
+
+Round 5 acceptance: `SG_BIN=<path> python3 oracle.py` (main conversation's
+scratchpad, not in this repo) reaches **408/421**.
+Every one of the 13 remaining mismatches is one of the accepted cells: the
+3 `new HEAD^{tree}` cells, `loose ['-d', 'Master']` (divergence #10), the 3
+`emptydir` D1a cells, the 2 `packed` `-f Master/x`/`-f Topic/x` cells
+(`err` dimension only -- `rc`/`refs`/`dirs`/`logs` all still match git,
+per Q2's own acceptance rule below), and the 4 `packed-nolog` cells (Q2's
+residual, listed by name in that section). `tests/interop.sh` as measured
+in round 5 (unchanged through rounds 6-7, superseded by round 8 -- see
+round 9's V2 section near the end of this file for the current total):
+**4582/4582 passed, 0 skipped** on macOS. SIMULATED case-sensitive/Linux (both folding
+probes forced negative the same way rounds 3/4 measured it): **4488/4488
+passed, 8 skipped** -- a gap of 94 checks against the macOS total, since
+`skip()` only increments the skip counter, not the total (see CLAUDE.md's
+own warning on this). Of round 5's OWN new checks, only the Q2 floor block
+is gated on the case-insensitive-FS probe; its 6 checks collapse into the
+ONE `skip()` call for that block in the simulated run (round 5's D1d, D1e,
+and P1 additions are all unconditional and still run in full there).
+
+### P1 / R4-1 (HIGH, a SHIPPED destructive bug fixed at its one source)
+
+Measured against real git 2.55.0 AND against master (pre-Phase-76): a
+path-spelled name -- `./merged`, `.//topic`, `heads/./x` -- let the
+filesystem resolve to a DIFFERENT ref than the one git says by that exact
+spelling, because the OS collapses `.`/`..`/`//` components while git's
+own ref lookup treats each spelling as a distinct name. `sg branch -d
+./merged` and **`sg tag -d ./lt` DELETED a real ref git says does not
+exist at all** -- a shipped bug, not something Phase 76 introduced, fixed
+here because the shared batch-delete engine (`sg_ref_delete_batch`) is
+this phase's own code and is the one place both `tag -d` and `branch -d`
+go through.
+
+Fixed with ONE gate, at the true source: `sg_ref_delete_batch`'s pass 1
+(`cli/ref_delete.c`) now validates every name with
+`sg_ref_path_components_are_safe` BEFORE the precheck callback, the
+existence check, or any other filesystem call, rejecting an unsafe name
+with the command's ordinary not-found message (git's own answer for
+every one of these spellings). This closes P1 AND R4-1 in the same
+change: `branch_aliases_current` (called from the precheck) and every
+`sg_ref_lock_try`/`sg_ref_lock_try_query` caller downstream now only ever
+see an already-validated name. The invariant is stated directly in
+`refs.h`, next to the lock API, rather than left implicit: **"every
+`name` passed to either lock function must already have passed
+`sg_ref_path_components_are_safe`"**, with a note to grep both function
+names for the full caller list if a third one is ever added. Verified
+directly: `./merged`, `./lt`, `.//topic`, `heads/./x` all now correctly
+answer "not found" and keep the real ref intact, on both loose and
+packed fixtures, for `tag -d`, `branch -d`, and `branch -D`.
+
+### R4-1's own discriminator, and why round 4's proposed one does not work
+
+Round 4's report treated "the final message is unchanged" as proof a
+guard was redundant. It is not: the SAME `-d ../../evil` name, without a
+gate, builds `<git_dir>/refs/heads/../../evil.lock`, and
+`open(O_CREAT|O_EXCL)` on that path creates (however transiently, since
+every caller unlinks on every exit path) a real file OUTSIDE the
+repository -- with enough `..` components, outside the filesystem
+hierarchy sg was ever supposed to touch at all. **Planting something AT
+the escape target does not discriminate**: `open(O_CREAT|O_EXCL)` on any
+EXISTING path (file OR directory) returns `EEXIST` before anything about
+the target's type is even inspected, so "not found" comes out identical
+whether a gate ran first or the probe merely happened to collide.
+**Planting a read-only PARENT directory at the escape target DOES
+discriminate**: with nothing at the target itself but its parent mode
+`0555`, an attempted `open(O_CREAT|O_EXCL)` fails with `EACCES` -- a
+resource-failure errno, not `ENOENT`/`ENOTDIR` -- so the OLD (ungated)
+code's fail-closed path prints "sg: out of memory" (proving the probe
+really tried to create a file outside the repository), while a gate that
+runs BEFORE any filesystem call never reaches that code at all and
+prints the ordinary not-found message. This is now the pinned interop
+discriminator (`phase76 R4-1`), not the planted-directory shape.
+
+### The redundant-guard reasoning error itself, generalized
+
+See CLAUDE.md's amended "redundant guard" bullet (Testing conventions)
+for the general rule this incident now documents project-wide: a guard
+is redundant only if removing it changes NEITHER the final answer NOR
+anything the code touches on the way to producing it (filesystem, locks,
+subprocesses, network), and the second half needs its own fixture --
+"same happy-path answer" is not evidence about a side effect the happy
+path never exercises.
+
+### Q1 (HIGH, oracle-confirmed): the no-op force-update short-circuit must take the lock first
+
+Measured: with a foreign `refs/heads/topic.lock` present, `git branch -f
+topic topic` (topic already at that value) exits 128 with git's own raw
+lockfile wording -- identical on loose and packed fixtures, topic
+unchanged, foreign lock kept. Round 4's own no-op short-circuit (added
+for D1e) returned early BEFORE the create-path lock was ever attempted,
+so a foreign lock never got a chance to refuse and sg exited 0 where git
+refuses 128 -- confirmed by the oracle's own new `lockcreate` probes
+(`-f topic topic`, `-f Topic topic`), which round 4 had not added.
+
+Fixed by moving the short-circuit to AFTER the lock is acquired (still
+before any write): the lock is taken purely to prove nothing else holds
+it, the no-op check runs, and on a genuine no-op the lock is released
+without ever calling `sg_ref_update` -- still no write, still no reflog
+line, matching git's real "touches nothing" outcome for the true no-op
+case while now also matching its "refuses" outcome when something else
+holds the lock.
+
+### Q2 (HIGH): round 4 inferred the WRONG mechanism from one fixture
+
+Round 4's packed-case-folded-D/F fix (`logs_component_is_file` +
+`find_casefold_branch`) detected the conflict by checking whether
+`logs/refs/heads/<prefix>` exists as a file -- which coincided with git's
+own answer on the ONE fixture it was measured against (a fresh repo,
+reflog present) and NOWHERE ELSE. Measured directly, with the branch's
+reflog file deleted (`core.logAllRefUpdates=false`, or simply an older
+repository git itself created without one -- both real, reachable
+states): git STILL refuses the SAME D/F conflict, with the SAME wording,
+keyed on `core.ignorecase` (a config knob, written `true` by `git init`
+on macOS), not on whether a reflog file happens to exist. Round 4's
+heuristic MISSED every one of these no-reflog rows -- **worse than
+predicted**: not merely wrong wording, sg silently CREATES the ref
+(`refs/heads/MASTER/x`) where git refuses outright, leaving a repository
+holding a packed `master` and a loose `Master/` directory at once (which
+collide on the next loose write of `master`, e.g. after any commit or a
+`pack-refs` round trip). This is this project's own "inferring a
+mechanism from one symptom" failure shape: the reflog test and git's
+real `core.ignorecase` test happened to agree on exactly the fixture
+measured and disagreed everywhere else.
+
+**Root classification (measured against a `master` build)**: the
+creating cell is PRE-EXISTING on master, not introduced by Phase 76 --
+`git branch Master` against a packed, no-reflog `master` already created
+the ref on master's own binary, before this phase touched anything.
+Phase 76's own round 4 did not make this WORSE (it did not touch the
+no-reflog rows at all) and, for the one row it did handle correctly (a
+reflog present), IMPROVED on master's own answer. Also measured:
+`core.ignorecase` affects ONLY the D/F-conflict check, not the
+"already exists" check -- with `ignorecase=true` and a packed `master`,
+`git branch Master` still creates a loose `Master` (git's own "does this
+already exist" question and "would creating this collide" question are
+answered by two DIFFERENT mechanisms). So the eventual real fix belongs
+entirely in `check_df_conflict`, never in `sg_ref_branch_exists`.
+
+**Decision: REMOVE the heuristic rather than patch it further.** sg has
+no general git-config reader at all (`grep`-confirmed: the only config
+parser in this project is `sg_repo_read_chunk_config`, for sg's own
+chunking settings) -- a one-off `core.ignorecase` reader for this single
+cell would be inventing a second, narrower, ad hoc mechanism instead of
+implementing git's actual one, and this project already has a
+`core.precomposeUnicode` gap recorded (Phase 76 round 2's K3 residual)
+that needs the identical kind of reader. The two are merged into one
+residual: **"sg never reads `core.ignorecase` or `core.precomposeUnicode`
+-- both are written by `git init` on macOS, both change how a name
+matches an existing ref, and both should be read by the SAME
+future-phase config reader rather than two independent one-off
+patches."**
+
+| condition | git's D/F check |
+|---|---|
+| repo as `git init` wrote it (`core.ignorecase=true`), reflog present | refuses (D/F wording) |
+| `ignorecase=true`, reflog DELETED | still refuses, identical wording |
+| `ignorecase=true`, `logAllRefUpdates=false` (never had a reflog) | still refuses, identical wording |
+| `-c core.ignorecase=false`, reflog present | a DIFFERENT git error (`unable to append to '...': Not a directory`) -- and git's OWN answer leaves a directory behind here; out of scope, non-default on macOS |
+| `-c core.ignorecase=false`, no reflog | rc 0, CREATES the ref -- git's own non-default configuration choosing to create |
+
+**Floor requirement, pinned regardless of the residual**: even without
+implementing git's real mechanism, sg must be no WORSE than master was --
+exit 1, no ref created, and (the part master itself did not guarantee,
+now fixed) NO empty directory left under `refs/` or `logs/refs/` on the
+refusal path. Verified directly and pinned in interop
+(`phase76 Q2 floor`, gated on the case-insensitive-FS probe): sg's own
+generic wording is measured and pinned as a literal (NOT assumed to be
+master's old wording, which this project no longer has any record of
+reproducing byte-for-byte) -- `create_branch`'s existing failure path
+already calls `sg_prune_empty_parents` on any write failure (added for
+this exact reason, see below), which turned out to be exactly what this
+floor needed with no further change.
+
+**A directory-leak fix that generalizes beyond Q2**: removing the
+heuristic exposed that `create_branch`'s OWN create-path lock (round 3's
+L1) creates `refs/heads/<name>`'s parent directories BEFORE the write is
+attempted at all (needed for the ordinary success case), and a write that
+then fails partway through (for ANY reason, not just this one) can leave
+that freshly-created directory behind, empty. Fixed generally: on any
+`sg_ref_update` failure in `create_branch`, `sg_prune_empty_parents` is
+now called for both the ref and reflog directory chains (the same helper
+D1d's delete-side pruning uses), unconditionally -- a no-op for every
+OTHER failure reason, since those never leave a directory that stays
+empty.
+
+### R4-2 (HIGH): the R3-2 checks never compared stderr
+
+`p76_r32_check` (added round 4 for the alias-probe directory leak)
+captured both sides' stderr but asserted only exit code and a directory
+COUNT -- the exact D1c bug (`out of memory` instead of `not found`) exits
+1 either way, so nothing in that check group could ever see it. Fixed by
+adding a byte compare of stderr (the same `p74_norm_eexist_msg`
+normalization used elsewhere) to every R3-2 cell. The main conversation's
+own mutation PQ1 (disabling the probe's `ENOENT`/`ENOTDIR` "not aliased"
+branch) is the proof this closes: PQ1 stayed fully green against round 4
+specifically because of this gap.
+
+### R4-8 (LOW): "no new directory" compared a COUNT, not a listing
+
+`find ... -type d | wc -l` equality cannot tell "one leaked, one
+legitimately missing" apart from "no change" -- both produce the same
+count. Every directory-comparison check this round (`R3-2`, `D1e`, `D1d`,
+`P1`) now compares the SORTED directory LIST instead (`find ... | sort`,
+byte-compared).
+
+### D1d, D1e, P1: interop coverage added (R4-5, R4-4, and the P1 fix's own pins)
+
+All three had ZERO interop coverage before this round (verified by ad-hoc
+scripts only, per round 4's own report). Added: `p76_d1d_check` (one
+`dirs`-comparison row per stopping-rule shape -- a/b/c, a sibling that
+survives, an unrelated empty directory left untouched, an empty
+grandchild that makes the two chains diverge, packed-only, and `tag
+t1/t2`); `p76_d1e_check` (loose/packed x with/without a foreign lock,
+covering both Q1's fix and the ordinary no-op); and `p76_p1_check`
+(every P1 row, loose and packed, for `branch -d`/`-D` and `tag -d`,
+comparing rc, stderr bytes, the refs listing, and the directory tree).
+
+### A normalizer gap found while building the D1e pins
+
+`p74_norm_eexist_msg` (defined once, near the top of this file, and
+reused by every EEXIST/lock-collision comparison since Phase 76 round 1)
+folded `error: `/`sg: ` to `E: ` but not `fatal: ` -- every EARLIER use
+compared a DELETE-side message (git always says `error: could not delete
+...` there), so the gap was invisible until round 5's new D1e checks
+compared a CREATE-side lock collision, which git prefixes with `fatal: `
+instead (a different git subsystem, the identical underlying lockfile.c
+sentence). Symptom: two genuinely non-empty, genuinely DIFFERENT-looking
+`.norm` files that `cmp` correctly failed on -- NOT a repeat of this
+file's own "two empty files compare equal" incident (round 1), a
+different failure shape from a normalizer with an incomplete prefix
+list rather than one that silently produced nothing. Fixed by adding
+`fatal: ` to the same substitution list.
+
+## Phase 76 fix round 6: a small, low-severity tail -- a comment overclaim, two mislabeled checks, a missing simulated count, a root-meaningless discriminator
+
+No behaviour change in this round; all four items are comment/test-metadata
+fixes. Oracle unchanged at 441/457 with the same accepted-mismatch list.
+
+### F1a (residual, recorded together with D1a/L2/Q2 -- NOT fixed this phase): the create failure-path prune can leave a 0-byte reflog and its directory behind, on an I/O failure ordering never measured against git
+
+`cmd_branch.c`'s create-path failure comment (see round 5's Q2 section
+above) used to claim `sg_prune_empty_parents`'s cleanup on a failed
+`sg_ref_update` "is a no-op ... for every OTHER failure reason, since
+those never create a directory that stays empty". That is only true for
+the failure paths actually measured, and even among those, the directory
+removal itself only happens for ONE of the three kinds -- see the table
+below. Measured 2026-09-14 against real git 2.55.0, macOS APFS
+(case-insensitive), `LC_ALL=C`, fixtures from the oracle's own fixture
+set ("dirs" = directories under `.git/refs` and `.git/logs/refs`, empty
+ones marked):
+
+| row | fixture + pre-existing dirs | command | git rc | git removes |
+|---|---|---|---|---|
+| R1 | fx_packed, empty `refs/heads/MASTER/` | `branch MASTER/x` | 128 (D/F: `'refs/heads/master' exists; cannot create 'refs/heads/master/x'`) | `refs/heads/MASTER/` (the empty dir standing in the way) |
+| R1b | fx_packed, empty `refs/heads/MASTER/y/` (so `MASTER/` is NOT empty) | `branch MASTER/x` | 128, same | nothing (no recursion into empty children) |
+| R2 | fx_packed-nolog, empty `MASTER/` under refs and logs | `branch MASTER/x` | 128, same | `refs/heads/MASTER/` |
+| R3 | fx_packed, empty `refs/heads/Master/` | `branch -f Master/x HEAD~1` | 128, same | `refs/heads/Master/` |
+| R4 | fx_packed-nolog, empty `refs/heads/MASTER/` | `branch MASTER/x` | 128, same | `refs/heads/MASTER/` |
+| R5 | fx_loose, empty `refs/heads/e/` | `branch e/x nonexistent` | 128 (not a valid object name) | nothing |
+| R6 | fx_loose, empty `e/` + foreign `e/x.lock` | `branch e/x HEAD~1` | 128 (cannot lock ref) | nothing |
+| R7 | fx_loose, empty `refs/heads/e/` | `branch other nonexistent` | 128 | nothing |
+| R8 | fx_loose, empty `refs/heads/e/y/` | `branch e/y/z HEAD~1` | 0 | reuses `e/y/` (it just stops being empty) |
+
+Not constructible on this filesystem (row skipped, not measured): an
+empty `logs/refs/heads/MASTER/` directory next to a packed `master` WITH
+a reflog -- `logs/refs/heads/master` is a FILE and the case-insensitive
+FS makes `MASTER` the same name. A first script crashed on that row and
+silently skipped every row after it; the rows above come from a re-run
+that handles each row separately.
+
+Reading, stated precisely per failure kind (this is the qualifier the
+`cmd_branch.c` comment must match): **only the D/F rows
+(R1-R4) remove a pre-existing empty directory** that sits exactly on the
+path git is trying to use, EVEN WHEN git then refuses the create. Git
+does **not** recurse into an empty CHILD (R1b: `MASTER/y/` survives
+because `MASTER/` itself is not empty). A **start-point failure (R5, R7)
+and a lock `EEXIST` (R6) touch nothing** -- git never reaches the
+directory-clearing step because it fails before any path work (R5, R7)
+or at the lock (R6).
+
+So round 5's create failure-path prune points the same way as git for
+the D/F rows. sg's own early returns (start-point, lock `EEXIST`) never
+reach that prune at all, matching R5-R7's "touches nothing" outcome.
+
+**Round 5 oracle confirmation (sg-r5, 2026-09-14): 441/457.** Added
+fixtures faildir-packed (empty `refs/heads/MASTER/`), faildir-packed-child
+(empty `MASTER/y/`), faildir-loose (empty `e/`), faildir-loose-lock (empty
+`e/` + foreign `e/x.lock`); 10 probes.
+- 7 cells match git fully: loose `e/x nonexistent`, `other nonexistent`,
+  `e/y/z HEAD~1`, `e/x HEAD~1`; lock `e/x HEAD~1`, `-f e/x HEAD~1`;
+  packed `MASTER/x nonexistent`.
+- 3 cells differ in `err` ONLY: faildir-packed `MASTER/x`, `-f Master/x
+  HEAD~1`, faildir-packed-child `MASTER/x` -- sg `cannot create branch
+  '<name>'` vs git's D/F wording. That is the recorded Q2 residual (no
+  `core.ignorecase` reader). `rc`, `refs`, `logs` and `dirs` all match:
+  sg removed the pre-existing empty `MASTER/` exactly as git did, and
+  left `MASTER/` alone when it held an empty `y/`.
+- The other 13 mismatches are unchanged from the previous run and all on
+  the accepted list.
+
+Conclusion: round 5's create failure-path prune agrees with git on every
+measured row. No new defect from it.
+
+What is NOT covered: `sg_ref_update` (`storage/refs.c`) appends the
+reflog line BEFORE writing the ref file, and on a ref-write failure only
+truncates that append back (`sg_reflog_truncate`), it never unlinks a
+reflog file it just created. For a nested name like `sub/leaf`, if the
+reflog append succeeds and the ref write then fails for an I/O reason
+(disk full, `EACCES` -- not a D/F conflict), `sg_prune_empty_parents`'s
+`rmdir` of `logs/refs/heads/sub` fails because a 0-byte `leaf` file is
+still sitting in it: a directory AND a 0-byte reflog file survive. The
+prune also has no memory of which directories THIS call created, so in
+that same scenario it can remove a PRE-EXISTING empty ancestor that had
+nothing to do with this call. No fixture reaches this ordering without
+fault injection, and git's own behaviour in this exact scenario has not
+been measured. Comment in `cmd_branch.c` rewritten to state this
+precisely (round 6), then made per-failure-kind exact and pointed at
+this heading instead of a scratchpad path (round 7's tail-review finding
+that the round-6 comment still read broader than this table); no code
+behaviour changed either round.
+
+### F2 (LOW): two P1 check names in `tests/interop.sh` disagreed with the command they ran
+
+`branch-D-dotslash-topic-$kind` (ran `branch -D ./merged`, not `topic`)
+and `branch-D-dotdotslash-topic-$kind` (ran `branch -D .//merged`, a `.`
+component plus an EMPTY component from the double slash, not a `../`
+parent reference) -- both renamed to name `merged` and, for the second,
+to say `dot-emptycomponent` instead of `dotdotslash`. The rest of the
+phase76 block was grepped for the same class of mistake (wrong ref name,
+wrong path spelling, wrong loose/packed label); no other instance found.
+
+### F3 (LOW-MEDIUM): the simulated case-sensitive count, added retroactively for round 5 and measured again after this round
+
+Round 5's own section above now also states the SIMULATED
+case-sensitive-filesystem total (4488/4488, 8 skipped), measured the same
+way rounds 3 and 4 did it (both folding probes forced to their negative
+branch, run from within `tests/`). After this round's (round 6's) F2/F4
+edits, the counts as of THIS round were: macOS actual **4582/4582 passed,
+0 skipped**; SIMULATED case-sensitive/Linux **4488/4488 passed, 8
+skipped** -- unchanged from the pre-round-6 measurement, since F2 only
+renamed existing checks and F4's root guard does not change anything on a
+non-root run (which this measurement, like CI, is). **These are round-6
+numbers, not the current total** -- round 8 added one more check (see
+round 8's own T1 section): the current macOS total is **4583/4583**. The
+simulated case-sensitive/Linux count was NOT re-measured for round 8 (see
+round 9's V2 section, near the end of this file, for the up-to-date
+statement of which counts are current).
+
+### F4 (LOW): the read-only-parent R4-1 discriminator is meaningless under root
+
+`chmod 0555` on a parent directory does not block a write performed as
+root, so the R4-1 discriminator (round 5, see above) would silently stop
+discriminating under root -- it would pass regardless of whether the fix
+is present, rather than fail loudly or skip honestly. `tests/interop.sh`
+now checks `id -u` first and `skip()`s with an explanation instead of
+running the check as root. GitHub's own CI runners are not root, so this
+changes nothing about CI's actual behaviour today; it only keeps the
+check's meaning honest in any environment (including a local root run)
+where it would otherwise lie.
+
+## Phase 76 fix round 8: a flaky lock-leak check that was reading git's own background lock
+
+No sg code change in this round either; oracle unchanged at 441/457.
+
+### T1 (MEDIUM -- harness defect, not an sg bug): three `*.lock` scans in `tests/interop.sh` were scoped wide enough to see git's own detached maintenance lock
+
+Round 7's first `bash tests/gates.sh --sanitize` had exactly one interop
+`FAIL`: `phase76 divergence #10: no .lock file anywhere under .git after
+the refused -d/-D/-f (all cwd variants)`. An immediate rerun passed.
+Measured cause (main conversation, 2026-09-14, git 2.55.0, macOS): in a
+fresh repo, right after `git commit`, a `*.lock` scan of the whole `.git`
+tree saw `.git/objects/maintenance.lock` (git's own detached
+auto-maintenance) in 22 of 40 trials with default config, 0 of 40 with
+`git config maintenance.auto false` and `git config gc.auto 0` set. The
+flaky `FAIL` was that lock, not anything sg left behind.
+
+Three sites had this defect (`p76_lockcreate_check`'s own lock-count
+check, the divergence #10 no-lock check, and the K1 NFD no-lock check):
+each scanned the WHOLE `.git` tree (or, for the divergence #10 check,
+every `phase76_alias_*` directory including the git-side fixtures and the
+untouched reference copy), and none printed which file it found on
+failure. Fixed on both fronts: (1) every one of the three scans is now
+scoped to the sg-side directories only and to `.git/refs` (where sg's own
+locks can ever live), never the whole `.git` tree and never a git-side or
+untouched fixture; (2) every fixture builder behind these three sites
+(`p76_lockcreate_check`, `mk_p76_alias_repo`, the K1 NFD fixture) now sets
+`git config maintenance.auto false` and `git config gc.auto 0` right
+after `git init`, with the 22/40-vs-0/40 measurement recorded in a
+comment at each site; (3) each check now writes its `find` output to a
+file first and prints it on failure, so a red run names the leftover
+file. See `docs/RULES-refs-revparse.md`'s own rule on this. The six
+pre-existing phase73/74 `tag -d` lock-scan checks (scoped to
+`refs/heads`/`refs/tags` already) were audited against the same three
+questions and left unchanged -- they never reach `.git/objects`.
+
+**LK-B coverage gap closed**: none of the existing phase76 checks ever
+asserted "no lock remains" after a SUCCESSFUL create/`-f`/delete, only
+after a refusal -- added one new check (`P76_SG_REPO`, scoped to
+`.git/refs`, run after the block of successful create/`-f`/delete
+operations already exercised earlier in the phase76 group) that would
+catch a lock leaked on the success path, the one shape none of the
+refusal-scoped checks above could ever see.
+
+### U1 (MEDIUM-LOW): a dangling spec-numbering label, and a full audit of every label used in this phase's added text
+
+Round 7's own rewritten text left one dangling reference: "see R6-1
+below" / "round 7, R6-1" in the F1a section above. `R6-1` was never a
+DESIGN heading, only the main conversation's own spec-draft numbering,
+unresolvable by a repository reader -- fixed by removing the bare label
+(replaced with a plain-words description of the finding it referred to,
+or dropped where the surrounding sentence no longer needed it).
+
+Audited every spec-style label (`R<n>-<n>`, `R<n>`, `Q<n>`, `P1`, `D1a`
+through `D1e`, `L1`, `L2`, `K1` through `K3`, `F1a`, `F1`-`F4`, plus this
+round's own `T1`/`U1`/`U2`/`U3`) appearing in `docs/DESIGN.md` itself.
+
+**Correction (round 9): this audit's REWRITE step only actually touched
+`docs/DESIGN.md`**, even though the paragraph below claimed the sweep
+covered `CLAUDE.md`, `docs/RULES-*.md`, `src/`, `include/`, and `tests/
+interop.sh` too -- the identical bare `R2-1`/`R2-3` sentences (and a
+previously unaudited `R3-3`) survived untouched in `tests/interop.sh`
+comments, found by the round-9 tail review and fixed there. See round 9's
+own section below for the file-by-file list; a check name is this
+project's own diagnostic interface, so this matters beyond comments -- a
+reader seeing a red "phase76 R3-2" must be able to find what R3-2 means
+without leaving the repo. Resolution for each label found in
+`docs/DESIGN.md` itself:
+- `D1a`-`D1e`, `L1`, `L2`, `K1`-`K3`, `P1`, `Q1`, `Q2`, `F1a`, `F1`-`F4`,
+  `R1`-`R4` (round 2's own defect numbering), `R2-2`, `R2-4`, `R2-5`,
+  `R3-1`, `R3-4`, `R4-1`, `R4-2`, `R4-8`: each has its own `###` heading
+  in this file's Phase 76 section.
+- `R3-2`: no heading of its own, but R4-2's heading and opening sentence
+  ("`p76_r32_check` (added round 4 for the alias-probe directory leak)")
+  name the actual interop.sh function it refers to explicitly -- this
+  counts as the "explicit definition line" alternative, not a heading.
+- `R2-1`, `R2-3`, `R3-5`: bare inline mentions with no heading and no
+  clear definition elsewhere -- rewritten to plain words ("the round-2
+  review finding that...", "reviewer round 3, R3-5 -- this section
+  originally named the wrong failing call" already carried its own
+  inline gloss and was left as-is, since the sentence immediately
+  explains the finding rather than requiring a lookup).
+- The `R1`-`R4`/`R1b` row IDs inside F1a's measured table (a distinct
+  namespace collision with round 2's own `R1`-`R4` defect headings,
+  both pre-existing on the page before this audit) are self-defining --
+  each is a literal table row, not a forward reference -- so left as-is
+  rather than renamed; flagged here so a future reader knows the
+  collision is not an oversight.
+- `G5`, `G5b`, `PQ1r5`, `PR1`-`PR4`, `FP1`, `L1drop`, `Q1o`, `LK-A`,
+  `LK-B` (all round-5/round-8 mutation-battery labels): `grep`-confirmed
+  none were ever committed as bare labels except `LK-B`, which appears
+  only in a `tests/interop.sh` comment that names what it covers in the
+  same sentence, not as a forward reference.
+- `T1`, `U1`, `U2`, `U3` (this round's own labels): given headings in
+  this section, so every `(T1)`-style citation elsewhere (`tests/
+  interop.sh` comments, `docs/RULES-refs-revparse.md`) now resolves here.
+
+### U2 (LOW): one acceptance line lacked its own "not in this repo" disclaimer
+
+Round 5's own acceptance line ("`SG_BIN=<path> python3 oracle.py` reaches
+**408/421**") was missing the parenthetical every other round's acceptance
+line carries. Added: "(main conversation's scratchpad, not in this
+repo)".
+
+### U3 (info): scratchpad/oracle.py/NOTES- reference recount
+
+See the round-7 completion report for the classification; recounted again
+after this round's edits with no new sites introduced (this round's own
+new text names no scratchpad path).
+
+## Phase 76 fix round 9: the label audit had stopped at DESIGN.md, and the interop total was one check stale
+
+No sg code change in this round either; oracle unchanged at 441/457.
+
+### V1 (MEDIUM-LOW): the label audit's REWRITE step had only touched DESIGN.md
+
+Round 8's own U1 section (above) claimed its label sweep covered
+`tests/interop.sh`, `src/`, `include/`, `CLAUDE.md`, and `docs/
+RULES-*.md`, but the actual rewriting only happened in this file --
+the identical bare `R2-1`/`R2-3` sentences survived untouched in
+`tests/interop.sh` comments, and a THIRD bare label (`R3-3`, never
+audited at all) was found in the same file. Fixed in `tests/interop.sh`:
+- `tests/interop.sh:3971` (`R2-3`): "the way the rest of divergence #10's
+  checks are (R2-3: every gated count...)" -> "a round-2 review finding:
+  every gated count...".
+- `tests/interop.sh:4678` (`R2-1`): "the reviewer's own R2-1 detail is
+  that a BYPASSED alias..." -> "the reviewer's own finding (round 2
+  review) is that a BYPASSED alias...".
+- `tests/interop.sh:3940` (`R3-3`, newly found, no heading or definition
+  anywhere): "Reviewer round 3 (R3-3): the "new"/"topic" rows..." ->
+  "Reviewer round 3 review finding: the "new"/"topic" rows...".
+
+Redone over every file the phase touches, not only `docs/DESIGN.md`:
+`tests/interop.sh` (every `phase76 <label>` check name, plus every
+comment-embedded label), `src/cli/cmd_branch.c`, `src/cli/ref_delete.c`,
+`src/storage/refs.c`, `include/sg/refs.h`, `include/sg/ref_delete.h`,
+`CLAUDE.md`, `docs/RULES-refs-revparse.md`, `docs/RULES-paths-strings.md`,
+`docs/sg.1`. Every remaining label in every one of those files resolves
+to one of this file's `###` headings or an explicit definition line
+already catalogued in round 8's U1 section above (`D1a`-`D1e`, `L1`,
+`L2`, `K1`-`K3`, `P1`, `Q1`, `Q2`, `F1a`, `F1`-`F4`, `R1`-`R4`, `R2-2`,
+`R2-4`, `R2-5`, `R3-1`, `R3-2` (via R4-2's naming of `p76_r32_check`),
+`R3-4`, `R4-1`, `R4-2`, `R4-8`, `M11`). `docs/sg.1` carries no Phase 76
+labels at all. Round 8's own U1 audit sentence corrected above to state
+plainly that its file coverage claim was wrong.
+
+### V2 (LOW-MEDIUM): the interop total presented as current was one check stale
+
+Round 8 added exactly one check (the LK-B success-path lock coverage
+check). Every sentence above that presented **4582/4582** as the
+CURRENT/final macOS total has been re-labelled as that round's own
+historical snapshot (round 5's own measured number, restated unchanged
+through round 6's F3 section) rather than left implying it is still
+true today. **Current, measured by the main conversation on the round-8
+tree: macOS 4583/4583 passed, 0 skipped.** The simulated
+case-sensitive/Linux count was **not** re-simulated for round 8 (no
+check inside the `$P73_FS_CASE_INSENSITIVE`/`$P76_FS_NORMALIZATION_FOLDING`
+gates was touched, only the LK-B check, which is unconditional) -- the
+last actually-measured simulated number remains round 5's 4488/4488, 8
+skipped, now stale by exactly the same one check; CI's own ubuntu
+(case-sensitive) matrix cells will report the real, current count rather
+than this project re-simulating it locally every round.
+
+`grep`-classification of every `4582`/`4488` hit in `docs/DESIGN.md`,
+`CLAUDE.md`, `docs/RULES-*.md` (none in the latter two):
+- `docs/DESIGN.md` (round 4's own line): "macOS 4488/4488, 0 skipped" --
+  round 4's own historical macOS actual count, already labelled by round,
+  left as-is.
+- `docs/DESIGN.md` (round 5's own line, this round's V2 fix): "4582/4582
+  passed, 0 skipped" -- was presented as a bare fact; now explicitly
+  labelled "as measured in round 5 (unchanged through rounds 6-7,
+  superseded by round 8)".
+- `docs/DESIGN.md` (round 5's own line, same paragraph): "4488/4488" --
+  round 5's own SIMULATED count (coincidentally the same digits as round
+  4's unrelated macOS actual count above) -- historical, correctly
+  attributed, left as-is.
+- `docs/DESIGN.md` (round 6's F3 section, restating round 5's simulated
+  count): "4488/4488 passed, 8 skipped" -- historical, correctly
+  attributed, left as-is.
+- `docs/DESIGN.md` (round 6's F3 section "final counts" line, this
+  round's V2 fix): "macOS actual 4582/4582 ... SIMULATED ... 4488/4488"
+  -- was phrased as an unqualified final answer; now explicitly labelled
+  as round 6's own counts, with a forward pointer to this section for the
+  current number.
+
+### V3 (LOW): the exactly-one-lock check could not say "too few"
+
+`p76_lockcreate_check`'s "no OTHER `.lock` file survives under refs/"
+check printed the leftover list on failure but never said how many were
+expected versus found, so a run where the foreign lock itself had
+vanished (0 found, not the expected 1) printed an empty list with no
+indication anything was even wrong with the count itself. Fixed: on
+failure it now prints `expected exactly 1 lock under .git/refs (the
+foreign one), found N:` (N computed the same way the pass/fail check
+itself computes it) before the list. Pass/fail logic unchanged -- still
+exactly `grep -c .` compared to `1`.

@@ -71,14 +71,23 @@ do not read the whole thing).
   real git lists `.git.` as an untracked directory, and using the predicate
   to skip it would make `sg status` **under-report** (measured in Phase 22).
 - **After deleting a tracked file, `sg_prune_empty_parents` must be called**
-  (`include/sg/workdir.h`, Phase 21). There are **three** call sites: right
-  after a successful `remove()` in `workdir/apply.c` and `workdir/merge.c`,
-  and (Phase 37) `safety/stash.c`'s `restore_matched_paths`, which does the
-  same "delete a matched, target-absent path" step for `sg stash push`'s
-  partial-pathspec restore -- the same reasoning applies there as at the
-  other two, it is just a third call site rather than a reason to route
-  through `sg_apply_tree_to_workdir` (which this codebase deliberately does
-  not give a pathspec parameter, see Phase 37 in `docs/DESIGN.md`).
+  (`include/sg/workdir.h`, Phase 21). There were **three** WORKING-TREE call
+  sites as of Phase 37: right after a successful `remove()` in
+  `workdir/apply.c` and `workdir/merge.c`, and `safety/stash.c`'s
+  `restore_matched_paths`, which does the same "delete a matched,
+  target-absent path" step for `sg stash push`'s partial-pathspec restore
+  -- the same reasoning applies there as at the other two, it is just a
+  third call site rather than a reason to route through
+  `sg_apply_tree_to_workdir` (which this codebase deliberately does not
+  give a pathspec parameter, see Phase 37 in `docs/DESIGN.md`). **Phase 76
+  fix round 4 added TWO more, outside the working tree entirely**:
+  `cli/ref_delete.c`'s batch-delete engine, once for the ref's own
+  directory chain and once (independently) for its reflog's, after every
+  successful `sg_ref_delete_under` -- the function's `repo_root` parameter
+  is generic (any directory a caller wants treated as the floor that is
+  never removed), not worktree-specific, so reusing it for
+  `<git_dir>/refs/heads` / `<git_dir>/logs/refs/heads` needed no change to
+  the function itself, only to what gets passed in.
   WARNING: it is **deliberately not ignore-aware**, which is **the opposite
   rule** from `prune_empty_untracked_dirs` in `safety/stash.c`: the former
   cleans up a directory that is "empty but ignored" (measured against real
@@ -146,3 +155,44 @@ do not read the whole thing).
   Phase 75 section. Do not "fix" this call site to use
   `sg_quote_path_delimited` for consistency with the rest of this file;
   that would produce a wording git itself does not use.
+
+- **Phase 76 fix round 1: a fixed-size buffer that silently picks the
+  WRONG answer once a name gets long enough is worse than one that
+  silently truncates a path, because the failure is invisible in the
+  common case and only shows up as a wrong branch taken.** Three spots in
+  `cli/cmd_branch.c` and `cli/ref_delete.c` used to `continue`/return a
+  default the moment a name-derived buffer overflowed a fixed
+  `SG_PATH_MAX` array: `check_df_conflict`'s per-ancestor-component
+  `prefix` buffer (would have silently skipped checking that ancestor,
+  letting a real D/F conflict through uncaught), `is_loose_branch_ref`'s
+  path buffer (would have silently answered "not loose", picking the
+  WRONG wording branch for the D/F message), and `ref_delete.c`'s pass 2b
+  `.lock`-suffixed path (would have silently skipped lock-collision
+  detection for that name entirely, letting it reach the delete pass with
+  no lock taken at all). None of the three needed to be a fixed-size check
+  in the first place: `sg_mkdir_parents` (`workdir.h`) already enforces
+  the project's REAL, single, shared length ceiling (`SG_PATH_MAX`, with
+  an explicit -1) further down the same call chain, so a second, smaller,
+  ad hoc ceiling here bought nothing except a chance to pick the WRONG
+  answer silently (CLAUDE.md's own bug #3, an 803-char name, is proof the
+  per-name/per-component limit is looser than one of these local buffers,
+  not proof there is no limit anywhere -- round 1's own text overstated
+  this as "no length limit exists", corrected here in round 2). All three
+  now build their strings with `sg_strfmt_alloc` and only fall back on an
+  actual allocation failure (not a length-based silent skip), which is a
+  different, acceptable category: OOM is failed CLOSED (treated as "a
+  conflict/collision could exist and cannot be ruled out"), never as
+  "assume the answer that lets the operation through." Phase 76 fix round
+  2 additionally found and closed a THIRD failure-direction bug in this
+  same family, one call further out: `cmd_branch.c`'s
+  `is_loose_branch_ref` returning "not loose" on its OWN allocation
+  failure was being read by its one safety-critical caller
+  (`branch_aliases_current`, deliberate divergence #10's alias probe) as
+  "packed-only, cannot alias," which let a dangerous force-update/delete
+  of the checked-out branch through on the strength of an OOM -- a
+  cosmetic-wording helper's fail-open leaking into a SAFETY decision one
+  level up. Fixed by making the helper genuinely tri-state
+  (yes/no/error) so the one caller that needs to can fail closed on
+  error, while `check_df_conflict`'s two call sites (a wording choice
+  made only AFTER a conflict is already proven to exist) still fold error
+  into "not loose," which is fine at that point.

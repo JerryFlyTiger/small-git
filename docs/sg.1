@@ -1127,10 +1127,17 @@ an ordinary addition or deletion. Renames and copies are not shown by
 .BR "sg status" .
 .SS branch
 .B sg branch
-.RB [ -d | --delete ]
 .RB [ --force | -f ]
 .RB [ -- ]
-.RI [ name ]
+.RI [ name
+.RI [ start-point ]]
+.br
+.B sg branch
+.RB ( -d | --delete | -D )
+.RB [ -f ]
+.RB [ -q ]
+.RB [ -- ]
+.IR name ...
 .PP
 With no arguments, lists every branch, one per line, with the current
 branch marked by a leading
@@ -1148,15 +1155,19 @@ uses when resolving a single ref.
 .PP
 With
 .IR name ,
-creates a branch pointing at the current
+creates a branch pointing at
+.I start-point
+(any commit-ish expression, resolved the same strict way
+.B "sg cat-file"
+does \(em an ambiguous abbreviated id refuses rather than guessing) or, if
+omitted, the current
 .B HEAD
-commit and does
+commit; either way the new branch is
 .B not
-switch to it (use
+switched to (use
 .B "sg switch"
-for that). Creating fails if the name already exists in either store, if
-the repository has no commits yet, or if the name is not a valid ref name
-\(em names may not begin with
+for that). Creating fails if the name is not a valid ref name \(em names
+may not begin with
 .BR - ,
 begin or end with
 .BR / ,
@@ -1171,41 +1182,73 @@ contain
 a backslash, whitespace, an ASCII control character, or any of
 .BR ~^:?*[ ,
 and may not be exactly
-.BR HEAD .
-Names containing
+.BR HEAD ;
+if the name already exists in either store (unless
+.B -f
+is given); if
+.I start-point
+does not resolve to a commit (a tag is peeled automatically, but a tree or
+blob is refused); if
+.B -f
+would move the checked-out branch, or a spelling that resolves to the
+same ref file as the checked-out branch on a case-insensitive filesystem
+(the current branch stays intact and unmoved either way); or if creating
+it would conflict with an existing ref anywhere along the
+.B refs/heads/
+hierarchy, at any depth (for example, creating
+.B a/b/c
+when
+.B a
+already exists as a branch, or vice versa). Names containing
 .B /
 (for example
 .BR feature/x )
-are valid.
+are otherwise valid.
+.B -f
+also allows re-pointing an EXISTING branch at a new
+.IR start-point ,
+except the currently checked-out branch, which always refuses (moving it
+without switching would leave the working tree and
+.B HEAD
+disagreeing).
 .PP
 With
 .B -d
-(or
-.BR --delete ),
-deletes
-.IR name .
-Deletion removes the branch from
+.RB ( --delete ),
+.B -D
+(equivalent to
+.BR "-d -f" ),
+deletes every
+.I name
+given, each independently, in the order given: a name that does not exist,
+one that is the checked-out branch (or, on a case-insensitive filesystem, a
+differently-cased spelling that resolves to the same ref file as the
+checked-out branch), or one that is not fully merged into
+.B HEAD
+(without
+.BR -f / -D )
+is refused with its own diagnostic, while every other name in the same
+invocation is still deleted \(em this is
+.B not
+all-or-nothing. Deletion removes the branch from
 .B both
 the loose file and
 .BR packed-refs ;
 removing only the loose file would leave a stale packed entry that
-silently resurrects the branch at an older commit. The current branch is
-never deletable, with or without
-.BR --force .
-.PP
-If the branch is not fully merged into
-.B HEAD
-its commits would become unreachable, so deletion asks for confirmation
-first; the prompt names the branch and its tip. As elsewhere in
-.BR sg ,
-.B --force
-skips the prompt but not the refusal to delete the current branch, and a
-non-interactive standard input refuses rather than assuming yes (see
-.BR "EXIT STATUS" ).
-A successful deletion prints the deleted tip's full object id \(em because
-.B "sg undo"
-snapshots the working tree and index but not refs, that printed id is the
-only way to recreate the branch.
+silently resurrects the branch at an older commit. There is no
+interactive confirmation at any point: an unmerged branch without
+.B -f / -D
+is refused outright, with a hint naming
+.B "sg branch -D"
+as the way through, rather than prompted. A successful deletion prints
+.RI "Deleted branch " name " (was " tip ")." ,
+.I tip
+abbreviated to 7 hex digits, one line per name, unless
+.B -q
+.RB ( --quiet )
+is given. Repeating the exact same name within one invocation refuses the
+whole batch without deleting anything for it, matching git's own
+ref-transaction behavior.
 .SS tag
 .B sg tag
 .RB [ -a ]

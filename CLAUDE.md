@@ -217,10 +217,10 @@ them.
 
 | Touching | Read first |
 |---|---|
-| `storage/refs.c`, `storage/revparse.c`, `refs.h`, `revparse.h`, `objstore.h`, `object.h`; detached HEAD; `cli/cmd_merge.c`'s `<rev>`/message/fast-forward output; `cli/cmd_tag.c`; `sg_message_cleanup` | `docs/RULES-refs-revparse.md` |
+| `storage/refs.c`, `storage/revparse.c`, `refs.h`, `revparse.h`, `objstore.h`, `object.h`; detached HEAD; `cli/cmd_merge.c`'s `<rev>`/message/fast-forward output; `cli/cmd_tag.c`; `cli/cmd_branch.c`; `cli/ref_delete.c`; `ref_delete.h`; `sg_message_cleanup` | `docs/RULES-refs-revparse.md` |
 | `util/date.c`, `date.h`, `cli/cmd_undo.c`'s own formatter; any `--date=` / `%ad` / `%ar` / `%ah` work | `docs/RULES-date.md` |
 | `cli/cmd_log.c`, `cli/cmd_show.c`, `cli/cmd_cat_file.c`, `cli/commit_out.c`, `cli/log_graph.c`, `commit_out.h`, `log_graph.h` | `docs/RULES-log-show.md` |
-| **any file that joins a path, prints a path to the user, deletes a tracked file, or builds a user-facing string with `snprintf`** -- `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir.h`, `quote.h`, `strfmt.h`; `workdir/apply.c`, `workdir/merge.c`, `object/tree.c`, `storage/refs.c`, `storage/repo.c`, `safety/stash.c`, `cli/pick.c`, `cli/cmd_add.c`, `cli/cmd_restore.c`, `cli/cmd_reset.c`, `cli/cmd_merge.c`, `cli/cmd_rebase.c` | `docs/RULES-paths-strings.md` |
+| **any file that joins a path, prints a path to the user, deletes a tracked file, or builds a user-facing string with `snprintf`** -- `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir.h`, `quote.h`, `strfmt.h`; `workdir/apply.c`, `workdir/merge.c`, `object/tree.c`, `storage/refs.c`, `storage/repo.c`, `safety/stash.c`, `cli/pick.c`, `cli/cmd_add.c`, `cli/cmd_restore.c`, `cli/cmd_reset.c`, `cli/cmd_merge.c`, `cli/cmd_rebase.c`, `cli/cmd_branch.c`, `cli/ref_delete.c` | `docs/RULES-paths-strings.md` |
 | `workdir/diff.c`, `cli/diff_out.c`, `cli/cmd_diff.c`, `util/diff_lcs.c`, `diff.h`, `diff_out.h`, `tree_build.h` | `docs/RULES-diff.md` |
 | `workdir/merge.c`, `cli/cmd_merge.c`, `merge.h` | `docs/RULES-merge.md` |
 | `workdir/rename.c`, `util/similarity.c`, `cli/cmd_diff.c`'s `-M`/`-C`/pathspec parsing, `pathspec.h`, `similarity.h` | `docs/RULES-pathspec-rename.md` |
@@ -331,8 +331,8 @@ point where the harness warns that it is too large to keep in context.
 
 ## Deliberate divergences from real git
 
-Eight places where sg's answer differs from real git (the numbering still
-runs 1-9, with entry 8 retired -- see the parenthetical below for where it
+Nine places where sg's answer differs from real git (the numbering still
+runs 1-10, with entry 8 retired -- see the parenthetical below for where it
 went; do not renumber the rest into a lie). Each was measured
 against git 2.55.0 and each is pinned on both sides by an interop check, so
 accidentally "fixing" one back into silent agreement with git would itself go
@@ -554,6 +554,107 @@ marked "fixed" in place, same as the other two retired entries above.)
    still does), and a second check asserting sg's listing DOES contain it,
    for both `sg tag` and `sg branch` (both share `sg_ref_list_under`'s one
    enumerator).
+10. **`sg branch -d`/`-D`/`-f` refuses a case- or Unicode-normalization-
+    aliased spelling of the checked-out branch; real git does not, and
+    leaves `HEAD` dangling** (Phase 76 fix round 2) -- an ACCEPTED answer,
+    not a deferred defect: git's own answer is unsafe, sg's is the safer
+    one. Measured on a case-insensitive filesystem (macOS default): with
+    `master` checked out, `git branch -d Master` (or `-D Master`, or
+    `-f Master <rev>`) exits 0, prints `Deleted branch Master (was
+    <hex>).`, and actually deletes/moves `refs/heads/master` (the SAME
+    loose file, since the filesystem folds the two spellings to one path)
+    while `HEAD` still symrefs to `refs/heads/master` -- the repo is left
+    looking like "No commits yet" (delete) or with `HEAD`/the working tree
+    disagreeing (`-f`). **The identical shape reproduces via Unicode
+    NORMALIZATION instead of case** (measured, `NOTES-nfd.md`, not in this
+    repo): with `core.precomposeUnicode` false or unset, an NFD-spelled
+    argv name (`cafe\xcc\x81`) aliases an NFC-named checked-out branch
+    (`caf\xc3\xa9`) on APFS the same way a differently-cased spelling
+    does -- case-folding and normalization-folding are independent
+    filesystem properties that happen to both be true on APFS, probed
+    separately in interop (`P73_FS_CASE_INSENSITIVE` and a second,
+    NFC/NFD-specific probe). git's own checked-out-branch safety check is
+    a plain string compare against the current branch's name, which
+    neither alias spelling textually equals, so it never fires; the
+    actual delete/force-update then goes through the OS, which resolves
+    both alias forms to the same file. sg detects this with a lock-path
+    probe (`cmd_branch.c`'s `branch_aliases_current`) -- NOT `strcasecmp`
+    (wrong on a case-SENSITIVE filesystem, and blind to normalization
+    aliasing entirely) and NOT an inode compare of the ref files (Phase 74
+    round 1 measured that wrong in both directions for an unrelated
+    collision) -- and refuses with git's own "used by worktree" wording,
+    exit 1, nothing changed. A packed-only current branch cannot alias
+    this way (packed-refs lookup is an exact string match, unaffected by
+    filesystem case- or normalization-folding) and keeps its ordinary
+    "not found" answer. A resource failure (allocation/mkdir) inside the
+    probe fails CLOSED (an "out of memory" refusal), never silently as
+    "no alias" -- round 1 shipped this collapsed into a fail-OPEN 0/1
+    return, closed in round 2 (see `docs/RULES-paths-strings.md`'s own
+    Phase 76 bullet).
+    **What is actually pinned, precisely** (round 1 claimed a pin here and
+    had none at all -- confirmed empirically, the main conversation's
+    mutation battery found M3/drop-the-probe-at-create and
+    M4/drop-the-probe-at-delete both stayed fully green against round 1's
+    tree): for `-d Master`/`-D Master`/`-f Master HEAD~1`, from three cwd
+    contexts each (repo root, a subdirectory, cwd reached through a
+    symlink to the repo) -- a git-side precondition (exit 0, the ref
+    actually gone or moved) and a SEPARATE sg-side literal-string
+    assertion of the full refusal line INCLUDING the worktree path (not a
+    git-vs-sg comparison: real git prints no message here at all in the
+    cases this entry is about), plus `refs/heads/master` and its reflog
+    byte-identical to an untouched copy and no `.lock` file left anywhere
+    under `.git`; one more pin for the identical shape via NFD/NFC
+    normalization; and one pin that a FOREIGN stale
+    `refs/heads/master.lock` does not make `-d Master` misfire (measured:
+    it does not, but via the SHARED `ref_delete.c` transaction's own
+    lock-collision detector independently catching the case-folded
+    collision, not via `branch_aliases_current` itself, which cannot
+    safely probe when the current branch's own lock path is already held
+    by something else and documented-falls-through as "not aliased" in
+    that one case).
+    **Phase 76 fix round 3 (L1): the CREATE/`-f` side of this same
+    scenario was a REAL, unrelated hole, not part of this divergence --
+    `sg branch -f Master HEAD~1` with a foreign `refs/heads/master.lock`
+    used to move the checked-out `master` anyway, because the create path
+    took no lock of its own and the alias probe's documented fall-through
+    (above) let the name through unchecked. Real git refuses this cell
+    too (`fatal: cannot lock ref ...`), so closing it needed no new
+    divergence, only a lock `sg branch`'s create/`-f` write had simply
+    never taken -- now closed the same way `sg tag -d`/`sg branch -d`
+    always were, via the shared `sg_ref_lock_try` (`refs.h`). Pinned
+    separately (`phase76 L1 (*)` in interop, a `lockcreate` oracle
+    fixture) from the alias-probe pins above; a mutation disabling the
+    create lock and a mutation disabling the alias probe are each
+    expected to red a DIFFERENT named set. This is git PARITY, not part
+    of the divergence: the divergence itself is still exactly "no foreign
+    lock present," where the alias probe (not any lock) is what refuses.
+    **`sg_ref_update` itself still takes no lock at all, project-wide,
+    for every OTHER ref-writing command** -- `sg tag -d`/`sg branch -d`/
+    the create/`-f` write above are the only three O_EXCL-guarded call
+    sites in this project; `switch`, `reset`, plain `tag` (create), and
+    `commit` all still silently override a concurrent git process's lock.
+    Recorded as the recommended NEXT phase in `docs/DESIGN.md`'s Phase 76
+    residuals, deliberately NOT fixed here.
+    **Phase 76 fix round 4: the alias probe's own lock-taking (round 3's
+    L1 fix) leaked EMPTY directories** (`refs/heads/<name>/`) for any
+    NONEXISTENT nested delete target, since it ran for every batch name
+    regardless of existence -- fixed by making the probe a pure query
+    (`sg_ref_lock_try_query`, no `mkdir`), which also fixed a
+    misdiagnosed "sg: out of memory" for an ordinary not-found sibling
+    shape (`-d heads/x/y`) and made round 3's own path-safety guard for
+    `-d merged/` redundant (deleted). Round 4 also closed a real
+    regression of SHIPPED `sg tag -d`: round 1's extraction held every
+    acquired lock's fd open for the whole batch, exhausting the platform
+    default `RLIMIT_NOFILE` (256 on macOS) past ~253 names -- fixed by
+    closing the fd immediately after `O_CREAT|O_EXCL` succeeds (the lock
+    IS the file's existence, not the descriptor). See `docs/DESIGN.md`'s
+    Phase 76 round-4 section for the full measurements, the D1a residual
+    (an externally-planted empty directory still defeats
+    `sg_ref_update`, recorded alongside L2 above rather than fixed here),
+    and the two smaller D1e disk-state/wording fixes for the NEW `-f`
+    feature (a no-op force on a packed branch no longer materializes a
+    loose file; a packed, case-folded D/F conflict now names the real
+    stored ref and matches git's wording byte-for-byte).
 
 ## Core types cheat sheet
 
@@ -723,6 +824,28 @@ bumping the version, keep the man page in sync.
   write down the proof and switch to a property you can actually verify).
   Only the first one is a coverage gap; treating all three as the same thing
   sends the next person hunting for a test that does not exist.
+  **"Redundant guard" requires checking TWO things, not one** (Phase 76
+  round 5, R4-1): the FINAL ANSWER staying the same after deleting the
+  guard is necessary but not sufficient -- a guard can ALSO be the only
+  thing standing between untrusted input and something the code touches
+  ON THE WAY to that answer (a filesystem call, a lock, a subprocess, a
+  network request), and "same final wording" says nothing about that.
+  Measured: deleting a path-safety guard in `sg branch`'s alias probe
+  left the printed message unchanged for `sg branch -d ../../evil` (still
+  "not found"), which looked like exactly the "real defense line is one
+  layer down" shape -- but the guard was ALSO the only check between the
+  raw argv name and an `open(O_CREAT|O_EXCL)` call, and without it the
+  probe built a path OUTSIDE the repository and briefly created a real
+  file there before unlinking it. The fixture that catches this is NOT
+  "plant something at the escape target" (an already-existing path of
+  ANY kind returns `EEXIST` before any of this matters, so the answer is
+  "not found" either way and the check cannot discriminate) -- it is
+  making the escape target's PARENT directory read-only, so the escaped
+  `open()` fails with `EACCES` instead of the ordinary "doesn't exist"
+  errno, which a real gate running first would never reach at all. Before
+  deleting a guard for being "redundant," measure with a fixture where
+  the side effect itself would fail in a way that changes the OUTPUT --
+  same-answer-on-the-happy-path is not proof of nothing left to prove.
 
   WARNING: **per-site vs. batch**: the script's comment says "if a literal
   appears more than once, you must add `/g`" -- that answers "is this rule

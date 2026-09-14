@@ -2,10 +2,12 @@
 
 #include "sg/reflog.h"
 #include "sg/revparse.h"
+#include "sg/strfmt.h"
 #include "sg/workdir.h"
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1170,6 +1172,7 @@ int sg_ref_update(const char *git_dir, const char *ref_path, const unsigned char
     }
 
     if (write_ref_path_raw(git_dir, ref_path, new_id) != 0) {
+
         if (wrote_head_log)
             sg_reflog_truncate(git_dir, "HEAD", head_offset);
         if (wrote_branch_log)
@@ -1290,4 +1293,69 @@ int sg_ref_move_head(const char *git_dir, const char *branch,
            (int)sizeof(ref_path))
         return -1;
     return sg_ref_update(git_dir, ref_path, target, reflog_msg);
+}
+
+/* Shared by sg_ref_lock_try (create_dirs=1) and sg_ref_lock_try_query
+   (create_dirs=0) -- everything except the mkdir_parents step is
+   identical, and factoring it out is what keeps the fd-close fix (R3-4)
+   and any future change to the open() call itself from needing to be
+   made twice. */
+static sg_ref_lock_result ref_lock_try_impl(const char *git_dir, const char *prefix, const char *name,
+                                            int create_dirs, sg_ref_lock *lock)
+{
+    int fd;
+
+    memset(lock, 0, sizeof(*lock));
+    lock->path = sg_strfmt_alloc("%s/%s%s.lock", git_dir, prefix, name);
+    if (lock->path == NULL)
+        return SG_REFLOCK_ERROR;
+    if (create_dirs && sg_mkdir_parents(lock->path) != 0) {
+        lock->mkdir_failed = 1;
+        return SG_REFLOCK_ERROR;
+    }
+    fd = open(lock->path, O_CREAT | O_EXCL | O_WRONLY, 0666);
+    if (fd < 0) {
+        if (errno == EEXIST)
+            return SG_REFLOCK_EEXIST;
+        lock->open_errno = errno;
+        return SG_REFLOCK_ERROR;
+    }
+    /* Phase 76 fix round 4 (R3-4): close the fd immediately -- the LOCK is
+       the file's EXISTENCE (O_CREAT|O_EXCL already did its job the instant
+       it returned success), not the open descriptor. Holding N fds open
+       across a whole batch (as this did until this fix, for as long as
+       cli/ref_delete.c's own `locks[]` array kept every acquired lock
+       around until the loop finished) is what regressed a SHIPPED
+       behavior of master's `sg tag -d`: with the platform's default
+       `RLIMIT_NOFILE=256` (macOS), deleting 400 tags in one invocation
+       failed the WHOLE batch with "Too many open files" where master (no
+       fd held past acquisition) and real git both delete all 400. `lock->
+       fd` is left at -1 after this so a caller can never mistake it for a
+       still-open descriptor. */
+    close(fd);
+    lock->fd = -1;
+    lock->held = 1;
+    return SG_REFLOCK_ACQUIRED;
+}
+
+sg_ref_lock_result sg_ref_lock_try(const char *git_dir, const char *prefix, const char *name,
+                                   sg_ref_lock *lock)
+{
+    return ref_lock_try_impl(git_dir, prefix, name, 1, lock);
+}
+
+sg_ref_lock_result sg_ref_lock_try_query(const char *git_dir, const char *prefix, const char *name,
+                                         sg_ref_lock *lock)
+{
+    return ref_lock_try_impl(git_dir, prefix, name, 0, lock);
+}
+
+void sg_ref_lock_release(sg_ref_lock *lock)
+{
+    if (lock->held) {
+        unlink(lock->path);
+        lock->held = 0;
+    }
+    free(lock->path);
+    lock->path = NULL;
 }

@@ -466,6 +466,21 @@ static const sg_rev_err_row REV_ERR_TABLE[] = {
        why this row is named for the tree read rather than for switch. */
     { "switch", "invalid reference: %s", "unable to read tree (%s)", 0, 0,
       /*p_uses_r*/ 1, /*has_d*/ 0, NULL, NULL },
+    /* Phase 76: `sg branch`'s <start-point>. Measured against real git
+       2.55.0 -- class R covers BOTH "does not resolve at all" (a
+       nonexistent name, an empty string) AND "resolved but the path half
+       of a <rev>:<path> is missing" (`branch new HEAD:nosuch.txt` ->
+       "not a valid object name: 'HEAD:nosuch.txt'", the WHOLE arg, hence
+       p_uses_r=1, same shape as tag/merge-base/cherry-pick/revert/switch).
+       Class O is for a well-formed 40-hex id whose object is missing --
+       "not a valid branch point: '<hex>'", with NO preceding "error:
+       object ... is a X" line (that line only appears for the DIFFERENT
+       "resolves, but to a tree/blob" case, which this table has no cell
+       for at all: cmd_branch.c prints that one directly, since it needs
+       the object's actual type name and there is no fifth sg_rev_err_kind
+       for "wrong type" today). */
+    { "branch", "not a valid object name: '%s'", "not a valid branch point: '%s'", 0, 0,
+      /*p_uses_r*/ 1, /*has_d*/ 0, NULL, NULL },
 };
 
 static const sg_rev_err_row *find_rev_err_row(const char *cmd)
