@@ -384,3 +384,148 @@ do not read the whole thing).
   it CONSTRUCTS a brand-new message (the `Revert "..."`/`This reverts
   commit ...` text) and does run it through cleanup, same as any other
   newly-authored message.
+- **Phase 76: `sg tag -d`'s Phase 74 batch-delete engine now lives in
+  `cli/ref_delete.c` (`sg_ref_delete_batch`), used by both `cmd_tag.c` and
+  `cmd_branch.c`.** See `include/sg/ref_delete.h` for the full mechanism
+  (precheck/existence/gate merged into one interleaved loop, in-batch
+  literal-duplicate refusal, then the O_CREAT|O_EXCL lock-collision
+  detector) and the `sg_ref_delete_eexist_style` enum's own comment for a
+  measured DIVERGENCE from this phase's own starting assumption: `git tag
+  -d` and `git branch -d` are NOT the same C code past the ref-transaction
+  layer. The literal-duplicate refusal ("multiple updates for ref '%s' not
+  allowed") IS identical between the two; the lock-COLLISION wording is
+  NOT -- `git tag -d Foo foo` on a case-insensitive filesystem prints "'X'
+  and 'Y' are the same ref" (Phase 74's own finding), while `git branch -d
+  Merged merged` for the identical shape prints git's raw lockfile.c
+  sentence ("cannot lock ref '...': Unable to create '<path>': File
+  exists.\n\nAnother git process seems to be running..."), with no
+  in-batch-alias special case at all. `SG_REFDEL_EEXIST_ALIAS` (tag) vs
+  `SG_REFDEL_EEXIST_RAW` (branch) exists specifically because this project
+  MEASURED the difference rather than assuming Phase 74's tag behavior
+  transferred unchanged -- do not merge the two styles back into one
+  without re-measuring both commands.
+- **`sg branch`'s create path resolves `<start-point>` in STRICT
+  disambiguation mode** (`SG_REV_STRICT`, `cmd_branch.c`'s
+  `resolve_branch_point`), unlike `sg log`/`sg reset`'s COMMITTISH --
+  measured against real git 2.55.0 with a 2-way commit/blob prefix
+  collision: `git log` resolves it, `git branch` refuses and lists both
+  candidates. A resolved TREE or BLOB (not a nonexistent name) gets a
+  message shape `sg_cli_report_rev_error`'s `sg_rev_err_kind` enum cannot
+  express at all ("error: object <hex> is a tree, not a commit" followed by
+  "not a valid branch point: '<arg>'") -- `cmd_branch.c` prints it directly
+  rather than forcing a fifth kind into that table for one caller. The
+  REV_ERR_TABLE row named `"branch"` in `cli_args.c` only covers the two
+  cells that DO fit the existing R/O/P shape (a name that resolves to
+  nothing at all, and a well-formed-but-missing 40-hex).
+- **`sg branch <name> <start>` and `sg branch -f <name> <start>` reproduce
+  git's D/F (directory/file) conflict detection for the refs/heads/
+  namespace** (`cmd_branch.c`'s `check_df_conflict`), in BOTH directions
+  (an existing leaf ref blocking a nested name, and an existing nested ref
+  blocking a leaf name). The wording differs depending on whether the
+  EXISTING, blocking ref is loose or packed-only (measured against real
+  git 2.55.0): a loose blocker gets git's "cannot lock ref '<new>': '<old>'
+  exists; cannot create '<new>'" wording; a packed-only blocker gets the
+  plain "'<old>' exists; cannot create '<new>'" with no "cannot lock ref"
+  prefix at all -- git's own ref-transaction code apparently never
+  attempts (and so never reports failing) a lock for a conflict it can
+  already see is packed-only.
+- **`^{tree}`/`^{commit}`/`^{blob}` peel syntax remains unsupported project-
+  wide** (see `revparse.h`'s own comment) -- `sg branch new HEAD^{tree}`
+  is a known, pre-existing, cross-cutting gap this phase did NOT fix: sg
+  reports the generic "not a valid object name: 'HEAD^{tree}'" where git
+  reports the tree/blob-specific two-line wording above, because
+  `sg_rev_parse_object` never resolves the peel syntax to a tree/blob
+  object in the first place. Fixing it would mean teaching peel syntax to
+  every caller of `sg_rev_parse_object` project-wide, not just `sg
+  branch`'s start-point resolution -- out of scope for this phase, and
+  pinned as a known 3-probe gap in the Phase 76 oracle rather than silently
+  left unmeasured.
+- **Phase 76 fix round 3: `sg_ref_lock_try`/`sg_ref_lock_release`
+  (`refs.h`/`refs.c`) are the ONE `O_CREAT|O_EXCL` ref-lock implementation
+  in this project.** Shared by `cli/ref_delete.c`'s batch-delete
+  transaction, `cli/cmd_branch.c`'s deliberate-divergence-#10 alias probe,
+  and `cmd_branch.c`'s create/`-f` write's own lock (added this round to
+  close a real hole -- see CLAUDE.md's divergence #10 entry). Do not
+  hand-roll a fourth `open(..., O_CREAT|O_EXCL, ...)` on a ref path
+  anywhere in this project; extend this one instead. Every non-EEXIST
+  failure from either of `sg_ref_lock_try`'s two possible callers-in-one-
+  probe (the current branch's own lock, and the typed name's lock) must
+  route through `SG_REFLOCK_ERROR`, never silently through the EEXIST arm
+  or a bare 0/1 collapse -- round 2 closed this for one of the two open()
+  calls in `branch_aliases_current` and missed the other; round 3 audited
+  and closed both (see `docs/DESIGN.md`'s Phase 76 round-3 R2-2 section).
+  `sg_ref_update` (this same file) still takes NO lock at all -- see
+  `docs/DESIGN.md`'s Phase 76 residuals for why that is deliberately out
+  of scope here rather than silently inconsistent.
+- **Phase 76 fix round 4: `sg_ref_lock_try_query` (`refs.h`/`refs.c`) is
+  the PURE-QUERY sibling of `sg_ref_lock_try`** -- same lock file, same
+  EEXIST semantics, but never calls `sg_mkdir_parents`, for a caller that
+  must not create anything on disk while merely asking "would this name's
+  lock collide" (`cmd_branch.c`'s divergence-#10 alias probe is the one
+  caller today, since it runs for every batch-delete name regardless of
+  whether that name exists). Both share `ref_lock_try_impl`; do not
+  duplicate the open()/close() sequence a third time. An `ENOENT`/
+  `ENOTDIR` from the query variant means "this spelling resolves to
+  nothing on disk" -- classifying that as an error vs. a clean negative
+  result is the CALLER's decision, not this function's (see its own
+  header comment); `branch_aliases_current` treats it as "not aliased",
+  a different answer than the ERROR (fail-closed) treatment for every
+  other errno.
+- **`cli/ref_delete.c`'s batch-delete engine prunes empty ancestor
+  directories after each successful delete** (Phase 76 fix round 4, D1d),
+  reusing `sg_prune_empty_parents` (`workdir.h` -- read
+  `docs/RULES-paths-strings.md` on it before touching this) with the
+  namespace root (`refs/heads`, `refs/tags`, `logs/refs/heads`) passed as
+  the `repo_root` argument so it structurally cannot remove that root.
+  Applies to `sg tag -d` too (same shared engine) -- do not special-case
+  branch here.
+- **Phase 76 fix round 5 (P1/R4-1): `sg_ref_delete_batch`'s pass 1
+  (`cli/ref_delete.c`) validates `name` with
+  `sg_ref_path_components_are_safe` BEFORE its precheck callback, the
+  existence check, or any other filesystem call -- state this ordering
+  explicitly if you ever touch pass 1, it is load-bearing, not
+  incidental.** Two things went wrong before this fix, both worth
+  remembering:
+  1. **A SHIPPED, pre-existing destructive bug**: `sg branch -d
+     ./merged` and `sg tag -d ./lt` DELETED a ref real git says does not
+     exist at all, because the OS resolves `refs/heads/./merged` to
+     `refs/heads/merged` while git's own lookup treats the two spellings
+     as different names. This predates Phase 76 (measured against
+     master) but is fixed here because the batch-delete engine is this
+     phase's own code.
+  2. **Deleting round 3's `sg_ref_path_components_are_safe` guard in
+     round 4 was itself a mistake, and the reasoning error is worth
+     naming**: round 4 judged the guard "redundant" because removing it
+     did not change the FINAL PRINTED MESSAGE for the one case it was
+     measured against (`-d merged/` still said "not found" either way).
+     But the guard was also the ONLY thing standing between the raw argv
+     name and `sg_ref_lock_try_query`'s `open(O_CREAT|O_EXCL)` call --
+     without it, `sg branch -d ../../../../x/pwn` builds a path OUTSIDE
+     the repository and briefly creates a real file there before
+     unlinking it. "Same answer" proved nothing about what the code
+     touched on the way to that answer. See CLAUDE.md's own amended
+     "redundant guard" bullet for the general rule this incident now
+     documents, and this file's own INVARIANT comment (next to
+     `sg_ref_lock_try`/`sg_ref_lock_try_query` in `refs.h`) for where the
+     restored gate now lives.
+- **A `tests/interop.sh` check that scans a git-built fixture for `*.lock`
+  must scope to `.git/refs` and to the sg-side directories only, never
+  the whole `.git` tree and never a git-side (`*_git`) or "untouched
+  reference" fixture** (Phase 76 fix round 8, T1). Measured (main
+  conversation, 2026-09-14, git 2.55.0, macOS): in a fresh repo, right
+  after `git commit`, a `*.lock` scan of the whole `.git` tree saw
+  `.git/objects/maintenance.lock` in 22 of 40 trials (git's own detached
+  auto-maintenance), 0 of 40 with `git config maintenance.auto false` and
+  `git config gc.auto 0` set in the fixture right after `git init`. sg's
+  own ref locks can only ever live under `.git/refs`, so a scan of
+  anything wider both risks this exact flake AND fails to discriminate a
+  real sg lock leak from git's own background lock. This caused one
+  observed flaky `FAIL` in round 7 (`phase76 divergence #10: no .lock
+  file anywhere under .git ...`), traced to `.git/objects/maintenance.lock`
+  on the git-side/untouched fixtures the scan should never have reached.
+  Fix applied on both fronts (scope AND fixture quiescence), not either
+  alone -- the six pre-existing phase73/74 `tag -d` lock-scan checks
+  (`refs/heads`/`refs/tags`... roots) were already scoped correctly and
+  were left untouched. Every lock-leak check must also print the actual
+  leftover path(s) on failure, not just fail silently -- a red run should
+  name the file, not just say "found something".

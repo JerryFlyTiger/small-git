@@ -29,12 +29,92 @@ skip() {
     echo "SKIP: $1"
 }
 
+# Phase 76 fix round 1: git tag -d's and git branch -d's EEXIST wording for
+# a per-ref .lock collision are IDENTICAL raw git lockfile.c text (the
+# "same ref" wording formerly pinned below was an sg-authored literal from
+# Phase 74 round 1, never git's own -- see ref_delete.c's own comment).
+# Both sides' message embeds an ABSOLUTE lock path rooted at that side's
+# own repo copy, so a byte comparison needs both prefixes folded to one
+# placeholder first -- both the raw path handed to `cd` and its
+# symlink-resolved form (macOS's /tmp -> /private/tmp), same shape as
+# oracle.py's own <WT> normalization. Defined here, near the top of the
+# file (used starting in the Phase 76 group, long before the Phase 73/74
+# tag groups later in the file also start using it) -- shell function
+# definitions take effect only once the defining statement itself has been
+# EXECUTED, not hoisted, so defining this next to its first Phase 73/74
+# use (as an earlier version of this file did) left every EARLIER caller
+# silently running a nonexistent command; see this project's own
+# mutation-verification incident recorded in docs/DESIGN.md's Phase 76
+# section for how that stayed invisible (the two files being `cmp`'d were
+# both empty, and `cmp -s` on two empty files is a false PASS).
+p74_norm_eexist_msg() {
+    # $1 = raw output file, $2 = that side's own repo root. The REAL
+    # (symlink-resolved, e.g. macOS's /var -> /private/var) path is
+    # substituted FIRST: on this platform the raw path is a SUBSTRING of
+    # the real one, so substituting the raw path first leaves a stray
+    # "/private" prefix behind that the second substitution can no longer
+    # match (measured: produced "/private<REPO>" instead of "<REPO>").
+    real=$(cd "$2" && pwd -P)
+    # Phase 76 fix round 5: `fatal: ` added alongside `error: `/`sg: ` --
+    # every EARLIER use of this function normalized a DELETE-side EEXIST
+    # message, which git always prefixes with `error: `; round 5's new
+    # D1e/create-lock checks compare a CREATE-side lock collision, which
+    # git prefixes with `fatal: ` instead (a different git subsystem, same
+    # underlying lockfile.c sentence) -- measured missing, produced two
+    # non-empty, genuinely DIFFERENT-looking `.norm` files that `cmp`
+    # correctly failed on, not a repeat of this file's own "two empty
+    # files" incident.
+    sed -e "s#$real#<REPO>#g" -e "s#$2#<REPO>#g" -e 's/^error: /E: /' -e 's/^fatal: /E: /' \
+        -e 's/^sg: /E: /' "$1"
+}
+
 if [ ! -x "$SG" ]; then
     echo "error: $SG not found, run 'make' first" >&2
     exit 1
 fi
 
 WORKDIR=$(mktemp -d)
+
+# Phase 73 review round 7 (moved here in Phase 76 fix round 2 -- see
+# p74_norm_eexist_msg's own comment above for why an early, shared helper
+# must be defined/computed before its FIRST use in file order, not next to
+# a later one): whether refs/tags/Foo and refs/tags/foo (or a checked-out
+# branch and a differently-cased spelling of it) alias the SAME file is a
+# FILESYSTEM property (macOS's default APFS/HFS+ fold case, Linux's ext4
+# does not), and several interop checks below are only meaningful -- and
+# only reachable at all -- where the filesystem folds. Probe it at runtime
+# with a plain touch+test, unrelated to git/sg entirely, rather than
+# assuming "this machine" one way or the other.
+P73_CASEFOLD_PROBE="$WORKDIR/phase73_casefold_probe"
+rm -rf "$P73_CASEFOLD_PROBE"
+mkdir -p "$P73_CASEFOLD_PROBE"
+touch "$P73_CASEFOLD_PROBE/CaseProbe"
+if [ -f "$P73_CASEFOLD_PROBE/caseprobe" ]; then
+    P73_FS_CASE_INSENSITIVE=1
+else
+    P73_FS_CASE_INSENSITIVE=0
+fi
+
+# Phase 76 fix round 2 (K1): a SEPARATE probe for Unicode-NORMALIZATION
+# folding -- NOT the same property as case-folding (APFS folds both, but
+# they are independently possible filesystem behaviors; measured only
+# APFS here, so this probe decides whether K1's NFD-alias checks below can
+# run at all, never assumed). Builds the NFD form with a printf octal
+# escape, never a typed literal -- a typed literal was measured arriving
+# as NFC through a shell heredoc, which would silently test the exact
+# name instead of the alias.
+P76_NFD_PROBE="$WORKDIR/phase76_nfd_probe"
+rm -rf "$P76_NFD_PROBE"
+mkdir -p "$P76_NFD_PROBE"
+P76_NFC_NAME=$(printf 'caf\303\251')
+P76_NFD_NAME=$(printf 'cafe\314\201')
+touch "$P76_NFD_PROBE/$P76_NFC_NAME"
+if [ -f "$P76_NFD_PROBE/$P76_NFD_NAME" ]; then
+    P76_FS_NORMALIZATION_FOLDING=1
+else
+    P76_FS_NORMALIZATION_FOLDING=0
+fi
+
 # HTTP_SERVER_PID is set once the phase 5b smart-HTTP test server is
 # launched; cleanup() kills it (if still running) alongside removing WORKDIR,
 # so a failure partway through phase 5b can never leak an orphaned server
@@ -3577,8 +3657,11 @@ check "phase9 case4: shadow branch fully gone, NOT resurrected at the stale pack
     test $? != 0
 grep -q "refs/heads/shadow" "$P9B_REPO/.git/packed-refs" 2>/dev/null
 check "phase9 case4: stale packed line purged as part of the delete" test $? != 0
-check "phase9 case4: delete printed the true (loose) tip in full, recoverable" \
-    grep -q "$P9_SHADOW_TIP" "$P9_SHADOW_OUT"
+# Phase 76: `sg branch -d` now prints git's own 7-hex-prefix form
+# ("Deleted branch X (was <7hex>).") rather than the old full 40-hex --
+# still the TRUE (loose) tip, not the stale packed one, just abbreviated.
+check "phase9 case4: delete printed the true (loose) tip, recoverable" \
+    grep -q "${P9_SHADOW_TIP:0:7}" "$P9_SHADOW_OUT"
 
 # case 5: current-branch delete refused (even forced); unmerged delete is
 # refused on a non-tty stdin without --force, succeeds with it
@@ -3593,15 +3676,20 @@ check "phase9 case5: current branch is intact after the refused delete" test $? 
 P9_UM_TIP=$(cd "$P9B_REPO" && git rev-parse unmerged)
 P9_UM_OUT="$WORKDIR/p9_um_out.txt"
 (cd "$P9B_REPO" && "$SG" branch -d unmerged < /dev/null) > "$P9_UM_OUT" 2>&1
-check "phase9 case5: unmerged delete on non-tty stdin without --force is refused" test $? = 1
-check "phase9 case5: the refusal names --force as the way through" \
-    grep -q -- "--force" "$P9_UM_OUT"
+check "phase9 case5: unmerged delete without --force is refused (no prompt)" test $? = 1
+# Phase 76: git REFUSES outright here (no interactive confirmation at all,
+# even on a tty) and its hint names `-D`, not `--force` -- see
+# docs/DESIGN.md's Phase 76 section for why the old confirm-with-bypass
+# shape was removed rather than kept.
+check "phase9 case5: the refusal's hint names -D as the way through" \
+    grep -q -- "-D" "$P9_UM_OUT"
 check "phase9 case5: branch untouched after the refused unmerged delete" \
     test "$(cd "$P9B_REPO" && git rev-parse unmerged)" = "$P9_UM_TIP"
 (cd "$P9B_REPO" && "$SG" branch -d unmerged --force < /dev/null) > "$P9_UM_OUT" 2>&1
 check "phase9 case5: unmerged delete with --force succeeds" test $? = 0
-check "phase9 case5: forced delete printed the branch's full 40-hex old tip" \
-    grep -q "$P9_UM_TIP" "$P9_UM_OUT"
+# Phase 76: 7-hex-prefix form, see case4's identical rewrite above.
+check "phase9 case5: forced delete printed the branch's old tip" \
+    grep -q "${P9_UM_TIP:0:7}" "$P9_UM_OUT"
 (cd "$P9B_REPO" && git rev-parse --verify refs/heads/unmerged) > /dev/null 2>&1
 check "phase9 case5: unmerged branch gone after the forced delete" test $? != 0
 
@@ -3639,6 +3727,1081 @@ check "phase9 case8: sg branch in an empty repo exits 0" test "$P9E_RC" = 0
 check "phase9 case8: sg branch in an empty repo prints nothing" test ! -s "$P9E_LIST"
 (cd "$P9E_REPO" && "$SG" branch nothing-yet) > /dev/null 2>&1
 check "phase9 case8: creating a branch in an empty repo fails (no commit yet)" test $? = 1
+
+echo ""
+
+# --- Phase 76: sg branch -- create-with-start-point, -f, git's batch delete
+# Each check below discriminates ONE step of the measured check-order (see
+# CLAUDE.md's Phase 76 milestone and docs/DESIGN.md's Phase 76 section for
+# the full oracle this mirrors). Git-vs-sg byte comparisons where both
+# sides can run the same command; literal pins of sg's own bytes where the
+# scenario needs a fixture git itself cannot easily reach twin-built (e.g.
+# the shared ref_delete engine's collision wording, already exercised
+# git-vs-git-identically by the phase73/74 tag groups elsewhere in this
+# file).
+mk_p76_repo() {
+    # $1 = path
+    mkdir -p "$1"
+    (cd "$WORKDIR" && "$SG" init "$(basename "$1")") > /dev/null 2>&1
+    (cd "$1" && printf 'v1\n' > f.txt && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+    (cd "$1" && printf 'v2\n' > f.txt && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+    (cd "$1" && "$SG" branch merged HEAD~1) > /dev/null 2>&1
+    (cd "$1" && "$SG" branch heads/x) > /dev/null 2>&1
+    (cd "$1" && "$SG" tag -a -m annot at HEAD~1) > /dev/null 2>&1
+}
+
+P76_SG_REPO="$WORKDIR/phase76_sg_repo"
+mk_p76_repo "$P76_SG_REPO"
+P76_HEAD=$(cd "$P76_SG_REPO" && git rev-parse HEAD)
+P76_PARENT=$(cd "$P76_SG_REPO" && git rev-parse HEAD~1)
+
+# --- create: start point resolution -----------------------------------
+(cd "$P76_SG_REPO" && "$SG" branch fromparent HEAD~1) > /dev/null 2>&1
+check "phase76 create: sg branch <name> <start> exits 0" test $? = 0
+check "phase76 create: branch resolves to the given start point" \
+    test "$(cd "$P76_SG_REPO" && git rev-parse fromparent)" = "$P76_PARENT"
+check "phase76 create: reflog names the start point exactly as typed" \
+    grep -q "branch: Created from HEAD~1" "$P76_SG_REPO/.git/logs/refs/heads/fromparent"
+
+(cd "$P76_SG_REPO" && "$SG" branch fromtag at) > /dev/null 2>&1
+check "phase76 create: annotated tag start point peels to its commit" \
+    test "$(cd "$P76_SG_REPO" && git rev-parse fromtag)" = "$P76_PARENT"
+
+P76_TREE=$(cd "$P76_SG_REPO" && git rev-parse "HEAD^{tree}")
+P76_OUT="$WORKDIR/p76_out.txt"
+(cd "$P76_SG_REPO" && "$SG" branch fromtree "$P76_TREE") > "$P76_OUT" 2>&1
+check "phase76 create: a tree start point is refused" test $? = 1
+check "phase76 create: tree refusal names the object and its real type" \
+    grep -q "object $P76_TREE is a tree, not a commit" "$P76_OUT"
+check "phase76 create: tree refusal's second line is git's own wording" \
+    grep -q "not a valid branch point: '$P76_TREE'" "$P76_OUT"
+check "phase76 create: no branch left behind by the refused tree start point" \
+    test ! -f "$P76_SG_REPO/.git/refs/heads/fromtree"
+
+(cd "$P76_SG_REPO" && "$SG" branch fromhex 0123456789abcdef0123456789abcdef01234567) > "$P76_OUT" 2>&1
+check "phase76 create: a well-formed but nonexistent 40-hex is refused" test $? = 1
+check "phase76 create: ...with the short one-line wording (no 'error: object' line)" \
+    sh -c "! grep -q 'error: object' '$P76_OUT'"
+check "phase76 create: ...naming the hex as an invalid branch point" \
+    grep -q "not a valid branch point: '0123456789abcdef0123456789abcdef01234567'" "$P76_OUT"
+
+(cd "$P76_SG_REPO" && "$SG" branch fromnone nonexistent) > "$P76_OUT" 2>&1
+check "phase76 create: a nonexistent name is refused" test $? = 1
+check "phase76 create: ...as 'not a valid object name'" \
+    grep -q "not a valid object name: 'nonexistent'" "$P76_OUT"
+
+# --- create: -f semantics ----------------------------------------------
+(cd "$P76_SG_REPO" && "$SG" branch -f merged HEAD) > /dev/null 2>&1
+check "phase76 create -f: resets an existing branch to the new start point" \
+    test "$(cd "$P76_SG_REPO" && git rev-parse merged)" = "$P76_HEAD"
+check "phase76 create -f: reflog records a Reset line, not Created" \
+    sh -c "tail -1 '$P76_SG_REPO/.git/logs/refs/heads/merged' | grep -q 'branch: Reset to HEAD'"
+P76_MERGED_LOG_LINES=$(wc -l < "$P76_SG_REPO/.git/logs/refs/heads/merged")
+(cd "$P76_SG_REPO" && "$SG" branch -f merged HEAD) > /dev/null 2>&1
+check "phase76 create -f: resetting to the SAME value logs nothing new" \
+    test "$(wc -l < "$P76_SG_REPO/.git/logs/refs/heads/merged")" = "$P76_MERGED_LOG_LINES"
+
+(cd "$P76_SG_REPO" && "$SG" branch -f master) > "$P76_OUT" 2>&1
+check "phase76 create -f: force-updating the CHECKED-OUT branch is refused" test $? = 1
+check "phase76 create -f: ...naming the worktree, not a generic error" \
+    grep -q "used by worktree at" "$P76_OUT"
+
+# --- create: D/F conflict ------------------------------------------------
+(cd "$P76_SG_REPO" && "$SG" branch merged/sub) > "$P76_OUT" 2>&1
+check "phase76 create: D/F conflict (existing leaf blocks a nested name) is refused" \
+    test $? = 1
+check "phase76 create: ...naming both the new and the blocking existing ref" \
+    grep -q "'refs/heads/merged' exists; cannot create 'refs/heads/merged/sub'" "$P76_OUT"
+(cd "$P76_SG_REPO" && "$SG" branch heads) > "$P76_OUT" 2>&1
+check "phase76 create: D/F conflict (existing nested ref blocks a leaf name) is refused" \
+    test $? = 1
+check "phase76 create: ...naming the new ref in the 'cannot lock ref' prefix" \
+    grep -q "cannot lock ref 'refs/heads/heads'" "$P76_OUT"
+
+# --- delete: gate order, one fixture per gate ---------------------------
+(cd "$P76_SG_REPO" && "$SG" switch -c topic \
+    && printf 't\n' > g.txt && "$SG" add g.txt && "$SG" commit -m t1 \
+    && "$SG" switch master) > /dev/null 2>&1
+(cd "$P76_SG_REPO" && "$SG" branch -d master topic nope merged) > "$P76_OUT" 2>&1
+check "phase76 delete: a mixed batch exits 1" test $? = 1
+check "phase76 delete: checked-out branch's message comes FIRST (worktree, not merged/not-found)" \
+    sh -c "head -1 '$P76_OUT' | grep -q 'used by worktree'"
+check "phase76 delete: not-merged branch's message is SECOND, in argv order" \
+    sh -c "sed -n 2p '$P76_OUT' | grep -q 'is not fully merged'"
+check "phase76 delete: not-merged hint names -D, not --force" \
+    grep -q "hint: If you are sure you want to delete it, run 'sg branch -D topic'" "$P76_OUT"
+check "phase76 delete: missing name's message is THIRD, in argv order" \
+    sh -c "sed -n 4p '$P76_OUT' | grep -q \"branch 'nope' not found\""
+check "phase76 delete: master untouched by the refused batch" \
+    test "$(cd "$P76_SG_REPO" && git rev-parse master)" = "$P76_HEAD"
+check "phase76 delete: topic untouched by the refused batch" \
+    test -f "$P76_SG_REPO/.git/refs/heads/topic"
+check "phase76 delete: merged (the one eligible name) WAS deleted despite the other failures" \
+    test ! -f "$P76_SG_REPO/.git/refs/heads/merged"
+
+(cd "$P76_SG_REPO" && "$SG" branch -D topic) > "$P76_OUT" 2>&1
+check "phase76 delete -D: force-deletes an unmerged branch, no prompt" test $? = 0
+check "phase76 delete -D: success line has no quotes and a trailing period" \
+    grep -qE "^Deleted branch topic \(was [a-z0-9]+\)\.$" "$P76_OUT"
+
+(cd "$P76_SG_REPO" && "$SG" branch -q -d heads/x) > "$P76_OUT" 2>&1
+check "phase76 delete -q: quiet suppresses the Deleted line" test ! -s "$P76_OUT"
+check "phase76 delete -q: the branch is still actually gone" \
+    test ! -f "$P76_SG_REPO/.git/refs/heads/heads/x"
+
+# Phase 76 fix round 8 (T1, LK-B coverage): every earlier check above ran
+# a SUCCESSFUL create, -f, or delete on $P76_SG_REPO -- none of them ever
+# asserted that sg's own O_CREAT|O_EXCL lock is actually released on the
+# ordinary success path, only on refusal paths (the checks named
+# elsewhere in this phase's block all scan a fixture AFTER a refusal).
+# Scoped to .git/refs (sg's own locks only; $P76_SG_REPO is built by `sg
+# init`/`sg commit`, never real git, so there is no detached-maintenance
+# lock risk here the way there is for the git-built fixtures above).
+find "$P76_SG_REPO/.git/refs" -name '*.lock' > "$WORKDIR/p76_success_locks.txt" 2>/dev/null
+check "phase76 create/-f/delete: no .lock file remains under refs/ after any of the successful operations above" \
+    sh -c "! grep -q . '$WORKDIR/p76_success_locks.txt' || { echo 'leftover lock(s):'; cat '$WORKDIR/p76_success_locks.txt'; false; }"
+
+# --- parser: bundled short options, -D as -d -f -------------------------
+(cd "$P76_SG_REPO" && "$SG" switch -c bundletest \
+    && printf 'b\n' > h.txt && "$SG" add h.txt && "$SG" commit -m b1 \
+    && "$SG" switch master) > /dev/null 2>&1
+(cd "$P76_SG_REPO" && "$SG" branch -df bundletest) > /dev/null 2>&1
+check "phase76 parser: bundled -df deletes an unmerged branch like -d -f" \
+    test ! -f "$P76_SG_REPO/.git/refs/heads/bundletest"
+
+(cd "$P76_SG_REPO" && "$SG" branch -x) > /dev/null 2>&1
+check "phase76 parser: an unrecognized flag is a usage error" test $? = 1
+(cd "$P76_SG_REPO" && "$SG" branch new HEAD~1 extra) > /dev/null 2>&1
+check "phase76 parser: more than two positionals in create mode is a usage error" test $? = 1
+(cd "$P76_SG_REPO" && "$SG" branch -d) > "$P76_OUT" 2>&1
+check "phase76 parser: -d with no names is 'branch name required', not the usage block" \
+    grep -q "branch name required" "$P76_OUT"
+
+# --- Phase 76 fix round 3 (L1): create/-f writes through a foreign
+# refs/heads/<name>.lock -- measured against real git 2.55.0: creating OR
+# force-updating ANY branch while a foreign .lock sits at its OWN typed
+# path is refused (`fatal: cannot lock ref ...`), even a BRAND NEW branch
+# with no prior existence at all. Row 3 (a foreign master.lock while
+# "Master" is a case alias of the checked-out branch) is the one that
+# matters for divergence #10: round 2 shipped an alias probe that cannot
+# safely tell when the CURRENT branch's own lock path is already held by
+# something else, and the create path had no lock of its own to catch it
+# a second way -- `-f Master HEAD~1` moved the checked-out master anyway.
+# This is git PARITY, not part of divergence #10 itself (which is exactly
+# the case with NO foreign lock, where this lock always succeeds and the
+# alias probe is what refuses).
+p76_lockcreate_check() {
+    # $1 = label, $2 = lock-target name (as typed, used to build the
+    # foreign lock path), $3.. = branch argv
+    lbl="$1"; lockname="$2"
+    shift 2
+    gdir="$WORKDIR/phase76_lc_git_$lbl"; sdir="$WORKDIR/phase76_lc_sg_$lbl"
+    rm -rf "$gdir" "$sdir"
+    mkdir -p "$gdir"
+    git init -q -b master "$gdir" > /dev/null 2>&1
+    # Phase 76 fix round 8 (T1): quiescent, so a lock-count check below never
+    # sees git's own detached auto-maintenance lock -- measured (main
+    # conversation, 2026-09-14, git 2.55.0, macOS): right after `git commit`,
+    # a *.lock scan of .git saw .git/objects/maintenance.lock in 22 of 40
+    # trials with default config, 0 of 40 with these two disabled.
+    (cd "$gdir" && git config maintenance.auto false && git config gc.auto 0) \
+        > /dev/null 2>&1
+    (cd "$gdir" && git config user.email "p76lc@example.com" && git config user.name "p76 lc") \
+        > /dev/null 2>&1
+    printf 'v1\n' > "$gdir/f.txt"
+    (cd "$gdir" && git add f.txt && GIT_AUTHOR_DATE="@1700003000 +0000" \
+        GIT_COMMITTER_DATE="@1700003000 +0000" git commit -q -m c1) > /dev/null 2>&1
+    printf 'v2\n' > "$gdir/f.txt"
+    (cd "$gdir" && git add f.txt && GIT_AUTHOR_DATE="@1700003100 +0000" \
+        GIT_COMMITTER_DATE="@1700003100 +0000" git commit -q -m c2) > /dev/null 2>&1
+    (cd "$gdir" && git branch topic) > /dev/null 2>&1
+    cp -R "$gdir" "$sdir"
+    touch "$gdir/.git/refs/heads/$lockname.lock"
+    touch "$sdir/.git/refs/heads/$lockname.lock"
+    gout="$WORKDIR/p76_lc_git_$lbl.out"; sout="$WORKDIR/p76_lc_sg_$lbl.out"
+    (cd "$gdir" && LC_ALL=C git branch "$@") > "$gout" 2>&1; grc=$?
+    (cd "$sdir" && "$SG" branch "$@") > "$sout" 2>&1; src=$?
+    check "phase76 L1 ($lbl) oracle: precondition -- git refuses with a foreign lock present (exit 128)" \
+        test "$grc" = 128
+    check "phase76 L1 ($lbl): sg also refuses (exit 1)" \
+        test "$src" = 1
+    check "phase76 L1 ($lbl): sg's message names the LOCK collision, not some other refusal" \
+        grep -q "cannot lock ref" "$sout"
+    check "phase76 L1 ($lbl): the foreign lock file itself is left exactly as it was" \
+        test -e "$sdir/.git/refs/heads/$lockname.lock"
+    # Phase 76 fix round 8 (T1): scoped to $sdir/.git/refs (where sg's own
+    # locks live), never the whole .git tree -- .git/objects can hold git's
+    # own detached maintenance.lock (see the quiescent-config note above),
+    # which would inflate this count without sg ever touching it. On
+    # failure, print the actual list so a red run names the file.
+    find "$sdir/.git/refs" -name '*.lock' > "$WORKDIR/p76_lc_locks_$lbl.txt" 2>/dev/null
+    # Phase 76 fix round 9 (V3): print the expected and actual counts
+    # before the list, so a run where the foreign lock itself vanished
+    # (0 found, not the expected 1) says so explicitly rather than just
+    # showing an empty list. Pass/fail logic unchanged (still exactly
+    # `grep -c .` compared to 1).
+    check "phase76 L1 ($lbl): no OTHER .lock file survives under refs/ (sg cleans up any lock it created itself)" \
+        sh -c "test \"\$(grep -c . '$WORKDIR/p76_lc_locks_$lbl.txt')\" = 1 || { echo \"expected exactly 1 lock under .git/refs (the foreign one), found \$(grep -c . '$WORKDIR/p76_lc_locks_$lbl.txt'):\"; cat '$WORKDIR/p76_lc_locks_$lbl.txt'; false; }"
+    # Reviewer round 3 review finding: the "new"/"topic" rows used to check only
+    # exit code, message, foreign-lock survival, and lock count -- on a
+    # case-sensitive filesystem (where the gated "master-alias" row below
+    # never runs at all), NO lockcreate check verified that sg's refusal
+    # actually left the ref/reflog untouched. "new" never existed on
+    # either side (the refusal must leave it ABSENT on both, not merely
+    # "not asserted"); "topic" pre-exists on both, so it needs full
+    # byte-identity of both the ref and its reflog. Unconditional (not
+    # gated on case-folding): both rows use identical spellings on each
+    # side.
+    if [ "$lockname" = "new" ]; then
+        check "phase76 L1 ($lbl): 'new' is ABSENT on the git side (refused, never created)" \
+            sh -c "! test -e '$gdir/.git/refs/heads/new'"
+        check "phase76 L1 ($lbl): 'new' is ABSENT on the sg side (refused, never created)" \
+            sh -c "! test -e '$sdir/.git/refs/heads/new'"
+    fi
+    if [ "$lockname" = "topic" ]; then
+        check "phase76 L1 ($lbl): refs/heads/topic is BYTE-IDENTICAL between git and sg after the refusal" \
+            cmp -s "$gdir/.git/refs/heads/topic" "$sdir/.git/refs/heads/topic"
+        check "phase76 L1 ($lbl): logs/refs/heads/topic is BYTE-IDENTICAL between git and sg after the refusal" \
+            cmp -s "$gdir/.git/logs/refs/heads/topic" "$sdir/.git/logs/refs/heads/topic"
+    fi
+}
+
+p76_lockcreate_check "new" "new" new HEAD~1
+p76_lockcreate_check "topic" "topic" -f topic HEAD~1
+
+# "master-alias" needs the LOCK PATH itself to case-fold ("master.lock"
+# foreign vs "Master.lock" typed) -- unlike "new"/"topic" above (same
+# spelling on both sides, filesystem-independent), this row only
+# reproduces on a case-insensitive filesystem, so it is gated the same
+# way the rest of divergence #10's checks are (a round-2 review finding:
+# every gated count must say so explicitly, not just the ones already
+# inside the earlier `if` block).
+if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
+    p76_lockcreate_check "master-alias" "master" -f Master HEAD~1
+    check "phase76 L1 (master-alias): master's ref is BYTE-IDENTICAL to an untouched copy (not moved by the bypass)" \
+        cmp -s "$WORKDIR/phase76_lc_git_master-alias/.git/refs/heads/master" \
+        "$WORKDIR/phase76_lc_sg_master-alias/.git/refs/heads/master"
+    check "phase76 L1 (master-alias): master's reflog is BYTE-IDENTICAL to an untouched copy" \
+        cmp -s "$WORKDIR/phase76_lc_git_master-alias/.git/logs/refs/heads/master" \
+        "$WORKDIR/phase76_lc_sg_master-alias/.git/logs/refs/heads/master"
+    check "phase76 L1 (master-alias): logs/HEAD is BYTE-IDENTICAL to an untouched copy" \
+        cmp -s "$WORKDIR/phase76_lc_git_master-alias/.git/logs/HEAD" \
+        "$WORKDIR/phase76_lc_sg_master-alias/.git/logs/HEAD"
+else
+    skip "phase76 L1 (master-alias): filesystem is case-sensitive -- 'master.lock'/'Master.lock' do not alias here"
+fi
+
+# The exact-name (no alias needed) refusal must still win when master.lock
+# is foreign and the typed name is the LITERAL current branch name.
+P76_LC_EXACT="$WORKDIR/phase76_lc_exact"
+rm -rf "$P76_LC_EXACT"
+mkdir -p "$P76_LC_EXACT"
+(cd "$WORKDIR" && "$SG" init phase76_lc_exact) > /dev/null 2>&1
+(cd "$P76_LC_EXACT" && printf 'v1\n' > f.txt && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+touch "$P76_LC_EXACT/.git/refs/heads/master.lock"
+(cd "$P76_LC_EXACT" && "$SG" branch -f master HEAD) > "$P76_OUT" 2>&1
+check "phase76 L1 (exact-name over a foreign lock): the exact-name worktree refusal still wins (no lock-collision wording)" \
+    sh -c "test $? = 1 && grep -q 'used by worktree' '$P76_OUT' && ! grep -q 'cannot lock ref' '$P76_OUT'"
+
+# --- Phase 76 fix round 4 (R3-2/D1b/D1c): the alias probe's pure-query
+# fix has NO in-repo test at all before this -- it was only ever
+# exercised by an out-of-repo differential-testing script (this project's
+# oracle.py, never committed; see docs/DESIGN.md's own note on it).
+# Git-vs-sg byte compares (rc,
+# stderr, refs) for every shape D1b/D1c named, on a fixture checked out
+# on a LOOSE branch (the probe only ever runs then), and an explicit
+# assertion that no new directory appears under refs/heads/ -- the
+# regression this round fixed was never about the WRONG ANSWER (both
+# "not found" and the refusal both already matched git in wording), it
+# was an invisible DISK-STATE leak that only a directory listing catches.
+p76_r32_check() {
+    # $1 = label, $2.. = branch argv
+    lbl="$1"; shift
+    gdir="$WORKDIR/phase76_r32_git_$lbl"; sdir="$WORKDIR/phase76_r32_sg_$lbl"
+    rm -rf "$gdir" "$sdir"
+    mkdir -p "$gdir"
+    git init -q -b master "$gdir" > /dev/null 2>&1
+    (cd "$gdir" && git config user.email "p76r32@example.com" && git config user.name "p76 r32") \
+        > /dev/null 2>&1
+    printf 'v1\n' > "$gdir/f.txt"
+    (cd "$gdir" && git add f.txt && GIT_AUTHOR_DATE="@1700003500 +0000" \
+        GIT_COMMITTER_DATE="@1700003500 +0000" git commit -q -m c1) > /dev/null 2>&1
+    (cd "$gdir" && git branch merged && git branch heads/x) > /dev/null 2>&1
+    cp -R "$gdir" "$sdir"
+    gout="$WORKDIR/p76_r32_git_$lbl.out"; sout="$WORKDIR/p76_r32_sg_$lbl.out"
+    (cd "$gdir" && LC_ALL=C git branch "$@") > "$gout" 2>&1; grc=$?
+    (cd "$sdir" && "$SG" branch "$@") > "$sout" 2>&1; src=$?
+    check "phase76 R3-2 ($lbl) oracle: precondition -- git refuses (exit 1 or 128)" \
+        sh -c "test '$grc' != 0"
+    check "phase76 R3-2 ($lbl): sg refuses too (exit 1)" \
+        test "$src" = 1
+    # Reviewer round 4 (R4-2): this function used to capture stderr on
+    # both sides but never COMPARE it -- exit code alone cannot
+    # distinguish git's "not found" from sg's own "out of memory" (the
+    # exact D1c bug this whole group exists to pin), since both are
+    # non-zero. Byte-compare, same normalization as the EEXIST group
+    # above (path folded to <REPO>, "fatal:"/"error:"/"sg:" folded to
+    # "E:").
+    p74_norm_eexist_msg "$gout" "$gdir" > "$gout.norm"
+    p74_norm_eexist_msg "$sout" "$sdir" > "$sout.norm"
+    check "phase76 R3-2 ($lbl): sg's stderr matches git's byte-for-byte (not just 'some refusal')" \
+        cmp -s "$gout.norm" "$sout.norm"
+    # Reviewer round 4 (R4-8): a directory COUNT cannot tell "one leaked,
+    # one legitimately missing" apart from "no change" -- compare the
+    # actual sorted path LISTS.
+    (cd "$gdir" && find .git/refs/heads -type d | sort) > "$WORKDIR/p76_r32_git_$lbl.dirs"
+    (cd "$sdir" && find .git/refs/heads -type d | sort) > "$WORKDIR/p76_r32_sg_$lbl.dirs"
+    check "phase76 R3-2 ($lbl): sg's refs/heads/ directory LISTING is BYTE-IDENTICAL to git's (the fixed leak)" \
+        cmp -s "$WORKDIR/p76_r32_git_$lbl.dirs" "$WORKDIR/p76_r32_sg_$lbl.dirs"
+    (cd "$gdir" && git for-each-ref --format='%(refname) %(objectname)') | sort > "$WORKDIR/p76_r32_git_$lbl.refs"
+    (cd "$sdir" && git for-each-ref --format='%(refname) %(objectname)') | sort > "$WORKDIR/p76_r32_sg_$lbl.refs"
+    check "phase76 R3-2 ($lbl): sg's refs listing is BYTE-IDENTICAL to git's (nothing created)" \
+        cmp -s "$WORKDIR/p76_r32_git_$lbl.refs" "$WORKDIR/p76_r32_sg_$lbl.refs"
+}
+
+p76_r32_check "d-merged-slash" -d merged/
+p76_r32_check "d-merged-sub" -d merged/sub
+p76_r32_check "D-merged-sub" -D merged/sub
+p76_r32_check "d-heads-x-y" -d heads/x/y
+p76_r32_check "d-nope-sub" -d nope/sub
+p76_r32_check "d-deep-a-b" -d deep/a/b
+if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
+    p76_r32_check "d-Master-x" -d Master/x
+else
+    skip "phase76 R3-2 (d-Master-x): filesystem is case-sensitive -- 'Master' does not alias 'master' here"
+fi
+
+# --- Phase 76 fix round 5 (R4-4/D1e): the packed no-op `-f` had ZERO
+# interop coverage before this round. Four cells: loose/packed x
+# with/without a foreign lock on the target name -- with the lock
+# present, round 5's Q1 fix means the LOCK refuses first (git parity,
+# byte-compared); without it, the no-op must touch NOTHING (no loose
+# file materialized for a packed-only branch, no reflog line, no
+# directory).
+p76_d1e_check() {
+    # $1 = label, $2 = "loose"|"packed", $3 = "lock"|"nolock"
+    lbl="$1"; kind="$2"; lockmode="$3"
+    gdir="$WORKDIR/phase76_d1e_git_$lbl"; sdir="$WORKDIR/phase76_d1e_sg_$lbl"
+    rm -rf "$gdir" "$sdir"
+    mkdir -p "$gdir"
+    git init -q -b master "$gdir" > /dev/null 2>&1
+    (cd "$gdir" && git config user.email "p76d1e@example.com" && git config user.name "p76 d1e") \
+        > /dev/null 2>&1
+    printf 'v1\n' > "$gdir/f.txt"
+    (cd "$gdir" && git add f.txt && GIT_AUTHOR_DATE="@1700005000 +0000" \
+        GIT_COMMITTER_DATE="@1700005000 +0000" git commit -q -m c1) > /dev/null 2>&1
+    (cd "$gdir" && git branch topic) > /dev/null 2>&1
+    if [ "$kind" = "packed" ]; then
+        (cd "$gdir" && git pack-refs --all) > /dev/null 2>&1
+    fi
+    cp -R "$gdir" "$sdir"
+    if [ "$lockmode" = "lock" ]; then
+        touch "$gdir/.git/refs/heads/topic.lock"
+        touch "$sdir/.git/refs/heads/topic.lock"
+    fi
+    gout="$WORKDIR/p76_d1e_git_$lbl.out"; sout="$WORKDIR/p76_d1e_sg_$lbl.out"
+    (cd "$gdir" && LC_ALL=C git branch -f topic topic) > "$gout" 2>&1; grc=$?
+    (cd "$sdir" && "$SG" branch -f topic topic) > "$sout" 2>&1; src=$?
+    if [ "$lockmode" = "lock" ]; then
+        check "phase76 D1e ($lbl) oracle: precondition -- a foreign lock refuses the no-op TOO (exit 128)" \
+            test "$grc" = 128
+        check "phase76 D1e ($lbl): sg refuses identically (exit 1)" \
+            test "$src" = 1
+        p74_norm_eexist_msg "$gout" "$gdir" > "$gout.norm"
+        p74_norm_eexist_msg "$sout" "$sdir" > "$sout.norm"
+        check "phase76 D1e ($lbl): sg's refusal matches git's raw lockfile wording byte-for-byte" \
+            cmp -s "$gout.norm" "$sout.norm"
+        check "phase76 D1e ($lbl): the foreign lock survives untouched" \
+            test -e "$sdir/.git/refs/heads/topic.lock"
+    else
+        check "phase76 D1e ($lbl) oracle: precondition -- git's no-op exits 0 and touches nothing" \
+            test "$grc" = 0
+        check "phase76 D1e ($lbl): sg's no-op ALSO exits 0" \
+            test "$src" = 0
+    fi
+    check "phase76 D1e ($lbl): refs/heads/topic is BYTE-IDENTICAL between git and sg (or absent on BOTH, for a packed-only no-op)" \
+        sh -c "if test -e '$gdir/.git/refs/heads/topic' || test -e '$sdir/.git/refs/heads/topic'; then \
+                   cmp -s '$gdir/.git/refs/heads/topic' '$sdir/.git/refs/heads/topic'; \
+               else true; fi"
+    (cd "$gdir" && find .git/refs .git/logs -type f -o -type d | sort) > "$WORKDIR/p76_d1e_git_$lbl.tree"
+    (cd "$sdir" && find .git/refs .git/logs -type f -o -type d | sort) > "$WORKDIR/p76_d1e_sg_$lbl.tree"
+    check "phase76 D1e ($lbl): the ENTIRE refs/logs directory tree is BYTE-IDENTICAL to git's (no loose file, no directory materialized)" \
+        cmp -s "$WORKDIR/p76_d1e_git_$lbl.tree" "$WORKDIR/p76_d1e_sg_$lbl.tree"
+}
+
+p76_d1e_check "loose-nolock" loose nolock
+p76_d1e_check "packed-nolock" packed nolock
+p76_d1e_check "loose-lock" loose lock
+p76_d1e_check "packed-lock" packed lock
+
+# --- Phase 76 fix round 5 (Q2 floor): the packed case-folded D/F
+# heuristic was REMOVED (see cmd_branch.c's own comment) rather than
+# fixed, since it agreed with git on only one fixture -- this is now a
+# residual (docs/DESIGN.md's Phase 76 round-5 Q2 section), but the FLOOR
+# still holds: whatever sg prints, it must exit 1, create no ref, and
+# leave no directory behind. Gated on case-folding (the whole scenario
+# needs it); wording is sg's own generic one, not git's D/F wording --
+# said so in the check name rather than implied.
+if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
+    P76_Q2_A="$WORKDIR/phase76_q2_a"
+    rm -rf "$P76_Q2_A"
+    mkdir -p "$P76_Q2_A"
+    git init -q -b master "$P76_Q2_A" > /dev/null 2>&1
+    (cd "$P76_Q2_A" && git config user.email "p76q2@example.com" && git config user.name "p76 q2") \
+        > /dev/null 2>&1
+    printf 'v1\n' > "$P76_Q2_A/f.txt"
+    (cd "$P76_Q2_A" && git add f.txt && GIT_AUTHOR_DATE="@1700005100 +0000" \
+        GIT_COMMITTER_DATE="@1700005100 +0000" git commit -q -m c1) > /dev/null 2>&1
+    (cd "$P76_Q2_A" && git pack-refs --all) > /dev/null 2>&1
+    (cd "$P76_Q2_A" && "$SG" branch MASTER/x) > "$P76_OUT" 2>&1
+    check "phase76 Q2 floor (packed, reflog present, 'branch MASTER/x'): sg's OWN (residual, non-git) wording still refuses (exit 1)" \
+        test $? = 1
+    check "phase76 Q2 floor: no ref was created" \
+        test ! -e "$P76_Q2_A/.git/refs/heads/MASTER"
+    check "phase76 Q2 floor: NO directory was left under refs/heads/ or logs/refs/heads/ (the fixed leak)" \
+        sh -c "! find '$P76_Q2_A/.git/refs/heads' '$P76_Q2_A/.git/logs/refs/heads' -mindepth 1 -type d 2>/dev/null | grep -q ."
+
+    P76_Q2_B="$WORKDIR/phase76_q2_b"
+    rm -rf "$P76_Q2_B"
+    cp -R "$P76_Q2_A" "$P76_Q2_B"
+    # (P76_Q2_A already failed above and left no trace, so a plain copy is
+    # an equally pristine starting point for the -f cell.)
+    (cd "$P76_Q2_B" && "$SG" branch -f Master/x HEAD) > "$P76_OUT" 2>&1
+    check "phase76 Q2 floor (packed, reflog present, '-f Master/x HEAD'): sg's OWN wording still refuses (exit 1)" \
+        test $? = 1
+    check "phase76 Q2 floor (-f): no ref was created" \
+        test ! -e "$P76_Q2_B/.git/refs/heads/Master"
+    check "phase76 Q2 floor (-f): NO directory was left" \
+        sh -c "! find '$P76_Q2_B/.git/refs/heads' '$P76_Q2_B/.git/logs/refs/heads' -mindepth 1 -type d 2>/dev/null | grep -q ."
+else
+    skip "phase76 Q2 floor: filesystem is case-sensitive -- 'Master'/'MASTER' do not alias 'master' here"
+fi
+
+# --- Phase 76 fix round 5 (D1d, R4-5): empty-parent-directory pruning
+# after a delete had ZERO interop coverage before this round (verified by
+# ad-hoc scripts only). One git-vs-sg `dirs` compare per stopping-rule row
+# (docs/DESIGN.md's own D1d table), loose and packed where the row makes a
+# distinction, plus tag t1/t2 (same shared engine).
+p76_d1d_check() {
+    # $1 = label, $2 = setup-shell-fragment (run with cwd=$dir, $SG in scope),
+    # $3.. = branch/tag argv for the delete
+    lbl="$1"; setup="$2"; shift 2
+    gdir="$WORKDIR/phase76_d1d_git_$lbl"; sdir="$WORKDIR/phase76_d1d_sg_$lbl"
+    rm -rf "$gdir" "$sdir"
+    mkdir -p "$gdir"
+    git init -q -b master "$gdir" > /dev/null 2>&1
+    (cd "$gdir" && git config user.email "p76d1d@example.com" && git config user.name "p76 d1d") \
+        > /dev/null 2>&1
+    printf 'v1\n' > "$gdir/f.txt"
+    (cd "$gdir" && git add f.txt && GIT_AUTHOR_DATE="@1700005500 +0000" \
+        GIT_COMMITTER_DATE="@1700005500 +0000" git commit -q -m c1) > /dev/null 2>&1
+    (cd "$gdir" && eval "$setup") > /dev/null 2>&1
+    cp -R "$gdir" "$sdir"
+    (cd "$gdir" && LC_ALL=C git "$@") > /dev/null 2>&1
+    (cd "$sdir" && "$SG" "$@") > /dev/null 2>&1
+    (cd "$gdir" && find .git/refs .git/logs -type d | sort) > "$WORKDIR/p76_d1d_git_$lbl.dirs"
+    (cd "$sdir" && find .git/refs .git/logs -type d | sort) > "$WORKDIR/p76_d1d_sg_$lbl.dirs"
+    check "phase76 D1d ($lbl): sg's refs/logs directory tree matches git's AFTER the delete (empty ancestors pruned identically)" \
+        cmp -s "$WORKDIR/p76_d1d_git_$lbl.dirs" "$WORKDIR/p76_d1d_sg_$lbl.dirs"
+}
+
+# a/b/c: prunes a/b/ and a/ on both the refs and logs side.
+p76_d1d_check "abc-loose" 'git branch a/b/c' branch -d a/b/c
+# a/b/c with a sibling a/x: only a/b/ is pruned, a/ survives (non-empty).
+p76_d1d_check "abc-sibling" 'git branch a/b/c && git branch a/x' branch -d a/b/c
+# heads/x with an UNRELATED empty refs/heads/e/ present: e/ must survive untouched.
+p76_d1d_check "heads-x-unrelated-e" 'git branch heads/x && mkdir -p .git/refs/heads/e' branch -d heads/x
+# a/b/c with an empty SUBDIRECTORY a/b/z/: refs side keeps a/b/ (and a/,
+# since it is not empty either) because git does not recurse into an
+# empty CHILD; logs side has no such child and prunes normally -- the
+# two chains diverging is the whole point of pruning them independently.
+p76_d1d_check "abc-empty-subdir" 'git branch a/b/c && mkdir -p .git/refs/heads/a/b/z' branch -d a/b/c
+# packed-only p/q: only the logs chain has anything to prune (no loose
+# ref directory exists at all for a packed-only name).
+p76_d1d_check "packed-only-pq" 'git branch p/q && git pack-refs --all' branch -d p/q
+# tag t1/t2: same shared engine, refs/tags/ this time.
+p76_d1d_check "tag-t1-t2" 'git tag t1/t2' tag -d t1/t2
+
+# --- Phase 76 fix round 4 (R3-4, HIGH -- a regression of SHIPPED master
+# behavior): sg_ref_lock_try used to hold every acquired lock's fd open
+# until the whole batch's loop finished (cli/ref_delete.c's own `locks[]`
+# array). With the platform default RLIMIT_NOFILE (256 on macOS), deleting
+# more than ~253 names in one invocation exhausted file descriptors and
+# failed the WHOLE batch -- master (which closed each fd right after
+# acquiring) and real git both delete all of them. The gate environment's
+# own limit is 1048576, so no existing gate could ever see this; the pin
+# below declares `ulimit -n 256` explicitly, in a subshell, for the sg
+# call only (git gets the SAME explicit limit too, so this is an
+# apples-to-apples comparison, not "git gets unlimited fds and sg
+# doesn't").
+P76_FD_N=400
+P76_FD_GIT="$WORKDIR/phase76_fd_git"; P76_FD_SG="$WORKDIR/phase76_fd_sg"
+rm -rf "$P76_FD_GIT" "$P76_FD_SG"
+mkdir -p "$P76_FD_GIT"
+git init -q -b master "$P76_FD_GIT" > /dev/null 2>&1
+(cd "$P76_FD_GIT" && git config user.email "p76fd@example.com" && git config user.name "p76 fd") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P76_FD_GIT/x.txt"
+(cd "$P76_FD_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700004000 +0000" \
+    GIT_COMMITTER_DATE="@1700004000 +0000" git commit -q -m c1) > /dev/null 2>&1
+P76_FD_NAMES=""
+i=0
+while [ "$i" -lt "$P76_FD_N" ]; do
+    P76_FD_NAMES="$P76_FD_NAMES fdbranch$i"
+    (cd "$P76_FD_GIT" && git branch "fdbranch$i") > /dev/null 2>&1
+    i=$((i + 1))
+done
+cp -R "$P76_FD_GIT" "$P76_FD_SG"
+(cd "$P76_FD_GIT" && ulimit -n 256 && LC_ALL=C git branch -D $P76_FD_NAMES) \
+    > "$WORKDIR/p76_fd_git.out" 2>&1
+P76_FD_GIT_RC=$?
+(cd "$P76_FD_SG" && ulimit -n 256 && "$SG" branch -D $P76_FD_NAMES) \
+    > "$WORKDIR/p76_fd_sg.out" 2>&1
+P76_FD_SG_RC=$?
+check "phase76 R3-4 (branch -D x$P76_FD_N under ulimit -n 256) oracle: precondition -- git deletes all $P76_FD_N (exit 0)" \
+    test "$P76_FD_GIT_RC" = 0
+check "phase76 R3-4: sg ALSO deletes all $P76_FD_N under the SAME fd limit (exit 0, not 'Too many open files')" \
+    test "$P76_FD_SG_RC" = 0
+check "phase76 R3-4: sg's stdout line count equals git's (both report every deletion)" \
+    test "$(wc -l < "$WORKDIR/p76_fd_sg.out")" = "$(wc -l < "$WORKDIR/p76_fd_git.out")"
+check "phase76 R3-4: no branch survives on either side" \
+    sh -c "test \"\$(cd '$P76_FD_GIT' && git for-each-ref 'refs/heads/fdbranch*' | grep -c .)\" = 0 && \
+           test \"\$(cd '$P76_FD_SG' && git for-each-ref 'refs/heads/fdbranch*' | grep -c .)\" = 0"
+
+# Same regression, same fix, for `sg tag -d` -- the ORIGINALLY shipped
+# command this broke (branch -D didn't exist before this phase at all).
+P76_FDT_GIT="$WORKDIR/phase76_fdt_git"; P76_FDT_SG="$WORKDIR/phase76_fdt_sg"
+rm -rf "$P76_FDT_GIT" "$P76_FDT_SG"
+mkdir -p "$P76_FDT_GIT"
+git init -q -b master "$P76_FDT_GIT" > /dev/null 2>&1
+(cd "$P76_FDT_GIT" && git config user.email "p76fdt@example.com" && git config user.name "p76 fdt") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P76_FDT_GIT/x.txt"
+(cd "$P76_FDT_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700004100 +0000" \
+    GIT_COMMITTER_DATE="@1700004100 +0000" git commit -q -m c1) > /dev/null 2>&1
+P76_FDT_NAMES=""
+i=0
+while [ "$i" -lt "$P76_FD_N" ]; do
+    P76_FDT_NAMES="$P76_FDT_NAMES fdtag$i"
+    (cd "$P76_FDT_GIT" && git tag "fdtag$i") > /dev/null 2>&1
+    i=$((i + 1))
+done
+cp -R "$P76_FDT_GIT" "$P76_FDT_SG"
+(cd "$P76_FDT_GIT" && ulimit -n 256 && LC_ALL=C git tag -d $P76_FDT_NAMES) \
+    > "$WORKDIR/p76_fdt_git.out" 2>&1
+P76_FDT_GIT_RC=$?
+(cd "$P76_FDT_SG" && ulimit -n 256 && "$SG" tag -d $P76_FDT_NAMES) \
+    > "$WORKDIR/p76_fdt_sg.out" 2>&1
+P76_FDT_SG_RC=$?
+check "phase76 R3-4 (tag -d x$P76_FD_N under ulimit -n 256) oracle: precondition -- git deletes all $P76_FD_N (exit 0)" \
+    test "$P76_FDT_GIT_RC" = 0
+check "phase76 R3-4: sg tag -d ALSO deletes all $P76_FD_N under the SAME fd limit (exit 0, not 'Too many open files')" \
+    test "$P76_FDT_SG_RC" = 0
+check "phase76 R3-4: sg tag -d's stdout line count equals git's" \
+    test "$(wc -l < "$WORKDIR/p76_fdt_sg.out")" = "$(wc -l < "$WORKDIR/p76_fdt_git.out")"
+
+# --- Phase 76 fix round 5 (P1/R4-1, HIGH -- a SHIPPED, pre-existing
+# destructive bug): a path-spelled name ("./merged", ".//topic",
+# "heads/./x") let the delete engine's raw-argv filesystem calls resolve
+# to a DIFFERENT ref than the one git says by that exact spelling --
+# `sg tag -d ./lt` and `sg branch -d ./merged` DELETED a real ref git
+# refuses to touch at all. Fixed with one gate at the top of
+# sg_ref_delete_batch's pass 1, before any filesystem call. Pins below
+# compare rc + stderr bytes + refs + the refs/logs directory tree, loose
+# AND packed, for every P1 row and both `tag -d` and `branch -d`/`-D`.
+p76_p1_check() {
+    # $1 = label, $2 = "loose"|"packed", $3.. = branch/tag argv
+    lbl="$1"; kind="$2"; shift 2
+    gdir="$WORKDIR/phase76_p1_git_$lbl"; sdir="$WORKDIR/phase76_p1_sg_$lbl"
+    rm -rf "$gdir" "$sdir"
+    mkdir -p "$gdir"
+    git init -q -b master "$gdir" > /dev/null 2>&1
+    (cd "$gdir" && git config user.email "p76p1@example.com" && git config user.name "p76 p1") \
+        > /dev/null 2>&1
+    printf 'v1\n' > "$gdir/f.txt"
+    (cd "$gdir" && git add f.txt && GIT_AUTHOR_DATE="@1700006000 +0000" \
+        GIT_COMMITTER_DATE="@1700006000 +0000" git commit -q -m c1) > /dev/null 2>&1
+    (cd "$gdir" && git branch merged && git tag lt && git branch heads/x) > /dev/null 2>&1
+    if [ "$kind" = "packed" ]; then
+        (cd "$gdir" && git pack-refs --all) > /dev/null 2>&1
+    fi
+    cp -R "$gdir" "$sdir"
+    gout="$WORKDIR/p76_p1_git_$lbl.out"; sout="$WORKDIR/p76_p1_sg_$lbl.out"
+    (cd "$gdir" && LC_ALL=C git "$@") > "$gout" 2>&1; grc=$?
+    (cd "$sdir" && "$SG" "$@") > "$sout" 2>&1; src=$?
+    check "phase76 P1 ($lbl) oracle: precondition -- git refuses (does not resolve the path-spelled name)" \
+        sh -c "test '$grc' != 0"
+    check "phase76 P1 ($lbl): sg refuses too (exit 1)" \
+        test "$src" = 1
+    p74_norm_eexist_msg "$gout" "$gdir" > "$gout.norm"
+    p74_norm_eexist_msg "$sout" "$sdir" > "$sout.norm"
+    check "phase76 P1 ($lbl): sg's stderr matches git's byte-for-byte" \
+        cmp -s "$gout.norm" "$sout.norm"
+    (cd "$gdir" && git for-each-ref --format='%(refname) %(objectname)') | sort > "$WORKDIR/p76_p1_git_$lbl.refs"
+    (cd "$sdir" && git for-each-ref --format='%(refname) %(objectname)') | sort > "$WORKDIR/p76_p1_sg_$lbl.refs"
+    check "phase76 P1 ($lbl): sg's refs listing is BYTE-IDENTICAL to git's (the targeted ref SURVIVES)" \
+        cmp -s "$WORKDIR/p76_p1_git_$lbl.refs" "$WORKDIR/p76_p1_sg_$lbl.refs"
+    (cd "$gdir" && find .git/refs .git/logs -type d | sort) > "$WORKDIR/p76_p1_git_$lbl.dirs"
+    (cd "$sdir" && find .git/refs .git/logs -type d | sort) > "$WORKDIR/p76_p1_sg_$lbl.dirs"
+    check "phase76 P1 ($lbl): sg's refs/logs directory tree is BYTE-IDENTICAL to git's (no directory touched)" \
+        cmp -s "$WORKDIR/p76_p1_git_$lbl.dirs" "$WORKDIR/p76_p1_sg_$lbl.dirs"
+}
+
+for p76_p1_kind in loose packed; do
+    p76_p1_check "branch-d-dotslash-merged-$p76_p1_kind" "$p76_p1_kind" branch -d ./merged
+    p76_p1_check "tag-d-dotslash-lt-$p76_p1_kind" "$p76_p1_kind" tag -d ./lt
+    p76_p1_check "branch-D-dotslash-merged-$p76_p1_kind" "$p76_p1_kind" branch -D ./merged
+    p76_p1_check "branch-D-dot-emptycomponent-merged-$p76_p1_kind" "$p76_p1_kind" branch -D .//merged
+    p76_p1_check "branch-D-heads-dot-x-$p76_p1_kind" "$p76_p1_kind" branch -D heads/./x
+done
+
+# The create path already rejects these spellings via
+# sg_ref_name_valid_for_create -- confirm it stays that way (unrelated
+# code path from the delete-side fix above, but the P1 spec asked for
+# both directions to be checked).
+P76_P1_CREATE="$WORKDIR/phase76_p1_create"
+rm -rf "$P76_P1_CREATE"
+mkdir -p "$P76_P1_CREATE"
+(cd "$WORKDIR" && "$SG" init phase76_p1_create) > /dev/null 2>&1
+(cd "$P76_P1_CREATE" && printf 'v1\n' > f.txt && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+(cd "$P76_P1_CREATE" && "$SG" branch ./new) > /dev/null 2>&1
+check "phase76 P1: 'sg branch ./new' is already rejected by sg_ref_name_valid_for_create" \
+    test $? = 1
+(cd "$P76_P1_CREATE" && "$SG" tag ./newtag) > /dev/null 2>&1
+check "phase76 P1: 'sg tag ./newtag' is already rejected the same way" \
+    test $? = 1
+
+# R4-1's own discriminator: the ONLY fixture shape that actually tells
+# "a name gate ran first" apart from "the probe tried and failed closed
+# for an unrelated reason" -- a read-only PARENT directory of the escape
+# target (planting a directory AT the target does not discriminate: an
+# existing path of any kind returns EEXIST before anything about
+# permissions is even checked, so "not found" comes out identical either
+# way -- see docs/DESIGN.md's own note on why that fixture shape was
+# rejected). With the parent read-only, an attempted O_CREAT fails with
+# EACCES; a gate that runs BEFORE any filesystem call never reaches it.
+# Phase 76 fix round 6 (F4): as root, permission bits do not block a
+# write at all, so chmod 0555 on the parent below would NOT produce
+# EACCES -- the check would silently stop discriminating (it would pass
+# regardless of whether the gate runs) rather than fail loudly or skip
+# honestly. GitHub's own runners are not root, so this changes nothing
+# about CI's actual behavior; it only keeps the check's meaning honest
+# in any environment (including a local root run) where it would
+# otherwise lie.
+if [ "$(id -u)" = "0" ]; then
+    skip "phase76 R4-1 (read-only-parent discriminator): running as root -- permission bits do not block root's writes, so this check cannot discriminate"
+else
+    P76_R41_RO="$WORKDIR/phase76_r41_ro_parent"
+    rm -rf "$P76_R41_RO"
+    mkdir -p "$P76_R41_RO"
+    P76_R41_REPO="$WORKDIR/phase76_r41_repo"
+    rm -rf "$P76_R41_REPO"
+    mkdir -p "$P76_R41_REPO"
+    (cd "$WORKDIR" && "$SG" init phase76_r41_repo) > /dev/null 2>&1
+    (cd "$P76_R41_REPO" && printf 'v1\n' > f.txt && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+    chmod 0555 "$P76_R41_RO"
+    (cd "$P76_R41_REPO" && "$SG" branch -d "../../../../phase76_r41_ro_parent/pwn") \
+        > "$P76_OUT" 2>&1
+    P76_R41_RC=$?
+    chmod 0755 "$P76_R41_RO"
+    check "phase76 R4-1 (read-only-parent discriminator): sg exits 1" \
+        test "$P76_R41_RC" = 1
+    check "phase76 R4-1: sg's message is the ORDINARY not-found wording, NOT 'out of memory' (proves the gate ran before any filesystem call)" \
+        sh -c "grep -q 'not found' '$P76_OUT' && ! grep -q 'out of memory' '$P76_OUT'"
+    check "phase76 R4-1: no file was created outside the repository" \
+        test ! -e "$P76_R41_RO/pwn"
+fi
+
+# --- reviewer round 1, item 3: coverage gaps -- EEXIST raw wording ------
+# git-vs-sg, singular (one stale lock, one existing name) and plural (two
+# existing names, only one holding the stale lock) -- the same shape
+# case2n/case2n2 pin for TAG, now for BRANCH, proving the wording really
+# is shared rather than merely asserted shared in a comment.
+P76_EEX_GIT="$WORKDIR/phase76_eex_git"
+P76_EEX_SG="$WORKDIR/phase76_eex_sg"
+rm -rf "$P76_EEX_GIT" "$P76_EEX_SG"
+mkdir -p "$P76_EEX_GIT"
+git init -q -b master "$P76_EEX_GIT" > /dev/null 2>&1
+(cd "$P76_EEX_GIT" && git config user.email "p76@example.com" && git config user.name "p76 tester") \
+    > /dev/null 2>&1
+printf 'x\n' > "$P76_EEX_GIT/x.txt"
+(cd "$P76_EEX_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700000900 +0000" \
+    GIT_COMMITTER_DATE="@1700000900 +0000" git commit -q -m c1) > /dev/null 2>&1
+(cd "$P76_EEX_GIT" && git branch foo) > /dev/null 2>&1
+touch "$P76_EEX_GIT/.git/refs/heads/foo.lock"
+cp -R "$P76_EEX_GIT" "$P76_EEX_SG"
+(cd "$P76_EEX_GIT" && LC_ALL=C git branch -d foo) > "$WORKDIR/p76_eex_git.out" 2>&1
+(cd "$P76_EEX_SG" && "$SG" branch -d foo) > "$WORKDIR/p76_eex_sg.out" 2>&1
+# Reviewer round 1, item R3: a precondition BEFORE the byte comparison --
+# two empty files `cmp` equal (this exact file's own p74_norm_eexist_msg
+# incident, see docs/DESIGN.md's Phase 76 round-1 section), so the
+# comparison below is only meaningful once both raw captures are proven
+# non-empty and actually contain the collision text, same shape as
+# case2j/case2n's own oracle precondition.
+check "phase76 delete EEXIST (singular) oracle: precondition -- git's raw capture is non-empty and names the lock collision" \
+    sh -c "test -s '$WORKDIR/p76_eex_git.out' && grep -q 'cannot lock ref' '$WORKDIR/p76_eex_git.out'"
+check "phase76 delete EEXIST (singular): sg's raw capture is ALSO non-empty (not silently comparing two empty files)" \
+    test -s "$WORKDIR/p76_eex_sg.out"
+p74_norm_eexist_msg "$WORKDIR/p76_eex_git.out" "$P76_EEX_GIT" > "$WORKDIR/p76_eex_git.norm"
+p74_norm_eexist_msg "$WORKDIR/p76_eex_sg.out" "$P76_EEX_SG" > "$WORKDIR/p76_eex_sg.norm"
+check "phase76 delete EEXIST (singular, foreign stale lock): sg matches git's raw wording byte-for-byte" \
+    cmp -s "$WORKDIR/p76_eex_git.norm" "$WORKDIR/p76_eex_sg.norm"
+check "phase76 delete EEXIST: foo survives the refusal on both sides" \
+    sh -c "(cd '$P76_EEX_GIT' && git rev-parse --verify refs/heads/foo) > /dev/null 2>&1 && \
+           (cd '$P76_EEX_SG' && git rev-parse --verify refs/heads/foo) > /dev/null 2>&1"
+
+P76_EEX2_GIT="$WORKDIR/phase76_eex2_git"
+P76_EEX2_SG="$WORKDIR/phase76_eex2_sg"
+rm -rf "$P76_EEX2_GIT" "$P76_EEX2_SG"
+cp -R "$P76_EEX_GIT" "$P76_EEX2_GIT"
+(cd "$P76_EEX2_GIT" && git branch bar) > /dev/null 2>&1
+cp -R "$P76_EEX2_GIT" "$P76_EEX2_SG"
+(cd "$P76_EEX2_GIT" && LC_ALL=C git branch -d foo bar) > "$WORKDIR/p76_eex2_git.out" 2>&1
+(cd "$P76_EEX2_SG" && "$SG" branch -d foo bar) > "$WORKDIR/p76_eex2_sg.out" 2>&1
+check "phase76 delete EEXIST (plural) oracle: precondition -- git's raw capture is non-empty and names the lock collision" \
+    sh -c "test -s '$WORKDIR/p76_eex2_git.out' && grep -q 'cannot lock ref' '$WORKDIR/p76_eex2_git.out'"
+check "phase76 delete EEXIST (plural): sg's raw capture is ALSO non-empty" \
+    test -s "$WORKDIR/p76_eex2_sg.out"
+p74_norm_eexist_msg "$WORKDIR/p76_eex2_git.out" "$P76_EEX2_GIT" > "$WORKDIR/p76_eex2_git.norm"
+p74_norm_eexist_msg "$WORKDIR/p76_eex2_sg.out" "$P76_EEX2_SG" > "$WORKDIR/p76_eex2_sg.norm"
+check "phase76 delete EEXIST (plural, one of two names holds the stale lock): sg matches git's raw wording byte-for-byte" \
+    cmp -s "$WORKDIR/p76_eex2_git.norm" "$WORKDIR/p76_eex2_sg.norm"
+check "phase76 delete EEXIST plural: both foo and bar survive the whole-batch refusal" \
+    sh -c "(cd '$P76_EEX2_SG' && git rev-parse --verify refs/heads/foo) > /dev/null 2>&1 && \
+           (cd '$P76_EEX2_SG' && git rev-parse --verify refs/heads/bar) > /dev/null 2>&1"
+
+# --- reviewer round 1, item 3: in-batch literal duplicate refusal -------
+(cd "$P76_SG_REPO" && "$SG" branch dup1) > /dev/null 2>&1
+(cd "$P76_SG_REPO" && "$SG" branch -d dup1 dup1) > "$P76_OUT" 2>&1
+check "phase76 delete: 'sg branch -d X X' (literal duplicate) refuses the whole batch" \
+    sh -c "test $? = 1 && grep -q \"multiple updates for ref 'refs/heads/dup1' not allowed\" '$P76_OUT'"
+check "phase76 delete: ...and dup1 was NOT deleted" \
+    test -f "$P76_SG_REPO/.git/refs/heads/dup1"
+
+# --- reviewer round 1, item 3: D/F conflict with a PACKED blocker -------
+P76_DFP="$WORKDIR/phase76_df_packed"
+rm -rf "$P76_DFP"
+mkdir -p "$P76_DFP"
+git init -q -b master "$P76_DFP" > /dev/null 2>&1
+(cd "$P76_DFP" && git config user.email a@x && git config user.name A) > /dev/null 2>&1
+printf 'x\n' > "$P76_DFP/x.txt"
+(cd "$P76_DFP" && git add x.txt && GIT_AUTHOR_DATE="@1700001000 +0000" \
+    GIT_COMMITTER_DATE="@1700001000 +0000" git commit -q -m c1) > /dev/null 2>&1
+(cd "$P76_DFP" && git branch packedparent && git branch nestedX/leaf && git pack-refs --all) \
+    > /dev/null 2>&1
+(cd "$P76_DFP" && "$SG" branch packedparent/child) > "$P76_OUT" 2>&1
+check "phase76 create: D/F conflict, forward direction, PACKED-ONLY blocker uses the packed wording (no 'cannot lock ref')" \
+    sh -c "test $? = 1 && \
+           grep -qx \"sg: 'refs/heads/packedparent' exists; cannot create 'refs/heads/packedparent/child'\" '$P76_OUT' && \
+           ! grep -q 'cannot lock ref' '$P76_OUT'"
+(cd "$P76_DFP" && "$SG" branch nestedX) > "$P76_OUT" 2>&1
+check "phase76 create: D/F conflict, reverse direction, PACKED-ONLY blocker uses the packed wording (no 'cannot lock ref')" \
+    sh -c "test $? = 1 && \
+           grep -qx \"sg: 'refs/heads/nestedX/leaf' exists; cannot create 'refs/heads/nestedX'\" '$P76_OUT' && \
+           ! grep -q 'cannot lock ref' '$P76_OUT'"
+
+# --- reviewer round 1, item 3: detached HEAD -----------------------------
+P76_DET="$WORKDIR/phase76_detached"
+rm -rf "$P76_DET"
+mkdir -p "$P76_DET"
+(cd "$WORKDIR" && "$SG" init phase76_detached) > /dev/null 2>&1
+(cd "$P76_DET" && printf 'v1\n' > f.txt && "$SG" add f.txt && "$SG" commit -m c1) > /dev/null 2>&1
+(cd "$P76_DET" && printf 'v2\n' > f.txt && "$SG" add f.txt && "$SG" commit -m c2) > /dev/null 2>&1
+P76_DET_HEAD=$(cd "$P76_DET" && git rev-parse HEAD)
+(cd "$P76_DET" && git switch -q --detach HEAD) > /dev/null 2>&1
+(cd "$P76_DET" && "$SG" branch fromdetached) > /dev/null 2>&1
+check "phase76 create (detached HEAD): resolves to HEAD's commit" \
+    test "$(cd "$P76_DET" && git rev-parse fromdetached)" = "$P76_DET_HEAD"
+check "phase76 create (detached HEAD): no start point defaults to HEAD, reflog says 'Created from HEAD' (no branch name to fall back to)" \
+    grep -q "branch: Created from HEAD$" "$P76_DET/.git/logs/refs/heads/fromdetached"
+P76_DET_PARENT=$(cd "$P76_DET" && git rev-parse HEAD~1)
+(cd "$P76_DET" && "$SG" branch -f master HEAD~1) > "$P76_OUT" 2>&1
+check "phase76 create -f (detached HEAD): -f on 'master' is allowed while HEAD is DETACHED (master is not the checked-out branch, HEAD is a raw commit id)" \
+    test $? = 0
+check "phase76 create -f (detached HEAD): master actually moved to HEAD~1" \
+    test "$(cd "$P76_DET" && git rev-parse master)" = "$P76_DET_PARENT"
+check "phase76 create -f (detached HEAD): reflog records 'Reset to HEAD~1', not 'Created from'" \
+    sh -c "tail -1 '$P76_DET/.git/logs/refs/heads/master' | grep -q 'branch: Reset to HEAD~1'"
+
+# --- reviewer round 1, item 3: unborn HEAD --------------------------------
+P76_UNBORN="$WORKDIR/phase76_unborn"
+rm -rf "$P76_UNBORN"
+mkdir -p "$P76_UNBORN"
+(cd "$WORKDIR" && "$SG" init phase76_unborn) > /dev/null 2>&1
+(cd "$P76_UNBORN" && "$SG" branch new) > "$P76_OUT" 2>&1
+check "phase76 create (unborn HEAD): no start point names the CURRENT BRANCH, not the literal HEAD" \
+    sh -c "test $? = 1 && grep -q \"not a valid object name: 'master'\" '$P76_OUT'"
+(cd "$P76_UNBORN" && "$SG" branch -d master) > "$P76_OUT" 2>&1
+check "phase76 delete (unborn HEAD): -d on the checked-out (never-committed) branch is the WORKTREE refusal, not 'not found'" \
+    sh -c "test $? = 1 && grep -q 'used by worktree' '$P76_OUT' && ! grep -q 'not found' '$P76_OUT'"
+
+# --- Phase 76 fix round 2: deliberate divergence #10 interop pins (R1) --
+# Round 1 shipped `branch_aliases_current` (cmd_branch.c) but added NO
+# interop coverage for it at all -- confirmed empirically by the main
+# conversation's mutation battery, M3 (drop the alias probe at create -f)
+# and M4 (drop it at the delete precheck) both stayed FULLY GREEN. Every
+# check below is new in round 2. skip()'d entirely on a case-sensitive
+# filesystem, where "Master" and "master" are two distinct branches and
+# none of this divergence is reachable.
+if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
+    mk_p76_alias_repo() {
+        # $1 = path -- two commits on master, HEAD checked out on master.
+        mkdir -p "$1"
+        git init -q -b master "$1" > /dev/null 2>&1
+        # Phase 76 fix round 8 (T1): quiescent, same reasoning and same
+        # measurement as p76_lockcreate_check's own note above (22/40 trials
+        # saw .git/objects/maintenance.lock with default config, 0/40 with
+        # these two disabled) -- this fixture is byte-compared against an
+        # "untouched" copy later, and a background maintenance lock file
+        # would be indistinguishable from a real leak to a scan that is not
+        # scoped to refs/.
+        (cd "$1" && git config maintenance.auto false && git config gc.auto 0) \
+            > /dev/null 2>&1
+        (cd "$1" && git config user.email "p76align@example.com" && git config user.name "p76 alias") \
+            > /dev/null 2>&1
+        printf 'x\n' > "$1/x.txt"
+        (cd "$1" && git add x.txt && GIT_AUTHOR_DATE="@1700002000 +0000" \
+            GIT_COMMITTER_DATE="@1700002000 +0000" git commit -q -m c1) > /dev/null 2>&1
+        printf 'y\n' > "$1/x.txt"
+        (cd "$1" && git add x.txt && GIT_AUTHOR_DATE="@1700002100 +0000" \
+            GIT_COMMITTER_DATE="@1700002100 +0000" git commit -q -m c2) > /dev/null 2>&1
+    }
+
+    # K2: SEPARATE assertions, one per side, from three different cwd
+    # contexts -- (a) the repo root, (b) a subdirectory, (c) cwd reached
+    # through a symlink to the repo root. This is NOT a git-vs-sg byte
+    # comparison (unlike the EEXIST checks above): real git does not
+    # print ANY message here at all (it exits 0 and silently does the
+    # dangerous thing -- that is the whole premise of the divergence), so
+    # the git side gets its own precondition (exit 0, ref actually gone or
+    # moved) and the sg side gets a literal-expected-string assertion
+    # (the exact wording `cmd_branch.c` prints, path substituted from a
+    # `pwd -P` computed independently of sg). $WORKDIR itself already
+    # comes from `mktemp -d` under macOS's /var -> /private/var symlink,
+    # so (a)/(b) here already exercise realpath resolution on this
+    # machine; (c) is what exercises it on a filesystem where $WORKDIR
+    # itself is not behind a symlink (e.g. Linux CI) -- all three run
+    # unconditionally, none skip, so CI's case-sensitive-Linux run is
+    # expected to skip this WHOLE block (no case-folding there), not to
+    # silently drop just the realpath cell.
+    p76_alias_check() {
+        # $1 = label, $2 = sg repo dir, $3 = cwd (git side), $4 = cwd (sg
+        # side), $5 = kind ("delete" or "force"), $6.. = branch argv
+        lbl="$1"; sdir="$2"; gcwd="$3"; scwd="$4"; kind="$5"
+        shift 5
+        gout="$WORKDIR/p76_alias_git_$lbl.out"
+        sout="$WORKDIR/p76_alias_sg_$lbl.out"
+        # Captured BEFORE running the command: for "force", HEAD moves
+        # onto the SAME ref this command just retargeted (master), so
+        # asking "HEAD~1" again AFTER the move answers a different
+        # question than it did before.
+        expect_parent=$(cd "$gcwd" && git rev-parse HEAD~1)
+        (cd "$gcwd" && LC_ALL=C git branch "$@") > "$gout" 2>&1
+        grc=$?
+        (cd "$scwd" && "$SG" branch "$@") > "$sout" 2>&1
+        src=$?
+        check "phase76 divergence #10 ($lbl) oracle: precondition -- real git ACTUALLY performs the dangerous op under the aliased spelling (exit 0)" \
+            test "$grc" = 0
+        if [ "$kind" = "delete" ]; then
+            check "phase76 divergence #10 ($lbl) oracle: precondition -- git's checked-out ref is actually GONE afterward" \
+                sh -c "! (cd '$gcwd' && git rev-parse --verify refs/heads/master) > /dev/null 2>&1"
+        else
+            check "phase76 divergence #10 ($lbl) oracle: precondition -- git's checked-out ref actually MOVED afterward" \
+                test "$(cd "$gcwd" && git rev-parse master)" = "$expect_parent"
+        fi
+        check "phase76 divergence #10 ($lbl): sg refuses instead (exit 1)" \
+            test "$src" = 1
+        real=$(cd "$sdir" && pwd -P)
+        if [ "$kind" = "delete" ]; then
+            expect="sg: cannot delete branch 'Master' used by worktree at '$real'"
+        else
+            expect="sg: cannot force update the branch 'Master' used by worktree at '$real'"
+        fi
+        check "phase76 divergence #10 ($lbl): sg's FULL refusal line (path included) matches the expected literal" \
+            test "$(cat "$sout")" = "$expect"
+    }
+
+    # -d Master, from all three cwd contexts.
+    P76_AL_D_A_GIT="$WORKDIR/phase76_alias_d_a_git"; P76_AL_D_A_SG="$WORKDIR/phase76_alias_d_a_sg"
+    rm -rf "$P76_AL_D_A_GIT" "$P76_AL_D_A_SG"
+    mk_p76_alias_repo "$P76_AL_D_A_GIT"; cp -R "$P76_AL_D_A_GIT" "$P76_AL_D_A_SG"
+    p76_alias_check "d-root" "$P76_AL_D_A_SG" "$P76_AL_D_A_GIT" "$P76_AL_D_A_SG" delete -d Master
+
+    P76_AL_D_B_GIT="$WORKDIR/phase76_alias_d_b_git"; P76_AL_D_B_SG="$WORKDIR/phase76_alias_d_b_sg"
+    rm -rf "$P76_AL_D_B_GIT" "$P76_AL_D_B_SG"
+    mk_p76_alias_repo "$P76_AL_D_B_GIT"; mkdir -p "$P76_AL_D_B_GIT/sub"; cp -R "$P76_AL_D_B_GIT" "$P76_AL_D_B_SG"
+    p76_alias_check "d-subdir" "$P76_AL_D_B_SG" "$P76_AL_D_B_GIT/sub" "$P76_AL_D_B_SG/sub" delete -d Master
+
+    P76_AL_D_C_REAL_GIT="$WORKDIR/phase76_alias_d_c_real_git"; P76_AL_D_C_REAL_SG="$WORKDIR/phase76_alias_d_c_real_sg"
+    P76_AL_D_C_LINK_GIT="$WORKDIR/phase76_alias_d_c_link_git"; P76_AL_D_C_LINK_SG="$WORKDIR/phase76_alias_d_c_link_sg"
+    rm -rf "$P76_AL_D_C_REAL_GIT" "$P76_AL_D_C_REAL_SG" "$P76_AL_D_C_LINK_GIT" "$P76_AL_D_C_LINK_SG"
+    mk_p76_alias_repo "$P76_AL_D_C_REAL_GIT"; cp -R "$P76_AL_D_C_REAL_GIT" "$P76_AL_D_C_REAL_SG"
+    ln -s "$P76_AL_D_C_REAL_GIT" "$P76_AL_D_C_LINK_GIT"; ln -s "$P76_AL_D_C_REAL_SG" "$P76_AL_D_C_LINK_SG"
+    p76_alias_check "d-symlink" "$P76_AL_D_C_REAL_SG" "$P76_AL_D_C_LINK_GIT" "$P76_AL_D_C_LINK_SG" delete -d Master
+
+    # -f Master HEAD~1, from all three cwd contexts (same shape as -d above).
+    P76_AL_F_A_GIT="$WORKDIR/phase76_alias_f_a_git"; P76_AL_F_A_SG="$WORKDIR/phase76_alias_f_a_sg"
+    rm -rf "$P76_AL_F_A_GIT" "$P76_AL_F_A_SG"
+    mk_p76_alias_repo "$P76_AL_F_A_GIT"; cp -R "$P76_AL_F_A_GIT" "$P76_AL_F_A_SG"
+    p76_alias_check "f-root" "$P76_AL_F_A_SG" "$P76_AL_F_A_GIT" "$P76_AL_F_A_SG" force -f Master HEAD~1
+
+    P76_AL_F_B_GIT="$WORKDIR/phase76_alias_f_b_git"; P76_AL_F_B_SG="$WORKDIR/phase76_alias_f_b_sg"
+    rm -rf "$P76_AL_F_B_GIT" "$P76_AL_F_B_SG"
+    mk_p76_alias_repo "$P76_AL_F_B_GIT"; mkdir -p "$P76_AL_F_B_GIT/sub"; cp -R "$P76_AL_F_B_GIT" "$P76_AL_F_B_SG"
+    p76_alias_check "f-subdir" "$P76_AL_F_B_SG" "$P76_AL_F_B_GIT/sub" "$P76_AL_F_B_SG/sub" force -f Master HEAD~1
+
+    P76_AL_F_C_REAL_GIT="$WORKDIR/phase76_alias_f_c_real_git"; P76_AL_F_C_REAL_SG="$WORKDIR/phase76_alias_f_c_real_sg"
+    P76_AL_F_C_LINK_GIT="$WORKDIR/phase76_alias_f_c_link_git"; P76_AL_F_C_LINK_SG="$WORKDIR/phase76_alias_f_c_link_sg"
+    rm -rf "$P76_AL_F_C_REAL_GIT" "$P76_AL_F_C_REAL_SG" "$P76_AL_F_C_LINK_GIT" "$P76_AL_F_C_LINK_SG"
+    mk_p76_alias_repo "$P76_AL_F_C_REAL_GIT"; cp -R "$P76_AL_F_C_REAL_GIT" "$P76_AL_F_C_REAL_SG"
+    ln -s "$P76_AL_F_C_REAL_GIT" "$P76_AL_F_C_LINK_GIT"; ln -s "$P76_AL_F_C_REAL_SG" "$P76_AL_F_C_LINK_SG"
+    p76_alias_check "f-symlink" "$P76_AL_F_C_REAL_SG" "$P76_AL_F_C_LINK_GIT" "$P76_AL_F_C_LINK_SG" force -f Master HEAD~1
+
+    # -D Master (root only -- -D shares the exact same delete precheck as
+    # -d, already fully exercised above; this only needs to confirm -D
+    # doesn't bypass it).
+    P76_AL_BD_GIT="$WORKDIR/phase76_alias_bigd_git"; P76_AL_BD_SG="$WORKDIR/phase76_alias_bigd_sg"
+    rm -rf "$P76_AL_BD_GIT" "$P76_AL_BD_SG"
+    mk_p76_alias_repo "$P76_AL_BD_GIT"; cp -R "$P76_AL_BD_GIT" "$P76_AL_BD_SG"
+    p76_alias_check "D-root" "$P76_AL_BD_SG" "$P76_AL_BD_GIT" "$P76_AL_BD_SG" delete -D Master
+
+    # (Each p76_alias_check call above already asserts git's own exit-0
+    # precondition per cwd/command combination -- 7 independent
+    # confirmations that real git actually performs the dangerous op, not
+    # a single shared one.)
+
+    # sg-side outcome assertions (refs/reflog/logs-HEAD untouched, no stale
+    # .lock). Independent fresh copy, untouched by any command, is the
+    # reference value -- comparing against $P76_AL_D_A_GIT's own file is
+    # wrong here, since git ACTUALLY DELETED (or moved) it (that is the
+    # whole point of the precondition above). Reviewer round 2 (R2-4):
+    # this used to check only ONE of the seven alias scenarios (d-root) --
+    # extended to all seven (d-root/d-subdir/d-symlink/D-root/f-root/
+    # f-subdir/f-symlink) so a regression that prints the right refusal
+    # but still writes cannot hide behind an untested cwd/command
+    # combination. logs/HEAD is included too (not just the branch's own
+    # reflog): the reviewer's own finding (round 2 review) is that a
+    # BYPASSED alias write updates the branch's reflog via an exact
+    # strcmp while HEAD's own reflog is untouched, so the two disagree --
+    # after this round's fix both must stay identical to the untouched
+    # pair.
+    P76_AL_UNTOUCHED="$WORKDIR/phase76_alias_untouched"
+    rm -rf "$P76_AL_UNTOUCHED"
+    mk_p76_alias_repo "$P76_AL_UNTOUCHED"
+    for p76_al_scn in \
+        "d-root:$P76_AL_D_A_SG" "d-subdir:$P76_AL_D_B_SG" "d-symlink:$P76_AL_D_C_REAL_SG" \
+        "D-root:$P76_AL_BD_SG" "f-root:$P76_AL_F_A_SG" "f-subdir:$P76_AL_F_B_SG" \
+        "f-symlink:$P76_AL_F_C_REAL_SG"
+    do
+        p76_al_lbl="${p76_al_scn%%:*}"; p76_al_dir="${p76_al_scn#*:}"
+        check "phase76 divergence #10 ($p76_al_lbl): sg's refs/heads/master is BYTE-IDENTICAL to a fresh, never-touched copy" \
+            cmp -s "$P76_AL_UNTOUCHED/.git/refs/heads/master" "$p76_al_dir/.git/refs/heads/master"
+        check "phase76 divergence #10 ($p76_al_lbl): sg's logs/refs/heads/master is BYTE-IDENTICAL to a fresh, never-touched copy" \
+            cmp -s "$P76_AL_UNTOUCHED/.git/logs/refs/heads/master" "$p76_al_dir/.git/logs/refs/heads/master"
+        check "phase76 divergence #10 ($p76_al_lbl): sg's logs/HEAD is BYTE-IDENTICAL to a fresh, never-touched copy" \
+            cmp -s "$P76_AL_UNTOUCHED/.git/logs/HEAD" "$p76_al_dir/.git/logs/HEAD"
+    done
+    # Phase 76 fix round 8 (T1): scoped to the SEVEN sg-side directories
+    # actually run through sg (never the *_git fixtures or the untouched
+    # reference copy) and to .git/refs only (where sg's own locks live) --
+    # scanning all of .git, or the git-side dirs, catches git's own
+    # detached maintenance.lock under .git/objects (mk_p76_alias_repo is
+    # now quiescent for this reason, see its own comment above; this scope
+    # restriction is kept anyway as defense in depth). On failure, print
+    # the actual leftover paths.
+    : > "$WORKDIR/p76_alias_locks.txt"
+    for p76_al_dir in "$P76_AL_D_A_SG" "$P76_AL_D_B_SG" "$P76_AL_D_C_REAL_SG" \
+        "$P76_AL_BD_SG" "$P76_AL_F_A_SG" "$P76_AL_F_B_SG" "$P76_AL_F_C_REAL_SG"
+    do
+        find "$p76_al_dir/.git/refs" -name '*.lock' >> "$WORKDIR/p76_alias_locks.txt" 2>/dev/null
+    done
+    check "phase76 divergence #10: no .lock file under any sg-side .git/refs after the refused -d/-D/-f (all cwd variants)" \
+        sh -c "! grep -q . '$WORKDIR/p76_alias_locks.txt' || { echo 'leftover lock(s):'; cat '$WORKDIR/p76_alias_locks.txt'; false; }"
+
+    # Foreign stale lock on the CURRENT branch's own path must not make
+    # -d Master misfire -- measured (Phase 76 fix round 2): the alias
+    # probe itself cannot safely tell (its own documented "ambiguous,
+    # fall through" case, see branch_aliases_current's comment) and lets
+    # the name through to the ordinary delete pipeline, but the SHARED
+    # ref_delete.c transaction's OWN O_CREAT|O_EXCL lock on
+    # refs/heads/Master.lock then collides with that exact same foreign
+    # file (case-folded to the identical path) and refuses anyway -- a
+    # second, independent safety net, not the alias probe itself. Pinning
+    # the ACTUAL measured behavior, not the mechanism that produces it.
+    P76_AL_STALE="$WORKDIR/phase76_alias_stale"
+    rm -rf "$P76_AL_STALE"
+    mk_p76_alias_repo "$P76_AL_STALE"
+    touch "$P76_AL_STALE/.git/refs/heads/master.lock"
+    (cd "$P76_AL_STALE" && "$SG" branch -d Master) > "$P76_OUT" 2>&1
+    check "phase76 divergence #10 (foreign stale lock on master.lock): -d Master still refuses (exit 1), via the shared lock mechanism's own EEXIST" \
+        sh -c "test $? = 1 && grep -q 'cannot lock ref' '$P76_OUT'"
+    check "phase76 divergence #10 (foreign stale lock): master survives" \
+        test -f "$P76_AL_STALE/.git/refs/heads/master"
+    check "phase76 divergence #10 (foreign stale lock): the FOREIGN lock itself is left exactly as it was (sg never owned it)" \
+        test -e "$P76_AL_STALE/.git/refs/heads/master.lock"
+
+    # K1: the identical alias shape via UNICODE NORMALIZATION (NFD vs NFC)
+    # instead of case -- measured, see docs/DESIGN.md's Phase 76 K1
+    # section: with core.precomposeUnicode explicitly set to false
+    # (declaring the knob, since it changes git's own answer -- see the
+    # oracle-environment rule), an NFD-spelled argv name aliases an
+    # NFC-named checked-out branch on this filesystem the same way a
+    # differently-cased spelling does. Independent probe
+    # (P76_FS_NORMALIZATION_FOLDING): case-folding and
+    # normalization-folding are not the same filesystem property, even
+    # though APFS happens to do both.
+    if [ "$P76_FS_NORMALIZATION_FOLDING" = 1 ]; then
+        P76_NFD_GIT="$WORKDIR/phase76_nfd_git"; P76_NFD_SG="$WORKDIR/phase76_nfd_sg"
+        rm -rf "$P76_NFD_GIT" "$P76_NFD_SG"
+        mkdir -p "$P76_NFD_GIT"
+        git init -q -b "$P76_NFC_NAME" "$P76_NFD_GIT" > /dev/null 2>&1
+        # Phase 76 fix round 8 (T1): quiescent, same 22/40-vs-0/40 measurement
+        # as p76_lockcreate_check's own comment above -- this fixture is
+        # scanned for leftover *.lock files right after a `git commit`.
+        (cd "$P76_NFD_GIT" && git config maintenance.auto false && git config gc.auto 0) \
+            > /dev/null 2>&1
+        (cd "$P76_NFD_GIT" && git config user.email "p76nfd@example.com" && git config user.name "p76 nfd" \
+            && git config core.precomposeUnicode false) > /dev/null 2>&1
+        printf 'x\n' > "$P76_NFD_GIT/x.txt"
+        (cd "$P76_NFD_GIT" && git add x.txt && GIT_AUTHOR_DATE="@1700002200 +0000" \
+            GIT_COMMITTER_DATE="@1700002200 +0000" git commit -q -m c1) > /dev/null 2>&1
+        cp -R "$P76_NFD_GIT" "$P76_NFD_SG"
+        (cd "$P76_NFD_GIT" && LC_ALL=C git branch -d "$P76_NFD_NAME") > "$WORKDIR/p76_nfd_git.out" 2>&1
+        P76_NFD_GIT_RC=$?
+        (cd "$P76_NFD_SG" && "$SG" branch -d "$P76_NFD_NAME") > "$WORKDIR/p76_nfd_sg.out" 2>&1
+        P76_NFD_SG_RC=$?
+        check "phase76 K1 oracle: precondition -- with core.precomposeUnicode=false, real git DELETES the checked-out branch under the NFD spelling (exit 0)" \
+            sh -c "test '$P76_NFD_GIT_RC' = 0 && \
+                   ! (cd '$P76_NFD_GIT' && git rev-parse --verify \"refs/heads/$P76_NFC_NAME\") > /dev/null 2>&1"
+        check "phase76 K1: sg refuses the identical NFD-normalization alias (exit 1)" \
+            test "$P76_NFD_SG_RC" = 1
+        # Reviewer round 2 (R2-5): `test -f .git/refs/heads/<NFC-name>`
+        # passes REGARDLESS of which spelling is actually stored on disk,
+        # because the filesystem folds NFC/NFD lookups to the same file --
+        # it cannot tell "still NFC, untouched" apart from "renamed to
+        # NFD by a regression". Asserting the STORED BYTES instead: the
+        # directory listing of .git/refs/heads must contain exactly the
+        # NFC byte sequence, compared as hex so the check output itself
+        # shows the actual bytes rather than however the terminal/shell
+        # would render an NFD/NFC string identically.
+        P76_NFC_HEX=$(printf '%s' "$P76_NFC_NAME" | od -An -tx1 | tr -d ' \n')
+        P76_NFD_LISTING_HEX=$(ls "$P76_NFD_SG/.git/refs/heads" | od -An -tx1 | tr -d ' \n')
+        check "phase76 K1: the STORED ref name is exactly the NFC byte sequence (not renamed to NFD, checked by hex, not by a folding stat())" \
+            sh -c "echo \"$P76_NFD_LISTING_HEX\" | grep -qi \"$P76_NFC_HEX\""
+        # Phase 76 fix round 8 (T1): scoped to .git/refs (where sg's own
+        # locks live), never the whole .git tree, and prints the leftover
+        # list on failure -- see p76_lockcreate_check's own comment on why
+        # a whole-.git scan can catch git's own detached maintenance.lock.
+        find "$P76_NFD_SG/.git/refs" -name '*.lock' > "$WORKDIR/p76_nfd_locks.txt" 2>/dev/null
+        check "phase76 K1: no .lock file left under refs/ by the NFD alias probe" \
+            sh -c "! grep -q . '$WORKDIR/p76_nfd_locks.txt' || { echo 'leftover lock(s):'; cat '$WORKDIR/p76_nfd_locks.txt'; false; }"
+    else
+        skip "phase76 K1: filesystem does not fold Unicode normalization forms -- NFD/NFC alias cannot occur here"
+    fi
+else
+    skip "phase76 divergence #10: filesystem is case-sensitive -- 'Master'/'master' do not alias here"
+    skip "phase76 K1: filesystem is case-sensitive (checked before the normalization probe) -- skipped alongside divergence #10"
+fi
 
 echo ""
 
@@ -18504,6 +19667,26 @@ PYEOF
 )
 eval "$P68_FIX"
 
+# --- Phase 76 reviewer round 1, item 3: `sg branch`'s start-point
+# resolution uses STRICT disambiguation, unlike `sg log`/`sg reset`'s
+# COMMITTISH -- reusing this exact fixture's 2-way (real commit + crafted
+# blob) prefix collision is the head-on discriminator: `sg log` resolves
+# it (COMMITTISH, only one commit-ish candidate), `sg branch` must refuse
+# it outright with the full STRICT candidate list, even though the SAME
+# prefix resolves for log on the SAME repo.
+(cd "$P68" && LC_ALL=C git log --oneline -1 "$P68_PREFIX2" > /dev/null 2>&1)
+check "phase76 STRICT precondition: git log resolves this 2-way commit+blob prefix (COMMITTISH, not ambiguous)" \
+    test $? = 0
+(cd "$P68" && "$SG" branch p76fromamb "$P68_PREFIX2") > "$WORKDIR/p76_strict_sg.out" 2>&1
+check "phase76 STRICT: sg branch refuses the SAME prefix sg log just resolved (STRICT, not COMMITTISH)" \
+    test $? = 1
+check "phase76 STRICT: refusal is the ambiguity error:/hint: block (not the generic 'no start point' wording)" \
+    grep -q "^error: short object ID $P68_PREFIX2 is ambiguous" "$WORKDIR/p76_strict_sg.out"
+check "phase76 STRICT: the candidate list names BOTH the commit and the crafted blob (STRICT does not narrow to commit-ish)" \
+    sh -c "grep -q \"${P68_BLOB2:0:7} blob\" '$WORKDIR/p76_strict_sg.out' && grep -q \"${P68_C1:0:7} commit\" '$WORKDIR/p76_strict_sg.out'"
+check "phase76 STRICT: no branch was created for the refused ambiguous start point" \
+    test ! -f "$P68/.git/refs/heads/p76fromamb"
+
 # --- Phase 68b review round 3: a tag pointing at a BLOB. Membership must
 # be decided by the PEELED type, not the tag's own raw type -- a
 # self-contained fixture, independent of P68_PREFIX/P68_PREFIX2 above (a
@@ -20270,22 +21453,6 @@ check "phase72 case5: November and June resolve to DIFFERENT offsets (DST), prov
 echo ""
 
 # --- Phase 73: sg tag matrix ------------------------------------------------
-# Review round 7: whether refs/tags/Foo and refs/tags/foo alias the SAME
-# file is a FILESYSTEM property (macOS's default APFS/HFS+ fold case,
-# Linux's ext4 does not), and one interop check below is only meaningful
-# -- and only reachable at all -- where the filesystem folds. Probe it at
-# runtime with a plain touch+test, unrelated to git/sg entirely, rather
-# than assuming "this machine" one way or the other.
-P73_CASEFOLD_PROBE="$WORKDIR/phase73_casefold_probe"
-rm -rf "$P73_CASEFOLD_PROBE"
-mkdir -p "$P73_CASEFOLD_PROBE"
-touch "$P73_CASEFOLD_PROBE/CaseProbe"
-if [ -f "$P73_CASEFOLD_PROBE/caseprobe" ]; then
-    P73_FS_CASE_INSENSITIVE=1
-else
-    P73_FS_CASE_INSENSITIVE=0
-fi
-
 # Fixture used throughout: two commits on master, a branch topic, a
 # lightweight tag lw -> c2, an annotated tag atag -> c2, and an annotated
 # tag atag2 -> atag (a tag of a tag). Every case below copies this pristine
@@ -20717,10 +21884,15 @@ if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
     # claims a lock, sg has none and says so instead (spec section 4).
     check "phase74 case2j oracle: precondition -- git's message names 'refs/tags/foo' (the SECOND/later colliding spelling), not 'Foo'" \
         grep -q "cannot lock ref 'refs/tags/foo'" "$WORKDIR/p73_2j_git.out"
-    check "phase74 case2j: sg's message names both colliding paths and says they are the same ref, without claiming a lock sg does not have" \
-        grep -qx "sg: could not delete references: 'refs/tags/Foo' and 'refs/tags/foo' are the same ref" "$WORKDIR/p73_2j_sg.out"
-    check "phase74 case2j: sg's message does NOT claim to lock anything (sg has no ref lock files)" \
-        sh -c "! grep -q 'lock' '$WORKDIR/p73_2j_sg.out'"
+    # Phase 76 fix round 1: sg now creates a REAL lock file the same way
+    # git does, so it reports the SAME raw lockfile.c collision wording git
+    # does -- there is no more "same ref" special case (that wording was
+    # never git's; see ref_delete.h's own comment). Byte-equal after
+    # folding each side's own absolute repo path to one placeholder.
+    p74_norm_eexist_msg "$WORKDIR/p73_2j_git.out" "$P73_2J_GIT" > "$WORKDIR/p73_2j_git.norm"
+    p74_norm_eexist_msg "$WORKDIR/p73_2j_sg.out" "$P73_2J_SG" > "$WORKDIR/p73_2j_sg.norm"
+    check "phase74 case2j: sg's message matches git's own raw lockfile wording byte-for-byte (worktree path normalized)" \
+        cmp -s "$WORKDIR/p73_2j_git.norm" "$WORKDIR/p73_2j_sg.norm"
     check "phase74 case2j: no stale .lock file survives the refusal (sg cleans up every lock it created)" \
         sh -c "! find '$P73_2J_SG/.git/refs/tags' -name '*.lock' 2>/dev/null | grep -q ."
 
@@ -20737,8 +21909,10 @@ if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
     (cd "$P73_2J2_SG" && "$SG" tag -d foo Foo) > "$WORKDIR/p73_2j2_sg.out" 2>&1
     check "phase74 case2j2 oracle: precondition -- 'tag -d foo Foo' (reversed spelling order) makes git name 'refs/tags/Foo', the LATER one" \
         grep -q "cannot lock ref 'refs/tags/Foo'" "$WORKDIR/p73_2j2_git.out"
-    check "phase74 case2j2: sg also names 'Foo' (the later spelling), and Foo survives" \
-        sh -c "grep -qx \"sg: could not delete references: 'refs/tags/foo' and 'refs/tags/Foo' are the same ref\" '$WORKDIR/p73_2j2_sg.out' && \
+    p74_norm_eexist_msg "$WORKDIR/p73_2j2_git.out" "$P73_2J2_GIT" > "$WORKDIR/p73_2j2_git.norm"
+    p74_norm_eexist_msg "$WORKDIR/p73_2j2_sg.out" "$P73_2J2_SG" > "$WORKDIR/p73_2j2_sg.norm"
+    check "phase74 case2j2: sg also names 'Foo' (the later spelling) via git's own raw wording, byte-for-byte, and Foo survives" \
+        sh -c "cmp -s '$WORKDIR/p73_2j2_git.norm' '$WORKDIR/p73_2j2_sg.norm' && \
                (cd '$P73_2J2_SG' && git rev-parse --verify refs/tags/Foo) > /dev/null 2>&1"
     check "phase74 case2j2: no stale .lock file survives the refusal" \
         sh -c "! find '$P73_2J2_SG/.git/refs/tags' -name '*.lock' 2>/dev/null | grep -q ."
@@ -20929,28 +22103,18 @@ check "phase74 case2n oracle: precondition -- git also refuses on a stale .lock 
            (cd '$P74_2N_GIT' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1"
 check "phase74 case2n: sg also refuses (exit 1), foo survives" \
     sh -c "test '$P74_2N_SG_RC' = 1 && (cd '$P74_2N_SG' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1"
-# round 4: this used to be `grep -qx` against a literal copied straight out
-# of cmd_tag.c's own source -- self-referential, since the "expected" text
-# was never anything but a second copy of the implementation, so it could
-# never catch a wording drift OR tell you the original wording was ever
-# wrong (which it was, for four rounds, in exactly this function -- see
-# case2c/case2h's own history). Derived from GIT's ACTUAL output instead,
-# the same convention case2c/case2h use: extract git's own
-# "reference X" / "references" choice and its locked ref path via sed,
-# then build the ONE line sg is expected to print by substituting into
-# sg's OWN prefix and dropping the absolute path/advisory text git adds
-# and sg deliberately does not (an acknowledged, intentional wording
-# difference, not something this check is trying to paper over).
-P74_2N_GIT_REASON_PATH=$(sed -E -n \
-    "s/^error: could not delete (reference [^:]*|references): cannot lock ref '([^']*)':.*/\\1|\\2/p" \
-    "$WORKDIR/p74_2n_git.out")
-P74_2N_EXPECT_REASON="${P74_2N_GIT_REASON_PATH%%|*}"
-P74_2N_EXPECT_LOCKPATH="${P74_2N_GIT_REASON_PATH##*|}"
-check "phase74 case2n oracle: precondition -- git's own message actually parses into a (reference-clause, locked-path) pair (sanity check on the sed above, not on sg)" \
-    test -n "$P74_2N_GIT_REASON_PATH" -a "$P74_2N_EXPECT_REASON" != "$P74_2N_GIT_REASON_PATH"
-check "phase74 case2n: sg's message equals git's own reference-clause and locked path, with sg's prefix and no absolute path/advisory text -- derived from git's output, not a second hardcoded copy" \
-    test "$(cat "$WORKDIR/p74_2n_sg.out")" = \
-    "sg: could not delete ${P74_2N_EXPECT_REASON}: cannot lock ref '${P74_2N_EXPECT_LOCKPATH}': File exists"
+# round 4 used a sed field-extraction here and rebuilt an expected line
+# from git's "reference clause"/"locked path" fields with sg's own prefix,
+# dropping git's absolute-path/advisory text as "an acknowledged wording
+# difference". Phase 76 fix round 1 measured that assumption wrong: sg
+# NOW reproduces git's raw lockfile wording byte-for-byte, absolute path
+# and advisory text included (see ref_delete.c), so a full normalized
+# byte comparison replaces the field-by-field reconstruction -- same
+# helper as case2j/case2j2 above.
+p74_norm_eexist_msg "$WORKDIR/p74_2n_git.out" "$P74_2N_GIT" > "$WORKDIR/p74_2n_git.norm"
+p74_norm_eexist_msg "$WORKDIR/p74_2n_sg.out" "$P74_2N_SG" > "$WORKDIR/p74_2n_sg.norm"
+check "phase74 case2n: sg's message matches git's own raw lockfile wording byte-for-byte (worktree path normalized), derived from git's actual output, not a hardcoded copy" \
+    cmp -s "$WORKDIR/p74_2n_git.norm" "$WORKDIR/p74_2n_sg.norm"
 check "phase74 case2n: sg's message does NOT claim two names are the same ref" \
     sh -c "! grep -q 'are the same ref' '$WORKDIR/p74_2n_sg.out'"
 check "phase74 case2n: the pre-existing stale .lock file itself is left exactly as it was (sg never owned it, so it must not delete someone else's lock)" \
@@ -20985,11 +22149,13 @@ check "phase74 case2n2 oracle: precondition -- git refuses the whole batch (exit
     sh -c "test '$P74_2N2_GIT_RC' = 1 && grep -q '^error: could not delete references:' '$WORKDIR/p74_2n2_git.out' && \
            (cd '$P74_2N2_GIT' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1 && \
            (cd '$P74_2N2_GIT' && git rev-parse --verify refs/tags/bar) > /dev/null 2>&1"
-check "phase74 case2n2: sg also refuses the whole batch, both survive, and ITS message is ALSO plural ('could not delete references:'), not the singular form" \
+p74_norm_eexist_msg "$WORKDIR/p74_2n2_git.out" "$P74_2N2_GIT" > "$WORKDIR/p74_2n2_git.norm"
+p74_norm_eexist_msg "$WORKDIR/p74_2n2_sg.out" "$P74_2N2_SG" > "$WORKDIR/p74_2n2_sg.norm"
+check "phase74 case2n2: sg also refuses the whole batch, both survive, and ITS message matches git's own PLURAL raw wording byte-for-byte" \
     sh -c "test '$P74_2N2_SG_RC' = 1 && \
            (cd '$P74_2N2_SG' && git rev-parse --verify refs/tags/foo) > /dev/null 2>&1 && \
            (cd '$P74_2N2_SG' && git rev-parse --verify refs/tags/bar) > /dev/null 2>&1 && \
-           grep -qx \"sg: could not delete references: cannot lock ref 'refs/tags/foo': File exists\" '$WORKDIR/p74_2n2_sg.out'"
+           cmp -s '$WORKDIR/p74_2n2_git.norm' '$WORKDIR/p74_2n2_sg.norm'"
 
 # case2n3 (round 4): the plural boundary is keyed on EXISTENCE, not raw
 # argv count -- a batch of a MISSING name plus one existing, stale-locked
@@ -21014,8 +22180,10 @@ cp -R "$P74_2N3_GIT" "$P74_2N3_SG"
 (cd "$P74_2N3_SG" && "$SG" tag -d nosuch foo) > "$WORKDIR/p74_2n3_sg.out" 2>&1
 check "phase74 case2n3 oracle: precondition -- git's message is SINGULAR ('could not delete reference refs/tags/foo:') even with TWO argv names, since 'nosuch' never entered the transaction" \
     grep -q "^error: could not delete reference refs/tags/foo:" "$WORKDIR/p74_2n3_git.out"
-check "phase74 case2n3: sg's message is ALSO singular here -- keyed on existence, not argv count" \
-    grep -qx "sg: could not delete reference refs/tags/foo: cannot lock ref 'refs/tags/foo': File exists" "$WORKDIR/p74_2n3_sg.out"
+p74_norm_eexist_msg "$WORKDIR/p74_2n3_git.out" "$P74_2N3_GIT" > "$WORKDIR/p74_2n3_git.norm"
+p74_norm_eexist_msg "$WORKDIR/p74_2n3_sg.out" "$P74_2N3_SG" > "$WORKDIR/p74_2n3_sg.norm"
+check "phase74 case2n3: sg's message is ALSO singular here -- keyed on existence, not argv count -- and matches git's raw wording byte-for-byte" \
+    cmp -s "$WORKDIR/p74_2n3_git.norm" "$WORKDIR/p74_2n3_sg.norm"
 
 # case2o (round 3): the SAME stale .lock file must not be listed as a
 # phantom tag by `sg tag`. `list_loose_branches` (src/storage/refs.c, shared

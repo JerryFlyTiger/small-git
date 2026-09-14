@@ -307,4 +307,113 @@ int sg_ref_move_head(const char *git_dir, const char *branch,
                      const unsigned char target[SG_SHA1_RAW_LEN],
                      const char *reflog_msg);
 
+/* Phase 76 fix round 3 (L1): the ONE O_CREAT|O_EXCL ref-lock
+   implementation in this project, shared by cli/ref_delete.c's
+   batch-delete engine, cmd_branch.c's create-path lock, and its
+   case/Unicode-normalization alias probe -- three independently-drifting
+   copies of the identical mechanism would have been one rule copied three
+   times with one wrong copy waiting to happen (this project's own
+   recurring failure shape).
+
+   INVARIANT (Phase 76 fix round 5, P1/R4-1): every `name` passed to
+   `sg_ref_lock_try`/`sg_ref_lock_try_query` MUST already have passed
+   `sg_ref_path_components_are_safe` -- neither lock function validates
+   its own `name` argument, both build a path directly from it
+   (`<git_dir>/<prefix><name>.lock`) and hand that straight to
+   `open(O_CREAT|O_EXCL, ...)`. An unvalidated name containing `..`
+   components resolves OUTSIDE `<git_dir>` entirely, and `O_CREAT` there
+   creates a real file (however transiently, since the caller unlinks it
+   on every path) OUTSIDE THE REPOSITORY -- measured, `sg branch -d
+   ../../../../x/pwn` before this round's fix. This is why
+   `sg_ref_delete_batch`'s pass 1 (`cli/ref_delete.c`) validates a name
+   BEFORE its precheck callback ever runs (so `cmd_branch.c`'s alias
+   probe, called from that precheck, never sees an unvalidated name
+   either), and why `cmd_branch.c`'s create path is safe for the SAME
+   reason via a DIFFERENT gate (`sg_ref_name_valid_for_create`, already
+   the first check `create_branch` runs). If a THIRD caller of either lock
+   function is ever added, it must validate first too -- grep both
+   function names for the full caller list before assuming this is
+   automatic. */
+typedef enum {
+    SG_REFLOCK_ACQUIRED = 1, /* lock held; caller MUST sg_ref_lock_release() later */
+    SG_REFLOCK_EEXIST = 0,   /* another lock (foreign or in-batch) already holds this path */
+    SG_REFLOCK_ERROR = -1,   /* allocation, sg_mkdir_parents, or a non-EEXIST open() failure */
+} sg_ref_lock_result;
+
+typedef struct {
+    char *path;       /* owned; "<git_dir>/<prefix><name>.lock". NULL only
+                          when SG_REFLOCK_ERROR happened before a path
+                          could even be built (allocation failure). */
+    int fd;            /* Phase 76 fix round 4 (R3-4): ALWAYS -1 after
+                          sg_ref_lock_try returns -- the fd is closed
+                          immediately after a successful O_CREAT|O_EXCL,
+                          since the lock IS the file's existence, not an
+                          open descriptor. Held open across a whole batch
+                          used to exhaust RLIMIT_NOFILE (macOS default
+                          256) at 257+ names, a regression of master's
+                          shipped `sg tag -d`. Kept as a field (rather
+                          than removed) only so a future reader who reads
+                          "-1" understands it was deliberately closed, not
+                          a leftover uninitialized value. */
+    int held;          /* internal: 1 iff this process must unlink on release */
+    int mkdir_failed;  /* SG_REFLOCK_ERROR only: 1 if sg_mkdir_parents failed
+                          specifically (distinct wording from an OOM or an
+                          open() failure -- see each caller's own message) */
+    int open_errno;    /* SG_REFLOCK_ERROR only, from a non-EEXIST open()
+                          failure: the saved errno, 0 otherwise (0 also
+                          covers the OOM and mkdir_failed cases, which have
+                          no errno of their own to report) */
+} sg_ref_lock;
+
+/* Attempts to acquire the lock, creating the lock path's parent
+   directories first (via sg_mkdir_parents) -- the right choice for every
+   caller that is about to WRITE at this path anyway (cli/ref_delete.c's
+   batch-delete transaction, only ever locking a name pass 1 already
+   confirmed exists, so its directory chain necessarily exists too; and
+   cmd_branch.c's create/-f write, which needs the directory regardless).
+   Every field of `lock` is populated regardless of the return value, so a
+   caller building a diagnostic always has whatever it needs: `path` for
+   the EEXIST message (git's own wording embeds the lock path even on a
+   name it did not create), and `mkdir_failed`/`open_errno` to pick the
+   right ERROR wording without the caller re-deriving them. Does not print
+   anything itself -- every caller's wording differs (tag/branch/create),
+   matching this project's convention that lower layers return codes and
+   the CLI layer reports. */
+sg_ref_lock_result sg_ref_lock_try(const char *git_dir, const char *prefix, const char *name,
+                                   sg_ref_lock *lock);
+
+/* Phase 76 fix round 4 (R3-1/D1b/D1c): a PURE QUERY variant for a caller
+   that must NOT create anything on disk while merely asking "would this
+   name's lock collide" -- cmd_branch.c's divergence-#10 alias probe is
+   the one caller today, since it runs for every batch-delete name
+   regardless of whether that name even exists, and creating
+   `refs/heads/<name>.lock`'s parent directories for a name that turns out
+   not to exist left an EMPTY directory behind (measured: `sg branch -d
+   nope/sub` -- "not found", correctly -- used to also plant an empty
+   `refs/heads/nope/`, which could then make a LATER `sg branch nope`
+   fail, since sg's own ref write has no tolerance for an empty directory
+   sitting where it wants to write a file; see docs/DESIGN.md's Phase 76
+   D1a residual). Skips sg_mkdir_parents entirely: `lock->mkdir_failed` is
+   never set by this path. An open() failure of ENOENT or ENOTDIR (a path
+   component that does not exist, or exists but is not a directory -- both
+   reachable here: a nonexistent parent, or an existing SIBLING ref file
+   occupying the component's own name, e.g. probing "merged/sub" when
+   "merged" is a loose ref) is reported as an ordinary SG_REFLOCK_ERROR
+   with `lock->open_errno` set to the specific errno -- this function
+   itself does not special-case those two errnos into a non-error result,
+   because "clean not-aliased" is a decision specific to the ONE caller
+   that currently needs it (a hypothetical second caller might legitimately
+   want ENOENT to be an error), so it is the CALLER's job to recognize
+   `open_errno == ENOENT || open_errno == ENOTDIR` and treat that as "this
+   spelling cannot resolve to anything on disk", not this function's. */
+sg_ref_lock_result sg_ref_lock_try_query(const char *git_dir, const char *prefix, const char *name,
+                                         sg_ref_lock *lock);
+
+/* Releases a lock this process holds (closes the fd, unlinks the file,
+   frees `path`) -- safe to call unconditionally on any `sg_ref_lock` this
+   file produced, regardless of which result it returned: a lock that was
+   never acquired (EEXIST/ERROR) just has its `path` freed, nothing is
+   unlinked (a caller must never unlink a lock it does not own). */
+void sg_ref_lock_release(sg_ref_lock *lock);
+
 #endif
