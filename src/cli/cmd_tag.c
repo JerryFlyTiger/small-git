@@ -171,7 +171,8 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         free(serialized);
 
         if (sg_ref_write_path(git_dir, ref_path, tag_id) != 0) {
-            fprintf(stderr, "sg: cannot create tag '%s'\n", name);
+            if (!sg_ref_lock_err_report(stderr, NULL))
+                fprintf(stderr, "sg: cannot create tag '%s'\n", name);
             return 1;
         }
 
@@ -188,7 +189,8 @@ static int create_tag(const char *git_dir, const char *name, const char *rev, in
         }
     } else {
         if (sg_ref_write_path(git_dir, ref_path, target_id) != 0) {
-            fprintf(stderr, "sg: cannot create tag '%s'\n", name);
+            if (!sg_ref_lock_err_report(stderr, NULL))
+                fprintf(stderr, "sg: cannot create tag '%s'\n", name);
             return 1;
         }
 

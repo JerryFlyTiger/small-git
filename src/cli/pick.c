@@ -670,7 +670,15 @@ static int run_todo(const char *git_dir, const char *repo_root, sg_seq_kind kind
                 return 1;
             }
             if (sg_ref_move_head(git_dir, current_branch, out.new_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: failed to update HEAD\n");
+                /* Phase 77 fix round, measured: no "update_ref failed for
+                   ref" prefix here, but git DOES add a trailing
+                   "cherry-pick failed"/"revert failed" line after the
+                   HINT block. */
+                char trailing[32];
+
+                snprintf(trailing, sizeof(trailing), "%s failed", op);
+                if (!sg_ref_lock_err_report_ex(stderr, "HEAD", NULL, trailing))
+                    fprintf(stderr, "sg: failed to update HEAD\n");
                 free(reflog_msg);
                 attempt_result_free(&out);
                 free(todo);
@@ -988,7 +996,11 @@ int sg_pick_continue(const char *git_dir, const char *repo_root, sg_seq_kind kin
             return 1;
         }
         if (sg_ref_move_head(git_dir, current_branch, new_commit_id, reflog_msg) != 0) {
-            fprintf(stderr, "sg: failed to update HEAD\n");
+            char trailing[32];
+
+            snprintf(trailing, sizeof(trailing), "%s failed", op_name(kind));
+            if (!sg_ref_lock_err_report_ex(stderr, "HEAD", NULL, trailing))
+                fprintf(stderr, "sg: failed to update HEAD\n");
             free(reflog_msg);
             free(current_branch);
             free(message);

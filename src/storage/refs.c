@@ -458,9 +458,21 @@ int sg_ref_resolve_head(const char *git_dir, unsigned char id_out[SG_SHA1_RAW_LE
     return rc;
 }
 
+/* Forward declaration: defined further down with the rest of the Phase 77
+   side-channel machinery, but sg_ref_update_branch (right below) needs it
+   earlier in the file than that definition lives. */
+static void lock_err_clear(void);
+
 int sg_ref_update_branch(const char *git_dir, const char *branch, const unsigned char id[SG_SHA1_RAW_LEN])
 {
     char ref_path[SG_PATH_MAX];
+
+    /* Phase 77 fix round 3 (B): clear the side channel first, so a -1
+       never carries a stale kind from an earlier call (refs.h contract).
+       Both early returns below (unsafe name, path too long) leave it at
+       the NONE this sets, deliberately not calling lock_err_set --
+       neither is a lock failure. */
+    lock_err_clear();
 
     if (!sg_ref_branch_name_is_safe(branch))
         return -1;
@@ -487,25 +499,422 @@ int sg_ref_branch_exists(const char *git_dir, const char *branch)
     return sg_ref_read_branch(git_dir, branch, id) == 0;
 }
 
+static int ref_path_reflog_allowed(const char *ref_path);
+
+/* Phase 77: last-failure record for the locked-write primitive below, see
+   sg_ref_lock_err's header comment for the full contract. */
+static sg_ref_lock_err g_ref_lock_err = {SG_REF_LOCK_ERR_NONE, NULL, NULL, NULL};
+
+static void lock_err_reset_fields(void)
+{
+    free(g_ref_lock_err.ref_path);
+    free(g_ref_lock_err.lock_path);
+    free(g_ref_lock_err.conflict_path);
+    g_ref_lock_err.ref_path = NULL;
+    g_ref_lock_err.lock_path = NULL;
+    g_ref_lock_err.conflict_path = NULL;
+}
+
+static void lock_err_clear(void)
+{
+    lock_err_reset_fields();
+    g_ref_lock_err.kind = SG_REF_LOCK_ERR_NONE;
+}
+
+static void lock_err_set(sg_ref_lock_err_kind kind, const char *ref_path,
+                         const char *lock_path, const char *conflict_path)
+{
+    lock_err_reset_fields();
+    g_ref_lock_err.kind = kind;
+    g_ref_lock_err.ref_path = ref_path ? strdup(ref_path) : NULL;
+    g_ref_lock_err.lock_path = lock_path ? strdup(lock_path) : NULL;
+    g_ref_lock_err.conflict_path = conflict_path ? strdup(conflict_path) : NULL;
+}
+
+const sg_ref_lock_err *sg_ref_last_lock_err(void)
+{
+    return &g_ref_lock_err;
+}
+
+int sg_ref_lock_err_report(FILE *out, const char *ref_display)
+{
+    return sg_ref_lock_err_report_ex(out, ref_display, NULL, NULL);
+}
+
+int sg_ref_lock_err_report_ex(FILE *out, const char *ref_display, const char *prefix_ref,
+                              const char *trailing)
+{
+    const char *ref = ref_display ? ref_display : g_ref_lock_err.ref_path;
+
+    if (g_ref_lock_err.kind == SG_REF_LOCK_ERR_LOCKED) {
+        if (prefix_ref != NULL)
+            fprintf(out, "sg: update_ref failed for ref '%s': cannot lock ref '%s': Unable to create '%s': "
+                        "File exists.\n\n"
+                        "Another git process seems to be running in this repository, or the lock "
+                        "file may be stale\n",
+                   prefix_ref, ref ? ref : "", g_ref_lock_err.lock_path ? g_ref_lock_err.lock_path : "");
+        else
+            fprintf(out,
+                   "sg: cannot lock ref '%s': Unable to create '%s': File exists.\n\n"
+                   "Another git process seems to be running in this repository, or the lock "
+                   "file may be stale\n",
+                   ref ? ref : "", g_ref_lock_err.lock_path ? g_ref_lock_err.lock_path : "");
+        if (trailing != NULL)
+            fprintf(out, "sg: %s\n", trailing);
+        return 1;
+    }
+    if (g_ref_lock_err.kind == SG_REF_LOCK_ERR_DF) {
+        if (prefix_ref != NULL)
+            fprintf(out, "sg: update_ref failed for ref '%s': cannot lock ref '%s': '%s' exists; cannot "
+                        "create '%s'\n",
+                   prefix_ref, ref ? ref : "", g_ref_lock_err.conflict_path ? g_ref_lock_err.conflict_path : "",
+                   ref ? ref : "");
+        else
+            fprintf(out, "sg: cannot lock ref '%s': '%s' exists; cannot create '%s'\n",
+                   ref ? ref : "", g_ref_lock_err.conflict_path ? g_ref_lock_err.conflict_path : "",
+                   ref ? ref : "");
+        if (trailing != NULL)
+            fprintf(out, "sg: %s\n", trailing);
+        return 1;
+    }
+    return 0;
+}
+
+/* D1a: removes an EMPTY directory tree rooted at `abs_path` (which must
+   already be known to be a directory), depth-first, stopping the moment a
+   regular file is found anywhere under it -- siblings already fully empty
+   are left removed even when a later sibling blocks the rest, matching
+   git's own measured behaviour (see refs.h's Phase 77 comment). Returns 0
+   if the tree (or what could be removed of it) is now gone, -2 if a
+   regular file was found (`*conflict_out` set to a malloc'd absolute path
+   of that file, caller frees), -1 on an unrelated I/O error. */
+int sg_ref_remove_empty_dir_tree(const char *abs_path, char **conflict_out)
+{
+    DIR *d = opendir(abs_path);
+    struct dirent *ent;
+    int rc = 0;
+
+    if (d == NULL)
+        return -1;
+
+    while ((ent = readdir(d)) != NULL) {
+        char child[SG_PATH_MAX];
+        struct stat st;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+        if (snprintf(child, sizeof(child), "%s/%s", abs_path, ent->d_name) >= (int)sizeof(child)) {
+            rc = -1;
+            break;
+        }
+        if (lstat(child, &st) != 0) {
+            rc = -1;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            rc = sg_ref_remove_empty_dir_tree(child, conflict_out);
+            if (rc != 0)
+                break; /* conflict or error below: do not remove this level either */
+        } else {
+            *conflict_out = strdup(child);
+            rc = (*conflict_out != NULL) ? -2 : -1;
+            break;
+        }
+    }
+    closedir(d);
+    if (rc != 0)
+        return rc;
+    if (rmdir(abs_path) != 0)
+        return -1;
+    return 0;
+}
+
+/* F7 (Phase 77 fix round 2): split out of the old single-shot
+   locked_ref_write so a caller that must not write any OTHER on-disk
+   state (a reflog line) until the ref's own lock is actually held --
+   sg_ref_update, below -- can call this FIRST, then do that other work,
+   then call locked_ref_commit once it is safe to actually write. Handles
+   path-safety, D1a's empty-directory removal, and the O_CREAT|O_EXCL
+   acquisition; does NOT clear the side channel itself (callers that
+   sequence several lock attempts, like sg_ref_update's own HEAD phantom
+   lock, need to control exactly when it is cleared -- see each caller's
+   own entry-clear). On success, `*lock` is populated and held; the
+   caller owns it and must eventually reach locked_ref_commit or
+   sg_ref_lock_release, not both partially. */
+/* D1a: shared by BOTH locked_ref_acquire (the fresh-lock path) and
+   locked_ref_write's `existing != NULL` path (cmd_branch.c's landmine
+   case, where the caller already holds the lock and locked_ref_acquire
+   is never called at all) -- factored out after a real regression
+   (Phase 77 fix round 2): when this check lived ONLY inside
+   locked_ref_acquire, `sg branch nope` with an empty `refs/heads/nope/`
+   directory started failing again, because sg_ref_update_locked's call
+   into locked_ref_write with a pre-held lock skips locked_ref_acquire
+   entirely and the D1a removal silently never ran. Returns 0 if the ref
+   path is not a directory (nothing to do) or was an empty one (now
+   removed), -1 with the side channel set (LOCK_ERR_DF or _OTHER) if it
+   should refuse the write. Path-safety is NOT this function's own job --
+   EVERY caller must run sg_ref_path_components_are_safe(ref_path) itself
+   BEFORE calling this (it does no validation of `full_path` at all, and
+   walks it with lstat/opendir/rmdir). This was stated as an invariant
+   that "already fires earlier in every call path" without it actually
+   being true for locked_ref_write's `existing != NULL` branch -- fixed
+   in Phase 77 fix round 3 (A) by adding the missing check there; verify
+   any NEW caller does the same rather than trusting this comment alone. */
+static int locked_ref_clear_blocking_dir(const char *git_dir, const char *ref_path, const char *full_path)
+{
+    struct stat st;
+
+    if (lstat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        char *conflict_abs = NULL;
+        int rc = sg_ref_remove_empty_dir_tree(full_path, &conflict_abs);
+
+        if (rc == -2) {
+            size_t git_dir_len = strlen(git_dir);
+            const char *rel = conflict_abs;
+
+            if (strncmp(conflict_abs, git_dir, git_dir_len) == 0 && conflict_abs[git_dir_len] == '/')
+                rel = conflict_abs + git_dir_len + 1;
+            lock_err_set(SG_REF_LOCK_ERR_DF, ref_path, NULL, rel);
+            free(conflict_abs);
+            return -1;
+        }
+        if (rc != 0) {
+            lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int locked_ref_acquire(const char *git_dir, const char *ref_path, sg_ref_lock *lock)
+{
+    char full_path[SG_PATH_MAX];
+    sg_ref_lock_result lrc;
+
+    if (!sg_ref_path_components_are_safe(ref_path)) {
+        lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+        return -1;
+    }
+    if (snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path) >= (int)sizeof(full_path)) {
+        lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+        return -1;
+    }
+
+    if (locked_ref_clear_blocking_dir(git_dir, ref_path, full_path) != 0)
+        return -1;
+
+    lrc = sg_ref_lock_try(git_dir, "", ref_path, lock);
+    if (lrc == SG_REFLOCK_EEXIST) {
+        lock_err_set(SG_REF_LOCK_ERR_LOCKED, ref_path, lock->path, NULL);
+        sg_ref_lock_release(lock);
+        return -1;
+    }
+    if (lrc == SG_REFLOCK_ERROR) {
+        lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+        sg_ref_lock_release(lock);
+        return -1;
+    }
+    return 0;
+}
+
+/* F7: the second half -- writes `content` into an ALREADY-HELD `lock`
+   (from locked_ref_acquire, or a caller's own, e.g. cmd_branch.c's) and
+   renames it onto the ref path, exactly as the old single-shot function
+   did. On success `lock->held` is cleared (consumed). On failure `lock`
+   is left exactly as passed in (still held) -- the caller's own cleanup
+   (sg_ref_lock_release) still applies, this function never releases a
+   lock it did not itself fail to acquire (it never acquires one at all). */
+static int locked_ref_commit(const char *git_dir, const char *ref_path,
+                             const unsigned char *content, size_t content_len, sg_ref_lock *lock)
+{
+    char full_path[SG_PATH_MAX];
+    FILE *f;
+
+    if (snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path) >= (int)sizeof(full_path)) {
+        lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+        return -1;
+    }
+
+    f = fopen(lock->path, "wb");
+    if (f == NULL || fwrite(content, 1, content_len, f) != content_len || fclose(f) != 0) {
+        if (f != NULL)
+            fclose(f);
+        lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+        return -1;
+    }
+
+    if (rename(lock->path, full_path) != 0) {
+        lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+        return -1;
+    }
+
+    /* Consumed: the file at lock->path no longer exists (renamed away), so
+       held is cleared -- sg_ref_lock_release must not try to unlink it. */
+    lock->held = 0;
+    return 0;
+}
+
+/* The one locked-write primitive every ORDINARY ref write in this project
+   goes through -- see refs.h's Phase 77 comment for the full contract
+   (locking, atomicity via rename, and the D1a empty-directory fix). Now a
+   thin acquire-then-commit wrapper around the two halves above, for a
+   caller that does a SINGLE lock attempt (write_ref_path_raw,
+   sg_ref_update_locked); every -1 it returns has recorded its own kind.
+   sg_ref_update's own multi-lock sequence (F7 below) calls
+   locked_ref_acquire/locked_ref_commit directly instead, since it also
+   takes the phantom HEAD lock between the two halves. `lock` may be NULL (the common case: a fresh lock is
+   taken and released internally) or an already-acquired lock this call
+   should consume instead (cmd_branch.c's landmine, see
+   sg_ref_update_locked). */
+static int locked_ref_write(const char *git_dir, const char *ref_path,
+                            const unsigned char *content, size_t content_len,
+                            sg_ref_lock *existing)
+{
+    sg_ref_lock local_lock;
+    sg_ref_lock *lock;
+
+    /* No lock_err_clear() here (Phase 77 round 5): every -1 below records
+       its own kind via lock_err_set (directly, or inside
+       locked_ref_clear_blocking_dir / locked_ref_acquire /
+       locked_ref_commit), so an entry clear was measured unobservable. */
+
+    if (existing != NULL) {
+        /* D1a regression fix (Phase 77 fix round 2): locked_ref_acquire is
+           never called on THIS path (the caller already holds the lock),
+           so its own D1a check must be run here explicitly instead --
+           see locked_ref_clear_blocking_dir's own comment for the
+           regression this closes (sg_ref_update_locked's caller,
+           cmd_branch.c's create/-f write, hitting an empty
+           refs/heads/<name>/ directory).
+
+           Phase 77 fix round 3 (A): path-safety is ALSO this branch's own
+           job, not something "already fired earlier in every call path"
+           -- that claim (still on locked_ref_clear_blocking_dir's own
+           comment above) was FALSE for this exact branch: round 2 moved
+           the sg_ref_path_components_are_safe check into
+           locked_ref_acquire, which this branch never calls, so an
+           unvalidated ref_path reached locked_ref_clear_blocking_dir's
+           lstat/opendir/rmdir walk unchecked. cmd_branch.c's one caller
+           happens to validate its own `name` first (sg_ref_name_valid_
+           for_create), so this was not reachable through it, but
+           sg_ref_update_locked has no OTHER caller-independent guarantee
+           of that -- the check belongs here regardless of who the only
+           caller today is. */
+        char full_path[SG_PATH_MAX];
+
+        if (!sg_ref_path_components_are_safe(ref_path)) {
+            lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+            return -1;
+        }
+        if (snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path) >= (int)sizeof(full_path)) {
+            lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+            return -1;
+        }
+        if (locked_ref_clear_blocking_dir(git_dir, ref_path, full_path) != 0)
+            return -1;
+        lock = existing;
+    } else {
+        if (locked_ref_acquire(git_dir, ref_path, &local_lock) != 0)
+            return -1;
+        lock = &local_lock;
+    }
+
+    if (locked_ref_commit(git_dir, ref_path, content, content_len, lock) != 0) {
+        if (lock == &local_lock)
+            sg_ref_lock_release(&local_lock);
+        return -1;
+    }
+
+    if (lock == &local_lock) {
+        free(local_lock.path);
+        local_lock.path = NULL;
+    }
+    return 0;
+}
+
+int sg_ref_update_locked(const char *git_dir, const char *ref_path, sg_ref_lock *lock,
+                         const unsigned char new_id[SG_SHA1_RAW_LEN], const char *reflog_msg)
+{
+    char content[SG_SHA1_HEX_LEN + 2];
+
+    /* No lock_err_clear() anywhere in this function, deliberately (Phase 77
+       rounds 4-5): every -1 exit records its own kind -- the namespace and
+       reflog-append branches below call lock_err_set, which resets the
+       whole record itself, and every other failure comes out of
+       locked_ref_write, whose failure branches all set a kind too. An entry
+       clear here, and a clear() right before each lock_err_set, were both
+       measured unobservable through any input (redundant guards, CLAUDE.md
+       "Testing conventions"; they guarded no side effect either). The
+       contract (refs.h) promises the record only right after a -1, so a
+       NEW failure branch added here must call lock_err_set itself. */
+
+    /* Reflog handling identical to sg_ref_update's own (duplicated rather
+       than shared, since sg_ref_update's version is wired to
+       write_ref_path_raw, not to an externally-held lock) is deliberately
+       NOT reproduced here: cmd_branch.c's one caller always passes
+       reflog_msg through unchanged, and going through sg_ref_update's own
+       reflog bookkeeping would require a callback into this function
+       anyway. To avoid duplicating that bookkeeping a second time, this
+       performs the reflog append/truncate the same way sg_ref_update does,
+       inline. */
+    if (reflog_msg != NULL) {
+        unsigned char old_id[SG_SHA1_RAW_LEN];
+        long long offset = 0;
+        int wrote_log = 0;
+
+        if (!ref_path_reflog_allowed(ref_path)) {
+            lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+            return -1;
+        }
+        if (sg_ref_read_path(git_dir, ref_path, old_id) != 0)
+            memset(old_id, 0, SG_SHA1_RAW_LEN);
+
+        if (memcmp(old_id, new_id, SG_SHA1_RAW_LEN) != 0) {
+            if (sg_reflog_append(git_dir, ref_path, old_id, new_id, reflog_msg, &offset) != 0) {
+                lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+                return -1;
+            }
+            wrote_log = 1;
+        }
+
+        sg_sha1_to_hex(new_id, content);
+        content[SG_SHA1_HEX_LEN] = '\n';
+        content[SG_SHA1_HEX_LEN + 1] = '\0';
+        if (locked_ref_write(git_dir, ref_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, lock) != 0) {
+            if (wrote_log)
+                sg_reflog_truncate(git_dir, ref_path, offset);
+            return -1;
+        }
+        return 0;
+    }
+
+    sg_sha1_to_hex(new_id, content);
+    content[SG_SHA1_HEX_LEN] = '\n';
+    content[SG_SHA1_HEX_LEN + 1] = '\0';
+    return locked_ref_write(git_dir, ref_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, lock);
+}
+
 /* The actual ref-file writer, shared by sg_ref_write_path and sg_ref_update
    (which both, ultimately, only ever write a ref through here) -- named
    separately so sg_ref_update's NULL-message fast path can call it directly
    instead of going through sg_ref_write_path, which would recurse right
-   back into sg_ref_update. */
+   back into sg_ref_update. Phase 77: now goes through the locked-write
+   primitive (locking + atomic rename + the D1a empty-directory fix)
+   instead of a bare sg_write_file_mkdirs. */
 static int write_ref_path_raw(const char *git_dir, const char *ref_path,
                               const unsigned char id[SG_SHA1_RAW_LEN])
 {
-    char full_path[SG_PATH_MAX];
     char content[SG_SHA1_HEX_LEN + 2];
 
-    if (!sg_ref_branch_name_is_safe(ref_path))
+    if (!sg_ref_branch_name_is_safe(ref_path)) {
+        lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
         return -1;
+    }
 
-    snprintf(full_path, sizeof(full_path), "%s/%s", git_dir, ref_path);
     sg_sha1_to_hex(id, content);
     content[SG_SHA1_HEX_LEN] = '\n';
     content[SG_SHA1_HEX_LEN + 1] = '\0';
-    return sg_write_file_mkdirs(full_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, 0644);
+    return locked_ref_write(git_dir, ref_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, NULL);
 }
 
 int sg_ref_write_path(const char *git_dir, const char *ref_path, const unsigned char id[SG_SHA1_RAW_LEN])
@@ -960,6 +1369,9 @@ static int packed_refs_remove_under(const char *git_dir, const char *prefix, con
     return 0;
 }
 
+static int sg_ref_delete_under_locked(const char *git_dir, const char *prefix, const char *name,
+                                      const char *ref_path, const char *path);
+
 int sg_ref_delete_under(const char *git_dir, const char *prefix, const char *name)
 {
     char path[SG_PATH_MAX];
@@ -967,6 +1379,13 @@ int sg_ref_delete_under(const char *git_dir, const char *prefix, const char *nam
     unsigned char id[SG_SHA1_RAW_LEN];
     struct stat st;
     size_t prefix_len = strlen(prefix);
+
+    /* Phase 77: clear the side channel first. refs.h promises the record
+       is meaningful right after a -1, and at least one early return below
+       never calls lock_err_set -- without this clear it would carry a
+       stale kind from an earlier, unrelated call, and the CLI would print
+       lock wording for a non-lock failure. */
+    lock_err_clear();
 
     /* name comes straight from argv -- same traversal concern as every
        other function here. */
@@ -985,6 +1404,47 @@ int sg_ref_delete_under(const char *git_dir, const char *prefix, const char *nam
        sg_ref_read_path(git_dir, ref_path, id) != 0)
         return 1;
 
+    /* Phase 77: a delete is a ref write too -- real git takes the SAME
+       "<ref>.lock" it takes for any other write before actually removing
+       the loose file (measured: `sg stash pop`/`sg stash drop`'s own
+       refs/stash removal, called directly here with no lock of its own
+       before this phase, is what a foreign refs/stash.lock caught nothing
+       against). cli/ref_delete.c's batch-delete transaction (`sg tag -d`/
+       `sg branch -d`) already acquires and releases its OWN lock at this
+       same path in an earlier pass purely to detect a same-batch
+       collision up front (Phase 76) -- by the time it reaches pass 3 and
+       calls this function, that lock is already released, so acquiring a
+       fresh one here does not collide with it and closes the real TOCTOU
+       window between that release and this delete as a side effect. */
+    {
+        sg_ref_lock del_lock;
+        sg_ref_lock_result lrc = sg_ref_lock_try(git_dir, prefix, name, &del_lock);
+
+        if (lrc == SG_REFLOCK_EEXIST) {
+            lock_err_set(SG_REF_LOCK_ERR_LOCKED, ref_path, del_lock.path, NULL);
+            sg_ref_lock_release(&del_lock);
+            return -1;
+        }
+        if (lrc == SG_REFLOCK_ERROR) {
+            lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
+            sg_ref_lock_release(&del_lock);
+            return -1;
+        }
+
+        {
+            int rc = sg_ref_delete_under_locked(git_dir, prefix, name, ref_path, path);
+
+            sg_ref_lock_release(&del_lock);
+            return rc;
+        }
+    }
+}
+
+/* The body of sg_ref_delete_under, factored out so the lock taken above
+   wraps it -- everything below is unchanged from before Phase 77. */
+static int sg_ref_delete_under_locked(const char *git_dir, const char *prefix, const char *name,
+                                      const char *ref_path, const char *path)
+{
     /* Purge BOTH stores. Unlinking only the loose file would resurrect the
        ref from any stale packed-refs line (measured against real git:
        loose e6215c5 shadowing packed 72566fa came back at 72566fa); a
@@ -1040,16 +1500,14 @@ int sg_ref_delete_branch(const char *git_dir, const char *branch)
     return sg_ref_delete_under(git_dir, BRANCH_PREFIX, branch);
 }
 
-static int ref_path_reflog_allowed(const char *ref_path);
-
 int sg_ref_set_symref(const char *git_dir, const char *ref_path, const char *target_ref_path,
                       const char *reflog_msg)
 {
-    char path[SG_PATH_MAX];
-    FILE *f;
+    char content[SG_PATH_MAX];
     long long offset = 0;
     int wrote_log = 0;
     int rc;
+    int written;
 
     /* sg_ref_branch_name_is_safe, not sg_ref_name_valid_for_create: both
        arguments here are full ref PATHS built by the caller, not names a
@@ -1057,6 +1515,12 @@ int sg_ref_set_symref(const char *git_dir, const char *ref_path, const char *tar
        every ref access -- the creation-time validator enforces
        check-ref-format rules that do not apply (and rejects the literal
        "HEAD", which is a perfectly valid thing to write a symref to). */
+    /* Phase 77 fix round 3 (B): clear the side channel first, so a -1
+       never carries a stale kind from an earlier call (refs.h contract):
+       the unsafe-name, namespace, reflog and overflow returns below do not
+       all call lock_err_set. */
+    lock_err_clear();
+
     if (!sg_ref_branch_name_is_safe(ref_path) || !sg_ref_branch_name_is_safe(target_ref_path))
         return -1;
 
@@ -1075,29 +1539,20 @@ int sg_ref_set_symref(const char *git_dir, const char *ref_path, const char *tar
         wrote_log = 1;
     }
 
-    if (snprintf(path, sizeof(path), "%s/%s", git_dir, ref_path) >= (int)sizeof(path)) {
+    /* F2 (Phase 77 fix round 2): goes through the same locked-write
+       primitive as every other ref write in this project now (locking +
+       atomic rename + the D1a empty-directory fix) -- before this fix,
+       the one caller (`sg clone`, creating `refs/remotes/<remote>/HEAD`)
+       was the last ref write left using a bare mkdir+fopen, which made
+       "every ref write in this project takes git's <ref>.lock" (CLAUDE.md
+       divergence #10, docs/RULES-refs-revparse.md) not actually true. */
+    written = snprintf(content, sizeof(content), "ref: %s\n", target_ref_path);
+    if (written < 0 || (size_t)written >= sizeof(content)) {
         if (wrote_log)
             sg_reflog_truncate(git_dir, ref_path, offset);
         return -1;
     }
-    if (sg_mkdir_parents(path) != 0) {
-        if (wrote_log)
-            sg_reflog_truncate(git_dir, ref_path, offset);
-        return -1;
-    }
-    f = fopen(path, "wb");
-    if (f == NULL) {
-        if (wrote_log)
-            sg_reflog_truncate(git_dir, ref_path, offset);
-        return -1;
-    }
-    if (fprintf(f, "ref: %s\n", target_ref_path) < 0) {
-        fclose(f);
-        if (wrote_log)
-            sg_reflog_truncate(git_dir, ref_path, offset);
-        return -1;
-    }
-    rc = fclose(f) == 0 ? 0 : -1;
+    rc = locked_ref_write(git_dir, ref_path, (const unsigned char *)content, (size_t)written, NULL);
     if (rc != 0 && wrote_log)
         sg_reflog_truncate(git_dir, ref_path, offset);
     return rc;
@@ -1131,12 +1586,24 @@ int sg_ref_update(const char *git_dir, const char *ref_path, const unsigned char
     int wrote_branch_log = 0;
     int wrote_head_log = 0;
     int is_current_branch = 0;
+    sg_ref_lock head_phantom_lock;
+    int head_phantom_held = 0;
+    sg_ref_lock own_lock;
+    char content[SG_SHA1_HEX_LEN + 2];
+
+    /* Phase 77 fix round: clear the side channel first, so a -1 never
+       carries a stale kind from an earlier call (refs.h contract). The
+       reflog-append failures below deliberately do not call lock_err_set
+       (not a lock failure), so they rely on this clear to report NONE. */
+    lock_err_clear();
 
     if (reflog_msg == NULL)
         return write_ref_path_raw(git_dir, ref_path, new_id);
 
-    if (!ref_path_reflog_allowed(ref_path))
+    if (!ref_path_reflog_allowed(ref_path)) {
+        lock_err_set(SG_REF_LOCK_ERR_OTHER, ref_path, NULL, NULL);
         return -1;
+    }
 
     if (sg_ref_read_path(git_dir, ref_path, old_id) != 0)
         memset(old_id, 0, SG_SHA1_RAW_LEN); /* no such ref yet (or unreadable): treat as "created" */
@@ -1151,11 +1618,71 @@ int sg_ref_update(const char *git_dir, const char *ref_path, const unsigned char
         }
     }
 
+    /* F7 (Phase 77 fix round 2): the ref's OWN lock is now acquired HERE,
+       before either reflog append, not inside the write at the very end
+       -- matching git's own transaction order, where every ref touched by
+       a transaction (the branch AND, when mirroring, HEAD) is locked
+       BEFORE any reflog line is written, so a crash or a refusal between
+       locking and writing can never leave a reflog line for a ref update
+       that never actually happened. Before this fix, a foreign
+       refs/heads/<b>.lock was only discovered at the very end (inside
+       write_ref_path_raw), by which point both reflog appends had
+       already landed on disk and had to be rolled back by truncation --
+       observably equivalent for the FINAL state (truncate undoes it) but
+       not for the ordering git itself uses, and not safe against a crash
+       between the (now nonexistent) early write and the truncate. */
+    if (locked_ref_acquire(git_dir, ref_path, &own_lock) != 0)
+        return -1;
+
+    /* Phase 77: measured against git 2.55.0, updating the branch HEAD
+       currently points at needs BOTH refs/heads/<b>.lock AND HEAD.lock --
+       either one already held (foreign, or a stale leftover) refuses the
+       WHOLE write, even when the update is itself a no-op (e.g. `sg reset
+       --hard HEAD`), because real git's HEAD write is not "the file
+       content changes", it is "the ref transaction that includes HEAD's
+       mirrored reflog line runs". This is the PHANTOM lock for HEAD,
+       which never gets written into (HEAD's own file content is
+       unchanged here -- only logs/HEAD gets a line) but still has to
+       exist and be released cleanly, exactly the way git takes and drops
+       it. Taken BEFORE any reflog append (same F7 reasoning as the own
+       lock above), so a foreign HEAD.lock refuses before anything at all
+       is written -- matching "no-op writes still lock" and leaving both
+       refs and both reflogs untouched on refusal. */
+    if (is_current_branch) {
+        sg_ref_lock_result hrc = sg_ref_lock_try(git_dir, "", "HEAD", &head_phantom_lock);
+
+        if (hrc == SG_REFLOCK_EEXIST) {
+            lock_err_set(SG_REF_LOCK_ERR_LOCKED, "HEAD", head_phantom_lock.path, NULL);
+            sg_ref_lock_release(&head_phantom_lock);
+            sg_ref_lock_release(&own_lock);
+            return -1;
+        }
+        if (hrc == SG_REFLOCK_ERROR) {
+            lock_err_set(SG_REF_LOCK_ERR_OTHER, "HEAD", NULL, NULL);
+            sg_ref_lock_release(&head_phantom_lock);
+            sg_ref_lock_release(&own_lock);
+            return -1;
+        }
+        head_phantom_held = 1;
+    }
+
     /* Rule 1 (measured, asymmetric): a ref's own log suppresses a no-op
        (old == new) update; logs/HEAD does not. */
     if (memcmp(old_id, new_id, SG_SHA1_RAW_LEN) != 0) {
-        if (sg_reflog_append(git_dir, ref_path, old_id, new_id, reflog_msg, &branch_offset) != 0)
+        if (sg_reflog_append(git_dir, ref_path, old_id, new_id, reflog_msg, &branch_offset) != 0) {
+            /* Deliberately NOT lock_err_set here -- an ordinary reflog
+               I/O failure has nothing to do with a lock, and the entry
+               clear() above already leaves the side channel at NONE,
+               which is what a caller checking sg_ref_last_lock_err()
+               after this -1 should see (F1, Phase 77 fix round 2:
+               verified this does not leak a STALE kind from an earlier,
+               unrelated LOCKED failure -- test_lock_err_does_not_leak_
+               across_calls). */
+            if (head_phantom_held)
+                sg_ref_lock_release(&head_phantom_lock);
+            sg_ref_lock_release(&own_lock);
             return -1;
+        }
         wrote_branch_log = 1;
     }
 
@@ -1164,32 +1691,53 @@ int sg_ref_update(const char *git_dir, const char *ref_path, const unsigned char
        whether that update was itself a no-op. */
     if (is_current_branch) {
         if (sg_reflog_append(git_dir, "HEAD", old_id, new_id, reflog_msg, &head_offset) != 0) {
+            /* Same F1 reasoning as the branch's own append above: not a
+               lock failure, leave the side channel at NONE. */
             if (wrote_branch_log)
                 sg_reflog_truncate(git_dir, ref_path, branch_offset);
+            if (head_phantom_held)
+                sg_ref_lock_release(&head_phantom_lock);
+            sg_ref_lock_release(&own_lock);
             return -1;
         }
         wrote_head_log = 1;
     }
 
-    if (write_ref_path_raw(git_dir, ref_path, new_id) != 0) {
+    sg_sha1_to_hex(new_id, content);
+    content[SG_SHA1_HEX_LEN] = '\n';
+    content[SG_SHA1_HEX_LEN + 1] = '\0';
 
+    if (locked_ref_commit(git_dir, ref_path, (const unsigned char *)content, SG_SHA1_HEX_LEN + 1, &own_lock) != 0) {
         if (wrote_head_log)
             sg_reflog_truncate(git_dir, "HEAD", head_offset);
         if (wrote_branch_log)
             sg_reflog_truncate(git_dir, ref_path, branch_offset);
+        if (head_phantom_held)
+            sg_ref_lock_release(&head_phantom_lock);
+        sg_ref_lock_release(&own_lock);
         return -1;
     }
 
+    sg_ref_lock_release(&own_lock); /* consumed by locked_ref_commit (held==0): frees ->path, unlinks nothing */
+    if (head_phantom_held)
+        sg_ref_lock_release(&head_phantom_lock);
     return 0;
 }
 
 int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_msg)
 {
-    char path[SG_PATH_MAX];
-    FILE *f;
+    char content[SG_PATH_MAX];
     long long offset = 0;
     int wrote_log = 0;
     int rc;
+    int written;
+
+    /* Phase 77: clear the side channel first. refs.h promises the record
+       is meaningful right after a -1, and at least one early return below
+       never calls lock_err_set -- without this clear it would carry a
+       stale kind from an earlier, unrelated call, and the CLI would print
+       lock wording for a non-lock failure. */
+    lock_err_clear();
 
     if (reflog_msg != NULL) {
         unsigned char old_id[SG_SHA1_RAW_LEN];
@@ -1205,20 +1753,16 @@ int sg_ref_set_head(const char *git_dir, const char *branch, const char *reflog_
         wrote_log = 1;
     }
 
-    snprintf(path, sizeof(path), "%s/HEAD", git_dir);
-    f = fopen(path, "wb");
-    if (f == NULL) {
+    /* Phase 77: goes through the same locked-write primitive as every
+       other ref write (locking + atomic rename + the D1a empty-directory
+       fix), not a bare fopen. */
+    written = snprintf(content, sizeof(content), "ref: refs/heads/%s\n", branch);
+    if (written < 0 || (size_t)written >= sizeof(content)) {
         if (wrote_log)
             sg_reflog_truncate(git_dir, "HEAD", offset);
         return -1;
     }
-    if (fprintf(f, "ref: refs/heads/%s\n", branch) < 0) {
-        fclose(f);
-        if (wrote_log)
-            sg_reflog_truncate(git_dir, "HEAD", offset);
-        return -1;
-    }
-    rc = fclose(f) == 0 ? 0 : -1;
+    rc = locked_ref_write(git_dir, "HEAD", (const unsigned char *)content, (size_t)written, NULL);
     if (rc != 0 && wrote_log)
         sg_reflog_truncate(git_dir, "HEAD", offset);
     return rc;
@@ -1232,6 +1776,13 @@ int sg_ref_set_head_detached(const char *git_dir, const unsigned char id[SG_SHA1
     int wrote_log = 0;
     int was_detached = (reflog_msg != NULL) ? sg_ref_head_is_detached(git_dir) : 0;
     int want_log = (reflog_msg != NULL);
+
+    /* Phase 77: clear the side channel first. refs.h promises the record
+       is meaningful right after a -1, and at least one early return below
+       never calls lock_err_set -- without this clear it would carry a
+       stale kind from an earlier, unrelated call, and the CLI would print
+       lock wording for a non-lock failure. */
+    lock_err_clear();
 
     if (reflog_msg != NULL) {
         /* The old value MUST come from sg_ref_resolve_head, not from
@@ -1286,6 +1837,15 @@ int sg_ref_move_head(const char *git_dir, const char *branch,
                      const char *reflog_msg)
 {
     char ref_path[SG_PATH_MAX];
+
+    /* Phase 77 fix round 3 (B): clear the side channel first, so a -1
+       never carries a stale kind from an earlier call (refs.h contract).
+       The branch==NULL
+       and snprintf-overflow returns below reach neither sg_ref_set_head_
+       detached nor sg_ref_update (both of which clear it themselves
+       anyway), so this only matters for the overflow branch, which
+       returns -1 without ever calling lock_err_set. */
+    lock_err_clear();
 
     if (branch == NULL)
         return sg_ref_set_head_detached(git_dir, target, reflog_msg);

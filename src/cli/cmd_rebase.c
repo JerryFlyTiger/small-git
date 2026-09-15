@@ -384,7 +384,14 @@ static int finish_rebase(const char *git_dir, const char *branch, const sg_rebas
     snprintf(head_msg, sizeof(head_msg), "rebase (finish): returning to %s", ref_path);
 
     if (sg_ref_update(git_dir, ref_path, tip, branch_msg) != 0) {
-        fprintf(stderr, "sg: failed to update branch '%s'\n", branch);
+        /* Phase 77 fix round, measured: rebase's finish write prefixes
+           AND trails with the BRANCH's own ref path, not "HEAD" -- unlike
+           every other lock-collision message in this project. */
+        char trailing[SG_PATH_MAX];
+
+        snprintf(trailing, sizeof(trailing), "could not update %s", ref_path);
+        if (!sg_ref_lock_err_report_ex(stderr, ref_path, ref_path, trailing))
+            fprintf(stderr, "sg: failed to update branch '%s'\n", branch);
         return -1;
     }
     if (sg_ref_set_head(git_dir, branch, head_msg) != 0) {
@@ -690,7 +697,8 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
                 return 1;
             }
             if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
-                fprintf(stderr, "sg: cannot point HEAD at '%s'\n", upstream_arg);
+                if (!sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", "could not detach HEAD"))
+                    fprintf(stderr, "sg: cannot point HEAD at '%s'\n", upstream_arg);
                 free(start_msg);
                 sg_rebase_state_remove(git_dir);
                 free(current_branch);
@@ -836,7 +844,8 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
             return 1;
         }
         if (sg_ref_set_head_detached(git_dir, upstream_commit, start_msg) != 0) {
-            fprintf(stderr, "sg: cannot point HEAD at '%s'\n", upstream_arg);
+            if (!sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", "could not detach HEAD"))
+                fprintf(stderr, "sg: cannot point HEAD at '%s'\n", upstream_arg);
             free(start_msg);
             sg_rebase_state_free(&state);
             return 1;

@@ -205,3 +205,16 @@ do not read the whole thing).
   different sources renamed onto one name give git an ordinary add/add
   whether or not it noticed the renames, so its 0-out-of-N is the correct
   answer and not a coverage gap. Do not "fix" the generator to make it fail.
+
+## Phase 77: fast-forward's HEAD move can refuse on a foreign lock
+
+`cmd_merge.c`'s fast-forward path's `sg_ref_move_head` call can now return
+-1 for a NEW reason (a foreign `refs/heads/<branch>.lock` or `HEAD.lock`),
+not just an I/O error -- the failure message uses
+`sg_ref_lock_err_report(stderr, "HEAD")` first (git's own fast-forward
+failure always names `'HEAD'`, even when the actual collision is on the
+branch's own lock, since HEAD's ref transaction is what fast-forward
+updates), falling back to the pre-existing generic message otherwise. The
+3-way merge path's own `sg_ref_move_head` call is UNCHANGED (still the
+generic message) -- best-effort per Phase 77's own spec, not required to
+match git's exact multi-line wording.

@@ -628,13 +628,19 @@ marked "fixed" in place, same as the other two retired entries above.)
     expected to red a DIFFERENT named set. This is git PARITY, not part
     of the divergence: the divergence itself is still exactly "no foreign
     lock present," where the alias probe (not any lock) is what refuses.
-    **`sg_ref_update` itself still takes no lock at all, project-wide,
-    for every OTHER ref-writing command** -- `sg tag -d`/`sg branch -d`/
-    the create/`-f` write above are the only three O_EXCL-guarded call
-    sites in this project; `switch`, `reset`, plain `tag` (create), and
-    `commit` all still silently override a concurrent git process's lock.
-    Recorded as the recommended NEXT phase in `docs/DESIGN.md`'s Phase 76
-    residuals, deliberately NOT fixed here.
+    **`sg_ref_update` itself took no lock at all, project-wide, for every
+    OTHER ref-writing command, until Phase 77** -- before that phase,
+    `sg tag -d`/`sg branch -d`/the create/`-f` write above were the only
+    three O_EXCL-guarded call sites in this project, and `switch`,
+    `reset`, plain `tag` (create), and `commit` all silently overrode a
+    concurrent git process's lock. Recorded as the recommended NEXT phase
+    in `docs/DESIGN.md`'s Phase 76 residuals; **fixed as of Phase 77**,
+    which threads the same O_CREAT|O_EXCL-lock-then-atomic-rename
+    mechanism through `sg_ref_update`/`sg_ref_write_path`/
+    `sg_ref_set_head`/`sg_ref_set_head_detached`/`sg_ref_delete_under`, so
+    every ref write and delete in this project now takes the target's own
+    lock. See `docs/DESIGN.md`'s `## Phase 77` section for the measured
+    oracle and the residuals it left.
     **Phase 76 fix round 4: the alias probe's own lock-taking (round 3's
     L1 fix) leaked EMPTY directories** (`refs/heads/<name>/`) for any
     NONEXISTENT nested delete target, since it ran for every batch name

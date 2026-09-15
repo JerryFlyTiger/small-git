@@ -312,12 +312,16 @@ static void test_push_list_drop_clear(void)
 /* ---- drop/clear roll back the reflog when the follow-up ref op fails ---- */
 
 /* Forces sg_stash_drop's non-empty path (rewrite succeeds, then
-   sg_ref_write_path fails) by chmod'ing refs/stash itself read-only right
-   before the drop: sg_ref_write_path truncates an EXISTING file in place, so
-   only the file's own write bit -- not the containing directory's -- needs
-   to be revoked. Asserts the reflog is put back so the tip invariant holds,
-   exactly what stash.c's rollback comment above sg_reflog_rewrite(git_dir,
-   "refs/stash", log.entries, log.count) promises. */
+   sg_ref_write_path fails) by chmod'ing the CONTAINING refs/ directory
+   read-only right before the drop. Phase 77: sg_ref_write_path now writes
+   through refs/stash.lock and atomically renames it onto refs/stash, so
+   chmod'ing the EXISTING refs/stash file itself no longer has any effect --
+   rename() replacing a file does not consult that file's own permission
+   bits (same fix as test_ref_update.c's sibling tests). Revoking refs/'s
+   write bit makes the O_CREAT|O_EXCL open() of refs/stash.lock itself fail.
+   Asserts the reflog is put back so the tip invariant holds, exactly what
+   stash.c's rollback comment above sg_reflog_rewrite(git_dir, "refs/stash",
+   log.entries, log.count) promises. */
 static void test_drop_rolls_back_on_ref_write_failure(void)
 {
     char *git_dir = make_tmp_repo();
@@ -345,13 +349,13 @@ static void test_drop_rolls_back_on_ref_write_failure(void)
     CHECK(sg_ref_read_path(git_dir, "refs/stash", old_tip) == 0, "refs/stash should exist before drop");
     CHECK(memcmp(old_tip, commit2, SG_SHA1_RAW_LEN) == 0, "refs/stash should point at the newest stash");
 
-    snprintf(ref_path, sizeof(ref_path), "%s/refs/stash", git_dir);
-    CHECK(chmod(ref_path, 0444) == 0, "chmod refs/stash read-only failed");
+    snprintf(ref_path, sizeof(ref_path), "%s/refs", git_dir);
+    CHECK(chmod(ref_path, 0555) == 0, "chmod refs/ read-only failed");
 
     CHECK(sg_stash_drop(git_dir, 0) == -1,
          "drop should fail once refs/stash cannot be rewritten (read-only)");
 
-    chmod(ref_path, 0644); /* restore before any further reads/writes */
+    chmod(ref_path, 0755); /* restore before any further reads/writes */
 
     /* Rollback must have restored the reflog so it still backs the
        untouched refs/stash (still commit2 -- the write never landed). */

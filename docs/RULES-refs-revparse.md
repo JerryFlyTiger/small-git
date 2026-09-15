@@ -529,3 +529,47 @@ do not read the whole thing).
   were left untouched. Every lock-leak check must also print the actual
   leftover path(s) on failure, not just fail silently -- a red run should
   name the file, not just say "found something".
+
+## Phase 77: every ref write/delete now locks, and a ref write can survive an empty directory
+
+- **All of `sg_ref_update` / `sg_ref_write_path` / `sg_ref_set_head` /
+  `sg_ref_set_head_detached` / `sg_ref_delete_under` go through ONE static
+  primitive, `locked_ref_write` (`storage/refs.c`)** -- it takes
+  `<ref_path>.lock` (O_CREAT|O_EXCL, the same mechanism Phase 76's
+  `sg_ref_lock_try` already used elsewhere), writes into it, and
+  `rename()`s it onto the ref path. Do not add a NEW ref-writing function
+  that bypasses this (e.g. a bare `fopen`/`sg_write_file_mkdirs` on a ref
+  path) -- see `docs/RULES-duplication.md`'s standing rule and Phase 77's
+  own DESIGN.md section for why this was consolidated to one place instead
+  of copied per call site.
+- **A caller that already holds the lock it is about to write into must
+  use `sg_ref_update_locked`, not `sg_ref_update`** -- calling
+  `sg_ref_update` while already holding `<ref_path>.lock` collides with
+  your OWN lock (EEXIST against yourself). `cmd_branch.c`'s create/`-f`
+  path is the one caller today; if a second one is ever added, grep
+  `sg_ref_lock_try` for every caller that locks a path BEFORE calling
+  `sg_ref_update` on that same path.
+- **Updating the branch HEAD currently points at takes a PHANTOM
+  `HEAD.lock` too**, even when HEAD's own file content never changes
+  (only `logs/HEAD` gets a mirrored reflog line) -- this is
+  `sg_ref_update`'s `is_current_branch` branch, and it is what makes
+  `commit`/`reset`/`merge --ff-only`/`cherry-pick` refuse under a foreign
+  `HEAD.lock` even though none of them writes HEAD's file directly. Taken
+  BEFORE any reflog append, so a foreign lock refuses before anything is
+  written at all (leaving both refs' reflogs untouched, not partially
+  written and rolled back).
+- **`sg_ref_last_lock_err()`/`sg_ref_lock_err_report()`** (both declared
+  in `refs.h`) are the errno-shaped side channel for building git's exact
+  wording at a CLI call site after any of the functions above return -1 --
+  valid only immediately after that call, one call's worth of detail, not
+  reset between different failure KINDS (always check `->kind` first). Use
+  `sg_ref_lock_err_report(stderr, ref_display)` rather than hand-rolling a
+  fourth copy of the "Another git process..." HINT block (`cmd_branch.c`'s
+  Phase-76 copy is the one this shares its exact text from).
+- **D1a**: `sg_ref_remove_empty_dir_tree` (non-`static`, `refs.h`) removes
+  an empty directory (or nested tree of them) sitting at a ref path or a
+  reflog path before the write, matching real git. It is depth-first and
+  STOPS at the first REGULAR FILE found, leaving already-empty siblings
+  removed -- do not "simplify" this to an all-or-nothing removal, that
+  changes which siblings survive a D/F-conflict refusal (pinned in
+  `tests/interop.sh`'s `phase77` group and `tests/test_ref_locked_write.c`).

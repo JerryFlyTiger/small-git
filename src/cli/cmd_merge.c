@@ -128,7 +128,8 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
         return 1;
     }
     if (sg_ref_move_head(git_dir, current_branch, theirs_commit, reflog_msg) != 0) {
-        fprintf(stderr, "sg: failed to update HEAD\n");
+        if (!sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", NULL))
+            fprintf(stderr, "sg: failed to update HEAD\n");
         free(reflog_msg);
         return 1;
     }
@@ -470,7 +471,8 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
                 goto done;
             }
             if (sg_ref_move_head(git_dir, current_branch, new_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: failed to update HEAD\n");
+                if (!sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", NULL))
+                    fprintf(stderr, "sg: failed to update HEAD\n");
                 free(reflog_msg);
                 rc = 1;
                 goto done;

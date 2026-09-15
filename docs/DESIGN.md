@@ -18156,6 +18156,8 @@ project-wide behavior change that needs its own measurement pass (starting
 with the one unmeasured row above, `sg commit` under a `HEAD.lock`, using a
 real content change rather than `--allow-empty`).
 
+**FIXED as of Phase 77** -- see this file's `## Phase 77` section.
+
 ## Phase 76 fix round 4: fd exhaustion regressed shipped `sg tag -d`, and the alias probe leaked empty directories
 
 Round 4 acceptance: `SG_BIN=<path> python3 oracle.py` (main conversation's
@@ -18364,6 +18366,9 @@ directory sitting where it wants to write a file -- the identical
 recorded and deferred alongside it rather than fixed as a
 `cmd_branch.c`-only patch.
 
+**FIXED as of Phase 77**, together with L2 -- see this file's `## Phase 77`
+section.
+
 ### L2 (residual, unchanged from round 3, NOT fixed this phase): `sg_ref_update` still takes no lock, project-wide
 
 See round 3's own L2 section for the measured table; unchanged this round.
@@ -18374,6 +18379,10 @@ See round 3's own L2 section for the measured table; unchanged this round.
 process's lock, and none of them tolerate an empty directory the way D1a
 above needs. Both residuals point at the same function and the same next
 phase.
+
+**FIXED as of Phase 77** -- see this file's own `## Phase 77` section
+(after the round-8 material below) for the measured oracle, the design
+chosen, and the residuals it left.
 
 ## Phase 76 fix round 5: a shipped destructive bug, a deleted guard that still guarded a side effect, and an inferred mechanism that only matched one fixture
 
@@ -18931,3 +18940,478 @@ failure it now prints `expected exactly 1 lock under .git/refs (the
 foreign one), found N:` (N computed the same way the pass/fail check
 itself computes it) before the list. Pass/fail logic unchanged -- still
 exactly `grep -c .` compared to `1`.
+
+## Phase 77: every ref write takes git's `<ref>.lock`, and a ref write succeeds through an empty directory
+
+Closes L2 and D1a (both recorded in the Phase 76 round-3/round-4 sections
+above) together, as their own text predicted: both point at
+`sg_ref_update` (and its siblings `sg_ref_write_path`, `sg_ref_set_head`,
+`sg_ref_set_head_detached`, and -- newly brought into the same mechanism
+this phase -- `sg_ref_delete_under`), so one fix closes both.
+
+### Measured oracle (git 2.55.0)
+
+A foreign `<ref>.lock` refuses the write outright: nonzero exit, the ref
+file and its reflog both byte-identical to before the attempt, the foreign
+lock left exactly as it was. Side effects that happened BEFORE the ref
+write (a merge's worktree update, a stash's worktree reset) are NOT rolled
+back by git, and sg does not roll them back either -- this matches sg's
+pre-existing call order, no new rollback logic was added.
+
+Updating a branch HEAD currently points at needs BOTH
+`refs/heads/<b>.lock` AND `HEAD.lock`; either one existing refuses the
+WHOLE write, even for a content no-op (`sg reset --hard HEAD`) -- real
+git's HEAD write is "the ref transaction that includes HEAD's mirrored
+reflog line runs", not "the file content changes". Writing HEAD directly
+(`switch`, a detached commit/reset) needs only `HEAD.lock`.
+
+D1a: an empty directory (or nested tree of empty directories) sitting at
+the ref path, or at the reflog path, does not block a write that would
+otherwise succeed -- git removes the empty subtree first, depth-first,
+stopping the instant a REGULAR FILE is found anywhere under it (so
+siblings already found empty stay removed even when a later sibling
+blocks the rest). A real file anywhere under the directory is a D/F
+conflict, refused with git's own wording naming the exact colliding file.
+
+### Design chosen
+
+**The lock-holding write is the primitive.** `locked_ref_write`
+(`src/storage/refs.c`, `static`) takes `<git_dir>/<ref_path>.lock` via the
+existing `sg_ref_lock_try` (O_CREAT|O_EXCL, unchanged from Phase 76),
+writes the new content into the lock file, and `rename()`s it onto the ref
+path -- which is also what makes the write ATOMIC (a crash between the
+write and the rename leaves the ref untouched), a property this project's
+ref writes did not have before this phase. `write_ref_path_raw`,
+`sg_ref_set_head`, and `sg_ref_set_head_detached` were rewritten to go
+through it instead of a bare `fopen`/`sg_write_file_mkdirs`.
+
+**The `cmd_branch.c` landmine** (flagged by name in this phase's own
+spec): `create_branch` already takes `refs/heads/<name>.lock` itself
+(Phase 76) before deciding whether to write, so a naive `sg_ref_update`
+that also tries to lock the same path would collide with its own caller.
+Closed with `sg_ref_update_locked(git_dir, ref_path, lock, ...)`: an
+`existing`-lock parameter that, when non-NULL, is CONSUMED (renamed into
+place, `held` cleared) instead of a fresh lock being acquired.
+`cmd_branch.c`'s one call site was switched to it.
+
+**The HEAD-mirroring phantom lock.** `sg_ref_update`'s existing
+`is_current_branch` branch (Phase 17's reflog-mirroring rule) now also
+takes a `sg_ref_lock_try(git_dir, "", "HEAD", ...)` BEFORE any reflog
+append, released (never renamed into, since HEAD's own file content is
+unchanged by this path -- only `logs/HEAD` gets a line) once the whole
+write finishes or fails. This is what makes `commit`/`reset`/`merge
+--ff-only`/`cherry-pick` refuse under a foreign `HEAD.lock` even though
+none of them writes HEAD's file content directly.
+
+**D1a shares one removal routine two ways.** `sg_ref_remove_empty_dir_tree`
+(non-`static`, declared in `refs.h`) is called from `locked_ref_write`
+(for the ref path itself) and, separately, from `sg_reflog_append`
+(`storage/reflog.c`, for the reflog path) -- see
+`docs/RULES-duplication.md`'s standing rule against a second copy of the
+same walk. `sg_reflog_append`'s call site treats a D/F conflict (`-2`) as
+"fall through, let the ordinary `fopen` failure report it" rather than
+inventing a second D/F message, since this project's reflog layer has
+never had one.
+
+**Delete is a write too.** `sg_ref_delete_under` (the shared engine behind
+`sg branch -d`, `sg tag -d`, and `sg stash pop`/`drop`'s `refs/stash`
+removal) now takes the SAME lock before actually removing the loose file.
+`cli/ref_delete.c`'s own pre-existing lock (Phase 76, taken purely to
+detect an in-BATCH collision up front) is released before its pass 3 ever
+calls `sg_ref_delete_under`, so the two do not collide -- and acquiring a
+fresh lock at delete time closes, as a side effect, the real TOCTOU window
+between that release and the actual unlink that existed even in the
+Phase-76-shipped code. `sg stash pop`/`drop` had NO lock of their own
+before this phase (the actual gap the oracle's `X stash pop/drop
+stash.lock` rows measure) and are now protected purely by
+`sg_ref_delete_under`'s own new lock.
+
+**`sg_stash_push`'s "not fatal" comment was half right.** Its final
+worktree-reset step (`sg_ref_move_head(..., "reset: moving to HEAD")`) was
+deliberately non-fatal on failure (the stash commit and worktree reset
+already happened; refusing the whole command would misreport work that
+did happen) -- true for an ordinary I/O failure, but measured FALSE for a
+lock collision: real git's own `stash push` exits 1 in that case. Fixed by
+checking `sg_ref_last_lock_err()->kind` after the failure: a
+`SG_REF_LOCK_ERR_LOCKED`/`_DF` kind now returns `-2` (this function's own
+pre-existing "durable stash entry, but a later step failed" convention,
+already handled by `cmd_stash.c`), any other kind keeps the old warn-and-
+continue behavior unchanged.
+
+**Error reporting: a shared last-failure record, not a signature change.**
+Every ref-writing function in `refs.h` keeps its existing `int`
+0/-1 signature (this project's own "errors return int" convention) --
+`sg_ref_last_lock_err()`/`sg_ref_lock_err_report()` are a new,
+errno-shaped side channel (valid only immediately after a -1 return, one
+call's worth of detail, no threads to race) rather than widening every one
+of the ~15 call sites' function signatures. `sg_ref_lock_err_report`
+prints git's own two message shapes (`LOCKED`: "cannot lock ref '<ref>':
+Unable to create '<lock>': File exists." + the HINT block, shared with
+`cmd_branch.c`'s Phase-76 copy of the same text; `DF`: "cannot lock ref
+'<ref>': '<conflict>' exists; cannot create '<ref>'") and lets a call site
+override the displayed ref name (git shows `'HEAD'` for the mirroring
+failure even though the underlying collision may be on the branch's own
+lock).
+
+### Call sites updated
+
+`cmd_commit.c`, `cmd_switch.c` (both the `-c` create write and the HEAD
+write), `cmd_reset.c` (all three call sites, identical pattern), `cmd_tag.c`
+(both create/`-f`), `cmd_merge.c` (fast-forward path), `cmd_stash.c` (pop
+and apply-then-pop's drop step), `cmd_branch.c` (switched to
+`sg_ref_update_locked`), `safety/stash.c` (the push-time worktree-reset
+step). `pick.c`, `cmd_rebase.c`, `cmd_fetch.c`, `cmd_push.c`, `cmd_clone.c`,
+`safety/snapshot.c`, `storage/chunk.c`, `storage/repo.c` were NOT given
+bespoke messages -- their existing generic failure handling already
+propagates the new `-1` correctly (refuses, exit 1, ref unchanged), so
+they meet this phase's best-effort floor without a wording change; a
+future phase can add exact wording for them the same way this phase did
+for the required rows, using `sg_ref_lock_err_report`.
+
+### Residuals / explicitly out of scope this phase
+
+- **`sg switch -c <name> <start-point>` (two positional arguments) is not
+  implemented at all** (`usage: sg switch [-c] [--detach] [--force|-f]
+  <branch>`) -- a PRE-EXISTING gap in `cmd_switch.c`'s argument parser,
+  unrelated to ref locking; the oracle's `switch -c new topic HEAD.lock`
+  row cannot be measured until that feature exists. Not fixed here (out of
+  this phase's scope: adding a CLI feature, not closing a lock gap).
+- **`ORIG_HEAD` is not locked** -- sg does not write `ORIG_HEAD` at all
+  (a pre-existing, unrelated gap; out of scope per this phase's own spec).
+- **`cherry-pick`/`revert` leave `CHERRY_PICK_HEAD`/`REVERT_HEAD` behind
+  after a refused write; sg does not** -- matches git's own measured
+  behavior in the best-effort sense the spec asked for (refuses, ref
+  unchanged) but not byte-for-byte state, since sg's sequencer state is a
+  separate, unaffected mechanism from the ref lock this phase closes.
+- **A pre-existing, unrelated divergence in `sg stash push`'s stash-commit
+  object id** (measured: sg's and git's stash commits hash differently
+  even on an otherwise-identical fixture, apparently a stash-commit
+  construction difference predating this phase) makes three of the
+  oracle's `stash push` rows report a state difference even though both
+  sides fully succeed and the ref/lock behavior itself matches. Not
+  investigated further here -- it is not a locking question, and no
+  existing `interop.sh` check compares raw stash commit ids for equality
+  (the baseline 4583/4583 predates this phase and would already have
+  caught it if it were pinned anywhere).
+- **`sg_ref_update` still takes no lock for `switch`/`reset`/plain `tag`
+  (create)/`commit` on the WORKING-TREE side effects that happen before
+  the ref write** -- unchanged, matches git's own measured "side effects
+  before the ref write are not rolled back" behavior, not a gap.
+- Exact per-command stderr wording was matched for the REQUIRED rows this
+  phase's spec named (commit, switch, reset, tag, merge fast-forward,
+  stash pop/drop) -- see the "Phase 77 fix round 2" section below, which
+  ALSO matched every "best-effort" row this bullet used to describe as
+  unattempted (3-way merge, cherry-pick, revert, rebase start/finish,
+  stash push) once the actual measured wording (`sg_ref_lock_err_report_ex`'s
+  prefix/trailing axes) was known. Superseded, kept only so a reader
+  following an old cross-reference lands somewhere that explains why.
+
+## Phase 77 fix round 2: stderr wording matched for every measured row, plus a stale-side-channel/lock-ordering/print-layering review pass
+
+Round 1 (above) closed the ref-locking MECHANISM (state: rc, ref/reflog
+content, no stray `.lock`) but left most stderr text as sg's own
+pre-existing generic messages. This round matched git's own wording,
+measured per command, and then a cold-read review pass (labeled F1-F9 by
+the reviewer) found and fixed five further defects the mechanism itself
+still had.
+
+### Wording: `sg_ref_lock_err_report_ex`
+
+Git's own "cannot lock ref ..." message is NOT one fixed shape -- measured
+against git 2.55.0, per command, it varies on two independent axes:
+
+- an optional `"update_ref failed for ref '<X>': "` PREFIX before
+  `"cannot lock ref '<Y>': ..."` (`X` and `Y` can legitimately differ --
+  rebase's finish write prefixes+names the BRANCH, not `HEAD`);
+- an optional TRAILING line after the HINT block (`"unable to update
+  HEAD"`, `"cherry-pick failed"`/`"revert failed"`, `"could not detach
+  HEAD"`, `"could not update refs/heads/<b>"`).
+
+`sg_ref_lock_err_report_ex(FILE *out, ref_display, prefix_ref, trailing)`
+(`refs.h`/`refs.c`) takes both as explicit parameters; the original
+`sg_ref_lock_err_report` is now a thin wrapper passing both NULL. Measured
+mapping, per call site:
+
+| Call site | prefix_ref | trailing |
+|---|---|---|
+| `commit`, `tag`, `switch` (create-branch write), `switch` (plain, not `--detach`) | none / none | none / `"unable to update HEAD"` |
+| `switch --detach`, `reset` (all 3 modes), `merge --ff-only`, `merge` (3-way) | `"HEAD"` | none |
+| `cherry-pick`/`revert` (both the initial attempt and `--continue`) | none | `"<op> failed"` |
+| `rebase` start (the initial detach) | `"HEAD"` | `"could not detach HEAD"` |
+| `rebase` finish (the branch move) | the branch's own `ref_path` | `"could not update <ref_path>"` |
+| `stash push`'s worktree-reset step, kind == LOCKED/DF | `"HEAD"` | none (see F3/F4 below) |
+| `stash push`'s EARLIER `refs/stash` create, kind == LOCKED/DF | n/a | git's own wording here has NO `fatal:`/`error:`/`sg: ` prefix at all: exactly `"Cannot save the current status"` (a shell-wrapper catch-all, not `update_ref`'s own message) -- sg prints `"sg: Cannot save the current status"` (the `sg: ` still strips cleanly in the oracle/interop normalizers, both of which strip a KNOWN prefix per line, not per file) |
+
+`tag -a`'s extra `"The tag message has been left in .git/TAG_EDITMSG"`
+line and `rebase`'s `"Rebasing (N/M)"` progress (each terminated by a
+CARRIAGE RETURN, not a newline -- measured, `od -c`; a naive whole-LINE
+`grep -v` cannot strip it, since the progress text and the real error
+share one `\n`-delimited "line") are both left unmatched, out of scope
+(not lock-related).
+
+### F1: the side channel leaked a stale kind across calls
+
+`sg_ref_update`, `sg_ref_set_head`, `sg_ref_set_head_detached`, and
+`sg_ref_delete_under` each now call `lock_err_clear()` as the FIRST
+statement (before any early return). (`sg_ref_update_locked` and
+`locked_ref_write` had one too; rounds 4-5 DELETED both as redundant
+guards, since every -1 they return records its own kind via
+`lock_err_set` -- see "Entry-clear coverage for every remaining public
+writer" in the round-3 section.) Before this, a function whose OWN early
+failure (a namespace-policy
+rejection, an allocation, a plain reflog I/O error) never reached the
+locking code at all left whatever a PREVIOUS, unrelated call had recorded
+sitting in `g_ref_lock_err`, so a CLI call site checking
+`sg_ref_last_lock_err()->kind` after such a failure could print LOCKED/DF
+wording for a failure that had nothing to do with a lock. Verified with a
+new test, `test_lock_err_does_not_leak_across_calls`
+(`tests/test_ref_locked_write.c`): provokes a real LOCKED failure, clears
+the foreign lock, then forces an ordinary reflog-I/O failure on a
+DIFFERENT, brand-new ref (no intervening successful write -- an
+intervening one would itself re-clear the channel via its own entry
+clear, masking a missing clear in the function under test behind a
+redundant one; an earlier draft of this test had exactly that redundancy
+and stayed green under `bash tests/mutate.sh` with the entry clear
+removed, a false negative caught before landing) and asserts the recorded
+kind is `SG_REF_LOCK_ERR_NONE`. Mutation-verified: removing
+`sg_ref_update`'s own entry `lock_err_clear()` call makes this test red.
+An ordinary reflog-append I/O failure deliberately does NOT call
+`lock_err_set` either (leaving the channel at the NONE the entry clear
+already set) -- it is not a lock failure, and `SG_REF_LOCK_ERR_OTHER`
+would be equally silent from `sg_ref_lock_err_report`'s point of view
+(both NONE and OTHER return 0, print nothing), but NONE is the more
+honest value to leave on record.
+
+### F2: `sg_ref_set_symref` was still a bare mkdir+fopen
+
+The one caller (`cmd_clone.c`, creating `refs/remotes/<remote>/HEAD`) went
+through no lock and no D1a handling at all, which made CLAUDE.md's and
+`docs/RULES-refs-revparse.md`'s "every ref write" claim not actually
+true. Now routes through `locked_ref_write`, identically to every other
+symbolic-content ref write in this project.
+
+### F3/F4: `sg_stash_push`'s lock message was wrong and printed twice
+
+The message printed at the point of a lock/D-F failure on the
+worktree-reset step ("...working directory could not be reset to
+HEAD...") was factually WRONG -- the actual worktree reset already
+succeeded, several lines earlier, via `sg_apply_tree_to_workdir`; the
+failing call here is a NO-OP reflog-mirroring write (old_id == new_id,
+the same shape as any other current-branch HEAD write), not a worktree
+operation at all. It was ALSO printed a second time by `cmd_stash.c`'s
+generic `-2` handler, which prints unconditionally regardless of the
+specific failure reason -- every OTHER `-2` path in this function prints
+nothing at the library layer, and this one should not have been the
+exception. Fixed by making `safety/stash.c` print-free for this case
+(matching the project's own "lower layers return codes, the CLI layer
+reports" convention) and having `cmd_stash.c`'s `-2` branch check
+`sg_ref_last_lock_err()->kind` itself: LOCKED/DF gets git's own
+single-line wording (`sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD",
+NULL)`, matching the measured `stash push master.lock` row exactly, only
+one line, nothing about the stash entry at all); anything else keeps the
+pre-existing generic "stash was created, but a later step failed..." +
+`stash@{0}` message, unchanged.
+
+### F6: no test covered `sg_stash_push` hitting a lock
+
+Added to `tests/interop.sh`'s `phase77` group: `stash push` with
+`refs/heads/master.lock` planted, asserting exit 1, the stash entry
+EXISTS on both sides (unlike the EARLIER `refs/stash.lock` case, where
+the push never gets far enough to create one), and the exact
+`sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", NULL)` wording.
+
+### F7: the ref's own lock was taken too late, after both reflog appends
+
+`sg_ref_update` used to acquire the PHANTOM `HEAD.lock` before either
+reflog append (Phase 77 round 1), but the ref's OWN `<ref_path>.lock` was
+only taken inside the final write, AFTER both reflog lines were already
+on disk (rolled back by truncation on a later failure) -- observably
+equivalent for the FINAL state (truncate undoes it) but not the ORDERING
+git's own transaction uses (every ref touched by a transaction is locked
+before any reflog line in that transaction is written), and not safe
+against a crash between the (now-removed) early write and the truncate.
+Fixed by splitting the old single-shot `locked_ref_write` into
+`locked_ref_acquire` (path-safety + D1a + the `O_CREAT|O_EXCL` lock) and
+`locked_ref_commit` (write + atomic rename, consuming an already-held
+lock) -- `sg_ref_update` now calls `locked_ref_acquire` for the ref's own
+lock immediately after the phantom HEAD lock (before either reflog
+append), and `locked_ref_commit` only at the very end. `locked_ref_write`
+itself becomes a thin acquire-then-commit wrapper for every OTHER caller
+that does a single lock attempt. Mutation-verified indirectly through the
+existing test suite (no test asserts the ORDERING directly, only the
+observable end states, which round 1's tests already covered) --
+`bash tests/gates.sh --sanitize` stayed green after the split, and
+`oracle77.py`'s full sweep was re-run and reconfirmed unchanged.
+
+**Regression this refactor introduced and then fixed** (caught by this
+round's own oracle re-run, not by any pre-existing test): `locked_ref_
+acquire`'s D1a empty-directory removal became unreachable for
+`sg_ref_update_locked`'s `existing`-lock path (`cmd_branch.c`'s
+create/`-f` write, which already holds its own lock and therefore never
+calls `locked_ref_acquire` at all) -- `sg branch nope` against an empty
+`refs/heads/nope/` directory started failing again (`branch nope
+emptydir`/`branch nope nested emptydirs` regressed from OK to DIFF).
+Fixed by factoring the D1a check into its own `locked_ref_clear_blocking_
+dir`, called from BOTH `locked_ref_acquire` and `locked_ref_write`'s
+`existing != NULL` branch, so every path that can reach `locked_ref_
+commit` has already had the D1a check applied first, regardless of which
+lock-acquisition route got it there.
+
+### F9: the atomicity test did not distinguish rename from in-place write
+
+`test_write_is_full_length_never_truncated` (round 1) only asserted the
+final file size was correct, which an in-place `fopen(path, "wb")` that
+merely finished successfully would ALSO produce -- it could not actually
+tell "wrote via rename" apart from "wrote in place, but happened not to
+be observed mid-write". Renamed to `test_write_is_atomic_rename_not_in_
+place_truncate` and given a second, discriminating assertion: the ref
+file's INODE (`stat().st_ino`) must differ before and after overwriting
+an EXISTING ref, since `rename()` always replaces the directory entry
+with a different inode (the lock file's own) while an in-place rewrite of
+the same path keeps the same inode. Mutation-verified together with the
+other locked-write tests (disabling the `rename()` call turns this test,
+and several others, red).
+
+## Phase 77 fix round 3: a real path-traversal regression from round 2's split, plus ordering/leak test coverage the reviewer asked for by name
+
+### A (HIGH -- real regression from round 2's acquire/commit split)
+
+`locked_ref_write`'s `existing != NULL` branch (`sg_ref_update_locked`'s
+consume-a-held-lock path, `cmd_branch.c`'s create/`-f` write) called
+`locked_ref_clear_blocking_dir` -- an unguarded `lstat`/`opendir`/`rmdir`
+walk of `git_dir + "/" + ref_path` -- WITHOUT first validating `ref_path`
+with `sg_ref_path_components_are_safe`. Round 2 moved that validation
+into `locked_ref_acquire`, and this branch never calls
+`locked_ref_acquire` (the caller already holds the lock), so the
+validation silently stopped happening for it. The comment on
+`locked_ref_clear_blocking_dir` claimed path-safety "already fires
+earlier in every call path" -- false for this exact branch. Not
+reachable through `cmd_branch.c`'s own caller today (it validates the
+typed name itself, via `sg_ref_name_valid_for_create`, before ever
+reaching this code), but `sg_ref_update_locked` has no caller-independent
+guarantee of that, and the invariant this project already documents on
+`sg_ref_lock_try`/`sg_ref_lock_try_query` ("every name MUST already have
+passed the check") applies here too.
+
+Fixed by restoring the check on that branch (returns -1,
+`SG_REF_LOCK_ERR_OTHER`) and rewriting the now-accurate comment.
+Verified with `test_update_locked_rejects_unsafe_ref_path`
+(`tests/test_ref_locked_write.c`), built on the CLAUDE.md Phase 76 R4-1
+technique explicitly requested: "plant something AT the escape target"
+is the WRONG fixture here (an existing file/dir there yields the same
+observable failure whether or not the guard ran, so it cannot
+discriminate) -- instead an EMPTY directory at the escape target
+(`/tmp/sg_p77_escape_marker_<pid>/inner`, reached via a ref_path of
+`"../../sg_p77_escape_marker_<pid>/inner"`, which resolves outside
+`git_dir` because `make_tmp_repo`'s `git_dir` is always exactly two path
+components below `/tmp`) is asserted to SURVIVE the call. Mutation-
+verified: removing the restored check turns this test red (and only
+this test -- the FAIL line names exactly the "must SURVIVE" assertion,
+nothing else).
+
+### B: three more public writers were missing their entry clear
+
+`sg_ref_move_head`, `sg_ref_update_branch`, `sg_ref_set_symref` each had
+an early-return branch (an unsafe name, an overlong branch name) that
+returned -1 without ever touching the side channel -- unlike every other
+public writer fixed in round 2, none of these three had a
+`lock_err_clear()` at entry at all. Fixed identically to the round-2
+pattern (first statement, before any early return).
+
+### F7 ordering: a real mutation the test suite could not catch
+
+Main conversation's own mutation (moving `locked_ref_acquire` in
+`sg_ref_update` to AFTER both reflog appends) stayed fully green under
+`make test` AND `interop.sh` -- the END STATE round 2's tests already
+covered (ref/reflog rolled back correctly either way) does not
+distinguish the two orderings, only which ERROR KIND gets recorded along
+the way. Added `test_update_locks_ref_before_reflog_append`: plants a
+foreign `refs/heads/x.lock` AND makes `logs/refs/heads` read-only (so
+the reflog append would ALSO fail, for an unrelated reason, if it were
+ever reached), then asserts the recorded kind is
+`SG_REF_LOCK_ERR_LOCKED` -- with the wrong order, the reflog append
+fails FIRST (a non-lock I/O error) and the recorded kind would be NONE
+instead. Mutation-verified with a proxy for the reviewer's exact
+reorder (replacing the own-lock acquisition with a no-op success, since
+a literal multi-statement reorder does not fit a single-line `perl -0pe`
+substitution cleanly): this specific test goes red, distinctly named,
+alongside the expected cascade of other tests that plant a lock and
+expect it to be honored.
+
+### Entry-clear coverage for every remaining public writer
+
+`test_lock_err_does_not_leak_across_calls` (round 2) covered only
+`sg_ref_update`. Extended with one no-leak test per remaining public
+writer -- `sg_ref_update_locked`, `sg_ref_delete_under`,
+`sg_ref_set_head`, `sg_ref_set_head_detached`, `sg_ref_move_head`,
+`sg_ref_update_branch`, `sg_ref_set_symref` -- via a shared
+`provoke_stale_locked` helper (plant a foreign lock on a throwaway ref,
+confirm LOCKED is recorded, remove the lock) followed IMMEDIATELY by a
+call into the writer under test that fails for an unrelated reason (an
+unsafe/overlong name, a disallowed reflog namespace, or a read-only
+`logs/` directory), with NO intervening successful write in between --
+an intervening success would re-clear the channel via its OWN entry
+clear, masking a missing clear in the function actually under test (see
+round 2's own note on this exact false-negative shape, confirmed there
+the hard way). ONE of the seven lands on `SG_REF_LOCK_ERR_OTHER` rather
+than NONE (`sg_ref_update_locked`'s disallowed-namespace branch
+explicitly sets OTHER); the other six assert NONE.
+
+**Rounds 4-5 correction:** that one test proves no LOCKED leak, but NOT
+an entry clear. The cold read traced every exit of
+`sg_ref_update_locked`: every -1 records its own kind, either directly
+via `lock_err_set` or from a failure branch inside `locked_ref_write`
+(all of which set one too). So these clears were unobservable through any
+input and were deleted rather than documented as covered:
+
+- `sg_ref_update_locked`'s entry clear (round 4; unobservable by tracing
+  every exit);
+- `locked_ref_write`'s entry clear (round 5; a full-`make test` mutation
+  deleting it stayed green, and every -1 below it was traced to a
+  `lock_err_set`);
+- the `lock_err_clear()` immediately before `lock_err_set` in
+  `sg_ref_update_locked`'s namespace and reflog-append branches (round 5;
+  a full-`make test` mutation deleting both stayed green) and the same
+  pattern in `write_ref_path_raw` (round 5; NOT mutated -- dead by
+  construction, since `lock_err_set` resets the whole record itself).
+
+None of them guarded a side effect either: a clear only frees and resets
+the in-process side-channel record, with no file, lock, subprocess or
+network operation behind it. The rule that replaces them is the one the
+code comments now state: a new failure branch must call `lock_err_set`
+itself. The other six writers' entry clears ARE individually
+load-bearing: each test's chosen failure branch sets no kind of its own,
+and each was mutation-verified red.
+
+### `sg_ref_set_symref`'s own dedicated lock test
+
+Added `test_set_symref_foreign_lock_refuses`: a foreign
+`refs/remotes/origin/HEAD.lock` refuses the write (kind LOCKED, lock
+survives, the ref FILE is never created) -- this function's own
+behavior was never directly pinned before (F2, round 2, only routed it
+through the shared primitive; round 2's own test suite exercised the
+primitive through OTHER callers).
+
+### Residual D: the D/F kind's prefix_ref/trailing wording combination is unmeasured outside one row
+
+`sg_ref_lock_err_report_ex`'s `prefix_ref`/`trailing` parameters were
+measured (round 2) against the `SG_REF_LOCK_ERR_LOCKED` shape across
+every required command. The `SG_REF_LOCK_ERR_DF` shape combined with a
+non-NULL `prefix_ref`/`trailing` has exactly ONE measured oracle row
+(`switch -c nope` against a NON-EMPTY `refs/heads/nope/`, which uses
+neither parameter -- `NULL`/`NULL`) -- no row in this project's oracle
+exercises a D/F conflict on `reset`/`merge`/`cherry-pick`/`revert`/
+`rebase`, where a prefix or trailing line would also apply. The
+mirrored handling in `sg_ref_lock_err_report_ex`'s DF branch is
+therefore UNVERIFIED for that combination; treat it as a plausible
+generalization, not a measured fact, until such a row exists.
+
+### Interop flake (recorded, not investigated further)
+
+Main conversation's `bash tests/gates.sh --sanitize` run on rounds 1+2
+(before this round's own edits) got `4671/4679` with 8 `FAIL` lines, all
+in the phase68/69 ambiguity-block group -- a group this phase does not
+touch (no ref writes there) and ran unmodified. An immediate rerun on
+the identical tree got `4679/4679`, no FAILs. Cause not found; recorded
+here rather than silently ignored, in case a future phase touching that
+group reads this as background noise it is not responsible for.

@@ -12,6 +12,7 @@
 #include "sg/quote.h"
 #include "sg/rebase.h"
 #include "sg/pathspec.h"
+#include "sg/refs.h"
 #include "sg/repo.h"
 #include "sg/sequencer.h"
 #include "sg/stash.h"
@@ -202,15 +203,32 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         /* The stash commit + refs/stash were already written durably (it IS
            on `sg stash list`) -- only the snapshot or the working-tree reset
            back to HEAD failed after that. Saying "cannot create stash" here would
-           be a lie: the entry exists, only its cleanup step is in doubt. */
-        sg_stash_list list;
+           be a lie: the entry exists, only its cleanup step is in doubt.
 
-        fprintf(stderr, "sg: stash was created, but a later step failed (snapshot, restoring the working directory to "
-                        "HEAD, or (under -u/-a) removing untracked files now in the stash / pruning empty "
-                        "directories); please check the working directory state yourself\n");
-        if (sg_stash_list_read(git_dir, &list) == 0 && list.count > 0) {
-            fprintf(stderr, "sg: that stash is stash@{0}: %s\n", list.entries[0].message);
-            sg_stash_list_free(&list);
+           Phase 77 fix round 2 (F3/F4): a LOCK collision on the reflog-
+           mirroring HEAD write gets git's own single-line wording instead
+           -- measured (`stash push master.lock`): git prints ONLY
+           "update_ref failed for ref 'HEAD': cannot lock ref 'HEAD':
+           ..." + the HINT, nothing about the stash entry at all, so
+           printing the generic message (or the stash@{0} line) alongside
+           it here would both misdescribe the failure (this is a LOCK
+           refusal, not a vague "later step failed") and double-report
+           it. */
+        if (sg_ref_last_lock_err()->kind == SG_REF_LOCK_ERR_LOCKED ||
+           sg_ref_last_lock_err()->kind == SG_REF_LOCK_ERR_DF) {
+            if (!sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", NULL))
+                fprintf(stderr, "sg: stash was created, but the working directory could not be reset to "
+                                "HEAD\n");
+        } else {
+            sg_stash_list list;
+
+            fprintf(stderr, "sg: stash was created, but a later step failed (snapshot, restoring the working directory to "
+                            "HEAD, or (under -u/-a) removing untracked files now in the stash / pruning empty "
+                            "directories); please check the working directory state yourself\n");
+            if (sg_stash_list_read(git_dir, &list) == 0 && list.count > 0) {
+                fprintf(stderr, "sg: that stash is stash@{0}: %s\n", list.entries[0].message);
+                sg_stash_list_free(&list);
+            }
         }
         sg_pathspec_free(&pathspec);
         free(git_dir);
@@ -227,6 +245,15 @@ static int cmd_stash_push(int argc, char **argv, const char *usage)
         if (bad_path[0] != '\0')
             fprintf(stderr, "sg: cannot create stash: the index names an invalid path (%s)\n",
                    sg_quote_path_delimited(bad_path));
+        else if (sg_ref_last_lock_err()->kind == SG_REF_LOCK_ERR_LOCKED ||
+                sg_ref_last_lock_err()->kind == SG_REF_LOCK_ERR_DF)
+            /* Phase 77 fix round, measured: git's own wording here is
+               JUST this one line, with none of "fatal:"/"error:"'s usual
+               prefix and no lock-path detail at all -- git's stash is a
+               shell script wrapping several git-plumbing calls, and this
+               is the shell wrapper's own catch-all for "the internal
+               reset/create step failed", not update-ref's own message. */
+            fprintf(stderr, "sg: Cannot save the current status\n");
         else
             fprintf(stderr,
                    "sg: cannot create stash (unborn HEAD, or the index has unresolved conflicts?)\n");
@@ -762,7 +789,10 @@ static int cmd_stash_drop(int argc, char **argv)
     sg_stash_list_free(&list);
 
     if (sg_stash_drop(git_dir, index) != 0) {
-        fprintf(stderr, "sg: failed to drop stash@{%zu}\n", index);
+        if (!sg_ref_lock_err_report(stderr, NULL))
+            fprintf(stderr, "sg: failed to drop stash@{%zu}\n", index);
+        else
+            fprintf(stderr, "sg: refs/stash@{%zu}: Could not drop stash entry\n", index);
         free(git_dir);
         return 1;
     }
@@ -974,7 +1004,10 @@ static int cmd_stash_apply_or_pop(int argc, char **argv, int is_pop)
 
         sg_sha1_to_hex(commit_id, hex);
         if (sg_stash_drop(git_dir, index) != 0) {
-            fprintf(stderr, "sg: apply succeeded, but failed to drop stash@{%zu}\n", index);
+            if (!sg_ref_lock_err_report(stderr, NULL))
+                fprintf(stderr, "sg: apply succeeded, but failed to drop stash@{%zu}\n", index);
+            else
+                fprintf(stderr, "sg: refs/stash@{%zu}: Could not drop stash entry\n", index);
             free(git_dir);
             free(repo_root);
             return 1;

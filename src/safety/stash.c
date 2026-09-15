@@ -865,13 +865,50 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
            being NULL means exactly detached, never corrupt -- a corrupt HEAD
            has already failed sg_ref_resolve_head far above.
 
-       Failure here is deliberately NOT fatal: the stash commit is already
-       written and the working tree already reset, so refusing now would
-       report failure for work that actually happened. The user is told
-       instead. */
+       Failure here is deliberately NOT fatal for an ordinary reflog-write
+       problem: the stash commit is already written and the working tree
+       already reset, so refusing now would report failure for work that
+       actually happened. The user is told instead.
+
+       Phase 77 exception, measured against git 2.55.0: a LOCK collision
+       (a foreign refs/heads/<branch>.lock or HEAD.lock) is different from
+       an ordinary reflog-write problem -- real git's own `stash push`
+       refuses the whole operation (exit 1) when this step's update_ref
+       cannot take its lock, matching every other locked-ref-write
+       refusal in this project, not the soft warning above. This is
+       reported the same way every other "durable stash entry, but a
+       later step failed" case in this function already is (return -2,
+       see the "Destructive from here on" comment above and
+       cmd_stash.c's -2 handling) -- the stash commit and refs/stash are
+       already durable by this point, so "stash push failed outright"
+       would be a lie.
+
+       Phase 77 fix round 2 (F3/F4): this layer stays PRINT-FREE for the
+       lock-collision case, matching this project's own layering
+       convention (lower layers return codes, the CLI layer reports) --
+       it used to print its own "...working directory could not be reset
+       to HEAD..." line here, which was also FACTUALLY WRONG (the actual
+       worktree reset already happened several lines above, via
+       sg_apply_tree_to_workdir; THIS call is the reflog-mirroring no-op,
+       old_id == new_id, same shape as any other current-branch HEAD
+       write) and, since cmd_stash.c's -2 branch ALSO prints its own
+       generic "stash was created, but a later step failed" message, the
+       user got the same failure reported TWICE. cmd_stash.c now checks
+       sg_ref_last_lock_err()->kind itself and picks the accurate,
+       git-matching wording instead. */
     if (!partial &&
-       sg_ref_move_head(git_dir, branch, head_commit, "reset: moving to HEAD") != 0)
+       sg_ref_move_head(git_dir, branch, head_commit, "reset: moving to HEAD") != 0) {
+        sg_ref_lock_err_kind lock_kind = sg_ref_last_lock_err()->kind;
+
+        if (lock_kind == SG_REF_LOCK_ERR_LOCKED || lock_kind == SG_REF_LOCK_ERR_DF) {
+            for (i = 0; i < untracked_path_count; i++)
+                free(untracked_paths[i]);
+            free(untracked_paths);
+            free(branch);
+            return -2;
+        }
         fprintf(stderr, "sg: warning: stash succeeded but its reflog line could not be written\n");
+    }
 
     /* --keep-index (measured against real git 2.55.0): after the reset to
        HEAD above, re-apply the index tree on top so staged changes land

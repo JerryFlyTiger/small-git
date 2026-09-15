@@ -386,3 +386,19 @@ do not read the whole thing).
   actually unblocks `switch` needs `--force` on a fixture whose conflict
   genuinely left the working tree dirty.
 
+
+## Phase 77: commit's HEAD move and switch's writes can now refuse on a lock
+
+`cmd_commit.c`'s `sg_ref_move_head` call and `cmd_switch.c`'s branch-create
+write and HEAD write can now return -1 for a NEW reason (a foreign
+`.lock`), not just an I/O error -- both use `sg_ref_lock_err_report`
+first (`ref_display` = `"HEAD"` for commit and for switch's own HEAD
+write, `NULL` for switch's branch-create write, since git shows the
+branch's own ref path there), falling back to the pre-existing generic
+message otherwise. See `docs/RULES-refs-revparse.md`'s Phase 77 entry for
+the shared mechanism. `pick.c` and `cmd_rebase.c`'s own `sg_ref_move_head`/
+`sg_ref_set_head*` call sites are UNCHANGED (still their pre-existing
+generic messages) -- best-effort per Phase 77's own spec (cherry-pick,
+revert, rebase are not on its REQUIRED list), though the underlying calls
+are now locked the same as everywhere else and already refuse correctly
+with the ref left unchanged; only the exact wording was not matched.
