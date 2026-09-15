@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -233,6 +234,28 @@ int sg_reflog_append(const char *git_dir, const char *ref_path, const unsigned c
 
     if (sg_mkdir_parents(full_path) != 0)
         return -1;
+
+    /* Phase 77/D1a: a stale/foreign EMPTY directory sitting exactly at the
+       reflog path must not block the write, matching real git -- see
+       sg_ref_remove_empty_dir_tree's own header comment. A non-empty one
+       (a real file somewhere under it) is left as an ordinary open()
+       failure below (ENOTDIR/EISDIR from fopen), same as before this
+       phase: this project's reflog append has no D/F-conflict message of
+       its own to produce, unlike the ref-write path. */
+    {
+        struct stat st;
+
+        if (lstat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            char *conflict = NULL;
+            int rc = sg_ref_remove_empty_dir_tree(full_path, &conflict);
+
+            free(conflict);
+            if (rc == -1)
+                return -1;
+            /* rc == -2 (non-empty): fall through and let the fopen below
+               fail naturally. */
+        }
+    }
 
     normalized = normalize_message(message);
     if (normalized == NULL)

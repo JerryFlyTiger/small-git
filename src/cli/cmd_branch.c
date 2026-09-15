@@ -610,7 +610,14 @@ static int create_branch(const char *git_dir, const char *name, const char *star
             }
         }
 
-        rc = sg_ref_update(git_dir, ref_path, commit_id, reflog_msg);
+        /* Phase 77: this lock is already held (acquired just above), so the
+           write must CONSUME it rather than taking a second, independent
+           lock at the same path -- sg_ref_update would collide with its
+           own caller's lock (SG_REF_LOCK_ERR_LOCKED against itself).
+           sg_ref_lock_release afterward is then a harmless no-op on
+           success (held was cleared by the consuming write) and still
+           does real cleanup on failure, unchanged from before. */
+        rc = sg_ref_update_locked(git_dir, ref_path, &lock, commit_id, reflog_msg);
         sg_ref_lock_release(&lock);
     }
     free(reflog_msg);

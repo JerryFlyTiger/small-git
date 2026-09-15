@@ -329,8 +329,13 @@ int sg_cmd_commit(int argc, char **argv)
            is the same one a branch commit would get: git does not mark a
            detached commit differently in logs/HEAD (measured). */
         if (sg_ref_move_head(git_dir, branch, commit_id, reflog_msg) != 0) {
-            fprintf(stderr, detached ? "sg: failed to update HEAD\n"
-                                     : "sg: failed to update branch '%s'\n", branch);
+            /* Phase 77: git's own commit failure always names 'HEAD',
+               never the branch, even when the actual lock collision is on
+               refs/heads/<branch>.lock (measured, git 2.55.0) -- HEAD is
+               what commit's own ref transaction updates. */
+            if (!sg_ref_lock_err_report(stderr, "HEAD"))
+                fprintf(stderr, detached ? "sg: failed to update HEAD\n"
+                                         : "sg: failed to update branch '%s'\n", branch);
             rc = 1;
         }
         free(reflog_msg);

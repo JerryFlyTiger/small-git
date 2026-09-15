@@ -94,3 +94,30 @@ do not read the whole thing).
   deletion, then stage a deletion of that same path, then pop -- sg rejects
   it while real git does not (the same "ours is HEAD, not the index" rule).
   Details in Phase 21 of `docs/DESIGN.md`.
+
+## Phase 77: the whole-tree reset-to-HEAD step can now fail on a lock collision
+
+`sg_stash_push`'s final `sg_ref_move_head(..., "reset: moving to HEAD")`
+call (the no-op reset that logs `HEAD@{1}`) used to be unconditionally
+non-fatal on ANY failure ("stash succeeded but its reflog line could not
+be written", exit 0) -- correct for an ordinary I/O problem (the stash
+commit and worktree reset already happened), but measured WRONG for a
+lock collision: real git's own `stash push` exits 1 there. The fix checks
+`sg_ref_last_lock_err()->kind` right after the failure: `LOCKED`/`_DF`
+now returns `-2` (this function's pre-existing "durable stash entry, but
+a later step failed" convention, already handled by `cmd_stash.c`); any
+other kind keeps the old warn-and-continue behavior. Do not collapse this
+back to a single unconditional branch -- the two failure directions
+(warn-and-continue vs. -2) are deliberately different per git's own
+measured behavior, not an arbitrary choice.
+
+`sg_stash_drop`'s `refs/stash` removal (both the "last entry" branch,
+which calls `sg_ref_delete_under`, and any future branch that writes
+`refs/stash` directly) is now covered by the SAME lock `sg_ref_update`/
+`sg_ref_delete_under` take everywhere else in this project -- before
+Phase 77, `sg stash pop`/`sg stash drop` had NO lock of their own at all,
+and a foreign `refs/stash.lock` caught nothing. `cmd_stash.c`'s pop/drop
+failure messages use `sg_ref_lock_err_report(stderr, NULL)` (see
+`docs/RULES-refs-revparse.md`'s Phase 77 entry) to get git's own "cannot
+lock ref 'refs/stash': ..." wording when the failure is a lock collision,
+falling back to the pre-existing generic message otherwise.

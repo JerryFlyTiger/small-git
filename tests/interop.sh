@@ -23437,6 +23437,336 @@ P75AZ_ATTACHED_RC=0
 check "phase75a attached trailing junk (\"1767225600ZZ\", no space): sg refuses (exit 1)" \
     test "$P75AZ_ATTACHED_RC" -eq 1
 
+# --- Phase 77: every ref write takes git's <ref>.lock, and a ref write
+# succeeds through an empty directory (docs/DESIGN.md's L2/D1a). Pins the
+# REQUIRED rows from this phase's own oracle (scratchpad/oracle77.py, not
+# checked into the repo) against real git: a foreign lock refuses the
+# write (exit nonzero, ref UNCHANGED, no stray .lock survives past the
+# refusal other than the foreign one itself), and an empty directory
+# sitting at the ref path (or the reflog path) does not block a write that
+# would otherwise succeed. Two repos per case -- one driven by git, one by
+# sg -- built identically by real git first so both start from the exact
+# same bytes; p77_lock plants the SAME foreign lock name in each copy
+# right before the command under test.
+#
+# Exported for the REST of this file (phase77 is the last group, nothing
+# runs after it except the final summary line): local git here is
+# zh_TW-localized (see docs/RULES-refs-revparse.md's own note on this --
+# a prior debug session without this confirmed it, git's "cannot lock
+# ref" message came back as "致命錯誤：無法鎖定引用..."), and every OTHER
+# git invocation in this file that needs English output sets LC_ALL=C
+# per-command rather than exporting it globally; phase77 exports instead
+# because it has dozens of git invocations across several small helper
+# functions, and per-command LC_ALL=C was tried first and missed one,
+# which is exactly the failure mode a single export at group start
+# removes entirely. ---
+export LC_ALL=C
+export LANG=C
+p77_mk_repo() {
+    # $1 = target dir
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && printf '2\n' > f \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -am c2 \
+        && git branch ahead \
+        && git switch -q ahead \
+        && printf '3\n' > f \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -am c3 \
+        && git switch -q master \
+        && git tag t1 HEAD) > /dev/null 2>&1
+}
+
+# $1 = repo dir, $2 = lock path relative to .git (e.g. "refs/heads/master.lock" or "HEAD.lock")
+p77_lock() {
+    mkdir -p "$(dirname "$1/.git/$2")"
+    : > "$1/.git/$2"
+}
+
+# Phase 77 fix round: normalizes a captured stderr file the same way
+# oracle77.py's own comparison does -- fold the repo path (both raw and
+# symlink-resolved, macOS's /tmp -> /private/tmp) to a placeholder, then
+# strip a "fatal: "/"error: "/"sg: " prefix PER LINE (git's own multi-line
+# messages mix prefixed and unprefixed lines, e.g. the blank line and the
+# HINT body carry no prefix at all) -- printed to stdout, one normalized
+# line per input line, for the caller to capture via command substitution
+# and `diff`/`test` against the other side's normalized output.
+p77_norm_err() {
+    # $1 = raw captured stderr file, $2 = that side's own repo root
+    real=$(cd "$2" && pwd -P)
+    sed -e "s#$real#<R>#g" -e "s#$2#<R>#g" "$1" | sed -e 's/^fatal: /E: /' -e 's/^error: /E: /' -e 's/^sg: /E: /'
+}
+
+# $1 = label, $2 = sg repo dir, $3 = git repo dir, $4 = lock rel path,
+# $5 = ref rel path expected UNCHANGED (e.g. "refs/heads/master"),
+# then the argv for both tools.
+p77_refuse_case() {
+    p77_lbl="$1"; p77_sgd="$2"; p77_gd="$3"; p77_lock_rel="$4"; p77_ref_rel="$5"
+    shift 5
+    p77_mk_repo "$p77_sgd"; rm -rf "$p77_gd"; cp -R "$p77_sgd" "$p77_gd"
+    # sg has no `--allow-empty` (usage error, not a lock question) -- a
+    # caller that wants a real `commit` to reach the lock needs a genuine
+    # staged change first. P77_STAGE=1, set by the caller right before
+    # invoking this function, does that identically in both repos.
+    if [ "${P77_STAGE:-0}" = 1 ]; then
+        (cd "$p77_sgd" && printf 'staged\n' > f && git add f) > /dev/null 2>&1
+        (cd "$p77_gd" && printf 'staged\n' > f && git add f) > /dev/null 2>&1
+    fi
+    p77_before_sg=$(cat "$p77_sgd/.git/$p77_ref_rel" 2>/dev/null || echo MISSING)
+    p77_before_git=$(cat "$p77_gd/.git/$p77_ref_rel" 2>/dev/null || echo MISSING)
+    p77_lock "$p77_sgd" "$p77_lock_rel"
+    p77_lock "$p77_gd" "$p77_lock_rel"
+    (cd "$p77_gd" && git "$@") > /dev/null 2>"$WORKDIR/p77_git_err.txt"
+    p77_git_rc=$?
+    (cd "$p77_sgd" && "$SG" "$@") > /dev/null 2>"$WORKDIR/p77_sg_err.txt"
+    p77_sg_rc=$?
+    check "phase77 ($p77_lbl): git precondition -- a foreign $p77_lock_rel refuses (nonzero exit)" \
+        test "$p77_git_rc" -ne 0
+    check "phase77 ($p77_lbl): sg refuses too (exit 1)" \
+        test "$p77_sg_rc" -eq 1
+    check "phase77 ($p77_lbl): sg's $p77_ref_rel is UNCHANGED by the refused write" \
+        test "$(cat "$p77_sgd/.git/$p77_ref_rel" 2>/dev/null || echo MISSING)" = "$p77_before_sg"
+    check "phase77 ($p77_lbl): git's $p77_ref_rel is UNCHANGED too (both sides agree it's a refusal)" \
+        test "$(cat "$p77_gd/.git/$p77_ref_rel" 2>/dev/null || echo MISSING)" = "$p77_before_git"
+    check "phase77 ($p77_lbl): the FOREIGN lock itself survives (sg never owned it, never unlinks it)" \
+        test -e "$p77_sgd/.git/$p77_lock_rel"
+    check "phase77 ($p77_lbl): sg's stderr is BYTE-IDENTICAL to git's (normalized)" \
+        test "$(p77_norm_err "$WORKDIR/p77_git_err.txt" "$p77_gd")" = "$(p77_norm_err "$WORKDIR/p77_sg_err.txt" "$p77_sgd")"
+}
+
+P77_SG="$WORKDIR/phase77_sg"; P77_GIT="$WORKDIR/phase77_git"
+
+P77_STAGE=1
+p77_refuse_case "commit, refs/heads/master.lock" "$P77_SG" "$P77_GIT" \
+    "refs/heads/master.lock" "refs/heads/master" commit -m x
+p77_refuse_case "commit, HEAD.lock" "$P77_SG" "$P77_GIT" \
+    "HEAD.lock" "refs/heads/master" commit -m x
+P77_STAGE=0
+p77_refuse_case "switch topic, HEAD.lock" "$P77_SG" "$P77_GIT" \
+    "HEAD.lock" "HEAD" switch topic
+p77_refuse_case "reset --soft HEAD~1, refs/heads/master.lock" "$P77_SG" "$P77_GIT" \
+    "refs/heads/master.lock" "refs/heads/master" reset --soft HEAD~1
+p77_refuse_case "reset --hard HEAD~1, HEAD.lock" "$P77_SG" "$P77_GIT" \
+    "HEAD.lock" "refs/heads/master" reset --hard HEAD~1
+p77_refuse_case "tag nt HEAD~1, refs/tags/nt.lock" "$P77_SG" "$P77_GIT" \
+    "refs/tags/nt.lock" "refs/heads/master" tag nt HEAD~1
+p77_refuse_case "merge ff ahead, refs/heads/master.lock" "$P77_SG" "$P77_GIT" \
+    "refs/heads/master.lock" "refs/heads/master" merge ahead
+p77_refuse_case "merge ff ahead, HEAD.lock" "$P77_SG" "$P77_GIT" \
+    "HEAD.lock" "refs/heads/master" merge ahead
+
+# --- Phase 77 fix round: message-only pins for merge 3-way / cherry-pick /
+# revert / rebase start / rebase finish / stash push -- state residuals
+# (CHERRY_PICK_HEAD, "Rebasing (N/M)" progress lines) are OUT of scope and
+# not asserted here, only the "cannot lock ref ..." + HINT (+ each
+# command's own trailing line) text. A richer fixture is needed than
+# p77_mk_repo above: topic must ACTUALLY diverge from master (its own
+# extra commit) for a 3-way merge and a real cherry-pick target to exist. ---
+p77_mk_repo_full() {
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && printf '2\n' > f \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -am c2 \
+        && git switch -q topic \
+        && printf 't\n' > g && git add g \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+# $1 = label, $2 = sg repo dir, $3 = git repo dir, $4 = lock rel path, then argv
+p77_stderr_pin() {
+    p77p_lbl="$1"; p77p_sgd="$2"; p77p_gd="$3"; p77p_lock_rel="$4"
+    shift 4
+    p77_mk_repo_full "$p77p_sgd"; rm -rf "$p77p_gd"; cp -R "$p77p_sgd" "$p77p_gd"
+    p77_lock "$p77p_sgd" "$p77p_lock_rel"
+    p77_lock "$p77p_gd" "$p77p_lock_rel"
+    (cd "$p77p_gd" && git "$@") > /dev/null 2>"$WORKDIR/p77_git_err.txt"
+    p77p_git_rc=$?
+    (cd "$p77p_sgd" && "$SG" "$@") > /dev/null 2>"$WORKDIR/p77_sg_err.txt"
+    p77p_sg_rc=$?
+    check "phase77 ($p77p_lbl): git precondition -- a foreign $p77p_lock_rel refuses (nonzero exit)" \
+        test "$p77p_git_rc" -ne 0
+    check "phase77 ($p77p_lbl): sg refuses too (exit 1)" \
+        test "$p77p_sg_rc" -eq 1
+    check "phase77 ($p77p_lbl): the FOREIGN lock itself survives (sg never owned it, never unlinks it)" \
+        test -e "$p77p_sgd/.git/$p77p_lock_rel"
+    # P77_DROP_REBASING_PROGRESS=1: git's rebase prints "Rebasing (N/M)"
+    # progress updates sg does not print anywhere (out of scope per this
+    # phase's own spec), each terminated by a CARRIAGE RETURN (\r, a
+    # same-line progress overwrite), NOT a newline -- measured directly
+    # (od -c): "Rebasing (1/1)\rerror: update_ref failed ...", all one
+    # `\n`-delimited "line" as far as p77_norm_err's own line-splitting is
+    # concerned. A whole-line grep -v would therefore never match (the
+    # progress text and the real error share one line) and, worse, would
+    # silently make this check pass by matching NOTHING -- this needs a
+    # substring strip, not a line filter. Stripped from GIT's side only,
+    # so the check still fails if sg starts diverging on the part that
+    # DOES matter (the lock message itself).
+    if [ "${P77_DROP_REBASING_PROGRESS:-0}" = 1 ]; then
+        # Strip the "Rebasing (N/M)\r" progress update BEFORE
+        # p77_norm_err's own per-line prefix stripping runs -- it shares
+        # ONE `\n`-delimited "line" with the real "error: ..." message
+        # that follows it (measured, od -c), and p77_norm_err's
+        # `^error: ` match only fires at the true start of that line, so
+        # stripping the progress text AFTER normalization would leave the
+        # "error: " prefix stranded mid-line, unstripped, on git's side
+        # only -- a mismatch that looks like a real divergence but is
+        # really just wrong operation order in the test itself.
+        sed -E 's/Rebasing \([0-9]+\/[0-9]+\)\r//g' "$WORKDIR/p77_git_err.txt" > "$WORKDIR/p77_git_err_stripped.txt"
+        check "phase77 ($p77p_lbl): sg's stderr is BYTE-IDENTICAL to git's (normalized, git's own 'Rebasing (N/M)\\r' progress updates excluded -- out of scope)" \
+            test "$(p77_norm_err "$WORKDIR/p77_git_err_stripped.txt" "$p77p_gd")" = \
+                "$(p77_norm_err "$WORKDIR/p77_sg_err.txt" "$p77p_sgd")"
+    else
+        check "phase77 ($p77p_lbl): sg's stderr is BYTE-IDENTICAL to git's (normalized)" \
+            test "$(p77_norm_err "$WORKDIR/p77_git_err.txt" "$p77p_gd")" = "$(p77_norm_err "$WORKDIR/p77_sg_err.txt" "$p77p_sgd")"
+    fi
+}
+
+P77_SG2="$WORKDIR/phase77_sg2"; P77_GIT2="$WORKDIR/phase77_git2"
+p77_stderr_pin "merge 3way, refs/heads/master.lock" "$P77_SG2" "$P77_GIT2" \
+    "refs/heads/master.lock" merge topic
+p77_stderr_pin "merge 3way, HEAD.lock" "$P77_SG2" "$P77_GIT2" \
+    "HEAD.lock" merge topic
+
+p77_mk_repo_full "$WORKDIR/phase77_topic_tip_probe"
+P77_TOPIC_TIP=$(cd "$WORKDIR/phase77_topic_tip_probe" && git rev-parse topic)
+p77_stderr_pin "cherry-pick topic, refs/heads/master.lock" "$P77_SG2" "$P77_GIT2" \
+    "refs/heads/master.lock" cherry-pick "$P77_TOPIC_TIP"
+p77_stderr_pin "cherry-pick topic, HEAD.lock" "$P77_SG2" "$P77_GIT2" \
+    "HEAD.lock" cherry-pick "$P77_TOPIC_TIP"
+p77_stderr_pin "revert HEAD, refs/heads/master.lock" "$P77_SG2" "$P77_GIT2" \
+    "refs/heads/master.lock" revert --no-edit HEAD
+
+P77_DROP_REBASING_PROGRESS=1
+p77_stderr_pin "rebase topic (finish), refs/heads/master.lock" "$P77_SG2" "$P77_GIT2" \
+    "refs/heads/master.lock" rebase topic
+P77_DROP_REBASING_PROGRESS=0
+p77_stderr_pin "rebase topic (start), HEAD.lock" "$P77_SG2" "$P77_GIT2" \
+    "HEAD.lock" rebase topic
+
+# stash push, refs/stash.lock: git's own wording here has NO fatal:/error:/
+# sg: prefix at all ("Cannot save the current status") -- verified via the
+# raw bytes, not just the normalized form, so a future change that adds an
+# unexpected prefix on either side cannot hide behind the normalizer.
+P77_SG3="$WORKDIR/phase77_sg3"; P77_GIT3="$WORKDIR/phase77_git3"
+p77_mk_repo_full "$P77_SG3"; rm -rf "$P77_GIT3"; cp -R "$P77_SG3" "$P77_GIT3"
+(cd "$P77_SG3" && printf 'dirty\n' > f) > /dev/null 2>&1
+(cd "$P77_GIT3" && printf 'dirty\n' > f) > /dev/null 2>&1
+p77_lock "$P77_SG3" "refs/stash.lock"
+p77_lock "$P77_GIT3" "refs/stash.lock"
+(cd "$P77_GIT3" && git stash push) > /dev/null 2>"$WORKDIR/p77_git_err.txt"
+P77_STASH_GIT_RC=$?
+(cd "$P77_SG3" && "$SG" stash push) > /dev/null 2>"$WORKDIR/p77_sg_err.txt"
+P77_STASH_SG_RC=$?
+check "phase77 (stash push, refs/stash.lock): git precondition -- refuses (nonzero exit)" \
+    test "$P77_STASH_GIT_RC" -ne 0
+check "phase77 (stash push, refs/stash.lock): sg refuses too (exit 1)" \
+    test "$P77_STASH_SG_RC" -eq 1
+check "phase77 (stash push, refs/stash.lock): git's raw stderr is exactly 'Cannot save the current status'" \
+    test "$(cat "$WORKDIR/p77_git_err.txt")" = "Cannot save the current status"
+check "phase77 (stash push, refs/stash.lock): sg's raw stderr is exactly 'sg: Cannot save the current status'" \
+    test "$(cat "$WORKDIR/p77_sg_err.txt")" = "sg: Cannot save the current status"
+
+# F6 (Phase 77 fix round 2): stash push, refs/heads/master.lock -- unlike
+# the refs/stash.lock case above, git's OWN worktree-reset step fails
+# here (the stash entry has already been created durably by this point),
+# so its wording is the ordinary "update_ref failed for ref 'HEAD': ..."
+# shape, not "Cannot save the current status". Asserts exit 1, the stash
+# entry EXISTS on both sides (`sg stash list` non-empty), and the exact
+# message.
+P77_SG4="$WORKDIR/phase77_sg4"; P77_GIT4="$WORKDIR/phase77_git4"
+p77_mk_repo_full "$P77_SG4"; rm -rf "$P77_GIT4"; cp -R "$P77_SG4" "$P77_GIT4"
+(cd "$P77_SG4" && printf 'dirty\n' > f) > /dev/null 2>&1
+(cd "$P77_GIT4" && printf 'dirty\n' > f) > /dev/null 2>&1
+p77_lock "$P77_SG4" "refs/heads/master.lock"
+p77_lock "$P77_GIT4" "refs/heads/master.lock"
+(cd "$P77_GIT4" && git stash push) > /dev/null 2>"$WORKDIR/p77_git_err.txt"
+P77_STASH2_GIT_RC=$?
+(cd "$P77_SG4" && "$SG" stash push) > /dev/null 2>"$WORKDIR/p77_sg_err.txt"
+P77_STASH2_SG_RC=$?
+check "phase77 (stash push, refs/heads/master.lock): git precondition -- refuses (nonzero exit)" \
+    test "$P77_STASH2_GIT_RC" -ne 0
+check "phase77 (stash push, refs/heads/master.lock): sg refuses too (exit 1)" \
+    test "$P77_STASH2_SG_RC" -eq 1
+check "phase77 (stash push, refs/heads/master.lock): git's stash entry exists (refs/stash present)" \
+    test -f "$P77_GIT4/.git/refs/stash"
+check "phase77 (stash push, refs/heads/master.lock): sg's stash entry exists too (refs/stash present)" \
+    test -f "$P77_SG4/.git/refs/stash"
+check "phase77 (stash push, refs/heads/master.lock): sg's stderr is BYTE-IDENTICAL to git's (normalized)" \
+    test "$(p77_norm_err "$WORKDIR/p77_git_err.txt" "$P77_GIT4")" = "$(p77_norm_err "$WORKDIR/p77_sg_err.txt" "$P77_SG4")"
+check "phase77 (stash push, refs/heads/master.lock): the FOREIGN lock itself survives" \
+    test -e "$P77_SG4/.git/refs/heads/master.lock"
+
+# --- D1a: an empty directory at the ref path (or the reflog path) must
+# not block a write that would otherwise succeed. Two DISTINCT dirs (not
+# reusing $P77_SG) so the stray-lock scan below can check them without
+# also scanning a repo that deliberately still holds a FOREIGN lock
+# (the stash pop/drop fixtures further down, which are supposed to). ---
+P77_SG_ED1="$WORKDIR/phase77_sg_ed1"
+p77_mk_repo "$P77_SG_ED1"
+mkdir -p "$P77_SG_ED1/.git/refs/heads/nope/a/b"
+(cd "$P77_SG_ED1" && "$SG" branch nope) > "$WORKDIR/p77_emptydir.out" 2>&1
+check "phase77 (branch nope, nested empty refs/heads/nope/a/b): sg succeeds (exit 0)" \
+    test $? -eq 0
+check "phase77 (branch nope, nested empty refs/heads/nope/a/b): refs/heads/nope now holds a real ref" \
+    test -f "$P77_SG_ED1/.git/refs/heads/nope"
+check "phase77 (branch nope, nested empty refs/heads/nope/a/b): the empty directory tree is gone" \
+    sh -c "! test -d '$P77_SG_ED1/.git/refs/heads/nope/a'"
+
+P77_SG_ED2="$WORKDIR/phase77_sg_ed2"
+p77_mk_repo "$P77_SG_ED2"
+mkdir -p "$P77_SG_ED2/.git/logs/refs/heads/nope"
+(cd "$P77_SG_ED2" && "$SG" switch -c nope) > "$WORKDIR/p77_emptylogdir.out" 2>&1
+check "phase77 (switch -c nope, empty logs/refs/heads/nope): sg succeeds (exit 0)" \
+    test $? -eq 0
+check "phase77 (switch -c nope, empty logs/refs/heads/nope): HEAD now points at nope" \
+    test "$(cat "$P77_SG_ED2/.git/HEAD")" = "ref: refs/heads/nope"
+
+# --- stash pop / drop: a foreign refs/stash.lock refuses (exit 1), and the
+# stash entry is KEPT (not dropped) since the failing step is the drop. ---
+p77_mk_repo "$P77_SG"
+(cd "$P77_SG" && printf 'dirty\n' > f && git stash push -q) > /dev/null 2>&1
+p77_stash_before=$(cat "$P77_SG/.git/refs/stash")
+p77_lock "$P77_SG" "refs/stash.lock"
+(cd "$P77_SG" && "$SG" stash pop) > /dev/null 2>&1
+check "phase77 (stash pop, refs/stash.lock): sg refuses (exit 1)" \
+    test $? -eq 1
+check "phase77 (stash pop, refs/stash.lock): refs/stash is UNCHANGED (the entry is kept, not dropped)" \
+    test "$(cat "$P77_SG/.git/refs/stash")" = "$p77_stash_before"
+
+p77_mk_repo "$P77_SG"
+(cd "$P77_SG" && printf 'dirty\n' > f && git stash push -q) > /dev/null 2>&1
+p77_stash_before=$(cat "$P77_SG/.git/refs/stash")
+p77_lock "$P77_SG" "refs/stash.lock"
+(cd "$P77_SG" && "$SG" stash drop) > /dev/null 2>&1
+check "phase77 (stash drop, refs/stash.lock): sg refuses (exit 1)" \
+    test $? -eq 1
+check "phase77 (stash drop, refs/stash.lock): refs/stash is UNCHANGED (the entry is kept, not dropped)" \
+    test "$(cat "$P77_SG/.git/refs/stash")" = "$p77_stash_before"
+
+# --- no stray .lock left under .git/refs or top-level .git/HEAD.lock by
+# EITHER of the two successful D1a writes above -- scoped to refs/ and
+# HEAD.lock specifically, never all of .git, see
+# docs/RULES-refs-revparse.md on git's own objects/maintenance.lock. The
+# stash pop/drop repos further above are deliberately EXCLUDED here: each
+# of those still holds the FOREIGN refs/stash.lock this phase's own
+# p77_refuse_case-style checks already asserted must survive untouched --
+# scanning them here would misreport that correct behavior as a leak. ---
+: > "$WORKDIR/p77_stray_locks.txt"
+for p77_ed_dir in "$P77_SG_ED1" "$P77_SG_ED2"; do
+    find "$p77_ed_dir/.git/refs" -name '*.lock' >> "$WORKDIR/p77_stray_locks.txt" 2>/dev/null
+    if [ -e "$p77_ed_dir/.git/HEAD.lock" ]; then echo "$p77_ed_dir/.git/HEAD.lock" >> "$WORKDIR/p77_stray_locks.txt"; fi
+done
+check "phase77: no stray .lock left under either D1a sg repo's .git/refs or top-level HEAD.lock" \
+    sh -c "! grep -q . '$WORKDIR/p77_stray_locks.txt' || { echo leftover:; cat '$WORKDIR/p77_stray_locks.txt'; false; }"
+
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
 if [ "$FAIL" -gt 0 ]; then

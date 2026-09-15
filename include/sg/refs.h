@@ -2,6 +2,7 @@
 #define SG_REFS_H
 
 #include <stddef.h>
+#include <stdio.h>
 
 #include "sg/hash.h"
 
@@ -415,5 +416,160 @@ sg_ref_lock_result sg_ref_lock_try_query(const char *git_dir, const char *prefix
    never acquired (EEXIST/ERROR) just has its `path` freed, nothing is
    unlinked (a caller must never unlink a lock it does not own). */
 void sg_ref_lock_release(sg_ref_lock *lock);
+
+/* Phase 77: EVERY ref write in this project (sg_ref_update,
+   sg_ref_write_path, sg_ref_set_head, sg_ref_set_head_detached, and
+   therefore sg_ref_move_head/sg_ref_update_branch, which are thin
+   wrappers) now goes through this same locked-write mechanism, matching
+   real git: it takes `<ref_path>.lock` (O_CREAT|O_EXCL, so a foreign lock
+   -- planted by a crashed process or a real concurrent git -- is refused
+   rather than raced), writes the new content into the lock file, and
+   `rename()`s it onto the ref path, which is also what makes the write
+   ATOMIC (a crash between fopen and rename leaves the ref untouched, not
+   half-written). Before Phase 77, `sg_ref_update` took no lock at all and
+   every other ref-writing command silently overrode a concurrent git
+   process's lock -- see CLAUDE.md's divergence #10 note. Two prior
+   O_CREAT|O_EXCL lock sites already existed for OTHER purposes (`sg tag
+   -d`/`sg branch -d`'s batch-delete transaction, and `sg branch`'s own
+   create/-f path) and are UNCHANGED by this phase; this is the third and
+   last remaining write path gaining locking.
+
+   Also fixes D1a (docs/DESIGN.md): when the ref path is itself an EMPTY
+   directory (or a directory of nested EMPTY directories -- e.g. a stale
+   `refs/heads/nope/` left by an older sg build, or a foreign tool), the
+   write now succeeds, matching git: the empty subtree is removed first,
+   walking depth-first and stopping (without removing anything further)
+   the moment a REGULAR FILE is found anywhere under it -- so a directory
+   that has both empty and non-empty branches ends up with only the empty
+   ones actually removed. A file found there is a real D/F conflict and
+   the write is refused with `SG_REF_LOCK_ERR_DF` (see below); measured
+   against git 2.55.0, its wording names the exact colliding file, not
+   just "a conflict exists".
+
+   None of this widens the accepted VALUE of `ref_path` -- callers must
+   still pass something `sg_ref_path_components_are_safe` accepts (the
+   lock functions' own long-standing invariant, see their comment above);
+   an unsafe path fails the write with SG_REF_LOCK_ERR_OTHER, same as
+   before this phase (a plain -1), not a crash or an escape. */
+typedef enum {
+    SG_REF_LOCK_ERR_NONE = 0,   /* no failed locked-write on record */
+    SG_REF_LOCK_ERR_LOCKED,     /* ref_path.lock already exists (foreign, or -- for a caller that does not itself pre-hold it -- in-batch) */
+    SG_REF_LOCK_ERR_DF,         /* a regular file blocks a directory the write needed to remove/create */
+    SG_REF_LOCK_ERR_OTHER,      /* OOM, an unsafe ref_path, or any other I/O failure */
+} sg_ref_lock_err_kind;
+
+/* Details of the MOST RECENT locked-ref-write failure, mirroring errno:
+   valid only immediately after such a call returns -1 (sg_ref_update,
+   sg_ref_write_path, sg_ref_set_head, sg_ref_set_head_detached,
+   sg_ref_move_head, sg_ref_update_branch, sg_ref_update_locked,
+   sg_ref_set_symref, sg_ref_delete_under) -- after a SUCCESSFUL call it
+   may still hold an earlier failure's kind, so never read it without a
+   -1 first -- and only
+   ONE call's worth of detail is kept -- this project has no threads, so
+   that is not a race, but a caller that wants to keep the detail past the
+   NEXT such call must copy the strings out first. `ref_path`, `lock_path`
+   (SG_REF_LOCK_ERR_LOCKED only, absolute), and `conflict_path`
+   (SG_REF_LOCK_ERR_DF only, git_dir-relative, e.g.
+   "refs/heads/nope/b/c") are malloc'd internally and owned by this
+   struct; they are NOT reset to NULL between failures of different
+   kinds, so always check `kind` before reading a path field. */
+typedef struct {
+    sg_ref_lock_err_kind kind;
+    char *ref_path;
+    char *lock_path;
+    char *conflict_path;
+} sg_ref_lock_err;
+
+/* Returns a pointer to Phase 77's single last-failure record (see
+   sg_ref_lock_err above); never NULL, but ->kind is SG_REF_LOCK_ERR_NONE
+   before any locked write has ever failed in this process. */
+const sg_ref_lock_err *sg_ref_last_lock_err(void);
+
+/* Prints git's own wording for the last recorded lock error, prefixed
+   "sg: ", to `out`:
+     SG_REF_LOCK_ERR_LOCKED: "sg: cannot lock ref '<ref_display>': Unable
+       to create '<lock_path>': File exists.\n\n" followed by git's own
+       two-line hint ("Another git process seems to be running in this
+       repository, or the lock file may be stale\n").
+     SG_REF_LOCK_ERR_DF: "sg: cannot lock ref '<ref_display>':
+       '<conflict_path>' exists; cannot create '<ref_display>'\n".
+   `ref_display` overrides the ref name shown in the message (git shows
+   "HEAD" for a HEAD-mirroring failure even where the underlying write
+   internally used a different ref_path in some call shapes); pass NULL to
+   use the failing call's own recorded ref_path verbatim. Shared so the
+   many CLI call sites across `src/cli/` do not each hand-roll a copy of
+   the HINT block (`cmd_branch.c`'s Phase 76 copy predates this phase and
+   is the one this shares from; it is NOT rewritten to call this, to avoid
+   touching working Phase 76 code, but any NEW call site should use this
+   instead of writing a fourth copy). Returns 1 if it printed a
+   LOCKED/DF-shaped message (the caller then still owns the exit code and
+   whatever else it wants to add, e.g. "sg: unable to update HEAD"), 0 if
+   the last recorded error is SG_REF_LOCK_ERR_OTHER/_NONE (nothing is
+   printed; the caller should fall back to its own generic message). */
+int sg_ref_lock_err_report(FILE *out, const char *ref_display);
+
+/* Phase 77 fix round: the extended form, needed because git's own wording
+   is NOT one fixed shape across every ref-writing command -- measured
+   against git 2.55.0, three independent axes vary per call site:
+     - whether the message is prefixed "update_ref failed for ref
+       '<prefix_ref>': " before "cannot lock ref ..." (`reset`, `merge
+       --ff-only`, 3-way `merge`, `switch --detach`, rebase's start/finish
+       writes: yes; `commit`, plain `switch`, `tag`, cherry-pick/revert:
+       no) -- pass the ref name for the prefix, or NULL for none. This
+       axis is not just cosmetic: `prefix_ref` and `ref_display` can
+       legitimately differ (rebase's finish write prefixes+names the
+       BRANCH, `refs/heads/<b>`, not `HEAD`).
+     - a trailing line AFTER the HINT block (`switch` to an existing
+       branch: "unable to update HEAD"; cherry-pick/revert: "cherry-pick
+       failed"/"revert failed"; rebase start: "could not detach HEAD";
+       rebase finish: "could not update refs/heads/<b>") -- pass the exact
+       text (no trailing newline), or NULL for none.
+   Only measured for the SG_REF_LOCK_ERR_LOCKED shape combined with each
+   axis; the SG_REF_LOCK_ERR_DF shape's `prefix_ref`/`trailing` handling
+   mirrors it by construction but has no oracle row exercising that
+   specific combination -- verify before relying on it if one is added.
+   `ref_display`/return-value contract is otherwise identical to the plain
+   form, which is now a thin wrapper calling this with both new
+   parameters NULL. */
+int sg_ref_lock_err_report_ex(FILE *out, const char *ref_display, const char *prefix_ref,
+                              const char *trailing);
+
+/* Like sg_ref_update, but writes into a LOCK the caller has ALREADY
+   acquired (via sg_ref_lock_try(git_dir, "", ref_path, lock) -- empty
+   prefix, since the lock path IS the ref path itself with ".lock"
+   appended, not refs/heads/-prefixed again) instead of taking a fresh
+   one. This is what closes the landmine a naive locked sg_ref_update
+   would hit: cmd_branch.c's create/-f path already holds
+   `refs/heads/<name>.lock` by the time it decides to write, and a second,
+   independent lock attempt at the same path would collide with itself
+   (SG_REF_LOCK_ERR_LOCKED against its own caller's lock).
+
+   On success, the lock is CONSUMED: it is renamed onto the ref path, and
+   `lock->held` is cleared so a later sg_ref_lock_release(lock) is a
+   harmless no-op (it will `unlink()` nothing, since held is already 0,
+   and just free `lock->path`). On failure, `*lock` is left exactly as the
+   caller passed it in (still held) -- the caller's own existing
+   sg_ref_lock_release cleans it up, same as it always did. Same reflog
+   contract as sg_ref_update (reflog_msg == NULL writes only the ref;
+   otherwise the same append-then-truncate-on-failure rule, gated by the
+   same namespace policy). Returns 0 on success, -1 on failure
+   (sg_ref_last_lock_err() is populated the same way sg_ref_update's is,
+   though SG_REF_LOCK_ERR_LOCKED cannot happen here since the lock is
+   already held going in -- only _DF or _OTHER). */
+int sg_ref_update_locked(const char *git_dir, const char *ref_path, sg_ref_lock *lock,
+                         const unsigned char new_id[SG_SHA1_RAW_LEN], const char *reflog_msg);
+
+/* D1a's empty-directory removal (see the Phase 77 comment above), exposed
+   so sg_reflog_append (storage/reflog.c) can apply the SAME fix to a
+   reflog path (`logs/refs/heads/<name>`) that a stale/foreign empty
+   directory blocks -- measured against git 2.55.0: git removes an empty
+   directory sitting at the REFLOG path the same way it does for the ref
+   path itself, not just the latter. `abs_path` must already be known to
+   be a directory. Returns 0 if removed (or already gone), -2 with
+   `*conflict_out` set to a malloc'd absolute path of the first regular
+   file found (caller frees) if the tree is not actually empty, -1 on an
+   unrelated I/O error. Not `static` specifically so reflog.c can share
+   it rather than duplicating the walk -- see docs/RULES-duplication.md. */
+int sg_ref_remove_empty_dir_tree(const char *abs_path, char **conflict_out);
 
 #endif

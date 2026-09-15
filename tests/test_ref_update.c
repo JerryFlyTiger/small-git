@@ -237,14 +237,19 @@ static void test_policy_violation_writes_nothing(void)
 
 /* ---- 5b: rollback when the ref file itself cannot be written ------------- */
 
-/* Forces sg_ref_update's write_ref_path_raw failure path by chmod'ing an
-   EXISTING refs/heads/master read-only right before a message-bearing call:
-   write_ref_path_raw goes through sg_write_file_mkdirs, which fopen(...,
-   "wb")'s the file in place (same technique as tests/test_stash.c's
-   test_drop_rolls_back_on_ref_write_failure), so only the file's own write
-   bit needs to be revoked. Asserts BOTH logs are rolled back to their exact
-   pre-call length (not just that the call failed) and that the ref still
-   reads back as the OLD value. */
+/* Forces sg_ref_update's write_ref_path_raw failure path by chmod'ing the
+   CONTAINING refs/heads/ directory read-only right before a message-bearing
+   call. Phase 77: write_ref_path_raw now writes through a lock file
+   (refs/heads/master.lock) and atomically renames it onto refs/heads/master,
+   so chmod'ing the EXISTING ref file itself no longer blocks anything --
+   rename() replacing a file does not consult that file's own permission
+   bits, only the containing directory's write bit (same reasoning as
+   test_stash.c's sibling fix below, and tests/test_reflog.c's own
+   directory-based techniques elsewhere in this project). Revoking the
+   directory's write bit makes the O_CREAT|O_EXCL open() of the .lock file
+   itself fail. Asserts BOTH logs are rolled back to their exact pre-call
+   length (not just that the call failed) and that the ref still reads back
+   as the OLD value. */
 static void test_ref_update_rolls_back_reflog_on_write_failure(void)
 {
     char *git_dir = make_tmp_repo();
@@ -271,13 +276,13 @@ static void test_ref_update_rolls_back_reflog_on_write_failure(void)
     CHECK(branch_count_before == 0, "no branch reflog should exist yet before the chmod");
     CHECK(head_count_before == 0, "no logs/HEAD should exist yet before the chmod");
 
-    snprintf(ref_path, sizeof(ref_path), "%s/refs/heads/master", git_dir);
-    CHECK(chmod(ref_path, 0444) == 0, "chmod refs/heads/master read-only failed");
+    snprintf(ref_path, sizeof(ref_path), "%s/refs/heads", git_dir);
+    CHECK(chmod(ref_path, 0555) == 0, "chmod refs/heads read-only failed");
 
     CHECK(sg_ref_update(git_dir, "refs/heads/master", id_b, "should fail: read-only ref") == -1,
          "sg_ref_update should fail once refs/heads/master cannot be rewritten");
 
-    chmod(ref_path, 0644); /* restore before any further reads/writes */
+    chmod(ref_path, 0755); /* restore before any further reads/writes */
 
     CHECK(reflog_count(git_dir, "refs/heads/master") == branch_count_before,
          "branch reflog must be rolled back to its pre-call length");
@@ -440,9 +445,10 @@ static void test_set_head_noop_with_message_still_logs(void)
 }
 
 /* Same rollback contract as sg_ref_update, but forcing sg_ref_set_head's own
-   write failure: chmod git_dir/HEAD read-only right before a message-bearing
-   call (sg_ref_set_head fopen(..., "wb")'s HEAD directly, not through
-   sg_write_file_mkdirs, but the effect on an EXISTING file is identical). */
+   write failure. Phase 77: sg_ref_set_head now writes HEAD.lock in git_dir
+   and renames it onto HEAD, so (as in the sibling fix above) chmod'ing the
+   EXISTING HEAD file no longer has any effect -- git_dir itself must be
+   made read-only so creating HEAD.lock fails. */
 static void test_set_head_rolls_back_reflog_on_head_write_failure(void)
 {
     char *git_dir = make_tmp_repo();
@@ -458,13 +464,22 @@ static void test_set_head_rolls_back_reflog_on_head_write_failure(void)
     head_count_before = reflog_count(git_dir, "HEAD");
     CHECK(head_count_before == 0, "no logs/HEAD should exist yet before the chmod");
 
-    snprintf(head_path, sizeof(head_path), "%s/HEAD", git_dir);
-    CHECK(chmod(head_path, 0444) == 0, "chmod HEAD read-only failed");
+    /* logs/ must exist and stay writable BEFORE git_dir itself is locked
+       down, so the reflog append below can still create logs/HEAD in it --
+       otherwise chmod'ing git_dir read-only would block the append too
+       (mkdir_parents needs to create "logs/" inside git_dir), and the test
+       would trivially pass without ever reaching the ref-write rollback
+       path it is named for. */
+    snprintf(head_path, sizeof(head_path), "%s/logs", git_dir);
+    CHECK(mkdir(head_path, 0755) == 0, "mkdir logs/ failed");
+
+    snprintf(head_path, sizeof(head_path), "%s", git_dir);
+    CHECK(chmod(head_path, 0555) == 0, "chmod git_dir read-only failed");
 
     CHECK(sg_ref_set_head(git_dir, "master", "should fail: read-only HEAD") == -1,
          "sg_ref_set_head should fail once HEAD cannot be rewritten");
 
-    chmod(head_path, 0644); /* restore before any further reads/writes */
+    chmod(head_path, 0755); /* restore before any further reads/writes */
 
     CHECK(reflog_count(git_dir, "HEAD") == head_count_before,
          "logs/HEAD must be rolled back to its pre-call length");

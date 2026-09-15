@@ -196,3 +196,19 @@ do not read the whole thing).
   error, while `check_df_conflict`'s two call sites (a wording choice
   made only AFTER a conflict is already proven to exist) still fold error
   into "not loose," which is fine at that point.
+
+## Phase 77: ref writes across cmd_branch.c/cmd_tag.c/cmd_reset.c/cmd_merge.c/cmd_switch.c can now fail on a lock, not just an I/O error
+
+`sg_ref_update`/`sg_ref_write_path`/`sg_ref_move_head`/`sg_ref_set_head*`
+now take a real O_CREAT|O_EXCL lock before every write (see
+`docs/RULES-refs-revparse.md`'s Phase 77 entry for the shared mechanism).
+`cmd_branch.c`'s create/`-f` path was changed to call
+`sg_ref_update_locked` (consuming the lock it already holds) instead of
+`sg_ref_update`, to avoid colliding with its own Phase-76 lock -- do not
+revert this back to a plain `sg_ref_update` call, that reintroduces a
+self-collision (EEXIST against your own lock) on every create/`-f`.
+`cmd_tag.c`/`cmd_reset.c`/`cmd_merge.c`'s ff path use
+`sg_ref_lock_err_report` to surface git's own wording when the new
+failure kind is a lock collision; see each file's own module-table row
+(`docs/RULES-merge.md`/`docs/RULES-sequencer.md`) for the specific
+`ref_display` chosen at each call site.

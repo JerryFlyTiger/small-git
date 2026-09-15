@@ -110,3 +110,15 @@ do not read the whole thing).
   add a second per-class rev-error table** -- a new command that needs this
   kind of diagnostic gets a new row in `REV_ERR_TABLE`, not a new switch
   statement at its own call site.
+
+## Phase 77: reflog.c shares refs.c's empty-directory removal instead of copying it
+
+`sg_reflog_append` (`storage/reflog.c`) needed the SAME D1a fix
+`storage/refs.c`'s ref-write path got -- a stale/foreign empty directory
+sitting exactly at the reflog path (`logs/refs/heads/<name>`) must not
+block the append, matching real git. Rather than writing a second
+depth-first empty-directory walk, `sg_ref_remove_empty_dir_tree`
+(`storage/refs.c`) was made non-`static` and declared in `refs.h`
+specifically so `reflog.c` could call the existing one. If a THIRD file
+ever needs this same removal, it goes through this same function -- do
+not write a third copy.

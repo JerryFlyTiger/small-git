@@ -357,7 +357,8 @@ int sg_cmd_switch(int argc, char **argv)
 
         if (snprintf(ref_path, sizeof(ref_path), "refs/heads/%s", branch_arg) >= (int)sizeof(ref_path) ||
            sg_ref_update(git_dir, ref_path, target_commit_id, "branch: Created from HEAD") != 0) {
-            fprintf(stderr, "sg: failed to create branch '%s'\n", branch_arg);
+            if (!sg_ref_lock_err_report(stderr, NULL))
+                fprintf(stderr, "sg: failed to create branch '%s'\n", branch_arg);
             free(checkout_msg);
             free(old_branch);
             free(git_dir);
@@ -379,7 +380,19 @@ int sg_cmd_switch(int argc, char **argv)
                         : sg_ref_set_head(git_dir, branch_arg, checkout_msg);
 
         if (rc != 0) {
-            fprintf(stderr, "sg: failed to update HEAD\n");
+            /* Phase 77 fix round, measured against git 2.55.0: the two
+               HEAD-move shapes get DIFFERENT wording on a lock collision.
+               `switch --detach` writes HEAD directly (git's own
+               update_ref path): "update_ref failed for ref 'HEAD':
+               cannot lock ref 'HEAD': ..." + HINT, no trailing line.
+               Switching TO a branch (create_symref) instead: plain
+               "cannot lock ref 'HEAD': ..." + HINT + a separate trailing
+               "unable to update HEAD" line. */
+            int reported = detach ? sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", NULL)
+                                  : sg_ref_lock_err_report_ex(stderr, "HEAD", NULL, "unable to update HEAD");
+
+            if (!reported)
+                fprintf(stderr, "sg: failed to update HEAD\n");
             free(checkout_msg);
             free(old_branch);
             free(git_dir);

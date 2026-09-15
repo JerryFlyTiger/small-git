@@ -240,8 +240,9 @@ int sg_cmd_reset(int argc, char **argv)
                 return 1;
             }
             if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: cannot update %s\n",
-                       current_branch != NULL ? current_branch : "HEAD");
+                if (!sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", NULL))
+                    fprintf(stderr, "sg: cannot update %s\n",
+                           current_branch != NULL ? current_branch : "HEAD");
                 free(reflog_msg);
                 free(current_branch);
                 free(git_dir);
@@ -332,8 +333,9 @@ int sg_cmd_reset(int argc, char **argv)
                 return 1;
             }
             if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: cannot update %s\n",
-                       current_branch != NULL ? current_branch : "HEAD");
+                if (!sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", NULL))
+                    fprintf(stderr, "sg: cannot update %s\n",
+                           current_branch != NULL ? current_branch : "HEAD");
                 free(reflog_msg);
                 free(current_branch);
                 free(git_dir);
@@ -403,8 +405,9 @@ int sg_cmd_reset(int argc, char **argv)
                 return 1;
             }
             if (sg_ref_move_head(git_dir, current_branch, target_commit_id, reflog_msg) != 0) {
-                fprintf(stderr, "sg: cannot update %s\n",
-                       current_branch != NULL ? current_branch : "HEAD");
+                if (!sg_ref_lock_err_report_ex(stderr, "HEAD", "HEAD", NULL))
+                    fprintf(stderr, "sg: cannot update %s\n",
+                           current_branch != NULL ? current_branch : "HEAD");
                 free(reflog_msg);
                 free(current_branch);
                 free(git_dir);
