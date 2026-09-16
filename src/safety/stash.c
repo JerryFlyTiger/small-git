@@ -896,6 +896,24 @@ int sg_stash_push(const char *git_dir, const char *repo_root, const sg_stash_pus
        user got the same failure reported TWICE. cmd_stash.c now checks
        sg_ref_last_lock_err()->kind itself and picks the accurate,
        git-matching wording instead. */
+    /* Phase 78: only a FULL push writes ORIG_HEAD (measured against git
+       2.55.0, ORACLE-orig-head.md section 2/N4) -- a path-limited partial
+       push leaves an existing ORIG_HEAD untouched. Written here, after the
+       stash commit and refs/stash update above (":804") are already
+       durable, so a write failure never turns an already-successful stash
+       into a reported one -- non-fatal, same reasoning as the
+       reflog-mirroring HEAD write right below it. Value is head_commit,
+       the pre-stash HEAD; a detached HEAD still writes it (measured).
+       Calls sg_ref_write_path directly rather than cli/cli_args.c's
+       sg_cli_write_orig_head: safety/ may not depend on cli/ (module
+       layering is bottom-up), so this is intentionally NOT the same call
+       site, just the same wording -- see sg_cli_write_orig_head's own
+       header comment. */
+    if (!partial && sg_ref_write_path(git_dir, "ORIG_HEAD", head_commit) != 0) {
+        if (!sg_ref_lock_err_report_ex(stderr, "ORIG_HEAD", "ORIG_HEAD", NULL))
+            fprintf(stderr, "sg: unable to update ORIG_HEAD\n");
+    }
+
     if (!partial &&
        sg_ref_move_head(git_dir, branch, head_commit, "reset: moving to HEAD") != 0) {
         sg_ref_lock_err_kind lock_kind = sg_ref_last_lock_err()->kind;

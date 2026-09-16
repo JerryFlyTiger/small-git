@@ -573,3 +573,104 @@ do not read the whole thing).
   removed -- do not "simplify" this to an all-or-nothing removal, that
   changes which siblings survive a D/F-conflict refusal (pinned in
   `tests/interop.sh`'s `phase77` group and `tests/test_ref_locked_write.c`).
+
+## Phase 78: `ORIG_HEAD` is a real ref, and its rules are per command
+
+- **Write it with `sg_ref_write_path(git_dir, "ORIG_HEAD", id)` and NOTHING
+  else.** Measured against git 2.55.0: git writes it through its own refs
+  API, so it is 41 bytes (40 hex + `\n`), it takes
+  `$GIT_DIR/ORIG_HEAD.lock`, and `git update-ref -d ORIG_HEAD` deletes it.
+  Do NOT copy `sg_merge_head_write`'s bare `fopen` shape (that is right for
+  `MERGE_HEAD`, which is not a ref). The reflog message **must** be NULL:
+  `ref_path_reflog_allowed` does not list `ORIG_HEAD`, so a non-NULL
+  message makes the whole write return -1, and real git writes no
+  `logs/ORIG_HEAD` by default either (only `core.logAllRefUpdates=always`
+  does, and sg has no such knob). Pinned by `tests/test_orig_head.c`'s
+  "logs/ORIG_HEAD must NOT be created".
+- **`sg_cli_write_orig_head` (`cli/cli_args.h`) is the shared writer for
+  the three `cli/` call sites; `safety/stash.c` deliberately repeats the
+  three lines** because `safety/` may not depend on `cli/`. Both sides
+  carry a comment naming the other. WARNING: the alternative -- putting the
+  helper in `storage/refs.c`, which both layers already depend on and where
+  the pack and HTTP layers already print to stderr -- was raised in review
+  and is
+  NOT unreasonable; if a third caller ever appears, move it rather than
+  writing a third copy.
+- **Whether a failed ORIG_HEAD write is fatal is PER COMMAND, and matching
+  git means keeping them different.** Measured with a foreign
+  `ORIG_HEAD.lock`: `reset`, `rebase` and `stash push` print the error and
+  still do the work (rc=0); `merge` refuses outright and does nothing
+  (git rc=128, sg rc=1 per this project's exit-code convention). Two
+  mutations pin the split in opposite directions -- making merge's failure
+  non-fatal reds ONLY the foreign-lock merge rows, making reset's fatal
+  reds the reset ones.
+- **An unborn HEAD means DELETE in `reset` and DO NOTHING in `merge`.**
+  Measured, three rows each. `cmd_reset.c`'s helper unlinks an existing
+  `ORIG_HEAD` (and creates nothing when there was none); `cmd_merge.c`
+  guards its write with `has_head` and leaves any existing value alone.
+  **Do not unify these two into one rule** -- the interop rows
+  `phase78 (unborn HEAD, reset)` and `phase78 (unborn HEAD, merge)` exist
+  to make that attempt fail loudly.
+- **The delete is a bare `unlink`, NOT the locked ref API -- but it must
+  still report.** git is not silent when the delete fails: with an
+  undeletable `ORIG_HEAD` it prints `error: unable to unlink
+  '.git/ORIG_HEAD': Operation not permitted` and completes anyway, so sg
+  prints the same sentence (its own `sg: ` prefix and absolute path) and
+  completes anyway. **`ENOENT` is excluded on purpose**: "there was nothing
+  to delete" is the ordinary case, and reporting it would make every
+  unborn reset noisier than git. Both halves are pinned, each with its own
+  mutation (dropping the report reds one row; widening it to every errno
+  reds a different one).
+  **A DIRECTORY at the path is excluded too, and that one cannot be done
+  with errno**: measured, git is silent for it, and on macOS `unlink()`
+  returns EPERM for a directory exactly as it does for an immutable file
+  (errno 1 for both; EISDIR never appears), so the test is `lstat` +
+  `S_ISDIR`, not an errno list. Its own mutation (removing the `S_ISDIR`
+  test) reds only the portable directory rows.
+- **The WRITE path answers the same directory question DIFFERENTLY, and
+  that is git's answer too.** Measured with `test -d` (a `test -e` probe
+  cannot tell these apart and produced a false claim in two comments before
+  it was caught): with a born HEAD and an EMPTY directory at
+  `$GIT_DIR/ORIG_HEAD`, git REMOVES the directory and writes the 41-byte
+  ref through it, silently -- sg matches, via Phase 77's own D1a
+  `sg_ref_remove_empty_dir_tree`, so the ORIG_HEAD rows also pin D1a. With
+  a NON-empty directory both refuse the ORIG_HEAD write, report it, and
+  still complete the reset (rc 0). **Do not "unify" the write path's
+  handling with the delete path's silence** -- they are different answers
+  because git gives different answers.
+  WARNING: in that non-empty case the two tools' refusal text still
+  differs in its final clause (git names the blocking DIRECTORY, sg names
+  the FILE inside it). That is Phase 77's own recorded "D/F wording has no
+  oracle" residual; Phase 78 supplies the oracle and pins both sides
+  literally, but does NOT converge them -- changing that message is a
+  project-wide change to every ref write's D/F path, not an ORIG_HEAD
+  question.
+- **Only `do_rebase_start` writes.** `--continue`, `--skip` and `--abort`
+  must not touch `ORIG_HEAD` (measured: git does not rewrite it either),
+  and `sg_rebase_state.orig_head` is a DIFFERENT mechanism -- sg's own
+  sequencer field for `--abort`, not the file on disk. Do not wire one to
+  the other.
+- **`stash push` writes only for a FULL push**; a path-limited
+  (`-- <path>`) push leaves an existing value alone, while `-k`/`-u` and a
+  detached HEAD all write. The write goes AFTER `refs/stash` is already
+  durable, so a failure never turns a successful stash into a reported
+  failure.
+- **`sg merge`'s gate order is part of the contract**: parse `<rev>` ->
+  write `ORIG_HEAD` -> dirty-work-tree check. git's order is the same, and
+  it decides two user-visible answers -- a dirty tree with an unresolvable
+  `<rev>` reports the REV error, and a merge refused for dirtiness still
+  writes `ORIG_HEAD`. Reverting the order reds both rows.
+- WARNING: **the `phase78` interop group is 6 checks smaller on Linux.**
+  The "undeletable ORIG_HEAD" rows need a file that `unlink` cannot remove,
+  and the only fixture that reproduces git's own diagnostic is macOS's
+  `chflags uchg` (a read-only `$GIT_DIR` kills the reset at `index.lock`
+  before the row means anything; an `ORIG_HEAD` that is a DIRECTORY is
+  portable but git stays silent for it, so it cannot pin "git reports").
+  A runtime probe decides, and `skip()` increments `SKIP` without
+  incrementing `TOTAL` -- so compare Linux's `M` against Linux's, never
+  against macOS's. Measured on CI at the commit that introduced this
+  group: macOS `4789/4789, 0 skipped`, ubuntu `4689/4689, 14 skipped`.
+  **The 100-check gap between those two totals is NOT this group's doing**
+  -- 94 of it is inherited from the case-folding groups that Phase 73's
+  filesystem probe made possible and that Phases 74 and 76 added, and only
+  6 belong here.

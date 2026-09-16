@@ -6,6 +6,7 @@
 #include "sg/object.h"
 #include "sg/objstore.h"
 #include "sg/quote.h"
+#include "sg/refs.h"
 #include "sg/revparse.h"
 #include "sg/workdir.h"
 
@@ -600,4 +601,14 @@ void sg_cli_report_rev_error(const char *cmd, sg_rev_err_kind kind, const char *
     fprintf(stderr, "sg: ");
     fprintf(stderr, row->r, san_arg);
     fputc('\n', stderr);
+}
+
+int sg_cli_write_orig_head(const char *git_dir, const unsigned char head_id[SG_SHA1_RAW_LEN])
+{
+    if (sg_ref_write_path(git_dir, "ORIG_HEAD", head_id) != 0) {
+        if (!sg_ref_lock_err_report_ex(stderr, "ORIG_HEAD", "ORIG_HEAD", NULL))
+            fprintf(stderr, "sg: unable to update ORIG_HEAD\n");
+        return -1;
+    }
+    return 0;
 }

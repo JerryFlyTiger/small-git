@@ -19078,6 +19078,15 @@ for the required rows, using `sg_ref_lock_err_report`.
   this phase's scope: adding a CLI feature, not closing a lock gap).
 - **`ORIG_HEAD` is not locked** -- sg does not write `ORIG_HEAD` at all
   (a pre-existing, unrelated gap; out of scope per this phase's own spec).
+  **Closed as of Phase 78**, which makes all four of git's writers write it
+  through `sg_ref_write_path`, i.e. through this phase's own lock. Left in
+  place rather than deleted because a phase's residual list and CLAUDE.md's
+  deliberate-divergence list are different kinds of list, and they get
+  different conventions: the divergence list answers "what is still true
+  today", so a closed entry is DELETED there (and its number never reused
+  silently); a residual list answers "what did Phase 77 leave undone", a
+  historical statement that stays true and would become a lie if edited
+  away. See this file's `## Phase 78` section.
 - **`cherry-pick`/`revert` leave `CHERRY_PICK_HEAD`/`REVERT_HEAD` behind
   after a refused write; sg does not** -- matches git's own measured
   behavior in the best-effort sense the spec asked for (refuses, ref
@@ -19415,3 +19424,315 @@ touch (no ref writes there) and ran unmodified. An immediate rerun on
 the identical tree got `4679/4679`, no FAILs. Cause not found; recorded
 here rather than silently ignored, in case a future phase touching that
 group reads this as background noise it is not responsible for.
+
+## Phase 78: sg writes git's `ORIG_HEAD`
+
+Recorded in Phase 77's own residual list as the recommended next phase: sg
+did not write `$GIT_DIR/ORIG_HEAD` **at all**, in any command, while real git
+writes it in four (`reset` without a pathspec, `merge`, `rebase` at its
+start, and a full `stash push`). The user-visible cost is the recovery idiom
+`reset --hard ORIG_HEAD`, which in sg silently had nothing to resolve.
+
+The READ side needed no work: `sg_rev_parse_ref_path`'s rule 1 (any file
+under `$GIT_DIR` whose first 40 bytes are hex) already resolved `ORIG_HEAD`
+and `ORIG_HEAD~1` -- measured against a git-planted file before any code was
+written. The gap was entirely on the write side, and unlike Phases 69/70/73
+it had **no existing witness**: `rg ORIG_HEAD` over the repo found three
+prose lines and zero checks, so this phase had to create its own oracle.
+
+Gates: `interop 4679/4679 -> 4789/4789` (+110), 0 skipped on macOS, test
+binaries 86 -> 87, `make` 0 warnings. **Six of those checks skip on
+Linux** (see the `chflags` fixture below), and `skip()` increments `SKIP`
+without incrementing `TOTAL`, so the two platforms report different totals.
+Measured on CI for this commit: macOS `4789/4789, 0 skipped`; ubuntu
+`4689/4689, 14 skipped` (6 of those skips are this phase's, 8 are
+inherited). **The gap between the platforms is 100, not 6** -- 94 of it is
+the case-folding groups that Phase 73's filesystem probe made possible and
+that Phases 74 and 76 actually added (Phase 77 contributed none of them,
+and measured macOS 4679 vs ubuntu 4585), and this phase adds the other 6.
+Do not read "six skip on Linux" as "Linux's M is six smaller"; compare
+Linux's M against Linux's, never against macOS's.
+
+### The oracle (measured against git 2.55.0, macOS)
+
+`ORIG_HEAD` is a real ref, not a scratch file: 41 bytes (40 hex + `\n`),
+written through the refs API so it takes `$GIT_DIR/ORIG_HEAD.lock`,
+`show-ref --verify` finds it, `update-ref -d` deletes it -- but
+`for-each-ref` does not list it and **no reflog is written by default**
+(only `core.logAllRefUpdates=always` produces `logs/ORIG_HEAD`, and sg has
+no equivalent knob). So sg writes it with `sg_ref_write_path` (Phase 77's
+locked write) and a NULL reflog message.
+
+| Situation | ORIG_HEAD |
+|---|---|
+| `reset` any mode, no pathspec (incl. no-op, detached) | written |
+| `reset <rev> -- <path>`, unresolvable rev | not written |
+| `merge` FF / 3-way / conflict / **already up to date** | written |
+| `merge` refused for a dirty work tree | **written** (git writes before the dirty check) |
+| `merge` refused for an unmerged index | not written (that gate comes first) |
+| `rebase` real work, incl. stopping on a conflict | written |
+| `rebase` already up to date, refused for dirty work tree | not written |
+| `rebase --continue` / `--skip` / `--abort` | not rewritten |
+| `stash push` full (incl. `-k`, `-u`, detached HEAD) | written |
+| `stash push -- <path>`, nothing to stash, `pop`/`apply` | not written |
+| `cherry-pick`, `revert`, `commit`, `switch` | not written |
+
+Two further axes decided the implementation:
+
+- **Failure is per command, not uniform.** With a foreign `ORIG_HEAD.lock`,
+  `reset`/`rebase`/`stash push` print `error: update_ref failed for ref
+  'ORIG_HEAD': ...` and **carry on** (rc=0, the operation happens), while
+  `merge` is `fatal:`, rc=128, and does nothing at all. sg mirrors that
+  split exactly, using exit 1 where git uses 128 (this project's own
+  exit-code convention, the same reasoning as divergence #3).
+- **Unborn HEAD maps to OPPOSITE rules in the two commands.** `reset` with
+  a resolvable target DELETES an existing `ORIG_HEAD` (three measured rows,
+  and git's own `reset_refs` shape: "if HEAD resolves, update it; else
+  delete it"); `merge` into a clean unborn branch neither writes nor
+  deletes. That is why `cmd_merge.c`'s write is guarded by `has_head` and
+  does not share `cmd_reset.c`'s helper. Both halves are pinned; a
+  "simplification" that made them share one rule goes red.
+
+### What changed
+
+- `include/sg/cli_args.h` + `src/cli/cli_args.c`: `sg_cli_write_orig_head`,
+  the shared writer (locked write + Phase 77's `sg_ref_lock_err_report_ex`
+  wording with a `prefix_ref` of `ORIG_HEAD`, measured from git's own
+  sentence). Returns -1 and lets each caller decide whether that is fatal.
+- `src/cli/cmd_reset.c`: `reset_update_orig_head`, called from all three
+  modes immediately before `sg_ref_move_head` -- deliberately AFTER sg's two
+  "no changes made" gates (the `--mixed` snapshot failure and the `--hard`
+  confirmation refusal), which git has no counterpart for; writing before
+  them would make those messages false.
+- `src/cli/cmd_merge.c`: the rev-parse block and the `has_head` resolution
+  moved AHEAD of `sg_require_clean_workdir`, because git's own order is
+  "parse -> write ORIG_HEAD -> dirty check". The reorder buys two separate
+  behaviours, and each has its own pin: a dirty work tree with an
+  unresolvable `<rev>` now reports the REV error (not the dirty one), and a
+  merge refused for dirtiness still writes ORIG_HEAD.
+- `src/cli/cmd_rebase.c`: one write in `do_rebase_start`, past the dirty /
+  merge-base / "already up to date" early returns and before either path
+  that moves HEAD (the fast-forward shortcut and the ordinary replay).
+- `src/safety/stash.c`: a full push writes, a path-limited one does not.
+  This call site does NOT use the cli helper -- `safety/` may not depend on
+  `cli/` -- so it repeats three lines deliberately. **The cold read argued
+  the helper belongs in `storage/refs.c` instead**, where both layers could
+  share it and where `pack.c`/`http.c` already set the precedent of a lower
+  layer printing to stderr. That is a reasonable alternative; it was left in
+  `cli/` because the message text is CLI-facing wording, and the duplication
+  is three lines with a comment on each side naming the other. Recorded here
+  so the next person weighing it has both arguments rather than one.
+
+### Verification: what each gate could and could not see
+
+Four gates plus a 39-probe out-of-repo differential harness (sg vs git on
+identical fixtures, planting a DISTINCT prior value on every probe so "not
+written" is distinguishable from "written the same value by luck"). The
+harness went from **20 mismatches to 1**, and that last one was NOT a gap:
+`reset --hard` inside a stopped cherry-pick, where git proceeds and sg stops
+at its own confirmation gate. Re-measured with `--force`: byte-identical to
+git. **The spec's claim that "sg has no gate there" was simply wrong** --
+sg's gate is the safe-apply confirmation, not a cherry-pick check.
+
+Three mutation rounds, per site, never `/g`:
+
+| Mutation | Result |
+|---|---|
+| drop the write at each site (6 mutations across the 4 commands -- `reset`'s three modes are three independent call sites and were mutated one at a time) | each reds a DIFFERENT named set; no round touches another command's rows |
+| undo the merge reorder | reds BOTH rows the reorder bought, plus unrelated-histories |
+| a path-limited stash push writes too | reds exactly the partial row |
+| give cherry-pick a write | reds the control row (so the controls have teeth) |
+| merge's lock failure becomes non-fatal | reds ONLY the foreign-lock rows, not the value rows |
+| reset's lock failure becomes fatal | reds the reset foreign-lock rows |
+| merge writes `theirs` instead of `ours` | reds all six merge value rows, including "already up to date" |
+
+**Two mutation-methodology lessons, both cheap to repeat:**
+
+1. A round reported "a real blind spot" for the no-reflog assertion. It was
+   not one: the anchor `return sg_ref_update(git_dir, ref_path, id, NULL);`
+   occurs TWICE in `refs.c`, and without `/g` perl rewrote the first one -- a
+   different function -- so `sg_ref_write_path` was never touched and the
+   round proved nothing. Re-run with the function's own signature in the
+   anchor, the assertion reds immediately. **A green mutation has to be
+   proven to have changed the code under test, not just to have changed
+   something.**
+2. Two mutations were measured GREEN on purpose BEFORE the fix round (the
+   unborn-delete branch and a write planted in `do_rebase_continue`, both at
+   4749/4749), and RED afterwards. That before/after pair is what makes
+   "this pin has teeth" a measurement rather than a claim -- a review-found
+   fix otherwise ships with nothing guarding it.
+
+### The cold read found no functional bug and five test-completeness gaps
+
+The first review round's verdict on the code itself was clean; every gap was
+about what would still be protected later. All were closed:
+
+- the unborn-HEAD DELETE branch had **zero** coverage (the spec had asked
+  for a pin and it was never added) -- three rows now pin it;
+- `rebase --continue` had no negative pin, though the spec asked for both
+  `--continue` and `--abort`;
+- `merge` already-up-to-date was an oracle row with no pin of its own;
+- the path-limited `reset` control had no discriminating power at all (sg
+  rejects a pathspec long before this code) -- kept, but RENAMED to say it
+  is a precondition, so nobody reads it as evidence;
+- the delete branch swallowed `unlink()`'s failure in silence.
+
+That last one turned into its own measurement. **git is not silent there**:
+with an undeletable `ORIG_HEAD` it prints `error: unable to unlink
+'.git/ORIG_HEAD': Operation not permitted` and still completes, so sg now
+prints the same sentence with its own prefix and path, and still completes.
+`ENOENT` is excluded, because "there was nothing to delete" is the ordinary
+case and reporting it would make every unborn reset noisier than git -- and
+that exclusion has its own pin and its own mutation (widening it to every
+errno reds exactly one check).
+
+The fixture for "undeletable" was chosen by measurement, not convenience:
+
+| Candidate | Verdict |
+|---|---|
+| read-only `$GIT_DIR` | rejected: git dies at `index.lock`, the reset never happens |
+| `ORIG_HEAD` as a DIRECTORY | portable, but git is **silent** there for the UNBORN/delete path, so it cannot express "git reports" -- and NOT for a born HEAD, see below |
+| `chflags uchg` on the file | the only one that reproduces the oracle -- macOS only, hence a runtime probe and six `skip()`s on Linux |
+
+The directory case then turned into a fix of its own. Adding the report at
+all had QUIETLY CREATED a divergence: the old code was silent about every
+failure, so sg had matched git's silence for a directory by accident, and
+the new `fprintf` broke that (measured: git 0 bytes, sg 180). The second
+cold read caught it, and `reset_update_orig_head` now suppresses the report
+when the path is a directory, so **both tools are silent there again** --
+this is NOT an accepted divergence, it is parity that had to be restored.
+The test has to be the path's TYPE: on macOS `unlink()` returns EPERM for
+an immutable file AND for a directory (measured, errno 1 for both; EISDIR
+never appears), so an errno filter would either keep the divergence or
+silence the immutable-file case git does report. Pinned by seven PORTABLE
+rows across two fixtures, empty and non-empty (`mkdir` needs no `chflags`,
+so unlike the group above they never skip). Removing the `S_ISDIR` test
+reds TWO of those seven -- one per fixture, both the "sg says nothing
+either" rows -- and that is the whole of what this guard can be blamed
+for: the others assert git's own behaviour, or that the directory is still
+there afterwards, neither of which an sg-side guard can change. The count
+is measured on the CURRENT tree, not carried over: the first run of this
+mutation predated the non-empty fixture, and the write-up claimed its
+coverage by inference until a cold read asked for the number.
+
+### Recorded, not fixed
+
+- **One interop run reported 88 FAILs**, spread across phase16/17 groups
+  this phase does not touch; an immediate re-run on the identical tree was
+  fully green, as were the four runs after it. Cause not found. **Phase 77
+  recorded the same shape** (eight FAILs in the phase68/69 group, gone on
+  re-run), so this is now twice; whoever sees it a third time should treat
+  it as a real signal about the harness or the machine, not noise.
+- `sg merge` still has no dirty check for an UNTRACKED file that the merge
+  would overwrite (git refuses; sg proceeds). Pre-existing, unrelated to
+  ORIG_HEAD, found while building a fixture.
+- A reviewer running in its own git worktree **cannot see uncommitted
+  work** -- the worktree is checked out from HEAD, and `git add -A` does not
+  travel with it. Hand the batch over as a patch file (or name the main
+  checkout's absolute path) instead of assuming a shared index.
+- **CLAUDE.md's own pointer-table check reports four PRE-EXISTING gaps**,
+  and its text still says "expected leftovers today: none". Measured on
+  this tree: `cmd_merge_base.c` and `cmd_reflog.c` (named by
+  `docs/RULES-duplication.md`) and `ident.c`/`ident.h` (named by
+  `docs/RULES-date.md`) appear in no row of the table, so nothing sends a
+  reader from those files to the rules governing them. Neither rules file
+  is touched by this phase, and the gaps predate it -- left alone rather
+  than fixed here, because the fix belongs with whoever owns those rows,
+  but the "expected: none" line is now wrong and the next person to run the
+  check should not read four hits as this phase's doing. (Phase 78 did
+  briefly ADD two of its own, by naming `pack.c`/`http.c` in a
+  precedent-citing sentence; that sentence was reworded so the check is
+  back to the four inherited ones.)
+
+### The later cold reads: three rounds, and the third one caught me
+
+Round 2 (the fix batch) and round 3 (the fix-batch's own fix batch) each
+found things the gates could not, and the pattern is worth keeping:
+
+- **Round 2's most useful finding was about a divergence this phase had
+  just CREATED.** Teaching the delete branch to report failures made sg
+  speak where git is silent (a directory at the ORIG_HEAD path). The old
+  code had matched git there by accident, through silence. Fixed with an
+  `lstat`/`S_ISDIR` test -- and the test has to be the path's TYPE, because
+  on macOS `unlink()` returns EPERM for a directory and for an immutable
+  file alike (measured, errno 1 for both).
+- **Round 3 raised a bigger alarm: that the WRITE path had the same
+  problem, unfixed, on disk.** Measured, that premise is FALSE -- with a
+  born HEAD and an empty directory at `$GIT_DIR/ORIG_HEAD`, git itself
+  removes the directory and writes the ref through it, exactly as sg does
+  via Phase 77's D1a mechanism; with a NON-empty one both refuse, report,
+  and complete the reset. No divergence either way.
+- **But the alarm was worth more than its conclusion, because the claim it
+  was built on was MINE and it was wrong.** An earlier probe of this shape
+  asked `test -e ".git/ORIG_HEAD"` to decide whether git had left the
+  directory alone. A FILE satisfies `-e` too, so "git left the directory"
+  was really "git replaced the directory with a 41-byte ref file", and that
+  false reading had been copied into THREE places, in two different
+  phrasings: two source comments (`cmd_reset.c`'s "born HEAD alike",
+  `tests/interop.sh`'s "born HEAD too") and this phase's own fixture-choice
+  table, two subsections earlier ("born HEAD too" as well). Re-measured
+  with `test -d`; the two comments were corrected immediately, the table
+  only after cold read round 4 found it still contradicting the paragraph
+  you are reading. Twelve rows now pin all three states (unborn/born x
+  empty/non-empty). **Copy number three was written by the same hand that
+  had just corrected copies one and two** -- when a false claim is already
+  duplicated, fixing the copies you remember is not the same as grepping
+  for the claim. **A predicate that is true of the state you expect AND of
+  the state you are trying to rule out cannot tell you anything** -- `-e`
+  vs `-d` is the same failure shape as the `[ -s file ]` assertion Phase 66
+  had to replace.
+- The non-empty case handed this project an oracle it had been missing:
+  Phase 77 recorded "D/F wording has no oracle" as a residual, and here
+  git's own text is visible (`there is a non-empty directory ... blocking
+  reference 'ORIG_HEAD'`) next to sg's (`'ORIG_HEAD/keep' exists; cannot
+  create 'ORIG_HEAD'`). Both are pinned literally, per side. **Converging
+  them is deliberately NOT part of this phase** -- that message belongs to
+  every ref write's D/F path, not to ORIG_HEAD.
+
+Mutation rounds 4 and 5 added four more, all matching expectations written
+before the runs: widening the ENOENT exclusion to every errno reds exactly
+the silence row; REVERSING the condition reds BOTH ENOENT-axis rows at once
+(so they really are two directions of one condition, not two unrelated
+checks); swapping the two `%s` arguments reds only the byte-literal row;
+removing the `S_ISDIR` test reds only the portable directory rows (re-run
+in round 8 once a second directory fixture existed: exactly two rows, one
+per fixture).
+
+Rounds 6 and 7 covered the born-HEAD rows, and round 6 repeated this
+phase's own worst mutation mistake:
+
+- Disabling Phase 77's empty-directory clearing reds three `phase77` D1a
+  rows AND three of the new `phase78` ones -- the smear is the evidence
+  here, since the interop comment claims these rows "also pin D1a", and a
+  claim like that is only true if breaking D1a breaks them.
+- Changing sg's D/F sentence came back GREEN, and `mutate.sh` again
+  printed "a real blind spot". Again it was not one. `sg_ref_lock_err_report_ex`
+  has TWO D/F variants -- one prefixed with `update_ref failed for ref
+  '<ref>': ` (what ORIG_HEAD uses) and one without -- and in the prefixed
+  one the sentence is **split across two source lines** (`"... exists;
+  cannot "` / `"create '%s'\n"`). A pattern written against the joined text
+  therefore matches only the OTHER variant. Re-run with an anchor ending at
+  the closing quote, it reds EXACTLY one row: this phase's own. **Both of
+  this phase's false "blind spots" had the same cause** -- a literal that
+  exists in more than one place, with a pattern that could not tell the
+  sites apart -- and the second one adds a wrinkle worth remembering: a
+  string split across source lines is invisible to a search for the string
+  a reader sees in the output.
+- That round also measured something about the project rather than this
+  phase: nothing ELSE reds when the prefixed D/F sentence changes, so
+  Phase 78's row is the first pin anywhere on that wording.
+
+Seven rounds, 26 mutations, no surprises after the anchors were right. (An
+earlier draft of this section said "five rounds, 21 mutations"; the count
+was wrong twice over -- 6+8+5+1+3 is 23 through round 5 -- and it is
+recorded here rather than silently corrected, because a wrong number in a
+phase's own write-up is the exact failure this project calls its worst.)
+
+**Recorded as NOT verifiable, rather than quietly counted as covered**: the
+`unlink_errno` capture (taking errno before `lstat` can clobber it) has no
+fixture that can observe it -- every path that reaches the report has
+`lstat` succeeding, and a case where `lstat` fails with a DIFFERENT errno
+needs a TOCTOU race no portable fixture can produce. The same goes for a
+symlink-to-directory at the path (never measured, low priority, no
+porcelain produces it) and for the TOCTOU window between the failed
+`unlink` and the `lstat`.

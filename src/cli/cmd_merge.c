@@ -689,13 +689,6 @@ int sg_cmd_merge(int argc, char **argv)
             return 1;
         }
 
-        if (sg_require_clean_workdir(git_dir, repo_root, "sg merge") != 0) {
-            free(current_branch);
-            free(git_dir);
-            free(repo_root);
-            return 1;
-        }
-
         /* Any revision sg_rev_parse_commit understands, not just a bare
            branch name (Phase 43). The old code called sg_ref_branch_exists
            directly, which made `sg merge v1` / `refs/heads/topic` /
@@ -703,7 +696,16 @@ int sg_cmd_merge(int argc, char **argv)
            merge` succeeded -- and contradicted this project's own rule that
            a user-supplied revision always goes through sg_rev_parse_commit.
            That function peels annotated tags, which is what merge wants:
-           measured, `git merge <annotated-tag>` merges the tagged COMMIT. */
+           measured, `git merge <annotated-tag>` merges the tagged COMMIT.
+
+           Phase 78: this whole block, and the has_head/ORIG_HEAD write right
+           after it, moved AHEAD of sg_require_clean_workdir below -- measured
+           against git 2.55.0: git's own order is "rev parse -> write
+           ORIG_HEAD -> dirty check", so a dirty work tree with an
+           UNRESOLVABLE <rev> prints the REV error (not the dirty-workdir
+           one), and a dirty work tree with a RESOLVABLE <rev> still gets
+           ORIG_HEAD written even though the merge is then refused for being
+           dirty. Both corners are pinned in interop's phase78 group. */
         {
             int prc = sg_rev_parse_commit(git_dir, branch_arg, theirs_commit);
 
@@ -719,6 +721,27 @@ int sg_cmd_merge(int argc, char **argv)
         }
 
         has_head = (sg_ref_resolve_head(git_dir, ours_commit) == 0);
+
+        /* HEAD unborn (has_head == 0): neither written nor deleted here --
+           measured, this is the OPPOSITE of reset's unborn rule (see
+           cmd_reset.c's reset_update_orig_head): `git merge` into a clean
+           unborn branch succeeds (FF) and leaves a planted ORIG_HEAD
+           untouched. Failure to write is FATAL for merge (unlike reset/
+           rebase/stash), matching git: a foreign ORIG_HEAD.lock makes real
+           git exit 128 and do nothing at all. */
+        if (has_head && sg_cli_write_orig_head(git_dir, ours_commit) != 0) {
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
+
+        if (sg_require_clean_workdir(git_dir, repo_root, "sg merge") != 0) {
+            free(current_branch);
+            free(git_dir);
+            free(repo_root);
+            return 1;
+        }
 
         if (sg_commit_tree_of(git_dir, theirs_commit, theirs_tree) != 0) {
             fprintf(stderr, "sg: corrupt commit for branch '%s'\n", branch_arg);
