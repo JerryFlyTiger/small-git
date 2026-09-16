@@ -124,6 +124,13 @@ cleanup() {
     if [ -n "$HTTP_SERVER_PID" ]; then
         kill "$HTTP_SERVER_PID" 2>/dev/null
     fi
+    # Phase 78 makes one fixture immutable (chflags uchg) to reproduce git's
+    # "unable to unlink" oracle, and clears it again immediately. If the
+    # script is killed inside that window the flag survives, and then this
+    # rm -rf -- and every later one on the same path -- fails, leaving an
+    # undeletable stump in /tmp that needs a manual chflags to remove.
+    # Harmless where chflags does not exist (Linux): the command just fails.
+    chflags -R nouchg "$WORKDIR" 2>/dev/null
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -23766,6 +23773,736 @@ for p77_ed_dir in "$P77_SG_ED1" "$P77_SG_ED2"; do
 done
 check "phase77: no stray .lock left under either D1a sg repo's .git/refs or top-level HEAD.lock" \
     sh -c "! grep -q . '$WORKDIR/p77_stray_locks.txt' || { echo leftover:; cat '$WORKDIR/p77_stray_locks.txt'; false; }"
+
+# --- Phase 78: sg writes git's ORIG_HEAD in reset/merge/rebase/stash push.
+# Reuses p77_mk_repo / p77_mk_repo_full (defined above, in the phase77
+# group) for its fixtures rather than a third near-identical repo builder
+# -- see docs/RULES-duplication.md's standing rule. Comparison is always
+# "cmp both sides' .git/ORIG_HEAD", never "does sg merely have the file",
+# per this phase's own spec (SPEC-orig-head.md section 4.1's own warning).
+
+p78_oh() {
+    # $1 = repo dir. Prints the raw file content, or the literal string
+    # MISSING if it does not exist -- lets `check` do a plain string
+    # compare either way, same convention as p77_refuse_case's ref reads.
+    cat "$1/.git/ORIG_HEAD" 2>/dev/null || echo MISSING
+}
+
+p78_norm_line() {
+    # $1 = captured stderr file, $2 = that side's repo root. Reuses phase77's
+    # p77_norm_err (repo path -> <R>, and fatal:/error:/sg: -> E:) rather
+    # than a second normaliser -- see docs/RULES-duplication.md.
+    # Deliberately returns the WHOLE normalised stderr, not the line that
+    # happens to match: compared against a one-line literal, that makes any
+    # EXTRA line a failure too. Picking the matching line instead would let
+    # new noise through unnoticed.
+    p77_norm_err "$1" "$2"
+}
+
+p78_plant_oh() {
+    # $1 = repo dir, $2 = 40-hex value to plant as a pre-existing ORIG_HEAD
+    # (a NEGATIVE-control assertion needs a planted, DIFFERENT value to
+    # tell "did not write" apart from "wrote the same value by
+    # coincidence" -- see SPEC-orig-head.md section 3's own warning).
+    printf '%s\n' "$2" > "$1/.git/ORIG_HEAD"
+}
+
+# 1/2: four positive cases, byte-identical to git's own ORIG_HEAD, plus
+# the byte-shape/no-reflog assertions (section 1 of the oracle).
+P78_SG1="$WORKDIR/phase78_sg1"; P78_GIT1="$WORKDIR/phase78_git1"
+p77_mk_repo "$P78_SG1"; rm -rf "$P78_GIT1"; cp -R "$P78_SG1" "$P78_GIT1"
+(cd "$P78_GIT1" && git reset --soft HEAD~1) > /dev/null 2>&1
+(cd "$P78_SG1" && "$SG" reset --soft HEAD~1) > /dev/null 2>&1
+check "phase78 (reset --soft): sg's ORIG_HEAD matches git's" \
+    test "$(p78_oh "$P78_SG1")" = "$(p78_oh "$P78_GIT1")"
+check "phase78 (reset --soft): ORIG_HEAD is not MISSING (precondition -- both sides really wrote one)" \
+    test "$(p78_oh "$P78_GIT1")" != "MISSING"
+check "phase78 (reset --soft): sg's ORIG_HEAD is exactly 41 bytes (40 hex + newline)" \
+    test "$(wc -c < "$P78_SG1/.git/ORIG_HEAD" | tr -d ' ')" = 41
+check "phase78 (reset --soft): sg wrote no logs/ORIG_HEAD (no reflog by default)" \
+    test ! -e "$P78_SG1/.git/logs/ORIG_HEAD"
+check "phase78 (reset --soft): git wrote no logs/ORIG_HEAD either (control)" \
+    test ! -e "$P78_GIT1/.git/logs/ORIG_HEAD"
+
+P78_SG2="$WORKDIR/phase78_sg2"; P78_GIT2="$WORKDIR/phase78_git2"
+p77_mk_repo "$P78_SG2"; rm -rf "$P78_GIT2"; cp -R "$P78_SG2" "$P78_GIT2"
+(cd "$P78_GIT2" && git reset --mixed HEAD~1) > /dev/null 2>&1
+(cd "$P78_SG2" && "$SG" reset --mixed HEAD~1) > /dev/null 2>&1
+check "phase78 (reset --mixed): sg's ORIG_HEAD matches git's" \
+    test "$(p78_oh "$P78_SG2")" = "$(p78_oh "$P78_GIT2")"
+
+P78_SG3="$WORKDIR/phase78_sg3"; P78_GIT3="$WORKDIR/phase78_git3"
+p77_mk_repo "$P78_SG3"; rm -rf "$P78_GIT3"; cp -R "$P78_SG3" "$P78_GIT3"
+(cd "$P78_GIT3" && git reset --hard HEAD~1) > /dev/null 2>&1
+(cd "$P78_SG3" && "$SG" reset --hard HEAD~1 --force) > /dev/null 2>&1
+check "phase78 (reset --hard): sg's ORIG_HEAD matches git's" \
+    test "$(p78_oh "$P78_SG3")" = "$(p78_oh "$P78_GIT3")"
+
+# merge FF: p77_mk_repo's "ahead" branch is a descendant of master.
+P78_SG4="$WORKDIR/phase78_sg4"; P78_GIT4="$WORKDIR/phase78_git4"
+p77_mk_repo "$P78_SG4"; rm -rf "$P78_GIT4"; cp -R "$P78_SG4" "$P78_GIT4"
+(cd "$P78_GIT4" && git merge ahead) > /dev/null 2>&1
+(cd "$P78_SG4" && "$SG" merge ahead) > /dev/null 2>&1
+check "phase78 (merge, fast-forward): sg's ORIG_HEAD matches git's" \
+    test "$(p78_oh "$P78_SG4")" = "$(p78_oh "$P78_GIT4")"
+check "phase78 (merge, fast-forward): ORIG_HEAD is not MISSING (precondition)" \
+    test "$(p78_oh "$P78_GIT4")" != "MISSING"
+
+# merge 3-way: p77_mk_repo_full's topic diverges independently from master.
+P78_SG5="$WORKDIR/phase78_sg5"; P78_GIT5="$WORKDIR/phase78_git5"
+p77_mk_repo_full "$P78_SG5"; rm -rf "$P78_GIT5"; cp -R "$P78_SG5" "$P78_GIT5"
+(cd "$P78_GIT5" && git merge topic) > /dev/null 2>&1
+(cd "$P78_SG5" && "$SG" merge topic) > /dev/null 2>&1
+check "phase78 (merge, 3-way): sg's ORIG_HEAD matches git's" \
+    test "$(p78_oh "$P78_SG5")" = "$(p78_oh "$P78_GIT5")"
+check "phase78 (merge, 3-way): ORIG_HEAD is not MISSING (precondition)" \
+    test "$(p78_oh "$P78_GIT5")" != "MISSING"
+
+# rebase: replay topic (independent commit) onto master, a real replay.
+P78_SG6="$WORKDIR/phase78_sg6"; P78_GIT6="$WORKDIR/phase78_git6"
+p77_mk_repo_full "$P78_SG6"; rm -rf "$P78_GIT6"; cp -R "$P78_SG6" "$P78_GIT6"
+(cd "$P78_GIT6" && git switch -q topic && git rebase master) > /dev/null 2>&1
+(cd "$P78_SG6" && "$SG" switch topic > /dev/null 2>&1 && "$SG" rebase master) > /dev/null 2>&1
+check "phase78 (rebase, real replay): sg's ORIG_HEAD matches git's" \
+    test "$(p78_oh "$P78_SG6")" = "$(p78_oh "$P78_GIT6")"
+check "phase78 (rebase, real replay): ORIG_HEAD is not MISSING (precondition)" \
+    test "$(p78_oh "$P78_GIT6")" != "MISSING"
+
+# stash push (full): dirty tracked file, whole-tree stash.
+P78_SG7="$WORKDIR/phase78_sg7"; P78_GIT7="$WORKDIR/phase78_git7"
+p77_mk_repo "$P78_SG7"; rm -rf "$P78_GIT7"; cp -R "$P78_SG7" "$P78_GIT7"
+(cd "$P78_GIT7" && printf 'dirty\n' >> f && git stash push) > /dev/null 2>&1
+(cd "$P78_SG7" && printf 'dirty\n' >> f && "$SG" stash push) > /dev/null 2>&1
+check "phase78 (stash push, full): sg's ORIG_HEAD matches git's" \
+    test "$(p78_oh "$P78_SG7")" = "$(p78_oh "$P78_GIT7")"
+check "phase78 (stash push, full): ORIG_HEAD is not MISSING (precondition)" \
+    test "$(p78_oh "$P78_GIT7")" != "MISSING"
+
+# --- 3: negative controls -- a planted, DIFFERENT value must survive
+# untouched. P78_PLANT is an arbitrary 40-hex not equal to any real
+# object id in these fixtures, so "unchanged" can never be confused with
+# "happened to write the same thing". ---
+P78_PLANT="1111111111111111111111111111111111111111"
+
+p78_neg() {
+    # $1 = label, $2 = sg repo dir, $3 = git repo dir, then the git argv
+    # (sg is always invoked with the identical argv, substituting $SG).
+    p78n_lbl="$1"; p78n_sgd="$2"; p78n_gd="$3"
+    shift 3
+    p78_plant_oh "$p78n_sgd" "$P78_PLANT"
+    p78_plant_oh "$p78n_gd" "$P78_PLANT"
+    (cd "$p78n_gd" && git "$@") > /dev/null 2>&1
+    (cd "$p78n_sgd" && "$SG" "$@") > /dev/null 2>&1
+    check "phase78 (control, $p78n_lbl): git leaves the planted ORIG_HEAD untouched" \
+        test "$(p78_oh "$p78n_gd")" = "$P78_PLANT"
+    check "phase78 (control, $p78n_lbl): sg leaves the planted ORIG_HEAD untouched too" \
+        test "$(p78_oh "$p78n_sgd")" = "$P78_PLANT"
+}
+
+P78_SGN1="$WORKDIR/phase78_sgn1"; P78_GITN1="$WORKDIR/phase78_gitn1"
+p77_mk_repo_full "$P78_SGN1"; rm -rf "$P78_GITN1"; cp -R "$P78_SGN1" "$P78_GITN1"
+p78_neg "cherry-pick" "$P78_SGN1" "$P78_GITN1" cherry-pick topic
+
+P78_SGN2="$WORKDIR/phase78_sgn2"; P78_GITN2="$WORKDIR/phase78_gitn2"
+p77_mk_repo_full "$P78_SGN2"; rm -rf "$P78_GITN2"; cp -R "$P78_SGN2" "$P78_GITN2"
+p78_neg "revert" "$P78_SGN2" "$P78_GITN2" revert --no-edit topic
+
+P78_SGN3="$WORKDIR/phase78_sgn3"; P78_GITN3="$WORKDIR/phase78_gitn3"
+p77_mk_repo_full "$P78_SGN3"; rm -rf "$P78_GITN3"; cp -R "$P78_SGN3" "$P78_GITN3"
+(cd "$P78_SGN3" && printf 'x\n' >> f) ; (cd "$P78_GITN3" && printf 'x\n' >> f)
+p78_neg "commit" "$P78_SGN3" "$P78_GITN3" commit -am x
+
+P78_SGN4="$WORKDIR/phase78_sgn4"; P78_GITN4="$WORKDIR/phase78_gitn4"
+p77_mk_repo_full "$P78_SGN4"; rm -rf "$P78_GITN4"; cp -R "$P78_SGN4" "$P78_GITN4"
+p78_neg "switch" "$P78_SGN4" "$P78_GITN4" switch topic
+
+P78_SGN5="$WORKDIR/phase78_sgn5"; P78_GITN5="$WORKDIR/phase78_gitn5"
+p77_mk_repo "$P78_SGN5"; rm -rf "$P78_GITN5"; cp -R "$P78_SGN5" "$P78_GITN5"
+(cd "$P78_GITN5" && printf 'dirty\n' >> f && git stash push) > /dev/null 2>&1
+(cd "$P78_SGN5" && printf 'dirty\n' >> f && "$SG" stash push) > /dev/null 2>&1
+p78_plant_oh "$P78_SGN5" "$P78_PLANT"
+p78_plant_oh "$P78_GITN5" "$P78_PLANT"
+(cd "$P78_GITN5" && git stash pop) > /dev/null 2>&1
+(cd "$P78_SGN5" && "$SG" stash pop) > /dev/null 2>&1
+check "phase78 (control, stash pop): git leaves the planted ORIG_HEAD untouched" \
+    test "$(p78_oh "$P78_GITN5")" = "$P78_PLANT"
+check "phase78 (control, stash pop): sg leaves the planted ORIG_HEAD untouched too" \
+    test "$(p78_oh "$P78_SGN5")" = "$P78_PLANT"
+
+# NOTE: this row is a PRECONDITION, not a pin on Phase 78's own logic. sg
+# rejects any `reset` carrying a pathspec outright (cmd_reset.c's own
+# "reset does not support a pathspec", a pre-existing limitation unrelated
+# to this phase), so reset_update_orig_head is unreachable for this input
+# and no mutation of the ORIG_HEAD logic can ever turn this check red. It
+# still asserts a true fact -- git writes nothing here either -- and is
+# kept for the day sg grows pathspec support; the name says which of the
+# two it is, so nobody reads it as evidence that this phase verified the
+# path-limited row (Phase 78 cold-read round 1, finding 5).
+# Written out rather than routed through p78_neg: that helper names every
+# check it generates "phase78 (control, <label>)", and this row is NOT a
+# control -- a control is a command that COULD write and does not, whereas
+# sg cannot reach the write here at all. Keeping the helper would produce
+# the self-contradicting name "(control, ... precondition only ...)".
+P78_SGN6="$WORKDIR/phase78_sgn6"; P78_GITN6="$WORKDIR/phase78_gitn6"
+p77_mk_repo "$P78_SGN6"; rm -rf "$P78_GITN6"; cp -R "$P78_SGN6" "$P78_GITN6"
+p78_plant_oh "$P78_SGN6" "$P78_PLANT"
+p78_plant_oh "$P78_GITN6" "$P78_PLANT"
+(cd "$P78_GITN6" && git reset HEAD~1 -- f) > /dev/null 2>&1
+(cd "$P78_SGN6" && "$SG" reset HEAD~1 -- f) > /dev/null 2>&1
+check "phase78 (reset <rev> -- <path>): git leaves the planted ORIG_HEAD untouched" \
+    test "$(p78_oh "$P78_GITN6")" = "$P78_PLANT"
+check "phase78 (reset <rev> -- <path>): sg leaves it untouched too -- PRECONDITION ONLY, sg rejects a pathspec before reaching the write" \
+    test "$(p78_oh "$P78_SGN6")" = "$P78_PLANT"
+
+P78_SGN7="$WORKDIR/phase78_sgn7"; P78_GITN7="$WORKDIR/phase78_gitn7"
+p77_mk_repo "$P78_SGN7"; rm -rf "$P78_GITN7"; cp -R "$P78_SGN7" "$P78_GITN7"
+p78_neg "rebase already up to date" "$P78_SGN7" "$P78_GITN7" rebase master
+
+P78_SGN8="$WORKDIR/phase78_sgn8"; P78_GITN8="$WORKDIR/phase78_gitn8"
+p77_mk_repo_full "$P78_SGN8"; rm -rf "$P78_GITN8"; cp -R "$P78_SGN8" "$P78_GITN8"
+(cd "$P78_GITN8" && git switch -q topic) ; (cd "$P78_SGN8" && "$SG" switch topic > /dev/null 2>&1)
+(cd "$P78_GITN8" && printf 'g\n' > g && git add g && GIT_AUTHOR_DATE="1700000300 +0000" \
+    GIT_COMMITTER_DATE="1700000300 +0000" git commit -q -m conflictcommit) > /dev/null 2>&1
+(cd "$P78_SGN8" && printf 'g\n' > g && "$SG" add g > /dev/null 2>&1 && SG_AUTHOR_NAME=A SG_AUTHOR_EMAIL=a@x \
+    SG_COMMITTER_NAME=A SG_COMMITTER_EMAIL=a@x "$SG" commit -m conflictcommit) > /dev/null 2>&1
+(cd "$P78_GITN8" && git rebase master) > /dev/null 2>&1
+(cd "$P78_GITN8" && git rebase --abort) > /dev/null 2>&1
+(cd "$P78_SGN8" && "$SG" rebase master) > /dev/null 2>&1
+p78_plant_oh "$P78_SGN8" "$P78_PLANT"
+p78_plant_oh "$P78_GITN8" "$P78_PLANT"
+(cd "$P78_GITN8" && git rebase master) > /dev/null 2>&1
+(cd "$P78_SGN8" && "$SG" rebase master) > /dev/null 2>&1
+p78_plant_oh "$P78_SGN8" "$P78_PLANT"
+p78_plant_oh "$P78_GITN8" "$P78_PLANT"
+(cd "$P78_GITN8" && git rebase --abort) > /dev/null 2>&1
+(cd "$P78_SGN8" && "$SG" rebase --abort) > /dev/null 2>&1
+check "phase78 (control, rebase --abort): git leaves the planted ORIG_HEAD untouched" \
+    test "$(p78_oh "$P78_GITN8")" = "$P78_PLANT"
+check "phase78 (control, rebase --abort): sg leaves the planted ORIG_HEAD untouched too" \
+    test "$(p78_oh "$P78_SGN8")" = "$P78_PLANT"
+
+# partial stash push: path-limited, must not write.
+P78_SGN9="$WORKDIR/phase78_sgn9"; P78_GITN9="$WORKDIR/phase78_gitn9"
+p77_mk_repo "$P78_SGN9"; rm -rf "$P78_GITN9"; cp -R "$P78_SGN9" "$P78_GITN9"
+(cd "$P78_GITN9" && printf 'dirty\n' >> f) ; (cd "$P78_SGN9" && printf 'dirty\n' >> f)
+p78_neg "stash push -- f (partial)" "$P78_SGN9" "$P78_GITN9" stash push -- f
+
+# merge with an unresolvable <rev>: no ORIG_HEAD write on either side.
+P78_SGN10="$WORKDIR/phase78_sgn10"; P78_GITN10="$WORKDIR/phase78_gitn10"
+p77_mk_repo "$P78_SGN10"; rm -rf "$P78_GITN10"; cp -R "$P78_SGN10" "$P78_GITN10"
+p78_neg "merge, unresolvable rev" "$P78_SGN10" "$P78_GITN10" merge nosuchbranch
+
+# --- 4: rejected but STILL written -- a dirty work tree on a path the
+# merge would touch (git's own order writes ORIG_HEAD before the dirty
+# check), and an unrelated-history merge (git's own
+# "refusing to merge unrelated histories" fires after the write). ---
+# p77_mk_repo_full does not fit here: its topic only ADDS a new file "g"
+# and never touches "f", so dirtying an unrelated tracked path never
+# blocks that merge at all (measured: real git merges right through it).
+# This needs a fixture where topic's own change and the dirty file are
+# the SAME path ("f"), so the merge genuinely intends to update it and
+# git's "your local changes ... would be overwritten" fires.
+p78_mk_repo_conflict_f() {
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && printf 'h\n' > h && git add h \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -am c2 \
+        && git switch -q topic \
+        && printf 'topic-value\n' > f \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -am t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+P78_SG11="$WORKDIR/phase78_sg11"; P78_GIT11="$WORKDIR/phase78_git11"
+p78_mk_repo_conflict_f "$P78_SG11"; rm -rf "$P78_GIT11"; cp -R "$P78_SG11" "$P78_GIT11"
+(cd "$P78_GIT11" && printf 'dirty\n' >> f) ; (cd "$P78_SG11" && printf 'dirty\n' >> f)
+(cd "$P78_GIT11" && git merge topic) > /dev/null 2>&1
+p78_git11_rc=$?
+(cd "$P78_SG11" && "$SG" merge topic) > /dev/null 2>&1
+p78_sg11_rc=$?
+check "phase78 (dirty workdir blocks merge): git precondition -- refuses (nonzero exit)" \
+    test "$p78_git11_rc" -ne 0
+check "phase78 (dirty workdir blocks merge): sg refuses too (exit 1)" \
+    test "$p78_sg11_rc" -eq 1
+check "phase78 (dirty workdir blocks merge): sg's ORIG_HEAD matches git's (both still write it)" \
+    test "$(p78_oh "$P78_SG11")" = "$(p78_oh "$P78_GIT11")"
+check "phase78 (dirty workdir blocks merge): ORIG_HEAD is not MISSING (precondition)" \
+    test "$(p78_oh "$P78_GIT11")" != "MISSING"
+
+P78_SG12="$WORKDIR/phase78_sg12"; P78_GIT12="$WORKDIR/phase78_git12"
+rm -rf "$P78_SG12" "$P78_GIT12"; mkdir -p "$P78_SG12" "$P78_GIT12"
+(cd "$P78_GIT12" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+    && printf '1\n' > f && git add f \
+    && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1) \
+    > /dev/null 2>&1
+cp -R "$P78_GIT12/.git" "$P78_SG12/.git"
+(cd "$P78_GIT12" && git switch -q --orphan other \
+    && printf '2\n' > g && git add g \
+    && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m other1 \
+    && git switch -q master) > /dev/null 2>&1
+cp -R "$P78_GIT12/.git/refs/heads/other" "$P78_SG12/.git/refs/heads/other" 2>/dev/null
+cp -R "$P78_GIT12/.git/objects/." "$P78_SG12/.git/objects/"
+(cd "$P78_GIT12" && git merge other) > /dev/null 2>&1
+p78_git12_rc=$?
+(cd "$P78_SG12" && "$SG" merge other) > /dev/null 2>&1
+p78_sg12_rc=$?
+check "phase78 (merge, unrelated histories): git precondition -- refuses without the flag" \
+    test "$p78_git12_rc" -ne 0
+check "phase78 (merge, unrelated histories): sg refuses too (exit 1)" \
+    test "$p78_sg12_rc" -eq 1
+check "phase78 (merge, unrelated histories): sg's ORIG_HEAD matches git's (both still write it)" \
+    test "$(p78_oh "$P78_SG12")" = "$(p78_oh "$P78_GIT12")"
+check "phase78 (merge, unrelated histories): ORIG_HEAD is not MISSING (precondition)" \
+    test "$(p78_oh "$P78_GIT12")" != "MISSING"
+
+# --- 5: rejected and NOT written -- an unmerged index blocks the merge
+# before ORIG_HEAD's write point in git's own order. Needs a GENUINE
+# conflicting merge (topic and master both edit the same line of "f") so
+# the first merge actually stops with unresolved index entries + MERGE_HEAD
+# -- p77_mk_repo_full's topic only ADDS a new file and never conflicts
+# with master, so that fixture cannot reach this state at all (measured).
+# The gate that fires here is the PRE-EXISTING "an unfinished merge is in
+# progress" check (sg_merge_head_exists, before this phase's own rev-parse/
+# ORIG_HEAD-write block), not anything phase78 added. ---
+P78_SG13="$WORKDIR/phase78_sg13"; P78_GIT13="$WORKDIR/phase78_git13"
+rm -rf "$P78_SG13" "$P78_GIT13"; mkdir -p "$P78_SG13"
+(cd "$P78_SG13" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+    && printf '1\n' > f && git add f \
+    && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+    && git branch topic \
+    && printf 'master-side\n' > f \
+    && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -am c2 \
+    && git switch -q topic \
+    && printf 'topic-side\n' > f \
+    && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -am t1 \
+    && git switch -q master) > /dev/null 2>&1
+cp -R "$P78_SG13" "$P78_GIT13"
+(cd "$P78_GIT13" && git merge topic) > /dev/null 2>&1
+(cd "$P78_SG13" && "$SG" merge topic) > /dev/null 2>&1
+p78_plant_oh "$P78_SG13" "$P78_PLANT"
+p78_plant_oh "$P78_GIT13" "$P78_PLANT"
+(cd "$P78_GIT13" && git merge master) > /dev/null 2>&1
+p78_git13_rc=$?
+(cd "$P78_SG13" && "$SG" merge master) > /dev/null 2>&1
+p78_sg13_rc=$?
+check "phase78 (unmerged index blocks merge): git precondition -- refuses (nonzero exit)" \
+    test "$p78_git13_rc" -ne 0
+check "phase78 (unmerged index blocks merge): sg refuses too (exit 1)" \
+    test "$p78_sg13_rc" -eq 1
+check "phase78 (unmerged index blocks merge): git does NOT rewrite the planted ORIG_HEAD" \
+    test "$(p78_oh "$P78_GIT13")" = "$P78_PLANT"
+check "phase78 (unmerged index blocks merge): sg does NOT rewrite the planted ORIG_HEAD either" \
+    test "$(p78_oh "$P78_SG13")" = "$P78_PLANT"
+
+# --- 6: a foreign ORIG_HEAD.lock -- reset/rebase/stash proceed anyway
+# (exit 0), merge refuses outright (git 128 / sg 1). ---
+P78_SG14="$WORKDIR/phase78_sg14"; P78_GIT14="$WORKDIR/phase78_git14"
+p77_mk_repo "$P78_SG14"; rm -rf "$P78_GIT14"; cp -R "$P78_SG14" "$P78_GIT14"
+: > "$P78_SG14/.git/ORIG_HEAD.lock"; : > "$P78_GIT14/.git/ORIG_HEAD.lock"
+p78_before_git14=$(git -C "$P78_GIT14" rev-parse HEAD~1)
+(cd "$P78_GIT14" && git reset --hard HEAD~1) > /dev/null 2>&1
+p78_git14_rc=$?
+(cd "$P78_SG14" && "$SG" reset --hard HEAD~1 --force) > /dev/null 2>&1
+p78_sg14_rc=$?
+check "phase78 (foreign ORIG_HEAD.lock, reset --hard): git precondition -- still succeeds (exit 0)" \
+    test "$p78_git14_rc" -eq 0
+check "phase78 (foreign ORIG_HEAD.lock, reset --hard): sg succeeds too (exit 0)" \
+    test "$p78_sg14_rc" -eq 0
+check "phase78 (foreign ORIG_HEAD.lock, reset --hard): HEAD really moved on git's side (precondition)" \
+    test "$(git -C "$P78_GIT14" rev-parse HEAD)" = "$p78_before_git14"
+check "phase78 (foreign ORIG_HEAD.lock, reset --hard): HEAD really moved on sg's side too" \
+    test "$(git -C "$P78_SG14" rev-parse HEAD)" = "$p78_before_git14"
+check "phase78 (foreign ORIG_HEAD.lock, reset --hard): the foreign lock itself survives" \
+    test -e "$P78_SG14/.git/ORIG_HEAD.lock"
+
+P78_SG15="$WORKDIR/phase78_sg15"; P78_GIT15="$WORKDIR/phase78_git15"
+p77_mk_repo_full "$P78_SG15"; rm -rf "$P78_GIT15"; cp -R "$P78_SG15" "$P78_GIT15"
+(cd "$P78_GIT15" && git switch -q topic) ; (cd "$P78_SG15" && "$SG" switch topic > /dev/null 2>&1)
+: > "$P78_GIT15/.git/ORIG_HEAD.lock"; : > "$P78_SG15/.git/ORIG_HEAD.lock"
+(cd "$P78_GIT15" && git rebase master) > /dev/null 2>&1
+p78_git15_rc=$?
+(cd "$P78_SG15" && "$SG" rebase master) > /dev/null 2>&1
+p78_sg15_rc=$?
+check "phase78 (foreign ORIG_HEAD.lock, rebase): git precondition -- still succeeds (exit 0)" \
+    test "$p78_git15_rc" -eq 0
+check "phase78 (foreign ORIG_HEAD.lock, rebase): sg succeeds too (exit 0)" \
+    test "$p78_sg15_rc" -eq 0
+check "phase78 (foreign ORIG_HEAD.lock, rebase): the foreign lock itself survives" \
+    test -e "$P78_SG15/.git/ORIG_HEAD.lock"
+
+P78_SG16="$WORKDIR/phase78_sg16"; P78_GIT16="$WORKDIR/phase78_git16"
+p77_mk_repo "$P78_SG16"; rm -rf "$P78_GIT16"; cp -R "$P78_SG16" "$P78_GIT16"
+: > "$P78_GIT16/.git/ORIG_HEAD.lock"; : > "$P78_SG16/.git/ORIG_HEAD.lock"
+(cd "$P78_GIT16" && printf 'dirty\n' >> f && git stash push) > /dev/null 2>&1
+p78_git16_rc=$?
+(cd "$P78_SG16" && printf 'dirty\n' >> f && "$SG" stash push) > /dev/null 2>&1
+p78_sg16_rc=$?
+check "phase78 (foreign ORIG_HEAD.lock, stash push): git precondition -- still succeeds (exit 0)" \
+    test "$p78_git16_rc" -eq 0
+check "phase78 (foreign ORIG_HEAD.lock, stash push): sg succeeds too (exit 0)" \
+    test "$p78_sg16_rc" -eq 0
+check "phase78 (foreign ORIG_HEAD.lock, stash push): git's stash entry exists (refs/stash present)" \
+    test -f "$P78_GIT16/.git/refs/stash"
+check "phase78 (foreign ORIG_HEAD.lock, stash push): sg's stash entry exists too" \
+    test -f "$P78_SG16/.git/refs/stash"
+check "phase78 (foreign ORIG_HEAD.lock, stash push): the foreign lock itself survives" \
+    test -e "$P78_SG16/.git/ORIG_HEAD.lock"
+
+P78_SG17="$WORKDIR/phase78_sg17"; P78_GIT17="$WORKDIR/phase78_git17"
+p77_mk_repo "$P78_SG17"; rm -rf "$P78_GIT17"; cp -R "$P78_SG17" "$P78_GIT17"
+: > "$P78_GIT17/.git/ORIG_HEAD.lock"; : > "$P78_SG17/.git/ORIG_HEAD.lock"
+p78_before_git17=$(git -C "$P78_GIT17" rev-parse HEAD)
+(cd "$P78_GIT17" && git merge ahead) > /dev/null 2>&1
+p78_git17_rc=$?
+(cd "$P78_SG17" && "$SG" merge ahead) > /dev/null 2>&1
+p78_sg17_rc=$?
+check "phase78 (foreign ORIG_HEAD.lock, merge): git precondition -- refuses outright (nonzero)" \
+    test "$p78_git17_rc" -ne 0
+check "phase78 (foreign ORIG_HEAD.lock, merge): sg refuses too (exit 1)" \
+    test "$p78_sg17_rc" -eq 1
+check "phase78 (foreign ORIG_HEAD.lock, merge): git's HEAD did not move (merge did NOT happen)" \
+    test "$(git -C "$P78_GIT17" rev-parse HEAD)" = "$p78_before_git17"
+check "phase78 (foreign ORIG_HEAD.lock, merge): sg's HEAD did not move either" \
+    test "$(cd "$P78_SG17" && git rev-parse HEAD)" = "$p78_before_git17"
+check "phase78 (foreign ORIG_HEAD.lock, merge): the foreign lock itself survives" \
+    test -e "$P78_SG17/.git/ORIG_HEAD.lock"
+
+# --- 7: the reordering's own corner -- a dirty work tree AND an
+# unresolvable <rev> together must print the REV error on both sides, not
+# the dirty-workdir one (this is what moving the rev-parse block ahead of
+# sg_require_clean_workdir in cmd_merge.c is FOR). ---
+P78_SG18="$WORKDIR/phase78_sg18"; P78_GIT18="$WORKDIR/phase78_git18"
+p77_mk_repo "$P78_SG18"; rm -rf "$P78_GIT18"; cp -R "$P78_SG18" "$P78_GIT18"
+(cd "$P78_GIT18" && printf 'dirty\n' >> f) ; (cd "$P78_SG18" && printf 'dirty\n' >> f)
+(cd "$P78_GIT18" && git merge nosuchbranch) 2>"$WORKDIR/p78_git18_err.txt"
+(cd "$P78_SG18" && "$SG" merge nosuchbranch) 2>"$WORKDIR/p78_sg18_err.txt"
+check "phase78 (dirty workdir + unresolvable rev): git prints the REV error, not a dirty-workdir one" \
+    sh -c "! grep -qi 'stash\|clean\|commit your changes' '$WORKDIR/p78_git18_err.txt'"
+check "phase78 (dirty workdir + unresolvable rev): sg prints the REV error too, not a dirty-workdir one" \
+    sh -c "! grep -qi 'dirty\|uncommitted\|clean' '$WORKDIR/p78_sg18_err.txt'"
+check "phase78 (dirty workdir + unresolvable rev): ORIG_HEAD not written on git's side" \
+    test "$(p78_oh "$P78_GIT18")" = "MISSING"
+check "phase78 (dirty workdir + unresolvable rev): ORIG_HEAD not written on sg's side either" \
+    test "$(p78_oh "$P78_SG18")" = "MISSING"
+
+# --- 8: roundtrip -- sg reset --hard ORIG_HEAD recovers, using sg's OWN
+# written ORIG_HEAD (no real git involved in this one). ---
+P78_SG19="$WORKDIR/phase78_sg19"
+p77_mk_repo "$P78_SG19"
+p78_head_before=$(cd "$P78_SG19" && "$SG" log -1 --format=%H)
+(cd "$P78_SG19" && "$SG" reset --hard HEAD~1 --force) > /dev/null 2>&1
+(cd "$P78_SG19" && "$SG" reset --hard ORIG_HEAD --force) > /dev/null 2>&1
+check "phase78 (roundtrip): sg reset --hard ORIG_HEAD recovers the original HEAD" \
+    test "$(cd "$P78_SG19" && "$SG" log -1 --format=%H)" = "$p78_head_before"
+
+# --- 9: the unborn-HEAD rows. reset's WRITE branch and its DELETE branch are
+# different code paths, and until these three pins existed a mutation that
+# neutered the delete entirely (`unlink(path);` -> `(void)path;`) left
+# interop FULLY GREEN at 4749/4749 -- measured, Phase 78 cold-read round 1
+# finding 1. Built by hand because no porcelain command produces the shape:
+# `git symbolic-ref HEAD refs/heads/<name>` on a repo that already has
+# commits leaves HEAD unborn while other branches still resolve. Measured
+# against git 2.55.0, all three rows agree with sg:
+#   A   planted ORIG_HEAD + unborn HEAD + resolvable target -> DELETED
+#   A2  no ORIG_HEAD at all                                 -> stays absent
+#   B   merge into a CLEAN unborn branch                    -> UNTOUCHED
+# B is the one that matters most: "HEAD does not resolve" maps to *delete*
+# in reset and to *do nothing* in merge, which is why the merge site is
+# guarded by `has_head` instead of sharing reset's helper. A future
+# "simplification" that made the two share one rule would go red here. ---
+p78_mk_unborn() {
+    # $1 = target dir. p77_mk_repo's own history (master at c2, topic at c1,
+    # ahead at c3), then HEAD repointed at a branch that does not exist.
+    p77_mk_repo "$1"
+    (cd "$1" && git symbolic-ref HEAD refs/heads/nothere) > /dev/null 2>&1
+}
+
+P78_SG20="$WORKDIR/phase78_sg20"; P78_GIT20="$WORKDIR/phase78_git20"
+p78_mk_unborn "$P78_SG20"; rm -rf "$P78_GIT20"; cp -R "$P78_SG20" "$P78_GIT20"
+p78_plant_oh "$P78_SG20" "$P78_PLANT"
+p78_plant_oh "$P78_GIT20" "$P78_PLANT"
+(cd "$P78_GIT20" && git reset --hard master) > /dev/null 2>&1
+(cd "$P78_SG20" && "$SG" reset --hard master --force) > /dev/null 2>&1
+check "phase78 (unborn HEAD, reset): git DELETES the planted ORIG_HEAD (precondition)" \
+    test "$(p78_oh "$P78_GIT20")" = "MISSING"
+check "phase78 (unborn HEAD, reset): sg deletes it too" \
+    test "$(p78_oh "$P78_SG20")" = "MISSING"
+check "phase78 (unborn HEAD, reset): sg's HEAD landed where git's did (precondition -- the reset itself happened)" \
+    test "$(git -C "$P78_SG20" rev-parse HEAD)" = "$(git -C "$P78_GIT20" rev-parse HEAD)"
+
+P78_SG21="$WORKDIR/phase78_sg21"; P78_GIT21="$WORKDIR/phase78_git21"
+p78_mk_unborn "$P78_SG21"; rm -rf "$P78_GIT21"; cp -R "$P78_SG21" "$P78_GIT21"
+(cd "$P78_GIT21" && git reset --hard master) > /dev/null 2> "$WORKDIR/p78_git21_err.txt"
+(cd "$P78_SG21" && "$SG" reset --hard master --force) > /dev/null 2> "$WORKDIR/p78_sg21_err.txt"
+check "phase78 (unborn HEAD, reset, no prior value): git leaves ORIG_HEAD absent (precondition)" \
+    test "$(p78_oh "$P78_GIT21")" = "MISSING"
+check "phase78 (unborn HEAD, reset, no prior value): sg leaves it absent too -- the delete never CREATES one" \
+    test "$(p78_oh "$P78_SG21")" = "MISSING"
+# The delete branch reports a FAILED unlink (pinned further below), and this
+# is the other half of that rule: "there was nothing to delete" is ENOENT,
+# the ORDINARY case, and must stay silent -- without this pin, widening the
+# report to every errno would make EVERY unborn reset noisier than git, and
+# nothing would go red. Measured: both arms write ZERO bytes to stderr here,
+# and sg's own "--force, skipping confirmation" notice goes to STDOUT, so an
+# empty-stderr assertion is well-formed on the sg side too.
+check "phase78 (unborn HEAD, reset, no prior value): git says nothing on stderr (precondition)" \
+    sh -c 'test ! -s "$1"' sh "$WORKDIR/p78_git21_err.txt"
+check "phase78 (unborn HEAD, reset, no prior value): sg says nothing either -- ENOENT is not a failure" \
+    sh -c 'test ! -s "$1"' sh "$WORKDIR/p78_sg21_err.txt"
+
+# The third state of the delete: a DIRECTORY at the ORIG_HEAD path. This is
+# the one failure real git does NOT report -- measured, zero bytes of
+# stderr, rc 0, the directory left in place -- so sg must not report it
+# either, and needs an explicit lstat/S_ISDIR test to know: on macOS
+# unlink() returns EPERM for a directory exactly as it does for the
+# immutable file in the group further below, so errno cannot tell the two
+# apart (measured: errno 1 for both, EISDIR never appears). Unlike that
+# group this fixture is PORTABLE -- mkdir works everywhere -- so these rows
+# never skip, and they are what stops the diagnostic from growing back into
+# a divergence git does not have.
+P78_SG26="$WORKDIR/phase78_sg26"; P78_GIT26="$WORKDIR/phase78_git26"
+p78_mk_unborn "$P78_SG26"; rm -rf "$P78_GIT26"; cp -R "$P78_SG26" "$P78_GIT26"
+mkdir "$P78_SG26/.git/ORIG_HEAD"; mkdir "$P78_GIT26/.git/ORIG_HEAD"
+(cd "$P78_GIT26" && git reset --hard master) > /dev/null 2> "$WORKDIR/p78_git26_err.txt"
+(cd "$P78_SG26" && "$SG" reset --hard master --force) > /dev/null 2> "$WORKDIR/p78_sg26_err.txt"
+check "phase78 (unborn HEAD, reset, ORIG_HEAD is a directory): git says nothing (precondition)" \
+    sh -c 'test ! -s "$1"' sh "$WORKDIR/p78_git26_err.txt"
+check "phase78 (unborn HEAD, reset, ORIG_HEAD is a directory): sg says nothing either -- a directory is the failure git ignores" \
+    sh -c 'test ! -s "$1"' sh "$WORKDIR/p78_sg26_err.txt"
+check "phase78 (unborn HEAD, reset, ORIG_HEAD is a directory): both leave the directory in place" \
+    sh -c 'test -d "$1/.git/ORIG_HEAD" && test -d "$2/.git/ORIG_HEAD"' sh "$P78_SG26" "$P78_GIT26"
+check "phase78 (unborn HEAD, reset, ORIG_HEAD is a directory): sg's HEAD landed where git's did (precondition -- the reset still happened)" \
+    test "$(git -C "$P78_SG26" rev-parse HEAD)" = "$(git -C "$P78_GIT26" rev-parse HEAD)"
+
+# Same shape, NON-empty directory: emptiness does not change the delete
+# path's answer (unlink fails either way), and measuring it is what makes
+# "a directory is ignored" a rule rather than a property of one fixture.
+P78_SG27="$WORKDIR/phase78_sg27"; P78_GIT27="$WORKDIR/phase78_git27"
+p78_mk_unborn "$P78_SG27"; rm -rf "$P78_GIT27"; cp -R "$P78_SG27" "$P78_GIT27"
+mkdir "$P78_SG27/.git/ORIG_HEAD"; mkdir "$P78_GIT27/.git/ORIG_HEAD"
+: > "$P78_SG27/.git/ORIG_HEAD/keep"; : > "$P78_GIT27/.git/ORIG_HEAD/keep"
+(cd "$P78_GIT27" && git reset --hard master) > /dev/null 2> "$WORKDIR/p78_git27_err.txt"
+(cd "$P78_SG27" && "$SG" reset --hard master --force) > /dev/null 2> "$WORKDIR/p78_sg27_err.txt"
+check "phase78 (unborn HEAD, reset, ORIG_HEAD is a NON-empty directory): git says nothing (precondition)" \
+    sh -c 'test ! -s "$1"' sh "$WORKDIR/p78_git27_err.txt"
+check "phase78 (unborn HEAD, reset, ORIG_HEAD is a NON-empty directory): sg says nothing either" \
+    sh -c 'test ! -s "$1"' sh "$WORKDIR/p78_sg27_err.txt"
+check "phase78 (unborn HEAD, reset, ORIG_HEAD is a NON-empty directory): both leave it untouched" \
+    sh -c 'test -f "$1/.git/ORIG_HEAD/keep" && test -f "$2/.git/ORIG_HEAD/keep"' sh "$P78_SG27" "$P78_GIT27"
+
+# --- 9b: the WRITE path with a directory in the way. This is a DIFFERENT
+# answer from the delete path above, and getting that wrong is how a false
+# claim ended up in two comments (Phase 78 cold-read round 3): a probe using
+# `test -e` cannot tell "git left the directory" from "git replaced it with
+# a 41-byte ref file", and the second is what actually happens.
+#   empty directory     -> BOTH remove it and write the ref through it,
+#                          silently. sg reaches that answer through Phase
+#                          77's own D1a mechanism, so these rows also pin
+#                          D1a against a future "simplification".
+#   NON-empty directory -> BOTH refuse the ORIG_HEAD write, report it, and
+#                          complete the reset anyway (rc 0).
+# The refusal WORDING differs, so those two rows are literal pins per side,
+# not a cmp: git names the blocking directory, sg names the file inside it.
+# That difference is Phase 77's own recorded "D/F wording has no oracle"
+# residual -- this is the oracle, and closing it is NOT this phase's job. ---
+P78_SG28="$WORKDIR/phase78_sg28"; P78_GIT28="$WORKDIR/phase78_git28"
+p77_mk_repo "$P78_SG28"; rm -rf "$P78_GIT28"; cp -R "$P78_SG28" "$P78_GIT28"
+mkdir "$P78_SG28/.git/ORIG_HEAD"; mkdir "$P78_GIT28/.git/ORIG_HEAD"
+(cd "$P78_GIT28" && git reset --hard HEAD~1) > /dev/null 2> "$WORKDIR/p78_git28_err.txt"
+(cd "$P78_SG28" && "$SG" reset --hard HEAD~1 --force) > /dev/null 2> "$WORKDIR/p78_sg28_err.txt"
+check "phase78 (born HEAD, reset, empty directory at ORIG_HEAD): git REPLACES it with a ref file (precondition -- not 'leaves it alone')" \
+    sh -c 'test -f "$1/.git/ORIG_HEAD" && test "$(wc -c < "$1/.git/ORIG_HEAD" | tr -d " ")" = 41' sh "$P78_GIT28"
+check "phase78 (born HEAD, reset, empty directory at ORIG_HEAD): sg replaces it too, byte-identical to git's" \
+    test "$(p78_oh "$P78_SG28")" = "$(p78_oh "$P78_GIT28")"
+check "phase78 (born HEAD, reset, empty directory at ORIG_HEAD): neither says anything about it" \
+    sh -c 'test ! -s "$1" && test ! -s "$2"' sh "$WORKDIR/p78_git28_err.txt" "$WORKDIR/p78_sg28_err.txt"
+
+P78_SG29="$WORKDIR/phase78_sg29"; P78_GIT29="$WORKDIR/phase78_git29"
+p77_mk_repo "$P78_SG29"; rm -rf "$P78_GIT29"; cp -R "$P78_SG29" "$P78_GIT29"
+mkdir "$P78_SG29/.git/ORIG_HEAD"; mkdir "$P78_GIT29/.git/ORIG_HEAD"
+: > "$P78_SG29/.git/ORIG_HEAD/keep"; : > "$P78_GIT29/.git/ORIG_HEAD/keep"
+p78_before_git29=$(git -C "$P78_GIT29" rev-parse HEAD~1)
+(cd "$P78_GIT29" && git reset --hard HEAD~1) > /dev/null 2> "$WORKDIR/p78_git29_err.txt"
+p78_git29_rc=$?
+(cd "$P78_SG29" && "$SG" reset --hard HEAD~1 --force) > /dev/null 2> "$WORKDIR/p78_sg29_err.txt"
+p78_sg29_rc=$?
+check "phase78 (born HEAD, reset, NON-empty directory at ORIG_HEAD): git still completes (precondition)" \
+    test "$p78_git29_rc" -eq 0
+check "phase78 (born HEAD, reset, NON-empty directory at ORIG_HEAD): sg still completes too (exit 0)" \
+    test "$p78_sg29_rc" -eq 0
+check "phase78 (born HEAD, reset, NON-empty directory at ORIG_HEAD): both moved HEAD anyway" \
+    sh -c 'test "$(git -C "$1" rev-parse HEAD)" = "$3" && test "$(git -C "$2" rev-parse HEAD)" = "$3"' \
+        sh "$P78_SG29" "$P78_GIT29" "$p78_before_git29"
+check "phase78 (born HEAD, reset, NON-empty directory at ORIG_HEAD): git's exact refusal wording (oracle for phase77's D/F residual)" \
+    test "$(p78_norm_line "$WORKDIR/p78_git29_err.txt" "$P78_GIT29")" \
+         = "E: update_ref failed for ref 'ORIG_HEAD': cannot lock ref 'ORIG_HEAD': there is a non-empty directory '.git/ORIG_HEAD' blocking reference 'ORIG_HEAD'"
+check "phase78 (born HEAD, reset, NON-empty directory at ORIG_HEAD): sg's exact wording -- SAME behaviour, D/F detail clause still differs from git's" \
+    test "$(p78_norm_line "$WORKDIR/p78_sg29_err.txt" "$P78_SG29")" \
+         = "E: update_ref failed for ref 'ORIG_HEAD': cannot lock ref 'ORIG_HEAD': 'ORIG_HEAD/keep' exists; cannot create 'ORIG_HEAD'"
+check "phase78 (born HEAD, reset, NON-empty directory at ORIG_HEAD): both leave the directory and its file in place" \
+    sh -c 'test -f "$1/.git/ORIG_HEAD/keep" && test -f "$2/.git/ORIG_HEAD/keep"' sh "$P78_SG29" "$P78_GIT29"
+
+P78_SG22="$WORKDIR/phase78_sg22"; P78_GIT22="$WORKDIR/phase78_git22"
+p78_mk_unborn "$P78_SG22"
+(cd "$P78_SG22" && rm -f f && git read-tree --empty && git update-index -q --refresh) > /dev/null 2>&1
+rm -rf "$P78_GIT22"; cp -R "$P78_SG22" "$P78_GIT22"
+p78_plant_oh "$P78_SG22" "$P78_PLANT"
+p78_plant_oh "$P78_GIT22" "$P78_PLANT"
+(cd "$P78_GIT22" && git merge master) > /dev/null 2>&1
+(cd "$P78_SG22" && "$SG" merge master) > /dev/null 2>&1
+check "phase78 (unborn HEAD, merge): git leaves the planted ORIG_HEAD untouched (precondition -- merge does NOT share reset's delete)" \
+    test "$(p78_oh "$P78_GIT22")" = "$P78_PLANT"
+check "phase78 (unborn HEAD, merge): sg leaves it untouched too" \
+    test "$(p78_oh "$P78_SG22")" = "$P78_PLANT"
+check "phase78 (unborn HEAD, merge): sg fast-forwarded to the same commit git did (precondition -- the merge itself happened)" \
+    test "$(git -C "$P78_SG22" rev-parse HEAD)" = "$(git -C "$P78_GIT22" rev-parse HEAD)"
+
+# --- 10: `rebase --continue` must not touch ORIG_HEAD -- only
+# do_rebase_start writes one (cold-read round 1, finding 2: the spec asked
+# for both --continue and --abort, only --abort had a pin, and a mutation
+# that gave do_rebase_continue a write of its own left interop fully green).
+# p77_mk_repo_full does not fit: its topic only ADDS a file, so a rebase
+# never stops, and a --continue with nothing stopped proves nothing. This
+# fixture makes master and topic edit the SAME line of f.
+# GIT_EDITOR=true is set explicitly on git's own --continue: without it git
+# opens an editor for the commit message and interop would hang. ---
+p78_mk_rebase_conflict() {
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && printf 'master\n' > f \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -am c2 \
+        && git switch -q topic \
+        && printf 'topic\n' > f \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -am t1) \
+        > /dev/null 2>&1
+}
+
+P78_SG23="$WORKDIR/phase78_sg23"; P78_GIT23="$WORKDIR/phase78_git23"
+p78_mk_rebase_conflict "$P78_SG23"; rm -rf "$P78_GIT23"; cp -R "$P78_SG23" "$P78_GIT23"
+(cd "$P78_GIT23" && git rebase master) > /dev/null 2>&1
+(cd "$P78_SG23" && "$SG" rebase master) > /dev/null 2>&1
+check "phase78 (rebase --continue): git's rebase really stopped on a conflict (precondition)" \
+    sh -c 'test -d "$1/.git/rebase-merge" || test -d "$1/.git/rebase-apply"' sh "$P78_GIT23"
+check "phase78 (rebase --continue): sg's rebase really stopped too (precondition)" \
+    test -d "$P78_SG23/.git/sg-rebase"
+p78_plant_oh "$P78_SG23" "$P78_PLANT"
+p78_plant_oh "$P78_GIT23" "$P78_PLANT"
+(cd "$P78_GIT23" && printf 'resolved\n' > f && git add f \
+    && GIT_EDITOR=true GIT_AUTHOR_DATE="1700000300 +0000" GIT_COMMITTER_DATE="1700000300 +0000" \
+        git rebase --continue) > /dev/null 2>&1
+(cd "$P78_SG23" && printf 'resolved\n' > f && "$SG" add f \
+    && SG_AUTHOR_NAME=A SG_AUTHOR_EMAIL=a@x SG_COMMITTER_NAME=A SG_COMMITTER_EMAIL=a@x \
+        "$SG" rebase --continue) > /dev/null 2>&1
+check "phase78 (rebase --continue): git leaves the planted ORIG_HEAD untouched" \
+    test "$(p78_oh "$P78_GIT23")" = "$P78_PLANT"
+check "phase78 (rebase --continue): sg leaves it untouched too -- only do_rebase_start writes" \
+    test "$(p78_oh "$P78_SG23")" = "$P78_PLANT"
+check "phase78 (rebase --continue): sg's rebase really finished (precondition -- an untouched ORIG_HEAD must not come from a --continue that did nothing)" \
+    sh -c 'test ! -d "$1/.git/sg-rebase"' sh "$P78_SG23"
+
+# --- 11: a merge that is ALREADY UP TO DATE still writes ORIG_HEAD (an
+# oracle row named in section 2 of ORACLE-orig-head.md that had no pin of
+# its own -- cold-read round 1, finding 3). p77_mk_repo leaves master at c2
+# with topic at c1, so merging topic is the up-to-date case. The planted
+# value must be REPLACED here, which is what tells this row apart from
+# every negative control above.
+# HONEST LIMIT (cold-read round 2, finding 2): these three rows have NO
+# independent mutation. The up-to-date path shares cmd_merge.c's single
+# write call site with FF and 3-way, so every mutation that breaks it
+# breaks those too (measured: the ours->theirs mutation reds all six merge
+# value rows together). What they actually protect is a STRUCTURAL change
+# -- someone moving the "already up to date" early return ABOVE the write
+# -- which mutate.sh's one-expression model cannot express. Recorded as
+# such rather than counted as new coverage, per CLAUDE.md's rule that a
+# green mutation has three different meanings. ---
+P78_SG24="$WORKDIR/phase78_sg24"; P78_GIT24="$WORKDIR/phase78_git24"
+p77_mk_repo "$P78_SG24"; rm -rf "$P78_GIT24"; cp -R "$P78_SG24" "$P78_GIT24"
+p78_plant_oh "$P78_SG24" "$P78_PLANT"
+p78_plant_oh "$P78_GIT24" "$P78_PLANT"
+(cd "$P78_GIT24" && git merge topic) > /dev/null 2>&1
+(cd "$P78_SG24" && "$SG" merge topic) > /dev/null 2>&1
+check "phase78 (merge, already up to date): sg's ORIG_HEAD matches git's" \
+    test "$(p78_oh "$P78_SG24")" = "$(p78_oh "$P78_GIT24")"
+check "phase78 (merge, already up to date): git REPLACED the planted value (precondition -- this is a positive row, not a control)" \
+    test "$(p78_oh "$P78_GIT24")" != "$P78_PLANT"
+check "phase78 (merge, already up to date): the value sg wrote is HEAD itself" \
+    test "$(p78_oh "$P78_SG24")" = "$(git -C "$P78_SG24" rev-parse HEAD)"
+
+# --- 12: the unborn-HEAD DELETE is best-effort but NOT silent. Measured
+# against git 2.55.0 with an undeletable ORIG_HEAD: git prints
+#   error: unable to unlink '.git/ORIG_HEAD': Operation not permitted
+# and still completes (rc=0, HEAD moved) -- so sg reporting nothing there
+# was a real gap (Phase 78 cold-read round 1, finding 4), and sg now prints
+# the same sentence with its own "sg: " prefix.
+#
+# This is deliberately NOT a git-vs-sg comparison even after p77_norm_err:
+# git names the file repo-RELATIVE ('.git/ORIG_HEAD'), sg names it with the
+# absolute path it actually holds ('<R>/.git/ORIG_HEAD'), so each side gets
+# its own literal pin, the same shape divergence #10's pins use.
+#
+# Fixture choice was measured, not assumed -- three candidates:
+#   chflags uchg on the file : git DOES report (the row pinned here), macOS only
+#   read-only $GIT_DIR       : rejected, git dies at index.lock and the reset
+#                              never happens, so the row would assert nothing
+#   ORIG_HEAD as a DIRECTORY : portable, but git is SILENT there for the
+#                              UNBORN/delete path, so it cannot pin "git
+#                              reports". (An earlier version of this line
+#                              said "born HEAD too" -- wrong, see the born
+#                              HEAD rows below: the write path removes an
+#                              empty directory and reports a non-empty one.)
+# Only the first can express the oracle, and it needs a runtime probe: Linux
+# has no chflags, so that platform skips this row rather than pretending.
+: > "$WORKDIR/p78_chflags_probe"
+if chflags uchg "$WORKDIR/p78_chflags_probe" 2> /dev/null; then
+    chflags nouchg "$WORKDIR/p78_chflags_probe" 2> /dev/null
+    P78_CHFLAGS_OK=1
+else
+    P78_CHFLAGS_OK=0
+fi
+
+if [ "$P78_CHFLAGS_OK" = 1 ]; then
+    P78_SG25="$WORKDIR/phase78_sg25"; P78_GIT25="$WORKDIR/phase78_git25"
+    p78_mk_unborn "$P78_SG25"; rm -rf "$P78_GIT25"; cp -R "$P78_SG25" "$P78_GIT25"
+    p78_plant_oh "$P78_SG25" "$P78_PLANT"
+    p78_plant_oh "$P78_GIT25" "$P78_PLANT"
+    chflags uchg "$P78_SG25/.git/ORIG_HEAD" "$P78_GIT25/.git/ORIG_HEAD"
+    (cd "$P78_GIT25" && git reset --hard master) > /dev/null 2> "$WORKDIR/p78_git25_err.txt"
+    p78_git25_rc=$?
+    (cd "$P78_SG25" && "$SG" reset --hard master --force) > /dev/null 2> "$WORKDIR/p78_sg25_err.txt"
+    p78_sg25_rc=$?
+    # Cleared immediately: an immutable file left behind would make the
+    # WORKDIR cleanup (and any later `rm -rf` of these fixtures) fail.
+    chflags nouchg "$P78_SG25/.git/ORIG_HEAD" "$P78_GIT25/.git/ORIG_HEAD" 2> /dev/null
+
+    check "phase78 (undeletable ORIG_HEAD): git still completes (precondition -- the delete is best-effort)" \
+        test "$p78_git25_rc" -eq 0
+    check "phase78 (undeletable ORIG_HEAD): git is NOT silent about it (precondition -- this is what sg is matching)" \
+        test "$(p78_norm_line "$WORKDIR/p78_git25_err.txt" "$P78_GIT25")" \
+             = "E: unable to unlink '.git/ORIG_HEAD': Operation not permitted"
+    check "phase78 (undeletable ORIG_HEAD): sg completes too (exit 0)" \
+        test "$p78_sg25_rc" -eq 0
+    check "phase78 (undeletable ORIG_HEAD): sg reports it, with git's own sentence and its own path" \
+        test "$(p78_norm_line "$WORKDIR/p78_sg25_err.txt" "$P78_SG25")" \
+             = "E: unable to unlink '<R>/.git/ORIG_HEAD': Operation not permitted"
+    check "phase78 (undeletable ORIG_HEAD): the file itself survives on both sides" \
+        sh -c 'test -e "$1/.git/ORIG_HEAD" && test -e "$2/.git/ORIG_HEAD"' sh "$P78_SG25" "$P78_GIT25"
+    check "phase78 (undeletable ORIG_HEAD): sg's HEAD still landed where git's did (the reset itself happened)" \
+        test "$(git -C "$P78_SG25" rev-parse HEAD)" = "$(git -C "$P78_GIT25" rev-parse HEAD)"
+else
+    skip "phase78 (undeletable ORIG_HEAD): git still completes (precondition -- the delete is best-effort)"
+    skip "phase78 (undeletable ORIG_HEAD): git is NOT silent about it (precondition -- this is what sg is matching)"
+    skip "phase78 (undeletable ORIG_HEAD): sg completes too (exit 0)"
+    skip "phase78 (undeletable ORIG_HEAD): sg reports it, with git's own sentence and its own path"
+    skip "phase78 (undeletable ORIG_HEAD): the file itself survives on both sides"
+    skip "phase78 (undeletable ORIG_HEAD): sg's HEAD still landed where git's did (the reset itself happened)"
+fi
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

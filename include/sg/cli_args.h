@@ -172,4 +172,21 @@ sg_rev_err_kind sg_cli_classify_rev_error(const char *git_dir, const char *arg,
 void sg_cli_report_rev_error(const char *cmd, sg_rev_err_kind kind, const char *arg,
                              const char *detail, int dashdash);
 
+/* Writes git's ORIG_HEAD (the commit HEAD pointed at before a destructive
+   operation) via sg_ref_write_path -- reflog_msg is always NULL, since
+   ORIG_HEAD is not on the reflog namespace allowlist (ref_path_reflog_allowed
+   in refs.c) and real git itself does not write logs/ORIG_HEAD by default.
+   Returns 0 on success, -1 on failure, printing git's own
+   "update_ref failed for ref 'ORIG_HEAD': cannot lock ref 'ORIG_HEAD': ..."
+   wording (measured, ORACLE section 4) with sg's "sg: " prefix. Callers
+   decide whether a -1 is fatal: measured against git 2.55.0, reset/rebase/
+   stash print the error and CARRY ON (exit 0); merge refuses outright and
+   must not call this at all if it plans to keep going -- check the return
+   value.
+   Note: safety/stash.c cannot call this (cli/ may not be depended on by
+   safety/, module layering is bottom-up) -- it calls sg_ref_write_path and
+   sg_ref_lock_err_report_ex directly instead, same wording, no shared
+   call site. */
+int sg_cli_write_orig_head(const char *git_dir, const unsigned char head_id[SG_SHA1_RAW_LEN]);
+
 #endif

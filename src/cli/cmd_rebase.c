@@ -587,7 +587,10 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
 
     if (memcmp(base_commit, upstream_commit, SG_SHA1_RAW_LEN) == 0) {
         /* upstream is already an ancestor of HEAD: every commit here is
-           already built directly on top of it, nothing to replay. */
+           already built directly on top of it, nothing to replay. Measured
+           against git 2.55.0: this early return does NOT write ORIG_HEAD
+           (ORACLE-orig-head.md's "rebase already up to date" row) -- the
+           write below sits AFTER this check for exactly that reason. */
         if (current_branch != NULL)
             printf("Current branch %s is up to date.\n", current_branch);
         else
@@ -595,6 +598,18 @@ static int do_rebase_start(const char *git_dir, const char *repo_root, const cha
         free(current_branch);
         return 0;
     }
+
+    /* Phase 78: written here, past every early-return gate above (dirty
+       work tree, merge-base failure, "up to date") and before EITHER of the
+       two paths that actually start moving HEAD (the fast-forward shortcut
+       right below, at its sg_ref_set_head_detached call, and the ordinary
+       replay path's own sg_ref_set_head_detached further down) -- both are
+       "real rebase work" and both write ORIG_HEAD (measured against git
+       2.55.0: the fast-forward-only case is not "already up to date" and is
+       not exempt). Value is head_commit, the pre-rebase HEAD of the branch
+       being rebased. Non-fatal on failure, matching git: rc=0, the rebase
+       still happens. */
+    sg_cli_write_orig_head(git_dir, head_commit);
 
     if (memcmp(base_commit, head_commit, SG_SHA1_RAW_LEN) == 0) {
         /* HEAD is an ancestor of upstream: a pure fast-forward. */

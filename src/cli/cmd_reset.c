@@ -17,11 +17,86 @@
 #include "sg/strfmt.h"
 #include "sg/workdir.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 typedef enum { RESET_SOFT, RESET_MIXED, RESET_HARD } sg_reset_mode;
+
+/* Writes/deletes ORIG_HEAD right before HEAD itself moves (Phase 78),
+   matching git's own reset_refs: if HEAD currently resolves to a commit,
+   ORIG_HEAD becomes that commit (failure is non-fatal here -- measured
+   against git 2.55.0, a foreign ORIG_HEAD.lock still lets the reset
+   complete, sg_cli_write_orig_head already prints the diagnostic). If HEAD
+   is unborn, an existing ORIG_HEAD is instead DELETED, never created
+   (measured: ORACLE-orig-head.md section 3 -- three rows, inferred
+   mechanism "if HEAD resolves, update ORIG_HEAD; else delete it", verified
+   reachable in sg via a hand-built unborn-but-resolvable-target fixture).
+   Called only from the three call sites below, all past the "no changes
+   made" gates -- see this file's own header comment on where those sit. */
+static void reset_update_orig_head(const char *git_dir)
+{
+    unsigned char pre_head_id[SG_SHA1_RAW_LEN];
+
+    if (sg_ref_resolve_head(git_dir, pre_head_id) == 0) {
+        sg_cli_write_orig_head(git_dir, pre_head_id);
+    } else {
+        char path[SG_PATH_MAX];
+
+        if ((size_t)snprintf(path, sizeof(path), "%s/ORIG_HEAD", git_dir) < sizeof(path) &&
+            unlink(path) != 0 && errno != ENOENT) {
+            int unlink_errno = errno;
+            struct stat st;
+
+            /* A DIRECTORY at the ORIG_HEAD path is the one failure git does
+               NOT report (Phase 78 cold-read round 2). Measured on THIS
+               path -- the unborn-HEAD delete: with `.git/ORIG_HEAD` a
+               directory, git writes ZERO bytes to stderr, exits 0, and
+               leaves the directory. Without this check sg printed 180 bytes
+               there -- a divergence the report itself would have CREATED,
+               since the old code was silent about every failure.
+               WARNING: this does NOT generalise to the WRITE path a few
+               lines up, and an earlier version of this comment claimed it
+               did ("born HEAD alike"). That claim came from a probe that
+               tested `test -e`, which a FILE satisfies too, so "git left
+               the directory" was really "git replaced the directory with a
+               41-byte ref file" -- measured again with `test -d` (Phase 78
+               cold-read round 3): for a born HEAD, git REMOVES an empty
+               directory and writes through it, exactly as sg's own Phase 77
+               D1a mechanism does, and for a NON-empty one both tools report
+               and leave it. Only this delete branch is silent.
+               The test has to be the path's TYPE, not errno: on macOS
+               unlink() returns EPERM for BOTH an immutable file and a
+               directory (measured: errno 1 for each, EISDIR=21 never
+               appears), so an errno-based filter would either keep the
+               divergence or silence the immutable-file case git DOES
+               report. errno is captured before lstat(), which clobbers it. */
+            if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode))
+                return;
+            /* git is NOT silent when the delete fails, so neither is sg
+               (Phase 78 cold-read round 1, finding 4). Measured against git
+               2.55.0 with a chflags-immutable ORIG_HEAD: `git reset --hard
+               <rev>` on an unborn HEAD prints
+
+                 error: unable to unlink '.git/ORIG_HEAD': Operation not permitted
+
+               and STILL completes, rc=0, HEAD moved. sg borrows that wording
+               (with its own "sg: " prefix, and the absolute path it actually
+               holds rather than git's repo-relative display) and likewise
+               carries on -- the whole point of this branch is to be
+               best-effort, exactly like the write branch above.
+               ENOENT is deliberately excluded because it is the ORDINARY
+               case, not a failure: an unborn reset in a repo that never had
+               an ORIG_HEAD deletes nothing (measured, and pinned as
+               "phase78 (unborn HEAD, reset, no prior value)"), so reporting
+               it would make sg noisier than git on the common path. */
+            fprintf(stderr, "sg: unable to unlink '%s': %s\n", path, strerror(unlink_errno));
+        }
+    }
+}
 
 /* All three reset modes end by moving whatever HEAD names to the target
    commit and differ only in what they do to the index and working tree
@@ -222,6 +297,7 @@ int sg_cmd_reset(int argc, char **argv)
         /* Neither the index nor the working directory is touched: nothing
            uncommitted is ever at risk, so there is no confirmation gate and
            no automatic snapshot -- same rule real git follows. */
+        reset_update_orig_head(git_dir);
         {
             /* Phase 65: heap, not a fixed 512-byte buffer. Measured against
                git 2.55.0: this line ("reset: moving to <rev_arg>") is
@@ -322,6 +398,7 @@ int sg_cmd_reset(int argc, char **argv)
             return 1;
         }
 
+        reset_update_orig_head(git_dir);
         {
             char *reflog_msg = sg_strfmt_alloc("reset: moving to %s", rev_arg);
 
@@ -394,6 +471,7 @@ int sg_cmd_reset(int argc, char **argv)
             return 1;
         }
 
+        reset_update_orig_head(git_dir);
         {
             char *reflog_msg = sg_strfmt_alloc("reset: moving to %s", rev_arg);
 
