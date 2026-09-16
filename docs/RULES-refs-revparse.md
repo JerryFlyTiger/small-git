@@ -668,4 +668,9 @@ do not read the whole thing).
   portable but git stays silent for it, so it cannot pin "git reports").
   A runtime probe decides, and `skip()` increments `SKIP` without
   incrementing `TOTAL` -- so compare Linux's `M` against Linux's, never
-  against macOS's.
+  against macOS's. Measured on CI at the commit that introduced this
+  group: macOS `4789/4789, 0 skipped`, ubuntu `4689/4689, 14 skipped`.
+  **The 100-check gap between those two totals is NOT this group's doing**
+  -- 94 of it is inherited from the case-folding groups that Phase 73's
+  filesystem probe made possible and that Phases 74 and 76 added, and only
+  6 belong here.

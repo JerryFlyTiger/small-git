@@ -19441,10 +19441,17 @@ it had **no existing witness**: `rg ORIG_HEAD` over the repo found three
 prose lines and zero checks, so this phase had to create its own oracle.
 
 Gates: `interop 4679/4679 -> 4789/4789` (+110), 0 skipped on macOS, test
-binaries 86 -> 87, `make` 0 warnings. **On Linux six of those checks skip**
-(see the `chflags` fixture below), so CI's `M` is expected to be 6 smaller
-there -- that is a real per-platform difference in the total, not a
-regression, and `skip()` increments `SKIP` without incrementing `TOTAL`.
+binaries 86 -> 87, `make` 0 warnings. **Six of those checks skip on
+Linux** (see the `chflags` fixture below), and `skip()` increments `SKIP`
+without incrementing `TOTAL`, so the two platforms report different totals.
+Measured on CI for this commit: macOS `4789/4789, 0 skipped`; ubuntu
+`4689/4689, 14 skipped` (6 of those skips are this phase's, 8 are
+inherited). **The gap between the platforms is 100, not 6** -- 94 of it is
+the case-folding groups that Phase 73's filesystem probe made possible and
+that Phases 74 and 76 actually added (Phase 77 contributed none of them,
+and measured macOS 4679 vs ubuntu 4585), and this phase adds the other 6.
+Do not read "six skip on Linux" as "Linux's M is six smaller"; compare
+Linux's M against Linux's, never against macOS's.
 
 ### The oracle (measured against git 2.55.0, macOS)
 
