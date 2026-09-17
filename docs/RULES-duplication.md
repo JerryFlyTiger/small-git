@@ -122,3 +122,19 @@ depth-first empty-directory walk, `sg_ref_remove_empty_dir_tree`
 specifically so `reflog.c` could call the existing one. If a THIRD file
 ever needs this same removal, it goes through this same function -- do
 not write a third copy.
+
+## Phase 80: the worktree ancestor walk is one function, shared by write and delete
+
+F1's `sg_write_file_worktree` and the fix round's `sg_remove_file_worktree`
+(both `workdir/workdir.c`) need the IDENTICAL "lstat each ancestor component
+strictly below the repo root; a non-directory blocks the whole chain"
+walk -- the write side to refuse writing THROUGH a symlink, the delete side
+to refuse deleting through one. It is a single static helper,
+`walk_worktree_ancestors(abs, root_len, create_missing)`: `create_missing=1`
+is the write path (mkdir a missing component), `0` is the delete/prune path
+(a missing component means "nothing here", stop). `sg_prune_empty_parents`
+calls the same helper (with `0`) before its `rmdir`. Do NOT write a second
+ancestor-lstat walk for any future worktree mutation -- route it through this
+one. The rule it enforces (never traverse a symlink below the root; never
+inspect a component at or above the root, so a repo reached through a
+symlinked `/tmp` still works) lives in `docs/RULES-paths-strings.md`.

@@ -32,9 +32,76 @@ int sg_mkdir_parents(const char *path);
    the file can't be opened or read. */
 int sg_read_file(const char *path, unsigned char **out, size_t *out_len);
 
-/* Writes data to path, creating any missing parent directories first, and
-   chmod's the result to mode. Returns 0 on success, -1 on I/O failure. */
+/* Writes data to path, creating any missing parent directories first (via
+   sg_mkdir_parents, so it inherits that function's "EEXIST-without-S_ISDIR"
+   looseness -- see sg_mkdir_parents's own callers for that), and chmod's the
+   result to mode. Returns 0 on success, -1 on I/O failure.
+
+   Phase 80: no longer used by any WORKING-TREE write in src/ -- every one of
+   those goes through sg_write_file_worktree below instead, which adds the
+   symlink-safety and blocker-replacement rules real git's own checkout
+   follows. This function is kept only because it is still the tests'
+   general-purpose "write this fixture file, creating its parent directories"
+   helper (dozens of call sites across tests, none of them exercising or
+   depending on the worktree-write security boundary sg_write_file_worktree
+   exists for), and because a `.git`-side write (refs.c, reflog.c) still goes
+   through plain sg_mkdir_parents + fopen directly, with no symlink concern
+   below the gitdir root the way there is below the repo root. Do not add a
+   new worktree call site for this function -- see
+   docs/RULES-paths-strings.md. */
 int sg_write_file_mkdirs(const char *path, const unsigned char *data, size_t len, int mode);
+
+/* Phase 80 (F1): writes data as a WORKING-TREE file at repo_root/relpath,
+   creating missing parent directories, and never writing through a symlink
+   (or any other non-directory) sitting below repo_root. This is the single
+   worktree-write primitive -- replaces the old sg_write_file_mkdirs at every
+   worktree call site in src/ (a write under .git/ still goes through
+   sg_mkdir_parents + fopen directly, unaffected by this).
+
+   Every path component strictly BELOW repo_root is lstat'd (never stat'd):
+   a real directory is traversed; a missing one is created (mkdir); anything
+   else (symlink, regular file, fifo, ...) is NOT traversed, and the whole
+   call fails (-1) -- a caller that needs to replace such a blocker clears it
+   first (see sg_worktree_clear_write_path in sg/apply.h). Components AT OR
+   ABOVE repo_root are never checked, so a repository reached through a
+   symlinked ancestor (macOS's /tmp -> /private/tmp, or a symlinked cwd)
+   keeps working.
+
+   The final component: if lstat shows a symlink or a regular file, it is
+   unlinked first, then created with O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW (so a
+   symlink recreated by a racing process between the unlink and this open is
+   refused, not followed) and chmod'd to mode. A directory sitting at the
+   final component is a failure (-1) unless a caller already removed it.
+
+   Symlink (mode 120000) blob content is unaffected: sg does not check out
+   symlinks at all (a separate, future phase), so this function never
+   receives one.
+
+   Returns 0 on success, -1 on any failure. */
+int sg_write_file_worktree(const char *repo_root, const char *relpath,
+                          const unsigned char *data, size_t len, int mode);
+
+/* Phase 80 (fix round, finding 1): removes a WORKING-TREE file or empty
+   directory at repo_root/relpath -- the delete-side counterpart to
+   sg_write_file_worktree above, and the single worktree-delete primitive:
+   every worktree delete in src/ goes through this instead of a bare
+   remove()/unlink()/rmdir() on a joined path (a delete under .git/ is
+   unaffected, same carve-out as the write side).
+
+   Every path component strictly BELOW repo_root is lstat'd, never stat'd:
+   a real directory is traversed; a missing one means there is nothing here
+   to remove (returns 0, not a failure); anything else (symlink, regular
+   file, fifo, ...) fails the WHOLE call (-1) WITHOUT removing anything --
+   this is what stops a symlinked ancestor from letting a plain remove()
+   resolve straight through it and delete something OUTSIDE the
+   repository, the delete-side twin of F1's write-side rule. Components AT
+   OR ABOVE repo_root are never inspected. The final component itself is
+   never traversed either way (remove() does not follow a symlink there).
+
+   Returns 0 on success (including "there was nothing to remove"), -1 if a
+   non-directory ancestor blocked the walk or the final remove() itself
+   failed (e.g. a non-empty directory, or a permission error). */
+int sg_remove_file_worktree(const char *repo_root, const char *relpath);
 
 /* Non-zero if path exists and is a symlink (checked with lstat, so it isn't
    followed). */

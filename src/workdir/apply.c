@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static int flat_find(const sg_flat_list *list, const char *path)
 {
@@ -52,21 +53,33 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
     size_t i;
     int rc = 0;
     int flatten_rc;
+    sg_ignore *ig;
+
+    /* Phase 80 (F1/F2): one sg_ignore for the whole apply, reused by
+       sg_worktree_clear_write_path for every path below -- opening a fresh
+       one per file would re-read every .gitignore on every single write. */
+    if (sg_ignore_open(&ig, git_dir, repo_root) != 0) {
+        fprintf(stderr, "sg: out of memory\n");
+        return -1;
+    }
 
     flatten_rc = sg_tree_flatten(git_dir, tree_id, &target_flat, bad_path);
     if (flatten_rc == -2) {
         fprintf(stderr, "sg: path %s is invalid, refusing to flatten this tree into file paths\n",
                sg_quote_path_delimited(bad_path));
+        sg_ignore_free(ig);
         return -1;
     }
     if (flatten_rc != 0) {
         fprintf(stderr, "sg: failed to read target tree\n");
+        sg_ignore_free(ig);
         return -1;
     }
 
     if (sg_index_read(git_dir, &old_idx) != 0) {
         fprintf(stderr, "sg: failed to read index (corrupt?)\n");
         sg_flat_list_free(&target_flat);
+        sg_ignore_free(ig);
         return -1;
     }
 
@@ -78,30 +91,34 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         if (i > 0 && strcmp(old_idx.entries[i].path, old_idx.entries[i - 1].path) == 0)
             continue;
         if (flat_find(&target_flat, old_idx.entries[i].path) < 0) {
-            char abspath[SG_PATH_MAX];
-
             /* The index entry being removed here did not necessarily come
                through sg_tree_flatten's own guard above: it may have been
                written by an sg build that predates this check (or by `sg
                add`, before Phase 22's cmd_add guard existed), and that
                guard does not retroactively clean up what is already on
                disk. Without this, a path like "../victim.txt" or ".git/x"
-               left in the index by an old bug would still reach remove()
-               here even after the tree-side hole is closed. */
+               left in the index by an old bug would still reach the
+               guarded delete here even after the tree-side hole is
+               closed. */
             if (!sg_relpath_is_safe(old_idx.entries[i].path)) {
                 fprintf(stderr, "sg: path %s in index is invalid, refusing to delete\n",
                        sg_quote_path_delimited(old_idx.entries[i].path));
                 rc = -1;
                 continue;
             }
-            if (sg_path_join(abspath, sizeof(abspath), repo_root, old_idx.entries[i].path) != 0) {
-                fprintf(stderr, "sg: path too long, cannot delete %s\n",
+            /* Phase 80 (fix round, finding 1): sg_remove_file_worktree
+               fails closed on a symlinked ancestor instead of resolving
+               through it the way a bare remove() would -- that failure
+               must abort this apply the same way a failed write already
+               does, not be silently swallowed the way a plain remove()
+               failure used to be here. */
+            if (sg_remove_file_worktree(repo_root, old_idx.entries[i].path) != 0) {
+                fprintf(stderr, "sg: cannot remove %s\n",
                        sg_quote_path_delimited(old_idx.entries[i].path));
                 rc = -1;
                 continue;
             }
-            if (remove(abspath) == 0)
-                sg_prune_empty_parents(repo_root, old_idx.entries[i].path);
+            sg_prune_empty_parents(repo_root, old_idx.entries[i].path);
         }
     }
     sg_index_free(&old_idx);
@@ -137,8 +154,9 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
                 continue;
             }
         }
-        if (sg_write_file_mkdirs(abspath, blob_content, blob_len,
-                                 (int)(target_flat.entries[i].mode & 0777)) != 0) {
+        if (sg_worktree_clear_write_path(ig, repo_root, target_flat.entries[i].path, NULL) != 0 ||
+           sg_write_file_worktree(repo_root, target_flat.entries[i].path, blob_content, blob_len,
+                                  (int)(target_flat.entries[i].mode & 0777)) != 0) {
             fprintf(stderr, "sg: failed to write %s\n",
                    sg_quote_path_delimited(target_flat.entries[i].path));
             free(blob_content);
@@ -177,6 +195,7 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         }
     }
     sg_flat_list_free(&target_flat);
+    sg_ignore_free(ig);
 
     if (rc == 0 && sg_index_write(git_dir, &new_idx) != 0) {
         fprintf(stderr, "sg: failed to write index\n");
@@ -692,19 +711,32 @@ static void untracked_path_accum_pop(untracked_path_accum *pa, size_t old_len)
 }
 
 static int untracked_overwrite_dir_scan(sg_ignore *ig, const char *repo_root,
-                                        untracked_path_accum *pa, char *abs_scratch,
-                                        int *out_found, sg_untracked_overwrite_error *err);
+                                        const sg_index *idx, untracked_path_accum *pa,
+                                        char *abs_scratch, int *out_found,
+                                        sg_untracked_overwrite_error *err);
 
 /* Pushes proper ancestors of `path` (shortest first, same convention as
    untracked_overwrite_is_ignored above), then recursively scans `path`
    itself for at least one entry that is not ignored, then pops everything
    it pushed. See sg_untracked_would_be_overwritten's own header comment
-   (Phase 79b) for the exact rules this scan follows. Returns 0 and fills
-   *out_found on success; -1 on any opendir/readdir/lstat/ignore-engine
-   failure encountered anywhere in the scan (all pushed ancestors are
-   popped before returning either way), with `err` describing which. */
+   (Phase 79b) for the exact rules this scan follows.
+
+   Phase 80 (F3b/F2): `idx` is an optional tracked-path exemption -- when
+   non-NULL, an entry tracked at any stage does not count toward "found",
+   the same way an ignored one does not (but, unlike an ignored directory,
+   a tracked path is still just skipped, not a reason to avoid recursing
+   into a directory that has other, non-tracked content). Pass NULL for the
+   Phase 79/79b/79c write-time behavior (also what sg_worktree_clear_write_
+   path passes); sg_untracked_would_be_overwritten's own pre-flight caller
+   passes its own idx.
+
+   Returns 0 and fills *out_found on success; -1 on any opendir/readdir/
+   lstat/ignore-engine failure encountered anywhere in the scan (all pushed
+   ancestors are popped before returning either way), with `err` describing
+   which. */
 static int untracked_overwrite_dir_has_nonignored(sg_ignore *ig, const char *repo_root,
-                                                   const char *path, int *out_found,
+                                                   const char *path, const sg_index *idx,
+                                                   int *out_found,
                                                    sg_untracked_overwrite_error *err)
 {
     untracked_path_accum pa;
@@ -746,7 +778,7 @@ static int untracked_overwrite_dir_has_nonignored(sg_ignore *ig, const char *rep
     }
 
     if (rc == 0)
-        rc = untracked_overwrite_dir_scan(ig, repo_root, &pa, abs_scratch, out_found, err);
+        rc = untracked_overwrite_dir_scan(ig, repo_root, idx, &pa, abs_scratch, out_found, err);
 
     while (pushed-- > 0)
         sg_ignore_pop_dir(ig);
@@ -781,8 +813,9 @@ static int untracked_overwrite_dir_has_nonignored(sg_ignore *ig, const char *rep
    errno is left unchanged on a clean end-of-directory, only that it is set
    on failure). */
 static int untracked_overwrite_dir_scan(sg_ignore *ig, const char *repo_root,
-                                        untracked_path_accum *pa, char *abs_scratch,
-                                        int *out_found, sg_untracked_overwrite_error *err)
+                                        const sg_index *idx, untracked_path_accum *pa,
+                                        char *abs_scratch, int *out_found,
+                                        sg_untracked_overwrite_error *err)
 {
     DIR *d;
     struct dirent *ent;
@@ -833,15 +866,19 @@ static int untracked_overwrite_dir_scan(sg_ignore *ig, const char *repo_root,
             int sub_found = 0;
 
             if (!ignored &&
-                untracked_overwrite_dir_scan(ig, repo_root, pa, abs_scratch, &sub_found, err) !=
-                    0) {
+                untracked_overwrite_dir_scan(ig, repo_root, idx, pa, abs_scratch, &sub_found,
+                                             err) != 0) {
                 rc = -1;
                 untracked_path_accum_pop(pa, old_len);
                 break;
             }
             if (sub_found)
                 found = 1;
-        } else if (!ignored) {
+        } else if (!ignored && !(idx != NULL && path_tracked_any_stage(idx, pa->buf))) {
+            /* Phase 80 (F3b): a path tracked in idx (any stage) is not
+               untracked content, so it does not make this directory
+               "blocking" -- the same directory can still be reported for a
+               DIFFERENT, genuinely untracked file elsewhere inside it. */
             found = 1;
         }
         untracked_path_accum_pop(pa, old_len);
@@ -911,7 +948,69 @@ int sg_untracked_would_be_overwritten(const char *git_dir, const char *repo_root
         const char *x = NULL;
         int x_is_dir = 0;
 
-        if (sg_path_join(abspath, sizeof(abspath), repo_root, p) != 0) {
+        /* Phase 80 (F3a): walk P's proper ancestors shortest-first FIRST,
+           unconditionally -- not only when lstat(P) itself fails ENOTDIR.
+           A symlinked ancestor (A4/A6/A7/A8's shape: "a" is a symlink,
+           candidate is "a/b/c.txt") makes lstat(P) silently follow it and
+           answer about whatever "a" points at instead of about "a" itself
+           -- ENOENT if the target doesn't have "b/c.txt", or even success
+           if it does -- neither of which is "no collision along this
+           path", the wrong direction for a security-relevant check. The
+           ancestor's own lstat is never followed either (it inspects the
+           symlink, not its target), so this loop finds "a" itself as the
+           blocker regardless of what it points at or whether the target
+           exists at all. */
+        {
+            size_t j;
+
+            for (j = 0; p[j] != '\0' && !have_x; j++) {
+                if (p[j] != '/')
+                    continue;
+                {
+                    char prefix[SG_PATH_MAX];
+                    char anc_abs[SG_PATH_MAX];
+                    struct stat anc_st;
+
+                    if (j >= sizeof(prefix)) {
+                        x = p;
+                        have_x = 1;
+                        check_ignore = 0;
+                        break;
+                    }
+                    memcpy(prefix, p, j);
+                    prefix[j] = '\0';
+                    if (sg_path_join(anc_abs, sizeof(anc_abs), repo_root, prefix) != 0) {
+                        x = p;
+                        have_x = 1;
+                        check_ignore = 0;
+                        break;
+                    }
+                    if (lstat(anc_abs, &anc_st) != 0) {
+                        /* ENOENT: nothing here yet, keep walking (P itself
+                           might still exist relative to this missing
+                           ancestor being about to be created, handled
+                           below). Anything else (EACCES, ...) could not be
+                           verified -- leave it to the P-based fallback
+                           below, which will hit the identical lstat error
+                           on P (or an ancestor of it) and fail closed
+                           there. */
+                        continue;
+                    }
+                    if (!S_ISDIR(anc_st.st_mode)) {
+                        memcpy(x_buf, prefix, j + 1);
+                        x = x_buf;
+                        have_x = 1;
+                        x_is_dir = 0;
+                        break;
+                    }
+                    /* real directory: keep walking */
+                }
+            }
+        }
+
+        if (have_x) {
+            /* found via the ancestor walk above */
+        } else if (sg_path_join(abspath, sizeof(abspath), repo_root, p) != 0) {
             /* Truncated -- can't even be verified, same fail-closed
                direction as every other path-joining site in this project:
                report it rather than risk "clear". */
@@ -938,47 +1037,13 @@ int sg_untracked_would_be_overwritten(const char *git_dir, const char *repo_root
             x = p;
             have_x = 1;
             x_is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
-        } else if (errno == ENOENT) {
-            have_x = 0; /* nothing along this path at all -- clear */
-        } else if (errno == ENOTDIR) {
-            /* Some ancestor component exists and is not a directory --
-               walk P's proper ancestors shortest-first and take the first
-               one that exists and is not a directory as the blocker. */
-            size_t j;
-
-            for (j = 0; p[j] != '\0'; j++) {
-                if (p[j] != '/')
-                    continue;
-                {
-                    char prefix[SG_PATH_MAX];
-                    char anc_abs[SG_PATH_MAX];
-                    struct stat anc_st;
-
-                    if (j >= sizeof(prefix)) {
-                        x = p;
-                        have_x = 1;
-                        check_ignore = 0;
-                        break;
-                    }
-                    memcpy(prefix, p, j);
-                    prefix[j] = '\0';
-                    if (sg_path_join(anc_abs, sizeof(anc_abs), repo_root, prefix) != 0) {
-                        x = p;
-                        have_x = 1;
-                        check_ignore = 0;
-                        break;
-                    }
-                    if (lstat(anc_abs, &anc_st) == 0 && !S_ISDIR(anc_st.st_mode)) {
-                        memcpy(x_buf, prefix, j + 1);
-                        x = x_buf;
-                        have_x = 1;
-                        x_is_dir = 0;
-                        break;
-                    }
-                }
-            }
-            /* Loop ran to completion without finding a blocker: a race
-               between the ENOTDIR and this walk removed it. No collision. */
+        } else if (errno == ENOENT || errno == ENOTDIR) {
+            /* ENOENT: nothing along this path at all -- clear. ENOTDIR
+               should already have been caught by the ancestor walk above;
+               kept here as a fail-safe (a race could remove the ancestor
+               between the two lstats) rather than reported, matching this
+               function's own pre-Phase-80 "loop ran to completion" note. */
+            have_x = 0;
         } else {
             /* EACCES, ENAMETOOLONG, ELOOP, ... -- could not be verified,
                same fail-closed direction as the truncation case above. */
@@ -1014,7 +1079,7 @@ int sg_untracked_would_be_overwritten(const char *git_dir, const char *repo_root
         if (x_is_dir) {
             int found = 0;
 
-            if (untracked_overwrite_dir_has_nonignored(ig, repo_root, x, &found, err) != 0) {
+            if (untracked_overwrite_dir_has_nonignored(ig, repo_root, x, idx, &found, err) != 0) {
                 rc = -1;
                 break;
             }
@@ -1077,4 +1142,169 @@ int sg_untracked_would_be_overwritten(const char *git_dir, const char *repo_root
     *out_dirs = dir_collisions;
     *out_dirs_count = dir_count;
     return 0;
+}
+
+/* Phase 80 (F2): removes relpath's WHOLE subtree, lstat-based -- unlinks
+   every file and symlink it finds (never opendir/stat THROUGH a symlink, so
+   an ignored symlink pointing outside the repo is unlinked itself and its
+   target is never touched), then rmdir's every directory bottom-up,
+   including relpath itself. pa must already be initialized to relpath;
+   abs_scratch is a shared SG_PATH_MAX scratch buffer, same convention as
+   untracked_overwrite_dir_scan. Returns 0, or -1 on the first removal
+   failure (leaves whatever could not be removed; everything already removed
+   stays removed, no rollback). */
+static int untracked_overwrite_remove_subtree(const char *repo_root, untracked_path_accum *pa,
+                                              char *abs_scratch)
+{
+    DIR *d;
+    struct dirent *ent;
+    int rc = 0;
+
+    if (sg_path_join(abs_scratch, SG_PATH_MAX, repo_root, pa->buf) != 0)
+        return -1;
+
+    d = opendir(abs_scratch);
+    if (d == NULL)
+        return -1;
+
+    errno = 0;
+    while ((ent = readdir(d)) != NULL) {
+        struct stat st;
+        size_t old_len;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            errno = 0;
+            continue;
+        }
+
+        if (untracked_path_accum_push(pa, ent->d_name, &old_len) != 0) {
+            rc = -1;
+            break;
+        }
+        if (sg_path_join(abs_scratch, SG_PATH_MAX, repo_root, pa->buf) != 0) {
+            rc = -1;
+            untracked_path_accum_pop(pa, old_len);
+            break;
+        }
+        if (lstat(abs_scratch, &st) != 0) {
+            rc = -1;
+            untracked_path_accum_pop(pa, old_len);
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            if (untracked_overwrite_remove_subtree(repo_root, pa, abs_scratch) != 0) {
+                rc = -1;
+                untracked_path_accum_pop(pa, old_len);
+                break;
+            }
+        } else if (unlink(abs_scratch) != 0) {
+            rc = -1;
+            untracked_path_accum_pop(pa, old_len);
+            break;
+        }
+        untracked_path_accum_pop(pa, old_len);
+        errno = 0;
+    }
+    if (rc == 0 && ent == NULL && errno != 0)
+        rc = -1;
+
+    closedir(d);
+    if (rc != 0)
+        return -1;
+
+    if (sg_path_join(abs_scratch, SG_PATH_MAX, repo_root, pa->buf) != 0)
+        return -1;
+    return rmdir(abs_scratch) == 0 ? 0 : -1;
+}
+
+int sg_worktree_clear_write_path(sg_ignore *ig, const char *repo_root, const char *relpath,
+                                 const sg_index *idx)
+{
+    size_t i;
+
+    /* (a) ancestors, shortest first -- same walk sg_untracked_would_be_
+       overwritten's own F3a fix uses, but here a blocker is either cleared
+       (ignored) or fails the whole call outright, never merely reported. */
+    for (i = 0; relpath[i] != '\0'; i++) {
+        char prefix[SG_PATH_MAX];
+        char anc_abs[SG_PATH_MAX];
+        struct stat anc_st;
+        int ignored = 0;
+
+        if (relpath[i] != '/')
+            continue;
+
+        if (i >= sizeof(prefix))
+            return -1;
+        memcpy(prefix, relpath, i);
+        prefix[i] = '\0';
+        if (sg_path_join(anc_abs, sizeof(anc_abs), repo_root, prefix) != 0)
+            return -1;
+
+        if (lstat(anc_abs, &anc_st) != 0) {
+            if (errno == ENOENT)
+                return 0; /* nothing here yet: sg_write_file_worktree mkdir's the rest */
+            return -1;
+        }
+        if (S_ISDIR(anc_st.st_mode))
+            continue; /* real directory, keep walking */
+
+        if (untracked_overwrite_is_ignored(ig, prefix, 0, &ignored) != 0)
+            return -1;
+        if (!ignored)
+            return -1; /* real blocker: fail closed, do not remove it */
+        if (unlink(anc_abs) != 0)
+            return -1;
+        return 0; /* cleared; nothing below it existed */
+    }
+
+    /* (b) relpath itself. */
+    {
+        char abs[SG_PATH_MAX];
+        struct stat st;
+        int self_ignored = 0;
+        int found = 0;
+
+        if (sg_path_join(abs, sizeof(abs), repo_root, relpath) != 0)
+            return -1;
+        if (lstat(abs, &st) != 0)
+            return 0; /* ENOENT, or unverifiable -- the write's own open() will fail loudly */
+        if (!S_ISDIR(st.st_mode))
+            return 0; /* symlink or regular file: sg_write_file_worktree unlinks it */
+
+        if (untracked_overwrite_is_ignored(ig, relpath, 1, &self_ignored) != 0)
+            return -1;
+        if (!self_ignored) {
+            sg_untracked_overwrite_error scratch_err;
+
+            scratch_err.kind = SG_UNTRACKED_ERR_NONE;
+            scratch_err.path = NULL;
+            scratch_err.saved_errno = 0;
+            if (untracked_overwrite_dir_has_nonignored(ig, repo_root, relpath, idx, &found,
+                                                       &scratch_err) != 0) {
+                sg_untracked_overwrite_error_free(&scratch_err);
+                return -1;
+            }
+            if (found)
+                return -1;
+        }
+
+        {
+            untracked_path_accum pa;
+            char *abs_scratch;
+            int rc;
+
+            if (untracked_path_accum_init(&pa, relpath) != 0)
+                return -1;
+            abs_scratch = malloc(SG_PATH_MAX);
+            if (abs_scratch == NULL) {
+                untracked_path_accum_free(&pa);
+                return -1;
+            }
+            rc = untracked_overwrite_remove_subtree(repo_root, &pa, abs_scratch);
+            free(abs_scratch);
+            untracked_path_accum_free(&pa);
+            return rc;
+        }
+    }
 }

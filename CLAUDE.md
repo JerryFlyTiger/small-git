@@ -220,7 +220,7 @@ them.
 | `storage/refs.c`, `storage/revparse.c`, `refs.h`, `revparse.h`, `objstore.h`, `object.h`; detached HEAD; `cli/cmd_merge.c`'s `<rev>`/message/fast-forward output; `cli/cmd_tag.c`; `cli/cmd_branch.c`; `cli/ref_delete.c`; `ref_delete.h`; `sg_message_cleanup` | `docs/RULES-refs-revparse.md` |
 | `util/date.c`, `date.h`, `util/ident.c`, `ident.h`, `cli/cmd_undo.c`'s own formatter; any `--date=` / `%ad` / `%ar` / `%ah` work | `docs/RULES-date.md` |
 | `cli/cmd_log.c`, `cli/cmd_show.c`, `cli/cmd_cat_file.c`, `cli/commit_out.c`, `cli/log_graph.c`, `commit_out.h`, `log_graph.h` | `docs/RULES-log-show.md` |
-| **any file that joins a path, prints a path to the user, deletes a tracked file, or builds a user-facing string with `snprintf`** -- `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir.h`, `quote.h`, `strfmt.h`; `workdir/apply.c`, `workdir/merge.c`, `object/tree.c`, `storage/refs.c`, `storage/repo.c`, `safety/stash.c`, `cli/pick.c`, `cli/cmd_add.c`, `cli/cmd_restore.c`, `cli/cmd_reset.c`, `cli/cmd_merge.c`, `cli/cmd_rebase.c`, `cli/cmd_branch.c`, `cli/ref_delete.c` | `docs/RULES-paths-strings.md` |
+| **any file that joins a path, prints a path to the user, deletes a tracked file, or builds a user-facing string with `snprintf`** -- `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir.h`, `quote.h`, `strfmt.h`; `workdir/workdir.c`, `workdir/apply.c`, `workdir/merge.c`, `object/tree.c`, `storage/refs.c`, `storage/repo.c`, `safety/stash.c`, `cli/pick.c`, `cli/cmd_add.c`, `cli/cmd_restore.c`, `cli/cmd_reset.c`, `cli/cmd_merge.c`, `cli/cmd_rebase.c`, `cli/cmd_branch.c`, `cli/ref_delete.c` | `docs/RULES-paths-strings.md` |
 | `workdir/diff.c`, `cli/diff_out.c`, `cli/cmd_diff.c`, `util/diff_lcs.c`, `diff.h`, `diff_out.h`, `tree_build.h` | `docs/RULES-diff.md` |
 | `workdir/merge.c`, `cli/cmd_merge.c`, `merge.h`, `apply.h` | `docs/RULES-merge.md` |
 | `workdir/rename.c`, `util/similarity.c`, `cli/cmd_diff.c`'s `-M`/`-C`/pathspec parsing, `pathspec.h`, `similarity.h` | `docs/RULES-pathspec-rename.md` |
@@ -661,6 +661,35 @@ marked "fixed" in place, same as the other two retired entries above.)
     feature (a no-op force on a packed branch no longer materializes a
     loose file; a packed, case-folded D/F conflict now names the real
     stored ref and matches git's wording byte-for-byte).
+11. **`sg reset --hard` (and `sg undo`, same path) FAIL CLOSED with `sg:
+    failed to write "<p>"` where real git deletes the user's untracked,
+    non-ignored data and succeeds** (Phase 80) -- an ACCEPTED answer, not a
+    deferred defect: an untracked, non-ignored file or directory is user
+    data sg's snapshot mechanism does not capture, so sg refuses to be the
+    one that deletes it, even though git itself does so silently. Measured
+    against git 2.55.0: an untracked non-ignored FILE blocking an ancestor
+    component (`a` blocking `a/b/c.txt`), a non-empty untracked DIRECTORY
+    holding non-ignored content at the write target, and a non-ignored
+    SYMLINK ancestor pointing anywhere at all all give git exit 0 and a
+    deleted/overwritten blocker, while sg exits 1 and leaves the blocker
+    untouched. `sg switch`/`sg cherry-pick`/`sg rebase`/`sg revert` now
+    reach the identical fail-closed answer for the same three shapes (they
+    still lack the untracked-overwrite PRE-FLIGHT `sg merge` has since
+    Phase 79 -- see that phase's residual 1 in `docs/DESIGN.md`, unchanged
+    by this phase -- so where git prints its own refusal message, sg's is
+    the generic "failed to write"). This is a SEPARATE effect from `sg
+    merge`'s own Phase 79 pre-flight refusal: this divergence is about the
+    WRITE PATH itself (`sg_write_file_worktree`/`sg_worktree_clear_write_
+    path`, `docs/RULES-paths-strings.md`) refusing to delete non-ignored
+    content it cannot prove is safe to lose, not about a command deciding
+    not to attempt the write at all. An untracked file or directory
+    sitting exactly at the FINAL write path (not an ancestor) is NOT part
+    of this divergence and keeps being overwritten by `reset --hard`/
+    `switch`, matching git -- see `docs/RULES-paths-strings.md`'s Phase 80
+    entry for why F1 always replaces a blocker at the final component
+    regardless of its ignored status. Pinned on both sides in interop's
+    `phase80 N2` row (and covered structurally by every other `phase80`
+    row, since none of them ever rely on sg deleting non-ignored content).
 
 ## Core types cheat sheet
 

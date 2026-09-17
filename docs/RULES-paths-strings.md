@@ -260,3 +260,198 @@ truncated/extended in place across the whole recursion) and one shared
 `SG_PATH_MAX` scratch buffer for `opendir`/`lstat` absolute paths replace
 what used to be three per-frame stack arrays, so a pathological chain of
 one-letter untracked directories no longer scales stack use with depth.
+
+## Phase 80: a working-tree write always goes through `sg_write_file_worktree`,
+## never `fopen` a worktree path directly; below the repo root, always `lstat`,
+## never `stat`
+
+`sg_write_file_worktree` (`include/sg/workdir.h`, `src/workdir/workdir.c`) is
+the ONLY way to write tree/index/merge content into the working tree --
+`apply.c`, `merge.c`, `cmd_restore.c`, `stash.c` all go through it, and the
+old `sg_write_file_mkdirs` was removed from every one of those call sites
+(it still exists, purely as a test-fixture-setup helper with no symlink
+concern -- see its own header comment for why it was kept rather than
+deleted outright). Every path component strictly BELOW the repo root is
+`lstat`'d, never `stat`'d: a real directory is traversed, a missing one is
+created, and anything else (symlink, regular file, fifo) stops the write
+cold (-1) rather than being silently followed or truncated through --
+`stat` would resolve a symlink component and let a write land wherever that
+symlink points, which is exactly the security hole this phase closes (a
+merge or restore into an ignored symlink used to write straight through it
+into whatever it pointed at, including a directory outside the repository
+entirely). Components AT OR ABOVE the repo root are never inspected, so a
+repository reached through a symlinked ancestor (macOS's `/tmp` ->
+`/private/tmp`, or a symlinked cwd) keeps working -- the boundary is
+`repo_root` itself, not "any symlink anywhere in the path".
+
+`sg_worktree_clear_write_path` (`include/sg/apply.h`,
+`src/workdir/apply.c`) is the paired pre-write clearing step, called
+immediately before every one of the write sites above, with ONE `sg_ignore`
+opened per caller-level operation (not per file). It replaces exactly what
+real git itself replaces during a checkout-like write -- an IGNORED
+ancestor blocker, or a directory sitting at the write target that is
+itself ignored or recursively holds nothing but ignored (and, only for the
+pre-flight's own use, tracked) content -- and fails closed (-1) on
+anything else, leaving it in place. **The tracked-path exemption used by
+the recursive scan (`untracked_overwrite_dir_has_nonignored`'s `idx`
+parameter, shared with `sg_untracked_would_be_overwritten`) is deliberately
+NOT available at write time** -- every real call site passes `idx = NULL`,
+because Phase 80's own F4 fix (below) already deletes every tracked path a
+merge result removes BEFORE any write runs, so by the time this function
+scans a directory a write needs to replace, nothing that would have needed
+the exemption is still on disk. Passing a real `idx` here instead of `NULL`
+would silently reproduce the exact write-order bug F4 fixes, in reverse.
+
+**Do not add a second worktree-write helper for "just this one case".**
+`docs/RULES-duplication.md`'s rule about never coexisting with the old
+function applies here just as much as it did to `sg_mkdir_parents`'s own
+`.git`-side callers: if a new command needs to write into the working
+tree, it calls `sg_write_file_worktree`, preceded by
+`sg_worktree_clear_write_path` when the target might be blocked by
+something replaceable.
+
+## Phase 80 fix round (cold-read finding 1, CRITICAL): the DELETE side needs
+## the exact same symlink guard the write side got, and did not have it
+
+F1/F2 (above) close the write-side symlink hole, but a cold read found the
+DELETE side wide open: `sg_apply_tree_to_workdir`'s loop 1 (removing a
+tracked path absent from the target tree), `sg_merge_result_apply`'s F4
+delete pass, `sg stash`'s two worktree-delete sites, and
+`sg_prune_empty_parents` all built an absolute path with `sg_path_join`
+and then called `remove()`/`unlink()`/`rmdir()` on it directly -- every one
+of those POSIX calls resolves EVERY ancestor component of its argument
+through symlinks (only the FINAL component is left unresolved). Measured
+directly against git 2.55.0 (`SCRATCH/atk.py`'s construction): a tracked
+`a/b/tracked.txt` whose ancestor `a` is replaced on disk by a symlink to a
+directory OUTSIDE the repository, with the outside directory's own
+`b/tracked.txt` made BYTE-IDENTICAL to the tracked content (so `sg status`
+sees no local modification at all, and no second tracked file is needed to
+make the fixture reachable -- this is the "clean attack" shape, deliberately
+simpler than a fixture with a confounding second tracked change that would
+trip the ordinary clean-workdir gate first and never reach the delete code)
+-- `sg merge`/`switch`/`cherry-pick` (pre-fix) deleted the OUTSIDE file
+through the symlink, exit 0, no warning. git refuses in all three
+(`'a/b/tracked.txt' is beyond a symbolic link` for 3-way merge/cherry-pick;
+`Your local changes ... would be overwritten` for a fast-forward merge or a
+plain switch -- git's own wording differs by code path, sg does not
+reproduce either one, see below). **`reset --hard` measured DIFFERENTLY
+from what an earlier draft of this fix assumed**: in this exact shape
+(topic's target tree has NOTHING at all under `a`, not even a replacement
+file), git's `reset --hard` leaves the symlink completely untouched and
+exits 0 -- it does not "rebuild the real directory" the way the fix's own
+first-draft spec text claimed. That claim was never independently
+re-verified before being written down; this section states the MEASURED
+answer, and the interop pin (`phase80 D reset ff`/`3way`) asserts exactly
+that (exit 0, `a` still a symlink) rather than an unverified assumption
+that happened to look plausible.
+
+**Fix**: `sg_remove_file_worktree(repo_root, relpath)`
+(`include/sg/workdir.h`, `src/workdir/workdir.c`) is the single
+worktree-delete primitive, mirroring `sg_write_file_worktree`'s own
+ancestor walk almost exactly (both are now built on one shared static
+helper, `walk_worktree_ancestors`, per `docs/RULES-duplication.md` -- one
+walk, not two copies of it): every path component strictly below
+`repo_root` is `lstat`'d; a missing one (at ANY level, including the final
+component itself) means there is nothing to remove, which is SUCCESS, not
+a failure -- every caller already tolerated a plain `remove()` failing with
+ENOENT this way (a delete racing something else that got there first is
+not exceptional), and treating "already gone" as anything other than
+success broke an ordinary `sg reset --hard` onto a commit that restores a
+path the working tree had already deleted, unstaged (measured: caught by
+`tests/interop.sh`'s own `phase12` group during this fix's own gate run,
+not by a new test -- a real, pre-existing scenario, not a corner case
+invented for this fix). Anything else along the way that is NOT a real
+directory (a symlink, a regular file, ...) fails the WHOLE call closed
+(-1, `errno` set to `ELOOP` so a caller that already distinguishes
+"already gone" from "really failed" via `errno`, like `stash.c`'s
+`remove_untracked_files`, gets a reliable answer that is never mistaken
+for `ENOENT`) WITHOUT removing anything. Components at or above
+`repo_root` are never inspected, same boundary as the write side. Every
+worktree delete in `src/` (`apply.c`, `merge.c`, `stash.c` x2) now goes
+through this instead of a bare `remove()`/`unlink()` on a joined path.
+
+**Callers now treat a blocked delete as a hard failure, not a silently
+ignored one.** Before this fix, `sg_apply_tree_to_workdir`'s loop 1 and
+`sg_merge_result_apply`'s delete pass had NO `else` branch at all on a
+failed `remove()` -- the file stayed on disk, untracked, and the caller
+carried on as if nothing had happened. Now a failure prints `sg: cannot
+remove "<p>"` and sets the caller's own failure flag (`rc = -1` in
+`apply.c`/`stash.c`, `content_missing = 1` in `merge.c`, matching the
+existing convention each function already uses for a failed write),
+aborting the whole operation. This is a broader change than "just the
+symlink case" -- any REAL removal failure (e.g. a permission error on an
+existing, non-empty directory) now also aborts loudly where it used to be
+silent -- but ENOENT (the ordinary "already gone" case) is excluded from
+this by `sg_remove_file_worktree`'s own success-on-ENOENT rule above, so
+the common case is unaffected.
+
+**`sg_prune_empty_parents` needed the identical guard, not just the delete
+primitive** -- `rmdir()` has the exact same "resolves every ancestor
+component except the last" behavior `remove()`/`unlink()` do, and this
+function's own loop climbs from the deepest now-possibly-empty ancestor
+back up toward `repo_root`, one `rmdir()` per level. A single
+`walk_worktree_ancestors` check on `dirname(relpath)`'s full ancestor
+chain, run ONCE before the loop's first `rmdir`, covers every candidate the
+loop will ever pass to `rmdir` (each is a shrinking PREFIX of that same
+chain) -- a symlinked ancestor found there blocks the WHOLE chain, not
+just the deepest candidate, so the check cannot be threaded through the
+loop itself. Its existing "deliberately NOT ignore-aware" contract (this
+file's own rule above) is unchanged: this fix only closes the symlink hole,
+it does not change what counts as empty or ignorable.
+
+**Behavior contract**: a delete refused by the guard aborts the whole
+operation via the caller's own ordinary failure path (`-1` up the stack),
+exit 1. The **outside** directory is left byte-for-byte untouched -- that is
+the whole point of the guard and the invariant the `phase80 D*` interop rows
+pin. The IN-repo working tree is NOT guaranteed pristine, and must not be
+described as such: `sg_apply_tree_to_workdir`'s loop 2 and
+`sg_merge_result_apply`'s second pass both run unconditionally after the
+delete pass, so an unrelated new file (`o.txt` in the `phase80 D` fixtures)
+can already sit on disk when the abort fires -- exactly the "the working
+tree may already be partially updated" caveat that `include/sg/apply.h` and
+`include/sg/merge.h` have carried since before this phase. This guard adds
+the outside-repo guarantee on top of that pre-existing (weaker) in-repo one;
+it does not upgrade the in-repo one to atomic. This
+is FAIL-CLOSED and is the ACCEPTED answer, not a new numbered divergence --
+git also refuses in merge/switch/cherry-pick for this shape; only
+`reset --hard` differs (see the measurement above), and sg failing closed
+there instead of git's own "leave the symlink untouched" answer is
+consistent with divergence #11's philosophy already documented in
+`CLAUDE.md`: sg does not delete or otherwise disturb something it cannot
+prove is safe. The message is `sg: cannot remove "<p>"`, in the project's
+existing `sg: <verb> "<p>"` vocabulary (matching `sg: failed to write
+"<p>"`'s own shape) -- NOT git's `is beyond a symbolic link` wording, which
+sg has no equivalent concept for.
+
+**A genuine, unrelated fourth delete site was found the same way** (a
+`grep` for every other `remove`/`unlink`/`rmdir` on a worktree-joined
+path): `safety/stash.c`'s `remove_untracked_files` (used by `sg stash push
+-u`/`-a` to delete the untracked files it just captured into the stash's
+third parent) had the identical bare-`unlink()` hole -- reachable with NO
+tracked content at all, purely through an untracked file sitting under a
+symlinked directory. Fixed the same way, keeping its own pre-existing
+`ENOENT`-tolerant contract (a delete racing something else is not an
+error) intact via `sg_remove_file_worktree`'s own success-on-ENOENT rule.
+
+**Finding 3 (uninitialized read)**: `mkdir_parents_worktree`'s (and now
+`walk_worktree_ancestors`'s) loop starts at `i = root_len + 1`,
+deliberately skipping `abs[root_len]` (the terminator, when `abs` equals
+`repo_root` exactly). For an EMPTY `relpath`, `sg_path_join` copies
+`repo_root` alone (its own "rel is empty" rule), so `abs` has length
+exactly `root_len` and the loop's first read is `abs[root_len + 1]` --
+one byte past the string's own end, uninitialized stack content rather
+than the terminator. No real caller passes an empty relpath (every one is
+a repo-relative FILE path), but `sg_write_file_worktree` and
+`sg_remove_file_worktree` both reject an empty `relpath` outright (`-1`)
+before ever joining or walking, closing this rather than relying on every
+future caller never doing it.
+
+**Recorded, not fixed (same cold-read pass)**:
+- A double `/` in the joined path when `repo_root` itself ends in a
+  trailing slash -- no caller passes one (`sg_repo_root` never produces
+  one), so this is cosmetic-only and left alone.
+- `sg_write_file_mkdirs` (this file's own entry above) remains exported in
+  the public header purely as a test-fixture-setup helper. Moving it out
+  of `include/sg/workdir.h` into a test-only location is a future cleanup
+  that touches roughly 30 test files for no behavior change; not done
+  here.

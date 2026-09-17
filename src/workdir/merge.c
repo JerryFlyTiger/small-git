@@ -1,8 +1,10 @@
 #include "sg/merge.h"
 
+#include "sg/apply.h"
 #include "sg/chunk.h"
 #include "sg/diff.h"
 #include "sg/diff_lcs.h"
+#include "sg/ignore.h"
 #include "sg/loose.h"
 #include "sg/object.h"
 #include "sg/objstore.h"
@@ -2235,8 +2237,106 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
     size_t i;
     int index_ok = 1;
     int content_missing = 0;
+    sg_ignore *ig;
 
     memset(index_out, 0, sizeof(*index_out));
+
+    /* Phase 80 (F1/F2): one sg_ignore for the whole apply, reused by
+       sg_worktree_clear_write_path for every path below. */
+    if (sg_ignore_open(&ig, git_dir, repo_root) != 0) {
+        fprintf(stderr, "sg: out of memory\n");
+        return -1;
+    }
+
+    /* Phase 80 (F4): every plain deletion this merge result calls for runs
+       BEFORE any write below -- git's own check_updates order (delete
+       first, then create), same as sg_apply_tree_to_workdir already does.
+       The pre-Phase-80 shape of this function did both in one interleaved
+       pass, in result (path) order: writing a new file at "d" could run
+       before deleting a tracked "d/x.txt" still sitting underneath it in
+       the OLD tree, and the write then failed outright (a directory can't
+       be replaced by a file until it's empty) while the tracked deletion
+       had already gone through -- a half-applied merge (T3/T4 in the
+       Phase 80 oracle). Splitting into two full passes over result->entries
+       removes the ordering dependency: by the time any write below runs,
+       every deletion this SAME merge result calls for has already
+       happened, so a directory a write needs to replace is already clear
+       of anything this merge itself is getting rid of. Only the
+       filesystem side effect moves -- no message is printed here (this
+       branch never was one that prints on failure) and no index field is
+       touched, so stdout/stderr bytes and index contents are unchanged for
+       every existing case; see the second pass below for e->deleted's
+       corresponding path-too-long message, which stays exactly where it
+       was. */
+    for (i = 0; i < result->count; i++) {
+        sg_merge_result_entry *e = &result->entries[i];
+
+        if (e->conflict) {
+            /* Phase 80 (fix round, finding 2): rename/rename-1to2's
+               original-path entry (conflict_no_workdir_file, Phase 49) is
+               semantically a DELETE -- git leaves no file at the old name
+               -- so it belongs in this delete-first pass too, not
+               interleaved into the write pass below by path order. Moving
+               it here is what makes this function's own claim ("every
+               deletion runs before every write") actually true; before
+               this fix it was the one delete this pass did not cover
+               (docs/RULES-paths-strings.md and this function's own
+               sg_worktree_clear_write_path caller in apply.h overstated
+               this before the fix). sg_merge_entry_touches_ours always
+               answers 1 for a conflict (see that function's own comment),
+               so the guard here is just the delete itself. */
+            if (!e->conflict_no_workdir_file)
+                continue;
+            if (sg_remove_file_worktree(repo_root, e->path) != 0) {
+                fprintf(stderr, "sg: cannot remove %s\n", sg_quote_path_delimited(e->path));
+                content_missing = 1;
+                continue;
+            }
+            sg_prune_empty_parents(repo_root, e->path);
+            continue;
+        }
+        if (!e->deleted)
+            continue;
+        /* Skip the remove() when ours never had this path in the first
+           place (sg_merge_entry_touches_ours) -- otherwise this would
+           unlink an unrelated, unversioned file that happens to share
+           the name (Phase 20: base had the path, ours and theirs both
+           deleted it, and some untracked file with the same name now
+           sits at abspath).
+
+           Phase 36: unlike apply.c's equivalent remove(), e->path has no
+           guard of its own here -- same situation add_resolved_entry's
+           comment above already documents for its own sg_path_join, and
+           deliberately not fixed the same way (no guard added) for the
+           same reason: it would be a redundant defence that hides the
+           real one. This is safe today ONLY because e->path is a
+           structural fact, not an enforced invariant: sg_merge_result's
+           entries are built exclusively by sg_merge_trees out of three
+           trees that all went through sg_tree_flatten first (each
+           returns -2 and aborts the merge outright on a path that fails
+           sg_path_component_is_safe), so nothing reaches this loop that
+           flatten did not already clear. If sg_merge_result ever grows a
+           second producer -- e.g. building one by hand for a test
+           fixture, or a future caller assembling a result outside
+           sg_merge_trees -- that producer becomes responsible for the
+           same validation, or this remove() reopens exactly the
+           tree-build hole Phase 36 closed elsewhere (see
+           sg_tree_build_from_workdir in tree_build.c and
+           docs/DESIGN.md's Phase 36 section for the full writeup). */
+        if (!sg_merge_entry_touches_ours(e))
+            continue;
+        /* Phase 80 (fix round, finding 1): sg_remove_file_worktree fails
+           closed on a symlinked ancestor instead of resolving through it
+           the way a bare remove() would -- must abort the merge, not be
+           silently swallowed the way a plain remove() failure used to be
+           here. */
+        if (sg_remove_file_worktree(repo_root, e->path) != 0) {
+            fprintf(stderr, "sg: cannot remove %s\n", sg_quote_path_delimited(e->path));
+            content_missing = 1;
+            continue;
+        }
+        sg_prune_empty_parents(repo_root, e->path);
+    }
 
     for (i = 0; i < result->count; i++) {
         sg_merge_result_entry *e = &result->entries[i];
@@ -2260,14 +2360,14 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
 
             /* Phase 49: rename/rename-1to2's original path keeps only a
                stage-1 index entry and has no working-tree file at all --
-               git leaves no file at the old name. sg_merge_entry_touches_ours
-               always answers 1 for a conflict, so the guard here is just the
-               remove() itself, same as the `deleted` branch below. */
-            if (e->conflict_no_workdir_file) {
-                if (remove(abspath) == 0)
-                    sg_prune_empty_parents(repo_root, e->path);
-            } else if (sg_write_file_mkdirs(abspath, e->conflict_content, e->conflict_content_len,
-                                            mode) != 0) {
+               git leaves no file at the old name. Phase 80 (fix round,
+               finding 2) moved that removal into the delete-first pass
+               above (conflict_no_workdir_file is semantically a delete);
+               every OTHER conflict entry reaches this write unconditionally. */
+            if (!e->conflict_no_workdir_file &&
+               (sg_worktree_clear_write_path(ig, repo_root, e->path, NULL) != 0 ||
+                sg_write_file_worktree(repo_root, e->path, e->conflict_content,
+                                       e->conflict_content_len, mode) != 0)) {
                 fprintf(stderr, "sg: failed to write conflicted %s\n",
                        sg_quote_path_delimited(e->path));
             }
@@ -2290,34 +2390,8 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                     conflict_count++;
             }
         } else if (e->deleted) {
-            /* Skip the remove() when ours never had this path in the first
-               place (sg_merge_entry_touches_ours) -- otherwise this would
-               unlink an unrelated, unversioned file that happens to share
-               the name (Phase 20: base had the path, ours and theirs both
-               deleted it, and some untracked file with the same name now
-               sits at abspath).
-
-               Phase 36: unlike apply.c's equivalent remove(), e->path has no
-               guard of its own here -- same situation add_resolved_entry's
-               comment above already documents for its own sg_path_join, and
-               deliberately not fixed the same way (no guard added) for the
-               same reason: it would be a redundant defence that hides the
-               real one. This is safe today ONLY because e->path is a
-               structural fact, not an enforced invariant: sg_merge_result's
-               entries are built exclusively by sg_merge_trees out of three
-               trees that all went through sg_tree_flatten first (each
-               returns -2 and aborts the merge outright on a path that fails
-               sg_path_component_is_safe), so nothing reaches this loop that
-               flatten did not already clear. If sg_merge_result ever grows a
-               second producer -- e.g. building one by hand for a test
-               fixture, or a future caller assembling a result outside
-               sg_merge_trees -- that producer becomes responsible for the
-               same validation, or this remove() reopens exactly the
-               tree-build hole Phase 36 closed elsewhere (see
-               sg_tree_build_from_workdir in tree_build.c and
-               docs/DESIGN.md's Phase 36 section for the full writeup). */
-            if (sg_merge_entry_touches_ours(e) && remove(abspath) == 0)
-                sg_prune_empty_parents(repo_root, e->path);
+            /* Already removed by the deletion-first pass above. */
+            continue;
         } else {
             /* Skip re-reading/rewriting when the resolved outcome already
                equals ours -- this is the untouched-path case (Phase 20 spec
@@ -2336,7 +2410,9 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                 int read_rc = sg_chunk_read_blob(git_dir, e->sha1, &content, &content_len, &missing);
 
                 if (read_rc == 0) {
-                    if (sg_write_file_mkdirs(abspath, content, content_len, (int)(e->mode & 0777)) != 0) {
+                    if (sg_worktree_clear_write_path(ig, repo_root, e->path, NULL) != 0 ||
+                       sg_write_file_worktree(repo_root, e->path, content, content_len,
+                                              (int)(e->mode & 0777)) != 0) {
                         fprintf(stderr, "sg: failed to write %s\n", sg_quote_path_delimited(e->path));
                         content_missing = 1;
                     }
@@ -2368,6 +2444,8 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
        most to sg_stash_apply's caller: `sg stash pop` drops the entry once
        apply reports success, so a per-path failure reported as success
        would cost the user both the file and its only backup. */
+    sg_ignore_free(ig);
+
     if (content_missing || !index_ok) {
         sg_index_free(index_out);
         memset(index_out, 0, sizeof(*index_out));

@@ -443,18 +443,32 @@ static void test_clear_rolls_back_on_delete_failure(void)
 
 /* Forces sg_stash_push past its "destructive from here on" comment (the
    commit + refs/stash are already written) and then fails the
-   sg_apply_tree_to_workdir step that resets a.txt back to HEAD's content,
-   by chmod'ing a.txt read-only right before the push: reading the dirty
-   content for the stash tree still works (read permission is untouched),
-   but writing HEAD's content back over it does not. Confirms the caller
-   gets -2 (not -1) and that the stash is durably listed despite the
-   partial failure -- exactly what fix 3 in the milestone plan calls for. */
+   sg_apply_tree_to_workdir step that resets a.txt back to HEAD's content, by
+   chmod'ing repo_root ITSELF read-only (0555) right before the push: a.txt
+   lives directly in repo_root, so reading its dirty content for the stash
+   tree still works (read+traverse permission on repo_root is untouched, and
+   .git is a separate subdirectory whose own permissions this does not
+   touch), but F1's unlink-then-recreate of a.txt needs WRITE permission on
+   ITS parent directory (repo_root), which this removes. Confirms the caller
+   gets -2 (not -1) and that the stash is durably listed despite the partial
+   failure -- exactly what fix 3 in the milestone plan calls for.
+
+   Phase 80: this used to chmod a.txt ITSELF read-only (0444) instead of its
+   parent directory. That stopped working once sg_write_file_worktree (F1)
+   started unlinking the old file and creating a brand-new one rather than
+   fopen()'ing the existing one in place (the same mechanism real git's own
+   checkout uses, precisely so it CAN replace a read-only tracked file) --
+   unlink()/creat() permission is governed by the DIRECTORY's write bit, not
+   the target file's own mode, so the old fixture's read-only FILE no longer
+   blocks anything and rc came back 0 instead of -2. A read-only PARENT
+   directory is the correct way to still deny the write, and this is the
+   same shape as the Phase 80 oracle's R1/R2 rows (a read-only ancestor
+   directory, not a read-only file). */
 static void test_push_returns_minus_two_when_reset_fails(void)
 {
     char *git_dir = make_tmp_repo();
     char *repo_root = sg_repo_root(git_dir);
     unsigned char commit1[SG_SHA1_RAW_LEN];
-    char abspath[4096];
     int rc;
 
     if (geteuid() == 0) {
@@ -466,13 +480,12 @@ static void test_push_returns_minus_two_when_reset_fails(void)
     commit_initial(git_dir, repo_root); /* HEAD: a.txt = "hello\n" */
     write_workdir_file(repo_root, "a.txt", "changed\n");
 
-    snprintf(abspath, sizeof(abspath), "%s/a.txt", repo_root);
-    CHECK(chmod(abspath, 0444) == 0, "chmod a.txt read-only failed");
+    CHECK(chmod(repo_root, 0555) == 0, "chmod repo_root read-only failed");
 
     rc = stash_push(git_dir, repo_root, "will half-fail", commit1);
     CHECK(rc == -2, "expected -2 (stash durable, reset failed), got %d", rc);
 
-    chmod(abspath, 0644); /* restore before any further reads/writes */
+    chmod(repo_root, 0755); /* restore before any further reads/writes */
 
     {
         sg_stash_list list;
@@ -500,13 +513,26 @@ static void test_push_returns_minus_two_when_reset_fails(void)
 /* Forces the one branch in sg_merge_result_apply that phase15's interop
    coverage never reached: a clean (non-conflict) merge-result entry whose
    target path fails to write. Replacing the tracked target with a
-   same-named directory makes sg_write_file_mkdirs's fopen(path, "wb") fail
-   with EISDIR -- a directory is never mistaken for a writable regular file
-   on any of the platforms this project supports. Calls sg_stash_apply
+   same-named directory HOLDING A NON-IGNORED FILE makes it a genuine,
+   non-expendable collision: sg_worktree_clear_write_path (F2) only clears a
+   directory sitting at the write target when it is empty, itself ignored,
+   or recursively holds nothing but ignored/tracked content -- exactly
+   matching what real git itself silently replaces (Phase 80's E1/E3/S3
+   oracle rows) -- so a directory that still holds real, untracked content
+   is correctly left alone and the write fails. Calls sg_stash_apply
    directly (bypassing the CLI's sg_require_clean_workdir gate, which would
    otherwise refuse before this code path is ever reached) since the
    library function itself only guards untracked-in-HEAD collisions, not an
-   existing tracked path being replaced by a directory. */
+   existing tracked path being replaced by a directory.
+
+   Phase 80: this used to mkdir an EMPTY directory in place of d/file.txt,
+   which sg_write_file_mkdirs's plain fopen(path, "wb") could never write
+   through (EISDIR) regardless of the directory's contents. That was itself
+   one of the pre-Phase-80 residuals this phase's F1/F2 fix closes (an empty
+   directory is exactly what real git replaces without complaint) -- an
+   empty directory here would now make sg_stash_apply SUCCEED, matching git,
+   not fail. A non-empty, non-ignored directory is the shape that is still,
+   correctly, left alone. */
 static void test_apply_fails_when_clean_write_target_is_a_directory(void)
 {
     char *git_dir = make_tmp_repo();
@@ -568,10 +594,14 @@ static void test_apply_fails_when_clean_write_target_is_a_directory(void)
     rc = stash_push(git_dir, repo_root, "change d", stash_commit);
     CHECK(rc == 0, "stash push failed, rc=%d", rc);
 
-    /* replace the tracked file with a directory of the same name */
+    /* replace the tracked file with a NON-EMPTY directory of the same name
+       (a real, non-ignored file inside it -- see this test's own header
+       comment on why an empty one would no longer reproduce a failure as
+       of Phase 80) */
     snprintf(abspath, sizeof(abspath), "%s/d/file.txt", repo_root);
     CHECK(remove(abspath) == 0, "failed to remove d/file.txt before replacing it with a directory");
     CHECK(mkdir(abspath, 0755) == 0, "failed to mkdir in place of d/file.txt");
+    write_workdir_file(repo_root, "d/file.txt/blocker.txt", "still here\n");
 
     rc = sg_stash_apply(git_dir, repo_root, 0, 0);
     CHECK(rc == -1, "expected sg_stash_apply to fail when a clean write target is a directory, got %d",
@@ -1398,11 +1428,18 @@ static void test_apply_untracked_collision_rejects_whole_apply(void)
 /* "blocked/c.txt" is staged (so it is part of index_tree, the --keep-index
    re-apply's target) but absent from HEAD (so the first, head_tree, apply
    does not need to touch "blocked" at all -- it only ever tries to *remove*
-   the working-tree copy, and that removal's return value is discarded, see
-   sg_apply_tree_to_workdir). The working-tree copy is deleted and "blocked"
-   is left as an empty, write-less directory, so the SECOND apply -- which
-   must create c.txt fresh -- fails opening it while the first apply, which
-   never needed to create anything under "blocked", still succeeds. */
+   the working-tree copy of blocked/c.txt, which the test has already done
+   itself, so that removal finds nothing there). "blocked" also holds an
+   untracked ".keep" file, so it survives sg_apply_tree_to_workdir's own
+   sg_prune_empty_parents call as a non-empty, write-less directory --
+   without ".keep", the first apply's cleanup pass (Phase 80 fix round:
+   sg_remove_file_worktree finding "already gone" a success, same as a
+   completed removal, means the caller always tries to prune afterward, not
+   only when it actually removed something) would rmdir "blocked" itself
+   while it's still empty, and the second apply would then freely recreate
+   it -- silently defeating this whole fixture. With ".keep" present,
+   "blocked" survives read-only into the second apply, which must create
+   c.txt fresh in it and fails, while the first apply still succeeds. */
 static void test_push_returns_minus_two_when_keep_index_second_apply_fails(void)
 {
     char *git_dir = make_tmp_repo();
@@ -1436,6 +1473,7 @@ static void test_push_returns_minus_two_when_keep_index_second_apply_fails(void)
 
     snprintf(blocked_file, sizeof(blocked_file), "%s/blocked/c.txt", repo_root);
     CHECK(remove(blocked_file) == 0, "delete the working-tree copy of blocked/c.txt");
+    write_workdir_file(repo_root, "blocked/.keep", "keep this dir non-empty\n");
     snprintf(blocked_dir, sizeof(blocked_dir), "%s/blocked", repo_root);
     CHECK(chmod(blocked_dir, 0555) == 0, "chmod blocked/ read-only failed");
 

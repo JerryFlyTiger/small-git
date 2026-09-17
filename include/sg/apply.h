@@ -2,6 +2,7 @@
 #define SG_APPLY_H
 
 #include "sg/hash.h"
+#include "sg/ignore.h"
 #include "sg/index.h"
 
 /* Makes the working directory and index match tree_id exactly: writes/
@@ -188,6 +189,58 @@ int sg_untracked_would_be_overwritten(const char *git_dir, const char *repo_root
                                       char ***out_dirs, size_t *out_dirs_count,
                                       int *out_first_is_dir,
                                       sg_untracked_overwrite_error *out_err);
+
+/* Phase 80 (F2): prepares repo_root/relpath for a worktree write of a FILE
+   by clearing any REPLACEABLE blocker along its path, immediately before a
+   call to sg_write_file_worktree -- mirrors what real git replaces during a
+   checkout-like write. Anything not replaceable is left in place and this
+   returns -1, so the write fails closed rather than silently destroying
+   untracked user data.
+
+   ig must already be open (sg_ignore_open) and is reused across every path
+   of one caller-level operation (opening a fresh sg_ignore per file would
+   re-read every .gitignore on every single write).
+
+   idx is the SAME tracked-path exemption sg_untracked_would_be_overwritten's
+   own recursive scan uses: a path tracked in idx (any stage) found while
+   scanning a directory's contents does not count as "this directory holds
+   untracked content". Callers pass NULL here (at write time): this
+   function's caller list is exactly sg_write_file_worktree's, and
+   sg_merge_result_apply's own Phase 80 F4 fix deletes every tracked path a
+   merge result removes BEFORE any write runs, so any tracked content that
+   would have needed the exemption is already gone from disk by the time
+   this runs. The exemption exists for sg_untracked_would_be_overwritten's
+   PRE-FLIGHT use (before anything is deleted), a different call, not this
+   one.
+
+   Ancestors, shortest first below repo_root: ENOENT stops the walk (nothing
+   here yet, sg_write_file_worktree's own mkdir -p handles the rest); a real
+   directory continues the walk; anything else is queried against `ig` as a
+   non-directory (with its own ancestor chain pushed the same way
+   sg_untracked_would_be_overwritten's pre-flight does) -- IGNORED means
+   unlink it and stop (nothing existed below it), otherwise fail closed (-1),
+   leaving it in place.
+
+   relpath itself: nonexistent, a regular file, or a symlink -- nothing to
+   do here, sg_write_file_worktree's own final-component unlink handles all
+   three. A directory: expendable iff it is itself ignored, OR the
+   Phase 79/79b recursive scan (untracked_overwrite_dir_has_nonignored, the
+   SAME function sg_untracked_would_be_overwritten uses, with `idx`
+   threaded through as described above) finds no non-ignored, non-exempt
+   file anywhere inside it -- if expendable, the WHOLE subtree is removed
+   (lstat-based: unlink every file and symlink, RMDIR bottom-up, never
+   opendir/stat through a symlink, so an ignored symlink inside the removed
+   directory never touches whatever it points at); otherwise -1, nothing
+   removed.
+
+   A removal failure partway through (e.g. EACCES) returns -1, leaving
+   whatever could not be removed -- same no-rollback convention as every
+   other apply-side write in this project.
+
+   Returns 0 if relpath is now safe to hand to sg_write_file_worktree, -1 if
+   some blocker could not be safely cleared. */
+int sg_worktree_clear_write_path(sg_ignore *ig, const char *repo_root, const char *relpath,
+                                 const sg_index *idx);
 
 /* Rewrites the on-disk index to exactly match tree_id (sha1 + mode of every
    path), WITHOUT touching the working directory or HEAD/refs -- the "only
