@@ -218,3 +218,234 @@ updates), falling back to the pre-existing generic message otherwise. The
 3-way merge path's own `sg_ref_move_head` call is UNCHANGED (still the
 generic message) -- best-effort per Phase 77's own spec, not required to
 match git's exact multi-line wording.
+
+## Phase 79: `sg merge` refuses a merge that would overwrite an untracked file
+
+`cmd_merge.c` calls `sg_untracked_would_be_overwritten` (`include/sg/apply.h`)
+on all THREE of its write paths -- 3-way, fast-forward, and the unborn-HEAD
+fast-forward -- before anything is written. Every rule below was measured
+against git 2.55.0.
+
+- **There are TWO wordings, not one.** An ordinary merge (3-way AND
+  fast-forward) gets the plural list form; an UNBORN HEAD gets a genuinely
+  different sentence (`Untracked working tree file '<path>' would be
+  overwritten by merge.`, singular, quoted path, trailing period, no
+  "Please move or remove"/"Aborting" lines). A merge that happens to collide
+  on exactly ONE path still gets the PLURAL form -- so the wording is
+  selected by the CALL SITE and must never be inferred from the collision
+  count.
+  WARNING: **the unborn form names only the FIRST colliding path even when
+  several collide** (measured: three collisions, git names `f0.txt` alone and
+  exits 128). Printing all of them would be sg inventing output git does not
+  produce.
+- **Paths in the plural list are printed RAW** -- not through `sg_quote_path`
+  or `sg_quote_path_delimited`. Measured: git prints a space, a double quote
+  and UTF-8 verbatim there. Every OTHER path-printing site in `cmd_merge.c`
+  quotes, so this one reads like an oversight and is not;
+  `docs/RULES-paths-strings.md` carries the same warning from the other
+  direction.
+- WARNING (cold-read correction to this entry's own earlier text, which
+  claimed the opposite of both): **the list is NEITHER sorted NOR
+  de-duplicated by `sg_untracked_would_be_overwritten` itself.** Measured
+  against git 2.55.0: two candidates blocked by the SAME ancestor (`topic`
+  adds `a/b.txt` and `a/c.txt`, local untracked file `a`) print that
+  ancestor's name TWICE, not once --
+  `\ta\n\ta\n` -- so `sg_untracked_would_be_overwritten`'s own
+  de-duplication loop was wrong and has been removed. And a plain
+  alphabetical sort of the REPORTED names is also wrong: with `topic` adding
+  both `a.txt` and `a/x.txt`, and the working tree holding an untracked
+  `a.txt` (self-collision) AND an untracked file `a` (blocks `a/x.txt`),
+  git prints `\ta.txt\n\ta\n` -- `a.txt` before `a`, the reverse of what
+  `strcmp("a", "a.txt")` would sort them as. The list order is CANDIDATE
+  order (the order `sg_tree_flatten` walks `theirs_tree`, i.e. git tree
+  order: `.` 0x2E sorts before `/` 0x2F, so `a.txt` sorts before `a/x.txt`
+  as a tree entry even though `a` alone -- the blocker's OWN name, not the
+  candidate that lost to it -- would sort after `a.txt` as a plain string),
+  never the byte order of the reported blocker names. Both of these apply
+  identically to the directory bucket added by Phase 79b below.
+- **An ignored file is NOT a collision: git silently overwrites it**
+  (measured for a committed `.gitignore`, an uncommitted one, an ignored
+  DIRECTORY, and `.git/info/exclude` -- all four merge cleanly). So this
+  check cannot be built out of `lstat` alone, which is what
+  `safety/stash.c`'s older pre-flight (`sg_stash_apply`) does -- **do not
+  "converge" the two, they answer different questions.** The same applies to
+  an ignored file BLOCKING a directory the merge must create.
+- **A blocking ancestor is reported by ITS OWN name**: an untracked file at
+  `dir` where the merge must create `dir/deep.txt` makes git print `dir`, and
+  `a` blocking `a/b/c.txt` prints `a`. But a case- or normalization-aliased
+  on-disk name is reported by the CALLER's spelling (`new.txt` even though
+  `NEW.TXT` is what is on disk) -- which is why the check `lstat`s the
+  candidate path and lets the filesystem answer the folding question instead
+  of string-matching `sg_status_list_untracked`'s output. An exact compare
+  against that list misses the aliased row, and that row is data loss on a
+  macOS/APFS working tree.
+- **An untracked EMPTY directory exactly at the path is not a collision**
+  (git removes it), and an untracked directory holding unrelated files is not
+  one either. Both are controls: a rule that treats "a directory is in the
+  way" as a collision passes the blocker fixtures and fails these two.
+- **`sg reset --hard` and `sg undo` must NOT get this check.** Measured: real
+  git's `reset --hard` overwrites an untracked file without a word (exit 0),
+  so sg already agrees with git there. That is why the check is a separate
+  opt-in function instead of living inside `sg_safe_apply_tree`, which
+  `sg switch`/`sg reset --hard`/`sg undo` all share. `sg switch`, `sg rebase`,
+  `sg cherry-pick` and `sg revert` DO diverge (git refuses, sg overwrites) and
+  are recorded as residuals, not fixed here.
+- Ordering: the check runs AFTER `sg_require_clean_workdir` and AFTER
+  `sg_cli_write_orig_head`. Measured, git writes `ORIG_HEAD` even when it then
+  refuses -- for both the local-changes refusal and this one -- and a STAGED
+  change wins over an untracked collision when both apply. Pinned in
+  interop's `phase79d P-staged` row (Phase 79 round 3): a staged change to a
+  tracked path the merge does not even touch still makes both git and sg
+  refuse on the clean-workdir wording, never the untracked one.
+  WARNING: **an UNSTAGED change to that same untouched path diverges, and
+  this is PRE-EXISTING, not a new bug.** Measured: git's own dirty check for
+  a merge only cares about paths the merge is actually going to write, so an
+  unstaged edit to an unrelated tracked path does not trip it, and git falls
+  through to report the untracked collision instead (its own wording, naming
+  the untracked file). sg's `sg_require_clean_workdir` treats ANY unstaged
+  change anywhere in the working directory as disqualifying and refuses
+  before the untracked-overwrite check ever runs, so sg reports the
+  clean-workdir wording where git reports the untracked one. Pinned as
+  `phase79d P-unstaged` (both sides' literal first line, plus the
+  precondition that the two wordings differ).
+
+## Phase 79b: the DIRECTORY bucket of the same check
+
+**Git has FOUR wordings here in total, not two.** Phase 79 above only
+implemented the two FILE-bucket ones (a blocking FILE, or an ancestor
+component that is a FILE). When the merge wants to write a FILE at a path P
+where P itself is currently a NON-EMPTY untracked DIRECTORY, git uses a
+DIFFERENT sentence, with its own ordinary/unborn pair, and
+`sg_untracked_would_be_overwritten` now returns this as a SEPARATE bucket
+(`out_dirs`/`out_dirs_count`, alongside `out_files`/`out_files_count`) so
+`report_untracked_overwrite` can print the right wording for each.
+
+- **This is a DIFFERENT shape from Phase 79's own row #6/#7/#9/#10**, which
+  are all about a directory sitting as an ANCESTOR of the candidate path
+  (`dir` blocking `dir/deep.txt`) -- those remain non-blocking for an
+  unrelated/empty directory, unchanged by this phase. Phase 79b is about P
+  ITSELF, when P is the exact path the merge wants to create as a file, and
+  that path currently holds a directory.
+- **A non-empty directory is only a collision if it recursively contains at
+  least one file that is not ignored** -- measured: a directory whose entire
+  contents (at any depth) are ignored merges through cleanly, and git's own
+  answer there is not merely "no refusal", it REPLACES the local directory
+  (and its ignored contents) entirely with theirs' file. An ignored
+  SUBdirectory found during the scan is not descended into (its contents
+  cannot surface through an ignored subtree). A symlink is treated as a file
+  (never descended into).
+- **The two ordinary wordings both end in a BLANK LINE before `Aborting`**,
+  present even when there is no file-bucket section afterward:
+  ```
+  error: Updating the following directories would lose untracked files in them:
+  \t<path>
+  <blank line>
+  Aborting
+  ```
+  (plus `Merge with strategy ort failed.` for a 3-way, matching the file
+  bucket's own rule).
+- **The unborn wording has NO trailing period** (the opposite of the file
+  bucket's unborn form, which does), and is followed by git's own
+  `fatal: read-tree failed` -- a second line sg deliberately does NOT
+  reproduce, same treatment the file bucket's unborn case already gets:
+  ```
+  error: Updating '<path>' would lose untracked files in it
+  fatal: read-tree failed
+  ```
+  The "only the first colliding path" rule for the unborn wording (Phase
+  79's own WARNING) holds for this bucket too: first assumed by symmetry,
+  then measured in round 2 (U2 in `docs/DESIGN.md`'s Phase 79c oracle
+  table: two untracked directories under an unborn HEAD, git names only the
+  first). Not pinned in interop: the single-collision unborn rows only
+  confirm the wording and cannot tell "first only" from "all of them".
+- **When BOTH buckets fire in the same merge**, measured byte-for-byte: the
+  directory section prints first (ending in its own blank line), then the
+  file section (its own independent `sg: ` line), then exactly ONE
+  `Aborting`/strategy-failure pair for the WHOLE refusal, never one per
+  bucket.
+- **Phase 79c round 2 correction**: for the UNBORN-HEAD case with both
+  buckets non-empty, `report_untracked_overwrite` no longer picks "the
+  directory wording, always" -- that was an unmeasured assumption by
+  symmetry, and it was WRONG. Measured against git 2.55.0 (U1b in the
+  Phase 79c oracle, `docs/DESIGN.md`'s Phase 79c section): git reports
+  exactly the FIRST collision in CANDIDATE order across BOTH buckets, using
+  that collision's own wording -- a topic that adds a file-colliding path
+  before a directory-colliding one in candidate order refuses on the FILE
+  wording, not the directory one. `sg_untracked_would_be_overwritten`'s
+  `out_first_is_dir` out-param (`include/sg/apply.h`) is how the caller
+  learns which bucket's `[0]` entry is the actually-first collision.
+- **A path can only ever land in one bucket**, since X (the resolved
+  blocker) is either a file/blocker-file or a non-empty directory, never
+  both at the same time.
+- Cold-read correction shared with Phase 79 above: neither bucket is sorted
+  or de-duplicated by `sg_untracked_would_be_overwritten` itself -- see that
+  section's own WARNING for the measured counterexamples (a blocker printed
+  twice, and candidate order beating a byte sort of the reported names).
+  Both interop rows for that correction happen to use the FILE bucket, since
+  that is where the decisive fixture (`a.txt` vs `a/x.txt`) was found, but
+  the underlying function makes no bucket-specific exception -- the
+  directory bucket's own multi-entry row (`phase79b B2`) is pinned
+  separately to confirm the same non-sorting behavior there.
+- **Known residual, NOT this phase's responsibility to fix**: once the
+  pre-flight correctly determines "no collision" for a non-empty,
+  all-ignored directory, the underlying write (`sg_write_file_mkdirs`'s own
+  `fopen()` call) still fails on a path that is currently a directory -- the
+  SAME shape as Phase 79's own row #7 (empty directory) and row #10 (ignored
+  blocking file) residuals. Pinned in interop as `phase79b B7`, asserting
+  only that the pre-flight
+  itself got the "no collision" answer right, not that the merge as a whole
+  succeeds.
+
+## Phase 79c round 2: further residuals, no behavior change
+
+Same "not this phase's responsibility" class as the B7/row7/row10 residuals
+above, measured against git 2.55.0 and pinned on both sides in interop's
+`phase79c` group (S-numbering matches the oracle table in `docs/DESIGN.md`'s
+Phase 79c section).
+
+- **S3: a candidate directory holding only EMPTY subdirectories (no files at
+  all, not even ignored ones)** is the SAME shape as row #7/row #10/B7 --
+  the pre-flight correctly says "no collision" (there is nothing, ignored or
+  not, anywhere in the recursive scan), but `sg_write_file_mkdirs`'s
+  `fopen()` still cannot write a file at a path that is currently a
+  directory. git replaces the whole thing cleanly (rc 0); sg prints
+  `sg: failed to write "new.txt"`, exits 1, and the directory survives.
+  Pinned as `phase79c S3`.
+- **S4a/S4d: a candidate directory holding an ignored file plus JUNK that
+  merely LOOKS like a `.git` entry (not a valid repository -- either a
+  `.git/` directory containing only a `HEAD` file with no object store, or a
+  `.git` FILE pointing at a nonexistent gitdir)** -- git recognizes this is
+  not an actual repository and replaces the whole directory, junk included
+  (rc 0). sg's recursive scan has no "is this actually a git repository"
+  check at all: it just walks the directory's real on-disk contents and
+  finds the junk `.git/HEAD` (or the `.git` file itself) is not ignored, so
+  it reports a directory-bucket collision. This is the SAFE direction
+  (over-refusal, not the data-loss direction a false "no collision" would
+  be), and is deliberately NOT "fixed" to recognize valid-vs-junk `.git`
+  entries -- doing so would only trade this residual for the S3 write
+  failure above once the pre-flight agreed "no collision" (the directory
+  still can't be written through). Pinned as `phase79c S4a`/`phase79c S4d`.
+  Contrast with S4b/S4c (a REAL nested git repository, with or without a
+  commit): git refuses there too, matching sg -- the divergence is
+  specifically about JUNK that resembles `.git` without being a working
+  repository, not about nested repositories in general.
+- **S5a/b/c: a SYMLINK sitting exactly at the candidate path** (pointing at
+  an empty directory, a non-empty directory, or nowhere at all) -- not a
+  residual, a confirmation that the already-documented symlink rule holds:
+  `sg_untracked_would_be_overwritten` treats a symlink as a FILE, never
+  descending into whatever it points at, so both sides refuse via the FILE
+  wording naming the symlink itself, and the symlink (and its target, if
+  any) survive untouched. Pinned as `phase79c S5a`/`S5b`/`S5c`.
+- **S2: a scan path longer than the OS path limit** (a ~600-level chain,
+  measured on macOS where `PATH_MAX` is 1024). Both sides refuse with a
+  `cannot lstat '<path>': File name too long` line and change nothing, but
+  they are NOT byte-identical, and this is accepted: git first prints a
+  cascade of `warning: unable to access ...` / `warning: could not open
+  directory ...` lines, which sg does not reproduce; and the two name a
+  DIFFERENT path, because git works with paths relative to the work tree
+  while sg's scan builds absolute paths, so sg hits the limit sooner (the
+  temporary repo's own prefix counts against it -- measured 951 bytes of
+  path for sg vs 1025 for git in the same fixture). Not pinned in
+  interop (the depth depends on the platform's `PATH_MAX` and on the repo's
+  absolute location); `test_deep_recursion_stack_safety` covers only "fails
+  closed, never crashes".

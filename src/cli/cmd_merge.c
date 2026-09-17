@@ -25,6 +25,7 @@
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,191 @@ static void print_fast_forward_report(const char *git_dir, const char *repo_root
     sg_diff_list_free(&list);
 }
 
+/* Phase 79 (Phase 79b added the directory bucket). Prints git's own
+   untracked-overwrite refusal for BOTH buckets sg_untracked_would_be_
+   overwritten can report -- a blocking FILE (`file_collisions`) and a
+   blocking non-empty DIRECTORY (`dir_collisions`, Phase 79b) -- and frees
+   both. There are FOUR wordings total, measured against git 2.55.0 (not
+   two: the directory bucket has its own ordinary/unborn pair, distinct
+   from the file bucket's):
+
+     file, plural (ordinary merge, fast-forward and 3-way):
+       error: The following untracked working tree files would be overwritten by merge:
+       \t<path>
+       \t<path>
+       Please move or remove them before you merge.
+
+     file, singular (unborn HEAD; `file_collisions` has exactly one entry):
+       error: Untracked working tree file '<path>' would be overwritten by merge.
+
+     dir, plural (ordinary merge, fast-forward and 3-way):
+       error: Updating the following directories would lose untracked files in them:
+       \t<path>
+       \t<path>
+       <blank line>
+
+     dir, singular (unborn HEAD; `dir_collisions` has exactly one entry):
+       error: Updating '<path>' would lose untracked files in it
+       fatal: read-tree failed
+
+   git's own "error: " becomes "sg: " on every one of those first lines
+   (each is printed as its own independent line, so when BOTH buckets are
+   non-empty in the ordinary shape, BOTH lines get their own "sg: "), the
+   same substitution this project already makes for other borrowed wording.
+   "fatal: read-tree failed" leaks git's own internal plumbing name and is
+   deliberately NOT reproduced by sg, same treatment as the file bucket's
+   unborn case already gets (this project has no read-tree of its own to
+   leak).
+
+   Ordinary shape, both buckets combined (measured byte-for-byte): the
+   directory section (if non-empty) prints first, ending in a blank line
+   -- present EVEN when there is no file section afterward -- then the file
+   section (if non-empty), then exactly ONE "Aborting" line, then
+   "Merge with strategy ort failed." if `three_way`. There is never more
+   than one "Aborting"/strategy-failure pair even when both buckets fire.
+
+   Unborn shape, Phase 79c (round 2) correction: when BOTH buckets are
+   non-empty, git does NOT always pick the directory wording -- it reports
+   exactly ONE collision, the FIRST one in CANDIDATE order across BOTH
+   kinds, using that collision's own wording. Measured against git 2.55.0
+   (U1b in the Phase 79c oracle): topic adds "a" then "z" to an unborn HEAD;
+   locally "a" is an untracked FILE and "z" is a non-empty untracked
+   DIRECTORY. Candidate order puts "a" first, and git refuses on the FILE
+   wording naming "a" -- NOT the directory wording naming "z", which is
+   what an earlier "directory always wins" assumption in this comment used
+   to (wrongly) predict. `first_is_dir` (from
+   sg_untracked_would_be_overwritten's own out-param of the same name) is
+   how the caller tells this function which bucket's [0] entry is the
+   actually-first one; it is meaningless when `unborn` is 0.
+   WARNING: **the unborn singular forms name only the FIRST colliding entry
+   of their own bucket even when several collide** (measured for the file
+   bucket: three collisions, git names `f0.txt` alone and exits 128;
+   assumed by symmetry, not separately measured, for the directory bucket).
+   Printing all of them would be sg inventing output git does not produce.
+
+   Paths are printed RAW in both buckets, through neither sg_quote_path nor
+   sg_quote_path_delimited -- measured, git does not quote them here even for
+   a space, a double quote, or UTF-8, and this project's goal is byte
+   compatibility with git's own wording. Every OTHER path-printing site in
+   this file quotes; do not "fix" this one to match them.
+
+   `unborn` selects the singular wordings (used only by the unborn-HEAD
+   fast-forward call site, never inferred from either bucket's count == 1
+   alone -- an ordinary merge that happens to collide on exactly one path
+   still uses the PLURAL wording, just with one \t line). `three_way`
+   selects whether "Merge with strategy ort failed." is appended after
+   "Aborting" in the ordinary shape (measured: present for a 3-way merge,
+   absent for a fast-forward; mutually exclusive with `unborn` in practice,
+   kept as a separate parameter rather than a combined enum so a future
+   caller cannot accidentally request an unreachable "unborn 3-way"
+   combination by picking the wrong enum value).
+
+   Exit code is 1 in every shape (git: 2 for 3-way, 1 for fast-forward, 128
+   for unborn HEAD) -- this project's standing "exit codes are only ever 0 or
+   1" convention (CLAUDE.md's Code conventions), the same shape as deliberate
+   divergence #3. Returns 1, always. */
+/* Phase 79c (F2): prints a truthful reason for a -1 from
+   sg_untracked_would_be_overwritten, instead of the blanket "sg: out of
+   memory" every call site used to print regardless of cause. Measured
+   against git 2.55.0 (S6 in the Phase 79c oracle): a chmod-000
+   subdirectory makes git print
+     warning: could not open directory 'new.txt/locked/': Permission denied
+     fatal: cannot opendir 'new.txt/locked': Permission denied
+   -- git's "warning:"/"fatal:" both become "sg: " (this project's own
+   substitution, same as report_untracked_overwrite's "error:" -> "sg: ").
+   git's own opendir warning ends its path in a trailing slash; its fatal
+   line does not -- reproduced literally rather than "fixed" to match. There
+   is no measured git wording for a bare readdir() failure reached after
+   opendir already succeeded (a shape git's own code does not appear to hit
+   under any of this oracle's fixtures); "cannot readdir" is this project's
+   own choice of verb, not a borrowed one. SG_UNTRACKED_ERR_PATH_TOO_LONG
+   (a path that overflowed the SG_PATH_MAX join bound mid-scan) is reported
+   as a "cannot lstat" line with ENAMETOOLONG's own strerror text, on the
+   theory that the join failure stands in for "the lstat that would have
+   come next could not even be attempted" -- also not a git-measured
+   wording, recorded as a residual (see docs/RULES-merge.md's Phase 79c
+   section: git's own S2 answer here is a multi-line warning cascade this
+   project does not reproduce). SG_UNTRACKED_ERR_ALLOC (a real allocation
+   failure) is the only kind that still prints "sg: out of memory". */
+static void print_untracked_scan_error(const sg_untracked_overwrite_error *err)
+{
+    const char *path = err->path != NULL ? err->path : "?";
+
+    switch (err->kind) {
+    case SG_UNTRACKED_ERR_OPENDIR:
+        fprintf(stderr, "sg: warning: could not open directory '%s/': %s\n", path,
+               strerror(err->saved_errno));
+        fprintf(stderr, "sg: cannot opendir '%s': %s\n", path, strerror(err->saved_errno));
+        break;
+    case SG_UNTRACKED_ERR_READDIR:
+        fprintf(stderr, "sg: cannot readdir '%s': %s\n", path, strerror(err->saved_errno));
+        break;
+    case SG_UNTRACKED_ERR_LSTAT:
+        fprintf(stderr, "sg: cannot lstat '%s': %s\n", path, strerror(err->saved_errno));
+        break;
+    case SG_UNTRACKED_ERR_PATH_TOO_LONG:
+        fprintf(stderr, "sg: cannot lstat '%s': %s\n", path, strerror(ENAMETOOLONG));
+        break;
+    case SG_UNTRACKED_ERR_ALLOC:
+    case SG_UNTRACKED_ERR_NONE:
+    default:
+        fprintf(stderr, "sg: out of memory\n");
+        break;
+    }
+}
+
+static int report_untracked_overwrite(char **dir_collisions, size_t dir_count,
+                                      char **file_collisions, size_t file_count, int unborn,
+                                      int first_is_dir, int three_way)
+{
+    size_t i;
+
+    if (unborn) {
+        /* Phase 79c (F4): first_is_dir names which bucket's [0] entry is
+           the actually-first collision in candidate order -- NOT "prefer
+           the directory bucket whenever it is non-empty", see this
+           function's own doc comment above. */
+        if (first_is_dir && dir_count > 0) {
+            fprintf(stderr, "sg: Updating '%s' would lose untracked files in it\n",
+                   dir_collisions[0]);
+        } else if (file_count > 0) {
+            fprintf(stderr,
+                   "sg: Untracked working tree file '%s' would be overwritten by merge.\n",
+                   file_collisions[0]);
+        } else {
+            fprintf(stderr, "sg: Updating '%s' would lose untracked files in it\n",
+                   dir_collisions[0]);
+        }
+    } else {
+        if (dir_count > 0) {
+            fprintf(stderr,
+                   "sg: Updating the following directories would lose untracked files in "
+                   "them:\n");
+            for (i = 0; i < dir_count; i++)
+                fprintf(stderr, "\t%s\n", dir_collisions[i]);
+            fprintf(stderr, "\n");
+        }
+        if (file_count > 0) {
+            fprintf(stderr,
+                   "sg: The following untracked working tree files would be overwritten by "
+                   "merge:\n");
+            for (i = 0; i < file_count; i++)
+                fprintf(stderr, "\t%s\n", file_collisions[i]);
+            fprintf(stderr, "Please move or remove them before you merge.\n");
+        }
+        fprintf(stderr, "Aborting\n");
+        if (three_way)
+            fprintf(stderr, "Merge with strategy ort failed.\n");
+    }
+    for (i = 0; i < dir_count; i++)
+        free(dir_collisions[i]);
+    free(dir_collisions);
+    for (i = 0; i < file_count; i++)
+        free(file_collisions[i]);
+    free(file_collisions);
+    return 1;
+}
+
 /* current_branch may be NULL (detached HEAD): sg_ref_move_head then moves
    HEAD itself instead of a branch, leaving every branch ref untouched, same
    as real git measured against a detached fast-forward merge.
@@ -99,6 +285,81 @@ static int do_fast_forward(const char *git_dir, const char *repo_root, const cha
     char *label;
     int apply_rc;
     char *reflog_msg;
+
+    /* Phase 79: must run BEFORE sg_safe_apply_tree, so a refusal here writes
+       and snapshots nothing. Candidate set is every path theirs_tree adds
+       that the current index does not already have -- for the unborn-HEAD
+       call (ours_commit == NULL) the index is empty (sg_require_clean_workdir
+       already gated on that, since a non-empty index would show as staged
+       changes against the unborn HEAD's virtual empty tree), so this reduces
+       to exactly "every path in theirs_tree", matching the unborn case's own
+       spec. */
+    {
+        sg_flat_list theirs_flat;
+        sg_index idx;
+        char bad_path[SG_PATH_MAX];
+        char **candidates = NULL;
+        size_t candidate_count = 0;
+        size_t i;
+
+        if (sg_tree_flatten(git_dir, theirs_tree, &theirs_flat, bad_path) != 0) {
+            fprintf(stderr, "sg: failed to read target tree\n");
+            return 1;
+        }
+        if (sg_index_read(git_dir, &idx) != 0) {
+            fprintf(stderr, "sg: failed to read index (corrupt?)\n");
+            sg_flat_list_free(&theirs_flat);
+            return 1;
+        }
+
+        candidates = malloc(theirs_flat.count * sizeof(*candidates));
+        if (theirs_flat.count > 0 && candidates == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            sg_index_free(&idx);
+            sg_flat_list_free(&theirs_flat);
+            return 1;
+        }
+        for (i = 0; i < theirs_flat.count; i++) {
+            if (sg_index_find(&idx, theirs_flat.entries[i].path) < 0)
+                candidates[candidate_count++] = theirs_flat.entries[i].path;
+        }
+
+        if (candidate_count > 0) {
+            char **file_collisions = NULL;
+            size_t file_collision_count = 0;
+            char **dir_collisions = NULL;
+            size_t dir_collision_count = 0;
+            int first_is_dir = 0;
+            sg_untracked_overwrite_error scan_err;
+            int rc;
+
+            rc = sg_untracked_would_be_overwritten(git_dir, repo_root, &idx,
+                                                   (const char *const *)candidates,
+                                                   candidate_count, &file_collisions,
+                                                   &file_collision_count, &dir_collisions,
+                                                   &dir_collision_count, &first_is_dir,
+                                                   &scan_err);
+            sg_index_free(&idx);
+            if (rc != 0) {
+                print_untracked_scan_error(&scan_err);
+                sg_untracked_overwrite_error_free(&scan_err);
+                free(candidates);
+                sg_flat_list_free(&theirs_flat);
+                return 1;
+            }
+            if (file_collision_count > 0 || dir_collision_count > 0) {
+                free(candidates);
+                sg_flat_list_free(&theirs_flat);
+                return report_untracked_overwrite(dir_collisions, dir_collision_count,
+                                                  file_collisions, file_collision_count,
+                                                  ours_commit == NULL, first_is_dir, 0);
+            }
+        } else {
+            sg_index_free(&idx);
+        }
+        free(candidates);
+        sg_flat_list_free(&theirs_flat);
+    }
 
     /* Phase 65: heap, not a fixed 300-byte buffer -- this is a snapshot
        label (sg's own feature, no real-git oracle), but a truncated one
@@ -315,6 +576,79 @@ static int do_three_way_merge(const char *git_dir, const char *repo_root, const 
                        SG_SIMILARITY_DEFAULT, &result) != 0) {
         fprintf(stderr, "sg: an error occurred while merging\n");
         return 1;
+    }
+
+    /* Phase 79: pre-flight, after sg_merge_trees and before
+       sg_merge_result_apply -- mirrors sg_stash_apply's own pre-flight
+       (safety/stash.c). Candidate set: every entry the merge result will
+       WRITE that ours does not already have. !ours_present rules out a path
+       ours already has (not being newly created); !deleted rules out an
+       entry the merge result removes; !conflict_no_workdir_file rules out
+       rename/rename-1to2's original-path stage-1-only entry, which writes
+       nothing to the working tree at all (see sg/merge.h). A CONFLICTED
+       entry at a path ours lacks (e.g. a modify/delete conflict where ours
+       deleted the file) is deliberately included by this condition, not
+       excluded: sg_merge_result_apply still writes theirs' surviving content
+       there. */
+    {
+        sg_index conflict_idx;
+        char **candidates = NULL;
+        size_t candidate_count = 0;
+        size_t ci;
+
+        if (sg_index_read(git_dir, &conflict_idx) != 0) {
+            fprintf(stderr, "sg: failed to read index (corrupt?)\n");
+            sg_merge_result_free(&result);
+            return 1;
+        }
+        candidates = malloc(result.count * sizeof(*candidates));
+        if (result.count > 0 && candidates == NULL) {
+            fprintf(stderr, "sg: out of memory\n");
+            sg_index_free(&conflict_idx);
+            sg_merge_result_free(&result);
+            return 1;
+        }
+        for (ci = 0; ci < result.count; ci++) {
+            sg_merge_result_entry *e = &result.entries[ci];
+
+            if (!e->ours_present && !e->deleted && !e->conflict_no_workdir_file)
+                candidates[candidate_count++] = e->path;
+        }
+        if (candidate_count > 0) {
+            char **file_collisions = NULL;
+            size_t file_collision_count = 0;
+            char **dir_collisions = NULL;
+            size_t dir_collision_count = 0;
+            int first_is_dir = 0;
+            sg_untracked_overwrite_error scan_err;
+            int urc;
+
+            urc = sg_untracked_would_be_overwritten(git_dir, repo_root, &conflict_idx,
+                                                    (const char *const *)candidates,
+                                                    candidate_count, &file_collisions,
+                                                    &file_collision_count, &dir_collisions,
+                                                    &dir_collision_count, &first_is_dir,
+                                                    &scan_err);
+            sg_index_free(&conflict_idx);
+            if (urc != 0) {
+                print_untracked_scan_error(&scan_err);
+                sg_untracked_overwrite_error_free(&scan_err);
+                free(candidates);
+                sg_merge_result_free(&result);
+                return 1;
+            }
+            if (file_collision_count > 0 || dir_collision_count > 0) {
+                free(candidates);
+                sg_merge_result_free(&result);
+                /* Not unborn (3-way always has HEAD), so first_is_dir is
+                   irrelevant here -- passed as 0 for clarity. */
+                return report_untracked_overwrite(dir_collisions, dir_collision_count,
+                                                  file_collisions, file_collision_count, 0, 0, 1);
+            }
+        } else {
+            sg_index_free(&conflict_idx);
+        }
+        free(candidates);
     }
 
     /* Materializes the merge result into the working tree and a fresh

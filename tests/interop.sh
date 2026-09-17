@@ -24504,6 +24504,1495 @@ else
     skip "phase78 (undeletable ORIG_HEAD): sg's HEAD still landed where git's did (the reset itself happened)"
 fi
 
+# --- Phase 79: sg merge refuses when the merge would overwrite an
+# untracked working tree file (docs/RULES-merge.md, include/sg/apply.h).
+# Two wordings, never compared against each other with cmp -- each row is a
+# git-side PRECONDITION (git really does refuse / really does merge,
+# asserted on git's own output) plus a SEPARATE sg-side literal assertion
+# of sg's own exact line, same shape this project uses everywhere sg's text
+# is deliberately its own (e.g. phase41's ours-label pins). ---
+
+p79_mk_repo_ff() {
+    # $1 = target dir. master (f.txt) -> topic (descendant, adds new.txt) --
+    # a fast-forward fixture.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+p79_mk_repo_3way() {
+    # $1 = target dir. master and topic diverge (master gets its own commit
+    # on f AFTER branching topic off) -- a genuine 3-way merge fixture,
+    # topic still just adds new.txt.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master \
+        && printf '2\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m c2m) > /dev/null 2>&1
+}
+
+p79_mk_repo_unborn() {
+    # $1 = target dir. Built the same PROVEN way phase50's own
+    # p50_unborn_build does (line ~14629 of this file): commit once on
+    # master to seed topic, then rewind master back to genuinely unborn by
+    # dropping its ref, rewriting HEAD, and dropping the index and the
+    # seed file from the working tree -- topic keeps its own commit, which
+    # adds new.txt. measured: an in-repo `git checkout -b topic` + a raw
+    # `git symbolic-ref HEAD refs/heads/master` rewrite (tried first, since
+    # it looked simpler) does NOT reproduce git's own "genuinely unborn
+    # HEAD" merge codepath -- it fast-forwards SILENTLY (exit 0) without
+    # even writing new.txt, unlike a real fresh, unborn repository. This
+    # construction (rm the ref + rewrite HEAD directly, not symbolic-ref)
+    # is what reproduces git's actual exit 128.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'seed\n' > seed.txt && git add seed.txt \
+        && GIT_AUTHOR_DATE="1699999900 +0000" GIT_COMMITTER_DATE="1699999900 +0000" git commit -q -m seed \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+    (cd "$1" && rm -f .git/refs/heads/master \
+        && printf 'ref: refs/heads/master\n' > .git/HEAD \
+        && rm -f .git/index seed.txt) > /dev/null 2>&1
+}
+
+# $1 = sg dir, $2 = git dir, $3 = builder function name -- builds once with
+# git ($2), then cp -R's an independent copy for sg ($1), same convention
+# as p77_mk_repo/p78's own setup pairs.
+p79_setup() {
+    "$3" "$2"
+    rm -rf "$1"
+    cp -R "$2" "$1"
+}
+
+# Prints git's exact plural refusal (measured, docs/RULES-merge.md); $1 =
+# "ff" or "3way" (controls the trailing "Merge with strategy ort failed."
+# line, present only for 3way), remaining args = the colliding paths, RAW,
+# in the exact order/count the caller wants printed (the caller is
+# responsible for handing them pre-sorted -- this helper does not sort).
+p79_expect_plural() {
+    p79e_kind="$1"
+    shift
+    printf 'sg: The following untracked working tree files would be overwritten by merge:\n'
+    for p79e_p in "$@"; do
+        printf '\t%s\n' "$p79e_p"
+    done
+    printf 'Please move or remove them before you merge.\n'
+    printf 'Aborting\n'
+    if [ "$p79e_kind" = "3way" ]; then
+        printf 'Merge with strategy ort failed.\n'
+    fi
+}
+
+p79_expect_singular() {
+    printf "sg: Untracked working tree file '%s' would be overwritten by merge.\n" "$1"
+}
+
+# ---- row #1: plain untracked collision, both shapes ----
+
+P79_SG1="$WORKDIR/phase79_sg1"; P79_GIT1="$WORKDIR/phase79_git1"
+p79_setup "$P79_SG1" "$P79_GIT1" p79_mk_repo_ff
+printf 'user-data\n' > "$P79_GIT1/new.txt"
+printf 'user-data\n' > "$P79_SG1/new.txt"
+(cd "$P79_GIT1" && LC_ALL=C git merge topic) > "$WORKDIR/p79_git1.out" 2> "$WORKDIR/p79_git1.err"
+P79_GIT1_RC=$?
+(cd "$P79_SG1" && "$SG" merge topic) > "$WORKDIR/p79_sg1.out" 2> "$WORKDIR/p79_sg1.err"
+P79_SG1_RC=$?
+check "phase79 row1 (ff) oracle: precondition -- git refuses (exit 1), new.txt untouched" \
+    sh -c "test '$P79_GIT1_RC' -eq 1 -a \"\$(cat '$P79_GIT1/new.txt')\" = user-data"
+check "phase79 row1 (ff): sg refuses too (exit 1)" \
+    test "$P79_SG1_RC" -eq 1
+p79_expect_plural ff new.txt > "$WORKDIR/p79_expected1.txt"
+check "phase79 row1 (ff): sg's stderr matches git's own wording exactly (own literal, not cmp'd against git's)" \
+    test "$(cat "$WORKDIR/p79_sg1.err")" = "$(cat "$WORKDIR/p79_expected1.txt")"
+check "phase79 row1 (ff): new.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79_SG1/new.txt")" = user-data
+
+P79_SG1B="$WORKDIR/phase79_sg1b"; P79_GIT1B="$WORKDIR/phase79_git1b"
+p79_setup "$P79_SG1B" "$P79_GIT1B" p79_mk_repo_3way
+printf 'user-data\n' > "$P79_GIT1B/new.txt"
+printf 'user-data\n' > "$P79_SG1B/new.txt"
+(cd "$P79_GIT1B" && LC_ALL=C git merge topic) > "$WORKDIR/p79_git1b.out" 2> "$WORKDIR/p79_git1b.err"
+P79_GIT1B_RC=$?
+(cd "$P79_SG1B" && "$SG" merge topic) > "$WORKDIR/p79_sg1b.out" 2> "$WORKDIR/p79_sg1b.err"
+P79_SG1B_RC=$?
+check "phase79 row1 (3-way) oracle: precondition -- git refuses (exit 2), new.txt untouched" \
+    sh -c "test '$P79_GIT1B_RC' -eq 2 -a \"\$(cat '$P79_GIT1B/new.txt')\" = user-data"
+check "phase79 row1 (3-way): sg refuses too (exit 1, this project's own exit-code convention)" \
+    test "$P79_SG1B_RC" -eq 1
+p79_expect_plural 3way new.txt > "$WORKDIR/p79_expected1b.txt"
+check "phase79 row1 (3-way): sg's stderr matches git's own wording exactly, including the trailing strategy line" \
+    test "$(cat "$WORKDIR/p79_sg1b.err")" = "$(cat "$WORKDIR/p79_expected1b.txt")"
+check "phase79 row1 (3-way): new.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79_SG1B/new.txt")" = user-data
+check "phase79 row1 (3-way): no MERGE_HEAD was written -- the refusal is BEFORE the merge is recorded" \
+    test ! -e "$P79_SG1B/.git/MERGE_HEAD"
+
+# ---- row #2: identical content still refuses ----
+
+P79_SG2="$WORKDIR/phase79_sg2"; P79_GIT2="$WORKDIR/phase79_git2"
+p79_setup "$P79_SG2" "$P79_GIT2" p79_mk_repo_ff
+printf 'topic-content\n' > "$P79_GIT2/new.txt"
+printf 'topic-content\n' > "$P79_SG2/new.txt"
+(cd "$P79_GIT2" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79_git2.err"
+P79_GIT2_RC=$?
+(cd "$P79_SG2" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg2.err"
+P79_SG2_RC=$?
+check "phase79 row2 oracle: precondition -- git refuses even though the untracked content is IDENTICAL to theirs" \
+    test "$P79_GIT2_RC" -eq 1
+check "phase79 row2: sg refuses too" \
+    test "$P79_SG2_RC" -eq 1
+p79_expect_plural ff new.txt > "$WORKDIR/p79_expected2.txt"
+check "phase79 row2: sg's stderr matches git's own wording exactly" \
+    test "$(cat "$WORKDIR/p79_sg2.err")" = "$(cat "$WORKDIR/p79_expected2.txt")"
+
+# ---- row #4: ignored file at the added path -- merge succeeds, silently
+# overwritten (four variants collapse to one representative .gitignore
+# case here; .git/info/exclude is exercised separately below as its own
+# named check since it is a genuinely different source file) ----
+
+P79_SG4="$WORKDIR/phase79_sg4"; P79_GIT4="$WORKDIR/phase79_git4"
+p79_setup "$P79_SG4" "$P79_GIT4" p79_mk_repo_ff
+printf 'new.txt\n' > "$P79_GIT4/.gitignore"
+printf 'new.txt\n' > "$P79_SG4/.gitignore"
+printf 'user-data\n' > "$P79_GIT4/new.txt"
+printf 'user-data\n' > "$P79_SG4/new.txt"
+(cd "$P79_GIT4" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79_GIT4_RC=$?
+(cd "$P79_SG4" && "$SG" merge topic) > "$WORKDIR/p79_sg4.out" 2> "$WORKDIR/p79_sg4.err"
+P79_SG4_RC=$?
+check "phase79 row4 oracle: precondition -- git merges through an ignored collision, new.txt becomes theirs'" \
+    sh -c "test '$P79_GIT4_RC' -eq 0 -a \"\$(cat '$P79_GIT4/new.txt')\" = topic-content"
+check "phase79 row4: sg merges through it too (exit 0)" \
+    test "$P79_SG4_RC" -eq 0
+check "phase79 row4: sg's new.txt is silently overwritten with theirs' content, the ignored user data is gone" \
+    test "$(cat "$P79_SG4/new.txt")" = topic-content
+check "phase79 row4: sg printed no untracked-overwrite refusal" \
+    sh -c "! grep -q 'would be overwritten by merge' '$WORKDIR/p79_sg4.err'"
+
+# same shape via .git/info/exclude rather than a committed .gitignore --
+# a genuinely different source file in sg_ignore_open's own precedence list.
+P79_SG4B="$WORKDIR/phase79_sg4b"; P79_GIT4B="$WORKDIR/phase79_git4b"
+p79_setup "$P79_SG4B" "$P79_GIT4B" p79_mk_repo_ff
+printf 'new.txt\n' > "$P79_GIT4B/.git/info/exclude"
+printf 'new.txt\n' > "$P79_SG4B/.git/info/exclude"
+printf 'user-data\n' > "$P79_GIT4B/new.txt"
+printf 'user-data\n' > "$P79_SG4B/new.txt"
+(cd "$P79_GIT4B" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79_GIT4B_RC=$?
+(cd "$P79_SG4B" && "$SG" merge topic) > /dev/null 2>&1
+P79_SG4B_RC=$?
+check "phase79 row4 (.git/info/exclude) oracle: precondition -- git merges through it too" \
+    test "$P79_GIT4B_RC" -eq 0
+check "phase79 row4 (.git/info/exclude): sg merges through it too" \
+    test "$P79_SG4B_RC" -eq 0
+check "phase79 row4 (.git/info/exclude): sg's new.txt was silently overwritten" \
+    test "$(cat "$P79_SG4B/new.txt")" = topic-content
+
+# ---- row #5: an ignored collision at one path AND a plain untracked
+# collision at another -- refuse, naming only the non-ignored one ----
+
+p79_mk_repo_ff_two() {
+    # $1 = target dir. Like p79_mk_repo_ff, but topic adds TWO files:
+    # new.txt and new2.txt.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && printf 'topic-content2\n' > new2.txt \
+        && git add new.txt new2.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+P79_SG5="$WORKDIR/phase79_sg5"; P79_GIT5="$WORKDIR/phase79_git5"
+p79_setup "$P79_SG5" "$P79_GIT5" p79_mk_repo_ff_two
+printf 'new.txt\n' > "$P79_GIT5/.gitignore"
+printf 'new.txt\n' > "$P79_SG5/.gitignore"
+printf 'ignored-user-data\n' > "$P79_GIT5/new.txt"
+printf 'ignored-user-data\n' > "$P79_SG5/new.txt"
+printf 'plain-user-data\n' > "$P79_GIT5/new2.txt"
+printf 'plain-user-data\n' > "$P79_SG5/new2.txt"
+(cd "$P79_GIT5" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79_GIT5_RC=$?
+(cd "$P79_SG5" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg5.err"
+P79_SG5_RC=$?
+check "phase79 row5 oracle: precondition -- git refuses (exit 1)" \
+    test "$P79_GIT5_RC" -eq 1
+check "phase79 row5: sg refuses too" \
+    test "$P79_SG5_RC" -eq 1
+p79_expect_plural ff new2.txt > "$WORKDIR/p79_expected5.txt"
+check "phase79 row5: sg names ONLY the non-ignored path (new2.txt), not new.txt" \
+    test "$(cat "$WORKDIR/p79_sg5.err")" = "$(cat "$WORKDIR/p79_expected5.txt")"
+
+# ---- row #6 (control): an untracked directory containing unrelated files,
+# where the merge adds a file INSIDE it -- no collision, merges cleanly ----
+
+p79_mk_repo_ff_nested() {
+    # $1 = target dir. topic adds dir/added.txt (a NEW path nested under a
+    # directory name the working tree may independently already have).
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && mkdir dir && printf 'added\n' > dir/added.txt && git add dir/added.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+P79_SG6="$WORKDIR/phase79_sg6"; P79_GIT6="$WORKDIR/phase79_git6"
+p79_setup "$P79_SG6" "$P79_GIT6" p79_mk_repo_ff_nested
+mkdir -p "$P79_GIT6/dir"; printf 'unrelated\n' > "$P79_GIT6/dir/other.txt"
+mkdir -p "$P79_SG6/dir"; printf 'unrelated\n' > "$P79_SG6/dir/other.txt"
+(cd "$P79_GIT6" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79_GIT6_RC=$?
+(cd "$P79_SG6" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg6.err"
+P79_SG6_RC=$?
+check "phase79 row6 oracle: precondition -- git merges through cleanly (no collision)" \
+    test "$P79_GIT6_RC" -eq 0
+check "phase79 row6: sg merges through cleanly too (exit 0)" \
+    test "$P79_SG6_RC" -eq 0
+check "phase79 row6: sg's dir/added.txt was created" \
+    test "$(cat "$P79_SG6/dir/added.txt")" = added
+check "phase79 row6: the unrelated file under the same directory survives untouched" \
+    test "$(cat "$P79_SG6/dir/other.txt")" = unrelated
+check "phase79 row6: sg printed no untracked-overwrite refusal" \
+    sh -c "! grep -q 'would be overwritten by merge' '$WORKDIR/p79_sg6.err'"
+
+# ---- row #7: an untracked EMPTY directory exactly at the added path --
+# git removes it and merges cleanly. sg's own PRE-FLIGHT check (this
+# phase's own responsibility) correctly determines "no collision" -- unit-
+# tested directly in tests/test_untracked_overwrite.c's
+# test_empty_directory -- but sg's underlying write path
+# (sg_write_file_mkdirs, src/workdir/workdir.c) does not itself rmdir an
+# empty directory sitting in the way, a PRE-EXISTING gap unrelated to this
+# phase (it predates this patch; sg_write_file_mkdirs was not touched).
+# So the two sides are NOT asserted byte-identical end to end here --
+# doing so would either mis-state sg's real behavior or hide the residual.
+# What IS asserted: git's own precondition, and that sg's failure is NOT
+# the untracked-overwrite refusal this phase adds (proving the pre-flight
+# itself got this row right; the residual is recorded in docs/DESIGN.md). ----
+
+P79_SG7="$WORKDIR/phase79_sg7"; P79_GIT7="$WORKDIR/phase79_git7"
+p79_setup "$P79_SG7" "$P79_GIT7" p79_mk_repo_ff
+mkdir "$P79_GIT7/new.txt"
+mkdir "$P79_SG7/new.txt"
+(cd "$P79_GIT7" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79_GIT7_RC=$?
+(cd "$P79_SG7" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg7.err"
+check "phase79 row7 oracle: precondition -- git removes the empty directory and merges cleanly" \
+    sh -c "test '$P79_GIT7_RC' -eq 0 -a \"\$(cat '$P79_GIT7/new.txt')\" = topic-content"
+check "phase79 row7: sg's own pre-flight does NOT report this as an untracked-overwrite collision (residual: the write itself still fails, see docs/DESIGN.md)" \
+    sh -c "! grep -q 'would be overwritten by merge' '$WORKDIR/p79_sg7.err'"
+
+# ---- row #8: an untracked FILE blocking a directory component names the
+# BLOCKER, not the deeper candidate path (single level -- reuses row #6's
+# own fixture builder, this time planting "dir" as a FILE rather than a
+# directory holding an unrelated file). ----
+
+P79_SG8="$WORKDIR/phase79_sg8"; P79_GIT8="$WORKDIR/phase79_git8"
+p79_setup "$P79_SG8" "$P79_GIT8" p79_mk_repo_ff_nested
+printf 'blocker\n' > "$P79_GIT8/dir"
+printf 'blocker\n' > "$P79_SG8/dir"
+(cd "$P79_GIT8" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79_git8.err"
+P79_GIT8_RC=$?
+(cd "$P79_SG8" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg8.err"
+P79_SG8_RC=$?
+check "phase79 row8 oracle: precondition -- git refuses, naming the blocker 'dir'" \
+    test "$P79_GIT8_RC" -eq 1
+check "phase79 row8: sg refuses too" \
+    test "$P79_SG8_RC" -eq 1
+p79_expect_plural ff dir > "$WORKDIR/p79_expected8.txt"
+check "phase79 row8: sg names the blocker 'dir', not the deeper candidate 'dir/added.txt'" \
+    test "$(cat "$WORKDIR/p79_sg8.err")" = "$(cat "$WORKDIR/p79_expected8.txt")"
+check "phase79 row8: blocker file 'dir' is untouched -- still the user's own bytes" \
+    test "$(cat "$P79_SG8/dir")" = blocker
+
+# ---- row #9: same shape, TWO levels up ('a' blocks 'a/b/c.txt') ----
+
+p79_mk_repo_ff_deep() {
+    # $1 = target dir. topic adds a/b/c.txt (two directory levels deep).
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && mkdir -p a/b && printf 'deep\n' > a/b/c.txt && git add a/b/c.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+P79_SG9="$WORKDIR/phase79_sg9"; P79_GIT9="$WORKDIR/phase79_git9"
+p79_setup "$P79_SG9" "$P79_GIT9" p79_mk_repo_ff_deep
+printf 'blocker\n' > "$P79_GIT9/a"
+printf 'blocker\n' > "$P79_SG9/a"
+(cd "$P79_GIT9" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79_git9.err"
+P79_GIT9_RC=$?
+(cd "$P79_SG9" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg9.err"
+P79_SG9_RC=$?
+check "phase79 row9 (two levels deep) oracle: precondition -- git refuses, naming the top-level blocker" \
+    test "$P79_GIT9_RC" -eq 1
+check "phase79 row9: sg refuses too" \
+    test "$P79_SG9_RC" -eq 1
+p79_expect_plural ff a > "$WORKDIR/p79_expected9.txt"
+check "phase79 row9: sg names the BLOCKER 'a', not the deep candidate 'a/b/c.txt'" \
+    test "$(cat "$WORKDIR/p79_sg9.err")" = "$(cat "$WORKDIR/p79_expected9.txt")"
+check "phase79 row9: blocker file 'a' is untouched -- still the user's own bytes" \
+    test "$(cat "$P79_SG9/a")" = blocker
+
+# ---- row #10: as row #8, but the blocking file is IGNORED -- git merges
+# (ignore beats blocking). sg's OWN pre-flight (this phase's responsibility)
+# correctly agrees "no untracked-overwrite collision" -- measured, sg prints
+# no refusal -- but the merge as a WHOLE still fails on sg, for a reason
+# outside this phase's scope: sg_mkdir_parents (src/workdir/workdir.c)
+# treats `mkdir("a")` returning EEXIST as "the directory is already there"
+# without checking it really IS a directory, so it silently continues past
+# a blocking FILE the same way it would past an existing directory, and the
+# later write into "a/b/c.txt" then fails for its own unrelated reason. This
+# is the SAME underlying write-path gap as row #7's empty-directory residual
+# (see docs/DESIGN.md's Phase 79 section), just reached via a different
+# shape (an ignored blocking FILE rather than an empty blocking DIRECTORY).
+# Asserted honestly rather than claiming end-to-end parity: git's own
+# precondition, and that sg's own pre-flight check did its job (no
+# untracked-overwrite refusal), not that the merge as a whole succeeds. ----
+
+P79_SG10="$WORKDIR/phase79_sg10"; P79_GIT10="$WORKDIR/phase79_git10"
+p79_setup "$P79_SG10" "$P79_GIT10" p79_mk_repo_ff_deep
+printf 'a\n' > "$P79_GIT10/.gitignore"
+printf 'a\n' > "$P79_SG10/.gitignore"
+printf 'blocker\n' > "$P79_GIT10/a"
+printf 'blocker\n' > "$P79_SG10/a"
+(cd "$P79_GIT10" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79_GIT10_RC=$?
+(cd "$P79_SG10" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg10.err"
+check "phase79 row10 oracle: precondition -- git merges through the ignored blocker" \
+    test "$P79_GIT10_RC" -eq 0
+check "phase79 row10: sg's own pre-flight does NOT report this as an untracked-overwrite collision (residual: the write itself still fails, see docs/DESIGN.md)" \
+    sh -c "! grep -q 'would be overwritten by merge' '$WORKDIR/p79_sg10.err'"
+
+# ---- row #13: a case-aliased untracked NEW.TXT while the merge adds
+# new.txt (folding filesystem only) -- refuse, naming the TARGET spelling
+# new.txt, not the on-disk NEW.TXT. Guarded by the same runtime probe the
+# rest of this file uses (P73_FS_CASE_INSENSITIVE), skip()ped on Linux. ----
+
+if [ "$P73_FS_CASE_INSENSITIVE" = 1 ]; then
+    P79_SG13="$WORKDIR/phase79_sg13"; P79_GIT13="$WORKDIR/phase79_git13"
+    p79_setup "$P79_SG13" "$P79_GIT13" p79_mk_repo_ff
+    printf 'user-data\n' > "$P79_GIT13/NEW.TXT"
+    printf 'user-data\n' > "$P79_SG13/NEW.TXT"
+    (cd "$P79_GIT13" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79_git13.err"
+    P79_GIT13_RC=$?
+    (cd "$P79_SG13" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg13.err"
+    P79_SG13_RC=$?
+    check "phase79 row13 oracle: precondition -- on this case-folding filesystem, git refuses" \
+        test "$P79_GIT13_RC" -eq 1
+    check "phase79 row13: sg refuses too" \
+        test "$P79_SG13_RC" -eq 1
+    p79_expect_plural ff new.txt > "$WORKDIR/p79_expected13.txt"
+    check "phase79 row13: sg names the TARGET spelling new.txt, not the on-disk NEW.TXT" \
+        test "$(cat "$WORKDIR/p79_sg13.err")" = "$(cat "$WORKDIR/p79_expected13.txt")"
+else
+    skip "phase79 row13 oracle: precondition -- on this case-folding filesystem, git refuses"
+    skip "phase79 row13: sg refuses too"
+    skip "phase79 row13: sg names the TARGET spelling new.txt, not the on-disk NEW.TXT"
+fi
+
+# ---- row #15: "Already up to date" with an untracked file present. This
+# takes the memcmp(base_commit, theirs_commit) early-return in cmd_merge.c
+# (base == theirs, i.e. topic already has master's tip), which returns
+# BEFORE do_fast_forward/the 3-way path is ever reached -- so Phase 79's new
+# pre-flight code does not execute at all here, and this check's name must
+# not claim it evaluated the collision and dismissed it. What this DOES
+# prove: that pre-existing early-return path is untouched by Phase 79's
+# addition and still produces the right no-op regardless of what is lying
+# around in the working tree (cold-read correction: an earlier version of
+# this check's name claimed the untracked-overwrite logic itself ran and
+# found the collision irrelevant, which this fixture cannot demonstrate,
+# since it never reaches that code). ----
+
+P79_SG15="$WORKDIR/phase79_sg15"; P79_GIT15="$WORKDIR/phase79_git15"
+p79_setup "$P79_SG15" "$P79_GIT15" p79_mk_repo_ff
+(cd "$P79_GIT15" && git switch -q topic) ; (cd "$P79_SG15" && "$SG" switch topic > /dev/null 2>&1)
+printf 'unrelated-user-data\n' > "$P79_GIT15/unrelated.txt"
+printf 'unrelated-user-data\n' > "$P79_SG15/unrelated.txt"
+(cd "$P79_GIT15" && LC_ALL=C git merge master) > "$WORKDIR/p79_git15.out" 2>&1
+P79_GIT15_RC=$?
+(cd "$P79_SG15" && "$SG" merge master) > "$WORKDIR/p79_sg15.out" 2>&1
+P79_SG15_RC=$?
+check "phase79 row15 oracle: precondition -- git is a no-op (Already up to date, exit 0)" \
+    test "$P79_GIT15_RC" -eq 0
+check "phase79 row15: sg is a no-op too (exit 0) -- the early-return path never reaches the untracked-overwrite pre-flight, so nothing here exercises it" \
+    test "$P79_SG15_RC" -eq 0
+check "phase79 row15: sg's own wording is 'Already up to date.'" \
+    test "$(cat "$WORKDIR/p79_sg15.out")" = "Already up to date."
+check "phase79 row15: the unrelated untracked file survives untouched" \
+    test "$(cat "$P79_SG15/unrelated.txt")" = unrelated-user-data
+
+# ---- unborn HEAD: singular wording ----
+
+P79_SGU="$WORKDIR/phase79_sgu"; P79_GITU="$WORKDIR/phase79_gitu"
+p79_setup "$P79_SGU" "$P79_GITU" p79_mk_repo_unborn
+printf 'user-data\n' > "$P79_GITU/new.txt"
+printf 'user-data\n' > "$P79_SGU/new.txt"
+(cd "$P79_GITU" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79_gitu.err"
+P79_GITU_RC=$?
+(cd "$P79_SGU" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sgu.err"
+P79_SGU_RC=$?
+check "phase79 unborn oracle: precondition -- git refuses (exit 128)" \
+    test "$P79_GITU_RC" -eq 128
+check "phase79 unborn oracle: precondition -- git's first line is the singular sentence this phase's spec documented" \
+    sh -c "head -1 '$WORKDIR/p79_gitu.err' | grep -qF \"Untracked working tree file 'new.txt' would be overwritten by merge.\""
+check "phase79 unborn oracle: git ALSO prints a second 'fatal: read-tree failed' line, NOT part of this phase's own spec text -- recorded honestly rather than silently dropped; sg deliberately does not reproduce it (sg has no read-tree plumbing to leak), see docs/DESIGN.md" \
+    sh -c "test \"\$(sed -n 2p '$WORKDIR/p79_gitu.err')\" = 'fatal: read-tree failed'"
+check "phase79 unborn: sg refuses too (exit 1, this project's own exit-code convention)" \
+    test "$P79_SGU_RC" -eq 1
+p79_expect_singular new.txt > "$WORKDIR/p79_expectedu.txt"
+check "phase79 unborn: sg uses the SINGULAR wording, distinct from the plural ff/3-way one (own single-line literal, not cmp'd against git's two-line output)" \
+    test "$(cat "$WORKDIR/p79_sgu.err")" = "$(cat "$WORKDIR/p79_expectedu.txt")"
+check "phase79 unborn: new.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79_SGU/new.txt")" = user-data
+check "phase79 unborn: HEAD is still unborn (no ref written)" \
+    test ! -e "$P79_SGU/.git/refs/heads/master"
+
+# ---- sorted, multi-path listing, one with a space ----
+
+p79_mk_repo_ff_three() {
+    # $1 = target dir. topic adds three new files, deliberately out of
+    # sorted order in the git add/commit itself so a correctly-sorted
+    # output proves the sort, not an accident of insertion order.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'z\n' > z.txt && printf 'sp\n' > 'sp ace.txt' && printf 'a\n' > a.txt \
+        && git add z.txt 'sp ace.txt' a.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+P79_SGM="$WORKDIR/phase79_sgm"; P79_GITM="$WORKDIR/phase79_gitm"
+p79_setup "$P79_SGM" "$P79_GITM" p79_mk_repo_ff_three
+printf 'u1\n' > "$P79_GITM/z.txt"; printf 'u2\n' > "$P79_GITM/sp ace.txt"; printf 'u3\n' > "$P79_GITM/a.txt"
+printf 'u1\n' > "$P79_SGM/z.txt"; printf 'u2\n' > "$P79_SGM/sp ace.txt"; printf 'u3\n' > "$P79_SGM/a.txt"
+(cd "$P79_GITM" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79_gitm.err"
+P79_GITM_RC=$?
+(cd "$P79_SGM" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sgm.err"
+P79_SGM_RC=$?
+check "phase79 multi-path oracle: precondition -- git refuses (exit 1)" \
+    test "$P79_GITM_RC" -eq 1
+check "phase79 multi-path: sg refuses too" \
+    test "$P79_SGM_RC" -eq 1
+p79_expect_plural ff a.txt 'sp ace.txt' z.txt > "$WORKDIR/p79_expectedm.txt"
+check "phase79 multi-path: sg lists all three in candidate (tree) order -- NOT sorted by this function itself, but theirs_tree's own entries already are, so this happens to read as byte order too -- the space raw and unquoted" \
+    test "$(cat "$WORKDIR/p79_sgm.err")" = "$(cat "$WORKDIR/p79_expectedm.txt")"
+
+# ---- cold-read correction: sg_untracked_would_be_overwritten must NOT
+# de-duplicate. Two candidates blocked by the SAME ancestor ("a" blocks both
+# a/b.txt and a/c.txt) print that ancestor's name TWICE, matching git
+# (measured against git 2.55.0) -- an earlier version of this function
+# de-duplicated instead, which this pins against regressing back to. ----
+
+p79_mk_repo_ff_dedup() {
+    # $1 = target dir. topic adds a/b.txt and a/c.txt, both blocked by the
+    # SAME local ancestor "a" once it is planted as an untracked file.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && mkdir a && printf 'b\n' > a/b.txt && printf 'c\n' > a/c.txt && git add a/b.txt a/c.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+P79_SGD="$WORKDIR/phase79_sgd"; P79_GITD="$WORKDIR/phase79_gitd"
+p79_setup "$P79_SGD" "$P79_GITD" p79_mk_repo_ff_dedup
+printf 'blocker\n' > "$P79_GITD/a"
+printf 'blocker\n' > "$P79_SGD/a"
+(cd "$P79_GITD" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79_gitd.err"
+P79_GITD_RC=$?
+(cd "$P79_SGD" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sgd.err"
+P79_SGD_RC=$?
+# The tab-then-'a' count is computed HERE, in the outer (interop.sh's own)
+# shell, using an ANSI-C-quoted literal tab ($'\t') -- not inside a nested
+# `sh -c` string, where the backslash would have to survive two rounds of
+# shell parsing and (on macOS's BSD grep) `\t` is not a tab escape at all,
+# only a GNU extension. Measured: the nested-escaping version of this check
+# silently produced 0 instead of 2 and FAILED even though git's own output
+# was correct -- a bug in the check itself, not in git or sg.
+P79_GITD_TAB_A_COUNT=$(grep -Fxc "$(printf '\ta')" "$WORKDIR/p79_gitd.err")
+check "phase79 no-dedup oracle: precondition -- git refuses, printing the same blocker 'a' TWICE (once per colliding candidate, not de-duplicated)" \
+    sh -c "test '$P79_GITD_RC' -eq 1 -a '$P79_GITD_TAB_A_COUNT' -eq 2"
+check "phase79 no-dedup: sg refuses too" \
+    test "$P79_SGD_RC" -eq 1
+p79_expect_plural ff a a > "$WORKDIR/p79_expectedd.txt"
+check "phase79 no-dedup: sg's stderr also prints 'a' twice, matching git's own lack of de-duplication" \
+    test "$(cat "$WORKDIR/p79_sgd.err")" = "$(cat "$WORKDIR/p79_expectedd.txt")"
+
+# ---- cold-read correction: the report order is CANDIDATE order (the order
+# theirs_tree's own entries are walked in), never a sort of the REPORTED
+# blocker names. Decisive shape: topic adds BOTH "a.txt" (top-level) and
+# "a/x.txt" (nested); locally, "a.txt" itself is untracked (a direct
+# self-collision) AND "a" is a separate untracked FILE blocking "a/x.txt".
+# Candidate order is "a.txt" then "a/x.txt" (tree order: '.' 0x2E sorts
+# before '/' 0x2F), so the reported blocker order is "a.txt" then "a" -- the
+# REVERSE of alphabetically sorting the two REPORTED names ("a" < "a.txt").
+# Measured against git 2.55.0. ----
+
+p79_mk_repo_ff_order() {
+    # $1 = target dir. topic adds a.txt (top-level) and a/x.txt (nested
+    # under a DIFFERENT top-level entry "a") -- both new to master.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'top\n' > a.txt && mkdir a && printf 'nested\n' > a/x.txt \
+        && git add a.txt a/x.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+P79_SGR="$WORKDIR/phase79_sgr"; P79_GITR="$WORKDIR/phase79_gitr"
+p79_setup "$P79_SGR" "$P79_GITR" p79_mk_repo_ff_order
+printf 'user-data\n' > "$P79_GITR/a.txt"
+printf 'blocker\n' > "$P79_GITR/a"
+printf 'user-data\n' > "$P79_SGR/a.txt"
+printf 'blocker\n' > "$P79_SGR/a"
+(cd "$P79_GITR" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79_gitr.err"
+P79_GITR_RC=$?
+(cd "$P79_SGR" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sgr.err"
+P79_SGR_RC=$?
+# Same fix as the no-dedup check above (Phase 79c F1): the tab-prefixed
+# comparison is done HERE, in the outer (interop.sh's own) shell, using an
+# ANSI-C-quoted literal tab -- not inside a nested `sh -c` string. Measured:
+# on Ubuntu's dash (CI's /bin/sh), a nested `$'\ta.txt'` is NOT ANSI-C
+# quoting at all (that syntax is a bashism); dash reads it as a literal `$`
+# immediately followed by the single-quoted string `\ta.txt`, so the
+# comparison compares against the six bytes `$\ta.txt` and can never match a
+# real tab -- this check was always red under dash regardless of git's own
+# output, and every check below it in the file still ran (this one is not a
+# quoting-abort case), it just always failed.
+P79_GITR_LINE2=$(sed -n '2p' "$WORKDIR/p79_gitr.err")
+P79_GITR_LINE3=$(sed -n '3p' "$WORKDIR/p79_gitr.err")
+P79_GITR_TAB_ATXT=$(printf '\ta.txt')
+P79_GITR_TAB_A=$(printf '\ta')
+check "phase79 order oracle: precondition -- git refuses, printing 'a.txt' then 'a' (candidate/tree order), NOT the alphabetical 'a' then 'a.txt'" \
+    sh -c "test '$P79_GITR_RC' -eq 1 -a '$P79_GITR_LINE2' = '$P79_GITR_TAB_ATXT' -a '$P79_GITR_LINE3' = '$P79_GITR_TAB_A'"
+check "phase79 order: sg refuses too" \
+    test "$P79_SGR_RC" -eq 1
+p79_expect_plural ff a.txt a > "$WORKDIR/p79_expectedr.txt"
+check "phase79 order: sg lists 'a.txt' then 'a' -- candidate order, the reverse of a byte sort of the reported names" \
+    test "$(cat "$WORKDIR/p79_sgr.err")" = "$(cat "$WORKDIR/p79_expectedr.txt")"
+
+# ---- ORIG_HEAD is still written when the new check refuses, and
+# HEAD/index/working tree are otherwise byte-identical to before ----
+
+P79_SGO="$WORKDIR/phase79_sgo"
+p79_mk_repo_3way "$WORKDIR/phase79_gito_unused"
+rm -rf "$P79_SGO"; cp -R "$WORKDIR/phase79_gito_unused" "$P79_SGO"
+P79_HEAD_BEFORE=$(cat "$P79_SGO/.git/refs/heads/master")
+cp "$P79_SGO/.git/index" "$WORKDIR/p79_index_before"
+printf 'user-data\n' > "$P79_SGO/new.txt"
+(cd "$P79_SGO" && "$SG" merge topic) > /dev/null 2>&1
+check "phase79 ORIG_HEAD: sg wrote ORIG_HEAD even though the merge was then refused" \
+    test -e "$P79_SGO/.git/ORIG_HEAD"
+check "phase79 ORIG_HEAD: sg's ORIG_HEAD equals the pre-merge HEAD (ours_commit)" \
+    test "$(cat "$P79_SGO/.git/ORIG_HEAD")" = "$P79_HEAD_BEFORE"
+check "phase79 ORIG_HEAD: refs/heads/master (HEAD) is unchanged by the refused merge" \
+    test "$(cat "$P79_SGO/.git/refs/heads/master")" = "$P79_HEAD_BEFORE"
+check "phase79 ORIG_HEAD: the index is byte-identical to before the refused merge" \
+    cmp -s "$P79_SGO/.git/index" "$WORKDIR/p79_index_before"
+check "phase79 ORIG_HEAD: no MERGE_HEAD was written by the refused merge" \
+    test ! -e "$P79_SGO/.git/MERGE_HEAD"
+
+# ---- control: an untracked file at an UNRELATED path still merges
+# cleanly (otherwise this whole group would pass with a merge that
+# refuses everything) ----
+
+P79_SGC="$WORKDIR/phase79_sgc"; P79_GITC="$WORKDIR/phase79_gitc"
+p79_setup "$P79_SGC" "$P79_GITC" p79_mk_repo_ff
+printf 'unrelated-user-data\n' > "$P79_GITC/other.txt"
+printf 'unrelated-user-data\n' > "$P79_SGC/other.txt"
+(cd "$P79_GITC" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79_GITC_RC=$?
+(cd "$P79_SGC" && "$SG" merge topic) > /dev/null 2>&1
+P79_SGC_RC=$?
+check "phase79 control oracle: precondition -- git merges cleanly with an unrelated untracked file present" \
+    test "$P79_GITC_RC" -eq 0
+check "phase79 control: sg merges cleanly too (exit 0)" \
+    test "$P79_SGC_RC" -eq 0
+check "phase79 control: new.txt was created from theirs" \
+    test "$(cat "$P79_SGC/new.txt")" = topic-content
+check "phase79 control: the unrelated untracked file survives untouched" \
+    test "$(cat "$P79_SGC/other.txt")" = unrelated-user-data
+
+# --- Phase 79b: the DIRECTORY bucket of sg_untracked_would_be_overwritten --
+# a candidate path P where the merge wants to write a FILE, and locally P is
+# a NON-EMPTY untracked directory containing at least one non-ignored file
+# (recursively). This is a DIFFERENT collision from Phase 79's file bucket
+# (P itself, an untracked FILE, or a FILE blocking an ancestor component of
+# P) and gets its own, different wording from git. Every row below is a
+# git-side precondition plus a separate sg-side literal, same shape as
+# Phase 79 above; two wordings (ordinary plural, unborn singular), never
+# compared with cmp. ---
+
+p79b_mk_repo_ff() {
+    # $1 = target dir. Same shape as p79_mk_repo_ff (master f.txt -> topic
+    # descendant adding new.txt) -- kept as its own copy so this section
+    # does not depend on p79's fixture builders surviving unchanged.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+p79b_mk_repo_3way() {
+    # $1 = target dir. Diverges after branching (own commit on master), a
+    # genuine 3-way merge fixture -- topic still just adds new.txt.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master \
+        && printf '2\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m c2m) > /dev/null 2>&1
+}
+
+p79b_mk_repo_unborn() {
+    # $1 = target dir. Same construction p79_mk_repo_unborn uses (proven in
+    # Phase 79: a raw ref/HEAD rewrite, not `symbolic-ref`, is what actually
+    # reproduces git's exit-128 unborn-HEAD merge codepath) -- topic adds
+    # new.txt.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'seed\n' > seed.txt && git add seed.txt \
+        && GIT_AUTHOR_DATE="1699999900 +0000" GIT_COMMITTER_DATE="1699999900 +0000" git commit -q -m seed \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+    (cd "$1" && rm -f .git/refs/heads/master \
+        && printf 'ref: refs/heads/master\n' > .git/HEAD \
+        && rm -f .git/index seed.txt) > /dev/null 2>&1
+}
+
+# Prints git's exact plural DIRECTORY refusal (measured against git 2.55.0);
+# $1 = "ff" or "3way" (controls the trailing "Merge with strategy ort
+# failed." line), remaining args = the colliding directory names, RAW, in
+# the exact order the caller wants (pre-sorted/pre-ordered by the caller --
+# this helper does not sort, matching sg_untracked_would_be_overwritten's
+# own contract). Unlike p79_expect_plural (the file bucket), this ends in a
+# BLANK LINE before "Aborting", even when there is no file section after it.
+p79b_expect_dir_plural() {
+    p79be_kind="$1"
+    shift
+    printf 'sg: Updating the following directories would lose untracked files in them:\n'
+    for p79be_p in "$@"; do
+        printf '\t%s\n' "$p79be_p"
+    done
+    printf '\n'
+    printf 'Aborting\n'
+    if [ "$p79be_kind" = "3way" ]; then
+        printf 'Merge with strategy ort failed.\n'
+    fi
+}
+
+p79b_expect_dir_singular() {
+    printf "sg: Updating '%s' would lose untracked files in it\n" "$1"
+}
+
+# ---- B1: fast-forward, ONE directory collision at the exact candidate path
+# (not an ancestor -- Phase 79's own row #6/#7/#9/#10 already cover a
+# non-empty/empty/ignored directory sitting as an ANCESTOR of the candidate,
+# which is a DIFFERENT, non-blocking shape; measured separately during this
+# phase's own development and reconfirmed unchanged). ----
+
+P79B_SG1="$WORKDIR/phase79b_sg1"; P79B_GIT1="$WORKDIR/phase79b_git1"
+p79_setup "$P79B_SG1" "$P79B_GIT1" p79b_mk_repo_ff
+mkdir -p "$P79B_GIT1/new.txt"; printf 'leftover\n' > "$P79B_GIT1/new.txt/leftover.txt"
+mkdir -p "$P79B_SG1/new.txt"; printf 'leftover\n' > "$P79B_SG1/new.txt/leftover.txt"
+(cd "$P79B_GIT1" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79b_git1.err"
+P79B_GIT1_RC=$?
+(cd "$P79B_SG1" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79b_sg1.err"
+P79B_SG1_RC=$?
+check "phase79b B1 (ff) oracle: precondition -- git refuses (exit 1)" \
+    test "$P79B_GIT1_RC" -eq 1
+check "phase79b B1 (ff): sg refuses too" \
+    test "$P79B_SG1_RC" -eq 1
+p79b_expect_dir_plural ff new.txt > "$WORKDIR/p79b_expected1.txt"
+check "phase79b B1 (ff): sg's stderr matches git's own directory wording exactly (own literal, not cmp'd against git's)" \
+    test "$(cat "$WORKDIR/p79b_sg1.err")" = "$(cat "$WORKDIR/p79b_expected1.txt")"
+check "phase79b B1 (ff): new.txt/leftover.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79B_SG1/new.txt/leftover.txt")" = leftover
+
+# ---- B4: 3-way, one directory collision -- same shape as B1, but also
+# carries "Merge with strategy ort failed." after Aborting ----
+
+P79B_SG4="$WORKDIR/phase79b_sg4"; P79B_GIT4="$WORKDIR/phase79b_git4"
+p79_setup "$P79B_SG4" "$P79B_GIT4" p79b_mk_repo_3way
+mkdir -p "$P79B_GIT4/new.txt"; printf 'leftover\n' > "$P79B_GIT4/new.txt/leftover.txt"
+mkdir -p "$P79B_SG4/new.txt"; printf 'leftover\n' > "$P79B_SG4/new.txt/leftover.txt"
+(cd "$P79B_GIT4" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79b_git4.err"
+P79B_GIT4_RC=$?
+(cd "$P79B_SG4" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79b_sg4.err"
+P79B_SG4_RC=$?
+check "phase79b B4 (3-way) oracle: precondition -- git refuses (exit 2)" \
+    test "$P79B_GIT4_RC" -eq 2
+check "phase79b B4 (3-way): sg refuses too (exit 1, this project's own exit-code convention)" \
+    test "$P79B_SG4_RC" -eq 1
+p79b_expect_dir_plural 3way new.txt > "$WORKDIR/p79b_expected4.txt"
+check "phase79b B4 (3-way): sg's stderr matches git's own directory wording exactly, including the trailing strategy line" \
+    test "$(cat "$WORKDIR/p79b_sg4.err")" = "$(cat "$WORKDIR/p79b_expected4.txt")"
+check "phase79b B4 (3-way): no MERGE_HEAD was written -- the refusal is BEFORE the merge is recorded" \
+    test ! -e "$P79B_SG4/.git/MERGE_HEAD"
+
+# ---- B2: two directory collisions, sorted (both candidates are top-level,
+# so tree order and byte order coincide here -- see the phase79 order
+# correction above for the shape where they do NOT) ----
+
+p79b_mk_repo_ff_two() {
+    # $1 = target dir. topic adds z.txt and a.txt (deliberately out of
+    # sorted order in the add/commit itself).
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'z\n' > z.txt && printf 'a\n' > a.txt && git add z.txt a.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+P79B_SG2="$WORKDIR/phase79b_sg2"; P79B_GIT2="$WORKDIR/phase79b_git2"
+p79_setup "$P79B_SG2" "$P79B_GIT2" p79b_mk_repo_ff_two
+mkdir -p "$P79B_GIT2/z.txt" "$P79B_GIT2/a.txt"
+printf 'lz\n' > "$P79B_GIT2/z.txt/leftover.txt"; printf 'la\n' > "$P79B_GIT2/a.txt/leftover.txt"
+mkdir -p "$P79B_SG2/z.txt" "$P79B_SG2/a.txt"
+printf 'lz\n' > "$P79B_SG2/z.txt/leftover.txt"; printf 'la\n' > "$P79B_SG2/a.txt/leftover.txt"
+(cd "$P79B_GIT2" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79b_git2.err"
+P79B_GIT2_RC=$?
+(cd "$P79B_SG2" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79b_sg2.err"
+P79B_SG2_RC=$?
+check "phase79b B2 oracle: precondition -- git refuses, listing 'a.txt' then 'z.txt' (candidate/tree order)" \
+    test "$P79B_GIT2_RC" -eq 1
+check "phase79b B2: sg refuses too" \
+    test "$P79B_SG2_RC" -eq 1
+p79b_expect_dir_plural ff a.txt z.txt > "$WORKDIR/p79b_expected2.txt"
+check "phase79b B2: sg lists both directories in the same order git does, neither de-duplicated" \
+    test "$(cat "$WORKDIR/p79b_sg2.err")" = "$(cat "$WORKDIR/p79b_expected2.txt")"
+
+# ---- B5: unborn HEAD, singular directory wording (no trailing period,
+# unlike the file bucket's singular form; "fatal: read-tree failed" is
+# git's own internal plumbing name leaking out and is deliberately NOT
+# reproduced by sg, same treatment Phase 79's file-bucket unborn case
+# already gets) ----
+
+P79B_SGU="$WORKDIR/phase79b_sgu"; P79B_GITU="$WORKDIR/phase79b_gitu"
+p79_setup "$P79B_SGU" "$P79B_GITU" p79b_mk_repo_unborn
+mkdir -p "$P79B_GITU/new.txt"; printf 'leftover\n' > "$P79B_GITU/new.txt/leftover.txt"
+mkdir -p "$P79B_SGU/new.txt"; printf 'leftover\n' > "$P79B_SGU/new.txt/leftover.txt"
+(cd "$P79B_GITU" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79b_gitu.err"
+P79B_GITU_RC=$?
+(cd "$P79B_SGU" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79b_sgu.err"
+P79B_SGU_RC=$?
+check "phase79b unborn oracle: precondition -- git refuses (exit 128)" \
+    test "$P79B_GITU_RC" -eq 128
+check "phase79b unborn oracle: precondition -- git's first line is the singular directory sentence, WITHOUT a trailing period" \
+    sh -c "head -1 '$WORKDIR/p79b_gitu.err' | grep -qF \"Updating 'new.txt' would lose untracked files in it\" && ! head -1 '$WORKDIR/p79b_gitu.err' | grep -qF 'it.'"
+check "phase79b unborn oracle: git ALSO prints 'fatal: read-tree failed' as a second line -- recorded honestly, sg deliberately does not reproduce it" \
+    sh -c "test \"\$(sed -n 2p '$WORKDIR/p79b_gitu.err')\" = 'fatal: read-tree failed'"
+check "phase79b unborn: sg refuses too (exit 1, this project's own exit-code convention)" \
+    test "$P79B_SGU_RC" -eq 1
+p79b_expect_dir_singular new.txt > "$WORKDIR/p79b_expectedu.txt"
+check "phase79b unborn: sg uses the SINGULAR directory wording, no trailing period, no second 'fatal:' line (own single-line literal, not cmp'd against git's two-line output)" \
+    test "$(cat "$WORKDIR/p79b_sgu.err")" = "$(cat "$WORKDIR/p79b_expectedu.txt")"
+check "phase79b unborn: new.txt/leftover.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79B_SGU/new.txt/leftover.txt")" = leftover
+check "phase79b unborn: HEAD is still unborn (no ref written)" \
+    test ! -e "$P79B_SGU/.git/refs/heads/master"
+
+# ---- B6: BOTH buckets fire in the SAME merge -- exact combined byte
+# sequence measured against git 2.55.0: the directory section prints first,
+# ending in its own blank line, immediately followed by the file section
+# (its own independent "sg: " line), then exactly ONE "Aborting"/strategy
+# pair for the whole refusal. 3-way, so the strategy line is present. ----
+
+p79b_mk_repo_3way_combined() {
+    # $1 = target dir. topic adds new.txt (will collide with a local
+    # directory) AND plain.txt (will collide with a local file).
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '1\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && printf 'p\n' > plain.txt \
+        && git add new.txt plain.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master \
+        && printf '2\n' > f && git add f \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m c2m) > /dev/null 2>&1
+}
+
+P79B_SG6="$WORKDIR/phase79b_sg6"; P79B_GIT6="$WORKDIR/phase79b_git6"
+p79_setup "$P79B_SG6" "$P79B_GIT6" p79b_mk_repo_3way_combined
+mkdir -p "$P79B_GIT6/new.txt"; printf 'leftover\n' > "$P79B_GIT6/new.txt/leftover.txt"
+printf 'user-data\n' > "$P79B_GIT6/plain.txt"
+mkdir -p "$P79B_SG6/new.txt"; printf 'leftover\n' > "$P79B_SG6/new.txt/leftover.txt"
+printf 'user-data\n' > "$P79B_SG6/plain.txt"
+(cd "$P79B_GIT6" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79b_git6.err"
+P79B_GIT6_RC=$?
+(cd "$P79B_SG6" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79b_sg6.err"
+P79B_SG6_RC=$?
+check "phase79b B6 (combined buckets) oracle: precondition -- git refuses (exit 2)" \
+    test "$P79B_GIT6_RC" -eq 2
+check "phase79b B6 (combined buckets): sg refuses too" \
+    test "$P79B_SG6_RC" -eq 1
+printf 'sg: Updating the following directories would lose untracked files in them:\n\tnew.txt\n\nsg: The following untracked working tree files would be overwritten by merge:\n\tplain.txt\nPlease move or remove them before you merge.\nAborting\nMerge with strategy ort failed.\n' > "$WORKDIR/p79b_expected6.txt"
+check "phase79b B6 (combined buckets): sg's stderr matches the exact combined byte sequence measured against git (directory section, blank line, file section, ONE Aborting/strategy pair)" \
+    test "$(cat "$WORKDIR/p79b_sg6.err")" = "$(cat "$WORKDIR/p79b_expected6.txt")"
+
+# ---- B7: a non-empty untracked directory at the exact candidate path whose
+# contents are ALL ignored (even nested) is NOT an untracked-overwrite
+# collision -- git's own answer here is not merely "no refusal", it
+# REPLACES the local directory (and its all-ignored contents) entirely with
+# theirs' plain FILE, same as a plain ignored FILE getting silently
+# overwritten (row #4 above; the previously-ignored nested content does not
+# survive, it is gone along with the directory that held it). Measured: sg's
+# own PRE-FLIGHT check (this phase's own responsibility) correctly agrees
+# "no collision" -- no untracked-overwrite refusal is printed -- but sg's
+# underlying write path (sg_write_file_mkdirs, src/workdir/workdir.c) does
+# not itself rmdir/replace a directory sitting in the way (fopen() on an
+# existing directory path fails), a PRE-EXISTING gap this phase does not
+# touch, the SAME shape as row #7's and row #10's own residuals above (see
+# docs/DESIGN.md). So the two sides are NOT asserted byte-identical end to
+# end here -- what IS asserted: git's own precondition, and that sg's
+# pre-flight did its job correctly (no untracked-overwrite refusal of
+# either wording). ----
+
+P79B_SG7="$WORKDIR/phase79b_sg7"; P79B_GIT7="$WORKDIR/phase79b_git7"
+p79_setup "$P79B_SG7" "$P79B_GIT7" p79b_mk_repo_ff
+printf '*.log\n' > "$P79B_GIT7/.gitignore"; printf '*.log\n' > "$P79B_SG7/.gitignore"
+mkdir -p "$P79B_GIT7/new.txt/sub"; mkdir -p "$P79B_SG7/new.txt/sub"
+printf 'noise\n' > "$P79B_GIT7/new.txt/leftover.log"; printf 'noise\n' > "$P79B_SG7/new.txt/leftover.log"
+printf 'noise2\n' > "$P79B_GIT7/new.txt/sub/deep.log"; printf 'noise2\n' > "$P79B_SG7/new.txt/sub/deep.log"
+(cd "$P79B_GIT7" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79B_GIT7_RC=$?
+(cd "$P79B_SG7" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79b_sg7.err"
+check "phase79b B7 oracle: precondition -- git merges through cleanly (exit 0); new.txt becomes theirs' plain FILE, replacing the local directory entirely" \
+    sh -c "test '$P79B_GIT7_RC' -eq 0 -a ! -d '$P79B_GIT7/new.txt' -a \"\$(cat '$P79B_GIT7/new.txt')\" = topic-content"
+check "phase79b B7: sg's own pre-flight does NOT report this as an untracked-overwrite collision (residual: the write itself still fails, see docs/DESIGN.md)" \
+    sh -c "! grep -qE 'would be overwritten by merge|would lose untracked files' '$WORKDIR/p79b_sg7.err'"
+
+# ---- B8: a NESTED non-ignored file (two levels deep inside the candidate
+# directory) still makes the whole directory a collision -- proves the scan
+# recurses rather than only checking direct children ----
+
+P79B_SG8="$WORKDIR/phase79b_sg8"; P79B_GIT8="$WORKDIR/phase79b_git8"
+p79_setup "$P79B_SG8" "$P79B_GIT8" p79b_mk_repo_ff
+printf '*.log\n' > "$P79B_GIT8/.gitignore"; printf '*.log\n' > "$P79B_SG8/.gitignore"
+mkdir -p "$P79B_GIT8/new.txt/sub"; mkdir -p "$P79B_SG8/new.txt/sub"
+printf 'noise\n' > "$P79B_GIT8/new.txt/leftover.log"; printf 'noise\n' > "$P79B_SG8/new.txt/leftover.log"
+printf 'user data\n' > "$P79B_GIT8/new.txt/sub/deep.txt"; printf 'user data\n' > "$P79B_SG8/new.txt/sub/deep.txt"
+(cd "$P79B_GIT8" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79b_git8.err"
+P79B_GIT8_RC=$?
+(cd "$P79B_SG8" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79b_sg8.err"
+P79B_SG8_RC=$?
+check "phase79b B8 oracle: precondition -- git refuses, a nested non-ignored file still blocks" \
+    test "$P79B_GIT8_RC" -eq 1
+check "phase79b B8: sg refuses too" \
+    test "$P79B_SG8_RC" -eq 1
+p79b_expect_dir_plural ff new.txt > "$WORKDIR/p79b_expected8.txt"
+check "phase79b B8: sg names the directory 'new.txt', proving the recursive scan (not just direct children) found the nested non-ignored file" \
+    test "$(cat "$WORKDIR/p79b_sg8.err")" = "$(cat "$WORKDIR/p79b_expected8.txt")"
+check "phase79b B8: the nested non-ignored file is untouched -- still the user's own bytes" \
+    test "$(cat "$P79B_SG8/new.txt/sub/deep.txt")" = "user data"
+
+# --- Phase 79c (round 2 fixes for Phase 79/79b): F4 (unborn candidate-order
+# correction), F2 (scan I/O errors get a truthful message instead of "sg: out
+# of memory"), and F5 (residuals recorded, both sides pinned, no behavior
+# change). Measured against git 2.55.0; oracle scripts and summary in
+# docs/DESIGN.md's Phase 79c section. ---
+
+# ---- F4: the UNBORN-HEAD report names the FIRST collision in CANDIDATE
+# order across BOTH buckets, not "directory always wins" -- U1b is the
+# discriminator (a topic that adds a FILE-colliding path before a
+# DIRECTORY-colliding one in candidate order must refuse on the FILE
+# wording), U1 and O1 are non-discriminating shapes where the directory
+# bucket happens to be first anyway (kept as regression pins). All three
+# reuse p79_mk_repo_unborn's own proven construction: a raw ref/HEAD rewrite
+# (not `symbolic-ref`) is what reproduces git's actual exit-128 codepath. ----
+
+p79c_mk_repo_unborn_u1() {
+    # $1 = target dir. topic adds two TOP-LEVEL FILES "d" and "f" (not a
+    # subtree "d/x" -- the directory-bucket wording is for a candidate path P
+    # itself, where the merge wants to write a FILE at P and P is locally a
+    # non-empty untracked DIRECTORY).
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'seed\n' > seed.txt && git add seed.txt \
+        && GIT_AUTHOR_DATE="1699999900 +0000" GIT_COMMITTER_DATE="1699999900 +0000" git commit -q -m seed \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-d\n' > d && printf 'topic-f\n' > f && git add d f \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+    (cd "$1" && rm -f .git/refs/heads/master \
+        && printf 'ref: refs/heads/master\n' > .git/HEAD \
+        && rm -f .git/index seed.txt) > /dev/null 2>&1
+}
+
+P79C_SGU1="$WORKDIR/phase79c_sgu1"; P79C_GITU1="$WORKDIR/phase79c_gitu1"
+p79_setup "$P79C_SGU1" "$P79C_GITU1" p79c_mk_repo_unborn_u1
+mkdir -p "$P79C_GITU1/d"; printf 'local-x\n' > "$P79C_GITU1/d/x"; printf 'local-f\n' > "$P79C_GITU1/f"
+mkdir -p "$P79C_SGU1/d"; printf 'local-x\n' > "$P79C_SGU1/d/x"; printf 'local-f\n' > "$P79C_SGU1/f"
+(cd "$P79C_GITU1" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79c_gitu1.err"
+P79C_GITU1_RC=$?
+(cd "$P79C_SGU1" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgu1.err"
+P79C_SGU1_RC=$?
+check "phase79c U1 oracle: precondition -- git refuses (exit 128), naming the DIRECTORY 'd' (first in candidate order, and the only collision kind here that is first)" \
+    sh -c "test '$P79C_GITU1_RC' -eq 128 -a \"\$(head -1 '$WORKDIR/p79c_gitu1.err')\" = \"error: Updating 'd' would lose untracked files in it\""
+check "phase79c U1: sg refuses too (exit 1)" \
+    test "$P79C_SGU1_RC" -eq 1
+printf "sg: Updating 'd' would lose untracked files in it\n" > "$WORKDIR/p79c_expected_u1.txt"
+check "phase79c U1: sg's stderr matches the singular DIRECTORY wording naming 'd'" \
+    test "$(cat "$WORKDIR/p79c_sgu1.err")" = "$(cat "$WORKDIR/p79c_expected_u1.txt")"
+check "phase79c U1: d/x and f are untouched -- still the user's own bytes" \
+    sh -c "test \"\$(cat '$P79C_SGU1/d/x')\" = local-x -a \"\$(cat '$P79C_SGU1/f')\" = local-f"
+
+p79c_mk_repo_unborn_u1b() {
+    # $1 = target dir. Same construction, topic adds two top-level files "a"
+    # and "z" this time -- the DISCRIMINATOR: locally "a" is a plain
+    # untracked FILE (collision) and "z" is a non-empty untracked DIRECTORY
+    # (collision). Candidate/tree order is "a" then "z", so the FIRST
+    # collision is the FILE one -- a "directory always wins" implementation
+    # gets this wrong (batch 2's own bug, refuted by this fixture).
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'seed\n' > seed.txt && git add seed.txt \
+        && GIT_AUTHOR_DATE="1699999900 +0000" GIT_COMMITTER_DATE="1699999900 +0000" git commit -q -m seed \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-a\n' > a && printf 'topic-z\n' > z && git add a z \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+    (cd "$1" && rm -f .git/refs/heads/master \
+        && printf 'ref: refs/heads/master\n' > .git/HEAD \
+        && rm -f .git/index seed.txt) > /dev/null 2>&1
+}
+
+P79C_SGU1B="$WORKDIR/phase79c_sgu1b"; P79C_GITU1B="$WORKDIR/phase79c_gitu1b"
+p79_setup "$P79C_SGU1B" "$P79C_GITU1B" p79c_mk_repo_unborn_u1b
+printf 'local-a\n' > "$P79C_GITU1B/a"; mkdir -p "$P79C_GITU1B/z"; printf 'local-x\n' > "$P79C_GITU1B/z/x"
+printf 'local-a\n' > "$P79C_SGU1B/a"; mkdir -p "$P79C_SGU1B/z"; printf 'local-x\n' > "$P79C_SGU1B/z/x"
+(cd "$P79C_GITU1B" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79c_gitu1b.err"
+P79C_GITU1B_RC=$?
+(cd "$P79C_SGU1B" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgu1b.err"
+P79C_SGU1B_RC=$?
+check "phase79c U1b oracle (discriminator): precondition -- git refuses (exit 128), naming the FILE 'a' (first in candidate order), NOT the directory 'z'" \
+    sh -c "test '$P79C_GITU1B_RC' -eq 128 -a \"\$(head -1 '$WORKDIR/p79c_gitu1b.err')\" = \"error: Untracked working tree file 'a' would be overwritten by merge.\""
+check "phase79c U1b: sg refuses too (exit 1)" \
+    test "$P79C_SGU1B_RC" -eq 1
+p79_expect_singular a > "$WORKDIR/p79c_expected_u1b.txt"
+check "phase79c U1b (discriminator): sg's stderr matches the singular FILE wording naming 'a', NOT the directory wording naming 'z' -- this is the bug this round fixes" \
+    test "$(cat "$WORKDIR/p79c_sgu1b.err")" = "$(cat "$WORKDIR/p79c_expected_u1b.txt")"
+check "phase79c U1b: a and z/x are untouched -- still the user's own bytes" \
+    sh -c "test \"\$(cat '$P79C_SGU1B/a')\" = local-a -a \"\$(cat '$P79C_SGU1B/z/x')\" = local-x"
+
+p79c_mk_repo_unborn_o1() {
+    # $1 = target dir. topic adds a TOP-LEVEL FILE "a.txt" and a SUBTREE "a"
+    # (containing blob "a/x") -- tree order puts "a.txt" (0x2E) before "a/"
+    # (0x2F), same cold-read correction as the Phase 79 order fixture.
+    # Locally "a.txt" is a non-empty untracked DIRECTORY (dir-bucket
+    # collision) and "a" is a plain untracked FILE blocking the ancestor of
+    # candidate "a/x" (file-bucket collision, blocker name "a"). The FIRST
+    # collision in candidate order is "a.txt" (dir bucket).
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'seed\n' > seed.txt && git add seed.txt \
+        && GIT_AUTHOR_DATE="1699999900 +0000" GIT_COMMITTER_DATE="1699999900 +0000" git commit -q -m seed \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-atxt\n' > a.txt && mkdir a && printf 'topic-ax\n' > a/x \
+        && git add a.txt a/x \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+    (cd "$1" && rm -f .git/refs/heads/master \
+        && printf 'ref: refs/heads/master\n' > .git/HEAD \
+        && rm -f .git/index seed.txt) > /dev/null 2>&1
+}
+
+P79C_SGO1="$WORKDIR/phase79c_sgo1"; P79C_GITO1="$WORKDIR/phase79c_gito1"
+p79_setup "$P79C_SGO1" "$P79C_GITO1" p79c_mk_repo_unborn_o1
+mkdir -p "$P79C_GITO1/a.txt"; printf 'local-k\n' > "$P79C_GITO1/a.txt/k"; printf 'local-a\n' > "$P79C_GITO1/a"
+mkdir -p "$P79C_SGO1/a.txt"; printf 'local-k\n' > "$P79C_SGO1/a.txt/k"; printf 'local-a\n' > "$P79C_SGO1/a"
+(cd "$P79C_GITO1" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79c_gito1.err"
+P79C_GITO1_RC=$?
+(cd "$P79C_SGO1" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgo1.err"
+P79C_SGO1_RC=$?
+check "phase79c O1 oracle: precondition -- git refuses (exit 128), naming the DIRECTORY 'a.txt' (tree order beats a byte sort: 'a.txt' before 'a/')" \
+    sh -c "test '$P79C_GITO1_RC' -eq 128 -a \"\$(head -1 '$WORKDIR/p79c_gito1.err')\" = \"error: Updating 'a.txt' would lose untracked files in it\""
+check "phase79c O1: sg refuses too (exit 1)" \
+    test "$P79C_SGO1_RC" -eq 1
+printf "sg: Updating 'a.txt' would lose untracked files in it\n" > "$WORKDIR/p79c_expected_o1.txt"
+check "phase79c O1: sg's stderr matches the singular DIRECTORY wording naming 'a.txt'" \
+    test "$(cat "$WORKDIR/p79c_sgo1.err")" = "$(cat "$WORKDIR/p79c_expected_o1.txt")"
+
+# ---- F2: an opendir() failure DURING the recursive directory scan (a
+# chmod-000 subdirectory) must be reported truthfully, not as "sg: out of
+# memory". chmod 000 does not block root's own access, so this whole group
+# is skipped as root, same guard interop.sh already uses elsewhere (line
+# ~4398). ----
+
+if [ "$(id -u)" = "0" ]; then
+    skip "phase79c S6 (ff) oracle: precondition -- git's opendir cascade"
+    skip "phase79c S6 (ff): sg refuses too"
+    skip "phase79c S6 (ff): sg's stderr matches the two-line opendir-failure wording exactly"
+    skip "phase79c S6 (ff): new.txt/locked/secret survives untouched (fail-closed, not fail-open)"
+    skip "phase79c S6 (3way) oracle: precondition -- git's opendir cascade"
+    skip "phase79c S6 (3way): sg refuses too"
+    skip "phase79c S6 (3way): sg's stderr matches the two-line opendir-failure wording exactly"
+    skip "phase79c S6 (3way): new.txt/locked/secret survives untouched, no MERGE_HEAD written"
+else
+    P79C_SGS6="$WORKDIR/phase79c_sgs6"; P79C_GITS6="$WORKDIR/phase79c_gits6"
+    p79_setup "$P79C_SGS6" "$P79C_GITS6" p79_mk_repo_ff
+    mkdir -p "$P79C_GITS6/new.txt/locked"; printf 'secret\n' > "$P79C_GITS6/new.txt/locked/secret"
+    mkdir -p "$P79C_SGS6/new.txt/locked"; printf 'secret\n' > "$P79C_SGS6/new.txt/locked/secret"
+    chmod 000 "$P79C_GITS6/new.txt/locked"
+    chmod 000 "$P79C_SGS6/new.txt/locked"
+    (cd "$P79C_GITS6" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79c_gits6.err"
+    P79C_GITS6_RC=$?
+    (cd "$P79C_SGS6" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgs6.err"
+    P79C_SGS6_RC=$?
+    chmod 755 "$P79C_GITS6/new.txt/locked"
+    chmod 755 "$P79C_SGS6/new.txt/locked"
+    check "phase79c S6 (ff) oracle: precondition -- git's opendir cascade (rc != 0, 'could not open directory' warning then 'cannot opendir' fatal)" \
+        sh -c "test '$P79C_GITS6_RC' -ne 0 && grep -qF \"could not open directory 'new.txt/locked/': Permission denied\" '$WORKDIR/p79c_gits6.err' && grep -qF \"cannot opendir 'new.txt/locked': Permission denied\" '$WORKDIR/p79c_gits6.err'"
+    check "phase79c S6 (ff): sg refuses too (exit 1)" \
+        test "$P79C_SGS6_RC" -eq 1
+    printf "sg: warning: could not open directory 'new.txt/locked/': Permission denied\nsg: cannot opendir 'new.txt/locked': Permission denied\n" > "$WORKDIR/p79c_expected_s6.txt"
+    check "phase79c S6 (ff): sg's stderr matches the two-line opendir-failure wording exactly (own literal, not 'sg: out of memory')" \
+        test "$(cat "$WORKDIR/p79c_sgs6.err")" = "$(cat "$WORKDIR/p79c_expected_s6.txt")"
+    check "phase79c S6 (ff): new.txt/locked/secret survives untouched (fail-closed, not fail-open)" \
+        test "$(cat "$P79C_SGS6/new.txt/locked/secret")" = secret
+
+    P79C_SGS6W="$WORKDIR/phase79c_sgs6w"; P79C_GITS6W="$WORKDIR/phase79c_gits6w"
+    p79_setup "$P79C_SGS6W" "$P79C_GITS6W" p79_mk_repo_3way
+    mkdir -p "$P79C_GITS6W/new.txt/locked"; printf 'secret\n' > "$P79C_GITS6W/new.txt/locked/secret"
+    mkdir -p "$P79C_SGS6W/new.txt/locked"; printf 'secret\n' > "$P79C_SGS6W/new.txt/locked/secret"
+    chmod 000 "$P79C_GITS6W/new.txt/locked"
+    chmod 000 "$P79C_SGS6W/new.txt/locked"
+    (cd "$P79C_GITS6W" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79c_gits6w.err"
+    P79C_GITS6W_RC=$?
+    (cd "$P79C_SGS6W" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgs6w.err"
+    P79C_SGS6W_RC=$?
+    chmod 755 "$P79C_GITS6W/new.txt/locked"
+    chmod 755 "$P79C_SGS6W/new.txt/locked"
+    check "phase79c S6 (3way) oracle: precondition -- git's opendir cascade (rc != 0, same two lines)" \
+        sh -c "test '$P79C_GITS6W_RC' -ne 0 && grep -qF \"could not open directory 'new.txt/locked/': Permission denied\" '$WORKDIR/p79c_gits6w.err' && grep -qF \"cannot opendir 'new.txt/locked': Permission denied\" '$WORKDIR/p79c_gits6w.err'"
+    check "phase79c S6 (3way): sg refuses too (exit 1)" \
+        test "$P79C_SGS6W_RC" -eq 1
+    check "phase79c S6 (3way): sg's stderr matches the two-line opendir-failure wording exactly" \
+        test "$(cat "$WORKDIR/p79c_sgs6w.err")" = "$(cat "$WORKDIR/p79c_expected_s6.txt")"
+    check "phase79c S6 (3way): new.txt/locked/secret survives untouched, no MERGE_HEAD written" \
+        sh -c "test \"\$(cat '$P79C_SGS6W/new.txt/locked/secret')\" = secret -a ! -e '$P79C_SGS6W/.git/MERGE_HEAD'"
+fi
+
+# ---- F5 residuals: recorded and pinned on both sides, NOT this phase's
+# responsibility to fix (same class as the existing B7/row7/row10 residuals
+# in docs/RULES-merge.md). ----
+
+# S3: a candidate directory holding only EMPTY subdirectories (no files at
+# all, not even ignored ones) -- sg's own pre-flight correctly says "no
+# collision" (there is nothing to find, ignored or not), but the underlying
+# write then fails because sg_write_file_mkdirs cannot fopen() a path that
+# is currently a directory. git replaces the whole thing cleanly.
+P79C_SGS3="$WORKDIR/phase79c_sgs3"; P79C_GITS3="$WORKDIR/phase79c_gits3"
+p79_setup "$P79C_SGS3" "$P79C_GITS3" p79_mk_repo_ff
+mkdir -p "$P79C_GITS3/new.txt/emptysub/deeper"
+mkdir -p "$P79C_SGS3/new.txt/emptysub/deeper"
+(cd "$P79C_GITS3" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79C_GITS3_RC=$?
+(cd "$P79C_SGS3" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgs3.err"
+P79C_SGS3_RC=$?
+check "phase79c S3 oracle: precondition -- git replaces the directory-of-only-empty-subdirs cleanly (exit 0)" \
+    sh -c "test '$P79C_GITS3_RC' -eq 0 -a ! -d '$P79C_GITS3/new.txt' -a \"\$(cat '$P79C_GITS3/new.txt')\" = topic-content"
+check "phase79c S3: sg's pre-flight agrees 'no collision' but the underlying write then fails (residual, not this phase's responsibility -- see docs/RULES-merge.md)" \
+    test "$(cat "$WORKDIR/p79c_sgs3.err")" = 'sg: failed to write "new.txt"'
+check "phase79c S3: sg exits 1 and the directory survives (fail-closed, not silently wrong)" \
+    sh -c "test '$P79C_SGS3_RC' -eq 1 -a -d '$P79C_SGS3/new.txt'"
+
+# S4a/S4d: a candidate directory holding an ignored file plus JUNK that
+# merely LOOKS like a .git entry (not a valid repository) -- git replaces
+# the whole thing including the junk; sg over-refuses via the directory
+# bucket, since its scan has no special "is this actually a git repo"
+# check and simply finds the junk's own contents are not ignored. This is
+# the SAFE direction (over-refusal, not data loss), deliberately not
+# "fixed" -- see docs/RULES-merge.md's own Phase 79c note on why not.
+p79c_mk_repo_ff_gitignore() {
+    # Same as p79_mk_repo_ff/p79b_mk_repo_ff but adds a root .gitignore
+    # ignoring *.log, needed by both S4 fixtures.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '*.log\n' > .gitignore && git add .gitignore \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+}
+
+P79C_SGS4A="$WORKDIR/phase79c_sgs4a"; P79C_GITS4A="$WORKDIR/phase79c_gits4a"
+p79_setup "$P79C_SGS4A" "$P79C_GITS4A" p79c_mk_repo_ff_gitignore
+mkdir -p "$P79C_GITS4A/new.txt/.git"; printf 'ref: refs/heads/master\n' > "$P79C_GITS4A/new.txt/.git/HEAD"
+printf 'noise\n' > "$P79C_GITS4A/new.txt/ignored.log"
+mkdir -p "$P79C_SGS4A/new.txt/.git"; printf 'ref: refs/heads/master\n' > "$P79C_SGS4A/new.txt/.git/HEAD"
+printf 'noise\n' > "$P79C_SGS4A/new.txt/ignored.log"
+(cd "$P79C_GITS4A" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79C_GITS4A_RC=$?
+(cd "$P79C_SGS4A" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgs4a.err"
+P79C_SGS4A_RC=$?
+check "phase79c S4a oracle: precondition -- git replaces the junk-.git-plus-ignored-file directory cleanly (exit 0)" \
+    sh -c "test '$P79C_GITS4A_RC' -eq 0 -a ! -d '$P79C_GITS4A/new.txt' -a \"\$(cat '$P79C_GITS4A/new.txt')\" = topic-content"
+p79b_expect_dir_plural ff new.txt > "$WORKDIR/p79c_expected_s4a.txt"
+check "phase79c S4a: sg over-refuses (safe direction, residual -- its scan has no 'is this a real repo' check, see docs/RULES-merge.md)" \
+    sh -c "test '$P79C_SGS4A_RC' -eq 1 -a \"\$(cat '$WORKDIR/p79c_sgs4a.err')\" = \"\$(cat '$WORKDIR/p79c_expected_s4a.txt')\""
+
+P79C_SGS4D="$WORKDIR/phase79c_sgs4d"; P79C_GITS4D="$WORKDIR/phase79c_gits4d"
+p79_setup "$P79C_SGS4D" "$P79C_GITS4D" p79c_mk_repo_ff_gitignore
+mkdir -p "$P79C_GITS4D/new.txt"; printf 'gitdir: /nonexistent\n' > "$P79C_GITS4D/new.txt/.git"
+printf 'noise\n' > "$P79C_GITS4D/new.txt/ignored.log"
+mkdir -p "$P79C_SGS4D/new.txt"; printf 'gitdir: /nonexistent\n' > "$P79C_SGS4D/new.txt/.git"
+printf 'noise\n' > "$P79C_SGS4D/new.txt/ignored.log"
+(cd "$P79C_GITS4D" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79C_GITS4D_RC=$?
+(cd "$P79C_SGS4D" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgs4d.err"
+P79C_SGS4D_RC=$?
+check "phase79c S4d oracle: precondition -- git replaces the directory holding a dangling-gitdir .git FILE plus an ignored file (exit 0)" \
+    sh -c "test '$P79C_GITS4D_RC' -eq 0 -a ! -d '$P79C_GITS4D/new.txt' -a \"\$(cat '$P79C_GITS4D/new.txt')\" = topic-content"
+check "phase79c S4d: sg over-refuses too (same safe-direction residual as S4a)" \
+    sh -c "test '$P79C_SGS4D_RC' -eq 1 -a \"\$(cat '$WORKDIR/p79c_sgs4d.err')\" = \"\$(cat '$WORKDIR/p79c_expected_s4a.txt')\""
+
+# S5a/b/c: a SYMLINK sitting exactly at the candidate path -- treated as a
+# FILE (never descended into, matching sg_untracked_would_be_overwritten's
+# own documented symlink rule), so both sides refuse via the FILE wording,
+# naming the symlink itself; the symlink and whatever it points at survive
+# untouched.
+p79c_symlink_case() {
+    # $1 = case name (a/b/c), $2 = "ln -s" target argument (or "" for
+    # dangling, meaning point at a path that does not exist).
+    p79cs_name="$1"
+    p79cs_target="$2"
+    P79C_SGS5="$WORKDIR/phase79c_sgs5$p79cs_name"
+    P79C_GITS5="$WORKDIR/phase79c_gits5$p79cs_name"
+    p79_setup "$P79C_SGS5" "$P79C_GITS5" p79_mk_repo_ff
+    ln -s "$p79cs_target" "$P79C_GITS5/new.txt"
+    ln -s "$p79cs_target" "$P79C_SGS5/new.txt"
+    (cd "$P79C_GITS5" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79c_gits5$p79cs_name.err"
+    p79cs_git_rc=$?
+    (cd "$P79C_SGS5" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79c_sgs5$p79cs_name.err"
+    p79cs_sg_rc=$?
+    check "phase79c S5$p79cs_name oracle: precondition -- git refuses via the FILE wording naming the symlink itself (exit 1)" \
+        sh -c "test '$p79cs_git_rc' -eq 1 -a \"\$(head -1 '$WORKDIR/p79c_gits5$p79cs_name.err')\" = 'error: The following untracked working tree files would be overwritten by merge:'"
+    check "phase79c S5$p79cs_name: sg refuses too (exit 1)" \
+        test "$p79cs_sg_rc" -eq 1
+    p79_expect_plural ff new.txt > "$WORKDIR/p79c_expected_s5$p79cs_name.txt"
+    check "phase79c S5$p79cs_name: sg's stderr matches the FILE wording naming the symlink 'new.txt'" \
+        test "$(cat "$WORKDIR/p79c_sgs5$p79cs_name.err")" = "$(cat "$WORKDIR/p79c_expected_s5$p79cs_name.txt")"
+    check "phase79c S5$p79cs_name: the symlink itself survives, still pointing at the same target" \
+        test "$(readlink "$P79C_SGS5/new.txt")" = "$p79cs_target"
+}
+
+mkdir -p "$WORKDIR/p79c_s5a_target"
+p79c_symlink_case a "$WORKDIR/p79c_s5a_target"
+
+mkdir -p "$WORKDIR/p79c_s5b_target"
+printf 'leftover\n' > "$WORKDIR/p79c_s5b_target/leftover.txt"
+p79c_symlink_case b "$WORKDIR/p79c_s5b_target"
+
+p79c_symlink_case c "$WORKDIR/p79c_s5c_nonexistent_target"
+
+# --- Phase 79d (round 3): closing gaps found by the round-3 mutation
+# battery, plus new pins for two things already true of the code but never
+# pinned before -- the "!e->deleted" term in the 3-way candidate set, and
+# raw (unquoted) path printing. Fixture shape per the round-3 spec: base
+# commit carries a .gitignore (*.log) and a tracked "keep" file, branches
+# topic, and (every row here is a 3-way merge) master gets one more commit
+# after branching. ---
+
+p79d_mk_repo_3way() {
+    # $1 = target dir. Base: .gitignore (*.log) + keep. topic adds new.txt.
+    # master gets one more commit (m.txt) after branching -- a genuine
+    # 3-way merge fixture.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '*.log\n' > .gitignore && printf 'keep-content\n' > keep && git add .gitignore keep \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-content\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master \
+        && printf 'm-content\n' > m.txt && git add m.txt \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m c2m) > /dev/null 2>&1
+}
+
+p79d_mk_repo_delete() {
+    # $1 = target dir. Base: .gitignore (*.log) + keep + gone.txt. Both
+    # topic and master (after branching) delete gone.txt; topic also adds
+    # t.txt, master also adds m.txt -- a genuine 3-way merge where the
+    # candidate set must NOT include gone.txt, since both sides already
+    # agree it is gone (guards the "!e->deleted" term at cmd_merge.c's
+    # do_three_way_merge candidate-set loop).
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '*.log\n' > .gitignore && printf 'keep-content\n' > keep && printf 'base-gone\n' > gone.txt \
+        && git add .gitignore keep gone.txt \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && git rm -q gone.txt \
+        && printf 'topic-t\n' > t.txt && git add t.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master \
+        && git rm -q gone.txt \
+        && printf 'm-content\n' > m.txt && git add m.txt \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m c2m) > /dev/null 2>&1
+}
+
+# $1 = target dir. Same base shape as p79d_mk_repo_3way; topic adds three
+# files whose names need RAW (unquoted) printing: an embedded tab, a double
+# quote, and NFC UTF-8 bytes (an accented e). Names are built with
+# printf's octal escapes, never a literal character in this script's own
+# source encoding.
+P79D_TAB_NAME=$(printf 't\tab.txt')
+P79D_QUOTE_NAME='q"uote.txt'
+P79D_UTF8_NAME=$(printf 'caf\303\251.txt')
+
+p79d_mk_repo_q() {
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '*.log\n' > .gitignore && printf 'keep-content\n' > keep && git add .gitignore keep \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic-tab\n' > "$P79D_TAB_NAME" \
+        && printf 'topic-quote\n' > "$P79D_QUOTE_NAME" \
+        && printf 'topic-utf8\n' > "$P79D_UTF8_NAME" \
+        && git add "$P79D_TAB_NAME" "$P79D_QUOTE_NAME" "$P79D_UTF8_NAME" \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master \
+        && printf 'm-content\n' > m.txt && git add m.txt \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m c2m) > /dev/null 2>&1
+}
+
+# ---- Q: raw (unquoted) path printing in the plural FILE bucket, 3-way.
+# git prints a space^H^H a tab, then the name verbatim -- no quoting for a
+# tab, a double quote, or UTF-8. Every OTHER path-printing site in
+# cmd_merge.c quotes; this one deliberately does not (docs/RULES-merge.md's
+# Phase 79 section). ----
+
+P79D_SGQ="$WORKDIR/phase79d_sgq"; P79D_GITQ="$WORKDIR/phase79d_gitq"
+p79_setup "$P79D_SGQ" "$P79D_GITQ" p79d_mk_repo_q
+printf 'user-data\n' > "$P79D_GITQ/$P79D_TAB_NAME"
+printf 'user-data\n' > "$P79D_GITQ/$P79D_QUOTE_NAME"
+printf 'user-data\n' > "$P79D_GITQ/$P79D_UTF8_NAME"
+printf 'user-data\n' > "$P79D_SGQ/$P79D_TAB_NAME"
+printf 'user-data\n' > "$P79D_SGQ/$P79D_QUOTE_NAME"
+printf 'user-data\n' > "$P79D_SGQ/$P79D_UTF8_NAME"
+(cd "$P79D_GITQ" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79d_gitq.err"
+P79D_GITQ_RC=$?
+(cd "$P79D_SGQ" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79d_sgq.err"
+P79D_SGQ_RC=$?
+# Same fix as the order oracle above (Phase 79c F1): the tab-prefixed
+# comparison is done directly with `test` (check() execs "$@" itself, no
+# nested `sh -c` needed), using bytes already expanded by THIS shell via
+# $(printf ...) -- never a `$'\t'` ANSI-C literal inside a nested string,
+# which dash (Ubuntu CI's /bin/sh) does not support.
+P79D_GITQ_L2=$(sed -n '2p' "$WORKDIR/p79d_gitq.err")
+P79D_GITQ_L3=$(sed -n '3p' "$WORKDIR/p79d_gitq.err")
+P79D_GITQ_L4=$(sed -n '4p' "$WORKDIR/p79d_gitq.err")
+P79D_EXPECT_L2=$(printf '\t%s' "$P79D_UTF8_NAME")
+P79D_EXPECT_L3=$(printf '\t%s' "$P79D_QUOTE_NAME")
+P79D_EXPECT_L4=$(printf '\t%s' "$P79D_TAB_NAME")
+check "phase79d Q oracle: precondition -- git refuses (exit 2)" \
+    test "$P79D_GITQ_RC" -eq 2
+check "phase79d Q oracle: precondition -- git's 2nd line names the UTF-8 name RAW, tree order first ('c' < 'q' < 't')" \
+    test "$P79D_GITQ_L2" = "$P79D_EXPECT_L2"
+check "phase79d Q oracle: precondition -- git's 3rd line names q\"uote.txt RAW (unquoted double quote)" \
+    test "$P79D_GITQ_L3" = "$P79D_EXPECT_L3"
+check "phase79d Q oracle: precondition -- git's 4th line names t<TAB>ab.txt RAW (embedded tab in the name itself)" \
+    test "$P79D_GITQ_L4" = "$P79D_EXPECT_L4"
+check "phase79d Q: sg refuses too (exit 1)" \
+    test "$P79D_SGQ_RC" -eq 1
+p79_expect_plural 3way "$P79D_UTF8_NAME" "$P79D_QUOTE_NAME" "$P79D_TAB_NAME" > "$WORKDIR/p79d_expected_q.txt"
+check "phase79d Q: sg's stderr matches byte-for-byte (cmp), proving the names go through neither sg_quote_path nor sg_quote_path_delimited" \
+    cmp -s "$WORKDIR/p79d_sgq.err" "$WORKDIR/p79d_expected_q.txt"
+check "phase79d Q: t<TAB>ab.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79D_SGQ/$P79D_TAB_NAME")" = user-data
+check "phase79d Q: q\"uote.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79D_SGQ/$P79D_QUOTE_NAME")" = user-data
+check "phase79d Q: the NFC UTF-8 name is untouched -- still the user's own bytes" \
+    test "$(cat "$P79D_SGQ/$P79D_UTF8_NAME")" = user-data
+
+# ---- D: both sides delete the same path -- must NOT be a candidate (guards
+# the "!e->deleted" term) ----
+
+P79D_SGD="$WORKDIR/phase79d_sgd"; P79D_GITD="$WORKDIR/phase79d_gitd"
+p79_setup "$P79D_SGD" "$P79D_GITD" p79d_mk_repo_delete
+printf 'untracked user data\n' > "$P79D_GITD/gone.txt"
+printf 'untracked user data\n' > "$P79D_SGD/gone.txt"
+(cd "$P79D_GITD" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79d_gitd.err"
+P79D_GITD_RC=$?
+(cd "$P79D_SGD" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79d_sgd.err"
+P79D_SGD_RC=$?
+check "phase79d D oracle: precondition -- git merges cleanly (exit 0), both sides having independently deleted gone.txt is not a collision" \
+    test "$P79D_GITD_RC" -eq 0
+check "phase79d D: sg merges cleanly too (exit 0)" \
+    test "$P79D_SGD_RC" -eq 0
+check "phase79d D: gone.txt (the untracked file) is untouched -- still the user's own bytes" \
+    test "$(cat "$P79D_SGD/gone.txt")" = "untracked user data"
+check "phase79d D: t.txt (topic's own addition) was created" \
+    test "$(cat "$P79D_SGD/t.txt")" = topic-t
+
+# ---- C: 3-way control -- an untracked file at an UNRELATED path still
+# merges cleanly (otherwise the D/P rows below would pass vacuously) ----
+
+P79D_SGC="$WORKDIR/phase79d_sgc"; P79D_GITC="$WORKDIR/phase79d_gitc"
+p79_setup "$P79D_SGC" "$P79D_GITC" p79d_mk_repo_3way
+printf 'unrelated-user-data\n' > "$P79D_GITC/other.txt"
+printf 'unrelated-user-data\n' > "$P79D_SGC/other.txt"
+(cd "$P79D_GITC" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P79D_GITC_RC=$?
+(cd "$P79D_SGC" && "$SG" merge topic) > /dev/null 2>&1
+P79D_SGC_RC=$?
+check "phase79d C oracle: precondition -- git merges cleanly (exit 0) with an unrelated untracked file present" \
+    test "$P79D_GITC_RC" -eq 0
+check "phase79d C: sg merges cleanly too (exit 0)" \
+    test "$P79D_SGC_RC" -eq 0
+check "phase79d C: new.txt was created from theirs" \
+    test "$(cat "$P79D_SGC/new.txt")" = topic-content
+check "phase79d C: the unrelated untracked file survives untouched" \
+    test "$(cat "$P79D_SGC/other.txt")" = unrelated-user-data
+
+# ---- P-staged / P-unstaged: the clean-workdir check runs BEFORE the
+# untracked-overwrite check (docs/RULES-merge.md's Phase 79 ordering
+# bullet) -- a STAGED change to an unrelated tracked path (keep) wins over
+# an untracked collision (new.txt), so both sides report the dirty-workdir
+# refusal, never the untracked one. An UNSTAGED change to that same path is
+# a genuine, pre-existing divergence: git's own dirty check only cares
+# about paths the merge touches (keep is untouched by this merge), so git
+# reports the untracked collision instead, while sg's own clean-workdir
+# check treats ANY unstaged change as disqualifying, regardless of which
+# path. ----
+
+P79D_SGPS="$WORKDIR/phase79d_sgps"; P79D_GITPS="$WORKDIR/phase79d_gitps"
+p79_setup "$P79D_SGPS" "$P79D_GITPS" p79d_mk_repo_3way
+printf 'untracked-new\n' > "$P79D_GITPS/new.txt"
+printf 'untracked-new\n' > "$P79D_SGPS/new.txt"
+printf 'keep-content\nstaged\n' > "$P79D_GITPS/keep"
+printf 'keep-content\nstaged\n' > "$P79D_SGPS/keep"
+(cd "$P79D_GITPS" && git add keep) > /dev/null 2>&1
+(cd "$P79D_SGPS" && "$SG" add keep) > /dev/null 2>&1
+(cd "$P79D_GITPS" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79d_gitps.err"
+P79D_GITPS_RC=$?
+(cd "$P79D_SGPS" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79d_sgps.err"
+P79D_SGPS_RC=$?
+check "phase79d P-staged oracle: precondition -- git refuses (exit 2), the FIRST line is the local-changes wording, not the untracked one" \
+    test "$P79D_GITPS_RC" -eq 2 -a "$(head -1 "$WORKDIR/p79d_gitps.err")" = "error: Your local changes to the following files would be overwritten by merge:"
+check "phase79d P-staged: sg refuses too (exit 1)" \
+    test "$P79D_SGPS_RC" -eq 1
+check "phase79d P-staged: sg's first line is the clean-workdir refusal, not the untracked-collision one" \
+    test "$(head -1 "$WORKDIR/p79d_sgps.err")" = "sg: sg merge requires a clean working directory, but the following changes are not yet committed:"
+check "phase79d P-staged: sg's stderr never mentions the untracked-file collision" \
+    sh -c "! grep -q 'untracked working tree files' '$WORKDIR/p79d_sgps.err'"
+check "phase79d P-staged: new.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79D_SGPS/new.txt")" = untracked-new
+check "phase79d P-staged: keep is untouched -- still the staged content" \
+    test "$(cat "$P79D_SGPS/keep")" = "keep-content
+staged"
+
+P79D_SGPU="$WORKDIR/phase79d_sgpu"; P79D_GITPU="$WORKDIR/phase79d_gitpu"
+p79_setup "$P79D_SGPU" "$P79D_GITPU" p79d_mk_repo_3way
+printf 'untracked-new\n' > "$P79D_GITPU/new.txt"
+printf 'untracked-new\n' > "$P79D_SGPU/new.txt"
+printf 'keep-content\nunstaged\n' > "$P79D_GITPU/keep"
+printf 'keep-content\nunstaged\n' > "$P79D_SGPU/keep"
+(cd "$P79D_GITPU" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p79d_gitpu.err"
+P79D_GITPU_RC=$?
+(cd "$P79D_SGPU" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79d_sgpu.err"
+P79D_SGPU_RC=$?
+check "phase79d P-unstaged oracle: precondition -- git refuses (exit 2), the FIRST line reports the untracked collision (git's own dirty check does not care about an unstaged change to an untouched path)" \
+    test "$P79D_GITPU_RC" -eq 2 -a "$(head -1 "$WORKDIR/p79d_gitpu.err")" = "error: The following untracked working tree files would be overwritten by merge:"
+check "phase79d P-unstaged: sg refuses too (exit 1) -- PRE-EXISTING divergence, see docs/RULES-merge.md's Phase 79 ordering bullet" \
+    test "$P79D_SGPU_RC" -eq 1
+check "phase79d P-unstaged: sg's first line is the clean-workdir refusal, NOT the untracked one -- this is the divergence" \
+    test "$(head -1 "$WORKDIR/p79d_sgpu.err")" = "sg: sg merge requires a clean working directory, but the following changes are not yet committed:"
+check "phase79d P-unstaged: sg's stderr never mentions the untracked-file collision" \
+    sh -c "! grep -q 'untracked working tree files' '$WORKDIR/p79d_sgpu.err'"
+check "phase79d P-unstaged: new.txt is untouched -- still the user's own bytes" \
+    test "$(cat "$P79D_SGPU/new.txt")" = untracked-new
+check "phase79d P-unstaged: keep is untouched -- still the unstaged content" \
+    test "$(cat "$P79D_SGPU/keep")" = "keep-content
+unstaged"
+
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 
 if [ "$FAIL" -gt 0 ]; then

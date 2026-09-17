@@ -19736,3 +19736,342 @@ needs a TOCTOU race no portable fixture can produce. The same goes for a
 symlink-to-directory at the path (never measured, low priority, no
 porcelain produces it) and for the TOCTOU window between the failed
 `unlink` and the `lstat`.
+
+## Phase 79: `sg merge` refuses when the merge would overwrite an untracked
+working tree file
+
+New API `sg_untracked_would_be_overwritten` (`include/sg/apply.h`,
+implemented `src/workdir/apply.c`): given a set of repo-root-relative
+candidate paths a caller is about to CREATE, reports the ones that cannot be
+created without destroying something untracked. Wired into `sg merge`'s
+three write paths (`cmd_merge.c`'s 3-way, fast-forward, and unborn-HEAD
+fast-forward), deliberately NOT into `sg_safe_apply_tree` -- that function is
+shared by `switch`/`reset --hard`, and git's own answer differs there
+(`reset --hard` overwrites an untracked file without complaint, measured).
+
+Two wordings, not one: the ordinary (fast-forward and 3-way) refusal is
+plural ("The following untracked working tree files would be overwritten by
+merge:" + one TAB-prefixed path per line + "Please move or remove them
+before you merge." + "Aborting", with a 3-way-only trailing "Merge with
+strategy ort failed." line); the unborn-HEAD refusal is a genuinely
+different, singular sentence ("Untracked working tree file '<path>' would be
+overwritten by merge."). git's own exit codes are 2 (3-way) / 1
+(fast-forward) / 128 (unborn); sg's is 1 in all three shapes, per this
+project's standing "exit codes are only ever 0 or 1" convention -- this was
+NOT filed as a new numbered entry in CLAUDE.md's deliberate-divergences
+list, since (unlike divergence #3, `sg push`'s 128-vs-1) there is no single
+special exit code being collapsed to match, only the ordinary 0/1 convention
+already documented in CLAUDE.md's Code conventions section; the main
+conversation should revisit this call if it disagrees.
+
+The classification per candidate path P: `lstat(P)`; if it fails `ENOTDIR`
+(some ancestor component exists and is not a directory), walk P's proper
+ancestors shortest-first and take the first non-directory as the blocker B;
+let X be P or B. If X is tracked (any index stage) or ignored, no collision.
+Otherwise X is reported -- naming the blocker rather than the deep candidate
+path is what reproduces git's answer for "`dir` blocks `dir/deep.txt`", and
+naming P (the caller's own spelling) rather than a case/normalization-
+aliased on-disk name is what reproduces git's answer on a folding
+filesystem (`lstat` resolves the alias for you). The ignore query uses a
+direct `sg_ignore_push_dir`/`pop_dir` walk of each candidate's own ancestor
+chain (one `sg_ignore` opened for the whole call), not a cross-reference
+against `sg_status_list_untracked`'s output -- that list holds the on-disk
+spelling, so an exact string compare against it would silently miss the
+case/normalization-aliased row, which is exactly a data-loss bug on the
+user's own machine.
+
+**A defect of the same kind the spec did not mention, found by measurement
+during implementation**: an untracked EMPTY directory sitting exactly at a
+candidate path does not block it (measured against git 2.55.0 -- git
+silently `rmdir`s it and writes the file). The spec's own classification
+algorithm (lstat -> tracked? -> ignored? -> report) does not special-case
+this at all, and applying it literally would report every such empty
+directory as a collision, refusing merges git accepts. Handled with an
+explicit `dir_is_empty` check (opendir/readdir, ignoring "." and ".."): X ==
+P and a directory and empty means "clear", never even reaching the
+tracked/ignored checks; a NON-empty one falls through to the ordinary
+report, the fail-closed direction, since that specific shape was outside
+the measured oracle. Unit-tested directly (`tests/test_untracked_overwrite.c`'s
+`test_empty_directory`, both the empty and non-empty halves) and mutation-
+verified (`if (empty == 1)` mutated to `if (0)` reds exactly that test).
+
+**A second, larger gap found the same way, deliberately left unfixed by this
+phase**: sg's own write mechanism, `sg_write_file_mkdirs`
+(`src/workdir/workdir.c`), does not itself remove an empty directory sitting
+at its target path -- `fopen(path, "wb")` on an existing directory fails
+with EISDIR regardless of whether that directory is empty. Measured directly
+with `sg` alone (no real-git oracle needed to see this, sg's own error is
+enough): merging a branch that adds `new.txt` onto a working tree with an
+untracked EMPTY directory named `new.txt` prints `sg: failed to write
+"new.txt"` and exits 1, where real git merges cleanly. This predates Phase
+79 entirely (`sg_write_file_mkdirs` was not touched by this phase) and is
+NOT specific to merge -- `switch`/`reset --hard`/`undo` share the exact same
+write path and would hit the identical failure. Phase 79's own pre-flight
+check correctly determines "no collision" for this shape (see the previous
+paragraph), so the untracked-overwrite refusal never fires here; what fails
+is a later, unrelated step. `tests/interop.sh`'s `phase79 row7` group
+asserts only what this phase is responsible for (git's own precondition,
+and that sg's failure is NOT the untracked-overwrite message), not full
+end-to-end parity, to avoid either mis-stating sg's real behavior or hiding
+this residual behind a green byte-comparison. Recommended as a future
+phase: teach `sg_write_file_mkdirs` (or its caller) to `rmdir` an empty
+directory blocking its target path before `fopen`.
+
+**A third instance of the SAME underlying write-path gap, found via
+interop's own git-side oracle** (`phase79 row10`): `sg_mkdir_parents`
+(`src/workdir/workdir.c`) calls `mkdir(component, 0755)` for each ancestor
+directory component and treats a non-zero return as harmless exactly when
+`errno == EEXIST`, without checking that the existing entry is actually a
+directory. When an ancestor component is instead an *ignored*, untracked
+FILE (row #10's shape: `a` blocks `a/b/c.txt`, `.gitignore` covers `a`),
+Phase 79's own pre-flight correctly determines "no collision" (ignore beats
+blocking, matching git), so no refusal fires -- but `mkdir("a")` then
+returns `EEXIST` too (a file and a directory give the identical errno), is
+silently treated as "already there", and the later `fopen("a/b/c.txt",
+"wb")` fails with `ENOTDIR`, surfacing as `sg: failed to write
+"a/b/c.txt"` where real git removes the ignored file and merges cleanly.
+Same root cause as the empty-directory gap above (an ancestor-creation step
+that cannot tell "already a directory" apart from "blocked by something
+else"), different trigger (a file, not a directory; reached via the
+ignore-beats-blocking rule rather than the empty-directory rule) -- kept as
+a separate residual rather than folded into the previous paragraph, since a
+future fix for one shape (`rmdir` an empty directory) would not
+automatically fix the other (removing a blocking FILE needs a different
+check, `S_ISDIR` on the `mkdir` failure's target, not just "try rmdir").
+
+**Residuals recorded, not fixed, per the spec's own scope**:
+1. `sg switch` / `sg rebase` / `sg cherry-pick` / `sg revert` have the
+   identical untracked-overwrite gap this phase closes for `sg merge`;
+   measured, git refuses all four, sg still silently overwrites in all
+   four. Recommended next phase.
+2. `sg reset --hard` / `sg undo` overwrite an untracked file too, and so
+   does real git (measured) -- not a defect, recorded so nobody "fixes" it
+   into a divergence later.
+3. A TRACKED file blocking a directory (e.g. `dir` tracked, merge wants
+   `dir/deep.txt`) is unaffected by this phase (`sg_untracked_would_be_
+   overwritten` explicitly excludes any X tracked in the index) -- sg
+   prints `sg: failed to write "dir/deep.txt"` where git resolves a
+   `CONFLICT (file/directory)` and moves the tracked file to `dir~HEAD`.
+   Pre-existing, unrelated to this phase.
+4. `sg merge` refuses an unstaged change to a tracked path git does not
+   care about (`sg_require_clean_workdir` vs git's own, narrower check,
+   §1.3 of the phase spec) -- pre-existing, unrelated to this phase, not
+   touched here.
+5. The empty-directory write-path gap two paragraphs above, and the
+   sibling ignored-blocking-file write-path gap in the paragraph right
+   before this list.
+6. git's unborn-HEAD refusal actually prints a SECOND line this phase's
+   own spec text did not mention, `fatal: read-tree failed`, right after
+   the singular sentence -- measured directly while building this phase's
+   own interop fixture (`tests/interop.sh`'s `phase79 unborn` group now
+   has its own precondition asserting this line, added after the spec's
+   description of the oracle was found incomplete). sg deliberately does
+   NOT reproduce it: it is git's own internal plumbing name leaking into
+   user-facing output (sg has no `read-tree` concept to name), and no
+   other sg message anywhere in this project echoes a git internal
+   command name this way. Recorded here rather than silently matched or
+   silently dropped.
+
+**Oracle measurement caveat**: this project's subagent tooling blocks any
+`git commit`/ref-mutating command from being run by an implementer agent
+(commit authority belongs to the main conversation). The DECIDE items in
+this phase's spec that would have needed a NEW real-git measurement (rather
+than reasoning from an already-measured row, or from `sg`'s own observable
+behavior, both of which remained available) could not be independently
+re-verified by the agent that implemented this phase -- notably the
+"two candidates blocked by the same ancestor" de-duplication row, which is
+implemented per the spec's own explicit API contract (`sorted ... and
+de-duplicated`) rather than from a fresh measurement. The main conversation
+re-ran the actual gates (`make`, `make test`, `interop.sh`, `make
+sanitize`, both fuzzers) itself; where interop's `phase79` git-side
+preconditions could be run, they were, and stand as the measurement for
+every row that has one.
+
+### Phase 79b: the directory bucket, and two spec corrections
+
+git has four wordings for this refusal, not two. When the merge must put a
+FILE at a path where a non-empty untracked DIRECTORY sits, git says
+`Updating the following directories would lose untracked files in them:`
+(unborn HEAD: `Updating '<p>' would lose untracked files in it`, no trailing
+period). `sg_untracked_would_be_overwritten` now returns two buckets.
+Measured rules (docs/RULES-merge.md has the full list):
+
+- The directory bucket fires only when the CANDIDATE PATH ITSELF is that
+  directory and it holds, recursively, at least one non-ignored file. An
+  untracked directory at an ANCESTOR of a candidate does not block (the
+  phase 79 spec draft said it did; measurement said no).
+- A directory whose contents are all ignored passes the pre-flight, and git
+  then replaces it. sg's write still fails there (same write-path gap as
+  rows #7/#10 above), pinned as `phase79b B7`.
+- 3-way / fast-forward with both buckets: directory section first, blank
+  line, file section, one `Aborting` / strategy line.
+
+**The "sorted and de-duplicated" contract in the caveat above is WRONG and
+was removed in this round**: git prints one line per candidate (one blocker
+blocking two candidates prints twice) and keeps CANDIDATE order, not the
+byte order of the reported names (`phase79 no-dedup`, `phase79 order`).
+The `phase79 row15` check was renamed: its fixture takes the "Already up to
+date" early return and never reaches the new code.
+
+### Phase 79c: round-2 fixes from the batch-2 cold read
+
+Oracle (git 2.55.0, `LC_ALL=C`, measured by the main conversation, since
+subagents cannot run `git merge`). git's `error:`/`fatal:` is `sg:` and
+git's exit 2/128 is sg's 1, by project convention.
+
+| id | local untracked shape at the candidate path | git | sg after this round |
+|---|---|---|---|
+| S2 | ~600-level chain, deeper than macOS `PATH_MAX` | warning cascade, then `fatal: cannot lstat '<p>': File name too long` | `sg: cannot lstat '<p>': File name too long` (shallower `<p>`; residual, see RULES-merge.md) |
+| S3 | directory of empty directories only | exit 0, replaced | `sg: failed to write`, dir survives (residual) |
+| S4a | ignored file + junk `.git/HEAD` (not a real repo) | exit 0, replaced | directory-bucket refusal (residual, safe direction) |
+| S4b/c | a real nested repository | directory-bucket refusal | same |
+| S4d | ignored file + `.git` FILE pointing nowhere | exit 0, replaced | directory-bucket refusal (residual) |
+| S5a/b/c | symlink to empty dir / to non-empty dir / dangling | FILE-bucket refusal naming the symlink | same |
+| S6 | `locked/` subdirectory with mode 000 | `warning: could not open directory 'new.txt/locked/': Permission denied` + `fatal: cannot opendir 'new.txt/locked': Permission denied` | same two lines with `sg: warning:` / `sg:` |
+| U1 | UNBORN; dir `d/` then file `f` | `Updating 'd' would lose untracked files in it` | same |
+| U1b | UNBORN; file `a` then dir `z/` | `Untracked working tree file 'a' would be overwritten by merge.` | same (was the dir wording naming `z`) |
+| U2 | UNBORN; dirs `d1/`, `d2/` | names only `d1` | same |
+| O1 | UNBORN; dir `a.txt/`, file `a` blocking `a/x` | `Updating 'a.txt' ...` (candidate order, not name order) | same |
+| O2/U3 | 3-way, any mix and order | directory section first | same |
+
+Fixes:
+
+1. **F1** `phase79 order oracle` nested `$'\t'` inside `sh -c`. dash, Ubuntu's
+   `/bin/sh`, reads that literally, so the check could never pass on CI. The
+   tab comparison now happens in the outer bash.
+2. **F2** an `opendir`/`lstat` failure inside the recursive scan printed
+   `sg: out of memory`. The scan now returns a typed error
+   (`sg_untracked_overwrite_error`, `include/sg/apply.h`) and `cmd_merge.c`
+   prints git's wording. It still fails closed. "out of memory" is left
+   only for allocation failures.
+3. **F3** each scan recursion level held about three 4096-byte path arrays
+   on the stack, about 12KB. On Linux, where `PATH_MAX` equals
+   `SG_PATH_MAX`, a ~2000-level chain is reachable and needs ~24MB, over
+   the 8MB default stack. The scan now extends one heap path buffer in
+   place. `test_deep_recursion_stack_safety` only discriminates on Linux CI;
+   on macOS the OS limit stops the scan first.
+4. **F4** batch 2 assumed that an unborn HEAD with both kinds of collision
+   reports the directory. U1b refuted that: git reports the first collision
+   in candidate order, whatever its kind. `out_first_is_dir` carries it.
+5. **F5** S3, S4a, S4d, S5 recorded and pinned on both sides, no behavior
+   change.
+
+Found by the round-2 cold read and fixed by the main conversation:
+`test_deep_recursion_stack_safety` removed only `.git` in its cleanup,
+leaving the ~1900-level chain in `/tmp` on every `make test`. It now removes
+the repo root and asserts it is gone. `test_first_collision_across_buckets`
+gained the case where the first collision is a file reached through the
+ancestor walk.
+
+### Phase 79 mutation battery (round 3)
+
+Ran 30 mutations against the Phase 79/79b/79c code: 14 unit (`mut79_battery.sh
+unit`) and 16 interop (`mut79_battery.sh interop`). Every interop round did a
+full rebuild and ran the whole `interop.sh`, which had 4925 checks and 0
+skipped at the time of the run.
+
+Red for the named reason: 25 of the 30, plus u12. u12 was predicted GREEN (a
+fail-open `lstat` mid-scan) but came back RED via
+`test_deep_recursion_stack_safety`, and only on macOS -- the deep fixture's
+path crosses `ENAMETOOLONG` there, which is exactly the failure the mutation
+removes the handling for; on Linux, where the path fits, this witness does
+not fire and the mutation would need a different one.
+
+Four came back GREEN, each triaged individually rather than treated as one
+kind of result:
+
+- **u06**, deleting `if (empty == 1) have_x = 0;` (apply.c's empty-directory
+  guard) -- REDUNDANT GUARD, not a gap. Since Phase 79b, an empty directory
+  at the candidate path falls through to the same recursive scan a
+  non-empty one uses, and the scan finds nothing at any depth (ignored or
+  not), which is the same "no collision" answer the deleted guard used to
+  produce directly. The Phase 76 R4-1 two-part test applies: the final
+  answer is unchanged AND the scan has no side effect the guard was
+  additionally the only thing gating (it only opens directories and queries
+  `.gitignore`). Deleted in this round; `dir_is_empty` deleted with it, its
+  only caller.
+- **u11**, dropping the NUL write in `untracked_path_accum_pop` -- GENUINE
+  BLIND SPOT, but UNREACHABLE. It is observable exactly once, in
+  `untracked_overwrite_dir_scan`'s READDIR-error branch, which reads
+  `pa->buf` after the loop's last `pop` call; without the NUL write that
+  read sees a stale, longer path than the one that actually failed. No
+  fixture can reach it: making `readdir()` fail with `errno` still set
+  requires a failure AFTER `opendir()` already succeeded, which this
+  project has no portable way to induce (the S6 fixture used elsewhere in
+  this phase reaches `opendir()` itself failing, a different code path).
+  Left as-is, recorded rather than fixed.
+- **i05**, dropping `!e->ours_present` from the 3-way candidate-set filter
+  (`cmd_merge.c`) -- REDUNDANT for the FINAL ANSWER, kept on purpose. Every
+  path with `ours_present` true is necessarily tracked (it is ours'
+  existing content), and `sg_untracked_would_be_overwritten`'s own
+  `path_tracked_any_stage` check already excludes any tracked path from
+  being reported as an untracked collision -- so removing the term cannot
+  change which paths get refused. It is kept anyway because it is a cheap
+  filter that skips an `lstat` and an ignore-engine query per already-ours
+  path before the tracked check would otherwise discard it; unlike u06, no
+  fixture exists where a 3-way merge has no "clean merge, path already ours,
+  something untracked also happens to sit there" control to test the
+  side-effect half of the two-part rule against, so this one is recorded as
+  a deliberate keep on cost grounds, not proven redundant on both axes the
+  way u06 was.
+- **i04**, dropping `!e->deleted` from the same filter -- GENUINE GAP.
+  Without it, a path both sides of a 3-way merge independently deleted
+  (present in neither the merge result's ours-view nor its write set, but
+  still absent from `ours_present` since ours no longer has it either)
+  becomes a spurious candidate, and an untracked file placed at that name
+  locally makes the merge wrongly refuse. Closed by interop's new
+  `phase79d D` row (this round), which fixture-tests exactly this shape:
+  base has `gone.txt`, both master's post-branch commit and topic delete
+  it, and an untracked `gone.txt` sits in the working tree -- git and sg
+  both merge cleanly. Red-proofed by temporarily dropping the term and
+  confirming `phase79d D` goes red (both the exit-code and the created-file
+  checks).
+
+One more genuine gap, found by the same review rather than the numbered
+battery: the plural FILE-bucket wording (`report_untracked_overwrite`) had
+never been pinned on a name needing RAW (unquoted) output -- a tab, a
+double quote, or non-ASCII UTF-8 -- even though `docs/RULES-merge.md` already
+documented that the code deliberately does not call `sg_quote_path` there.
+Closed by interop's new `phase79d Q` row: three self-colliding names (an
+embedded tab, an embedded double quote, and an NFC-encoded "café.txt") in one
+3-way merge, compared byte-for-byte (`cmp`) against an expected file built
+with `printf`, in git's own candidate/tree order. Red-proofed by routing the
+print through `sg_quote_path` and confirming the `cmp` check alone goes red
+(the quoting would have changed `"` to `\"` and, depending on locale, could
+have altered the UTF-8 bytes) while every other row in the group stays
+green.
+
+Two ordering pins were also added, closing a gap the surveyor flagged as
+"M20": no fixture pinned that a STAGED change to an unrelated tracked path
+beats an untracked collision, even though `docs/RULES-merge.md` already
+described it as measured. `phase79d P-staged` and `phase79d P-unstaged` pin
+both halves: a staged change to `keep` (untouched by the merge) makes both
+git and sg refuse on the clean-workdir wording, never the untracked one; an
+UNSTAGED change to the same path is a genuine, pre-existing divergence
+(recorded in `docs/RULES-merge.md`'s Phase 79 section) -- git's own dirty
+check only looks at paths the merge touches, so git reports the untracked
+collision instead, while sg's `sg_require_clean_workdir` treats any unstaged
+change anywhere as disqualifying and never reaches the untracked check at
+all. Red-proofed together: temporarily skipping the `sg_require_clean_workdir`
+call turns both rows' "first line is the clean-workdir refusal" and
+"never mentions untracked" checks red.
+
+Two smaller findings from the surveyor's own read, not from the numbered
+battery: M2 and M3 (originally two separate planned mutations, "drop the
+fast-forward candidate-set check" and "drop the unborn-HEAD one") turn out to
+be ONE call site -- `do_fast_forward` handles both the ordinary fast-forward
+and the unborn-HEAD fast-forward through the same code path, so a single
+mutation there covers what was planned as two. And M11's original
+batch-1 prediction (an `lstat`-to-`stat` swap "only matters for the dangling
+symlink case", S5c) was wrong: it reds all three of S5a/S5b/S5c, since
+`stat()` following a symlink changes the answer for a symlink to an empty
+directory and to a non-empty one exactly as much as for a dangling one --
+`lstat`'s job here is "never look through the symlink", not "handle the
+dangling case".
+
+Gates after closing the four items above (u06 deleted, `phase79d`
+Q/D/C/P-staged/P-unstaged added): `make` 0 warnings; `make test` 88/88;
+`bash tests/interop.sh` 4954/4954 passed, 0 skipped (4925 + 29 new checks);
+`make sanitize` clean (0 FAIL, 0 ASan/UBSan SUMMARY lines); `make clean &&
+make` 0 warnings; `python3 tests/fuzz_merge.py 200 --seed 73000` 0/200
+mismatches.

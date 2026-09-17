@@ -212,3 +212,51 @@ self-collision (EEXIST against your own lock) on every create/`-f`.
 failure kind is a lock collision; see each file's own module-table row
 (`docs/RULES-merge.md`/`docs/RULES-sequencer.md`) for the specific
 `ref_display` chosen at each call site.
+
+## Phase 79 (extended by Phase 79b): one path-printing site in `cmd_merge.c`
+## deliberately does NOT quote
+
+`report_untracked_overwrite` (`cli/cmd_merge.c`) prints each colliding path
+RAW -- neither `sg_quote_path` nor `sg_quote_path_delimited` -- in BOTH the
+FILE bucket's listing ("The following untracked working tree files would be
+overwritten by merge:") and the DIRECTORY bucket's listing ("Updating the
+following directories would lose untracked files in them:", added Phase
+79b). Measured against git 2.55.0: git prints a space, a double quote and
+UTF-8 verbatim in both, and this project's goal is byte compatibility with
+git's own wording. **It used to be the only function with unquoted
+path-printing sites in that file; Phase 79c's `print_untracked_scan_error`
+(also `cli/cmd_merge.c`) is a second one**, for the same reason -- it prints
+a scan I/O error's path in a message shaped like git's own
+`warning:`/`fatal:` opendir wording (see below), and that wording is not
+quoted either. Both are deliberate, not an oversight; interop checks pin
+the odd-name listing on both sides precisely so that "fixing" either one
+goes red by name. See `docs/RULES-merge.md`'s Phase 79 entry for the rest of
+that check's rules, including the Phase 79b cold-read correction that
+NEITHER bucket is sorted or de-duplicated by this function -- the order and
+any repeated names come straight from the caller's candidate list.
+
+Also from Phase 79, in `sg_untracked_would_be_overwritten`
+(`workdir/apply.c`): a path too long to join with `repo_root`, and an
+`lstat` failure that is neither `ENOENT` nor `ENOTDIR`, both fail CLOSED --
+the path is reported as a collision rather than silently cleared. Same
+direction as the Phase 76 rule above: a check that cannot verify something
+must never answer with the value that lets the destructive operation
+through. Phase 79b's own recursive directory scan extends this: any
+opendir/readdir/lstat/ignore-engine failure encountered partway through
+scanning a candidate directory's contents fails the WHOLE call with -1,
+rather than guessing "clear" about the unscanned remainder.
+
+**Phase 79c**: that "-1 rather than guessing" rule now comes with a
+distinguishable REASON attached (`sg_untracked_overwrite_error`,
+`include/sg/apply.h`) instead of always collapsing to "sg: out of memory" --
+an opendir/readdir/lstat failure during the scan carries its own kind, the
+repo-relative path involved, and the errno, so `cli/cmd_merge.c`'s
+`print_untracked_scan_error` can print git's own truthful wording (measured
+against git 2.55.0: a chmod-000 subdirectory is a PERMISSION error, not an
+allocation one). The recursive scan itself (`untracked_overwrite_dir_scan`,
+`workdir/apply.c`) also stopped keeping a `char[SG_PATH_MAX]` array per
+recursion level -- a `untracked_path_accum` (one heap buffer, shared and
+truncated/extended in place across the whole recursion) and one shared
+`SG_PATH_MAX` scratch buffer for `opendir`/`lstat` absolute paths replace
+what used to be three per-frame stack arrays, so a pathological chain of
+one-letter untracked directories no longer scales stack use with depth.
