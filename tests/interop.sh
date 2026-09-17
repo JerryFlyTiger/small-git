@@ -14020,8 +14020,14 @@ p38_skel() {
     grep -v '^  (' "$1" | grep -v "$(printf '^\t')"
 }
 
+# p38_cmp keeps its Phase 38 name prefix; a later phase that reuses this
+# comparison calls p38_cmp_named with its OWN prefix, so a red line names the
+# phase whose behaviour broke (check names are the diagnostic unit).
 p38_cmp() {
-    _slug="$1"; _label="$2"; _dir="$3"; shift 3
+    p38_cmp_named phase38 "$@"
+}
+p38_cmp_named() {
+    _prefix="$1"; _slug="$2"; _label="$3"; _dir="$4"; shift 4
     ( cd "$_dir" && "$SG" status "$@" ) > "$WORKDIR/p38_${_slug}_sg.txt" 2>/dev/null
     _sg_rc=$?
     # Three environment axes have to be declared on git's side, not
@@ -14055,7 +14061,7 @@ p38_cmp() {
     # or exiting non-zero on some fixture was invisible to this oracle.
     # Real git exits 0 on all 34 of these fixture combinations (measured), so sg
     # must too.
-    check "phase38: sg status ($_label) matches real git skeleton" \
+    check "$_prefix: sg status ($_label) matches real git skeleton" \
         sh -c "test -s '$WORKDIR/p38_${_slug}_git_skel.txt' \
             && cmp -s '$WORKDIR/p38_${_slug}_sg_skel.txt' '$WORKDIR/p38_${_slug}_git_skel.txt' \
             && [ $_sg_rc = 0 ]"
@@ -26826,6 +26832,255 @@ for p80d_combo in "merge:ff" "merge:3way" "switch:3way" "reset:3way" "cherry-pic
             test "$p80d_git_rc" -ne 0
     fi
 done
+
+# ============================================================
+# Phase 81a: typechange rendering (T status letter, split patch, status
+# "typechange:"). This is a PRE-EXISTING bug reproducible with no worktree
+# symlink support at all (see CLAUDE.md's "Build and verification" and
+# docs/RULES-diff.md's Phase 81a note): every fixture below is built with
+# REAL git (ln -s + git add + git commit) and read directly in place by
+# BOTH git and sg -- no cp -R needed anywhere in this group, since neither
+# tool ever writes to these fixtures (pure read-side comparisons: show,
+# log, diff, status). LC_ALL=C on every git invocation, same convention as
+# the rest of this file.
+#
+# Deliberately NOT covered here (see the phase81a spec's "out of scope"
+# item 6, verbatim): combined/--cc diffs, merge, worktree symlink READING
+# (workdir_entry_mode still conservatively reports a real on-disk symlink
+# as 100644 until Phase 81b) -- every fixture below that touches the
+# working tree keeps the worktree file an ORDINARY regular file at
+# measurement time for exactly this reason: a fixture whose worktree
+# contains a real symlink would exercise the accepted, not-yet-fixed
+# transitional wrongness the spec explicitly says not to pin.
+# ============================================================
+
+P81A="$WORKDIR/phase81a"
+mkdir -p "$P81A"
+
+# --- C1: tree-to-tree typechange, 100644 -> 120000 (show/log/diff) ---
+P81A_C1="$P81A/c1"
+mkdir -p "$P81A_C1"
+(cd "$P81A_C1" && git init -q && git config user.email p81a@example.com && git config user.name p81a \
+    && printf 'f.txt' > lf && git add lf && git commit -q -m A) > /dev/null 2>&1
+P81A_C1_A=$(cd "$P81A_C1" && git rev-parse HEAD)
+(cd "$P81A_C1" && rm lf && ln -s f.txt lf && git add lf && git commit -q -m B) > /dev/null 2>&1
+P81A_C1_B=$(cd "$P81A_C1" && git rev-parse HEAD)
+
+(cd "$P81A_C1" && "$SG" show "$P81A_C1_B") > "$WORKDIR/p81a_c1_show_sg.txt" 2>&1
+(cd "$P81A_C1" && LC_ALL=C git show "$P81A_C1_B") > "$WORKDIR/p81a_c1_show_git.txt" 2>&1
+check "phase81a: sg show on a 100644->120000 typechange commit matches git byte-for-byte (split delete+add)" \
+    cmp -s "$WORKDIR/p81a_c1_show_sg.txt" "$WORKDIR/p81a_c1_show_git.txt"
+
+(cd "$P81A_C1" && "$SG" show --name-status "$P81A_C1_B") > "$WORKDIR/p81a_c1_shownm_sg.txt" 2>&1
+(cd "$P81A_C1" && LC_ALL=C git show --name-status "$P81A_C1_B") > "$WORKDIR/p81a_c1_shownm_git.txt" 2>&1
+check "phase81a: sg show --name-status prints T for a typechange commit" \
+    cmp -s "$WORKDIR/p81a_c1_shownm_sg.txt" "$WORKDIR/p81a_c1_shownm_git.txt"
+
+(cd "$P81A_C1" && "$SG" log -p -1 "$P81A_C1_B") > "$WORKDIR/p81a_c1_logp_sg.txt" 2>&1
+(cd "$P81A_C1" && LC_ALL=C git log -p -1 "$P81A_C1_B") > "$WORKDIR/p81a_c1_logp_git.txt" 2>&1
+check "phase81a: sg log -p -1 on a typechange commit matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c1_logp_sg.txt" "$WORKDIR/p81a_c1_logp_git.txt"
+
+(cd "$P81A_C1" && "$SG" log --graph -p -1 "$P81A_C1_B") > "$WORKDIR/p81a_c1_graphp_sg.txt" 2>&1
+(cd "$P81A_C1" && LC_ALL=C git log --graph -p -1 "$P81A_C1_B") > "$WORKDIR/p81a_c1_graphp_git.txt" 2>&1
+check "phase81a: sg log --graph -p -1 on a typechange commit matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c1_graphp_sg.txt" "$WORKDIR/p81a_c1_graphp_git.txt"
+
+(cd "$P81A_C1" && "$SG" diff "$P81A_C1_A" "$P81A_C1_B") > "$WORKDIR/p81a_c1_diff_sg.txt" 2>&1
+(cd "$P81A_C1" && LC_ALL=C git diff "$P81A_C1_A" "$P81A_C1_B") > "$WORKDIR/p81a_c1_diff_git.txt" 2>&1
+check "phase81a: sg diff A B on a typechange matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c1_diff_sg.txt" "$WORKDIR/p81a_c1_diff_git.txt"
+
+(cd "$P81A_C1" && "$SG" diff "$P81A_C1_A" "$P81A_C1_B" --name-status) > "$WORKDIR/p81a_c1_diffnm_sg.txt" 2>&1
+(cd "$P81A_C1" && LC_ALL=C git diff "$P81A_C1_A" "$P81A_C1_B" --name-status) > "$WORKDIR/p81a_c1_diffnm_git.txt" 2>&1
+check "phase81a: sg diff A B --name-status prints T" \
+    cmp -s "$WORKDIR/p81a_c1_diffnm_sg.txt" "$WORKDIR/p81a_c1_diffnm_git.txt"
+
+# --stat/--numstat: ONE row, counted like a modify -- sg already agreed
+# before this phase, this is a regression pin (spec section 3).
+(cd "$P81A_C1" && "$SG" diff "$P81A_C1_A" "$P81A_C1_B" --stat) > "$WORKDIR/p81a_c1_stat_sg.txt" 2>&1
+(cd "$P81A_C1" && LC_ALL=C git diff "$P81A_C1_A" "$P81A_C1_B" --stat) > "$WORKDIR/p81a_c1_stat_git.txt" 2>&1
+check "phase81a: sg diff --stat on a typechange stays a single modify-shaped row (regression pin)" \
+    cmp -s "$WORKDIR/p81a_c1_stat_sg.txt" "$WORKDIR/p81a_c1_stat_git.txt"
+
+(cd "$P81A_C1" && "$SG" diff "$P81A_C1_A" "$P81A_C1_B" --numstat) > "$WORKDIR/p81a_c1_numstat_sg.txt" 2>&1
+(cd "$P81A_C1" && LC_ALL=C git diff "$P81A_C1_A" "$P81A_C1_B" --numstat) > "$WORKDIR/p81a_c1_numstat_git.txt" 2>&1
+check "phase81a: sg diff --numstat on a typechange stays a single modify-shaped row (regression pin)" \
+    cmp -s "$WORKDIR/p81a_c1_numstat_sg.txt" "$WORKDIR/p81a_c1_numstat_git.txt"
+
+# --- C1b: 100755 -> 120000 typechange (both a file-type row, not merely an exec-bit row) ---
+P81A_C1B="$P81A/c1b"
+mkdir -p "$P81A_C1B"
+(cd "$P81A_C1B" && git init -q && git config user.email p81a@example.com && git config user.name p81a \
+    && printf 'exe body' > ex && chmod +x ex && git add ex && git commit -q -m A) > /dev/null 2>&1
+P81A_C1B_A=$(cd "$P81A_C1B" && git rev-parse HEAD)
+(cd "$P81A_C1B" && rm ex && ln -s f.txt ex && git add ex && git commit -q -m B) > /dev/null 2>&1
+P81A_C1B_B=$(cd "$P81A_C1B" && git rev-parse HEAD)
+
+(cd "$P81A_C1B" && "$SG" diff "$P81A_C1B_A" "$P81A_C1B_B") > "$WORKDIR/p81a_c1b_diff_sg.txt" 2>&1
+(cd "$P81A_C1B" && LC_ALL=C git diff "$P81A_C1B_A" "$P81A_C1B_B") > "$WORKDIR/p81a_c1b_diff_git.txt" 2>&1
+check "phase81a: sg diff A B on a 100755->120000 typechange matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c1b_diff_sg.txt" "$WORKDIR/p81a_c1b_diff_git.txt"
+
+(cd "$P81A_C1B" && "$SG" diff "$P81A_C1B_A" "$P81A_C1B_B" --name-status) > "$WORKDIR/p81a_c1b_diffnm_sg.txt" 2>&1
+(cd "$P81A_C1B" && LC_ALL=C git diff "$P81A_C1B_A" "$P81A_C1B_B" --name-status) > "$WORKDIR/p81a_c1b_diffnm_git.txt" 2>&1
+check "phase81a: sg diff A B --name-status on a 100755->120000 typechange prints T" \
+    cmp -s "$WORKDIR/p81a_c1b_diffnm_sg.txt" "$WORKDIR/p81a_c1b_diffnm_git.txt"
+
+# --- C1c: control -- 100644 <-> 100755 is NOT a typechange, stays "old mode"/"new mode" ---
+P81A_C1C="$P81A/c1c"
+mkdir -p "$P81A_C1C"
+(cd "$P81A_C1C" && git init -q && git config user.email p81a@example.com && git config user.name p81a \
+    && printf 'body\n' > m.txt && git add m.txt && git commit -q -m A) > /dev/null 2>&1
+P81A_C1C_A=$(cd "$P81A_C1C" && git rev-parse HEAD)
+(cd "$P81A_C1C" && chmod +x m.txt && git add m.txt && git commit -q -m B) > /dev/null 2>&1
+P81A_C1C_B=$(cd "$P81A_C1C" && git rev-parse HEAD)
+
+(cd "$P81A_C1C" && "$SG" diff "$P81A_C1C_A" "$P81A_C1C_B") > "$WORKDIR/p81a_c1c_diff_sg.txt" 2>&1
+(cd "$P81A_C1C" && LC_ALL=C git diff "$P81A_C1C_A" "$P81A_C1C_B") > "$WORKDIR/p81a_c1c_diff_git.txt" 2>&1
+check "phase81a oracle: precondition -- git renders a bare exec-bit change as old mode/new mode, not a typechange" \
+    grep -q '^old mode' "$WORKDIR/p81a_c1c_diff_git.txt"
+check "phase81a: sg diff A B on a 100644<->100755 exec-bit-only change stays old/new mode (control, NOT a typechange)" \
+    cmp -s "$WORKDIR/p81a_c1c_diff_sg.txt" "$WORKDIR/p81a_c1c_diff_git.txt"
+
+# --- C4: rename-pairing commit (spec item 4) -- a typechange row is never
+# paired with a rename, and exact-content renames on either side of it
+# still pair normally. ---
+P81A_C4="$P81A/c4"
+mkdir -p "$P81A_C4"
+(cd "$P81A_C4" && git init -q && git config user.email p81a@example.com && git config user.name p81a \
+    && printf 'hello\n' > f.txt \
+    && ln -s something lf \
+    && ln -s k lk \
+    && git add f.txt lf lk && git commit -q -m A) > /dev/null 2>&1
+P81A_C4_A=$(cd "$P81A_C4" && git rev-parse HEAD)
+(cd "$P81A_C4" && rm f.txt lf lk \
+    && printf 'hello\n' > lf \
+    && printf 'k' > lk2 \
+    && ln -s k lk3 \
+    && git add -A && git commit -q -m B) > /dev/null 2>&1
+P81A_C4_B=$(cd "$P81A_C4" && git rev-parse HEAD)
+
+(cd "$P81A_C4" && "$SG" diff "$P81A_C4_A" "$P81A_C4_B" --name-status) > "$WORKDIR/p81a_c4_sg.txt" 2>&1
+(cd "$P81A_C4" && LC_ALL=C git diff "$P81A_C4_A" "$P81A_C4_B" --name-status) > "$WORKDIR/p81a_c4_git.txt" 2>&1
+check "phase81a oracle: precondition -- git pairs lk/lk3 as R100, leaves lf a T row and lk2 an A row" \
+    grep -q '^R100' "$WORKDIR/p81a_c4_git.txt"
+check "phase81a: sg diff --name-status pairs the rename/typechange fixture identically to git" \
+    cmp -s "$WORKDIR/p81a_c4_sg.txt" "$WORKDIR/p81a_c4_git.txt"
+
+# --- C5: binary content half (a file with a NUL byte turned into a symlink) ---
+P81A_C5="$P81A/c5"
+mkdir -p "$P81A_C5"
+(cd "$P81A_C5" && git init -q && git config user.email p81a@example.com && git config user.name p81a \
+    && printf 'abc\000def' > bin.dat && git add bin.dat && git commit -q -m A) > /dev/null 2>&1
+P81A_C5_A=$(cd "$P81A_C5" && git rev-parse HEAD)
+(cd "$P81A_C5" && rm bin.dat && ln -s target-path bin.dat && git add bin.dat && git commit -q -m B) > /dev/null 2>&1
+P81A_C5_B=$(cd "$P81A_C5" && git rev-parse HEAD)
+
+(cd "$P81A_C5" && "$SG" diff "$P81A_C5_A" "$P81A_C5_B") > "$WORKDIR/p81a_c5_sg.txt" 2>&1
+(cd "$P81A_C5" && LC_ALL=C git diff "$P81A_C5_A" "$P81A_C5_B") > "$WORKDIR/p81a_c5_git.txt" 2>&1
+check "phase81a oracle: precondition -- git's delete half of the binary typechange says 'Binary files ... differ'" \
+    grep -q 'Binary files' "$WORKDIR/p81a_c5_git.txt"
+check "phase81a: sg diff on a binary-content typechange half matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c5_sg.txt" "$WORKDIR/p81a_c5_git.txt"
+
+# --- C6: unstaged typechange (committed symlink, worktree replaced with an
+# ordinary regular file -- never a real symlink in the worktree at
+# measurement time, see this group's own header note). ---
+P81A_C6="$P81A/c6"
+mkdir -p "$P81A_C6"
+(cd "$P81A_C6" && git init -q && git config user.email p81a@example.com && git config user.name p81a \
+    && ln -s f.txt lf && git add lf && git commit -q -m A) > /dev/null 2>&1
+(cd "$P81A_C6" && rm lf && printf 'now a file' > lf) > /dev/null 2>&1
+
+(cd "$P81A_C6" && "$SG" diff) > "$WORKDIR/p81a_c6_diff_sg.txt" 2>&1
+(cd "$P81A_C6" && LC_ALL=C git diff) > "$WORKDIR/p81a_c6_diff_git.txt" 2>&1
+check "phase81a: sg diff (unstaged 120000->100644 typechange) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c6_diff_sg.txt" "$WORKDIR/p81a_c6_diff_git.txt"
+
+(cd "$P81A_C6" && "$SG" status --porcelain) > "$WORKDIR/p81a_c6_porc_sg.txt" 2>&1
+(cd "$P81A_C6" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81a_c6_porc_git.txt" 2>&1
+check "phase81a: sg status --porcelain (unstaged typechange) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c6_porc_sg.txt" "$WORKDIR/p81a_c6_porc_git.txt"
+
+(cd "$P81A_C6" && "$SG" status --short) > "$WORKDIR/p81a_c6_short_sg.txt" 2>&1
+(cd "$P81A_C6" && LC_ALL=C git status --short) > "$WORKDIR/p81a_c6_short_git.txt" 2>&1
+check "phase81a: sg status --short (unstaged typechange) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c6_short_sg.txt" "$WORKDIR/p81a_c6_short_git.txt"
+
+# p38_skel drops every TAB-indented line, and those are exactly the long
+# format's entry lines ("\ttypechange: lf"), so p38_cmp_named alone never sees
+# the label or its padding (measured: a mutation removing the label's trailing
+# space stayed green). This compares the entry lines themselves, byte-for-byte,
+# from the two raw outputs p38_cmp_named already wrote.
+p81a_entries() {
+    _slug="$1"; _label="$2"
+    grep "$(printf '^\t')" "$WORKDIR/p38_${_slug}_git.txt" > "$WORKDIR/p38_${_slug}_git_ent.txt"
+    grep "$(printf '^\t')" "$WORKDIR/p38_${_slug}_sg.txt" > "$WORKDIR/p38_${_slug}_sg_ent.txt"
+    check "phase81a: sg status ($_label) entry lines match git byte-for-byte" \
+        sh -c "test -s '$WORKDIR/p38_${_slug}_git_ent.txt' \
+            && cmp -s '$WORKDIR/p38_${_slug}_sg_ent.txt' '$WORKDIR/p38_${_slug}_git_ent.txt'"
+}
+
+p38_cmp_named phase81a p81a_c6_long "unstaged typechange long status" "$P81A_C6"
+p81a_entries p81a_c6_long "unstaged typechange long status"
+
+# --- C7: staged typechange (R35 pattern -- committed symlink, worktree
+# replaced with a plain regular file and `git add`ed, so both the index
+# AND the worktree end up as an ordinary regular file: no real symlink in
+# the worktree at measurement time). ---
+P81A_C7="$P81A/c7"
+mkdir -p "$P81A_C7"
+(cd "$P81A_C7" && git init -q && git config user.email p81a@example.com && git config user.name p81a \
+    && ln -s f.txt lf && git add lf && git commit -q -m A) > /dev/null 2>&1
+(cd "$P81A_C7" && rm lf && printf 'now a file' > lf && git add lf) > /dev/null 2>&1
+
+(cd "$P81A_C7" && "$SG" diff --cached) > "$WORKDIR/p81a_c7_cached_sg.txt" 2>&1
+(cd "$P81A_C7" && LC_ALL=C git diff --cached) > "$WORKDIR/p81a_c7_cached_git.txt" 2>&1
+check "phase81a: sg diff --cached (staged 120000->100644 typechange) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c7_cached_sg.txt" "$WORKDIR/p81a_c7_cached_git.txt"
+
+(cd "$P81A_C7" && "$SG" diff --cached --name-status) > "$WORKDIR/p81a_c7_cachednm_sg.txt" 2>&1
+(cd "$P81A_C7" && LC_ALL=C git diff --cached --name-status) > "$WORKDIR/p81a_c7_cachednm_git.txt" 2>&1
+check "phase81a: sg diff --cached --name-status prints T for a staged typechange" \
+    cmp -s "$WORKDIR/p81a_c7_cachednm_sg.txt" "$WORKDIR/p81a_c7_cachednm_git.txt"
+
+(cd "$P81A_C7" && "$SG" status --porcelain) > "$WORKDIR/p81a_c7_porc_sg.txt" 2>&1
+(cd "$P81A_C7" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81a_c7_porc_git.txt" 2>&1
+check "phase81a: sg status --porcelain (staged typechange) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c7_porc_sg.txt" "$WORKDIR/p81a_c7_porc_git.txt"
+
+(cd "$P81A_C7" && "$SG" status --short) > "$WORKDIR/p81a_c7_short_sg.txt" 2>&1
+(cd "$P81A_C7" && LC_ALL=C git status --short) > "$WORKDIR/p81a_c7_short_git.txt" 2>&1
+check "phase81a: sg status --short (staged typechange) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c7_short_sg.txt" "$WORKDIR/p81a_c7_short_git.txt"
+
+p38_cmp_named phase81a p81a_c7_long "staged typechange long status" "$P81A_C7"
+p81a_entries p81a_c7_long "staged typechange long status"
+
+# --- C8: TT (staged typechange AND a further unstaged typechange on the
+# same path, worktree ends up an ordinary regular file again). ---
+P81A_C8="$P81A/c8"
+mkdir -p "$P81A_C8"
+(cd "$P81A_C8" && git init -q && git config user.email p81a@example.com && git config user.name p81a \
+    && printf 'orig\n' > t.txt && git add t.txt && git commit -q -m A) > /dev/null 2>&1
+(cd "$P81A_C8" && rm t.txt && ln -s target t.txt && git add t.txt) > /dev/null 2>&1
+(cd "$P81A_C8" && rm t.txt && printf 'now regular\n' > t.txt) > /dev/null 2>&1
+
+(cd "$P81A_C8" && "$SG" status --porcelain) > "$WORKDIR/p81a_c8_porc_sg.txt" 2>&1
+(cd "$P81A_C8" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81a_c8_porc_git.txt" 2>&1
+check "phase81a oracle: precondition -- git reports TT for the double-typechange fixture" \
+    grep -q '^TT t.txt' "$WORKDIR/p81a_c8_porc_git.txt"
+check "phase81a: sg status --porcelain reports TT byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c8_porc_sg.txt" "$WORKDIR/p81a_c8_porc_git.txt"
+
+(cd "$P81A_C8" && "$SG" status --short) > "$WORKDIR/p81a_c8_short_sg.txt" 2>&1
+(cd "$P81A_C8" && LC_ALL=C git status --short) > "$WORKDIR/p81a_c8_short_git.txt" 2>&1
+check "phase81a: sg status --short reports TT byte-for-byte" \
+    cmp -s "$WORKDIR/p81a_c8_short_sg.txt" "$WORKDIR/p81a_c8_short_git.txt"
+
+p38_cmp_named phase81a p81a_c8_long "TT (double typechange) long status" "$P81A_C8"
+p81a_entries p81a_c8_long "TT (double typechange) long status"
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

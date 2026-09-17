@@ -171,6 +171,19 @@ typedef struct {
    is. */
 int sg_diff_entry_is_combined(const sg_diff_entry *e);
 
+/* Whether a row is a TYPECHANGE: both sides present, both modes known, and
+   the file TYPE differs (the S_IFMT bits, 0170000: 100644<->120000,
+   100755<->120000, 160000<->anything, ...). 100644<->100755 is NOT a
+   typechange -- same type (regular file), only the exec bit differs, and
+   that stays the existing "old mode"/"new mode" rendering. Shared by the
+   patch renderer (diff_out.c splits a typechange into two blocks, delete
+   then add, same as real git), entry_status (name-status prints 'T'), and
+   sg_status_diff_staged/sg_status_diff_unstaged (status reports
+   SG_STATUS_TYPECHANGE). One definition, not three copies. Measured against
+   git 2.55.0; see docs/RULES-diff.md's Phase 81a note and interop's
+   `phase81a` group. */
+int sg_diff_entry_is_typechange(const sg_diff_entry *e);
+
 typedef struct {
     sg_diff_entry *entries; /* sorted by path, byte-wise */
     size_t count;

@@ -20400,3 +20400,73 @@ Residuals carried forward unchanged (recorded, not fixed): findings 4
 (`sg_write_file_mkdirs` still exported as a test-only fixture helper;
 moving it out of the public header would touch ~30 test files) from the
 first cold read.
+
+## Phase 81a: typechange rendering (diff, show, log, status)
+
+First of four Phase 81 commits (81a typechange rendering, 81b worktree
+READ side, 81c worktree WRITE side, 81d merge semantics for symlinks).
+81a is a PRE-EXISTING bug, reachable without any symlink worktree
+support: any commit made by real git that turns a file into a symlink
+(or back) rendered wrong in `sg show`, `sg log -p`, `sg diff A B`,
+`sg diff --cached`, and a staged `sg status`.
+
+Oracle, git 2.55.0, `LC_ALL=C`, `TZ=UTC`, `GIT_CONFIG_NOSYSTEM=1`,
+isolated `HOME`:
+
+| input | git | sg before |
+|---|---|---|
+| patch of a 120000<->100644 (or 100755) row | two blocks, delete first: `deleted file mode <old>` + full delete hunk, then `new file mode <new>` + full add hunk | `old mode`/`new mode` + one modify hunk |
+| `--name-status` | `T` | `M` |
+| `--stat`, `--numstat`, `--shortstat`, `--name-only` | one modify-shaped row | same (already agreed) |
+| `--summary` | `mode change 120000 => 100644` (NOT split) | no CLI flag |
+| rename pairing: delete `f.txt` "hello\n", `lf` link->file "hello\n", `lk` link "k" deleted, `lk2` file "k" added, `lk3` link "k" added | `D f.txt`, `T lf`, `A lk2`, `R100 lk lk3` | same (already agreed) |
+| status staged / unstaged / both | `T `, ` T`, `TT`; long `\ttypechange: <path>` | `M `, ` M`, `MM`; `modified:` |
+| 100644<->100755 | `old mode`/`new mode` (not a typechange) | same |
+
+Implementation: one predicate `sg_diff_entry_is_typechange` (both sides
+present, both modes nonzero, `(mode & 0170000)` differs), used by
+`entry_status` (`T`), `print_patch` (via `render_typechange_blocks`,
+which renders the one row twice through the extracted
+`render_two_way_block` with one side forced ABSENT) and both status
+producers. The diff row itself is NOT split, so stat/numstat/rename
+code is untouched. Combined (`-c`/`--cc`) rows are intercepted before
+the typechange branch.
+
+Transitional, accepted until 81b: `workdir_entry_mode` still reports an
+on-disk symlink as 100644, so a CLEAN committed symlink shows ` T`
+instead of the previous (also wrong) ` M`. Not pinned.
+
+Interop: `phase81a` group, 32 checks, 5110 -> 5142, 0 skipped. Gates
+(main conversation, `gates.sh --rebuild --sanitize`): make 0 warnings,
+make test 90/90, sanitize 0 errors. `python3 tests/fuzz_diff.py` and
+`--histogram`, 200 iterations from seed 0 each: 0 mismatches (both rerun
+with output saved after a docs cold read found the first, unsaved run
+had left no artifact to check the claim against).
+
+Mutation battery (`tests/mutate.sh`, main conversation):
+
+| mutation | result |
+|---|---|
+| predicate `!=` -> `==` (interop and unit test) | RED, including the 100644<->100755 control |
+| predicate always 0 | RED |
+| `entry_status` without `T` | RED, 5 `--name-status` checks only |
+| typechange delete half turned into an add half | RED |
+| add half rendered before delete half | RED |
+| staged producer never TYPECHANGE | RED, 4 staged/TT checks only |
+| unstaged producer never TYPECHANGE | RED, 4 unstaged/TT checks only |
+| `kind_char` `T` -> `X` | RED |
+| patch dispatch never takes the typechange branch | RED |
+| ABSENT guard `\|\|` -> `&&`; mode==0 guard `\|\|` -> `&&` | GREEN: redundant guards -- every ABSENT side constructor also zeroes mode, so each guard alone rejects the same inputs |
+| long label `"typechange: "` -> `"typechange:"` | GREEN at first: `p38_skel` drops every TAB-indented (entry) line. Fixed with `p81a_entries` (+3 checks); rerun RED on exactly those 3 |
+
+Cold reads: round 1 on the batch found (1) three checks named `phase38:`
+because `p38_cmp` hardcoded its prefix -- fixed with `p38_cmp_named`;
+(2) the redundant guards above -- recorded; (3) an unmerged path's
+stage2-vs-worktree companion row passes through the typechange
+predicate, with no unmerged+typechange oracle -- deferred to 81d;
+(4) 160000<->regular has unit coverage only -- recorded. Round 2 on the
+test-only tail (`p38_cmp_named`, `p81a_entries`) found nothing to change;
+it recorded that the 34 Phase 38 `p38_cmp` sites keep the entry-line
+blindness (see `docs/RULES-status.md`), and that the check-name prefix
+string itself is unobservable by any mutation (`check()` never compares
+names), a diagnostic-only property.

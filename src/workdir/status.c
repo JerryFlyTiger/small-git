@@ -124,6 +124,7 @@ int sg_status_diff_staged(const char *git_dir, const char *repo_root,
 
         kind = e->old_side.kind == SG_DIFF_SIDE_ABSENT   ? SG_STATUS_NEW
              : e->new_side.kind == SG_DIFF_SIDE_ABSENT   ? SG_STATUS_DELETED
+             : sg_diff_entry_is_typechange(e)            ? SG_STATUS_TYPECHANGE
                                                          : SG_STATUS_MODIFIED;
         if (status_list_add(out, e->path, e->old_path, kind) != 0) {
             rc = -1;
@@ -209,6 +210,8 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
             kind = SG_STATUS_NEW;
         else if (dl.entries[i].new_side.kind == SG_DIFF_SIDE_ABSENT)
             kind = SG_STATUS_DELETED;
+        else if (sg_diff_entry_is_typechange(&dl.entries[i]))
+            kind = SG_STATUS_TYPECHANGE;
         else
             kind = SG_STATUS_MODIFIED;
 

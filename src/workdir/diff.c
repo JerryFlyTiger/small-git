@@ -201,6 +201,15 @@ int sg_diff_entry_is_combined(const sg_diff_entry *e)
     return e->result.kind != SG_DIFF_SIDE_ABSENT;
 }
 
+int sg_diff_entry_is_typechange(const sg_diff_entry *e)
+{
+    if (e->old_side.kind == SG_DIFF_SIDE_ABSENT || e->new_side.kind == SG_DIFF_SIDE_ABSENT)
+        return 0;
+    if (e->old_side.mode == 0 || e->new_side.mode == 0)
+        return 0;
+    return (e->old_side.mode & 0170000) != (e->new_side.mode & 0170000);
+}
+
 void sg_diff_fill_combined_from_index(const sg_index *idx, sg_diff_list *list)
 {
     size_t i;

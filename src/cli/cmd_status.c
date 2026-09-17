@@ -87,6 +87,12 @@ static const char *kind_label(sg_status_kind kind)
         return "modified:   ";
     case SG_STATUS_DELETED:
         return "deleted:    ";
+    case SG_STATUS_TYPECHANGE:
+        /* Measured against git 2.55.0: "typechange:" is 11 bytes, one
+           trailing space, 12 columns total -- same width as every other
+           label here ("modified:   "), not the same width as "renamed:    "
+           either (also 12), the column is what matters, not the wording. */
+        return "typechange: ";
     }
     return "";
 }
@@ -110,6 +116,8 @@ static char kind_char(sg_status_kind kind)
         return 'M';
     case SG_STATUS_DELETED:
         return 'D';
+    case SG_STATUS_TYPECHANGE:
+        return 'T';
     }
     return '?';
 }

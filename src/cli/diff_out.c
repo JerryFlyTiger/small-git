@@ -105,6 +105,8 @@ static char entry_status(const sg_diff_entry *e)
         return 'A';
     if (e->new_side.kind == SG_DIFF_SIDE_ABSENT)
         return 'D';
+    if (sg_diff_entry_is_typechange(e))
+        return 'T';
     return 'M';
 }
 
@@ -1375,6 +1377,184 @@ static int render_combined_patch(const char *git_dir, const char *repo_root, con
     return 0;
 }
 
+/* Renders one ordinary 2-way "diff --git" block for `e` -- everything from
+   the "diff --git" line through the hunk body (or the binary notice, or
+   nothing at all for a pure mode change). Shared by the ordinary per-row
+   path in print_patch's main loop and, since Phase 81a, by the typechange
+   split below: a typechange row is rendered as TWO calls to this function,
+   one with new_side forced ABSENT (a pure delete) and one with old_side
+   forced ABSENT (a pure add), matching real git's "each half renders
+   EXACTLY like an ordinary pure deletion / pure addition" (measured against
+   git 2.55.0; see docs/RULES-diff.md's Phase 81a note). Returns 0, or 1 on
+   an error already reported to stderr (never a negative number -- the
+   caller only needs to know whether to set its own had_error). */
+static int render_two_way_block(const char *git_dir, const char *repo_root,
+                                const sg_diff_entry *e, sg_diff_algorithm algo)
+{
+    unsigned char *a_data = NULL, *b_data = NULL;
+    size_t a_len = 0, b_len = 0;
+    sg_chunk_missing_info missing;
+    int rc;
+    int old_present, new_present;
+    unsigned char old_eff[SG_SHA1_RAW_LEN], new_eff[SG_SHA1_RAW_LEN];
+    char old_hex[SG_SHA1_HEX_LEN + 1], new_hex[SG_SHA1_HEX_LEN + 1];
+    int wrote_mode_line;
+    int content_changed;
+
+    old_present = e->old_side.kind != SG_DIFF_SIDE_ABSENT;
+    new_present = e->new_side.kind != SG_DIFF_SIDE_ABSENT;
+
+    {
+        int old_verified = sg_diff_side_effective_id(git_dir, &e->old_side, old_eff) == 0;
+        int new_verified = sg_diff_side_effective_id(git_dir, &e->new_side, new_eff) == 0;
+
+        /* An add or a delete always counts as "content changed" even
+           though one side's id is the all-zero ABSENT id and can never
+           legitimately equal the other -- spelled out anyway rather than
+           relying on that, since a diff.h builder is free to emit a row
+           whenever mode OR content changed and every entry here is
+           guaranteed to differ in at least one of the two. An
+           unverified id on either side also forces this true: see
+           side_effective_id's contract for why treating a coincidental
+           byte-match as proof of "unchanged" here would swallow a read
+           error the code below is about to hit and report. */
+        content_changed = !old_present || !new_present || !old_verified || !new_verified ||
+                          memcmp(old_eff, new_eff, SG_SHA1_RAW_LEN) != 0;
+    }
+
+    /* The a/ side of a rename is where the content came from -- measured
+       against git 2.55.0: "diff --git a/exact.txt b/exact_new.txt". */
+    printf("diff --git %s %s\n",
+          sg_quote_path_prefixed("a/", e->old_path != NULL ? e->old_path : e->path),
+          sg_quote_path_prefixed("b/", e->path));
+
+    wrote_mode_line = 0;
+    if (!old_present && new_present) {
+        printf("new file mode %06o\n", e->new_side.mode);
+        wrote_mode_line = 1;
+    } else if (old_present && !new_present) {
+        printf("deleted file mode %06o\n", e->old_side.mode);
+        wrote_mode_line = 1;
+    } else if (old_present && new_present && e->old_side.mode != 0 && e->new_side.mode != 0 &&
+              e->old_side.mode != e->new_side.mode) {
+        printf("old mode %06o\n", e->old_side.mode);
+        printf("new mode %06o\n", e->new_side.mode);
+        wrote_mode_line = 1;
+    }
+
+    /* A rename's own three lines come AFTER any mode lines and BEFORE
+       the index line -- measured against git 2.55.0, which prints
+       "old mode"/"new mode", then "similarity index 100%", then
+       "rename from"/"rename to". The two paths are quoted with
+       sg_quote_path (no a//b/ prefix on these two lines: measured
+       `rename to "tab\there.txt"`). */
+    if (e->old_path != NULL) {
+        /* "copy from"/"copy to" when the source is still there --
+           measured against git 2.55.0; the similarity line above is
+           worded identically either way. */
+        printf("similarity index %d%%\n", e->score);
+        printf("%s from %s\n", e->is_copy ? "copy" : "rename",
+              sg_quote_path(e->old_path));
+        printf("%s to %s\n", e->is_copy ? "copy" : "rename",
+              sg_quote_path(e->path));
+    }
+
+    /* A pure mode change (content unchanged) prints NO index line at all
+       -- measured against git 2.55.0 (oracle rule 3 in sg/diff.h's Phase
+       26 note): "diff --git" + "old mode"/"new mode" is the entire
+       entry, nothing else. Every other case (add/delete/modify/binary)
+       always has content_changed true, since a diff.h builder never
+       emits a row unless mode or content differs and add/delete are
+       unconditionally "content changed" above. */
+    if (!content_changed)
+        return 0;
+
+    /* "index <old7>..<new7>[ <mode>]" -- the mode suffix appears only
+       when no mode line was printed above (measured against git 2.55.0,
+       see sg/diff.h's Phase 26 note): new-file/deleted-file/old+new-mode
+       already said the mode, so the suffix would be redundant there. */
+    sg_sha1_to_hex(old_eff, old_hex);
+    sg_sha1_to_hex(new_eff, new_hex);
+    old_hex[7] = '\0';
+    new_hex[7] = '\0';
+    if (wrote_mode_line)
+        printf("index %s..%s\n", old_hex, new_hex);
+    else
+        printf("index %s..%s %06o\n", old_hex, new_hex,
+              new_present ? e->new_side.mode : e->old_side.mode);
+
+    rc = sg_diff_side_read(git_dir, repo_root, old_side_path(e), &e->old_side, &a_data, &a_len, &missing);
+    if (rc == -2) {
+        sg_chunk_print_missing_error(e->path, &missing);
+        return 1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "sg: warning: cannot read %s\n", sg_quote_path_delimited(e->path));
+        return 1;
+    }
+    rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->new_side, &b_data, &b_len, &missing);
+    if (rc == -2) {
+        sg_chunk_print_missing_error(e->path, &missing);
+        free(a_data);
+        return 1;
+    }
+    if (rc != 0) {
+        fprintf(stderr, "sg: warning: cannot read %s\n", sg_quote_path_delimited(e->path));
+        free(a_data);
+        return 1;
+    }
+
+    if (is_binary_data(a_data, a_len) || is_binary_data(b_data, b_len)) {
+        /* The a/ side names the OLD path, which differs from the new
+           one for a rename -- measured against git 2.55.0, which prints
+           "Binary files a/b.bin and b/c.bin differ". */
+        printf("Binary files %s and %s differ\n",
+              old_present ? sg_quote_path_prefixed("a/", old_side_path(e)) : "/dev/null",
+              new_present ? sg_quote_path_prefixed("b/", e->path) : "/dev/null");
+        free(a_data);
+        free(b_data);
+        return 0;
+    }
+
+    {
+        int had_error = 0;
+
+        if (print_text_diff_body(old_side_path(e), e->path, old_present, new_present,
+                                 a_data, a_len, b_data, b_len, algo) != 0) {
+            fprintf(stderr, "sg: warning: out of memory diffing %s\n", sg_quote_path_delimited(e->path));
+            had_error = 1;
+        }
+        free(a_data);
+        free(b_data);
+        return had_error;
+    }
+}
+
+/* A typechange row rendered as two consecutive ordinary blocks for the SAME
+   path, delete then add -- measured against git 2.55.0 (docs/RULES-diff.md's
+   Phase 81a note): git treats a typechange as if the old-type file was
+   deleted and the new-type file was added, not as a single modify hunk. A
+   typechange row is never paired with a rename (SPEC section 4 / sg/diff.h's
+   Phase 81a note on sg_diff_entry_is_typechange), so old_path is always NULL
+   here and both synthetic entries share `e->path` on both sides. Returns 0,
+   or 1 on an error already reported to stderr. */
+static int render_typechange_blocks(const char *git_dir, const char *repo_root,
+                                    const sg_diff_entry *e, sg_diff_algorithm algo)
+{
+    sg_diff_entry del = *e;
+    sg_diff_entry add = *e;
+    int had_error = 0;
+
+    memset(&del.new_side, 0, sizeof(del.new_side));
+    memset(&add.old_side, 0, sizeof(add.old_side));
+
+    if (render_two_way_block(git_dir, repo_root, &del, algo) != 0)
+        had_error = 1;
+    if (render_two_way_block(git_dir, repo_root, &add, algo) != 0)
+        had_error = 1;
+    return had_error;
+}
+
 static int print_patch(const char *git_dir, const char *repo_root, const sg_diff_list *list, int combined,
                        sg_diff_algorithm algo)
 {
@@ -1388,15 +1568,6 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
 
     for (i = 0; i < list->count; i++) {
         const sg_diff_entry *e = &list->entries[i];
-        unsigned char *a_data = NULL, *b_data = NULL;
-        size_t a_len = 0, b_len = 0;
-        sg_chunk_missing_info missing;
-        int rc;
-        int old_present, new_present;
-        unsigned char old_eff[SG_SHA1_RAW_LEN], new_eff[SG_SHA1_RAW_LEN];
-        char old_hex[SG_SHA1_HEX_LEN + 1], new_hex[SG_SHA1_HEX_LEN + 1];
-        int wrote_mode_line;
-        int content_changed;
 
         if (skip_next) {
             skip_next = 0;
@@ -1441,132 +1612,20 @@ static int print_patch(const char *git_dir, const char *repo_root, const sg_diff
             continue;
         }
 
-        old_present = e->old_side.kind != SG_DIFF_SIDE_ABSENT;
-        new_present = e->new_side.kind != SG_DIFF_SIDE_ABSENT;
-
-        {
-            int old_verified = sg_diff_side_effective_id(git_dir, &e->old_side, old_eff) == 0;
-            int new_verified = sg_diff_side_effective_id(git_dir, &e->new_side, new_eff) == 0;
-
-            /* An add or a delete always counts as "content changed" even
-               though one side's id is the all-zero ABSENT id and can never
-               legitimately equal the other -- spelled out anyway rather than
-               relying on that, since a diff.h builder is free to emit a row
-               whenever mode OR content changed and every entry here is
-               guaranteed to differ in at least one of the two. An
-               unverified id on either side also forces this true: see
-               side_effective_id's contract for why treating a coincidental
-               byte-match as proof of "unchanged" here would swallow a read
-               error the code below is about to hit and report. */
-            content_changed = !old_present || !new_present || !old_verified || !new_verified ||
-                              memcmp(old_eff, new_eff, SG_SHA1_RAW_LEN) != 0;
-        }
-
-        /* The a/ side of a rename is where the content came from -- measured
-           against git 2.55.0: "diff --git a/exact.txt b/exact_new.txt". */
-        printf("diff --git %s %s\n",
-              sg_quote_path_prefixed("a/", e->old_path != NULL ? e->old_path : e->path),
-              sg_quote_path_prefixed("b/", e->path));
-
-        wrote_mode_line = 0;
-        if (!old_present && new_present) {
-            printf("new file mode %06o\n", e->new_side.mode);
-            wrote_mode_line = 1;
-        } else if (old_present && !new_present) {
-            printf("deleted file mode %06o\n", e->old_side.mode);
-            wrote_mode_line = 1;
-        } else if (old_present && new_present && e->old_side.mode != 0 && e->new_side.mode != 0 &&
-                  e->old_side.mode != e->new_side.mode) {
-            printf("old mode %06o\n", e->old_side.mode);
-            printf("new mode %06o\n", e->new_side.mode);
-            wrote_mode_line = 1;
-        }
-
-        /* A rename's own three lines come AFTER any mode lines and BEFORE
-           the index line -- measured against git 2.55.0, which prints
-           "old mode"/"new mode", then "similarity index 100%", then
-           "rename from"/"rename to". The two paths are quoted with
-           sg_quote_path (no a//b/ prefix on these two lines: measured
-           `rename to "tab\there.txt"`). */
-        if (e->old_path != NULL) {
-            /* "copy from"/"copy to" when the source is still there --
-               measured against git 2.55.0; the similarity line above is
-               worded identically either way. */
-            printf("similarity index %d%%\n", e->score);
-            printf("%s from %s\n", e->is_copy ? "copy" : "rename",
-                  sg_quote_path(e->old_path));
-            printf("%s to %s\n", e->is_copy ? "copy" : "rename",
-                  sg_quote_path(e->path));
-        }
-
-        /* A pure mode change (content unchanged) prints NO index line at all
-           -- measured against git 2.55.0 (oracle rule 3 in sg/diff.h's Phase
-           26 note): "diff --git" + "old mode"/"new mode" is the entire
-           entry, nothing else. Every other case (add/delete/modify/binary)
-           always has content_changed true, since a diff.h builder never
-           emits a row unless mode or content differs and add/delete are
-           unconditionally "content changed" above. */
-        if (!content_changed)
+        /* Phase 81a: a typechange is never paired with a rename (SPEC
+           section 4 / sg/diff.h's note on sg_diff_entry_is_typechange), so
+           this check can run before any rename-specific handling below.
+           Measured against git 2.55.0: it renders as two ordinary blocks,
+           delete then add, not as one modify hunk with "old mode"/"new
+           mode". */
+        if (sg_diff_entry_is_typechange(e)) {
+            if (render_typechange_blocks(git_dir, repo_root, e, algo) != 0)
+                had_error = 1;
             continue;
+        }
 
-        /* "index <old7>..<new7>[ <mode>]" -- the mode suffix appears only
-           when no mode line was printed above (measured against git 2.55.0,
-           see sg/diff.h's Phase 26 note): new-file/deleted-file/old+new-mode
-           already said the mode, so the suffix would be redundant there. */
-        sg_sha1_to_hex(old_eff, old_hex);
-        sg_sha1_to_hex(new_eff, new_hex);
-        old_hex[7] = '\0';
-        new_hex[7] = '\0';
-        if (wrote_mode_line)
-            printf("index %s..%s\n", old_hex, new_hex);
-        else
-            printf("index %s..%s %06o\n", old_hex, new_hex,
-                  new_present ? e->new_side.mode : e->old_side.mode);
-
-        rc = sg_diff_side_read(git_dir, repo_root, old_side_path(e), &e->old_side, &a_data, &a_len, &missing);
-        if (rc == -2) {
-            sg_chunk_print_missing_error(e->path, &missing);
+        if (render_two_way_block(git_dir, repo_root, e, algo) != 0)
             had_error = 1;
-            continue;
-        }
-        if (rc != 0) {
-            fprintf(stderr, "sg: warning: cannot read %s\n", sg_quote_path_delimited(e->path));
-            had_error = 1;
-            continue;
-        }
-        rc = sg_diff_side_read(git_dir, repo_root, e->path, &e->new_side, &b_data, &b_len, &missing);
-        if (rc == -2) {
-            sg_chunk_print_missing_error(e->path, &missing);
-            free(a_data);
-            had_error = 1;
-            continue;
-        }
-        if (rc != 0) {
-            fprintf(stderr, "sg: warning: cannot read %s\n", sg_quote_path_delimited(e->path));
-            free(a_data);
-            had_error = 1;
-            continue;
-        }
-
-        if (is_binary_data(a_data, a_len) || is_binary_data(b_data, b_len)) {
-            /* The a/ side names the OLD path, which differs from the new
-               one for a rename -- measured against git 2.55.0, which prints
-               "Binary files a/b.bin and b/c.bin differ". */
-            printf("Binary files %s and %s differ\n",
-                  old_present ? sg_quote_path_prefixed("a/", old_side_path(e)) : "/dev/null",
-                  new_present ? sg_quote_path_prefixed("b/", e->path) : "/dev/null");
-            free(a_data);
-            free(b_data);
-            continue;
-        }
-
-        if (print_text_diff_body(old_side_path(e), e->path, old_present, new_present,
-                                 a_data, a_len, b_data, b_len, algo) != 0) {
-            fprintf(stderr, "sg: warning: out of memory diffing %s\n", sg_quote_path_delimited(e->path));
-            had_error = 1;
-        }
-        free(a_data);
-        free(b_data);
     }
 
     return had_error ? -1 : 0;
