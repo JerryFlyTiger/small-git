@@ -449,3 +449,85 @@ Phase 79c section).
   interop (the depth depends on the platform's `PATH_MAX` and on the repo's
   absolute location); `test_deep_recursion_stack_safety` covers only "fails
   closed, never crashes".
+
+## Phase 80: the blocker walk no longer needs `lstat(P)` to fail ENOTDIR, and
+## `sg_merge_result_apply` deletes before it creates
+
+**F3(a): a blocking ancestor is now found by walking P's proper ancestors
+UNCONDITIONALLY, shortest-first, not only when `lstat(P)` itself fails with
+ENOTDIR.** The pre-Phase-80 code only ran the ancestor walk as a fallback
+after `lstat(P)` failed ENOTDIR -- correct for an ordinary blocking file,
+but wrong for a SYMLINK ancestor: `lstat` resolves every path component
+except the FINAL one, so `lstat("a/b/c.txt")` where `a` is a symlink
+follows `a` into whatever it points at and answers about THAT location
+instead (ENOENT if the target has no `b/c.txt`, or even success if it
+does) -- neither of which is ENOTDIR, so the old code silently read this as
+"no collision" and let the write proceed straight through the symlink
+(see `docs/RULES-paths-strings.md`'s Phase 80 entry for the write-side
+half of this same fix). The walk now runs first, always, and its own
+`lstat` on each ancestor is likewise never followed for that ancestor
+itself, so a symlink ancestor is found regardless of what it points at or
+whether the target exists at all. Measured against git 2.55.0: A4 (a
+non-ignored symlink `a` blocking `a/b/c.txt`) now correctly refuses,
+naming `a`, in the file bucket; A6 (same shape, but `a` points at a REAL
+in-repo directory) also refuses naming `a`; A3/A7 (the ignored variants of
+each) report no collision, matching git's own silent replacement. All
+pre-Phase-80 rows (row #7/#8/#9/#10, B7, S2-S6) stay green under this
+change -- the walk's ANSWER for an ordinary file blocker is unchanged, only
+WHEN it runs changed.
+
+**F3(b): the recursive directory scan (`untracked_overwrite_dir_has_
+nonignored`, `workdir/apply.c`) now takes an optional `idx` parameter.**
+When non-NULL, a path tracked at any stage is skipped the same way an
+ignored one is (it does not make the scan report "found"), but unlike an
+ignored directory it does not stop recursion into siblings -- a directory
+can hold both a tracked file the SAME merge is about to delete and a
+genuinely untracked one, and only the latter should block. This closes the
+T3/T4 shape: a merge that deletes tracked `d/x.txt` and adds a plain file
+`d` used to have its own pre-flight refuse, naming `d`, because the scan
+found `d/x.txt` still sitting on disk and had no way to know it was about
+to be removed by this same operation. `sg_untracked_would_be_overwritten`'s
+own pre-flight caller passes its real `idx`; `sg_worktree_clear_write_path`
+(see `docs/RULES-paths-strings.md`) always passes `NULL` -- see that
+function's own header comment for why the exemption is deliberately
+write-time-absent, not a second copy of the same rule with a different
+answer.
+
+**F4: `sg_merge_result_apply` (`src/workdir/merge.c`) now does every
+deletion its result calls for BEFORE any write, in two full passes over
+`result->entries` rather than one interleaved pass in result (path) order**
+-- git's own `check_updates` order, and what `sg_apply_tree_to_workdir`
+already did. The pre-Phase-80 single pass could write a new file at `d`
+before deleting a tracked `d/x.txt` still sitting underneath it in the OLD
+tree: the write failed outright (a directory can't be replaced by a file
+until it's empty) while the tracked deletion had already gone through --
+`sg merge`/`sg cherry-pick` left a HALF-APPLIED state, `d/x.txt` gone AND
+`d` not created. Splitting into a deletion-only pass followed by the
+existing write pass removes the ordering dependency: by the time any write
+runs, everything this SAME merge result deletes is already gone, so a
+directory a write needs to replace (via `sg_worktree_clear_write_path`) is
+already clear of anything this merge itself removes. **Only the filesystem
+side effect moved -- no stdout/stderr byte or index field changed for any
+existing case**, since the deletion branch never printed anything and
+never touched `index_out`; verify with `python3 tests/fuzz_merge.py 200`
+(oracle: real git) after touching this function, same rule this file
+already states for `sg_merge_content`. T3 (deleted file does not match any
+ignore rule) and T4 (it does, a `.log` file) are the two oracle rows this
+closes, both for the FF and 3-way merge paths and for `sg cherry-pick`
+(which shares `run_todo`'s call into the same `sg_merge_result_apply`, see
+`docs/RULES-sequencer.md`).
+
+**Phase 80 fix round (cold-read finding 2): `conflict_no_workdir_file`'s
+own removal (rename/rename-1to2's original-path entry, Phase 49) is ALSO
+in the delete-first pass now, not left interleaved in the write pass by
+path order.** It is semantically a delete (git leaves no file at the old
+name) exactly like the plain `e->deleted` branch above, and leaving it in
+the write pass meant F4's own claim ("every deletion runs before every
+write") was false for this one entry kind -- a merge whose rename source
+happens to sit where a DIFFERENT entry's write needs to land could still
+half-apply. Both delete-pass branches now go through the SAME guarded
+delete (`sg_remove_file_worktree`, see `docs/RULES-paths-strings.md`'s
+delete-side entry) and the same escalation-on-failure discipline: a failed
+delete sets `content_missing = 1` and prints `sg: cannot remove "<p>"`,
+aborting the whole apply rather than being silently swallowed the way a
+bare `remove()` failure used to be here.

@@ -24783,18 +24783,13 @@ check "phase79 row6: sg printed no untracked-overwrite refusal" \
     sh -c "! grep -q 'would be overwritten by merge' '$WORKDIR/p79_sg6.err'"
 
 # ---- row #7: an untracked EMPTY directory exactly at the added path --
-# git removes it and merges cleanly. sg's own PRE-FLIGHT check (this
-# phase's own responsibility) correctly determines "no collision" -- unit-
-# tested directly in tests/test_untracked_overwrite.c's
-# test_empty_directory -- but sg's underlying write path
-# (sg_write_file_mkdirs, src/workdir/workdir.c) does not itself rmdir an
-# empty directory sitting in the way, a PRE-EXISTING gap unrelated to this
-# phase (it predates this patch; sg_write_file_mkdirs was not touched).
-# So the two sides are NOT asserted byte-identical end to end here --
-# doing so would either mis-state sg's real behavior or hide the residual.
-# What IS asserted: git's own precondition, and that sg's failure is NOT
-# the untracked-overwrite refusal this phase adds (proving the pre-flight
-# itself got this row right; the residual is recorded in docs/DESIGN.md). ----
+# git removes it and merges cleanly. Phase 80's F1/F2 fix closed the
+# write-path gap this row used to be pinned against (sg_write_file_mkdirs's
+# plain fopen() could not replace an existing directory, empty or not) --
+# sg_worktree_clear_write_path now removes an expendable directory sitting
+# at the write target before sg_write_file_worktree creates the file, so
+# this row is now asserted as FULL parity with git, not just "the pre-flight
+# got it right". ----
 
 P79_SG7="$WORKDIR/phase79_sg7"; P79_GIT7="$WORKDIR/phase79_git7"
 p79_setup "$P79_SG7" "$P79_GIT7" p79_mk_repo_ff
@@ -24803,9 +24798,12 @@ mkdir "$P79_SG7/new.txt"
 (cd "$P79_GIT7" && LC_ALL=C git merge topic) > /dev/null 2>&1
 P79_GIT7_RC=$?
 (cd "$P79_SG7" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg7.err"
+P79_SG7_RC=$?
 check "phase79 row7 oracle: precondition -- git removes the empty directory and merges cleanly" \
     sh -c "test '$P79_GIT7_RC' -eq 0 -a \"\$(cat '$P79_GIT7/new.txt')\" = topic-content"
-check "phase79 row7: sg's own pre-flight does NOT report this as an untracked-overwrite collision (residual: the write itself still fails, see docs/DESIGN.md)" \
+check "phase79 row7: sg now also merges cleanly (exit 0), the empty directory replaced by the file" \
+    sh -c "test '$P79_SG7_RC' -eq 0 -a \"\$(cat '$P79_SG7/new.txt')\" = topic-content"
+check "phase79 row7: sg printed no untracked-overwrite refusal" \
     sh -c "! grep -q 'would be overwritten by merge' '$WORKDIR/p79_sg7.err'"
 
 # ---- row #8: an untracked FILE blocking a directory component names the
@@ -24847,6 +24845,37 @@ p79_mk_repo_ff_deep() {
         && git switch -q master) > /dev/null 2>&1
 }
 
+# Phase 80 follow-up: 3way and unborn siblings of p79_mk_repo_ff_deep above,
+# same "topic adds a/b/c.txt = deep" shape, needed for the A1/A5 rows in
+# every mode the oracle table has a value for.
+p79d_mk_repo_3way_deep() {
+    p79_mk_repo_ff_deep "$1"
+    (cd "$1" && printf 'm\n' > master.txt && git add master.txt \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m c2m) \
+        > /dev/null 2>&1
+}
+
+p79_mk_repo_unborn_deep() {
+    # Same construction p79_mk_repo_unborn uses (rm the ref + rewrite HEAD
+    # directly, not symbolic-ref -- see that function's own comment for why
+    # a simpler approach does not reproduce git's actual unborn-HEAD merge
+    # codepath), but topic adds a/b/c.txt = deep (two levels) instead of a
+    # single new.txt.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'seed\n' > seed.txt && git add seed.txt \
+        && GIT_AUTHOR_DATE="1699999900 +0000" GIT_COMMITTER_DATE="1699999900 +0000" git commit -q -m seed \
+        && git branch topic \
+        && git switch -q topic \
+        && mkdir -p a/b && printf 'deep\n' > a/b/c.txt && git add a/b/c.txt \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m t1 \
+        && git switch -q master) > /dev/null 2>&1
+    (cd "$1" && rm -f .git/refs/heads/master \
+        && printf 'ref: refs/heads/master\n' > .git/HEAD \
+        && rm -f .git/index seed.txt) > /dev/null 2>&1
+}
+
 P79_SG9="$WORKDIR/phase79_sg9"; P79_GIT9="$WORKDIR/phase79_git9"
 p79_setup "$P79_SG9" "$P79_GIT9" p79_mk_repo_ff_deep
 printf 'blocker\n' > "$P79_GIT9/a"
@@ -24866,20 +24895,11 @@ check "phase79 row9: blocker file 'a' is untouched -- still the user's own bytes
     test "$(cat "$P79_SG9/a")" = blocker
 
 # ---- row #10: as row #8, but the blocking file is IGNORED -- git merges
-# (ignore beats blocking). sg's OWN pre-flight (this phase's responsibility)
-# correctly agrees "no untracked-overwrite collision" -- measured, sg prints
-# no refusal -- but the merge as a WHOLE still fails on sg, for a reason
-# outside this phase's scope: sg_mkdir_parents (src/workdir/workdir.c)
-# treats `mkdir("a")` returning EEXIST as "the directory is already there"
-# without checking it really IS a directory, so it silently continues past
-# a blocking FILE the same way it would past an existing directory, and the
-# later write into "a/b/c.txt" then fails for its own unrelated reason. This
-# is the SAME underlying write-path gap as row #7's empty-directory residual
-# (see docs/DESIGN.md's Phase 79 section), just reached via a different
-# shape (an ignored blocking FILE rather than an empty blocking DIRECTORY).
-# Asserted honestly rather than claiming end-to-end parity: git's own
-# precondition, and that sg's own pre-flight check did its job (no
-# untracked-overwrite refusal), not that the merge as a whole succeeds. ----
+# (ignore beats blocking). sg's OWN pre-flight agrees "no untracked-overwrite
+# collision", and as of Phase 80's F1/F2 fix, sg_worktree_clear_write_path's
+# ancestor walk now unlinks an IGNORED blocking ancestor before the write --
+# so this row, like row #7, is now full parity with git rather than "the
+# pre-flight got it right but the write still failed". ----
 
 P79_SG10="$WORKDIR/phase79_sg10"; P79_GIT10="$WORKDIR/phase79_git10"
 p79_setup "$P79_SG10" "$P79_GIT10" p79_mk_repo_ff_deep
@@ -24890,9 +24910,12 @@ printf 'blocker\n' > "$P79_SG10/a"
 (cd "$P79_GIT10" && LC_ALL=C git merge topic) > /dev/null 2>&1
 P79_GIT10_RC=$?
 (cd "$P79_SG10" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79_sg10.err"
+P79_SG10_RC=$?
 check "phase79 row10 oracle: precondition -- git merges through the ignored blocker" \
     test "$P79_GIT10_RC" -eq 0
-check "phase79 row10: sg's own pre-flight does NOT report this as an untracked-overwrite collision (residual: the write itself still fails, see docs/DESIGN.md)" \
+check "phase79 row10: sg now also merges through the ignored blocker (exit 0)" \
+    sh -c "test '$P79_SG10_RC' -eq 0 -a \"\$(cat '$P79_SG10/a/b/c.txt')\" = deep"
+check "phase79 row10: sg printed no untracked-overwrite refusal" \
     sh -c "! grep -q 'would be overwritten by merge' '$WORKDIR/p79_sg10.err'"
 
 # ---- row #13: a case-aliased untracked NEW.TXT while the merge adds
@@ -25407,17 +25430,11 @@ check "phase79b B6 (combined buckets): sg's stderr matches the exact combined by
 # REPLACES the local directory (and its all-ignored contents) entirely with
 # theirs' plain FILE, same as a plain ignored FILE getting silently
 # overwritten (row #4 above; the previously-ignored nested content does not
-# survive, it is gone along with the directory that held it). Measured: sg's
-# own PRE-FLIGHT check (this phase's own responsibility) correctly agrees
-# "no collision" -- no untracked-overwrite refusal is printed -- but sg's
-# underlying write path (sg_write_file_mkdirs, src/workdir/workdir.c) does
-# not itself rmdir/replace a directory sitting in the way (fopen() on an
-# existing directory path fails), a PRE-EXISTING gap this phase does not
-# touch, the SAME shape as row #7's and row #10's own residuals above (see
-# docs/DESIGN.md). So the two sides are NOT asserted byte-identical end to
-# end here -- what IS asserted: git's own precondition, and that sg's
-# pre-flight did its job correctly (no untracked-overwrite refusal of
-# either wording). ----
+# survive, it is gone along with the directory that held it). sg's own
+# PRE-FLIGHT check correctly agrees "no collision", and as of Phase 80's
+# F1/F2 fix, sg_worktree_clear_write_path now removes the whole all-ignored
+# subtree before the write -- full parity with git, not just "the pre-flight
+# got it right", same upgrade as rows #7/#10 above. ----
 
 P79B_SG7="$WORKDIR/phase79b_sg7"; P79B_GIT7="$WORKDIR/phase79b_git7"
 p79_setup "$P79B_SG7" "$P79B_GIT7" p79b_mk_repo_ff
@@ -25428,9 +25445,12 @@ printf 'noise2\n' > "$P79B_GIT7/new.txt/sub/deep.log"; printf 'noise2\n' > "$P79
 (cd "$P79B_GIT7" && LC_ALL=C git merge topic) > /dev/null 2>&1
 P79B_GIT7_RC=$?
 (cd "$P79B_SG7" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p79b_sg7.err"
+P79B_SG7_RC=$?
 check "phase79b B7 oracle: precondition -- git merges through cleanly (exit 0); new.txt becomes theirs' plain FILE, replacing the local directory entirely" \
     sh -c "test '$P79B_GIT7_RC' -eq 0 -a ! -d '$P79B_GIT7/new.txt' -a \"\$(cat '$P79B_GIT7/new.txt')\" = topic-content"
-check "phase79b B7: sg's own pre-flight does NOT report this as an untracked-overwrite collision (residual: the write itself still fails, see docs/DESIGN.md)" \
+check "phase79b B7: sg now also merges cleanly, replacing the all-ignored directory entirely" \
+    sh -c "test '$P79B_SG7_RC' -eq 0 -a ! -d '$P79B_SG7/new.txt' -a \"\$(cat '$P79B_SG7/new.txt')\" = topic-content"
+check "phase79b B7: sg's own pre-flight did not report this as an untracked-overwrite collision" \
     sh -c "! grep -qE 'would be overwritten by merge|would lose untracked files' '$WORKDIR/p79b_sg7.err'"
 
 # ---- B8: a NESTED non-ignored file (two levels deep inside the candidate
@@ -25650,15 +25670,17 @@ else
         sh -c "test \"\$(cat '$P79C_SGS6W/new.txt/locked/secret')\" = secret -a ! -e '$P79C_SGS6W/.git/MERGE_HEAD'"
 fi
 
-# ---- F5 residuals: recorded and pinned on both sides, NOT this phase's
-# responsibility to fix (same class as the existing B7/row7/row10 residuals
-# in docs/RULES-merge.md). ----
+# ---- F5 residuals: recorded and pinned on both sides. S3 was in this same
+# class (a write-path gap, not this phase's responsibility) until Phase 80's
+# F1/F2 fix closed it, same as B7/row7/row10 above -- S4a/S4d below remain
+# genuine residuals (an over-refusal, the safe direction, deliberately not
+# "fixed" -- see docs/RULES-merge.md). ----
 
 # S3: a candidate directory holding only EMPTY subdirectories (no files at
 # all, not even ignored ones) -- sg's own pre-flight correctly says "no
-# collision" (there is nothing to find, ignored or not), but the underlying
-# write then fails because sg_write_file_mkdirs cannot fopen() a path that
-# is currently a directory. git replaces the whole thing cleanly.
+# collision" (there is nothing to find, ignored or not), and as of Phase
+# 80's F1/F2 fix, sg_worktree_clear_write_path now removes the whole empty
+# subtree before the write -- full parity with git, not a residual anymore.
 P79C_SGS3="$WORKDIR/phase79c_sgs3"; P79C_GITS3="$WORKDIR/phase79c_gits3"
 p79_setup "$P79C_SGS3" "$P79C_GITS3" p79_mk_repo_ff
 mkdir -p "$P79C_GITS3/new.txt/emptysub/deeper"
@@ -25669,10 +25691,8 @@ P79C_GITS3_RC=$?
 P79C_SGS3_RC=$?
 check "phase79c S3 oracle: precondition -- git replaces the directory-of-only-empty-subdirs cleanly (exit 0)" \
     sh -c "test '$P79C_GITS3_RC' -eq 0 -a ! -d '$P79C_GITS3/new.txt' -a \"\$(cat '$P79C_GITS3/new.txt')\" = topic-content"
-check "phase79c S3: sg's pre-flight agrees 'no collision' but the underlying write then fails (residual, not this phase's responsibility -- see docs/RULES-merge.md)" \
-    test "$(cat "$WORKDIR/p79c_sgs3.err")" = 'sg: failed to write "new.txt"'
-check "phase79c S3: sg exits 1 and the directory survives (fail-closed, not silently wrong)" \
-    sh -c "test '$P79C_SGS3_RC' -eq 1 -a -d '$P79C_SGS3/new.txt'"
+check "phase79c S3: sg now also replaces the whole empty subtree cleanly (exit 0)" \
+    sh -c "test '$P79C_SGS3_RC' -eq 0 -a ! -d '$P79C_SGS3/new.txt' -a \"\$(cat '$P79C_SGS3/new.txt')\" = topic-content"
 
 # S4a/S4d: a candidate directory holding an ignored file plus JUNK that
 # merely LOOKS like a .git entry (not a valid repository) -- git replaces
@@ -25992,6 +26012,820 @@ check "phase79d P-unstaged: new.txt is untouched -- still the user's own bytes" 
 check "phase79d P-unstaged: keep is untouched -- still the unstaged content" \
     test "$(cat "$P79D_SGPU/keep")" = "keep-content
 unstaged"
+
+# ============================================================
+# Phase 80: working-tree write side -- never write through a symlink,
+# replace what git replaces, delete before create. Reuses p79_setup,
+# p79_mk_repo_ff, p79_mk_repo_ff_deep, p79d_mk_repo_3way from the Phase 79
+# groups above. "@OUT" from the phase spec is a directory created per
+# fixture under $WORKDIR, outside either repo. Check names are prefixed
+# "phase80 <id>", matching the oracle table's row ids in docs/DESIGN.md's
+# Phase 80 section.
+# ============================================================
+
+# ---- A3: an IGNORED symlink 'a' -> @OUT blocking a/b/c.txt -- merges
+# cleanly, @OUT's own contents untouched (the symlink itself is replaced by
+# a fresh real directory, never traversed into). ----
+
+P80_OUT_A3="$WORKDIR/phase80_out_a3"
+rm -rf "$P80_OUT_A3"; mkdir -p "$P80_OUT_A3"
+printf 'outside-untouched\n' > "$P80_OUT_A3/keep.txt"
+P80_SGA3="$WORKDIR/phase80_sga3"; P80_GITA3="$WORKDIR/phase80_gita3"
+p79_setup "$P80_SGA3" "$P80_GITA3" p79_mk_repo_ff_deep
+printf 'a\n' > "$P80_GITA3/.gitignore"; printf 'a\n' > "$P80_SGA3/.gitignore"
+ln -s "$P80_OUT_A3" "$P80_GITA3/a"; ln -s "$P80_OUT_A3" "$P80_SGA3/a"
+(cd "$P80_GITA3" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_GITA3_RC=$?
+(cd "$P80_SGA3" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sga3.err"
+P80_SGA3_RC=$?
+check "phase80 A3 oracle: precondition -- git merges cleanly through the ignored symlink" \
+    sh -c "test '$P80_GITA3_RC' -eq 0 -a ! -L '$P80_GITA3/a' -a \"\$(cat '$P80_GITA3/a/b/c.txt')\" = deep"
+check "phase80 A3: sg merges cleanly too, symlink replaced by a real directory" \
+    sh -c "test '$P80_SGA3_RC' -eq 0 -a ! -L '$P80_SGA3/a' -a \"\$(cat '$P80_SGA3/a/b/c.txt')\" = deep"
+check "phase80 A3: @OUT is untouched -- the symlink was never traversed into" \
+    test "$(cat "$P80_OUT_A3/keep.txt")" = outside-untouched
+
+# ---- A4: a NON-ignored symlink 'a' -> @OUT blocking a/b/c.txt -- git
+# refuses (file bucket names 'a'); sg must refuse too and @OUT must stay
+# untouched (the pre-Phase-80 bug wrote straight into @OUT/b/c.txt). ----
+
+P80_OUT_A4="$WORKDIR/phase80_out_a4"
+rm -rf "$P80_OUT_A4"; mkdir -p "$P80_OUT_A4"
+printf 'outside-untouched\n' > "$P80_OUT_A4/keep.txt"
+P80_SGA4="$WORKDIR/phase80_sga4"; P80_GITA4="$WORKDIR/phase80_gita4"
+p79_setup "$P80_SGA4" "$P80_GITA4" p79_mk_repo_ff_deep
+ln -s "$P80_OUT_A4" "$P80_GITA4/a"; ln -s "$P80_OUT_A4" "$P80_SGA4/a"
+(cd "$P80_GITA4" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p80_gita4.err"
+P80_GITA4_RC=$?
+(cd "$P80_SGA4" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sga4.err"
+P80_SGA4_RC=$?
+check "phase80 A4 oracle: precondition -- git refuses (exit 1), naming the blocker 'a'" \
+    test "$P80_GITA4_RC" -eq 1
+check "phase80 A4: sg refuses too (exit 1)" \
+    test "$P80_SGA4_RC" -eq 1
+p79_expect_plural ff a > "$WORKDIR/p80_expected_a4.txt"
+check "phase80 A4: sg names the blocker 'a' in the file bucket" \
+    test "$(cat "$WORKDIR/p80_sga4.err")" = "$(cat "$WORKDIR/p80_expected_a4.txt")"
+check "phase80 A4: the symlink 'a' itself is untouched" \
+    test "$(readlink "$P80_SGA4/a")" = "$P80_OUT_A4"
+check "phase80 A4: @OUT is untouched -- the pre-Phase-80 bug wrote straight into it" \
+    sh -c "test \"\$(cat '$P80_OUT_A4/keep.txt')\" = outside-untouched -a ! -e '$P80_OUT_A4/b'"
+
+# ---- A6: a NON-ignored symlink 'a' -> an IN-REPO real directory blocking
+# a/b/c.txt -- git refuses naming 'a'; 'real/' itself must stay untouched. --
+
+P80_SGA6="$WORKDIR/phase80_sga6"; P80_GITA6="$WORKDIR/phase80_gita6"
+p79_setup "$P80_SGA6" "$P80_GITA6" p79_mk_repo_ff_deep
+mkdir -p "$P80_GITA6/real"; printf 'real-untouched\n' > "$P80_GITA6/real/keep.txt"
+mkdir -p "$P80_SGA6/real"; printf 'real-untouched\n' > "$P80_SGA6/real/keep.txt"
+(cd "$P80_GITA6" && ln -s real a)
+(cd "$P80_SGA6" && ln -s real a)
+(cd "$P80_GITA6" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_GITA6_RC=$?
+(cd "$P80_SGA6" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sga6.err"
+P80_SGA6_RC=$?
+check "phase80 A6 oracle: precondition -- git refuses (exit 1), naming the blocker 'a'" \
+    test "$P80_GITA6_RC" -eq 1
+check "phase80 A6: sg refuses too (exit 1)" \
+    test "$P80_SGA6_RC" -eq 1
+p79_expect_plural ff a > "$WORKDIR/p80_expected_a6.txt"
+check "phase80 A6: sg names the blocker 'a'" \
+    test "$(cat "$WORKDIR/p80_sga6.err")" = "$(cat "$WORKDIR/p80_expected_a6.txt")"
+check "phase80 A6: real/ is untouched -- the pre-Phase-80 bug wrote into real/b/c.txt" \
+    sh -c "test \"\$(cat '$P80_SGA6/real/keep.txt')\" = real-untouched -a ! -e '$P80_SGA6/real/b'"
+
+# ---- A7: an IGNORED symlink 'a' -> an IN-REPO real directory blocking
+# a/b/c.txt -- git replaces the symlink with a fresh real directory 'a' and
+# leaves 'real/' completely untouched. ----
+
+P80_SGA7="$WORKDIR/phase80_sga7"; P80_GITA7="$WORKDIR/phase80_gita7"
+p79_setup "$P80_SGA7" "$P80_GITA7" p79_mk_repo_ff_deep
+printf 'a\n' > "$P80_GITA7/.gitignore"; printf 'a\n' > "$P80_SGA7/.gitignore"
+mkdir -p "$P80_GITA7/real"; printf 'real-untouched\n' > "$P80_GITA7/real/keep.txt"
+mkdir -p "$P80_SGA7/real"; printf 'real-untouched\n' > "$P80_SGA7/real/keep.txt"
+(cd "$P80_GITA7" && ln -s real a)
+(cd "$P80_SGA7" && ln -s real a)
+(cd "$P80_GITA7" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_GITA7_RC=$?
+(cd "$P80_SGA7" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sga7.err"
+P80_SGA7_RC=$?
+check "phase80 A7 oracle: precondition -- git merges cleanly, 'a' becomes a real directory, real/ untouched" \
+    sh -c "test '$P80_GITA7_RC' -eq 0 -a ! -L '$P80_GITA7/a' -a \"\$(cat '$P80_GITA7/a/b/c.txt')\" = deep -a \"\$(cat '$P80_GITA7/real/keep.txt')\" = real-untouched"
+check "phase80 A7: sg merges cleanly too, 'a' becomes a real directory" \
+    sh -c "test '$P80_SGA7_RC' -eq 0 -a ! -L '$P80_SGA7/a' -a \"\$(cat '$P80_SGA7/a/b/c.txt')\" = deep"
+check "phase80 A7: real/ is untouched -- the pre-Phase-80 bug wrote into real/b/c.txt instead of a/b/c.txt" \
+    test "$(cat "$P80_SGA7/real/keep.txt")" = real-untouched
+
+# ---- E3: an untracked directory at the candidate path holding only an
+# IGNORED file -- git replaces the whole thing cleanly. ----
+
+P80_SGE3="$WORKDIR/phase80_sge3"; P80_GITE3="$WORKDIR/phase80_gite3"
+p79_setup "$P80_SGE3" "$P80_GITE3" p79_mk_repo_ff
+printf '*.log\n' > "$P80_GITE3/.gitignore"; printf '*.log\n' > "$P80_SGE3/.gitignore"
+mkdir -p "$P80_GITE3/new.txt"; printf 'noise\n' > "$P80_GITE3/new.txt/x.log"
+mkdir -p "$P80_SGE3/new.txt"; printf 'noise\n' > "$P80_SGE3/new.txt/x.log"
+(cd "$P80_GITE3" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_GITE3_RC=$?
+(cd "$P80_SGE3" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sge3.err"
+P80_SGE3_RC=$?
+check "phase80 E3 oracle: precondition -- git replaces the directory cleanly" \
+    sh -c "test '$P80_GITE3_RC' -eq 0 -a ! -d '$P80_GITE3/new.txt' -a \"\$(cat '$P80_GITE3/new.txt')\" = topic-content"
+check "phase80 E3: sg replaces the directory cleanly too" \
+    sh -c "test '$P80_SGE3_RC' -eq 0 -a ! -d '$P80_SGE3/new.txt' -a \"\$(cat '$P80_SGE3/new.txt')\" = topic-content"
+
+# ---- E6: an untracked directory at the candidate path holding only an
+# IGNORED SYMLINK pointing at @OUT -- git replaces the whole directory, and
+# @OUT itself (unlike the symlink) is untouched. ----
+
+P80_OUT_E6="$WORKDIR/phase80_out_e6"
+rm -rf "$P80_OUT_E6"; mkdir -p "$P80_OUT_E6"
+printf 'outside-untouched\n' > "$P80_OUT_E6/keep.txt"
+P80_SGE6="$WORKDIR/phase80_sge6"; P80_GITE6="$WORKDIR/phase80_gite6"
+p79_setup "$P80_SGE6" "$P80_GITE6" p79_mk_repo_ff
+printf '*.log\n' > "$P80_GITE6/.gitignore"; printf '*.log\n' > "$P80_SGE6/.gitignore"
+mkdir -p "$P80_GITE6/new.txt"; ln -s "$P80_OUT_E6" "$P80_GITE6/new.txt/l.log"
+mkdir -p "$P80_SGE6/new.txt"; ln -s "$P80_OUT_E6" "$P80_SGE6/new.txt/l.log"
+(cd "$P80_GITE6" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_GITE6_RC=$?
+(cd "$P80_SGE6" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sge6.err"
+P80_SGE6_RC=$?
+check "phase80 E6 oracle: precondition -- git replaces the directory cleanly, @OUT untouched" \
+    sh -c "test '$P80_GITE6_RC' -eq 0 -a ! -d '$P80_GITE6/new.txt' -a \"\$(cat '$P80_GITE6/new.txt')\" = topic-content"
+check "phase80 E6: sg replaces the directory cleanly too" \
+    sh -c "test '$P80_SGE6_RC' -eq 0 -a ! -d '$P80_SGE6/new.txt' -a \"\$(cat '$P80_SGE6/new.txt')\" = topic-content"
+check "phase80 E6: @OUT is untouched -- the ignored symlink inside the removed directory was never traversed into" \
+    test "$(cat "$P80_OUT_E6/keep.txt")" = outside-untouched
+
+# ---- I2: an IGNORED symlink AT the candidate path itself, pointing at
+# @OUT/keep.txt -- git replaces the link with a plain file, @OUT/keep.txt
+# untouched (the pre-Phase-80 bug wrote sg's new content straight INTO
+# keep.txt through the symlink). ----
+
+P80_OUT_I2="$WORKDIR/phase80_out_i2"
+rm -rf "$P80_OUT_I2"; mkdir -p "$P80_OUT_I2"
+printf 'outside-untouched\n' > "$P80_OUT_I2/keep.txt"
+P80_SGI2="$WORKDIR/phase80_sgi2"; P80_GITI2="$WORKDIR/phase80_giti2"
+p79_setup "$P80_SGI2" "$P80_GITI2" p79_mk_repo_ff
+printf 'new.txt\n' > "$P80_GITI2/.gitignore"; printf 'new.txt\n' > "$P80_SGI2/.gitignore"
+ln -s "$P80_OUT_I2/keep.txt" "$P80_GITI2/new.txt"; ln -s "$P80_OUT_I2/keep.txt" "$P80_SGI2/new.txt"
+(cd "$P80_GITI2" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_GITI2_RC=$?
+(cd "$P80_SGI2" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sgi2.err"
+P80_SGI2_RC=$?
+check "phase80 I2 oracle: precondition -- git replaces the symlink with a plain file, keep.txt untouched" \
+    sh -c "test '$P80_GITI2_RC' -eq 0 -a ! -L '$P80_GITI2/new.txt' -a \"\$(cat '$P80_GITI2/new.txt')\" = topic-content"
+check "phase80 I2: sg replaces the symlink with a plain file too" \
+    sh -c "test '$P80_SGI2_RC' -eq 0 -a ! -L '$P80_SGI2/new.txt' -a \"\$(cat '$P80_SGI2/new.txt')\" = topic-content"
+check "phase80 I2: @OUT/keep.txt is untouched -- the pre-Phase-80 bug wrote topic's content straight into it" \
+    test "$(cat "$P80_OUT_I2/keep.txt")" = outside-untouched
+
+# ---- I3: an IGNORED symlink AT the candidate path pointing at @OUT (a
+# directory) -- git replaces the symlink with a plain file. ----
+
+P80_OUT_I3="$WORKDIR/phase80_out_i3"
+rm -rf "$P80_OUT_I3"; mkdir -p "$P80_OUT_I3"
+P80_SGI3="$WORKDIR/phase80_sgi3"; P80_GITI3="$WORKDIR/phase80_giti3"
+p79_setup "$P80_SGI3" "$P80_GITI3" p79_mk_repo_ff
+printf 'new.txt\n' > "$P80_GITI3/.gitignore"; printf 'new.txt\n' > "$P80_SGI3/.gitignore"
+ln -s "$P80_OUT_I3" "$P80_GITI3/new.txt"; ln -s "$P80_OUT_I3" "$P80_SGI3/new.txt"
+(cd "$P80_GITI3" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_GITI3_RC=$?
+(cd "$P80_SGI3" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sgi3.err"
+P80_SGI3_RC=$?
+check "phase80 I3 oracle: precondition -- git replaces the symlink with a plain file" \
+    sh -c "test '$P80_GITI3_RC' -eq 0 -a ! -L '$P80_GITI3/new.txt' -a \"\$(cat '$P80_GITI3/new.txt')\" = topic-content"
+check "phase80 I3: sg replaces the symlink with a plain file too" \
+    sh -c "test '$P80_SGI3_RC' -eq 0 -a ! -L '$P80_SGI3/new.txt' -a \"\$(cat '$P80_SGI3/new.txt')\" = topic-content"
+
+# ---- T3/T4 (3-way): topic deletes a tracked file and adds a FILE at the
+# directory's own name -- F4's delete-before-create fix. T3: the deleted
+# tracked file does not match any ignore rule; T4: it does (a .log file).
+# Both must merge cleanly with no half-applied state (the tracked file
+# gone AND the new file present). ----
+
+p80_mk_repo_t3() {
+    # $1 = target dir, $2 = deleted tracked file's name under d/ ("x.txt" for
+    # T3, "x.log" for T4). Base has d/<name>; topic deletes it and adds a
+    # plain file "d"; master gets an unrelated second commit (m.txt) for a
+    # genuine 3-way merge.
+    rm -rf "$1"
+    mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf '*.log\n' > .gitignore && mkdir d && printf 'tracked\n' > "d/$2" \
+        && git add .gitignore && git add -f "d/$2" \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m c1 \
+        && git branch topic \
+        && git switch -q topic \
+        && git rm -q "d/$2" && printf 'topic-content\n' > d && git add d \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m t1 \
+        && git switch -q master \
+        && printf 'm-content\n' > m.txt && git add m.txt \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m c2m) > /dev/null 2>&1
+}
+
+for p80_t34_variant in "T3 x.txt" "T4 x.log"; do
+    p80_t34_id=${p80_t34_variant%% *}
+    p80_t34_name=${p80_t34_variant#* }
+    P80_SGT34="$WORKDIR/phase80_sg_${p80_t34_id}"; P80_GITT34="$WORKDIR/phase80_git_${p80_t34_id}"
+    rm -rf "$P80_GITT34"; mkdir -p "$P80_GITT34"
+    p80_mk_repo_t3 "$P80_GITT34" "$p80_t34_name"
+    rm -rf "$P80_SGT34"; cp -R "$P80_GITT34" "$P80_SGT34"
+    (cd "$P80_GITT34" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p80_git_${p80_t34_id}.err"
+    p80_git_rc=$?
+    (cd "$P80_SGT34" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_sg_${p80_t34_id}.err"
+    p80_sg_rc=$?
+    check "phase80 $p80_t34_id oracle: precondition -- git merges cleanly, d is a file" \
+        sh -c "test '$p80_git_rc' -eq 0 -a ! -d '$P80_GITT34/d' -a \"\$(cat '$P80_GITT34/d')\" = topic-content"
+    check "phase80 $p80_t34_id: sg merges cleanly too (no half-applied state)" \
+        sh -c "test '$p80_sg_rc' -eq 0 -a ! -d '$P80_SGT34/d' -a \"\$(cat '$P80_SGT34/d')\" = topic-content"
+done
+
+# ---- Additional merge rows (main-conversation review round): A1, A2, A5,
+# E2, E4, E5, I1, I4, R1, A8, in every mode the Phase 80 oracle has a value
+# for. All measured directly against this build (SCRATCH/oracle.py, git
+# 2.55.0) before being pinned. ----
+
+# A1: an IGNORED FILE 'a' blocking a/b/c.txt -- 'a' becomes a real
+# directory, full parity in all three modes.
+for p80_mode in ff 3way unborn; do
+    P80_GIT="$WORKDIR/phase80_a1_git_$p80_mode"; P80_SG="$WORKDIR/phase80_a1_sg_$p80_mode"
+    case "$p80_mode" in
+        ff) p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff_deep ;;
+        3way) p79_setup "$P80_SG" "$P80_GIT" p79d_mk_repo_3way_deep ;;
+        unborn) p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_unborn_deep ;;
+    esac
+    printf 'a\n' > "$P80_GIT/.gitignore"; printf 'a\n' > "$P80_SG/.gitignore"
+    printf 'L\n' > "$P80_GIT/a"; printf 'L\n' > "$P80_SG/a"
+    (cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+    p80_git_rc=$?
+    (cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_a1_${p80_mode}.err"
+    p80_sg_rc=$?
+    check "phase80 A1 $p80_mode oracle: precondition -- git replaces the ignored blocking file, 'a' becomes a real directory" \
+        sh -c "test '$p80_git_rc' -eq 0 -a ! -L '$P80_GIT/a' -a -d '$P80_GIT/a' -a \"\$(cat '$P80_GIT/a/b/c.txt')\" = deep"
+    check "phase80 A1 $p80_mode: sg replaces it too" \
+        sh -c "test '$p80_sg_rc' -eq 0 -a -d '$P80_SG/a' -a \"\$(cat '$P80_SG/a/b/c.txt')\" = deep"
+done
+
+# A2: an IGNORED file 'a/b' (a real intermediate component) blocking
+# a/b/c.txt -- replaced, ff only (the oracle table has no 3way/unborn value).
+P80_GIT="$WORKDIR/phase80_a2_git"; P80_SG="$WORKDIR/phase80_a2_sg"
+p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff_deep
+printf 'a/b\n' > "$P80_GIT/.gitignore"; printf 'a/b\n' > "$P80_SG/.gitignore"
+mkdir -p "$P80_GIT/a"; printf 'L\n' > "$P80_GIT/a/b"
+mkdir -p "$P80_SG/a"; printf 'L\n' > "$P80_SG/a/b"
+(cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_A2_GIT_RC=$?
+(cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_a2.err"
+P80_A2_SG_RC=$?
+check "phase80 A2 oracle: precondition -- git replaces the ignored blocking file 'a/b'" \
+    sh -c "test '$P80_A2_GIT_RC' -eq 0 -a \"\$(cat '$P80_GIT/a/b/c.txt')\" = deep"
+check "phase80 A2: sg replaces it too" \
+    sh -c "test '$P80_A2_SG_RC' -eq 0 -a \"\$(cat '$P80_SG/a/b/c.txt')\" = deep"
+
+# A5: an IGNORED SYMLINK 'a/b' (intermediate component) -> @OUT -- replaced,
+# @OUT untouched, full parity in all three modes.
+P80_OUT_A5="$WORKDIR/phase80_out_a5"
+rm -rf "$P80_OUT_A5"; mkdir -p "$P80_OUT_A5"
+printf 'outside-untouched\n' > "$P80_OUT_A5/keep.txt"
+for p80_mode in ff 3way unborn; do
+    P80_GIT="$WORKDIR/phase80_a5_git_$p80_mode"; P80_SG="$WORKDIR/phase80_a5_sg_$p80_mode"
+    case "$p80_mode" in
+        ff) p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff_deep ;;
+        3way) p79_setup "$P80_SG" "$P80_GIT" p79d_mk_repo_3way_deep ;;
+        unborn) p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_unborn_deep ;;
+    esac
+    printf 'a/b\n' > "$P80_GIT/.gitignore"; printf 'a/b\n' > "$P80_SG/.gitignore"
+    mkdir -p "$P80_GIT/a"; ln -s "$P80_OUT_A5" "$P80_GIT/a/b"
+    mkdir -p "$P80_SG/a"; ln -s "$P80_OUT_A5" "$P80_SG/a/b"
+    (cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+    p80_git_rc=$?
+    (cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_a5_${p80_mode}.err"
+    p80_sg_rc=$?
+    check "phase80 A5 $p80_mode oracle: precondition -- git replaces the ignored symlink 'a/b'" \
+        sh -c "test '$p80_git_rc' -eq 0 -a \"\$(cat '$P80_GIT/a/b/c.txt')\" = deep"
+    check "phase80 A5 $p80_mode: sg replaces it too" \
+        sh -c "test '$p80_sg_rc' -eq 0 -a \"\$(cat '$P80_SG/a/b/c.txt')\" = deep"
+    check "phase80 A5 $p80_mode: @OUT is untouched" \
+        test "$(cat "$P80_OUT_A5/keep.txt")" = outside-untouched
+done
+
+# E2: an untracked tree of EMPTY directories at the write target -- replaced,
+# ff only (the oracle table has no 3way/unborn value).
+P80_GIT="$WORKDIR/phase80_e2_git"; P80_SG="$WORKDIR/phase80_e2_sg"
+p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff
+mkdir -p "$P80_GIT/new.txt/d1/d2" "$P80_GIT/new.txt/d3"
+mkdir -p "$P80_SG/new.txt/d1/d2" "$P80_SG/new.txt/d3"
+(cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_E2_GIT_RC=$?
+(cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_e2.err"
+P80_E2_SG_RC=$?
+check "phase80 E2 oracle: precondition -- git replaces the tree of empty directories cleanly" \
+    sh -c "test '$P80_E2_GIT_RC' -eq 0 -a ! -d '$P80_GIT/new.txt' -a \"\$(cat '$P80_GIT/new.txt')\" = topic-content"
+check "phase80 E2: sg replaces it too" \
+    sh -c "test '$P80_E2_SG_RC' -eq 0 -a ! -d '$P80_SG/new.txt' -a \"\$(cat '$P80_SG/new.txt')\" = topic-content"
+
+# E4: an ignored file in a nested subdir, plus a separate empty subdir --
+# replaced, ff only.
+P80_GIT="$WORKDIR/phase80_e4_git"; P80_SG="$WORKDIR/phase80_e4_sg"
+p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff
+printf '*.log\n' > "$P80_GIT/.gitignore"; printf '*.log\n' > "$P80_SG/.gitignore"
+mkdir -p "$P80_GIT/new.txt/s" "$P80_GIT/new.txt/e"; printf 'L\n' > "$P80_GIT/new.txt/s/x.log"
+mkdir -p "$P80_SG/new.txt/s" "$P80_SG/new.txt/e"; printf 'L\n' > "$P80_SG/new.txt/s/x.log"
+(cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_E4_GIT_RC=$?
+(cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_e4.err"
+P80_E4_SG_RC=$?
+check "phase80 E4 oracle: precondition -- git replaces the directory cleanly" \
+    sh -c "test '$P80_E4_GIT_RC' -eq 0 -a ! -d '$P80_GIT/new.txt' -a \"\$(cat '$P80_GIT/new.txt')\" = topic-content"
+check "phase80 E4: sg replaces it too" \
+    sh -c "test '$P80_E4_SG_RC' -eq 0 -a ! -d '$P80_SG/new.txt' -a \"\$(cat '$P80_SG/new.txt')\" = topic-content"
+
+# E5: files under an ignored SUBDIRECTORY ('ign/', matched by the fixture's
+# own "ign/" ignore pattern) -- replaced, ff only.
+P80_GIT="$WORKDIR/phase80_e5_git"; P80_SG="$WORKDIR/phase80_e5_sg"
+p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff
+printf 'ign/\n' > "$P80_GIT/.gitignore"; printf 'ign/\n' > "$P80_SG/.gitignore"
+mkdir -p "$P80_GIT/new.txt/ign"; printf 'C\n' > "$P80_GIT/new.txt/ign/foo.c"
+mkdir -p "$P80_SG/new.txt/ign"; printf 'C\n' > "$P80_SG/new.txt/ign/foo.c"
+(cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_E5_GIT_RC=$?
+(cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_e5.err"
+P80_E5_SG_RC=$?
+check "phase80 E5 oracle: precondition -- git replaces the directory cleanly (ignored subdirectory)" \
+    sh -c "test '$P80_E5_GIT_RC' -eq 0 -a ! -d '$P80_GIT/new.txt' -a \"\$(cat '$P80_GIT/new.txt')\" = topic-content"
+check "phase80 E5: sg replaces it too" \
+    sh -c "test '$P80_E5_SG_RC' -eq 0 -a ! -d '$P80_SG/new.txt' -a \"\$(cat '$P80_SG/new.txt')\" = topic-content"
+
+# I1: an IGNORED regular file exactly at the write target -- already worked
+# before this phase (git silently overwrites an ignored file), full parity,
+# ff only.
+P80_GIT="$WORKDIR/phase80_i1_git"; P80_SG="$WORKDIR/phase80_i1_sg"
+p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff
+printf 'new.txt\n' > "$P80_GIT/.gitignore"; printf 'new.txt\n' > "$P80_SG/.gitignore"
+printf 'L\n' > "$P80_GIT/new.txt"; printf 'L\n' > "$P80_SG/new.txt"
+(cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_I1_GIT_RC=$?
+(cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_i1.err"
+P80_I1_SG_RC=$?
+check "phase80 I1 oracle: precondition -- git replaces the ignored file cleanly" \
+    sh -c "test '$P80_I1_GIT_RC' -eq 0 -a \"\$(cat '$P80_GIT/new.txt')\" = topic-content"
+check "phase80 I1: sg replaces it too" \
+    sh -c "test '$P80_I1_SG_RC' -eq 0 -a \"\$(cat '$P80_SG/new.txt')\" = topic-content"
+
+# I4: a directory at the write target that is ITSELF ignored (a
+# "new.txt/"-shaped pattern) -- replaced regardless of contents, ff only.
+P80_GIT="$WORKDIR/phase80_i4_git"; P80_SG="$WORKDIR/phase80_i4_sg"
+p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff
+printf 'new.txt/\n' > "$P80_GIT/.gitignore"; printf 'new.txt/\n' > "$P80_SG/.gitignore"
+mkdir -p "$P80_GIT/new.txt"; printf 'C\n' > "$P80_GIT/new.txt/foo.c"
+mkdir -p "$P80_SG/new.txt"; printf 'C\n' > "$P80_SG/new.txt/foo.c"
+(cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+P80_I4_GIT_RC=$?
+(cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_i4.err"
+P80_I4_SG_RC=$?
+check "phase80 I4 oracle: precondition -- git replaces the self-ignored directory cleanly" \
+    sh -c "test '$P80_I4_GIT_RC' -eq 0 -a ! -d '$P80_GIT/new.txt' -a \"\$(cat '$P80_GIT/new.txt')\" = topic-content"
+check "phase80 I4: sg replaces it too" \
+    sh -c "test '$P80_I4_SG_RC' -eq 0 -a ! -d '$P80_SG/new.txt' -a \"\$(cat '$P80_SG/new.txt')\" = topic-content"
+
+# A8: a NON-ignored symlink 'a' -> @OUT blocks BOTH a/b/c.txt and a/d.txt;
+# an untracked z.txt also collides -- the file bucket lists 'a','a','z.txt'
+# in CANDIDATE order, no de-duplication (ff/3way); the unborn wording names
+# only the first collision ('a', singular). @OUT and z.txt must survive
+# untouched in every mode.
+p80_mk_repo_a8() {
+    # $1 = target dir, $2 = mode (ff/3way/unborn). topic adds a/b/c.txt AND
+    # a/d.txt (both under directory 'a').
+    rm -rf "$1"; mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'base\n' > base.txt && git add base.txt \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m base \
+        && git branch topic \
+        && git switch -q topic \
+        && mkdir -p a/b && printf '1\n' > a/b/c.txt && printf '2\n' > a/d.txt && printf '3\n' > z.txt \
+        && git add a z.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m topic \
+        && git switch -q master) > /dev/null 2>&1
+    if [ "$2" = "3way" ]; then
+        (cd "$1" && printf 'm\n' > master.txt && git add master.txt \
+            && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m m) \
+            > /dev/null 2>&1
+    elif [ "$2" = "unborn" ]; then
+        (cd "$1" && git switch -q --orphan fresh) > /dev/null 2>&1
+    fi
+}
+
+P80_OUT_A8="$WORKDIR/phase80_out_a8"
+rm -rf "$P80_OUT_A8"; mkdir -p "$P80_OUT_A8"
+printf 'outside-untouched\n' > "$P80_OUT_A8/keep.txt"
+for p80_mode in ff 3way unborn; do
+    P80_GIT="$WORKDIR/phase80_a8_git_$p80_mode"; P80_SG="$WORKDIR/phase80_a8_sg_$p80_mode"
+    p80_mk_repo_a8 "$P80_GIT" "$p80_mode"; p80_mk_repo_a8 "$P80_SG" "$p80_mode"
+    ln -s "$P80_OUT_A8" "$P80_GIT/a"; printf 'u\n' > "$P80_GIT/z.txt"
+    ln -s "$P80_OUT_A8" "$P80_SG/a"; printf 'u\n' > "$P80_SG/z.txt"
+    (cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p80_a8_git_${p80_mode}.err"
+    p80_git_rc=$?
+    (cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_a8_sg_${p80_mode}.err"
+    p80_sg_rc=$?
+    if [ "$p80_mode" = "unborn" ]; then
+        check "phase80 A8 $p80_mode oracle: precondition -- git refuses (exit 128), naming only the first collision 'a'" \
+            test "$p80_git_rc" -eq 128
+        p79_expect_singular a > "$WORKDIR/p80_a8_expected_${p80_mode}.txt"
+        check "phase80 A8 $p80_mode: sg refuses too, same singular wording naming only 'a'" \
+            sh -c "test '$p80_sg_rc' -eq 1 -a \"\$(cat '$WORKDIR/p80_a8_sg_${p80_mode}.err')\" = \"\$(cat '$WORKDIR/p80_a8_expected_${p80_mode}.txt')\""
+    else
+        p80_expect_rc=1
+        [ "$p80_mode" = "3way" ] && p80_expect_rc=2
+        check "phase80 A8 $p80_mode oracle: precondition -- git refuses (candidate order, no dedup: a,a,z.txt)" \
+            test "$p80_git_rc" -eq "$p80_expect_rc"
+        p79_expect_plural "$p80_mode" a a z.txt > "$WORKDIR/p80_a8_expected_${p80_mode}.txt"
+        check "phase80 A8 $p80_mode: sg refuses too, file bucket lists a,a,z.txt in candidate order, no dedup" \
+            sh -c "test '$p80_sg_rc' -eq 1 -a \"\$(cat '$WORKDIR/p80_a8_sg_${p80_mode}.err')\" = \"\$(cat '$WORKDIR/p80_a8_expected_${p80_mode}.txt')\""
+    fi
+    check "phase80 A8 $p80_mode: @OUT is untouched" \
+        test "$(cat "$P80_OUT_A8/keep.txt")" = outside-untouched
+    check "phase80 A8 $p80_mode: z.txt survives untouched -- still the user's own bytes" \
+        test "$(cat "$P80_SG/z.txt")" = u
+done
+
+# R1: E3's shape (dir at P holding only an ignored x.log) but the DIRECTORY
+# ITSELF is mode 0555 -- git's own unlink fails (a real permission error,
+# not a data-loss risk sg needs to reproduce), sg's write fails too, and
+# BOTH leave the tree exactly as it was. ff and 3way (the oracle table has
+# no unborn value).
+for p80_mode in ff 3way; do
+    P80_GIT="$WORKDIR/phase80_r1_git_$p80_mode"; P80_SG="$WORKDIR/phase80_r1_sg_$p80_mode"
+    case "$p80_mode" in
+        ff) p79_setup "$P80_SG" "$P80_GIT" p79_mk_repo_ff ;;
+        3way) p79_setup "$P80_SG" "$P80_GIT" p79d_mk_repo_3way ;;
+    esac
+    printf '*.log\n' > "$P80_GIT/.gitignore"; printf '*.log\n' > "$P80_SG/.gitignore"
+    mkdir -p "$P80_GIT/new.txt"; printf 'L\n' > "$P80_GIT/new.txt/x.log"; chmod 0555 "$P80_GIT/new.txt"
+    mkdir -p "$P80_SG/new.txt"; printf 'L\n' > "$P80_SG/new.txt/x.log"; chmod 0555 "$P80_SG/new.txt"
+    (cd "$P80_GIT" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p80_r1_git_${p80_mode}.err"
+    p80_git_rc=$?
+    (cd "$P80_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80_r1_sg_${p80_mode}.err"
+    p80_sg_rc=$?
+    check "phase80 R1 $p80_mode oracle: precondition -- git's own unlink fails with a permission error" \
+        sh -c "test '$p80_git_rc' -eq 128 -a \"\$(cat '$WORKDIR/p80_r1_git_${p80_mode}.err')\" = \"fatal: cannot unlink 'new.txt/x.log': Permission denied\""
+    check "phase80 R1 $p80_mode: sg fails too, its own generic write-failure wording" \
+        sh -c "test '$p80_sg_rc' -eq 1 -a \"\$(cat '$WORKDIR/p80_r1_sg_${p80_mode}.err')\" = 'sg: failed to write \"new.txt\"'"
+    check "phase80 R1 $p80_mode: the tree is unchanged -- x.log survives" \
+        sh -c "chmod 0755 '$P80_SG/new.txt'; test \"\$(cat '$P80_SG/new.txt/x.log')\" = L"
+    chmod 0755 "$P80_GIT/new.txt" 2>/dev/null
+done
+
+# ---- Divergence #11: sg's own reset --hard/undo FAIL CLOSED where git
+# deletes untracked, non-ignored user data. N2: a NON-ignored blocking FILE
+# ancestor. Pinned both sides so "fixing" sg to match git here (deleting the
+# user's own untracked data) goes red by name. ----
+
+P80_SGN2="$WORKDIR/phase80_sgn2"; P80_GITN2="$WORKDIR/phase80_gitn2"
+p79_setup "$P80_SGN2" "$P80_GITN2" p79_mk_repo_ff_deep
+printf 'blocker\n' > "$P80_GITN2/a"; printf 'blocker\n' > "$P80_SGN2/a"
+(cd "$P80_GITN2" && LC_ALL=C git reset -q --hard topic) > /dev/null 2>&1
+P80_GITN2_RC=$?
+(cd "$P80_SGN2" && "$SG" reset --hard topic) > /dev/null 2> "$WORKDIR/p80_sgn2.err"
+P80_SGN2_RC=$?
+check "phase80 N2 oracle (divergence #11): precondition -- git reset --hard deletes the untracked blocker and succeeds" \
+    sh -c "test '$P80_GITN2_RC' -eq 0 -a \"\$(cat '$P80_GITN2/a/b/c.txt')\" = deep"
+check "phase80 N2 (divergence #11): sg FAILS CLOSED instead (accepted divergence -- untracked non-ignored data is never sg's to delete)" \
+    test "$P80_SGN2_RC" -eq 1
+check "phase80 N2 (divergence #11): sg's blocker 'a' survives untouched -- still the user's own bytes" \
+    test "$(cat "$P80_SGN2/a")" = blocker
+
+# ---- Divergence #11 continued: N1 (a non-empty untracked DIRECTORY holding
+# real, non-ignored content sitting at the write target) and A4 (a
+# non-ignored symlink ancestor) under reset --hard. Both are the same
+# accepted-divergence shape as N2 above: git deletes the user's untracked
+# data and succeeds, sg fails closed. ----
+
+P80_SGN1="$WORKDIR/phase80_sgn1"; P80_GITN1="$WORKDIR/phase80_gitn1"
+p79_setup "$P80_SGN1" "$P80_GITN1" p79_mk_repo_ff
+mkdir -p "$P80_GITN1/new.txt"; printf 'u\n' > "$P80_GITN1/new.txt/u.txt"
+mkdir -p "$P80_SGN1/new.txt"; printf 'u\n' > "$P80_SGN1/new.txt/u.txt"
+(cd "$P80_GITN1" && LC_ALL=C git reset -q --hard topic) > /dev/null 2>&1
+P80_GITN1_RC=$?
+(cd "$P80_SGN1" && "$SG" reset --hard topic) > /dev/null 2> "$WORKDIR/p80_sgn1.err"
+P80_SGN1_RC=$?
+check "phase80 N1 oracle (divergence #11): precondition -- git reset --hard deletes the untracked directory (and its u.txt) and succeeds" \
+    sh -c "test '$P80_GITN1_RC' -eq 0 -a ! -e '$P80_GITN1/new.txt/u.txt' -a \"\$(cat '$P80_GITN1/new.txt')\" = topic-content"
+check "phase80 N1 (divergence #11): sg FAILS CLOSED instead" \
+    test "$P80_SGN1_RC" -eq 1
+check "phase80 N1 (divergence #11): sg's stderr is the generic write failure" \
+    test "$(cat "$WORKDIR/p80_sgn1.err")" = 'sg: failed to write "new.txt"'
+check "phase80 N1 (divergence #11): u.txt survives untouched -- still the user's own bytes" \
+    test "$(cat "$P80_SGN1/new.txt/u.txt")" = u
+
+# A4 under reset --hard is pinned by the "phase80 A4 reset" checks in the
+# command-variant loop below (git replaces the symlink ancestor with a real
+# directory and succeeds; sg fails closed; @OUT untouched) -- not repeated
+# here as a separate fixture.
+
+# ============================================================
+# Phase 80 follow-up (main-conversation review round): command variants and
+# the merge rows initially skipped. Every row below states its own git-side
+# precondition and sg-side literal assertion; every symlink row additionally
+# asserts the outside directory (or in-repo 'real/') is byte-identical to
+# before -- the security invariant this whole phase exists to establish.
+# ============================================================
+
+# ---- shared fixtures for the command-variant rows: base.txt tracked;
+# topic branches off adding either a/b/c.txt (DEEP) or new.txt (NEW); master
+# gets ONE MORE commit after branching (master.txt) so the SAME fixture
+# supports switch/reset (branch-level) and cherry-pick (needs a genuine
+# 3-way merge against topic's own single-commit diff). ----
+
+p80cv_mk_deep() {
+    rm -rf "$1"; mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'base\n' > base.txt && git add base.txt \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m base \
+        && git branch topic \
+        && git switch -q topic \
+        && mkdir -p a/b && printf 'topic\n' > a/b/c.txt && git add a/b/c.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m topic \
+        && git switch -q master \
+        && printf 'm\n' > master.txt && git add master.txt \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m m) > /dev/null 2>&1
+}
+
+p80cv_mk_new() {
+    rm -rf "$1"; mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && printf 'base\n' > base.txt && git add base.txt \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m base \
+        && git branch topic \
+        && git switch -q topic \
+        && printf 'topic\n' > new.txt && git add new.txt \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m topic \
+        && git switch -q master \
+        && printf 'm\n' > master.txt && git add master.txt \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m m) > /dev/null 2>&1
+}
+
+p80cv_run() {
+    # $1=tool ("git"/sg), $2=op, $3=repo dir. Runs the op, capturing rc into
+    # p80cv_rc and stderr into $3.err.
+    case "$2.$1" in
+        switch.git) (cd "$3" && LC_ALL=C git switch topic) > /dev/null 2> "$3.err" ;;
+        switch.sg) (cd "$3" && "$SG" switch topic) > /dev/null 2> "$3.err" ;;
+        reset.git) (cd "$3" && LC_ALL=C git reset -q --hard topic) > /dev/null 2> "$3.err" ;;
+        reset.sg) (cd "$3" && "$SG" reset --hard topic) > /dev/null 2> "$3.err" ;;
+        cherry-pick.git) (cd "$3" && LC_ALL=C git cherry-pick topic) > /dev/null 2> "$3.err" ;;
+        cherry-pick.sg) (cd "$3" && "$SG" cherry-pick topic) > /dev/null 2> "$3.err" ;;
+    esac
+    p80cv_rc=$?
+}
+
+# ---- A3: an IGNORED symlink 'a' -> @OUT (dir) blocking a/b/c.txt -- full
+# parity across all three commands: replaced, @OUT untouched. ----
+
+P80CV_OUT_A3="$WORKDIR/phase80cv_out_a3"
+rm -rf "$P80CV_OUT_A3"; mkdir -p "$P80CV_OUT_A3"
+printf 'outside-untouched\n' > "$P80CV_OUT_A3/keep.txt"
+for p80cv_op in switch reset cherry-pick; do
+    P80CV_GIT="$WORKDIR/phase80cv_a3_git_$p80cv_op"; P80CV_SG="$WORKDIR/phase80cv_a3_sg_$p80cv_op"
+    p80cv_mk_deep "$P80CV_GIT"; printf 'a\n' > "$P80CV_GIT/.gitignore"; ln -s "$P80CV_OUT_A3" "$P80CV_GIT/a"
+    p80cv_mk_deep "$P80CV_SG"; printf 'a\n' > "$P80CV_SG/.gitignore"; ln -s "$P80CV_OUT_A3" "$P80CV_SG/a"
+    p80cv_run git "$p80cv_op" "$P80CV_GIT"; p80cv_git_rc=$p80cv_rc
+    p80cv_run sg "$p80cv_op" "$P80CV_SG"; p80cv_sg_rc=$p80cv_rc
+    check "phase80 A3 $p80cv_op oracle: precondition -- git replaces the ignored symlink cleanly" \
+        sh -c "test '$p80cv_git_rc' -eq 0 -a ! -L '$P80CV_GIT/a' -a \"\$(cat '$P80CV_GIT/a/b/c.txt')\" = topic"
+    check "phase80 A3 $p80cv_op: sg replaces it too" \
+        sh -c "test '$p80cv_sg_rc' -eq 0 -a ! -L '$P80CV_SG/a' -a \"\$(cat '$P80CV_SG/a/b/c.txt')\" = topic"
+    check "phase80 A3 $p80cv_op: @OUT is untouched" \
+        test "$(cat "$P80CV_OUT_A3/keep.txt")" = outside-untouched
+done
+
+# ---- A4: a NON-ignored symlink 'a' -> @OUT blocking a/b/c.txt. git refuses
+# for switch/cherry-pick (names 'a'); reset --hard replaces it (divergence
+# #11, already pinned above under a fresh fixture -- this loop pins the
+# switch/cherry-pick refusals plus the shared @OUT invariant). sg (no
+# pre-flight for these three commands, Phase 79 residual 1) FAILS CLOSED in
+# all three -- it never replaces AND never refuses with git's wording, it
+# just can't write through/past the symlink. ----
+
+P80CV_OUT_A4="$WORKDIR/phase80cv_out_a4"
+rm -rf "$P80CV_OUT_A4"; mkdir -p "$P80CV_OUT_A4"
+printf 'outside-untouched\n' > "$P80CV_OUT_A4/keep.txt"
+for p80cv_op in switch reset cherry-pick; do
+    P80CV_GIT="$WORKDIR/phase80cv_a4_git_$p80cv_op"; P80CV_SG="$WORKDIR/phase80cv_a4_sg_$p80cv_op"
+    p80cv_mk_deep "$P80CV_GIT"; ln -s "$P80CV_OUT_A4" "$P80CV_GIT/a"
+    p80cv_mk_deep "$P80CV_SG"; ln -s "$P80CV_OUT_A4" "$P80CV_SG/a"
+    p80cv_run git "$p80cv_op" "$P80CV_GIT"; p80cv_git_rc=$p80cv_rc
+    p80cv_run sg "$p80cv_op" "$P80CV_SG"; p80cv_sg_rc=$p80cv_rc
+    check "phase80 A4 $p80cv_op: sg fails closed (never writes through OR past the symlink)" \
+        test "$p80cv_sg_rc" -eq 1
+    check "phase80 A4 $p80cv_op: sg's stderr names the write failure" \
+        sh -c "grep -q 'failed to write \"a/b/c.txt\"' '$P80CV_SG.err'"
+    check "phase80 A4 $p80cv_op: sg's own symlink 'a' survives untouched" \
+        test "$(readlink "$P80CV_SG/a")" = "$P80CV_OUT_A4"
+    check "phase80 A4 $p80cv_op: @OUT is untouched" \
+        test "$(cat "$P80CV_OUT_A4/keep.txt")" = outside-untouched
+    case "$p80cv_op" in
+        reset)
+            check "phase80 A4 reset oracle: precondition -- git replaces the symlink with a real directory and succeeds" \
+                sh -c "test '$p80cv_git_rc' -eq 0 -a ! -L '$P80CV_GIT/a' -a \"\$(cat '$P80CV_GIT/a/b/c.txt')\" = topic"
+            ;;
+        switch)
+            check "phase80 A4 switch oracle: precondition -- git refuses (exit 1), naming the blocker 'a'" \
+                sh -c "test '$p80cv_git_rc' -eq 1 -a \"\$(head -1 '$P80CV_GIT.err')\" = 'error: The following untracked working tree files would be overwritten by checkout:'"
+            ;;
+        cherry-pick)
+            check "phase80 A4 cherry-pick oracle: precondition -- git refuses (exit 128), naming the blocker 'a'" \
+                sh -c "test '$p80cv_git_rc' -eq 128 -a \"\$(head -1 '$P80CV_GIT.err')\" = 'error: The following untracked working tree files would be overwritten by merge:'"
+            ;;
+    esac
+done
+
+# ---- I2: an IGNORED symlink AT the write target itself, pointing at
+# @OUT/keep.txt -- full parity across all three commands. ----
+
+P80CV_OUT_I2="$WORKDIR/phase80cv_out_i2"
+rm -rf "$P80CV_OUT_I2"; mkdir -p "$P80CV_OUT_I2"
+printf 'outside-untouched\n' > "$P80CV_OUT_I2/keep.txt"
+for p80cv_op in switch reset cherry-pick; do
+    P80CV_GIT="$WORKDIR/phase80cv_i2_git_$p80cv_op"; P80CV_SG="$WORKDIR/phase80cv_i2_sg_$p80cv_op"
+    p80cv_mk_new "$P80CV_GIT"; printf 'new.txt\n' > "$P80CV_GIT/.gitignore"; ln -s "$P80CV_OUT_I2/keep.txt" "$P80CV_GIT/new.txt"
+    p80cv_mk_new "$P80CV_SG"; printf 'new.txt\n' > "$P80CV_SG/.gitignore"; ln -s "$P80CV_OUT_I2/keep.txt" "$P80CV_SG/new.txt"
+    p80cv_run git "$p80cv_op" "$P80CV_GIT"; p80cv_git_rc=$p80cv_rc
+    p80cv_run sg "$p80cv_op" "$P80CV_SG"; p80cv_sg_rc=$p80cv_rc
+    check "phase80 I2 $p80cv_op oracle: precondition -- git replaces the symlink with a plain file" \
+        sh -c "test '$p80cv_git_rc' -eq 0 -a ! -L '$P80CV_GIT/new.txt' -a \"\$(cat '$P80CV_GIT/new.txt')\" = topic"
+    check "phase80 I2 $p80cv_op: sg replaces it too" \
+        sh -c "test '$p80cv_sg_rc' -eq 0 -a ! -L '$P80CV_SG/new.txt' -a \"\$(cat '$P80CV_SG/new.txt')\" = topic"
+    check "phase80 I2 $p80cv_op: @OUT/keep.txt is untouched -- the pre-Phase-80 bug wrote straight into it" \
+        test "$(cat "$P80CV_OUT_I2/keep.txt")" = outside-untouched
+done
+
+# ---- N4: a NON-ignored symlink AT the write target, pointing at
+# @OUT/keep.txt. git refuses for switch/cherry-pick (names new.txt); reset
+# --hard replaces it on both sides (NOT part of divergence #11: a blocker
+# at the FINAL path, not an ancestor, keeps being replaced). sg has no
+# pre-flight for switch/cherry-pick (Phase 79 residual 1) so it REPLACES
+# there too rather than refusing -- a real, documented residual, not a
+# security hole: @OUT/keep.txt must still never be written into. ----
+
+P80CV_OUT_N4="$WORKDIR/phase80cv_out_n4"
+rm -rf "$P80CV_OUT_N4"; mkdir -p "$P80CV_OUT_N4"
+printf 'outside-untouched\n' > "$P80CV_OUT_N4/keep.txt"
+for p80cv_op in switch reset cherry-pick; do
+    P80CV_GIT="$WORKDIR/phase80cv_n4_git_$p80cv_op"; P80CV_SG="$WORKDIR/phase80cv_n4_sg_$p80cv_op"
+    p80cv_mk_new "$P80CV_GIT"; ln -s "$P80CV_OUT_N4/keep.txt" "$P80CV_GIT/new.txt"
+    p80cv_mk_new "$P80CV_SG"; ln -s "$P80CV_OUT_N4/keep.txt" "$P80CV_SG/new.txt"
+    p80cv_run git "$p80cv_op" "$P80CV_GIT"; p80cv_git_rc=$p80cv_rc
+    p80cv_run sg "$p80cv_op" "$P80CV_SG"; p80cv_sg_rc=$p80cv_rc
+    check "phase80 N4 $p80cv_op: @OUT/keep.txt is untouched regardless of which answer sg gives" \
+        test "$(cat "$P80CV_OUT_N4/keep.txt")" = outside-untouched
+    case "$p80cv_op" in
+        reset)
+            check "phase80 N4 reset oracle: precondition -- git replaces the symlink with a plain file" \
+                sh -c "test '$p80cv_git_rc' -eq 0 -a ! -L '$P80CV_GIT/new.txt' -a \"\$(cat '$P80CV_GIT/new.txt')\" = topic"
+            check "phase80 N4 reset: sg replaces it too (full parity, this path is NOT divergence #11)" \
+                sh -c "test '$p80cv_sg_rc' -eq 0 -a ! -L '$P80CV_SG/new.txt' -a \"\$(cat '$P80CV_SG/new.txt')\" = topic"
+            ;;
+        switch)
+            check "phase80 N4 switch oracle: precondition -- git refuses (exit 1), naming new.txt" \
+                sh -c "test '$p80cv_git_rc' -eq 1 -a \"\$(head -1 '$P80CV_GIT.err')\" = 'error: The following untracked working tree files would be overwritten by checkout:'"
+            check "phase80 N4 switch: sg REPLACES instead of refusing (residual: no pre-flight for switch, see docs/DESIGN.md Phase 79's residual 1)" \
+                sh -c "test '$p80cv_sg_rc' -eq 0 -a ! -L '$P80CV_SG/new.txt' -a \"\$(cat '$P80CV_SG/new.txt')\" = topic"
+            ;;
+        cherry-pick)
+            check "phase80 N4 cherry-pick oracle: precondition -- git refuses (exit 128), naming new.txt" \
+                sh -c "test '$p80cv_git_rc' -eq 128 -a \"\$(head -1 '$P80CV_GIT.err')\" = 'error: The following untracked working tree files would be overwritten by merge:'"
+            check "phase80 N4 cherry-pick: sg REPLACES instead of refusing (residual: no pre-flight for cherry-pick)" \
+                sh -c "test '$p80cv_sg_rc' -eq 0 -a ! -L '$P80CV_SG/new.txt' -a \"\$(cat '$P80CV_SG/new.txt')\" = topic"
+            ;;
+    esac
+done
+
+# ---- T3: a TRACKED file deleted by topic, blocking a plain file added at
+# its directory's own name -- F4's delete-before-create fix, full parity
+# across all three commands (no half-applied state). ----
+
+p80cv_mk_t3() {
+    rm -rf "$1"; mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && mkdir d && printf 'tracked\n' > d/x.txt && git add d/x.txt \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m base \
+        && git branch topic \
+        && git switch -q topic \
+        && git rm -q d/x.txt && printf 'topic\n' > d && git add d \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m topic \
+        && git switch -q master \
+        && printf 'm\n' > master.txt && git add master.txt \
+        && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m m) > /dev/null 2>&1
+}
+
+for p80cv_op in switch reset cherry-pick; do
+    P80CV_GIT="$WORKDIR/phase80cv_t3_git_$p80cv_op"; P80CV_SG="$WORKDIR/phase80cv_t3_sg_$p80cv_op"
+    p80cv_mk_t3 "$P80CV_GIT"; p80cv_mk_t3 "$P80CV_SG"
+    p80cv_run git "$p80cv_op" "$P80CV_GIT"; p80cv_git_rc=$p80cv_rc
+    p80cv_run sg "$p80cv_op" "$P80CV_SG"; p80cv_sg_rc=$p80cv_rc
+    check "phase80 T3 $p80cv_op oracle: precondition -- git merges cleanly, d is a file, d/x.txt gone" \
+        sh -c "test '$p80cv_git_rc' -eq 0 -a ! -e '$P80CV_GIT/d/x.txt' -a \"\$(cat '$P80CV_GIT/d')\" = topic"
+    check "phase80 T3 $p80cv_op: sg does too (no half-applied state)" \
+        sh -c "test '$p80cv_sg_rc' -eq 0 -a ! -e '$P80CV_SG/d/x.txt' -a \"\$(cat '$P80CV_SG/d')\" = topic"
+done
+
+# ============================================================
+# Phase 80 fix round (cold-read finding 1, CRITICAL): the delete side must
+# never traverse a symlinked ancestor either. Shape: base commit tracks
+# a/b/tracked.txt; topic deletes it (and adds an unrelated file, so the
+# merge/pick/checkout has something to actually apply); the local working
+# tree replaces ancestor 'a' with a symlink to a directory OUTSIDE the
+# repo whose own b/tracked.txt is BYTE-IDENTICAL to the tracked content --
+# so `sg status` sees no local modification and the ONLY thing standing
+# between the operation and deleting the outside file is the delete-side
+# guard this fix round adds (sg_remove_file_worktree, workdir.c). No
+# second tracked file collides here (that would trip the ordinary
+# clean-workdir gate first and never reach the delete-side code at all --
+# this is deliberately the "clean attack" shape, matching SCRATCH/atk.py's
+# own construction, not oracle.py's D1/D2 fixtures which have exactly that
+# confound). Unborn HEAD has no reachable shape (an unborn merge has
+# nothing tracked yet to delete), so it is not in this group.
+# ============================================================
+
+p80d_mk_repo() {
+    # $1 = target dir, $2 = mode (ff/3way).
+    rm -rf "$1"; mkdir -p "$1"
+    (cd "$1" && git init -q -b master && git config user.email "a@x" && git config user.name "A" \
+        && mkdir -p a/b && printf 'TT\n' > a/b/tracked.txt && printf 'b\n' > base.txt && git add -A \
+        && GIT_AUTHOR_DATE="1700000000 +0000" GIT_COMMITTER_DATE="1700000000 +0000" git commit -q -m base \
+        && git branch topic \
+        && git switch -q topic \
+        && git rm -q a/b/tracked.txt && printf 'o\n' > o.txt && git add -A \
+        && GIT_AUTHOR_DATE="1700000100 +0000" GIT_COMMITTER_DATE="1700000100 +0000" git commit -q -m topic \
+        && git switch -q master) > /dev/null 2>&1
+    if [ "$2" = "3way" ]; then
+        (cd "$1" && printf 'm\n' > m.txt && git add -A \
+            && GIT_AUTHOR_DATE="1700000200 +0000" GIT_COMMITTER_DATE="1700000200 +0000" git commit -q -m m) \
+            > /dev/null 2>&1
+    fi
+}
+
+P80D_OUT="$WORKDIR/phase80d_out"
+rm -rf "$P80D_OUT"; mkdir -p "$P80D_OUT/b"
+printf 'TT\n' > "$P80D_OUT/b/tracked.txt"
+
+for p80d_combo in "merge:ff" "merge:3way" "switch:3way" "reset:3way" "cherry-pick:3way"; do
+    p80d_op=${p80d_combo%%:*}
+    p80d_mode=${p80d_combo#*:}
+    P80D_GIT="$WORKDIR/phase80d_git_${p80d_op}_${p80d_mode}"; P80D_SG="$WORKDIR/phase80d_sg_${p80d_op}_${p80d_mode}"
+    p80d_mk_repo "$P80D_GIT" "$p80d_mode"; p80d_mk_repo "$P80D_SG" "$p80d_mode"
+    rm -rf "$P80D_GIT/a"; ln -s "$P80D_OUT" "$P80D_GIT/a"
+    rm -rf "$P80D_SG/a"; ln -s "$P80D_OUT" "$P80D_SG/a"
+    case "$p80d_op" in
+        merge)
+            (cd "$P80D_GIT" && LC_ALL=C git merge topic) > /dev/null 2> "$WORKDIR/p80d_git_${p80d_op}_${p80d_mode}.err"
+            p80d_git_rc=$?
+            (cd "$P80D_SG" && "$SG" merge topic) > /dev/null 2> "$WORKDIR/p80d_sg_${p80d_op}_${p80d_mode}.err"
+            p80d_sg_rc=$?
+            ;;
+        switch)
+            (cd "$P80D_GIT" && LC_ALL=C git switch topic) > /dev/null 2> "$WORKDIR/p80d_git_${p80d_op}_${p80d_mode}.err"
+            p80d_git_rc=$?
+            (cd "$P80D_SG" && "$SG" switch topic) > /dev/null 2> "$WORKDIR/p80d_sg_${p80d_op}_${p80d_mode}.err"
+            p80d_sg_rc=$?
+            ;;
+        reset)
+            (cd "$P80D_GIT" && LC_ALL=C git reset -q --hard topic) > /dev/null 2> "$WORKDIR/p80d_git_${p80d_op}_${p80d_mode}.err"
+            p80d_git_rc=$?
+            (cd "$P80D_SG" && "$SG" reset --hard topic) > /dev/null 2> "$WORKDIR/p80d_sg_${p80d_op}_${p80d_mode}.err"
+            p80d_sg_rc=$?
+            ;;
+        cherry-pick)
+            (cd "$P80D_GIT" && LC_ALL=C git cherry-pick topic) > /dev/null 2> "$WORKDIR/p80d_git_${p80d_op}_${p80d_mode}.err"
+            p80d_git_rc=$?
+            (cd "$P80D_SG" && "$SG" cherry-pick topic) > /dev/null 2> "$WORKDIR/p80d_sg_${p80d_op}_${p80d_mode}.err"
+            p80d_sg_rc=$?
+            ;;
+    esac
+    check "phase80 D $p80d_op $p80d_mode: sg fails closed (exit 1), never deletes through the symlink" \
+        test "$p80d_sg_rc" -eq 1
+    check "phase80 D $p80d_op $p80d_mode: sg's stderr names the guarded-delete refusal" \
+        sh -c "grep -q 'cannot remove \"a/b/tracked.txt\"' '$WORKDIR/p80d_sg_${p80d_op}_${p80d_mode}.err'"
+    check "phase80 D $p80d_op $p80d_mode: the symlink 'a' itself survives untouched" \
+        test "$(readlink "$P80D_SG/a")" = "$P80D_OUT"
+    check "phase80 D $p80d_op $p80d_mode: @OUT/b/tracked.txt is byte-identical to before -- the actual invariant" \
+        test "$(cat "$P80D_OUT/b/tracked.txt")" = TT
+    if [ "$p80d_op" = "reset" ]; then
+        # Measured directly (git 2.55.0), and it does NOT match this fix
+        # round's own spec text ("reset --hard removes the symlink and
+        # rebuilds the real directory") -- in THIS exact shape (topic's
+        # target tree has NOTHING at all under "a", not even a replacement
+        # file), git's reset --hard leaves the symlink completely
+        # untouched and exits 0, never attempting to reconcile "a" at all.
+        # Pinned as measured, not adjusted to match the unverified claim --
+        # see docs/DESIGN.md's Phase 80 fix-round section.
+        check "phase80 D reset $p80d_mode oracle: precondition -- git exits 0 and leaves the symlink 'a' untouched (measured; does NOT rebuild in this shape)" \
+            sh -c "test '$p80d_git_rc' -eq 0 -a -L '$P80D_GIT/a'"
+    else
+        check "phase80 D $p80d_op $p80d_mode oracle: precondition -- git refuses (non-zero exit)" \
+            test "$p80d_git_rc" -ne 0
+    fi
+done
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

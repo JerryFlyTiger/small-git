@@ -1,8 +1,10 @@
 #include "sg/cli.h"
 
+#include "sg/apply.h"
 #include "sg/chunk.h"
 #include "sg/confirm.h"
 #include "sg/hash.h"
+#include "sg/ignore.h"
 #include "sg/index.h"
 #include "sg/objstore.h"
 #include "sg/object.h"
@@ -38,7 +40,7 @@ static int flat_find(const sg_flat_list *list, const char *path)
     return -1;
 }
 
-static int restore_worktree(const char *git_dir, const char *repo_root, sg_index *idx,
+static int restore_worktree(const char *git_dir, const char *repo_root, sg_ignore *ig, sg_index *idx,
                             const char *arg, const char *rel)
 {
     int pos = sg_index_find(idx, rel);
@@ -82,7 +84,11 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_index
         free(content);
         return -1;
     }
-    rc = sg_write_file_mkdirs(abspath, content, content_len, (int)(idx->entries[pos].mode & 0777));
+    rc = sg_worktree_clear_write_path(ig, repo_root, rel, NULL) != 0 ||
+        sg_write_file_worktree(repo_root, rel, content, content_len,
+                               (int)(idx->entries[pos].mode & 0777)) != 0
+            ? -1
+            : 0;
     free(content);
     if (rc != 0)
         fprintf(stderr, "sg: failed to restore %s\n", sg_quote_path_delimited(arg));
@@ -357,26 +363,44 @@ int sg_cmd_restore(int argc, char **argv)
         free(affected.buf);
     }
 
-    for (i = 1; i < argc; i++) {
-        char *rel;
+    {
+        /* Phase 80 (F1/F2): one sg_ignore for the whole `sg restore`
+           invocation, reused by sg_worktree_clear_write_path for every
+           argv path below -- opening a fresh one per file would re-read
+           every .gitignore on every single restore. Only needed for the
+           worktree half; --staged never writes to the working tree. */
+        sg_ignore *ig = NULL;
 
-        if (strcmp(argv[i], "--staged") == 0 || strcmp(argv[i], "--force") == 0 ||
-           strcmp(argv[i], "-f") == 0)
-            continue;
-
-        rel = sg_resolve_repo_path(repo_root, argv[i]);
-        if (rel == NULL) {
-            fprintf(stderr, "sg: %s is outside the repository\n", sg_quote_path_delimited(argv[i]));
+        if (!staged && sg_ignore_open(&ig, git_dir, repo_root) != 0) {
+            fprintf(stderr, "sg: out of memory\n");
             rc = 1;
-            continue;
+            ig = NULL;
         }
 
-        if (staged)
-            restore_staged(&idx, has_head, &head_flat, rel);
-        else if (restore_worktree(git_dir, repo_root, &idx, argv[i], rel) != 0)
-            rc = 1;
+        for (i = 1; i < argc; i++) {
+            char *rel;
 
-        free(rel);
+            if (strcmp(argv[i], "--staged") == 0 || strcmp(argv[i], "--force") == 0 ||
+               strcmp(argv[i], "-f") == 0)
+                continue;
+
+            rel = sg_resolve_repo_path(repo_root, argv[i]);
+            if (rel == NULL) {
+                fprintf(stderr, "sg: %s is outside the repository\n", sg_quote_path_delimited(argv[i]));
+                rc = 1;
+                continue;
+            }
+
+            if (staged)
+                restore_staged(&idx, has_head, &head_flat, rel);
+            else if (ig == NULL || restore_worktree(git_dir, repo_root, ig, &idx, argv[i], rel) != 0)
+                rc = 1;
+
+            free(rel);
+        }
+
+        if (ig != NULL)
+            sg_ignore_free(ig);
     }
 
     if (staged && sg_index_write(git_dir, &idx) != 0) {

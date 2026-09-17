@@ -20075,3 +20075,328 @@ Q/D/C/P-staged/P-unstaged added): `make` 0 warnings; `make test` 88/88;
 `make sanitize` clean (0 FAIL, 0 ASan/UBSan SUMMARY lines); `make clean &&
 make` 0 warnings; `python3 tests/fuzz_merge.py 200 --seed 73000` 0/200
 mismatches.
+
+## Phase 80: working-tree write side -- never write through a symlink, replace
+## what git replaces, delete before create
+
+Oracle measured against real git 2.55.0, `LC_ALL=C`, by the main
+conversation (subagents cannot run `git commit`). Condensed from the full
+table (E/I/A/N/R/T rows) recorded in the phase's own spec:
+
+| shape | git | sg before Phase 80 |
+|---|---|---|
+| untracked empty dir at write target (E1/E2/S3) | replaced | `failed to write` |
+| dir holding only ignored content (E3/E4/E5/E6/B7) | replaced | `failed to write` |
+| dir itself ignored (I4) | replaced | `failed to write` |
+| ignored symlink at write target -> outside file (I2) | link replaced, target file untouched | **wrote INTO the outside file** |
+| ignored symlink at write target -> outside dir (I3) | replaced | `failed to write` |
+| ignored symlink ancestor -> outside dir (A3/A5) | replaced, outside dir untouched | **wrote INTO the outside dir** |
+| non-ignored symlink ancestor -> outside dir (A4) | refused, names the symlink | **wrote INTO the outside dir, exit 0** |
+| non-ignored symlink ancestor -> in-repo dir (A6) | refused, names the symlink | **wrote into the wrong (real) directory** |
+| ignored symlink ancestor -> in-repo dir (A7) | replaced with a fresh real dir, target dir untouched | wrote into the wrong (real) directory |
+| non-ignored file/dir/symlink ancestor or target, reset --hard/undo only (N1/N2/A4) | deletes it, exit 0 | ACCEPTED divergence: fails closed (#11) |
+| tracked file deleted by the same merge, blocking a new file at its directory (T3/T4) | clean, half-delete-half-create never observable | half-applied: tracked file gone, new file not written |
+
+Four fixes, all in `src/workdir/workdir.c`, `src/workdir/apply.c`,
+`src/workdir/merge.c`, `include/sg/workdir.h`, `include/sg/apply.h`:
+
+- **F1** `sg_write_file_worktree` (`workdir.c`) replaces `sg_write_file_
+  mkdirs` at every worktree call site (`apply.c`, `merge.c`,
+  `cmd_restore.c`, `stash.c` x2). Every path component strictly below
+  `repo_root` is `lstat`'d, never `stat`'d, so a symlink component is never
+  silently followed; a real directory is traversed, a missing one created,
+  anything else fails the whole write (-1) unless F2 already cleared it.
+  The final component unconditionally replaces a symlink or regular file
+  (`unlink` then `open(O_CREAT|O_EXCL|O_NOFOLLOW)`), matching git's own
+  "recreate, don't truncate in place" checkout mechanism -- this is also
+  why a read-only TRACKED file no longer blocks `reset --hard`/`switch`
+  (unlink is governed by the parent directory's write bit, not the file's
+  own mode; see `tests/test_stash.c`'s
+  `test_push_returns_minus_two_when_reset_fails`, which had to move from
+  chmod'ing the file to chmod'ing its parent directory for this exact
+  reason). Components AT OR ABOVE `repo_root` are never inspected, so a
+  repo reached through a symlinked ancestor keeps working. `sg_write_file_
+  mkdirs` itself was NOT deleted -- it remains the tests' plain fixture-
+  setup helper (dozens of call sites, none touching the security boundary
+  this phase adds), see its own header comment.
+- **F2** `sg_worktree_clear_write_path` (`apply.c`, declared in `apply.h`)
+  runs immediately before every F1 write, one `sg_ignore` per caller-level
+  operation. Clears an IGNORED ancestor blocker (unlink and stop), or the
+  whole subtree of a directory sitting at the write target when it is
+  itself ignored or its recursive contents are all ignored (reusing
+  `untracked_overwrite_dir_has_nonignored`, no second copy of the rule);
+  fails closed (-1) on anything else. The subtree removal is `lstat`-based
+  (never `opendir`/`stat` through a symlink), so an ignored symlink inside
+  a removed directory is unlinked itself, its target never touched.
+- **F3** `sg_untracked_would_be_overwritten`'s classification (a):
+  the ancestor walk that finds a blocking non-directory now runs
+  UNCONDITIONALLY, not only when `lstat(P)` itself fails ENOTDIR -- a
+  symlink ancestor makes `lstat(P)` follow it and answer about the wrong
+  location entirely (ENOENT or even success), which the old ENOTDIR-gated
+  walk could never catch. (b): the recursive scan gained an optional `idx`
+  parameter -- a path tracked at any stage does not count as "this
+  directory holds untracked content", closing T3/T4's pre-flight
+  over-refusal. `sg_worktree_clear_write_path` always passes `idx = NULL`
+  (the exemption is a pre-flight-only concept, see F4 for why the write
+  side needs no exemption of its own).
+- **F4** `sg_merge_result_apply` (`merge.c`) now runs all deletions in one
+  pass over `result->entries`, then all writes in a second pass -- git's
+  own `check_updates` order. The pre-Phase-80 single interleaved pass could
+  write a new file at `d` before deleting a tracked `d/x.txt` still
+  underneath it, leaving a half-applied merge. No stdout/stderr byte or
+  index field moved; `python3 tests/fuzz_merge.py 200` stayed at 0/200
+  mismatches before and after.
+
+**Divergence #11** (`CLAUDE.md`'s numbered list): `sg reset --hard`/`sg
+undo` fail closed where git deletes untracked, non-ignored data (an
+ancestor file/symlink, or a non-empty directory at the write target) and
+succeeds. Accepted: sg's snapshot mechanism does not capture untracked
+data, so it must never be the one that silently discards it. `sg switch`/
+`cherry-pick`/`rebase`/`revert` now reach the identical fail-closed answer
+for the same shapes (they still lack `sg merge`'s own Phase 79 pre-flight,
+unchanged residual). A blocker sitting AT the final write path (not an
+ancestor) is unaffected and keeps being replaced by every command,
+matching git -- only an ancestor/directory blocker is refused.
+
+**Residuals, recorded rather than fixed by this phase**:
+1. sg does not check out symlinks at all -- a mode 120000 blob is written
+   as a mode-000 regular file containing the link target text, `sg status`
+   reports a committed symlink as a plain `M`/`D`, and an untracked symlink
+   is never listed by `sg status` at all. F1/F2 close the SECURITY half of
+   this gap (never writing through an on-disk symlink); actually
+   materializing a tree's own symlink entries as real symlinks is a
+   separate, larger feature, recommended as the next phase in this area.
+2. Real git's `cannot unlink '<p>': Permission denied` /
+   `cannot create directory at '<p>': Permission denied` wording (R1/R2)
+   is not reproduced -- sg's failure message stays the project's own `sg:
+   failed to write "<p>"` in every case, per this phase's own spec.
+3. `sg switch`/`sg rebase`/`sg cherry-pick`/`sg revert` still lack the
+   untracked-overwrite PRE-FLIGHT `sg merge` has had since Phase 79 (Phase
+   79's own residual 1, still open) -- this phase only made their WRITE
+   PATH fail closed on a non-ignored ancestor/directory blocker instead of
+   silently overwriting it; it did not give them git's own refusal wording
+   or a check that runs before anything is touched.
+
+**Gates after this phase**: `make` 0 warnings; `make test` 89/89 (added
+`tests/test_worktree_write.c`, extended `tests/test_untracked_overwrite.c`
+with two cases); `bash tests/interop.sh` **5085/5085 passed, 0 skipped**
+(4956 existing + 129 new `phase80` checks, plus the four Phase 79 pins
+upgraded from residual to full parity: `phase79 row7`, `phase79 row10`,
+`phase79b B7`, `phase79c S3`); `make sanitize` clean (0 FAIL, 0 ASan/UBSan
+SUMMARY lines); `python3 tests/fuzz_ignore.py` 0/200 mismatches; `python3
+tests/fuzz_merge.py 200` 0/200 mismatches. All builds/tests need
+`DEVELOPER_DIR=/Library/Developer/CommandLineTools` set on this machine
+(the full Xcode.app's own toolchain has an unaccepted license that breaks
+`xcrun`/`cc`/the `python3` interop.sh needs; the CommandLineTools one does
+not).
+
+**Coverage note (updated, review round)**: the interop group now covers,
+for `sg merge` in every mode (ff/3way/unborn) the oracle table has a value
+for: A1, A2 (ff only), A3, A4, A5, A6, A7, A8 (candidate-order file bucket
+in ff/3way, singular unborn wording), E1 (via the upgraded `row7`), E2, E3,
+E4, E5, E6, I1, I2, I3, I4, N2 (divergence #11), R1, T3, T4. And, as
+COMMAND VARIANTS (`switch`/`reset --hard`/`cherry-pick`, the security-
+critical part the first coverage pass skipped): A3 (full parity in all
+three), A4 (switch/cherry-pick fail closed with sg's own generic message
+where git refuses with its own wording; reset --hard is divergence #11),
+I2 (full parity in all three), N4 (reset --hard full parity; switch/
+cherry-pick sg REPLACES where git refuses -- Phase 79 residual 1, not a
+security hole, and every N4 row still asserts `@OUT/keep.txt` byte-
+identical to before regardless of which answer sg gives), T3 (full parity
+in all three). Divergence #11 is now pinned with N1, N2, and A4 (reset
+--hard) on both sides. Every symlink-involving row asserts the outside
+directory (or in-repo `real/`) is byte-identical to before the operation --
+the actual security invariant this whole phase exists to establish.
+
+**Still not individually pinned**: E7 (a symlink BLOB, i.e. a tracked
+120000-mode tree entry, colliding with an empty directory -- out of scope,
+see residual 1 above: sg does not check out symlink blobs at all), R2 (a
+read-only PARENT directory two levels up, `q/a/b/c.txt` blocked by ignored
+`q/a`), T1/T2 (a tracked SYMLINK or FILE being replaced by a directory --
+a different shape from T3/T4's "tracked file blocking a new file", not
+covered by this phase's own fixes), and the `switch`/`reset --hard`/
+`cherry-pick` variants of every merge-only row not listed as a command
+variant above (A1/A2/A5/A6/A7/A8/E2/E4/E5/I1/I4/R1). These remain
+exercised only indirectly, through the shared `sg_write_file_worktree`/
+`sg_worktree_clear_write_path` primitives every worktree write in the
+project goes through (unit-tested directly in `tests/test_worktree_write.c`)
+-- not guaranteed identical merely because the underlying functions are
+shared, since `sg_apply_tree_to_workdir` (switch/reset) and
+`sg_merge_result_apply` (cherry-pick/merge) are different call paths into
+those primitives. Recommended follow-up if this area is revisited again.
+
+### Phase 80 fix round: the DELETE side needed the write side's symlink guard too
+
+A cold read of the Phase 80 diff found one CRITICAL hole and two smaller
+ones. Full writeup of the critical one and the fix is in
+`docs/RULES-paths-strings.md`'s own "Phase 80 fix round (cold-read finding
+1, CRITICAL)" section; this section records the oracle measurements, the
+gate numbers, and the two record-only items.
+
+**Finding 1 (critical)**: F1/F2 guarded every worktree WRITE against
+symlink traversal, but every worktree DELETE (`sg_apply_tree_to_workdir`'s
+loop 1, `sg_merge_result_apply`'s F4 delete pass, two sites in
+`safety/stash.c`, and `sg_prune_empty_parents`) still built a path with
+`sg_path_join` and called `remove()`/`unlink()`/`rmdir()` on it directly --
+none of those resolve their FINAL component through a symlink, but all of
+them resolve every OTHER component. Reproduced directly with
+`SCRATCH/atk.py`: a tracked `a/b/tracked.txt`, ancestor `a` replaced by a
+symlink to an outside directory whose own `b/tracked.txt` is
+byte-identical (so `sg status` is clean and no second tracked file is
+needed) -- pre-fix, `sg merge`/`switch`/`cherry-pick` deleted the OUTSIDE
+file through the symlink, exit 0, no warning. Fixed by
+`sg_remove_file_worktree` (`workdir.c`), sharing the write side's ancestor
+walk via a new `walk_worktree_ancestors` helper, routed through every one
+of those five call sites (including `remove_untracked_files`, a SIXTH
+delete site found by grepping for the same shape rather than named in the
+fix's own spec -- `sg stash push -u`/`-a`'s untracked-file cleanup, reachable
+with no tracked content at all).
+
+**Measurement correction, made during this fix, not assumed**: the fix's
+own first-draft spec text claimed `reset --hard` "removes the symlink
+itself and rebuilds the real directory" for this shape. Measured directly
+(git 2.55.0): in the exact atk.py shape, where topic's target tree has
+NOTHING at all under `a`, git's `reset --hard` leaves the symlink
+completely untouched and exits 0 -- no rebuild happens, because there is
+nothing to reconcile under `a` in the target tree. The interop pin
+(`phase80 D reset ff`/`3way`) asserts the MEASURED behavior (exit 0, `a`
+still a symlink), not the unverified claim. sg still fails closed here
+(exit 1) regardless, which is the accepted, stricter answer -- see
+divergence #11's philosophy in `CLAUDE.md`; this is not a new numbered
+divergence, since git ALSO refuses in the other three commands for this
+same shape.
+
+**A caller-side behavior change, not just the guard itself**:
+`sg_apply_tree_to_workdir`'s loop 1 and `sg_merge_result_apply`'s delete
+pass used to have no `else` branch at all on a failed delete -- silently
+carrying on. Both now abort the whole operation (`rc = -1` /
+`content_missing = 1`) and print `sg: cannot remove "<p>"` on ANY real
+delete failure, not just the symlink case. `sg_remove_file_worktree`
+itself treats "already gone" (missing at any level, including the final
+component) as SUCCESS rather than a failure, matching every caller's
+pre-existing tolerance of a delete racing something else -- getting this
+wrong on the first attempt at this fix broke an ordinary `sg reset --hard`
+onto a commit that restores a path already deleted, unstaged (caught by
+`tests/interop.sh`'s pre-existing `phase12`/`phase45`/`phase49` groups
+going red, not by a new test), and separately broke
+`tests/test_stash.c`'s `test_push_returns_minus_two_when_keep_index_second_apply_fails`
+(that test's own fixture relied on `sg_prune_empty_parents` NOT running
+after a "delete found nothing there" outcome to keep a blocking directory
+non-empty; fixed by giving the fixture its own genuinely-non-empty reason
+to survive pruning, `blocked/.keep`, rather than relying on the removed
+implementation detail).
+
+**Finding 2 (medium-low)**: `conflict_no_workdir_file`'s own removal
+(rename/rename-1to2's original-path entry) was left in the write pass,
+interleaved by path order, contradicting this function's own claim (and
+`include/sg/apply.h`'s `sg_worktree_clear_write_path` comment, and
+`docs/RULES-paths-strings.md`'s own text) that F4 moved EVERY merge-result
+delete before every write. Fixed by moving it into the delete-first pass,
+routed through the same `sg_remove_file_worktree` guard --
+`python3 tests/fuzz_merge_rename.py 200 --max-failures 0` (the oracle for
+exactly this rename shape) stayed at 0/200 mismatches, and
+`python3 tests/fuzz_merge.py 200` stayed at 0/200. No doc correction was
+needed once the code matched the claim.
+
+**Finding 3 (low)**: `mkdir_parents_worktree` (now `walk_worktree_ancestors`)
+read one byte past the end of an empty-`relpath`-joined path (uninitialized
+stack content, not out-of-bounds of the buffer). No real caller passes an
+empty relpath; hardened by rejecting one outright in both
+`sg_write_file_worktree` and `sg_remove_file_worktree`, plus a unit
+assertion (`tests/test_worktree_write.c`'s `test_empty_relpath_rejected`).
+
+**Recorded, not fixed** (both added to this residual list per the fix's own
+instruction, no code changed for either):
+4. A double `/` when `repo_root` itself ends in a trailing slash --
+   unreachable (`sg_repo_root` never produces a trailing-slash result), so
+   left alone.
+5. `sg_write_file_mkdirs` remains exported in the public header as a
+   test-fixture-setup helper (see its own header comment, unchanged this
+   round). Moving it to a test-only location touches roughly 30 test files
+   for no behavior change -- a future cleanup, not this fix's job.
+
+**New checks**: `tests/test_worktree_write.c` gained
+`test_remove_blocked_by_ancestor_symlink_leaves_outside_intact`,
+`test_remove_ordinary_file_succeeds`, `test_remove_missing_ancestor_is_success`,
+`test_remove_missing_final_component_is_success`,
+`test_prune_empty_parents_blocked_by_ancestor_symlink`, and
+`test_empty_relpath_rejected` (6 new unit tests, 89 total binaries
+project-wide, unchanged count -- no new binary, this file already existed).
+`tests/interop.sh` gained a `phase80 D <op> <mode>` group (5 combinations:
+merge ff/3way, switch, reset --hard, cherry-pick, all 3way except the two
+merge rows -- unborn HEAD has no reachable shape, since an unborn merge has
+nothing tracked yet to delete), 20 new checks.
+
+**Gates after this fix round** (all foreground, plain `cc`, no
+`DEVELOPER_DIR` override needed for the build itself): `make` 0 warnings;
+`make test` 89/89; `bash tests/interop.sh` **5110/5110 passed, 0 skipped**
+(5085 baseline + 25 new `phase80 D*` checks: 5 op/mode combos x 5 checks
+each -- 4 per-iteration sg-side checks (fails-closed, stderr names the
+refusal, the symlink itself survives, the outside dir is byte-identical)
+plus 1 git-side oracle-precondition check per combo, 20 + 5 = 25); `make
+sanitize` clean (0 FAIL, 0 ASan/UBSan SUMMARY lines); `python3
+tests/fuzz_ignore.py` 0/200 mismatches; `python3 tests/fuzz_merge.py 200`
+0/200 mismatches; `python3 tests/fuzz_merge_rename.py 200 --max-failures 0`
+0/200 mismatches (all 8 rename shapes, including `rename_rename_1to2`, the
+one Finding 2's fix directly touches).
+
+Two intermediate interop runs during this fix round went red before this:
+one from the ENOENT-vs-failure bug described above (8 pre-existing checks:
+`phase12`, `phase45`, `phase49`), fixed by making `sg_remove_file_worktree`
+treat a missing final component as success too; one from the `reset --hard`
+row's own precondition being written from the unverified spec claim rather
+than a fresh measurement, fixed by measuring and pinning the real answer.
+Both are recorded here rather than silently smoothed over, per this
+project's own "measure, don't guess" convention.
+
+**Second cold read of this fix round (tail diff only), findings and their
+disposition.** The core security property -- no `sg` command deletes or
+modifies anything OUTSIDE the repository through a symlinked ancestor --
+survived the read; two independent cold reads could not break it. The
+remaining findings were about claims and coverage, not the guard itself:
+
+1. **The "working tree untouched" prose overclaimed atomicity** -- fixed in
+   `docs/RULES-paths-strings.md` (the guard gives the OUTSIDE-repo
+   guarantee; the in-repo tree keeps its pre-existing weaker "may be
+   partially updated" contract from `apply.h`/`merge.h`, since loop 2 /
+   pass 2 still run unconditionally). No `phase80 D` row asserts "no stray
+   in-repo file was created," deliberately -- that would pin the weaker
+   contract as if it were stronger.
+2. **Two of the six routed delete sites are `static` stash helpers with no
+   test that reds on a routing revert** (`remove_untracked_files`,
+   `restore_matched_paths` in `safety/stash.c`). Measured: the shape that
+   would exercise them -- an untracked file swept by `stash push -u` while
+   sitting under a symlinked ancestor -- is NOT constructible through
+   porcelain, because `git`/`sg` status never descends a symlink to list
+   `a/x` as untracked in the first place (measured: `stash push -u` with
+   `a -> outside` leaves outside intact on both sides, the symlink is
+   treated as one untracked entry, never followed). These two guards are
+   therefore defense-in-depth for a shape no fixture can reach, the same
+   category as the hand-built fixtures divergence #9 needs -- recorded, not
+   given a manufactured test. Mutations `p80_stash_untracked_route` and
+   `p80_stash_restore_route` are expected GREEN for this reason; that is
+   the honest state, not a coverage claim.
+3. **`sg_remove_file_worktree` did not set `errno` on the path-too-long
+   return**, while its own header promised "this is never ENOENT" and
+   `remove_untracked_files` relies on that via `errno != ENOENT` -- a stale
+   ENOENT could have masked a genuine too-long failure as "already gone."
+   Fixed: both the empty-relpath and the truncation returns now set errno
+   explicitly (`EINVAL` / `ENAMETOOLONG`). This is a hardening whose trigger
+   (a near-`SG_PATH_MAX` relpath plus a stale ENOENT in the same process)
+   no fixture reaches, so no mutation reds on it -- recorded as such, same
+   shape as Phase 79's u11.
+4. **Message specificity regressed** (`sg: path too long, cannot delete
+   <p>` -> the generic `sg: cannot remove "<p>"` for every failure kind).
+   No test ever pinned the old string. Left as the generic wording (it is
+   correctly path-quoted and in the project's `sg: <verb> "<p>"` shape);
+   recorded here so the change is on the record rather than silent.
+5. Two doc nits fixed: the interop check-count breakdown above (the "+25"
+   is 5 combos x 5 checks, not "20 + an extra 5 stderr checks"), and a
+   missing `docs/RULES-duplication.md` entry for the new shared
+   `walk_worktree_ancestors` primitive.
+
+Residuals carried forward unchanged (recorded, not fixed): findings 4
+(trailing-slash `repo_root` double slash, no caller reaches it) and 5
+(`sg_write_file_mkdirs` still exported as a test-only fixture helper;
+moving it out of the public header would touch ~30 test files) from the
+first cold read.

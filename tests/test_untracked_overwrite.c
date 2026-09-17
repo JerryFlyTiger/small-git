@@ -689,6 +689,125 @@ static void test_deep_recursion_stack_safety(void)
     free(git_dir);
 }
 
+/* Phase 80 (F3a): a SYMLINK ancestor (not a regular file) blocking a deep
+   candidate must be caught even when lstat(P) itself does NOT fail ENOTDIR
+   -- the pre-Phase-80 code only walked ancestors when lstat(candidate)
+   failed with ENOTDIR, but lstat resolves an intermediate symlink
+   component, so a symlink pointing at some OTHER real directory that does
+   not itself contain the rest of the candidate's path makes lstat(P) fail
+   with plain ENOENT (or even succeed), not ENOTDIR -- the exact shape that
+   made the pre-Phase-80 classifier silently answer "no collision" for a
+   security-relevant blocker. */
+static void test_ancestor_symlink_blocker(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    const char *paths[1];
+    char **out_files = NULL;
+    size_t out_files_count = 0;
+    char **out_dirs = NULL;
+    size_t out_dirs_count = 0;
+    char elsewhere[4096];
+    char link_path[4096];
+
+    memset(&idx, 0, sizeof(idx));
+    snprintf(elsewhere, sizeof(elsewhere), "%s/elsewhere", repo_root);
+    CHECK(mkdir(elsewhere, 0755) == 0, "failed to mkdir elsewhere");
+    snprintf(link_path, sizeof(link_path), "%s/a", repo_root);
+    CHECK(symlink(elsewhere, link_path) == 0, "failed to symlink a -> elsewhere");
+
+    /* "elsewhere" has no "b" component at all, so lstat("a/b/c.txt")
+       (which DOES follow the "a" symlink, since only the FINAL component
+       of an lstat path is left unresolved) fails with plain ENOENT, not
+       ENOTDIR -- proving this test actually discriminates the fix rather
+       than accidentally reproducing the old ENOTDIR-only path. */
+    paths[0] = "a/b/c.txt";
+    CHECK(sg_untracked_would_be_overwritten(git_dir, repo_root, &idx, paths, 1, &out_files,
+                                            &out_files_count, &out_dirs, &out_dirs_count,
+                                            NULL, NULL) == 0,
+         "call failed");
+    CHECK(out_files_count == 1, "expected the symlink 'a' to be reported as the blocker, got %zu",
+         out_files_count);
+    CHECK(out_dirs_count == 0, "expected no directory collision, got %zu", out_dirs_count);
+    if (out_files_count == 1)
+        CHECK(strcmp(out_files[0], "a") == 0, "expected blocker 'a', got '%s'", out_files[0]);
+
+    free_result(out_files, out_files_count);
+    free_result(out_dirs, out_dirs_count);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Phase 80 (F3b): a path tracked in idx found while recursively scanning a
+   directory's contents is NOT untracked content -- the pre-flight's own
+   directory bucket must not refuse a merge just because a file the SAME
+   merge is about to delete still physically sits on disk. Run as a pair
+   with the tracked entry present (no collision) and absent (a genuine
+   collision), so the tracked-path exemption itself is what's proven,
+   not merely "an empty directory doesn't collide". */
+static void test_directory_scan_tracked_exemption(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    sg_index_entry e;
+    const char *paths[1];
+    char **out_files = NULL;
+    size_t out_files_count = 0;
+    char **out_dirs = NULL;
+    size_t out_dirs_count = 0;
+
+    memset(&idx, 0, sizeof(idx));
+    mkdir_workdir(repo_root, "d");
+    write_workdir_file(repo_root, "d/x.txt", "tracked content\n");
+
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    e.path = (char *)"d/x.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert failed");
+
+    paths[0] = "d";
+    CHECK(sg_untracked_would_be_overwritten(git_dir, repo_root, &idx, paths, 1, &out_files,
+                                            &out_files_count, &out_dirs, &out_dirs_count,
+                                            NULL, NULL) == 0,
+         "call failed");
+    CHECK(out_files_count == 0, "expected no file collision, got %zu", out_files_count);
+    CHECK(out_dirs_count == 0,
+         "a directory whose only content is tracked (and about to be deleted by the same "
+         "operation) must not collide, got %zu",
+         out_dirs_count);
+    free_result(out_files, out_files_count);
+    free_result(out_dirs, out_dirs_count);
+
+    /* Control: the SAME on-disk shape, but idx has nothing tracked at
+       d/x.txt -- this must now genuinely collide (directory bucket), or
+       the first half of this test would be vacuous (e.g. if the scan
+       always answered "no collision" for any single-file directory
+       regardless of idx). */
+    out_files = NULL;
+    out_files_count = 0;
+    out_dirs = NULL;
+    out_dirs_count = 0;
+    sg_index_free(&idx);
+    memset(&idx, 0, sizeof(idx));
+    CHECK(sg_untracked_would_be_overwritten(git_dir, repo_root, &idx, paths, 1, &out_files,
+                                            &out_files_count, &out_dirs, &out_dirs_count,
+                                            NULL, NULL) == 0,
+         "call failed (control)");
+    CHECK(out_dirs_count == 1,
+         "control: without the tracked exemption this directory must collide, got %zu",
+         out_dirs_count);
+    CHECK(out_files_count == 0, "expected no file collision (control), got %zu", out_files_count);
+
+    free_result(out_files, out_files_count);
+    free_result(out_dirs, out_dirs_count);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_ancestor_blocker();
@@ -704,6 +823,8 @@ int main(void)
     test_first_collision_across_buckets();
     test_scan_opendir_permission_denied();
     test_deep_recursion_stack_safety();
+    test_ancestor_symlink_blocker();
+    test_directory_scan_tracked_exemption();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

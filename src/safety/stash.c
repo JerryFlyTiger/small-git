@@ -117,17 +117,22 @@ static int build_and_write_commit(const char *git_dir, const unsigned char tree[
    just went into the third parent's tree. ENOENT is not an error (the file
    may already be gone for some unrelated reason); anything else is, and
    aborts immediately rather than silently leaving some files behind while
-   reporting success. Returns 0, -1 on the first real failure. */
+   reporting success. Returns 0, -1 on the first real failure.
+
+   Phase 80 (fix round, finding 1): routed through sg_remove_file_worktree
+   instead of a bare unlink() on a joined path -- a symlinked ancestor used
+   to let this resolve straight through it and unlink a file OUTSIDE the
+   repository (this is exactly the untracked-file half of `sg stash push
+   -u`/`-a`, so it is reachable without any tracked content at all).
+   sg_remove_file_worktree sets errno to ELOOP (never ENOENT) when it fails
+   closed on a blocked ancestor, so the ENOENT-tolerant check below still
+   correctly treats that case as a real failure, not as "already gone". */
 static int remove_untracked_files(const char *repo_root, char **paths, size_t count)
 {
     size_t i;
 
     for (i = 0; i < count; i++) {
-        char abspath[SG_PATH_MAX];
-
-        if (sg_path_join(abspath, sizeof(abspath), repo_root, paths[i]) != 0)
-            return -1;
-        if (unlink(abspath) != 0 && errno != ENOENT)
+        if (sg_remove_file_worktree(repo_root, paths[i]) != 0 && errno != ENOENT)
             return -1;
     }
     return 0;
@@ -385,11 +390,20 @@ static int restore_matched_paths(const char *git_dir, const char *repo_root,
     char bad_path[SG_PATH_MAX];
     size_t i;
     int rc = 0;
+    sg_ignore *ig;
 
     if (sg_tree_flatten(git_dir, target_tree, &target_flat, bad_path) != 0)
         return -1;
 
     if (sg_index_read(git_dir, &idx) != 0) {
+        sg_flat_list_free(&target_flat);
+        return -1;
+    }
+
+    /* Phase 80 (F1/F2): one sg_ignore for the whole call, reused by
+       sg_worktree_clear_write_path for every path below. */
+    if (sg_ignore_open(&ig, git_dir, repo_root) != 0) {
+        sg_index_free(&idx);
         sg_flat_list_free(&target_flat);
         return -1;
     }
@@ -404,22 +418,22 @@ static int restore_matched_paths(const char *git_dir, const char *repo_root,
         if (!sg_pathspec_matches(ps, idx.entries[i].path))
             continue;
         if (stash_flat_find(&target_flat, idx.entries[i].path) == NULL) {
-            char abspath[SG_PATH_MAX];
-
             if (!sg_relpath_is_safe(idx.entries[i].path)) {
                 fprintf(stderr, "sg: path %s in index is invalid, refusing to delete\n",
                        sg_quote_path_delimited(idx.entries[i].path));
                 rc = -1;
                 continue;
             }
-            if (sg_path_join(abspath, sizeof(abspath), repo_root, idx.entries[i].path) != 0) {
-                fprintf(stderr, "sg: path too long, cannot delete %s\n",
+            /* Phase 80 (fix round, finding 1): sg_remove_file_worktree
+               fails closed on a symlinked ancestor instead of resolving
+               through it the way a bare remove() would. */
+            if (sg_remove_file_worktree(repo_root, idx.entries[i].path) != 0) {
+                fprintf(stderr, "sg: cannot remove %s\n",
                        sg_quote_path_delimited(idx.entries[i].path));
                 rc = -1;
                 continue;
             }
-            if (remove(abspath) == 0)
-                sg_prune_empty_parents(repo_root, idx.entries[i].path);
+            sg_prune_empty_parents(repo_root, idx.entries[i].path);
             if (sg_index_remove_all_stages(&idx, idx.entries[i].path) != 0)
                 rc = -1;
         }
@@ -461,8 +475,9 @@ static int restore_matched_paths(const char *git_dir, const char *repo_root,
             rc = -1;
             continue;
         }
-        if (sg_write_file_mkdirs(abspath, blob_content, blob_len,
-                                 (int)(target_flat.entries[i].mode & 0777)) != 0) {
+        if (sg_worktree_clear_write_path(ig, repo_root, target_flat.entries[i].path, NULL) != 0 ||
+           sg_write_file_worktree(repo_root, target_flat.entries[i].path, blob_content, blob_len,
+                                  (int)(target_flat.entries[i].mode & 0777)) != 0) {
             fprintf(stderr, "sg: failed to write %s\n",
                    sg_quote_path_delimited(target_flat.entries[i].path));
             free(blob_content);
@@ -500,6 +515,8 @@ static int restore_matched_paths(const char *git_dir, const char *repo_root,
             rc = -1;
         }
     }
+
+    sg_ignore_free(ig);
 
     if (rc == 0 && sg_index_write(git_dir, &idx) != 0)
         rc = -1;
@@ -1051,6 +1068,12 @@ static int path_is_conflict(const sg_merge_result *result, const char *path)
 static int restore_untracked_flat(const char *git_dir, const char *repo_root, const sg_flat_list *flat)
 {
     size_t i;
+    sg_ignore *ig;
+
+    /* Phase 80 (F1/F2): one sg_ignore for the whole call, reused by
+       sg_worktree_clear_write_path for every path below. */
+    if (sg_ignore_open(&ig, git_dir, repo_root) != 0)
+        return -1;
 
     for (i = 0; i < flat->count; i++) {
         char abspath[SG_PATH_MAX];
@@ -1059,25 +1082,32 @@ static int restore_untracked_flat(const char *git_dir, const char *repo_root, co
         sg_chunk_missing_info missing;
         int read_rc;
 
-        if (sg_path_join(abspath, sizeof(abspath), repo_root, flat->entries[i].path) != 0)
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, flat->entries[i].path) != 0) {
+            sg_ignore_free(ig);
             return -1;
+        }
         read_rc = sg_chunk_read_blob(git_dir, flat->entries[i].sha1, &blob_content, &blob_len, &missing);
         if (read_rc == -2) {
             sg_chunk_print_missing_error(flat->entries[i].path, &missing);
+            sg_ignore_free(ig);
             return -1;
         }
         if (read_rc != 0) {
             fprintf(stderr, "sg: missing blob for %s\n", sg_quote_path_delimited(flat->entries[i].path));
+            sg_ignore_free(ig);
             return -1;
         }
-        if (sg_write_file_mkdirs(abspath, blob_content, blob_len, (int)(flat->entries[i].mode & 0777)) !=
-           0) {
+        if (sg_worktree_clear_write_path(ig, repo_root, flat->entries[i].path, NULL) != 0 ||
+           sg_write_file_worktree(repo_root, flat->entries[i].path, blob_content, blob_len,
+                                  (int)(flat->entries[i].mode & 0777)) != 0) {
             fprintf(stderr, "sg: failed to write %s\n", sg_quote_path_delimited(flat->entries[i].path));
             free(blob_content);
+            sg_ignore_free(ig);
             return -1;
         }
         free(blob_content);
     }
+    sg_ignore_free(ig);
     return 0;
 }
 
