@@ -2,6 +2,7 @@
 
 #include "sg/chunk.h"
 #include "sg/confirm.h"
+#include "sg/ignore.h"
 #include "sg/index.h"
 #include "sg/merge.h"
 #include "sg/objstore.h"
@@ -15,6 +16,8 @@
 #include "sg/tree_build.h"
 #include "sg/workdir.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -517,4 +520,561 @@ int sg_require_clean_workdir(const char *git_dir, const char *repo_root, const c
     sg_status_list_free(&unstaged);
     sg_index_free(&idx);
     return dirty ? 1 : 0;
+}
+
+/* ---- Phase 79: untracked-overwrite pre-flight ---- */
+
+static int path_tracked_any_stage(const sg_index *idx, const char *path)
+{
+    unsigned int stage;
+
+    for (stage = 0; stage <= 3; stage++) {
+        if (sg_index_find_stage(idx, path, stage) >= 0)
+            return 1;
+    }
+    return 0;
+}
+
+void sg_untracked_overwrite_error_free(sg_untracked_overwrite_error *err)
+{
+    free(err->path);
+    err->path = NULL;
+    err->kind = SG_UNTRACKED_ERR_NONE;
+    err->saved_errno = 0;
+}
+
+/* Pushes every proper ancestor of `path` (shortest first) onto `ig`, queries
+   sg_ignore_is_ignored for `path` itself, then pops everything it pushed.
+   Returns 0 and fills *out_ignored on success, -1 on an sg_ignore_push_dir
+   allocation failure (everything already pushed is popped before returning,
+   *out_ignored is left untouched). */
+static int untracked_overwrite_is_ignored(sg_ignore *ig, const char *path, int is_dir,
+                                          int *out_ignored)
+{
+    size_t i;
+    size_t pushed = 0;
+    int rc = 0;
+
+    for (i = 0; path[i] != '\0'; i++) {
+        if (path[i] == '/') {
+            char prefix[SG_PATH_MAX];
+
+            if (i >= sizeof(prefix)) {
+                rc = -1;
+                break;
+            }
+            memcpy(prefix, path, i);
+            prefix[i] = '\0';
+            if (sg_ignore_push_dir(ig, prefix) != 0) {
+                rc = -1;
+                break;
+            }
+            pushed++;
+        }
+    }
+
+    if (rc == 0)
+        *out_ignored = sg_ignore_is_ignored(ig, path, is_dir);
+
+    while (pushed-- > 0)
+        sg_ignore_pop_dir(ig);
+
+    return rc;
+}
+
+/* Appends `x` to *arr (growing it). Measured against git 2.55.0 (correcting
+   this function's own earlier "de-duplicated" doc comment): git does NOT
+   de-duplicate -- two candidates blocked by the same ancestor each print
+   that ancestor's name once, so a blocker named twice in the input produces
+   TWO lines of output, not one. Returns 0 on success, -1 on allocation
+   failure. */
+static int untracked_overwrite_bucket_add(char ***arr, size_t *count, size_t *cap, const char *x)
+{
+    if (*count == *cap) {
+        size_t new_cap = *cap == 0 ? 8 : *cap * 2;
+        char **grown = realloc(*arr, new_cap * sizeof(**arr));
+
+        if (grown == NULL)
+            return -1;
+        *arr = grown;
+        *cap = new_cap;
+    }
+    (*arr)[*count] = strdup(x);
+    if ((*arr)[*count] == NULL)
+        return -1;
+    (*count)++;
+    return 0;
+}
+
+/* Records the FIRST failure only: every call site below either bails
+   immediately on -1 (nothing further can overwrite what was already
+   recorded) or, in the recursive case, simply propagates a child's -1
+   upward without calling this again -- so `err` is filled exactly once per
+   top-level sg_untracked_would_be_overwritten call. `path` may be NULL
+   (SG_UNTRACKED_ERR_ALLOC never has one; a strdup failure while trying to
+   record some other kind's path also leaves it NULL rather than losing the
+   original error to a second allocation failure). Always returns -1, so
+   call sites can `return set_untracked_err(...)`. */
+static int set_untracked_err(sg_untracked_overwrite_error *err, sg_untracked_err_kind kind,
+                             const char *path, int saved_errno)
+{
+    err->kind = kind;
+    free(err->path);
+    err->path = path != NULL ? strdup(path) : NULL;
+    err->saved_errno = saved_errno;
+    return -1;
+}
+
+/* Phase 79c (F3): a growable heap buffer holding the CURRENT relative path
+   being scanned, shared across an entire untracked_overwrite_dir_scan
+   recursion instead of each stack frame holding its own SG_PATH_MAX-sized
+   copy -- a chain of ~2000 one-letter untracked directories is a real,
+   reachable shape (SG_PATH_MAX == PATH_MAX == 4096 on Linux) and used to
+   need ~24MB of stack for that alone. push()/pop() extend and truncate the
+   SAME buffer in place; only one exists for the whole call, not one per
+   recursion level. */
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} untracked_path_accum;
+
+static int untracked_path_accum_init(untracked_path_accum *pa, const char *start)
+{
+    pa->len = strlen(start);
+    pa->cap = pa->len + 1 > 256 ? pa->len + 1 : 256;
+    pa->buf = malloc(pa->cap);
+    if (pa->buf == NULL)
+        return -1;
+    memcpy(pa->buf, start, pa->len + 1);
+    return 0;
+}
+
+static void untracked_path_accum_free(untracked_path_accum *pa)
+{
+    free(pa->buf);
+    pa->buf = NULL;
+}
+
+/* Appends "/name" to the buffer (growing it if needed), returning the
+   PREVIOUS length in *out_old_len so the caller can truncate back with
+   untracked_path_accum_pop. Returns -1 on allocation failure, leaving the
+   buffer at its old content/length. */
+static int untracked_path_accum_push(untracked_path_accum *pa, const char *name,
+                                     size_t *out_old_len)
+{
+    size_t nlen = strlen(name);
+    size_t need = pa->len + 1 + nlen + 1;
+
+    *out_old_len = pa->len;
+    if (need > pa->cap) {
+        size_t new_cap = pa->cap * 2;
+        char *grown;
+
+        if (new_cap < need)
+            new_cap = need;
+        grown = realloc(pa->buf, new_cap);
+        if (grown == NULL)
+            return -1;
+        pa->buf = grown;
+        pa->cap = new_cap;
+    }
+    pa->buf[pa->len] = '/';
+    memcpy(pa->buf + pa->len + 1, name, nlen + 1);
+    pa->len += 1 + nlen;
+    return 0;
+}
+
+static void untracked_path_accum_pop(untracked_path_accum *pa, size_t old_len)
+{
+    pa->len = old_len;
+    pa->buf[pa->len] = '\0';
+}
+
+static int untracked_overwrite_dir_scan(sg_ignore *ig, const char *repo_root,
+                                        untracked_path_accum *pa, char *abs_scratch,
+                                        int *out_found, sg_untracked_overwrite_error *err);
+
+/* Pushes proper ancestors of `path` (shortest first, same convention as
+   untracked_overwrite_is_ignored above), then recursively scans `path`
+   itself for at least one entry that is not ignored, then pops everything
+   it pushed. See sg_untracked_would_be_overwritten's own header comment
+   (Phase 79b) for the exact rules this scan follows. Returns 0 and fills
+   *out_found on success; -1 on any opendir/readdir/lstat/ignore-engine
+   failure encountered anywhere in the scan (all pushed ancestors are
+   popped before returning either way), with `err` describing which. */
+static int untracked_overwrite_dir_has_nonignored(sg_ignore *ig, const char *repo_root,
+                                                   const char *path, int *out_found,
+                                                   sg_untracked_overwrite_error *err)
+{
+    untracked_path_accum pa;
+    char *abs_scratch;
+    size_t i;
+    size_t pushed = 0;
+    int rc = 0;
+
+    if (untracked_path_accum_init(&pa, path) != 0)
+        return set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+    /* Phase 79c (F3): one shared SG_PATH_MAX scratch buffer for every
+       opendir()/lstat() absolute path built anywhere in the recursion below
+       -- heap-allocated once here rather than a fresh stack array per
+       frame, same rationale as untracked_path_accum above. sg_path_join
+       still enforces the SG_PATH_MAX bound on every use, so a path that
+       does not fit still fails closed exactly as before. */
+    abs_scratch = malloc(SG_PATH_MAX);
+    if (abs_scratch == NULL) {
+        untracked_path_accum_free(&pa);
+        return set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+    }
+
+    for (i = 0; path[i] != '\0'; i++) {
+        if (path[i] == '/') {
+            char prefix[SG_PATH_MAX];
+
+            if (i >= sizeof(prefix)) {
+                rc = set_untracked_err(err, SG_UNTRACKED_ERR_PATH_TOO_LONG, path, ENAMETOOLONG);
+                break;
+            }
+            memcpy(prefix, path, i);
+            prefix[i] = '\0';
+            if (sg_ignore_push_dir(ig, prefix) != 0) {
+                rc = set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+                break;
+            }
+            pushed++;
+        }
+    }
+
+    if (rc == 0)
+        rc = untracked_overwrite_dir_scan(ig, repo_root, &pa, abs_scratch, out_found, err);
+
+    while (pushed-- > 0)
+        sg_ignore_pop_dir(ig);
+
+    free(abs_scratch);
+    untracked_path_accum_free(&pa);
+    return rc;
+}
+
+/* Pushes `pa->buf` itself onto `ig` (so a .gitignore inside it applies to
+   its own children), then walks its direct entries: a file (or symlink,
+   treated as a file, never descended into) that is not ignored makes the
+   whole scan report "found" immediately; a subdirectory that is itself
+   ignored is skipped without recursing into it (an ignored subtree can
+   never contribute a non-ignored file to the outer answer); any other
+   subdirectory is recursed into. Pops `pa->buf` before returning. Returns 0
+   and fills *out_found on success, -1 on any opendir/readdir/lstat/
+   ignore-engine failure, filling `err` with which one and (where
+   applicable) the repo-relative path and errno involved -- see
+   sg_untracked_err_kind's own comment.
+
+   Phase 79c (F2): an opendir/readdir/lstat failure here used to propagate
+   as a bare -1 that cmd_merge.c printed as "sg: out of memory" regardless
+   of the real cause -- measured against git 2.55.0 (S6 in the Phase 79c
+   oracle), a chmod-000 subdirectory is a PERMISSION error, not an
+   allocation one, and git names the directory and the real reason. `err`
+   is how that distinction survives the trip back up the recursion.
+
+   readdir()'s own failure is detected the POSIX way: errno is cleared right
+   before each call, and a NULL return with errno left non-zero afterward is
+   a real failure rather than "no more entries" (readdir does not guarantee
+   errno is left unchanged on a clean end-of-directory, only that it is set
+   on failure). */
+static int untracked_overwrite_dir_scan(sg_ignore *ig, const char *repo_root,
+                                        untracked_path_accum *pa, char *abs_scratch,
+                                        int *out_found, sg_untracked_overwrite_error *err)
+{
+    DIR *d;
+    struct dirent *ent;
+    int rc = 0;
+    int found = 0;
+
+    if (sg_path_join(abs_scratch, SG_PATH_MAX, repo_root, pa->buf) != 0)
+        return set_untracked_err(err, SG_UNTRACKED_ERR_PATH_TOO_LONG, pa->buf, ENAMETOOLONG);
+
+    d = opendir(abs_scratch);
+    if (d == NULL)
+        return set_untracked_err(err, SG_UNTRACKED_ERR_OPENDIR, pa->buf, errno);
+
+    if (sg_ignore_push_dir(ig, pa->buf) != 0) {
+        closedir(d);
+        return set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+    }
+
+    errno = 0;
+    while (!found && (ent = readdir(d)) != NULL) {
+        struct stat st;
+        int ignored;
+        size_t old_len;
+
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) {
+            errno = 0;
+            continue;
+        }
+
+        if (untracked_path_accum_push(pa, ent->d_name, &old_len) != 0) {
+            rc = set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+            break;
+        }
+
+        if (sg_path_join(abs_scratch, SG_PATH_MAX, repo_root, pa->buf) != 0) {
+            rc = set_untracked_err(err, SG_UNTRACKED_ERR_PATH_TOO_LONG, pa->buf, ENAMETOOLONG);
+            untracked_path_accum_pop(pa, old_len);
+            break;
+        }
+        if (lstat(abs_scratch, &st) != 0) {
+            rc = set_untracked_err(err, SG_UNTRACKED_ERR_LSTAT, pa->buf, errno);
+            untracked_path_accum_pop(pa, old_len);
+            break;
+        }
+
+        ignored = sg_ignore_is_ignored(ig, pa->buf, S_ISDIR(st.st_mode) ? 1 : 0);
+        if (S_ISDIR(st.st_mode)) {
+            int sub_found = 0;
+
+            if (!ignored &&
+                untracked_overwrite_dir_scan(ig, repo_root, pa, abs_scratch, &sub_found, err) !=
+                    0) {
+                rc = -1;
+                untracked_path_accum_pop(pa, old_len);
+                break;
+            }
+            if (sub_found)
+                found = 1;
+        } else if (!ignored) {
+            found = 1;
+        }
+        untracked_path_accum_pop(pa, old_len);
+        errno = 0;
+    }
+    if (rc == 0 && ent == NULL && errno != 0)
+        rc = set_untracked_err(err, SG_UNTRACKED_ERR_READDIR, pa->buf, errno);
+
+    sg_ignore_pop_dir(ig);
+    closedir(d);
+
+    if (rc != 0)
+        return -1;
+
+    *out_found = found;
+    return 0;
+}
+
+int sg_untracked_would_be_overwritten(const char *git_dir, const char *repo_root,
+                                      const sg_index *idx,
+                                      const char *const *paths, size_t count,
+                                      char ***out_files, size_t *out_files_count,
+                                      char ***out_dirs, size_t *out_dirs_count,
+                                      int *out_first_is_dir,
+                                      sg_untracked_overwrite_error *out_err)
+{
+    sg_ignore *ig;
+    char **file_collisions = NULL;
+    size_t file_count = 0;
+    size_t file_cap = 0;
+    char **dir_collisions = NULL;
+    size_t dir_count = 0;
+    size_t dir_cap = 0;
+    size_t i;
+    int rc = 0;
+    int first_collision_seen = 0;
+    sg_untracked_overwrite_error err_local;
+    sg_untracked_overwrite_error *err = out_err != NULL ? out_err : &err_local;
+
+    *out_files = NULL;
+    *out_files_count = 0;
+    *out_dirs = NULL;
+    *out_dirs_count = 0;
+    if (out_first_is_dir != NULL)
+        *out_first_is_dir = 0;
+    err->kind = SG_UNTRACKED_ERR_NONE;
+    err->path = NULL;
+    err->saved_errno = 0;
+
+    if (count == 0)
+        return 0;
+
+    if (sg_ignore_open(&ig, git_dir, repo_root) != 0) {
+        set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+        if (out_err == NULL)
+            free(err_local.path);
+        return -1;
+    }
+
+    for (i = 0; i < count && rc == 0; i++) {
+        const char *p = paths[i];
+        char abspath[SG_PATH_MAX];
+        struct stat st;
+        int have_x = 0;
+        int check_ignore = 1;
+        char x_buf[SG_PATH_MAX];
+        const char *x = NULL;
+        int x_is_dir = 0;
+
+        if (sg_path_join(abspath, sizeof(abspath), repo_root, p) != 0) {
+            /* Truncated -- can't even be verified, same fail-closed
+               direction as every other path-joining site in this project:
+               report it rather than risk "clear". */
+            x = p;
+            have_x = 1;
+            check_ignore = 0;
+        } else if (lstat(abspath, &st) == 0) {
+            /* Row #7 of the oracle: an untracked EMPTY directory sitting
+               exactly at the path the merge wants to create does not block
+               it -- measured, git removes the empty directory without a
+               word. This used to be decided HERE, by a dedicated
+               dir_is_empty() call that cleared have_x on an empty directory
+               before the tracked/ignored/report path below ever ran.
+               Phase 79 round 3's mutation battery (u06) found that guard
+               redundant: since Phase 79b, x_is_dir falls through to the
+               recursive untracked_overwrite_dir_has_nonignored() scan
+               below, and an empty directory's scan finds nothing at any
+               depth (ignored or not) either -- found stays 0, so the
+               "not a collision" answer is now produced by that scan
+               instead, with no separate check needed here. Verified
+               (Phase 76 R4-1's two-part test): same final answer AND no
+               side effect depended on the deleted guard, since the scan
+               only reads (opendir + .gitignore queries). */
+            x = p;
+            have_x = 1;
+            x_is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+        } else if (errno == ENOENT) {
+            have_x = 0; /* nothing along this path at all -- clear */
+        } else if (errno == ENOTDIR) {
+            /* Some ancestor component exists and is not a directory --
+               walk P's proper ancestors shortest-first and take the first
+               one that exists and is not a directory as the blocker. */
+            size_t j;
+
+            for (j = 0; p[j] != '\0'; j++) {
+                if (p[j] != '/')
+                    continue;
+                {
+                    char prefix[SG_PATH_MAX];
+                    char anc_abs[SG_PATH_MAX];
+                    struct stat anc_st;
+
+                    if (j >= sizeof(prefix)) {
+                        x = p;
+                        have_x = 1;
+                        check_ignore = 0;
+                        break;
+                    }
+                    memcpy(prefix, p, j);
+                    prefix[j] = '\0';
+                    if (sg_path_join(anc_abs, sizeof(anc_abs), repo_root, prefix) != 0) {
+                        x = p;
+                        have_x = 1;
+                        check_ignore = 0;
+                        break;
+                    }
+                    if (lstat(anc_abs, &anc_st) == 0 && !S_ISDIR(anc_st.st_mode)) {
+                        memcpy(x_buf, prefix, j + 1);
+                        x = x_buf;
+                        have_x = 1;
+                        x_is_dir = 0;
+                        break;
+                    }
+                }
+            }
+            /* Loop ran to completion without finding a blocker: a race
+               between the ENOTDIR and this walk removed it. No collision. */
+        } else {
+            /* EACCES, ENAMETOOLONG, ELOOP, ... -- could not be verified,
+               same fail-closed direction as the truncation case above. */
+            x = p;
+            have_x = 1;
+            check_ignore = 0;
+        }
+
+        if (!have_x)
+            continue;
+
+        if (path_tracked_any_stage(idx, x))
+            continue;
+
+        if (check_ignore) {
+            int ignored = 0;
+
+            if (untracked_overwrite_is_ignored(ig, x, x_is_dir, &ignored) != 0) {
+                rc = set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+                break;
+            }
+            if (ignored)
+                continue;
+        }
+
+        /* Phase 79b: a non-empty untracked directory is only a collision if
+           it recursively contains at least one non-ignored file -- unlike a
+           blocking file, which is an unconditional collision once it is
+           reached here. check_ignore is only 0 on a fail-closed path
+           (truncation/EACCES/...), none of which can have x_is_dir set, so
+           this scan only ever runs when x really was lstat'd as a
+           directory. */
+        if (x_is_dir) {
+            int found = 0;
+
+            if (untracked_overwrite_dir_has_nonignored(ig, repo_root, x, &found, err) != 0) {
+                rc = -1;
+                break;
+            }
+            if (!found)
+                continue;
+        }
+
+        /* Phase 79c (F4): record which BUCKET the very first collision (in
+           candidate order) landed in, before adding it -- this is what lets
+           the unborn-HEAD caller in cmd_merge.c pick the correct one of the
+           four wordings when both buckets would otherwise fire. Measured
+           against git 2.55.0 (U1b in the Phase 79c oracle): git reports
+           exactly the FIRST collision across BOTH kinds, not "directory
+           wins" -- a topic that adds "a" then "z", with a local file "a"
+           and a local non-empty dir "z", refuses on the FILE wording
+           naming "a", not the directory wording. */
+        if (!first_collision_seen && out_first_is_dir != NULL) {
+            *out_first_is_dir = x_is_dir;
+            first_collision_seen = 1;
+        }
+
+        if (x_is_dir) {
+            if (untracked_overwrite_bucket_add(&dir_collisions, &dir_count, &dir_cap, x) != 0) {
+                rc = set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+                break;
+            }
+        } else {
+            if (untracked_overwrite_bucket_add(&file_collisions, &file_count, &file_cap, x) != 0) {
+                rc = set_untracked_err(err, SG_UNTRACKED_ERR_ALLOC, NULL, 0);
+                break;
+            }
+        }
+    }
+
+    sg_ignore_free(ig);
+
+    if (rc != 0) {
+        size_t k;
+
+        for (k = 0; k < file_count; k++)
+            free(file_collisions[k]);
+        free(file_collisions);
+        for (k = 0; k < dir_count; k++)
+            free(dir_collisions[k]);
+        free(dir_collisions);
+        if (out_err == NULL)
+            free(err_local.path);
+        return -1;
+    }
+
+    /* Neither bucket is sorted or de-duplicated here -- each is reported in
+       the CALLER's candidate order, one entry per candidate that collided
+       (see untracked_overwrite_bucket_add's own comment on why not
+       de-duplicating matches git). A caller whose candidates happen to
+       already be in path order (e.g. sg_tree_flatten's output) gets output
+       that looks sorted as a side effect, but that is not a guarantee this
+       function makes. */
+    *out_files = file_collisions;
+    *out_files_count = file_count;
+    *out_dirs = dir_collisions;
+    *out_dirs_count = dir_count;
+    return 0;
 }

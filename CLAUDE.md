@@ -218,18 +218,18 @@ them.
 | Touching | Read first |
 |---|---|
 | `storage/refs.c`, `storage/revparse.c`, `refs.h`, `revparse.h`, `objstore.h`, `object.h`; detached HEAD; `cli/cmd_merge.c`'s `<rev>`/message/fast-forward output; `cli/cmd_tag.c`; `cli/cmd_branch.c`; `cli/ref_delete.c`; `ref_delete.h`; `sg_message_cleanup` | `docs/RULES-refs-revparse.md` |
-| `util/date.c`, `date.h`, `cli/cmd_undo.c`'s own formatter; any `--date=` / `%ad` / `%ar` / `%ah` work | `docs/RULES-date.md` |
+| `util/date.c`, `date.h`, `util/ident.c`, `ident.h`, `cli/cmd_undo.c`'s own formatter; any `--date=` / `%ad` / `%ar` / `%ah` work | `docs/RULES-date.md` |
 | `cli/cmd_log.c`, `cli/cmd_show.c`, `cli/cmd_cat_file.c`, `cli/commit_out.c`, `cli/log_graph.c`, `commit_out.h`, `log_graph.h` | `docs/RULES-log-show.md` |
 | **any file that joins a path, prints a path to the user, deletes a tracked file, or builds a user-facing string with `snprintf`** -- `sg_path_join`, `sg_quote_path*`, `sg_path_component_is_safe`, `sg_prune_empty_parents`, `sg_strfmt_alloc`; `workdir.h`, `quote.h`, `strfmt.h`; `workdir/apply.c`, `workdir/merge.c`, `object/tree.c`, `storage/refs.c`, `storage/repo.c`, `safety/stash.c`, `cli/pick.c`, `cli/cmd_add.c`, `cli/cmd_restore.c`, `cli/cmd_reset.c`, `cli/cmd_merge.c`, `cli/cmd_rebase.c`, `cli/cmd_branch.c`, `cli/ref_delete.c` | `docs/RULES-paths-strings.md` |
 | `workdir/diff.c`, `cli/diff_out.c`, `cli/cmd_diff.c`, `util/diff_lcs.c`, `diff.h`, `diff_out.h`, `tree_build.h` | `docs/RULES-diff.md` |
-| `workdir/merge.c`, `cli/cmd_merge.c`, `merge.h` | `docs/RULES-merge.md` |
+| `workdir/merge.c`, `cli/cmd_merge.c`, `merge.h`, `apply.h` | `docs/RULES-merge.md` |
 | `workdir/rename.c`, `util/similarity.c`, `cli/cmd_diff.c`'s `-M`/`-C`/pathspec parsing, `pathspec.h`, `similarity.h` | `docs/RULES-pathspec-rename.md` |
 | `cli/cmd_status.c`, `workdir/status.c`, `workdir/tree_build.c`, `status.h` | `docs/RULES-status.md` |
 | `net/ssh.c`, `net/transport.c`, `cli/cmd_clone.c`, `ssh.h`, `transport.h` | `docs/RULES-net.md` |
 | `safety/stash.c`, `cli/cmd_stash.c`, `stash.h` | `docs/RULES-stash.md` |
 | `cli/cmd_push.c` | `docs/RULES-push.md` |
 | `cli/pick.c`, `cli/cmd_cherry_pick.c`, `cli/cmd_revert.c`, `cli/cmd_rebase.c`, `cli/cmd_commit.c`, `cli/cmd_switch.c`, `cli/cmd_undo.c`, `safety/sequencer.c`, `safety/rebase.c`, `pick.h`, `sequencer.h` | `docs/RULES-sequencer.md` |
-| `cli/cli_args.c`, `cli_args.h`, `workdir/tree_build.c`, `tree_build.h`, `storage/chunk.c`, `storage/reflog.c`, `safety/snapshot.c`; and anything at all before writing a second copy of something | `docs/RULES-duplication.md` |
+| `cli/cli_args.c`, `cli_args.h`, `workdir/tree_build.c`, `tree_build.h`, `storage/chunk.c`, `storage/reflog.c`, `safety/snapshot.c`, `cli/cmd_merge_base.c`, `cli/cmd_reflog.c`; and anything at all before writing a second copy of something | `docs/RULES-duplication.md` |
 
 **Source comments and `docs/DESIGN.md` still say "CLAUDE.md's X entry"** --
 173 places in `src/`/`include/`/`tests/` and 83 in `docs/DESIGN.md`, as of Phase
