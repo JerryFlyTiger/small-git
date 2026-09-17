@@ -371,10 +371,10 @@ do not read the whole thing).
   `workdir_entry_mode` conservatively reports every worktree file as
   100644/100755, never 120000 (see `diff.h`'s Phase 26 note, unchanged by
   this phase) -- so a CLEAN checked-out symlink will show as an unstaged
-  `T` under this phase where it used to show `M`, until Phase 81b teaches
-  the worktree side to read a real symlink's own type. That transitional
-  wrongness is accepted and deliberately UNPINNED (no interop check asserts
-  it) -- every phase81a fixture that touches the worktree keeps the
+  `T` under this phase where it used to show `M`, until Phase 81b taught
+  the worktree side to read a real symlink's own type (fixed there; a clean
+  committed symlink is now pinned clean by phase81b B5). Phase 81a itself
+  never pinned that transitional wrongness -- every phase81a fixture that touches the worktree keeps the
   worktree file an ordinary regular file at measurement time specifically
   to avoid exercising it. Interop's `phase81a` group covers tree-to-tree
   (`show`/`show --name-status`/`log -p`/`log --graph -p`/`diff A B`

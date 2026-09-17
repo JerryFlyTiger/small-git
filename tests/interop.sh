@@ -26810,8 +26810,20 @@ for p80d_combo in "merge:ff" "merge:3way" "switch:3way" "reset:3way" "cherry-pic
     esac
     check "phase80 D $p80d_op $p80d_mode: sg fails closed (exit 1), never deletes through the symlink" \
         test "$p80d_sg_rc" -eq 1
-    check "phase80 D $p80d_op $p80d_mode: sg's stderr names the guarded-delete refusal" \
-        sh -c "grep -q 'cannot remove \"a/b/tracked.txt\"' '$WORKDIR/p80d_sg_${p80d_op}_${p80d_mode}.err'"
+    # Phase 81b: the pre-flight dirty check now sees "a" is a symlinked
+    # ancestor, so a/b/tracked.txt is ABSENT (changed) and every one of these
+    # five refuses BEFORE any write, instead of reaching the guarded delete.
+    # Measured by the main conversation: fresh `sg merge` (even --force) and
+    # `sg cherry-pick` refuse at sg_require_clean_workdir (a DIFFERENT gate
+    # from sg_safe_apply_tree -- grepping for the latter alone wrongly
+    # suggested cherry-pick has no gate). apply.c's guarded delete stays
+    # witnessed by switch/reset --force below and by `merge --abort` (B16,
+    # no gate). Whether merge.c's own delete pass (sg_merge_result_apply) is
+    # still reachable with a symlinked ancestor -- e.g. through rebase
+    # --continue or stash apply -- is NOT measured; recorded as a Phase 81
+    # residual, not claimed either way.
+    check "phase81b D $p80d_op $p80d_mode: sg's pre-flight reports a/b/tracked.txt as changed (its ancestor is a symlink)" \
+        sh -c "grep -q 'modified (unstaged): a/b/tracked.txt' '$WORKDIR/p80d_sg_${p80d_op}_${p80d_mode}.err'"
     check "phase80 D $p80d_op $p80d_mode: the symlink 'a' itself survives untouched" \
         test "$(readlink "$P80D_SG/a")" = "$P80D_OUT"
     check "phase80 D $p80d_op $p80d_mode: @OUT/b/tracked.txt is byte-identical to before -- the actual invariant" \
@@ -26831,6 +26843,29 @@ for p80d_combo in "merge:ff" "merge:3way" "switch:3way" "reset:3way" "cherry-pic
         check "phase80 D $p80d_op $p80d_mode oracle: precondition -- git refuses (non-zero exit)" \
             test "$p80d_git_rc" -ne 0
     fi
+done
+
+# Phase 81b: --force skips sg_safe_apply_tree's dirty confirmation, so these
+# two still drive sg_apply_tree_to_workdir into the guarded delete -- the
+# end-to-end witness the loop above lost when the pre-flight got it right.
+for p81d_op in switch reset; do
+    P81D_SG="$WORKDIR/phase81b_dforce_sg_${p81d_op}"
+    p80d_mk_repo "$P81D_SG" 3way
+    rm -rf "$P81D_SG/a"; ln -s "$P80D_OUT" "$P81D_SG/a"
+    if [ "$p81d_op" = switch ]; then
+        (cd "$P81D_SG" && "$SG" switch --force topic) > /dev/null 2> "$WORKDIR/p81d_sg_${p81d_op}.err"
+    else
+        (cd "$P81D_SG" && "$SG" reset --hard --force topic) > /dev/null 2> "$WORKDIR/p81d_sg_${p81d_op}.err"
+    fi
+    p81d_rc=$?
+    check "phase81b D $p81d_op --force: sg fails closed (exit 1) at the guarded delete" \
+        test "$p81d_rc" -eq 1
+    check "phase81b D $p81d_op --force: sg's stderr names the guarded-delete refusal" \
+        sh -c "grep -q 'cannot remove \"a/b/tracked.txt\"' '$WORKDIR/p81d_sg_${p81d_op}.err'"
+    check "phase81b D $p81d_op --force: the symlink 'a' itself survives untouched" \
+        test "$(readlink "$P81D_SG/a")" = "$P80D_OUT"
+    check "phase81b D $p81d_op --force: @OUT/b/tracked.txt is byte-identical to before" \
+        test "$(cat "$P80D_OUT/b/tracked.txt")" = TT
 done
 
 # ============================================================
@@ -27013,13 +27048,21 @@ check "phase81a: sg status --short (unstaged typechange) matches git byte-for-by
 # the label or its padding (measured: a mutation removing the label's trailing
 # space stayed green). This compares the entry lines themselves, byte-for-byte,
 # from the two raw outputs p38_cmp_named already wrote.
-p81a_entries() {
-    _slug="$1"; _label="$2"
+#
+# Phase 81b addendum: generalized from the original phase81a-only
+# p81a_entries (same three call sites below still forward to it, same check
+# names byte-identical) so phase81b's own long-status fixtures -- and any
+# future phase's -- get the same entry-line coverage without a second copy.
+p81_entries() {
+    _prefix="$1"; _slug="$2"; _label="$3"
     grep "$(printf '^\t')" "$WORKDIR/p38_${_slug}_git.txt" > "$WORKDIR/p38_${_slug}_git_ent.txt"
     grep "$(printf '^\t')" "$WORKDIR/p38_${_slug}_sg.txt" > "$WORKDIR/p38_${_slug}_sg_ent.txt"
-    check "phase81a: sg status ($_label) entry lines match git byte-for-byte" \
+    check "$_prefix: sg status ($_label) entry lines match git byte-for-byte" \
         sh -c "test -s '$WORKDIR/p38_${_slug}_git_ent.txt' \
             && cmp -s '$WORKDIR/p38_${_slug}_sg_ent.txt' '$WORKDIR/p38_${_slug}_git_ent.txt'"
+}
+p81a_entries() {
+    p81_entries phase81a "$@"
 }
 
 p38_cmp_named phase81a p81a_c6_long "unstaged typechange long status" "$P81A_C6"
@@ -27081,6 +27124,662 @@ check "phase81a: sg status --short reports TT byte-for-byte" \
 
 p38_cmp_named phase81a p81a_c8_long "TT (double typechange) long status" "$P81A_C8"
 p81a_entries p81a_c8_long "TT (double typechange) long status"
+
+# ============================================================
+# Phase 81b: the worktree READ side of symlink support (CLAUDE.md's
+# docs/RULES-diff.md, docs/RULES-status.md, docs/RULES-paths-strings.md,
+# docs/RULES-pathspec-rename.md Phase 81b notes; ORACLE.md rows R01-R41,
+# X01-X13, X30, "81b extra measurements"). Every fixture is built with REAL
+# git (ln -s + git add [+ git commit]). Read-only comparisons (status/diff)
+# read the SAME fixture directory with both tools, same convention as the
+# phase81a group above. `sg add`/write comparisons build the fixture once,
+# `cp -R` it into a "_sg" and a "_git" copy, run the respective tool in
+# each, then compare `git ls-files -s` (real git reading sg's own index)
+# plus `find .git/objects -type f` (proving no stray object was written).
+# ============================================================
+
+P81B="$WORKDIR/phase81b"
+mkdir -p "$P81B"
+
+# --- B1: untracked symlinks (R01/R02/R03) -- a file symlink, a dir
+# symlink, and a dangling symlink are each ONE leaf entry, never descended. ---
+P81B_B1="$P81B/b1"
+mkdir -p "$P81B_B1"
+(cd "$P81B_B1" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'f.txt' > f.txt && ln -s f.txt lf && mkdir dir && ln -s dir ld \
+    && ln -s nowhere dangling) > /dev/null 2>&1
+
+(cd "$P81B_B1" && "$SG" status --porcelain) > "$WORKDIR/p81b_b1_porc_sg.txt" 2>&1
+(cd "$P81B_B1" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b1_porc_git.txt" 2>&1
+check "phase81b: sg status --porcelain lists untracked symlinks as leaves, matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b1_porc_sg.txt" "$WORKDIR/p81b_b1_porc_git.txt"
+
+(cd "$P81B_B1" && "$SG" status --porcelain -uall) > "$WORKDIR/p81b_b1_uall_sg.txt" 2>&1
+(cd "$P81B_B1" && LC_ALL=C git status --porcelain -uall) > "$WORKDIR/p81b_b1_uall_git.txt" 2>&1
+check "phase81b: sg status --porcelain -uall on untracked symlinks matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b1_uall_sg.txt" "$WORKDIR/p81b_b1_uall_git.txt"
+
+p38_cmp_named phase81b p81b_b1_long "untracked symlinks long status" "$P81B_B1"
+
+# --- B2: sg add stages a symlink as 120000, blob = readlink bytes exactly
+# (R04/R05/R38); a dangling symlink stages too (item 2). Compared via
+# `git ls-files -s` on sg's own index (real git reading sg's format), not
+# sg's own stdout, since `add` prints nothing on success either side. ---
+P81B_B2_SRC="$P81B/b2_src"
+mkdir -p "$P81B_B2_SRC"
+(cd "$P81B_B2_SRC" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'f.txt' > f.txt && ln -s f.txt lf && mkdir dir && ln -s dir ld \
+    && ln -s nowhere dangling) > /dev/null 2>&1
+P81B_B2_SG="$P81B/b2_sg"
+P81B_B2_GIT="$P81B/b2_git"
+rm -rf "$P81B_B2_SG" "$P81B_B2_GIT"
+cp -R "$P81B_B2_SRC" "$P81B_B2_SG"
+cp -R "$P81B_B2_SRC" "$P81B_B2_GIT"
+
+(cd "$P81B_B2_SG" && "$SG" add .) > /dev/null 2>&1
+(cd "$P81B_B2_GIT" && LC_ALL=C git add .) > /dev/null 2>&1
+(cd "$P81B_B2_SG" && LC_ALL=C git ls-files -s) > "$WORKDIR/p81b_b2_ls_sg.txt" 2>&1
+(cd "$P81B_B2_GIT" && LC_ALL=C git ls-files -s) > "$WORKDIR/p81b_b2_ls_git.txt" 2>&1
+check "phase81b oracle: precondition -- git add . on a mixed symlink/dangling/dir-symlink fixture stages three 120000 entries" \
+    sh -c "[ \"\$(grep -c '^120000' '$WORKDIR/p81b_b2_ls_git.txt')\" = 3 ]"
+check "phase81b: sg add . stages symlinks as 120000 with readlink-target blobs, matches git's index byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b2_ls_sg.txt" "$WORKDIR/p81b_b2_ls_git.txt"
+
+# --- B3: "beyond a symbolic link" refusal (R07/R08/R12, "81b extra
+# measurements") -- all-or-nothing: f.txt (an ordinary, otherwise-stageable
+# file) stays unstaged when a LATER argument is beyond a symlink. ---
+P81B_B3_SRC="$P81B/b3_src"
+mkdir -p "$P81B_B3_SRC"
+(cd "$P81B_B3_SRC" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'body\n' > f.txt && mkdir dir && printf 'a\n' > dir/a.txt \
+    && ln -s dir ld) > /dev/null 2>&1
+P81B_B3_SG="$P81B/b3_sg"
+P81B_B3_GIT="$P81B/b3_git"
+rm -rf "$P81B_B3_SG" "$P81B_B3_GIT"
+cp -R "$P81B_B3_SRC" "$P81B_B3_SG"
+cp -R "$P81B_B3_SRC" "$P81B_B3_GIT"
+
+(cd "$P81B_B3_SG" && "$SG" add f.txt ld/a.txt) > "$WORKDIR/p81b_b3_sg.txt" 2>&1
+P81B_B3_SG_RC=$?
+(cd "$P81B_B3_GIT" && LC_ALL=C git add f.txt ld/a.txt) > "$WORKDIR/p81b_b3_git.txt" 2>&1
+P81B_B3_GIT_RC=$?
+check "phase81b oracle: precondition -- git add f.txt ld/a.txt exits 128 (fatal: beyond a symbolic link)" \
+    sh -c "[ $P81B_B3_GIT_RC -eq 128 ]"
+check "phase81b: sg add f.txt ld/a.txt refuses (sg's own exit-1 convention, see CLAUDE.md divergence 3)" \
+    sh -c "[ $P81B_B3_SG_RC -eq 1 ]"
+check "phase81b: sg add f.txt ld/a.txt says the pathspec is beyond a symbolic link" \
+    grep -q "ld/a.txt' is beyond a symbolic link" "$WORKDIR/p81b_b3_sg.txt"
+check "phase81b: sg add f.txt ld/a.txt stages NOTHING (all-or-nothing) -- f.txt stays unstaged too" \
+    sh -c "cd '$P81B_B3_SG' && ! LC_ALL=C git ls-files -s -- f.txt | grep -q ."
+(cd "$P81B_B3_SG" && LC_ALL=C git status --porcelain -- f.txt) > "$WORKDIR/p81b_b3_fstatus.txt" 2>&1
+check "phase81b: sg add f.txt ld/a.txt leaves f.txt exactly as untracked (matches git's own all-or-nothing effect)" \
+    grep -q '^?? f.txt$' "$WORKDIR/p81b_b3_fstatus.txt"
+
+# Round 1 fix (item 3): all-or-nothing must cover .git/objects too, not just
+# the index -- refusing ld/a.txt must not have already loose-written
+# f.txt's blob before the refusal was even detected. Both sides start from
+# the same pristine SRC copy (0 objects each), so any post-refusal object
+# count above 0, or the presence of f.txt's own content hash, means a blob
+# was written despite the whole command failing.
+P81B_B3_OBJCOUNT_SG=$(find "$P81B_B3_SG/.git/objects" -type f | wc -l | tr -d ' ')
+P81B_B3_OBJCOUNT_GIT=$(find "$P81B_B3_GIT/.git/objects" -type f | wc -l | tr -d ' ')
+check "phase81b oracle: precondition -- git wrote NO object at all for the refused f.txt ld/a.txt" \
+    sh -c "[ '$P81B_B3_OBJCOUNT_GIT' = 0 ]"
+check "phase81b: sg add f.txt ld/a.txt wrote NO object either (all-or-nothing covers .git/objects, not just the index)" \
+    sh -c "[ '$P81B_B3_OBJCOUNT_SG' = 0 ]"
+P81B_B3_FTXT_BLOB=$(printf 'body\n' | LC_ALL=C git hash-object --stdin)
+check "phase81b: sg add f.txt ld/a.txt specifically never wrote f.txt's own blob id ($P81B_B3_FTXT_BLOB)" \
+    sh -c "! find '$P81B_B3_SG/.git/objects' -type f | grep -q '${P81B_B3_FTXT_BLOB#??}\$'"
+
+# `ld/` (trailing slash naming a symlink) and `lf/` (trailing slash on a
+# FILE symlink) are refused the same way (R07, "81b extra measurements").
+P81B_B3B_SRC="$P81B/b3b_src"
+mkdir -p "$P81B_B3B_SRC"
+(cd "$P81B_B3B_SRC" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'f.txt' > f.txt && ln -s f.txt lf && mkdir dir && ln -s dir ld) > /dev/null 2>&1
+P81B_B3B_SG="$P81B/b3b_sg"
+rm -rf "$P81B_B3B_SG"
+cp -R "$P81B_B3B_SRC" "$P81B_B3B_SG"
+(cd "$P81B_B3B_SG" && "$SG" add 'ld/') > "$WORKDIR/p81b_b3b_ld_sg.txt" 2>&1
+check "phase81b: sg add 'ld/' (trailing slash on a dir symlink) refuses as beyond a symbolic link" \
+    grep -q "ld/' is beyond a symbolic link" "$WORKDIR/p81b_b3b_ld_sg.txt"
+(cd "$P81B_B3B_SG" && "$SG" add 'lf/') > "$WORKDIR/p81b_b3b_lf_sg.txt" 2>&1
+check "phase81b: sg add 'lf/' (trailing slash on a FILE symlink) refuses as beyond a symbolic link" \
+    grep -q "lf/' is beyond a symbolic link" "$WORKDIR/p81b_b3b_lf_sg.txt"
+
+# eo -> "../out" escapes the repository; `add eo/x` must refuse WITHOUT
+# ever reading the outside file's content into an object (R11/R12).
+P81B_B3C="$P81B/b3c"
+mkdir -p "$P81B_B3C/repo"
+(cd "$P81B_B3C" && mkdir -p out && printf 'outside secret\n' > out/x) > /dev/null 2>&1
+(cd "$P81B_B3C/repo" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && ln -s ../out eo) > /dev/null 2>&1
+P81B_B3C_OBJCOUNT_BEFORE=$(find "$P81B_B3C/repo/.git/objects" -type f | wc -l | tr -d ' ')
+(cd "$P81B_B3C/repo" && "$SG" add eo/x) > "$WORKDIR/p81b_b3c_sg.txt" 2>&1
+P81B_B3C_OBJCOUNT_AFTER=$(find "$P81B_B3C/repo/.git/objects" -type f | wc -l | tr -d ' ')
+check "phase81b: sg add eo/x (eo -> ../out, escaping the repo) refuses as beyond a symbolic link" \
+    grep -q "eo/x' is beyond a symbolic link" "$WORKDIR/p81b_b3c_sg.txt"
+check "phase81b: sg add eo/x stages no eo/x entry" \
+    sh -c "cd '$P81B_B3C/repo' && ! LC_ALL=C git ls-files -s -- eo/x | grep -q ."
+check "phase81b: sg add eo/x writes NO object for the outside file's content (no read outside the repo)" \
+    sh -c "[ '$P81B_B3C_OBJCOUNT_BEFORE' = '$P81B_B3C_OBJCOUNT_AFTER' ]"
+
+# --- B4: a tracked path under a symlinked ancestor is ABSENT (X01/X02/X03) ---
+P81B_B4="$P81B/b4"
+mkdir -p "$P81B_B4"
+(cd "$P81B_B4" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && mkdir dir && printf 'a\n' > dir/a.txt && git add dir/a.txt && git commit -q -m A \
+    && rm -rf dir && mkdir other && printf 'b\n' > other/a.txt && ln -s other dir) > /dev/null 2>&1
+
+(cd "$P81B_B4" && "$SG" status --porcelain -uall) > "$WORKDIR/p81b_b4_porc_sg.txt" 2>&1
+(cd "$P81B_B4" && LC_ALL=C git status --porcelain -uall) > "$WORKDIR/p81b_b4_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- git treats dir/a.txt as deleted (space-D) and dir as untracked, beyond the symlink" \
+    grep -q '^ D dir/a.txt$' "$WORKDIR/p81b_b4_porc_git.txt"
+check "phase81b: sg status --porcelain -uall on a tracked path beyond a symlinked ancestor matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b4_porc_sg.txt" "$WORKDIR/p81b_b4_porc_git.txt"
+
+(cd "$P81B_B4" && "$SG" diff --name-status) > "$WORKDIR/p81b_b4_diffnm_sg.txt" 2>&1
+(cd "$P81B_B4" && LC_ALL=C git diff --name-status) > "$WORKDIR/p81b_b4_diffnm_git.txt" 2>&1
+check "phase81b: sg diff --name-status on a tracked path beyond a symlinked ancestor matches git byte-for-byte (D dir/a.txt)" \
+    cmp -s "$WORKDIR/p81b_b4_diffnm_sg.txt" "$WORKDIR/p81b_b4_diffnm_git.txt"
+
+# `add dir/a.txt` through the symlink must also refuse (X03), and must not
+# silently hash other/a.txt into the index under the tracked path's name.
+P81B_B4_SG="$P81B/b4_sg"
+rm -rf "$P81B_B4_SG"
+cp -R "$P81B_B4" "$P81B_B4_SG"
+(cd "$P81B_B4_SG" && "$SG" add dir/a.txt) > "$WORKDIR/p81b_b4_add_sg.txt" 2>&1
+check "phase81b: sg add dir/a.txt (dir now a symlink) refuses as beyond a symbolic link" \
+    grep -q "dir/a.txt' is beyond a symbolic link" "$WORKDIR/p81b_b4_add_sg.txt"
+P81B_B4_ORIG_BLOB=$(cd "$P81B_B4_SG" && LC_ALL=C git rev-parse HEAD:dir/a.txt)
+P81B_B4_STAGED_BLOB=$(cd "$P81B_B4_SG" && LC_ALL=C git ls-files -s -- dir/a.txt | awk '{print $2}')
+check "phase81b: sg add dir/a.txt (dir now a symlink) left dir/a.txt's staged blob untouched (never hashed other/a.txt)" \
+    sh -c "[ '$P81B_B4_ORIG_BLOB' = '$P81B_B4_STAGED_BLOB' ]"
+
+# --- B5: clean vs retargeted symlink (R20-R25) ---
+P81B_B5="$P81B/b5"
+mkdir -p "$P81B_B5"
+(cd "$P81B_B5" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'f.txt' > f.txt && ln -s f.txt lf && git add f.txt lf && git commit -q -m A) > /dev/null 2>&1
+
+(cd "$P81B_B5" && "$SG" status --porcelain) > "$WORKDIR/p81b_b5_clean_porc_sg.txt" 2>&1
+(cd "$P81B_B5" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b5_clean_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- a freshly committed symlink is clean" \
+    sh -c "[ ! -s '$WORKDIR/p81b_b5_clean_porc_git.txt' ]"
+check "phase81b: sg status --porcelain on an untouched committed symlink matches git (empty, clean)" \
+    cmp -s "$WORKDIR/p81b_b5_clean_porc_sg.txt" "$WORKDIR/p81b_b5_clean_porc_git.txt"
+
+(cd "$P81B_B5" && "$SG" diff) > "$WORKDIR/p81b_b5_clean_diff_sg.txt" 2>&1
+(cd "$P81B_B5" && LC_ALL=C git diff) > "$WORKDIR/p81b_b5_clean_diff_git.txt" 2>&1
+check "phase81b: sg diff on an untouched committed symlink matches git (empty, clean)" \
+    cmp -s "$WORKDIR/p81b_b5_clean_diff_sg.txt" "$WORKDIR/p81b_b5_clean_diff_git.txt"
+
+(cd "$P81B_B5" && rm lf && ln -s dir/a.txt lf) > /dev/null 2>&1
+
+(cd "$P81B_B5" && "$SG" status --porcelain) > "$WORKDIR/p81b_b5_retgt_porc_sg.txt" 2>&1
+(cd "$P81B_B5" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b5_retgt_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- retargeting a committed symlink shows ' M lf'" \
+    grep -q '^ M lf$' "$WORKDIR/p81b_b5_retgt_porc_git.txt"
+check "phase81b: sg status --porcelain on a retargeted symlink matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b5_retgt_porc_sg.txt" "$WORKDIR/p81b_b5_retgt_porc_git.txt"
+
+(cd "$P81B_B5" && "$SG" diff) > "$WORKDIR/p81b_b5_retgt_diff_sg.txt" 2>&1
+(cd "$P81B_B5" && LC_ALL=C git diff) > "$WORKDIR/p81b_b5_retgt_diff_git.txt" 2>&1
+check "phase81b: sg diff on a retargeted symlink matches git byte-for-byte (index line + one-line hunk)" \
+    cmp -s "$WORKDIR/p81b_b5_retgt_diff_sg.txt" "$WORKDIR/p81b_b5_retgt_diff_git.txt"
+
+(cd "$P81B_B5" && "$SG" diff --stat) > "$WORKDIR/p81b_b5_retgt_stat_sg.txt" 2>&1
+(cd "$P81B_B5" && LC_ALL=C git diff --stat) > "$WORKDIR/p81b_b5_retgt_stat_git.txt" 2>&1
+check "phase81b: sg diff --stat on a retargeted symlink matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b5_retgt_stat_sg.txt" "$WORKDIR/p81b_b5_retgt_stat_git.txt"
+
+# --- B6: typechange via a REAL worktree symlink, both directions (R30-R37) ---
+P81B_B6="$P81B/b6"
+mkdir -p "$P81B_B6"
+(cd "$P81B_B6" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && ln -s f.txt lf && git add lf && git commit -q -m A) > /dev/null 2>&1
+(cd "$P81B_B6" && rm lf && printf 'now a file' > lf) > /dev/null 2>&1
+
+(cd "$P81B_B6" && "$SG" status --porcelain) > "$WORKDIR/p81b_b6_porc_sg.txt" 2>&1
+(cd "$P81B_B6" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b6_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- link->file (real worktree symlink gone) shows ' T lf'" \
+    grep -q '^ T lf$' "$WORKDIR/p81b_b6_porc_git.txt"
+check "phase81b: sg status --porcelain on a real link->file typechange matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b6_porc_sg.txt" "$WORKDIR/p81b_b6_porc_git.txt"
+
+(cd "$P81B_B6" && "$SG" diff) > "$WORKDIR/p81b_b6_diff_sg.txt" 2>&1
+(cd "$P81B_B6" && LC_ALL=C git diff) > "$WORKDIR/p81b_b6_diff_git.txt" 2>&1
+check "phase81b: sg diff on a real link->file typechange matches git byte-for-byte (split delete+add)" \
+    cmp -s "$WORKDIR/p81b_b6_diff_sg.txt" "$WORKDIR/p81b_b6_diff_git.txt"
+
+p38_cmp_named phase81b p81b_b6_long "real link->file typechange long status" "$P81B_B6"
+p81_entries phase81b p81b_b6_long "real link->file typechange long status"
+
+# file -> link, the other direction (R36/R37).
+P81B_B7="$P81B/b7"
+mkdir -p "$P81B_B7"
+(cd "$P81B_B7" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'was a file\n' > f.txt && git add f.txt && git commit -q -m A) > /dev/null 2>&1
+(cd "$P81B_B7" && rm f.txt && ln -s target f.txt) > /dev/null 2>&1
+
+(cd "$P81B_B7" && "$SG" status --porcelain) > "$WORKDIR/p81b_b7_porc_sg.txt" 2>&1
+(cd "$P81B_B7" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b7_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- file->link (real worktree symlink) shows ' T f.txt'" \
+    grep -q '^ T f.txt$' "$WORKDIR/p81b_b7_porc_git.txt"
+check "phase81b: sg status --porcelain on a real file->link typechange matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b7_porc_sg.txt" "$WORKDIR/p81b_b7_porc_git.txt"
+
+(cd "$P81B_B7" && "$SG" diff) > "$WORKDIR/p81b_b7_diff_sg.txt" 2>&1
+(cd "$P81B_B7" && LC_ALL=C git diff) > "$WORKDIR/p81b_b7_diff_git.txt" 2>&1
+check "phase81b: sg diff on a real file->link typechange matches git byte-for-byte (split delete+add)" \
+    cmp -s "$WORKDIR/p81b_b7_diff_sg.txt" "$WORKDIR/p81b_b7_diff_git.txt"
+
+# --- B8: ignore rules treat a symlink as a non-directory leaf (X10-X13) ---
+P81B_B8="$P81B/b8"
+mkdir -p "$P81B_B8"
+(cd "$P81B_B8" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && mkdir realdir && ln -s realdir ld && printf 'ld/\n' > .gitignore) > /dev/null 2>&1
+
+(cd "$P81B_B8" && "$SG" status --porcelain -uall) > "$WORKDIR/p81b_b8_x10_sg.txt" 2>&1
+(cd "$P81B_B8" && LC_ALL=C git status --porcelain -uall) > "$WORKDIR/p81b_b8_x10_git.txt" 2>&1
+check "phase81b oracle: precondition -- a 'ld/' dir-only ignore pattern does NOT match a dir symlink" \
+    grep -q '?? ld$' "$WORKDIR/p81b_b8_x10_git.txt"
+check "phase81b: sg status --porcelain -uall (X10: dir-only ignore pattern vs a dir symlink) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b8_x10_sg.txt" "$WORKDIR/p81b_b8_x10_git.txt"
+
+(cd "$P81B_B8" && printf 'ld\n' > .gitignore) > /dev/null 2>&1
+(cd "$P81B_B8" && "$SG" status --porcelain -uall) > "$WORKDIR/p81b_b8_x11_sg.txt" 2>&1
+(cd "$P81B_B8" && LC_ALL=C git status --porcelain -uall) > "$WORKDIR/p81b_b8_x11_git.txt" 2>&1
+check "phase81b oracle: precondition -- a plain 'ld' ignore pattern DOES match the dir symlink" \
+    sh -c "! grep -q 'ld\$' '$WORKDIR/p81b_b8_x11_git.txt'"
+check "phase81b: sg status --porcelain -uall (X11: plain ignore pattern matches a dir symlink) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b8_x11_sg.txt" "$WORKDIR/p81b_b8_x11_git.txt"
+
+# X13: an explicitly named ignored symlink behaves like an ignored file.
+P81B_B9="$P81B/b9"
+mkdir -p "$P81B_B9"
+(cd "$P81B_B9" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'f.txt' > f.txt && ln -s f.txt lf && printf 'lf\n' > .gitignore) > /dev/null 2>&1
+P81B_B9_SG="$P81B/b9_sg"
+rm -rf "$P81B_B9_SG"
+cp -R "$P81B_B9" "$P81B_B9_SG"
+(cd "$P81B_B9_SG" && "$SG" add lf) > "$WORKDIR/p81b_b9_sg.txt" 2>&1
+P81B_B9_SG_RC=$?
+(cd "$P81B_B9" && LC_ALL=C git add lf) > "$WORKDIR/p81b_b9_git.txt" 2>&1
+P81B_B9_GIT_RC=$?
+check "phase81b oracle: precondition -- git add on an explicitly-ignored symlink refuses (exit 1)" \
+    sh -c "[ $P81B_B9_GIT_RC -eq 1 ]"
+check "phase81b: sg add on an explicitly-ignored symlink refuses the same way (exit 1)" \
+    sh -c "[ $P81B_B9_SG_RC -eq 1 ]"
+
+# --- B10: adding a symlink evicts every stale index entry under the old
+# directory it replaced ("81b extra measurements", the index D/F rule).
+# Round 1 fix (item 4): also plants three PREFIX LOOK-ALIKE siblings that
+# must all SURVIVE -- dir.txt and dir-x/y both share "dir" as a literal
+# string prefix without being genuinely "under dir/" (sg_index_remove_under
+# requires the '/' boundary right after "dir"), and dir2/x is a wholly
+# unrelated sibling directory. If the eviction boundary check were ever
+# loosened to a bare strncmp, all three would be wrongly swept away too. ---
+P81B_B10="$P81B/b10"
+mkdir -p "$P81B_B10"
+(cd "$P81B_B10" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && mkdir dir && printf 'a\n' > dir/a.txt && printf 't\n' > dir.txt \
+    && mkdir dir-x && printf 'y\n' > dir-x/y && mkdir dir2 && printf 'x\n' > dir2/x \
+    && git add dir/a.txt dir.txt dir-x/y dir2/x && git commit -q -m A) > /dev/null 2>&1
+P81B_B10_SG="$P81B/b10_sg"
+P81B_B10_GIT="$P81B/b10_git"
+rm -rf "$P81B_B10_SG" "$P81B_B10_GIT"
+cp -R "$P81B_B10" "$P81B_B10_SG"
+cp -R "$P81B_B10" "$P81B_B10_GIT"
+(cd "$P81B_B10_SG" && rm -rf dir && ln -s other dir && "$SG" add dir) > /dev/null 2>&1
+(cd "$P81B_B10_GIT" && rm -rf dir && ln -s other dir && LC_ALL=C git add dir) > /dev/null 2>&1
+(cd "$P81B_B10_SG" && LC_ALL=C git ls-files -s) > "$WORKDIR/p81b_b10_ls_sg.txt" 2>&1
+(cd "$P81B_B10_GIT" && LC_ALL=C git ls-files -s) > "$WORKDIR/p81b_b10_ls_git.txt" 2>&1
+check "phase81b oracle: precondition -- git add dir (dir now a symlink) evicts dir/a.txt and adds 120000 dir" \
+    sh -c "! grep -q 'dir/a.txt' '$WORKDIR/p81b_b10_ls_git.txt' && grep -q '^120000 .*	dir\$' '$WORKDIR/p81b_b10_ls_git.txt'"
+check "phase81b oracle: precondition -- git's eviction does NOT touch the prefix look-alike siblings" \
+    sh -c "grep -q '	dir.txt\$' '$WORKDIR/p81b_b10_ls_git.txt' && grep -q '	dir-x/y\$' '$WORKDIR/p81b_b10_ls_git.txt' && grep -q '	dir2/x\$' '$WORKDIR/p81b_b10_ls_git.txt'"
+check "phase81b: sg add dir (dir now a symlink) evicts the stale dir/a.txt entry, matches git's index byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b10_ls_sg.txt" "$WORKDIR/p81b_b10_ls_git.txt"
+check "phase81b: sg add dir left dir.txt/dir-x/y/dir2/x (prefix look-alikes) untouched" \
+    sh -c "grep -q '	dir.txt\$' '$WORKDIR/p81b_b10_ls_sg.txt' && grep -q '	dir-x/y\$' '$WORKDIR/p81b_b10_ls_sg.txt' && grep -q '	dir2/x\$' '$WORKDIR/p81b_b10_ls_sg.txt'"
+
+# --- B11: a non-ASCII / embedded-newline symlink target round-trips (Y20) ---
+P81B_B11="$P81B/b11"
+mkdir -p "$P81B_B11"
+(cd "$P81B_B11" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && ln -s "$(printf 'a\nb')" lnl && ln -s "caf$(printf '\303\251')" lutf && \
+    git add lnl lutf && git commit -q -m A) > /dev/null 2>&1
+
+(cd "$P81B_B11" && "$SG" status --porcelain) > "$WORKDIR/p81b_b11_porc_sg.txt" 2>&1
+(cd "$P81B_B11" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b11_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- newline/non-ASCII symlink targets are clean once committed" \
+    sh -c "[ ! -s '$WORKDIR/p81b_b11_porc_git.txt' ]"
+check "phase81b: sg status --porcelain on newline/non-ASCII symlink targets matches git (clean, no truncation)" \
+    cmp -s "$WORKDIR/p81b_b11_porc_sg.txt" "$WORKDIR/p81b_b11_porc_git.txt"
+
+# --- B12 (round 1 fix, item 5): symlink targets at and around
+# sg_worktree_readlink's growing-buffer boundaries (initial cap 256, then
+# doubling: 512, ...) plus the platform maximum (macOS refuses a symlink()
+# target over roughly 1023 bytes; Linux's own limit is PATH_MAX, comfortably
+# above every length tried here). cap-1/cap/cap+1 for the first two
+# capacities, plus the platform max. `ls-files -s` alone already proves
+# content-hash equality (so no length could still slip through and match by
+# coincidence with a real hash collision); `cat-file -p` + byte count is an
+# independent, non-hash-based proof against truncation. ---
+P81B_B12="$P81B/b12"
+mkdir -p "$P81B_B12"
+(cd "$P81B_B12" && git init -q && git config user.email p81b@example.com && git config user.name p81b) \
+    > /dev/null 2>&1
+for p81b_len in 255 256 257 511 512 513 1023; do
+    P81B_B12_TARGET=$(head -c "$p81b_len" /dev/zero | tr '\0' 'a')
+    P81B_B12_SG="$P81B/b12_sg_$p81b_len"
+    P81B_B12_GIT="$P81B/b12_git_$p81b_len"
+    rm -rf "$P81B_B12_SG" "$P81B_B12_GIT"
+    cp -R "$P81B_B12" "$P81B_B12_SG"
+    cp -R "$P81B_B12" "$P81B_B12_GIT"
+    (cd "$P81B_B12_SG" && ln -s "$P81B_B12_TARGET" "l$p81b_len" && "$SG" add "l$p81b_len") \
+        > /dev/null 2>&1
+    (cd "$P81B_B12_GIT" && ln -s "$P81B_B12_TARGET" "l$p81b_len" && LC_ALL=C git add "l$p81b_len") \
+        > /dev/null 2>&1
+    (cd "$P81B_B12_SG" && LC_ALL=C git ls-files -s) > "$WORKDIR/p81b_b12_${p81b_len}_ls_sg.txt" 2>&1
+    (cd "$P81B_B12_GIT" && LC_ALL=C git ls-files -s) > "$WORKDIR/p81b_b12_${p81b_len}_ls_git.txt" 2>&1
+    check "phase81b: sg add on a $p81b_len-byte symlink target matches git's index byte-for-byte (blob id equality proves content equality)" \
+        sh -c "test -s '$WORKDIR/p81b_b12_${p81b_len}_ls_git.txt' && cmp -s '$WORKDIR/p81b_b12_${p81b_len}_ls_sg.txt' '$WORKDIR/p81b_b12_${p81b_len}_ls_git.txt'"
+    P81B_B12_BLOB=$(cd "$P81B_B12_SG" && LC_ALL=C git ls-files -s | awk '{print $2}')
+    (cd "$P81B_B12_SG" && LC_ALL=C git cat-file -p "$P81B_B12_BLOB") > "$WORKDIR/p81b_b12_${p81b_len}_cat_sg.txt" 2>&1
+    check "phase81b: sg add on a $p81b_len-byte symlink target -- the stored blob is exactly $p81b_len bytes (independent, non-hash-based proof against truncation)" \
+        sh -c "[ \"\$(wc -c < '$WORKDIR/p81b_b12_${p81b_len}_cat_sg.txt' | tr -d ' ')\" = '$p81b_len' ]"
+done
+
+# --- B13 (round 1 fix, item 6): Y06 shape with a REAL on-disk symlink --
+# staged file->link (typechange), then the worktree goes back to an
+# ordinary file (a second typechange, the other direction) -- porcelain
+# `TT`, and BOTH sections of the long format say "typechange:". ---
+P81B_B13="$P81B/b13"
+mkdir -p "$P81B_B13"
+(cd "$P81B_B13" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'orig\n' > t.txt && git add t.txt && git commit -q -m A \
+    && rm t.txt && ln -s something t.txt && git add t.txt \
+    && rm t.txt && printf 'now a file again\n' > t.txt) > /dev/null 2>&1
+
+(cd "$P81B_B13" && "$SG" status --porcelain) > "$WORKDIR/p81b_b13_porc_sg.txt" 2>&1
+(cd "$P81B_B13" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b13_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- staged file->link, worktree back to a file, is TT" \
+    grep -q '^TT t\.txt$' "$WORKDIR/p81b_b13_porc_git.txt"
+check "phase81b: sg status --porcelain on a real staged-then-reverted symlink typechange (TT) matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b13_porc_sg.txt" "$WORKDIR/p81b_b13_porc_git.txt"
+
+p38_cmp_named phase81b p81b_b13_long "real TT typechange long status" "$P81B_B13"
+p81_entries phase81b p81b_b13_long "real TT typechange long status"
+
+# --- B14 (round 1 fix, item 6): X30 -- a staged rename of a symlink (exact
+# content, real on-disk symlink on both sides). ---
+P81B_B14="$P81B/b14"
+mkdir -p "$P81B_B14"
+(cd "$P81B_B14" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && ln -s target lf && git add lf && git commit -q -m A) > /dev/null 2>&1
+P81B_B14_SG="$P81B/b14_sg"
+P81B_B14_GIT="$P81B/b14_git"
+rm -rf "$P81B_B14_SG" "$P81B_B14_GIT"
+cp -R "$P81B_B14" "$P81B_B14_SG"
+cp -R "$P81B_B14" "$P81B_B14_GIT"
+(cd "$P81B_B14_SG" && rm lf && ln -s target lf2 && "$SG" add lf lf2) > /dev/null 2>&1
+(cd "$P81B_B14_GIT" && rm lf && ln -s target lf2 && LC_ALL=C git add lf lf2) > /dev/null 2>&1
+
+(cd "$P81B_B14_SG" && "$SG" status --porcelain) > "$WORKDIR/p81b_b14_porc_sg.txt" 2>&1
+(cd "$P81B_B14_GIT" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b14_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- a staged exact rename of a real symlink shows R  lf -> lf2" \
+    grep -q '^R  lf -> lf2$' "$WORKDIR/p81b_b14_porc_git.txt"
+check "phase81b: sg status --porcelain on a staged real-symlink rename matches git byte-for-byte" \
+    cmp -s "$WORKDIR/p81b_b14_porc_sg.txt" "$WORKDIR/p81b_b14_porc_git.txt"
+
+(cd "$P81B_B14_SG" && "$SG" status) > "$WORKDIR/p81b_b14_long_sg.txt" 2>&1
+(cd "$P81B_B14_GIT" && LC_ALL=C git status) > "$WORKDIR/p81b_b14_long_git.txt" 2>&1
+grep "$(printf '^\t')" "$WORKDIR/p81b_b14_long_git.txt" > "$WORKDIR/p81b_b14_long_git_ent.txt"
+grep "$(printf '^\t')" "$WORKDIR/p81b_b14_long_sg.txt" > "$WORKDIR/p81b_b14_long_sg_ent.txt"
+check "phase81b: sg status (staged real-symlink rename long status) entry lines match git byte-for-byte" \
+    sh -c "test -s '$WORKDIR/p81b_b14_long_git_ent.txt' && cmp -s '$WORKDIR/p81b_b14_long_sg_ent.txt' '$WORKDIR/p81b_b14_long_git_ent.txt'"
+
+# --- B15 (round 1 fix, item 6): Y12 -- staged delete of a regular file
+# "plain" and staged add of a symlink "link" whose target TEXT is
+# byte-identical to "plain"'s content, giving the two entries the SAME
+# blob id despite different modes (100644 vs 120000) -- measured NOT
+# paired as a rename (`A  link` / `D  plain`, two separate rows). ---
+P81B_B15="$P81B/b15"
+mkdir -p "$P81B_B15"
+(cd "$P81B_B15" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'dir/a.txt' > plain && git add plain && git commit -q -m A) > /dev/null 2>&1
+P81B_B15_SG="$P81B/b15_sg"
+P81B_B15_GIT="$P81B/b15_git"
+rm -rf "$P81B_B15_SG" "$P81B_B15_GIT"
+cp -R "$P81B_B15" "$P81B_B15_SG"
+cp -R "$P81B_B15" "$P81B_B15_GIT"
+(cd "$P81B_B15_SG" && rm plain && ln -s dir/a.txt link && "$SG" add plain link) > /dev/null 2>&1
+(cd "$P81B_B15_GIT" && rm plain && ln -s dir/a.txt link && LC_ALL=C git add plain link) > /dev/null 2>&1
+
+(cd "$P81B_B15_SG" && "$SG" status --porcelain) > "$WORKDIR/p81b_b15_porc_sg.txt" 2>&1
+(cd "$P81B_B15_GIT" && LC_ALL=C git status --porcelain) > "$WORKDIR/p81b_b15_porc_git.txt" 2>&1
+check "phase81b oracle: precondition -- git does NOT pair the identical-blob-id file->symlink swap as a rename" \
+    sh -c "grep -q '^A  link$' '$WORKDIR/p81b_b15_porc_git.txt' && grep -q '^D  plain$' '$WORKDIR/p81b_b15_porc_git.txt' && ! grep -q '^R' '$WORKDIR/p81b_b15_porc_git.txt'"
+check "phase81b: sg status --porcelain on the identical-blob-id file->symlink swap matches git byte-for-byte (not paired)" \
+    cmp -s "$WORKDIR/p81b_b15_porc_sg.txt" "$WORKDIR/p81b_b15_porc_git.txt"
+
+# --- B16 (round 1 fix, item 7a): `merge --abort` calls
+# sg_apply_tree_to_workdir with NO dirty pre-flight gate (unlike a fresh
+# `sg merge`/`sg switch`/`sg reset --hard`/`sg cherry-pick`, all of which
+# refuse earlier at sg_safe_apply_tree once their pre-flight sees the
+# ancestor is a symlink -- ORACLE.md's own phase81b/phase80-D checks
+# above). Fixture: topic ADDS a/b/tracked.txt (master's history never had
+# it), so a conflicted merge (conflict.txt clashes) auto-merges the clean
+# add into both the index and the working tree; only THEN is `a` replaced
+# by a symlink to an outside directory, so `merge --abort`'s restore of
+# HEAD (which lacks a/b/tracked.txt) must DELETE it -- reaching
+# sg_apply_tree_to_workdir's guarded delete (apply.c, not the pre-flight
+# gate in apply.c's sg_safe_apply_tree).
+#
+# Measured what git itself does in this exact shape (git 2.55.0): it does
+# NOT reach its own unsafe delete-through-symlink here either, but for an
+# entirely different, unrelated reason -- `git merge --abort`'s restore
+# uses read-tree's "is this entry up to date" safety check, which the
+# ancestor's directory->symlink type change alone fails regardless of
+# content, so git refuses too (exit 128, "not uptodate"). This is
+# STRUCTURALLY different from sg's refusal (sg's is the symlink-specific
+# guarded delete; git's is a generic stale-entry check that would equally
+# fire for an ordinary non-symlink modification) but the OBSERVABLE
+# safety property -- the outside file survives untouched either way -- is
+# identical, and both are pinned below rather than only asserting "git
+# fails somehow, sg fails somehow". ---
+P81B_B16="$P81B/b16"
+mkdir -p "$P81B_B16"
+(cd "$P81B_B16" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'c\n' > conflict.txt && git add conflict.txt && git commit -q -m base \
+    && git branch topic \
+    && git switch -q topic \
+    && mkdir -p a/b && printf 'TT\n' > a/b/tracked.txt && printf 'topic\n' > conflict.txt \
+    && git add -A && git commit -q -m topic \
+    && git switch -q master \
+    && printf 'master\n' > conflict.txt && git add -A && git commit -q -m masterchange) > /dev/null 2>&1
+P81B_B16_SG="$P81B/b16_sg"
+P81B_B16_GIT="$P81B/b16_git"
+rm -rf "$P81B_B16_SG" "$P81B_B16_GIT"
+cp -R "$P81B_B16" "$P81B_B16_SG"
+cp -R "$P81B_B16" "$P81B_B16_GIT"
+P81B_B16_SGOUT="$P81B/b16_sgout"
+P81B_B16_GITOUT="$P81B/b16_gitout"
+rm -rf "$P81B_B16_SGOUT" "$P81B_B16_GITOUT"
+mkdir -p "$P81B_B16_SGOUT/b" "$P81B_B16_GITOUT/b"
+printf 'TT\n' > "$P81B_B16_SGOUT/b/tracked.txt"
+printf 'TT\n' > "$P81B_B16_GITOUT/b/tracked.txt"
+
+(cd "$P81B_B16_SG" && "$SG" merge topic) > /dev/null 2>&1
+(cd "$P81B_B16_GIT" && LC_ALL=C git merge topic) > /dev/null 2>&1
+check "phase81b oracle: precondition -- the conflicted merge auto-added a/b/tracked.txt to git's own working tree" \
+    test -f "$P81B_B16_GIT/a/b/tracked.txt"
+rm -rf "$P81B_B16_SG/a"; ln -s "$P81B_B16_SGOUT" "$P81B_B16_SG/a"
+rm -rf "$P81B_B16_GIT/a"; ln -s "$P81B_B16_GITOUT" "$P81B_B16_GIT/a"
+
+(cd "$P81B_B16_GIT" && LC_ALL=C git merge --abort) > "$WORKDIR/p81b_b16_abort_git.txt" 2>&1
+P81B_B16_GIT_RC=$?
+(cd "$P81B_B16_SG" && "$SG" merge --abort) > "$WORKDIR/p81b_b16_abort_sg.txt" 2>&1
+P81B_B16_SG_RC=$?
+check "phase81b oracle: precondition -- git's own merge --abort ALSO refuses here (exit 128, unrelated 'not uptodate' safety check)" \
+    sh -c "[ $P81B_B16_GIT_RC -eq 128 ]"
+check "phase81b: sg merge --abort refuses too, via the symlink-specific guarded delete (exit 1)" \
+    sh -c "[ $P81B_B16_SG_RC -eq 1 ]"
+check "phase81b: sg merge --abort's stderr names the guarded-delete refusal" \
+    grep -q 'cannot remove "a/b/tracked.txt"' "$WORKDIR/p81b_b16_abort_sg.txt"
+check "phase81b: the symlink 'a' itself survives untouched (sg side)" \
+    test "$(readlink "$P81B_B16_SG/a")" = "$P81B_B16_SGOUT"
+check "phase81b: @OUT/b/tracked.txt is byte-identical to before on git's side too (both refusals are safe)" \
+    test "$(cat "$P81B_B16_GITOUT/b/tracked.txt")" = TT
+check "phase81b: @OUT/b/tracked.txt is byte-identical to before on sg's side -- the actual invariant" \
+    test "$(cat "$P81B_B16_SGOUT/b/tracked.txt")" = TT
+
+# --- B17: a plain cherry-pick of a commit that deletes a/b/tracked.txt,
+# with "a" replaced by a symlink to an outside dir holding the same file.
+# Measured (main conversation, git 2.55.0): git refuses with "Your local
+# changes to the following files would be overwritten by merge" (exit 128);
+# sg refuses at sg_require_clean_workdir (exit 1) listing the path as
+# changed. Neither reaches a delete. This pins that refusal; it does NOT
+# witness merge.c's delete pass (see the phase80 D loop's comment). ---
+P81B_B17="$P81B/b17"
+mkdir -p "$P81B_B17"
+(cd "$P81B_B17" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && mkdir -p a/b && printf 'TT\n' > a/b/tracked.txt && printf 'x\n' > other.txt \
+    && git add -A && git commit -q -m A \
+    && git branch side \
+    && git switch -q side \
+    && git rm -q a/b/tracked.txt && git commit -q -m "side deletes tracked.txt" \
+    && git switch -q master) > /dev/null 2>&1
+P81B_B17_SIDE=$(cd "$P81B_B17" && LC_ALL=C git rev-parse side)
+P81B_B17_SG="$P81B/b17_sg"
+P81B_B17_GIT="$P81B/b17_git"
+rm -rf "$P81B_B17_SG" "$P81B_B17_GIT"
+cp -R "$P81B_B17" "$P81B_B17_SG"
+cp -R "$P81B_B17" "$P81B_B17_GIT"
+P81B_B17_SGOUT="$P81B/b17_sgout"
+P81B_B17_GITOUT="$P81B/b17_gitout"
+rm -rf "$P81B_B17_SGOUT" "$P81B_B17_GITOUT"
+mkdir -p "$P81B_B17_SGOUT/b" "$P81B_B17_GITOUT/b"
+printf 'TT\n' > "$P81B_B17_SGOUT/b/tracked.txt"
+printf 'TT\n' > "$P81B_B17_GITOUT/b/tracked.txt"
+rm -rf "$P81B_B17_SG/a"; ln -s "$P81B_B17_SGOUT" "$P81B_B17_SG/a"
+rm -rf "$P81B_B17_GIT/a"; ln -s "$P81B_B17_GITOUT" "$P81B_B17_GIT/a"
+
+(cd "$P81B_B17_GIT" && LC_ALL=C git cherry-pick "$P81B_B17_SIDE") > "$WORKDIR/p81b_b17_git.txt" 2>&1
+P81B_B17_GIT_RC=$?
+(cd "$P81B_B17_SG" && "$SG" cherry-pick "$P81B_B17_SIDE") > "$WORKDIR/p81b_b17_sg.txt" 2>&1
+P81B_B17_SG_RC=$?
+check "phase81b B17 oracle: precondition -- git refuses the cherry-pick (would overwrite local changes)" \
+    sh -c "test '$P81B_B17_GIT_RC' -ne 0 && grep -q 'would be overwritten' '$WORKDIR/p81b_b17_git.txt'"
+check "phase81b B17: sg refuses the cherry-pick (exit 1) at the clean-worktree gate" \
+    sh -c "test '$P81B_B17_SG_RC' -eq 1 && grep -q 'modified (unstaged): a/b/tracked.txt' '$WORKDIR/p81b_b17_sg.txt'"
+check "phase81b: sg cherry-pick through a symlinked ancestor never deletes the outside file (the actual invariant)" \
+    test "$(cat "$P81B_B17_SGOUT/b/tracked.txt")" = TT
+check "phase81b: the symlink 'a' itself survives sg's cherry-pick attempt untouched" \
+    test "$(readlink "$P81B_B17_SG/a")" = "$P81B_B17_SGOUT"
+check "phase81b B17 oracle: precondition -- git's OUT/b/tracked.txt is byte-identical after its refusal" \
+    test "$(cat "$P81B_B17_GITOUT/b/tracked.txt")" = TT
+
+# --- B18 (round 2 fix, item 1; round 3 fix, item 2 -- this header was
+# stale, said "five shapes" and named a "symlink->file (readable tracked
+# target)" case that did not exist): `sg stash push`'s own tree records the
+# ON-DISK type/mode for a path whose worktree state differs from the
+# index, matching real git's stash exactly -- SIX shapes measured against
+# git 2.55.0 (see include/sg/tree_build.h's Phase 81b round 2 note):
+# file->symlink (dangling target), file->symlink (readable tracked
+# target), symlink->file (the real reverse direction: index 120000,
+# worktree now an ordinary regular file), an exec-bit-only chmod (no
+# content change), a dangling symlink (tracked as a file, worktree becomes
+# a dangling symlink), and a symlink retarget. Compared via
+# `git ls-tree -r stash@{0}` (real git reading sg's own stash commit),
+# byte-for-byte against git's own stash in the identical fixture. ---
+p81b_b18_case() {
+    _name="$1"; _setup="$2"
+    _sg="$P81B/b18_${_name}_sg"; _git="$P81B/b18_${_name}_git"
+    rm -rf "$_sg" "$_git"
+    mkdir -p "$_sg" "$_git"
+    (cd "$_sg" && git init -q && git config user.email p81b@example.com && git config user.name p81b) \
+        > /dev/null 2>&1
+    (cd "$_git" && git init -q && git config user.email p81b@example.com && git config user.name p81b) \
+        > /dev/null 2>&1
+    (cd "$_sg" && eval "$_setup") > /dev/null 2>&1
+    (cd "$_git" && eval "$_setup") > /dev/null 2>&1
+    (cd "$_sg" && "$SG" stash push -m x) > /dev/null 2>&1
+    (cd "$_git" && LC_ALL=C git stash push -q -m x) > /dev/null 2>&1
+    (cd "$_sg" && LC_ALL=C git ls-tree -r "stash@{0}") > "$WORKDIR/p81b_b18_${_name}_sg.txt" 2>&1
+    (cd "$_git" && LC_ALL=C git ls-tree -r "stash@{0}") > "$WORKDIR/p81b_b18_${_name}_git.txt" 2>&1
+    check "phase81b B18 ($_name): sg stash push's own tree matches git's byte-for-byte (git ls-tree -r stash@{0})" \
+        sh -c "test -s '$WORKDIR/p81b_b18_${_name}_git.txt' && cmp -s '$WORKDIR/p81b_b18_${_name}_sg.txt' '$WORKDIR/p81b_b18_${_name}_git.txt'"
+}
+
+p81b_b18_case "file_to_symlink" \
+    "printf 'orig content\n' > s && git add s && git commit -q -m base && rm s && ln -s target.txt s"
+p81b_b18_case "file_to_symlink_readable_target" \
+    "printf 'plain content\n' > s && printf 'target content\n' > target.txt && git add s target.txt && git commit -q -m base && rm s && ln -s target.txt s"
+# The real reverse direction (index 120000, worktree now a regular file).
+# Measured (main conversation, git 2.55.0): git's stash tree records
+# `100644` with the file's own bytes ("now a file").
+p81b_b18_case "symlink_to_file" \
+    "printf 'target content\n' > target.txt && ln -s target.txt s && git add s target.txt && git commit -q -m base && rm s && printf 'now a file\n' > s"
+p81b_b18_case "exec_bit_only" \
+    "printf 'body\n' > s && git add s && git commit -q -m base && chmod +x s"
+p81b_b18_case "dangling_symlink" \
+    "printf 'body\n' > s && git add s && git commit -q -m base && rm s && ln -s nowhere s"
+p81b_b18_case "symlink_retarget" \
+    "ln -s old_target s && git add s && git commit -q -m base && rm s && ln -s new_target s"
+
+# --- B19 (round 2 fix, item 1, regression A witness): `sg reset --hard
+# --force` on a tree with a 120000 entry, where the CURRENT worktree
+# holds an ordinary regular file at that path (not a symlink) -- round 1's
+# index-mode-decides-reader bug made readlink() fail EINVAL on a real
+# regular file, hard-failing sg_snapshot_create's automatic safety
+# snapshot and printing "sg: automatic snapshot failed; aborting..."
+# instead of resetting. Must now succeed. ---
+P81B_B19="$P81B/b19"
+mkdir -p "$P81B_B19"
+(cd "$P81B_B19" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && ln -s target.txt s && git add s && git commit -q -m A \
+    && rm s && printf 'now a file\n' > s) > /dev/null 2>&1
+(cd "$P81B_B19" && "$SG" reset --hard --force) > "$WORKDIR/p81b_b19_sg.txt" 2>&1
+P81B_B19_RC=$?
+check "phase81b B19: sg reset --hard --force succeeds when a 120000-tracked path is now a regular file on disk" \
+    sh -c "[ $P81B_B19_RC -eq 0 ]"
+check "phase81b B19: sg reset --hard --force did NOT print the automatic-snapshot-failed regression message" \
+    sh -c "! grep -q 'automatic snapshot failed' '$WORKDIR/p81b_b19_sg.txt'"
+
+# --- B20: directories whose ONLY content is a symlink. Two of status.c's
+# four untracked-traversal copies (dir_scan_flags, which decides folding,
+# and collect_ignored_within, which lists --ignored) had no fixture that
+# needed a symlink leaf: the mutation battery removed S_ISLNK from each
+# and interop stayed 5243/5243. Measured shapes (git 2.55.0): an untracked
+# dir holding only a symlink folds as "?? nd/" (lists "?? nd/l" under
+# -uall); an ignored dir holding only a symlink is "!! ig/" (normal) and
+# "!! ig/l" (-uall); ignored symlinks themselves are "!! ld" / "!! lf".
+# collect_ignored_within is only reached for an ignored entry INSIDE a
+# folded untracked dir: mix/ (keep.txt + ignored symlink x.lnk) gives
+# "?? mix/" and "!! mix/x.lnk" under --ignored (measured). ---
+P81B_B20="$P81B/b20"
+rm -rf "$P81B_B20"; mkdir -p "$P81B_B20"
+(cd "$P81B_B20" && git init -q && git config user.email p81b@example.com && git config user.name p81b \
+    && printf 'hello\n' > f.txt && mkdir dir && printf 'a\n' > dir/a.txt \
+    && printf 'ld\nlf\nig/\n*.lnk\n' > .gitignore \
+    && git add -A && git commit -q -m base \
+    && mkdir nd && ln -s ../f.txt nd/l \
+    && mkdir ig && ln -s ../f.txt ig/l \
+    && ln -s dir ld && ln -s f.txt lf \
+    && mkdir mix && printf 'k\n' > mix/keep.txt && ln -s ../f.txt mix/x.lnk) > /dev/null 2>&1
+for p81b_b20_args in "--porcelain" "--porcelain -uall" "--porcelain --ignored" "--porcelain --ignored -uall"; do
+    p81b_b20_slug=$(printf '%s' "$p81b_b20_args" | tr -c 'a-z' '_')
+    # $p81b_b20_args is split on purpose (a fixed list of flags, no paths).
+    (cd "$P81B_B20" && "$SG" status $p81b_b20_args) > "$WORKDIR/p81b_b20_${p81b_b20_slug}_sg.txt" 2>&1
+    (cd "$P81B_B20" && LC_ALL=C git -c core.quotepath=false status $p81b_b20_args) > "$WORKDIR/p81b_b20_${p81b_b20_slug}_git.txt" 2>&1
+    check "phase81b B20: sg status $p81b_b20_args on dirs holding symlinks (only, or next to a file) matches git byte-for-byte" \
+        sh -c "test -s '$WORKDIR/p81b_b20_${p81b_b20_slug}_git.txt' && cmp -s '$WORKDIR/p81b_b20_${p81b_b20_slug}_sg.txt' '$WORKDIR/p81b_b20_${p81b_b20_slug}_git.txt'"
+done
+check "phase81b B20 oracle: precondition -- git folds the symlink-only dir as '?? nd/' and lists '!! ig/' and '!! mix/x.lnk'" \
+    sh -c "grep -qx '?? nd/' '$WORKDIR/p81b_b20___porcelain_git.txt' && grep -qx '!! ig/' '$WORKDIR/p81b_b20___porcelain___ignored_git.txt' && grep -qx '!! mix/x.lnk' '$WORKDIR/p81b_b20___porcelain___ignored_git.txt'"
 
 echo "interop: $PASS/$TOTAL passed, $SKIP skipped"
 

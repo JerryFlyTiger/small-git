@@ -24,14 +24,14 @@ typedef enum {
 
 typedef struct {
     sg_diff_side_kind kind;
-    /* The tree/index entry mode, normalized to 100644/100755 for WORKDIR sides
-       too (Phase 26): read off the file's permission bits with lstat, exec-bit
-       only, never 120000 -- symlinks are out of scope for every tracked-file
-       walk in this codebase (status/apply/tree_build all exclude them), and
-       this field does not change that; a path that IS a symlink on disk is
-       reported conservatively as 100644, same as "no exec bit". 0 still means
-       "unknown" and mode comparison is skipped whenever either side is 0 (kept
-       for ABSENT sides, which never carry a mode). */
+    /* The tree/index entry mode, normalized to 100644/100755/120000 for
+       WORKDIR sides too (Phase 26; 120000 since Phase 81b): read off the
+       file with sg_worktree_classify (workdir.h) via lstat, never following
+       a symlink -- a WORKDIR side that IS a symlink on disk reports 120000,
+       its content being the readlink target, exactly like a BLOB side whose
+       mode is 120000. 0 still means "unknown" and mode comparison is
+       skipped whenever either side is 0 (kept for ABSENT sides, which never
+       carry a mode). */
     unsigned int mode;
     /* Valid iff kind != SG_DIFF_SIDE_ABSENT.
        For BLOB: the raw id as stored in the tree/index entry -- i.e. a chunk
@@ -43,10 +43,12 @@ typedef struct {
        sg_chunk_effective_id -- storing the effective id here instead would
        break sg_diff_side_read, since no object exists under the effective id
        when the entry is actually chunked.
-       For WORKDIR (Phase 26): the working file's own content hash
-       (sg_hash_file_blob's result, reused rather than recomputed) -- already
-       the "effective" id, since a working-tree file is never itself a chunk
-       pointer object. */
+       For WORKDIR (Phase 26; symlink-aware since Phase 81b): the working
+       entry's own content hash -- a regular file's bytes, or a symlink's
+       own readlink() target text, never the file it points at -- computed
+       by sg_worktree_hash_entry (workdir.h), reused rather than
+       recomputed. Already the "effective" id, since a working-tree entry
+       is never itself a chunk pointer object. */
     unsigned char id[SG_SHA1_RAW_LEN];
 } sg_diff_side;
 
@@ -287,14 +289,15 @@ int sg_diff_tree_index(const char *git_dir, const unsigned char *old_tree,
    path's diff, and the actionable message itself, since nothing downstream
    ever gets far enough to know which file was broken.
 
-   A working-tree file that EXISTS (stat succeeds) but cannot be read (e.g.
-   permission denied) is a different failure from the two above, and is
-   deliberately handled differently: it is folded into SG_DIFF_SIDE_ABSENT,
-   the same as if the file were not there at all -- NOT reported as a WORKDIR
-   side carrying a placeholder id. This matches sg_status_diff_unstaged
-   (src/workdir/status.c), which reports the identical failure as
-   SG_STATUS_DELETED. A placeholder id (all-zero, since sg_hash_file_blob
-   never legitimately produces one) would instead be indistinguishable, at
+   A working-tree entry that EXISTS (sg_worktree_classify says REGULAR or
+   SYMLINK) but cannot be read (e.g. permission denied) is a different
+   failure from the two above, and is deliberately handled differently: it
+   is folded into SG_DIFF_SIDE_ABSENT, the same as if the file were not
+   there at all -- NOT reported as a WORKDIR side carrying a placeholder id.
+   This matches sg_status_diff_unstaged (src/workdir/status.c), which
+   reports the identical failure as SG_STATUS_DELETED. A placeholder id
+   (all-zero, since sg_worktree_hash_entry never legitimately produces one)
+   would instead be indistinguishable, at
    render time, from a real content id that happens to be all-zero, and would
    print git's "0000000" placeholder in shapes real git never produces (e.g.
    with a mode suffix on an ordinary modification row, where 0000000 only

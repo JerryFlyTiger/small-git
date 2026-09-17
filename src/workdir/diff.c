@@ -173,9 +173,9 @@ static sg_diff_side side_blob(unsigned int mode, const unsigned char id[SG_SHA1_
     return s;
 }
 
-/* mode is expected already normalized to 100644/100755 by
-   workdir_entry_mode() below; id is the file's own content hash
-   (sg_hash_file_blob), reused rather than recomputed -- see sg/diff.h's
+/* mode is expected already normalized to 100644/100755/120000 by
+   sg_worktree_classify/sg_worktree_hash_entry (workdir.h); id is the file's
+   own content hash, reused rather than recomputed -- see sg/diff.h's
    sg_diff_side contract for why that is already the "effective" id for a
    WORKDIR side. */
 static sg_diff_side side_workdir(const unsigned char id[SG_SHA1_RAW_LEN], unsigned int mode)
@@ -248,28 +248,11 @@ void sg_diff_fill_combined_from_index(const sg_index *idx, sg_diff_list *list)
     }
 }
 
-/* Normalizes path's on-disk permission bits to a tree/index-entry mode.
-   Deliberately lstat, not stat: a following stat() would report the
-   *target's* mode for a symlink, which this codebase has no way to act on
-   correctly here (a symlink has no exec bit of its own to read, and 120000
-   is out of scope this round -- see sg/diff.h).
-
-   The exec bit is only read off a *regular* file. Anything else -- a
-   symlink, a directory, a fifo standing where a tracked file should be, or
-   a path lstat can't reach at all -- falls back to 100644. Those all carry
-   permission bits that mean something other than "git should record this
-   as executable", and a directory in particular is almost always exec for
-   reasons that have nothing to do with the blob that was supposed to be
-   there; reading its 0755 would put a mode in the patch header that no
-   content ever justified. */
-static unsigned int workdir_entry_mode(const char *abspath)
-{
-    struct stat lst;
-
-    if (lstat(abspath, &lst) != 0 || !S_ISREG(lst.st_mode))
-        return 0100644;
-    return (lst.st_mode & S_IXUSR) ? 0100755 : 0100644;
-}
+/* Phase 81b: the old workdir_entry_mode() (lstat -> 100644/100755, folding
+   a symlink into 100644 since 120000 was out of scope) is gone -- every
+   call site now gets its mode from sg_worktree_classify/
+   sg_worktree_hash_entry/sg_worktree_read_entry (workdir.h), which report
+   120000 for a symlink instead. See sg/diff.h's sg_diff_side contract. */
 
 /* Appends the fixed "unresolved conflict" row: both sides ABSENT, unmerged
    set. Shared by sg_diff_tree_index and sg_diff_index_workdir -- see
@@ -712,10 +695,8 @@ done:
 static int append_index_entry_vs_workdir(const char *git_dir, const char *repo_root,
                                          const sg_index_entry *entry, sg_diff_list *out)
 {
-    char abspath[SG_PATH_MAX];
     unsigned char wd_sha1[SG_SHA1_RAW_LEN];
     unsigned char effective_sha1[SG_SHA1_RAW_LEN];
-    struct stat st;
     unsigned int wd_mode;
     sg_diff_side os = side_blob(entry->mode, entry->sha1);
 
@@ -736,30 +717,23 @@ static int append_index_entry_vs_workdir(const char *git_dir, const char *repo_r
         return list_append(out, entry->path, &os, &ns);
     }
 
-    /* A truncated path must not be silently skipped: sg/diff.h and
-       CLAUDE.md both require a hard failure here rather than quietly
-       dropping a path from `sg diff`. */
-    if (sg_path_join(abspath, sizeof(abspath), repo_root, entry->path) != 0)
-        return -1;
-
-    if (stat(abspath, &st) != 0) {
-        sg_diff_side ns = side_absent();
-
-        return list_append(out, entry->path, &os, &ns);
-    }
-
-    wd_mode = workdir_entry_mode(abspath);
-
-    /* Existing-but-unreadable (permission denied, race with a delete, ...)
-       is treated the same as "not there at all" -- ABSENT, not a WORKDIR
-       side with a placeholder zero id. Same convention as
+    /* Phase 81b: sg_worktree_hash_entry folds together what used to be
+       three separate steps here (stat() for existence, workdir_entry_mode()
+       for the permission bits, sg_hash_file_blob() for the content hash) --
+       and, unlike stat(), it never follows a symlinked ancestor component
+       (ORACLE.md X01-X03) and never follows the final component either, so
+       a symlink is read as its own 120000 blob (readlink target) rather
+       than as whatever it points at. "Existing but unreadable" (permission
+       denied, a race with a delete, an ancestor blocked by a non-directory,
+       ...) is treated the same as "not there at all" -- ABSENT, not a
+       WORKDIR side with a placeholder zero id. Same convention as
        sg_status_diff_unstaged (src/workdir/status.c), which reports this
        exact failure as SG_STATUS_DELETED. A placeholder zero id would
        instead print as a real BLOB/WORKDIR pair whose "new" id happens to be
        all-zero -- indistinguishable, at render time, from git's genuine
        0000000 (which only ever appears on an add/delete row, never with a
        mode suffix) -- see sg/diff.h's sg_diff_side contract. */
-    if (sg_hash_file_blob(abspath, wd_sha1) != 0) {
+    if (sg_worktree_hash_entry(repo_root, entry->path, &wd_mode, wd_sha1) != 0) {
         sg_diff_side ns = side_absent();
 
         return list_append(out, entry->path, &os, &ns);
@@ -822,15 +796,12 @@ static sg_diff_side side_from_stage_entry(const sg_index *idx, const char *path,
 }
 
 /* Builds the `result` side of an unmerged sg_diff_entry: the working-tree
-   file at path, or ABSENT when it is missing or unreadable. Deliberately
-   simpler than append_index_entry_vs_workdir -- a working-tree file is never
-   itself a chunk pointer, so there is no effective-id resolution to do, only
-   stat + hash. "Exists but unreadable" collapses into ABSENT, same
-   convention as append_index_entry_vs_workdir uses for the same case. */
+   file at path, or ABSENT when it is missing, unreadable, or beyond a
+   blocked ancestor. Deliberately simpler than append_index_entry_vs_workdir
+   -- a working-tree file is never itself a chunk pointer, so there is no
+   effective-id resolution to do, only sg_worktree_hash_entry. */
 static sg_diff_side build_result_side(const char *repo_root, const char *path)
 {
-    char abspath[SG_PATH_MAX];
-    struct stat st;
     unsigned char wd_sha1[SG_SHA1_RAW_LEN];
     unsigned int wd_mode;
 
@@ -839,12 +810,7 @@ static sg_diff_side build_result_side(const char *repo_root, const char *path)
        collapse into ABSENT rather than reading outside the repository. */
     if (!sg_relpath_is_safe(path))
         return side_absent();
-    if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0)
-        return side_absent();
-    if (stat(abspath, &st) != 0)
-        return side_absent();
-    wd_mode = workdir_entry_mode(abspath);
-    if (sg_hash_file_blob(abspath, wd_sha1) != 0)
+    if (sg_worktree_hash_entry(repo_root, path, &wd_mode, wd_sha1) != 0)
         return side_absent();
     return side_workdir(wd_sha1, wd_mode);
 }
@@ -943,18 +909,22 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
             /* Present in both the tree and the index: compare the tree's
                blob against the working tree's actual bytes at this path,
                never the index's blob -- this is a tree-vs-workdir diff. */
-            char abspath[SG_PATH_MAX];
-            struct stat st;
             sg_diff_side os =
                 side_blob(old_flat.entries[oi].mode, old_flat.entries[oi].sha1);
+            unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+            unsigned int wd_mode;
 
-            if (sg_path_join(abspath, sizeof(abspath), repo_root, old_flat.entries[oi].path) !=
+            /* Phase 81b: sg_worktree_hash_entry folds the old stat() +
+               workdir_entry_mode() + sg_hash_file_blob() sequence into one
+               symlink-aware, ancestor-blocked-aware call -- see
+               append_index_entry_vs_workdir's matching comment above. */
+            if (sg_worktree_hash_entry(repo_root, old_flat.entries[oi].path, &wd_mode, wd_sha1) !=
                0) {
-                rc = -1;
-                goto done;
-            }
-
-            if (stat(abspath, &st) != 0) {
+                /* Same convention as append_index_entry_vs_workdir above
+                   and sg_status_diff_unstaged: not there, unreadable, or
+                   beyond a blocked ancestor is all ABSENT, not a WORKDIR
+                   side with a placeholder zero id -- see sg/diff.h's
+                   sg_diff_side contract. */
                 sg_diff_side ns = side_absent();
 
                 if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
@@ -962,22 +932,9 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                     goto done;
                 }
             } else {
-                unsigned char wd_sha1[SG_SHA1_RAW_LEN];
                 unsigned char effective_sha1[SG_SHA1_RAW_LEN];
-                unsigned int wd_mode = workdir_entry_mode(abspath);
 
-                if (sg_hash_file_blob(abspath, wd_sha1) != 0) {
-                    /* Same convention as append_index_entry_vs_workdir above
-                       and sg_status_diff_unstaged: existing-but-unreadable is
-                       ABSENT, not a WORKDIR side with a placeholder zero
-                       id -- see sg/diff.h's sg_diff_side contract. */
-                    sg_diff_side ns = side_absent();
-
-                    if (list_append(out, old_flat.entries[oi].path, &os, &ns) != 0) {
-                        rc = -1;
-                        goto done;
-                    }
-                } else if (sg_chunk_effective_id(git_dir, old_flat.entries[oi].sha1,
+                if (sg_chunk_effective_id(git_dir, old_flat.entries[oi].sha1,
                                                     effective_sha1) != 0) {
                     /* Same rule as append_index_entry_vs_workdir above and
                        sg/diff.h's sg_diff_index_workdir contract: an
@@ -1092,13 +1049,14 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                purpose; one unreadable path must not blind the user to every
                other path in the diff. */
             char abspath[SG_PATH_MAX];
-            struct stat st;
             sg_diff_side os = side_absent();
+            sg_wt_kind kind;
+            unsigned int wd_mode = 0;
 
             /* Phase 36: idx_path is untrusted (a raw .git/index path), same
                reasoning as append_index_entry_vs_workdir in
-               sg_diff_index_workdir above. Treat it exactly like the "stat
-               fails" case right below -- both sides absent, nothing
+               sg_diff_index_workdir above. Treat it exactly like the "not
+               there" case right below -- both sides absent, nothing
                reported -- rather than reading a file the index merely
                points at, possibly outside the repository entirely. */
             if (!sg_relpath_is_safe(idx_path)) {
@@ -1109,13 +1067,28 @@ int sg_diff_tree_workdir(const char *git_dir, const char *repo_root,
                 rc = -1;
                 goto done;
             }
-            if (stat(abspath, &st) == 0) {
+            /* Phase 81b: sg_worktree_classify replaces the old stat() --
+               unlike stat(), it never follows a symlinked ancestor and
+               classifies a symlink itself as 120000 rather than following it
+               (ORACLE.md X01-X03), and a dangling symlink now correctly
+               counts as present (a dangling symlink still EXISTS on disk,
+               ORACLE.md item 2), where the old stat() would have reported it
+               as gone. SG_WT_OTHER (a directory, fifo, ... standing where a
+               file should be) still appends a row with the NULL-id
+               fallback, same as REGULAR/SYMLINK whose own read fails below
+               -- only SG_WT_ABSENT (truly gone, or beyond a blocked
+               ancestor) reports nothing, matching the comment above. */
+            kind = sg_worktree_classify(repo_root, idx_path, &wd_mode);
+            if (kind != SG_WT_ABSENT) {
                 unsigned char wd_sha1[SG_SHA1_RAW_LEN];
-                unsigned int wd_mode = workdir_entry_mode(abspath);
+                sg_diff_side ns;
 
-                sg_diff_side ns = sg_hash_file_blob(abspath, wd_sha1) == 0
-                                      ? side_workdir(wd_sha1, wd_mode)
-                                      : side_workdir(NULL, wd_mode);
+                if (wd_mode == 0)
+                    wd_mode = 0100644; /* SG_WT_OTHER leaves mode_out unset */
+                ns = (kind != SG_WT_OTHER &&
+                     sg_worktree_hash_entry(repo_root, idx_path, &wd_mode, wd_sha1) == 0)
+                         ? side_workdir(wd_sha1, wd_mode)
+                         : side_workdir(NULL, wd_mode);
 
                 if (list_append(out, idx_path, &os, &ns) != 0) {
                     rc = -1;
@@ -1147,12 +1120,8 @@ int sg_diff_side_read(const char *git_dir, const char *repo_root, const char *pa
     if (side->kind == SG_DIFF_SIDE_BLOB)
         return sg_chunk_read_blob(git_dir, side->id, data, len, missing);
 
-    /* SG_DIFF_SIDE_WORKDIR */
-    {
-        char abspath[SG_PATH_MAX];
-
-        if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0)
-            return -1;
-        return sg_read_file(abspath, data, len);
-    }
+    /* SG_DIFF_SIDE_WORKDIR: sg_worktree_read_blob reads a symlink's target
+       (readlink) as its diffable content, same as a regular file's bytes --
+       never follows the symlink itself. */
+    return sg_worktree_read_blob(repo_root, path, data, len);
 }

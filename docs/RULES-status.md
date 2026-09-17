@@ -184,3 +184,15 @@ do not read the whole thing).
   own entry-line compare -- the existing `sed -n 's/^\t//p'` compares in
   those groups and `p81a_entries` are the templates -- and must not rely on
   `p38_cmp_named`.
+- **Phase 81b: all four untracked-traversal loops in `workdir/status.c`**
+  (`collect_untracked`, `dir_scan_flags`, `collect_ignored_within`,
+  `collect_untracked_folded`) treat `S_ISLNK` as a non-directory leaf:
+  listed, never descended, ignore-matched with `is_dir = 0` (measured: a
+  `ld/` pattern does NOT ignore a directory symlink `ld`; `ld` does).
+  WARNING: **each copy needs its own fixture.** The first Phase 81b
+  interop group covered only two of the four: removing `S_ISLNK` from
+  `dir_scan_flags` (folding) or from `collect_ignored_within` stayed
+  5243/5243 green. `collect_ignored_within` is reached ONLY for an ignored
+  entry inside a folded untracked directory (`?? mix/` + `!! mix/x.lnk`);
+  interop `phase81b B20` pins all four, and a per-site mutation of each
+  copy now goes red.

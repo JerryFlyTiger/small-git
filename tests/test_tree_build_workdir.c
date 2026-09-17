@@ -294,6 +294,322 @@ static void test_exists_but_unreadable_is_a_hard_failure(void)
     free(git_dir);
 }
 
+/* Phase 81b round 2 (item 1, regression A): the index says 120000 (a
+   symlink) but the working tree now holds an ORDINARY REGULAR FILE at that
+   path -- readlink() on a non-symlink fails EINVAL, so a build that decides
+   readlink-vs-fopen from the INDEX's mode (round 1's bug) hard-fails the
+   whole build even though the file is perfectly readable via fopen. Must
+   succeed and record the file's OWN observed content and mode (100644),
+   never the stale index mode -- matching `git stash push` (measured:
+   records 100644, not 120000, in this exact shape). */
+static void test_index_symlink_worktree_now_regular_file(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    sg_index_entry e;
+    unsigned char stale_blob[SG_SHA1_RAW_LEN];
+    unsigned char expected_content[SG_SHA1_RAW_LEN];
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    sg_flat_list flat;
+    int pos;
+
+    memset(&idx, 0, sizeof(idx));
+
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "old-target", strlen("old-target"), stale_blob) == 0,
+         "sg_loose_write for the stale symlink-target blob failed");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0120000;
+    memcpy(e.sha1, stale_blob, SG_SHA1_RAW_LEN);
+    e.path = (char *)"s";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "sg_index_upsert for s (120000) failed");
+
+    write_workdir_file(repo_root, "s", "now a regular file\n");
+    sg_object_hash(SG_OBJ_BLOB, "now a regular file\n", strlen("now a regular file\n"),
+                   expected_content);
+
+    CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB,
+                                     NULL, tree_id, NULL) == 0,
+         "build must succeed when the on-disk type differs from the index (120000 -> regular)");
+
+    CHECK(sg_tree_flatten(git_dir, tree_id, &flat, NULL) == 0, "flatten failed");
+    pos = flat_find(&flat, "s");
+    CHECK(pos >= 0, "s missing from the resulting tree");
+    if (pos >= 0) {
+        CHECK(flat.entries[pos].mode == 0100644, "expected mode 100644 (observed), got %o",
+             flat.entries[pos].mode);
+        CHECK(memcmp(flat.entries[pos].sha1, expected_content, SG_SHA1_RAW_LEN) == 0,
+             "expected the file's OWN content hash, not the stale index blob");
+    }
+
+    sg_flat_list_free(&flat);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Phase 81b round 2 (item 1, regression B): the index says 100644 (a
+   regular file) but the working tree now holds a SYMLINK to a separate,
+   readable, tracked file -- a build that decides readlink-vs-fopen from
+   the INDEX's mode (round 1's bug) calls fopen(), which FOLLOWS the
+   symlink and hashes the TARGET file's content under mode 100644 -- the
+   exact pre-Phase-81b bug this whole phase exists to fix, reintroduced by
+   round 1 for this one direction. Must record the symlink's OWN readlink
+   target text under mode 120000, matching `git stash push` (measured:
+   records 120000 with the target TEXT as content, in this exact shape,
+   even though target.txt itself is a separate, unrelated tracked file). */
+static void test_index_regular_worktree_now_symlink_to_tracked_file(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    sg_index_entry e;
+    unsigned char stale_blob[SG_SHA1_RAW_LEN];
+    unsigned char target_blob[SG_SHA1_RAW_LEN];
+    unsigned char expected_link_content[SG_SHA1_RAW_LEN];
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    sg_flat_list flat;
+    int pos;
+
+    memset(&idx, 0, sizeof(idx));
+
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "plain content\n", strlen("plain content\n"),
+                         stale_blob) == 0,
+         "sg_loose_write for the stale plain-file blob failed");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, stale_blob, SG_SHA1_RAW_LEN);
+    e.path = (char *)"s";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "sg_index_upsert for s (100644) failed");
+
+    /* target.txt is a second tracked file, readable, so fopen(s) would
+       "succeed" (following the symlink) if the bug were still present. */
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "target content\n", strlen("target content\n"),
+                         target_blob) == 0,
+         "sg_loose_write for target.txt's blob failed");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, target_blob, SG_SHA1_RAW_LEN);
+    e.path = (char *)"target.txt";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "sg_index_upsert for target.txt failed");
+    write_workdir_file(repo_root, "target.txt", "target content\n");
+
+    {
+        char abspath[SG_PATH_MAX];
+
+        snprintf(abspath, sizeof(abspath), "%s/s", repo_root);
+        CHECK(symlink("target.txt", abspath) == 0, "symlink() for s failed");
+    }
+    sg_object_hash(SG_OBJ_BLOB, "target.txt", strlen("target.txt"), expected_link_content);
+
+    CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB,
+                                     NULL, tree_id, NULL) == 0,
+         "build must succeed when the on-disk type differs from the index (100644 -> symlink)");
+
+    CHECK(sg_tree_flatten(git_dir, tree_id, &flat, NULL) == 0, "flatten failed");
+    pos = flat_find(&flat, "s");
+    CHECK(pos >= 0, "s missing from the resulting tree");
+    if (pos >= 0) {
+        CHECK(flat.entries[pos].mode == 0120000, "expected mode 120000 (observed), got %o",
+             flat.entries[pos].mode);
+        CHECK(memcmp(flat.entries[pos].sha1, expected_link_content, SG_SHA1_RAW_LEN) == 0,
+             "expected the symlink's OWN readlink target text (\"target.txt\"), not target.txt's "
+             "followed-through content");
+    }
+
+    sg_flat_list_free(&flat);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Phase 81b round 3 (item 1): the mutation `entry_mode != 0120000` ->
+   `idx->entries[i].mode != 0120000` in the chunk-eligibility test stayed
+   green against every existing fixture, because chunking is disabled
+   everywhere else in this file and in tests/interop.sh's B18/B19 -- that
+   branch was never actually exercised with chunking ON. These two tests
+   turn chunk storage on (append an [sg] section directly to git_dir/config,
+   the same mechanism `git config -f .../config sg.chunking true` uses at
+   the interop level) and use a low threshold so an ordinary-sized fixture
+   crosses it, discriminating the two conditions directly. */
+static void enable_chunking(const char *git_dir, size_t threshold)
+{
+    char path[SG_PATH_MAX];
+    FILE *f;
+
+    snprintf(path, sizeof(path), "%s/config", git_dir);
+    f = fopen(path, "a");
+    if (f == NULL) {
+        fprintf(stderr, "setup failed: could not open %s for chunk config\n", path);
+        exit(1);
+    }
+    fprintf(f, "[sg]\n\tchunking = true\n\tchunkthreshold = %zu\n", threshold);
+    fclose(f);
+}
+
+/* A blob stored WITHOUT chunking always has its raw tree-entry sha1 equal
+   to sg_object_hash of its own content directly (that is what "ordinary
+   loose blob" means). A CHUNKED blob's tree-entry sha1 is the pointer
+   object's own hash instead, which -- by SHA-1's collision resistance --
+   can never equal the content's direct hash. So "does the entry's sha1
+   equal the content's direct hash" is an exact, one-line discriminator for
+   "was this chunked", with no need to reach into storage/chunk.c's pointer
+   format at all. */
+static int blob_is_chunked(const unsigned char entry_sha1[SG_SHA1_RAW_LEN], const void *content,
+                           size_t len)
+{
+    unsigned char direct[SG_SHA1_RAW_LEN];
+
+    sg_object_hash(SG_OBJ_BLOB, content, len, direct);
+    return memcmp(entry_sha1, direct, SG_SHA1_RAW_LEN) != 0;
+}
+
+/* Regression A, chunk-aware: index says 120000 (a small symlink-target
+   blob) but the worktree now holds an ordinary REGULAR file large enough
+   to cross the chunk threshold. Correct sg behaviour (matching what a
+   REGULAR file always gets once chunking is on): the observed mode is
+   100644, and the content IS chunked. */
+static void test_index_symlink_worktree_now_large_regular_file_gets_chunked(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    sg_index_entry e;
+    unsigned char stale_blob[SG_SHA1_RAW_LEN];
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    sg_flat_list flat;
+    int pos;
+    char *big;
+    size_t big_len = 5000;
+    size_t i;
+
+    enable_chunking(git_dir, 100); /* threshold well below big_len */
+
+    memset(&idx, 0, sizeof(idx));
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "old-target", strlen("old-target"), stale_blob) == 0,
+         "sg_loose_write for the stale symlink-target blob failed");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0120000;
+    memcpy(e.sha1, stale_blob, SG_SHA1_RAW_LEN);
+    e.path = (char *)"s";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "sg_index_upsert for s (120000) failed");
+
+    big = malloc(big_len);
+    CHECK(big != NULL, "malloc for the large regular file failed");
+    if (big == NULL) {
+        sg_index_free(&idx);
+        free(repo_root);
+        free(git_dir);
+        return;
+    }
+    for (i = 0; i < big_len; i++)
+        big[i] = (char)('a' + (i % 26));
+    {
+        char abspath[SG_PATH_MAX];
+        FILE *f;
+
+        snprintf(abspath, sizeof(abspath), "%s/s", repo_root);
+        f = fopen(abspath, "wb");
+        CHECK(f != NULL, "fopen for the large regular file failed");
+        if (f != NULL) {
+            CHECK(fwrite(big, 1, big_len, f) == big_len, "fwrite for the large regular file failed");
+            fclose(f);
+        }
+    }
+
+    CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB,
+                                     NULL, tree_id, NULL) == 0,
+         "build must succeed (120000 -> large regular file, chunking on)");
+
+    CHECK(sg_tree_flatten(git_dir, tree_id, &flat, NULL) == 0, "flatten failed");
+    pos = flat_find(&flat, "s");
+    CHECK(pos >= 0, "s missing from the resulting tree");
+    if (pos >= 0) {
+        CHECK(flat.entries[pos].mode == 0100644, "expected mode 100644 (observed), got %o",
+             flat.entries[pos].mode);
+        CHECK(blob_is_chunked(flat.entries[pos].sha1, big, big_len),
+             "a large REGULAR file above the threshold must be chunked, even though the INDEX "
+             "said 120000");
+    }
+
+    sg_flat_list_free(&flat);
+    free(big);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* Regression B, chunk-aware: index says 100644 (a small blob) but the
+   worktree now holds a SYMLINK whose target text is long enough to cross
+   the (deliberately tiny) chunk threshold. Correct sg behaviour (item 1's
+   own requirement): a symlink's target text must NEVER be chunk-encoded,
+   regardless of its length relative to the threshold. */
+static void test_index_regular_worktree_now_symlink_target_never_chunked(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    sg_index idx;
+    sg_index_entry e;
+    unsigned char stale_blob[SG_SHA1_RAW_LEN];
+    unsigned char tree_id[SG_SHA1_RAW_LEN];
+    sg_flat_list flat;
+    int pos;
+    char *target;
+    size_t target_len = 500; /* well under macOS's ~1023-byte symlink() ceiling */
+    size_t i;
+
+    enable_chunking(git_dir, 10); /* threshold well below target_len */
+
+    memset(&idx, 0, sizeof(idx));
+    CHECK(sg_loose_write(git_dir, SG_OBJ_BLOB, "plain content\n", strlen("plain content\n"),
+                         stale_blob) == 0,
+         "sg_loose_write for the stale plain-file blob failed");
+    memset(&e, 0, sizeof(e));
+    e.mode = 0100644;
+    memcpy(e.sha1, stale_blob, SG_SHA1_RAW_LEN);
+    e.path = (char *)"s";
+    CHECK(sg_index_upsert(&idx, &e) == 0, "sg_index_upsert for s (100644) failed");
+
+    target = malloc(target_len + 1);
+    CHECK(target != NULL, "malloc for the long symlink target failed");
+    if (target == NULL) {
+        sg_index_free(&idx);
+        free(repo_root);
+        free(git_dir);
+        return;
+    }
+    for (i = 0; i < target_len; i++)
+        target[i] = (char)('a' + (i % 26));
+    target[target_len] = '\0';
+
+    {
+        char abspath[SG_PATH_MAX];
+
+        snprintf(abspath, sizeof(abspath), "%s/s", repo_root);
+        CHECK(symlink(target, abspath) == 0, "symlink() for the long target failed");
+    }
+
+    CHECK(sg_tree_build_from_workdir(git_dir, repo_root, &idx, SG_WORKDIR_MISSING_KEEP_INDEX_BLOB,
+                                     NULL, tree_id, NULL) == 0,
+         "build must succeed (100644 -> long symlink, chunking on)");
+
+    CHECK(sg_tree_flatten(git_dir, tree_id, &flat, NULL) == 0, "flatten failed");
+    pos = flat_find(&flat, "s");
+    CHECK(pos >= 0, "s missing from the resulting tree");
+    if (pos >= 0) {
+        CHECK(flat.entries[pos].mode == 0120000, "expected mode 120000 (observed), got %o",
+             flat.entries[pos].mode);
+        CHECK(!blob_is_chunked(flat.entries[pos].sha1, target, target_len),
+             "a symlink's target text must NEVER be chunked, even above the threshold");
+    }
+
+    sg_flat_list_free(&flat);
+    free(target);
+    sg_index_free(&idx);
+    free(repo_root);
+    free(git_dir);
+}
+
 /* Measured against real git 2.55.0: removing a/b/c/t.txt prunes a, b and c,
    and stops at repo_root. */
 static void test_prune_empty_parents_walks_up_to_repo_root(void)
@@ -461,6 +777,10 @@ int main(void)
     test_record_deletion_can_build_the_empty_tree();
     test_record_deletion_leaves_no_empty_subtree();
     test_exists_but_unreadable_is_a_hard_failure();
+    test_index_symlink_worktree_now_regular_file();
+    test_index_regular_worktree_now_symlink_to_tracked_file();
+    test_index_symlink_worktree_now_large_regular_file_gets_chunked();
+    test_index_regular_worktree_now_symlink_target_never_chunked();
     test_prune_empty_parents_walks_up_to_repo_root();
     test_prune_stops_at_a_directory_that_is_not_empty();
     test_prune_of_a_top_level_path_is_a_no_op();

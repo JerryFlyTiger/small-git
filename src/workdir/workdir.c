@@ -437,6 +437,138 @@ int sg_is_symlink(const char *path)
     return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
 }
 
+int sg_worktree_ancestor_blocked(const char *repo_root, const char *relpath)
+{
+    char abs[SG_PATH_MAX];
+
+    if (relpath[0] == '\0')
+        return 0;
+    if (sg_path_join(abs, sizeof(abs), repo_root, relpath) != 0)
+        return 0; /* truncation: not this function's failure mode to report */
+    return walk_worktree_ancestors(abs, strlen(repo_root), 0) < 0;
+}
+
+sg_wt_kind sg_worktree_mode_from_stat(const struct stat *st, unsigned int *mode_out)
+{
+    if (S_ISREG(st->st_mode)) {
+        if (mode_out != NULL)
+            *mode_out = (st->st_mode & S_IXUSR) ? 0100755 : 0100644;
+        return SG_WT_REGULAR;
+    }
+    if (S_ISLNK(st->st_mode)) {
+        if (mode_out != NULL)
+            *mode_out = 0120000;
+        return SG_WT_SYMLINK;
+    }
+    return SG_WT_OTHER;
+}
+
+sg_wt_kind sg_worktree_classify(const char *repo_root, const char *relpath,
+                                unsigned int *mode_out)
+{
+    char abspath[SG_PATH_MAX];
+    struct stat lst;
+
+    if (relpath[0] == '\0')
+        return SG_WT_OTHER; /* the repo root itself, never a blob */
+    if (sg_worktree_ancestor_blocked(repo_root, relpath))
+        return SG_WT_ABSENT;
+    if (sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0)
+        return SG_WT_ABSENT;
+    if (lstat(abspath, &lst) != 0)
+        return SG_WT_ABSENT;
+    return sg_worktree_mode_from_stat(&lst, mode_out);
+}
+
+/* readlink() with a buffer that grows until the target fits, so a target
+   longer than SG_PATH_MAX is never truncated -- readlink does not NUL
+   terminate and does not report "truncated" on its own, so the only way to
+   know the buffer was too small is that the returned length equals the
+   buffer's capacity. 1 MiB is far past any real symlink target (the
+   platform's own limit is a few KiB at most) and exists only to bound a
+   pathological loop. */
+int sg_worktree_readlink(const char *abspath, unsigned char **data, size_t *len_out)
+{
+    size_t cap = 256;
+
+    for (;;) {
+        char *buf = malloc(cap);
+        ssize_t n;
+
+        if (buf == NULL)
+            return -1;
+        n = readlink(abspath, buf, cap);
+        if (n < 0) {
+            free(buf);
+            return -1;
+        }
+        if ((size_t)n < cap) {
+            *data = (unsigned char *)buf;
+            *len_out = (size_t)n;
+            return 0;
+        }
+        free(buf);
+        if (cap >= (1u << 20))
+            return -1;
+        cap *= 2;
+    }
+}
+
+/* Reads abspath's content the way its already-known kind dictates. kind must
+   be SG_WT_REGULAR or SG_WT_SYMLINK (any other value is a caller bug and
+   fails closed). */
+static int sg_worktree_read_bytes(const char *abspath, sg_wt_kind kind,
+                                  unsigned char **data, size_t *len_out)
+{
+    if (kind == SG_WT_REGULAR)
+        return sg_read_file(abspath, data, len_out);
+    if (kind == SG_WT_SYMLINK)
+        return sg_worktree_readlink(abspath, data, len_out);
+    return -1;
+}
+
+sg_wt_kind sg_worktree_read_entry(const char *repo_root, const char *relpath,
+                                  unsigned int *mode_out,
+                                  unsigned char **data, size_t *len_out)
+{
+    char abspath[SG_PATH_MAX];
+    sg_wt_kind kind = sg_worktree_classify(repo_root, relpath, mode_out);
+
+    *data = NULL;
+    *len_out = 0;
+    if (kind != SG_WT_REGULAR && kind != SG_WT_SYMLINK)
+        return kind;
+    if (sg_path_join(abspath, sizeof(abspath), repo_root, relpath) != 0)
+        return SG_WT_ABSENT;
+    if (sg_worktree_read_bytes(abspath, kind, data, len_out) != 0)
+        return SG_WT_ABSENT; /* exists but unreadable, same convention as sg_hash_file_blob */
+    return kind;
+}
+
+int sg_worktree_hash_entry(const char *repo_root, const char *relpath,
+                           unsigned int *mode_out,
+                           unsigned char sha1_out[SG_SHA1_RAW_LEN])
+{
+    unsigned char *data;
+    size_t len;
+    sg_wt_kind kind = sg_worktree_read_entry(repo_root, relpath, mode_out, &data, &len);
+
+    if (kind != SG_WT_REGULAR && kind != SG_WT_SYMLINK)
+        return -1;
+    sg_object_hash(SG_OBJ_BLOB, data, len, sha1_out);
+    free(data);
+    return 0;
+}
+
+int sg_worktree_read_blob(const char *repo_root, const char *relpath,
+                          unsigned char **data, size_t *len_out)
+{
+    unsigned int mode;
+    sg_wt_kind kind = sg_worktree_read_entry(repo_root, relpath, &mode, data, len_out);
+
+    return (kind == SG_WT_REGULAR || kind == SG_WT_SYMLINK) ? 0 : -1;
+}
+
 int sg_path_join(char *out, size_t out_size, const char *base, const char *rel)
 {
     int n;

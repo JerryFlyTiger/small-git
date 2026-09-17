@@ -20470,3 +20470,123 @@ it recorded that the 34 Phase 38 `p38_cmp` sites keep the entry-line
 blindness (see `docs/RULES-status.md`), and that the check-name prefix
 string itself is unobservable by any mutation (`check()` never compares
 names), a diagnostic-only property.
+
+## Phase 81b: symlinks on the working-tree READ side
+
+Second of four Phase 81 commits. sg now reads a working-tree symlink the
+way git does -- as a blob whose bytes are the link target, mode 120000,
+never followed -- in status, diff, add, stash push and automatic
+snapshots, and in the restore/stash dirty checks. Writing real symlinks
+(checkout, restore, reset, merge, stash apply) is 81c; merge semantics
+for 120000 entries are 81d.
+
+Oracle, git 2.55.0, `LC_ALL=C`, `TZ=UTC`, `GIT_CONFIG_NOSYSTEM=1`,
+isolated `HOME`; `lf -> f.txt`, `ld -> dir`, `dangling -> nowhere`,
+`eo -> ../out` (outside the repository):
+
+| input | git | sg before |
+|---|---|---|
+| untracked `lf`, `ld`, `dangling`, `status --porcelain [-uall]` | `?? dangling`, `?? ld`, `?? lf`; a dir symlink is ONE entry, never descended | nothing listed |
+| `add lf ld dangling` / `add .` / `add dir` (dir contains a link) | index `120000`, blob = readlink bytes | "symlink, skipping (unsupported in phase 2)" |
+| `add ld/a.txt`, `add ld/`, `add lf/`, `add eo/x` | `fatal: pathspec '...' is beyond a symbolic link`, nothing staged, no object written, all-or-nothing across args | `add eo/x` staged the OUTSIDE file's content |
+| tracked `dir/a.txt`, `dir` replaced by a symlink | ` D dir/a.txt` + `?? dir`; `add .` / `add dir` evict `dir/a.txt` | read through the link, reported clean |
+| committed links untouched / retargeted / replaced by a file | clean / ` M` / ` T` | ` D`, ` M` (hashed the target's content) |
+| `.gitignore` `ld/` vs dir symlink `ld` | not ignored (a symlink is not a directory) | not listed |
+| untracked dir holding only a link; ignored dir holding only a link; ignored link inside an untracked dir, `--ignored` | `?? nd/`; `!! ig/`; `?? mix/` + `!! mix/x.lnk` | nothing |
+| `git stash push` tree for file->link, link->file, exec-bit-only, dangling, retarget | the OBSERVED type and bytes (`120000` + link text; `100644` + file bytes; `100755`) | index mode + followed content |
+
+Implementation: one set of helpers in `workdir.h` (`sg_worktree_classify`,
+`sg_worktree_mode_from_stat`, `sg_worktree_readlink`,
+`sg_worktree_read_entry`, `sg_worktree_hash_entry`,
+`sg_worktree_ancestor_blocked`) used by every worktree read in
+`workdir/diff.c`, `cli/cmd_restore.c`, `safety/stash.c` and
+`workdir/tree_build.c`; `S_ISLNK` as a leaf in all four untracked walks
+in `workdir/status.c`; `sg add` stages 120000 with a pre-pass for the
+"beyond a symbolic link" refusal and `sg_index_remove_under` for the
+index D/F eviction. Rules: `docs/RULES-paths-strings.md` and
+`docs/RULES-status.md` (Phase 81b entries), `docs/RULES-duplication.md`
+(tree_build's probe).
+
+Decision taken by the main conversation: Phase 80's five `D` interop
+checks pinned the guarded-delete message ("cannot remove") for
+merge/switch/reset/cherry-pick through a symlinked ancestor. 81b's
+pre-flight now correctly reports that path as changed, so all five
+refuse earlier. They were re-pinned to the pre-flight refusal
+(`modified (unstaged): a/b/tracked.txt`), and the guarded delete kept an
+end-to-end witness through `switch --force` and `reset --hard --force`
+(which skip `sg_safe_apply_tree`'s confirmation) and `merge --abort`
+(B16, no dirty gate). Fresh `sg merge` (even `--force`) and `sg
+cherry-pick` refuse at `sg_require_clean_workdir`; git refuses the same
+cherry-pick with exit 128 "would be overwritten" (B17).
+
+Transitional, accepted until 81c: anything that WRITES a 120000 entry
+still produces a mode-000 regular file (e.g. the file `sg stash pop` or
+`sg reset --hard` restores).
+
+Gates (main conversation), one final run on the final code and tests, after
+B20: `gates.sh --rebuild --sanitize` -- make 0 warnings, make test 91/91,
+interop 5142 -> 5248 with 0 skipped, sanitize 0 errors; then
+`fuzz_ignore.py` and `fuzz_diff.py`, 200 rounds each, 0 mismatches.
+The oracle harness agreed on 9 of 72 cases before 81b and 48 of 72 after
+the first implementation round; every remaining case was classified as
+81c/81d scope, sg's exit-code/hint-line conventions, or a command-surface
+gap outside symlinks (`sg commit`'s summary line, `sg show <rev> --
+<path>`).
+
+Mutation battery (`tests/mutate.sh`, main conversation, per site):
+
+| mutation | result |
+|---|---|
+| ancestor-blocked check disabled (interop; unit) | RED, 8 interop checks incl. the re-pinned Phase 80 `D` rows; RED unit |
+| symlink mode 120000 -> 100644 in `sg_worktree_mode_from_stat` | RED, 23 |
+| exec bit dropped in the same helper | RED, 13 (incl. phase49 renmode) |
+| `sg_index_remove_under` boundary `P/` -> string prefix | RED unit, precisely; interop crash-shaped (668 reds) |
+| stash dirty gate fail-open for an unreadable path | RED, the new unit test only |
+| `sg add` pre-pass disabled | RED, exactly the two no-object checks |
+| `sg_worktree_readlink` `n < cap` -> `n <= cap` | RED, boundary lengths 257+ |
+| tree_build probe dispatch keyed on the index mode (interop; unit) | RED, B18/B19; RED unit |
+| tree_build chunk eligibility keyed on the index mode | RED, both chunk-enabled unit tests |
+| `S_ISLNK` removed from each status walk, per site | site 1 RED 3, site 4 RED 1; sites 2 (`dir_scan_flags`) and 3 (`collect_ignored_within`) GREEN at first -- B20 added, then RED 2 and RED 1 |
+| `S_ISLNK` removed from `sg add`'s walk / argv branch | RED 1 / RED 18 |
+
+Cold reads; what they found, and what the main conversation
+found checking the implementer's reports:
+- Round 1 (batch): stash dirty gate turned fail-open for an unreadable
+  path (fixed); the "porcelain-unreachable" claim about merge's delete
+  route overstated (fixed: B16, comment); `sg_index_remove_under`'s
+  boundary untested (fixed); long-target interop missing (fixed: B12,
+  lengths 255/256/257/511/512/513/1023); tree_build classify-then-read
+  race (fixed); `sg add` wrote earlier arguments' blobs before refusing
+  (fixed: pre-pass); missing real-symlink pins for `TT`, a staged symlink
+  rename and a not-paired file/link swap (fixed: B13-B15).
+- Main, on the round-1 fixes: B17 shipped two `sh -c "true"` checks and a
+  comment claiming a plain cherry-pick has no dirty gate (the implementer
+  had grepped for `sg_safe_apply_tree` only). Measured and rewritten.
+- Round 2: tree_build chose readlink/fopen from the index mode (both
+  directions reproduced by the main conversation; fixed, B18/B19 + unit
+  tests).
+- Main, on the round-2 fixes: B18's `symlink_to_file` case actually built
+  file->symlink, and the implementer's measurement table was wrong for
+  that row (git stores `100644` + the file's bytes). Renamed and a real
+  case added. The main conversation also edited `tests/interop.sh` while
+  a gate run was executing it; that run was discarded and rerun.
+- Round 3: the chunk-eligibility condition was never evaluated with
+  chunking on (fixed: two chunk-enabled unit tests); duplicated mode
+  formula (fixed: `sg_worktree_mode_from_stat`); stale comments and the
+  Phase 21 rule in `docs/RULES-duplication.md` (fixed).
+- Round 4: nothing to change.
+- Rounds 5-7 (B20 and this section): the fixture and the section's
+  numbers checked out; the remaining findings were wording fixes to this
+  section only, chiefly that its gates sentence had combined numbers from
+  separate earlier runs and now cites the single final run.
+
+Residuals (recorded, not fixed):
+1. Whether merge.c's own delete pass (`sg_merge_result_apply`) is still
+   reachable with a symlinked ancestor through `rebase --continue` or
+   `stash apply` is NOT measured; carried to 81d, which works in that code.
+2. tree_build's race-only reset of the entry mode after a path vanishes
+   between probe and read is black-box unobservable.
+3. The argv flag scan exists three times in `cli/cmd_add.c` (identical
+   semantics today).
+4. `sg stash apply`'s dirty gate now also compares mode, so an
+   exec-bit-only change counts as dirty.

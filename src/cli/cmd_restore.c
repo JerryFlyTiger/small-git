@@ -170,19 +170,19 @@ static int would_lose_content(const char *git_dir, const char *repo_root, const 
                               const char *rel)
 {
     int pos = sg_index_find(idx, rel);
-    char abspath[SG_PATH_MAX];
-    struct stat st;
     unsigned char wd_sha1[SG_SHA1_RAW_LEN];
     unsigned char effective_sha1[SG_SHA1_RAW_LEN];
+    unsigned int wd_mode;
 
     if (pos < 0)
         return 0; /* not tracked: restore will error out, nothing to lose */
 
-    if (sg_path_join(abspath, sizeof(abspath), repo_root, rel) != 0)
-        return -1;
-    if (stat(abspath, &st) != 0)
-        return 0;
-    if (sg_hash_file_blob(abspath, wd_sha1) != 0)
+    /* Phase 81b: sg_worktree_hash_entry replaces stat()+sg_hash_file_blob()
+       -- symlink-aware (a worktree symlink hashes as its own 120000 blob,
+       never following it) and ancestor-blocked-aware (a path beyond a
+       symlinked ancestor is treated the same as "nothing there to lose",
+       matching sg_worktree_classify's ABSENT). */
+    if (sg_worktree_hash_entry(repo_root, rel, &wd_mode, wd_sha1) != 0)
         return 0;
     /* idx's sha1 may be a chunked-storage pointer's id -- normalize to the
        content's own id first, or a chunked file would always look "lossy"

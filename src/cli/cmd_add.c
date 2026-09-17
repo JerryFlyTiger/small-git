@@ -62,64 +62,145 @@ static int tracked_under_dir(const sg_index *idx, const char *dir)
     return 0;
 }
 
-/* Stages the regular file at rel_path (repo-root-relative). display is the
-   name used in messages: the user's own spelling for explicit arguments, the
-   repo-relative path during recursion. Symlinks warn and are skipped;
-   any other non-regular type (FIFO, socket, device) is rejected before any
-   read, so an explicit FIFO argument errors instead of hanging in
-   sg_read_file. */
+/* Non-zero if a proper ancestor component of repo_root/relpath (strictly
+   below repo_root) is itself a symlink -- matches git's own "pathspec 'X'
+   is beyond a symbolic link" refusal (measured against git 2.55.0,
+   ORACLE.md R07/R08/R12/X03, "81b extra measurements"). Deliberately
+   narrower than workdir.h's sg_worktree_ancestor_blocked (which also
+   treats a non-directory, non-symlink ancestor -- an ordinary regular file
+   -- as blocked): that is a different, pre-existing failure this project
+   does not attempt to give git's symlink-specific wording, so this walks
+   its own lstat loop rather than reusing that predicate under a misleading
+   message. relpath's OWN final component is never checked here -- only
+   components strictly above it. */
+static int path_beyond_symlink(const char *repo_root, const char *relpath)
+{
+    char abs[SG_PATH_MAX];
+    size_t root_len = strlen(repo_root);
+    size_t i;
+
+    if (relpath[0] == '\0')
+        return 0;
+    if (sg_path_join(abs, sizeof(abs), repo_root, relpath) != 0)
+        return 0; /* truncation is handled, and reported, by the caller */
+
+    for (i = root_len + 1; abs[i] != '\0'; i++) {
+        if (abs[i] != '/')
+            continue;
+        {
+            struct stat st;
+            int is_link;
+
+            abs[i] = '\0';
+            is_link = lstat(abs, &st) == 0 && S_ISLNK(st.st_mode);
+            abs[i] = '/';
+            if (is_link)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* Item 6 / item 3 (round 1 fix): the single "is this pathspec beyond a
+   symbolic link" check, shared by add_one_arg's own per-argument refusal
+   AND validate_args_not_beyond_symlink's pre-pass below -- one definition,
+   not two copies of the same rule (docs/RULES-duplication.md). rel must
+   already be resolved (sg_resolve_repo_path_allow_root) and known safe
+   (sg_relpath_is_safe) by the caller; arg is the user's own original
+   spelling, used both for the message and to detect a trailing slash the
+   resolved rel has already lost. Two shapes, both measured against git
+   2.55.0 (ORACLE.md R07/R08/R12/X03, "81b extra measurements"): a symlink
+   as a PROPER ancestor component (`ld/a.txt` when `ld` is a symlink), or
+   rel itself naming a symlink with a TRAILING SLASH in arg's own text
+   (`ld/`, `lf/`). Prints git's own wording (verbatim, single-quoted around
+   the raw arg text -- same convention as cmd_push.c's invalid refspec
+   message) and returns -1 when refused, 0 otherwise. */
+static int path_beyond_symlink_check(const char *repo_root, const char *rel, const char *arg)
+{
+    size_t alen;
+    int trailing_slash;
+    int beyond;
+
+    if (rel[0] == '\0')
+        return 0;
+
+    alen = strlen(arg);
+    trailing_slash = alen > 0 && arg[alen - 1] == '/';
+    beyond = path_beyond_symlink(repo_root, rel);
+
+    if (!beyond && trailing_slash) {
+        char check_abs[SG_PATH_MAX];
+
+        if (sg_path_join(check_abs, sizeof(check_abs), repo_root, rel) == 0 &&
+           sg_is_symlink(check_abs))
+            beyond = 1;
+    }
+    if (!beyond)
+        return 0;
+
+    fprintf(stderr, "sg: pathspec '%s' is beyond a symbolic link\n", arg);
+    return -1;
+}
+
+/* Stages the regular file OR symlink at rel_path (repo-root-relative).
+   display is the name used in messages: the user's own spelling for
+   explicit arguments, the repo-relative path during recursion. Any other
+   non-regular, non-symlink type (FIFO, socket, device) is rejected before
+   any read, so an explicit FIFO argument errors instead of hanging in
+   sg_worktree_read_entry.
+
+   Phase 81b: a symlink is staged as mode 120000, content = its readlink
+   target (never the file it points at) -- see workdir.h's
+   sg_worktree_read_entry/sg_worktree_classify (ORACLE.md R04/R05/R38). */
 static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
                       const char *rel_path, const char *display)
 {
     char abs_path[SG_PATH_MAX];
-    struct stat st;
+    struct stat lst;
     unsigned char *content;
     size_t content_len;
     sg_index_entry entry;
     unsigned int mode;
+    sg_wt_kind kind;
 
     if (sg_path_join(abs_path, sizeof(abs_path), repo_root, rel_path) != 0) {
         fprintf(stderr, "sg: path too long, cannot process %s\n", sg_quote_path_delimited(display));
         return -1;
     }
 
-    if (sg_is_symlink(abs_path)) {
-        fprintf(stderr, "sg: warning: %s is a symlink, skipping (unsupported in phase 2)\n",
-               sg_quote_path_delimited(display));
-        return 0;
-    }
-
-    if (stat(abs_path, &st) != 0) {
+    /* lstat, never stat: a symlink's own permission bits (never followed)
+       decide whether it is stage-able here, and its index stat data
+       (dev/ino/times) must be the symlink's own, not its target's. */
+    if (lstat(abs_path, &lst) != 0) {
         fprintf(stderr, "sg: cannot stat %s: no such file\n", sg_quote_path_delimited(display));
         return -1;
     }
-    if (!S_ISREG(st.st_mode)) {
+    if (!S_ISREG(lst.st_mode) && !S_ISLNK(lst.st_mode)) {
         fprintf(stderr, "sg: %s is an unsupported file type (not a regular file)\n", sg_quote_path_delimited(display));
         return -1;
     }
 
-    if (sg_read_file(abs_path, &content, &content_len) != 0) {
+    kind = sg_worktree_read_entry(repo_root, rel_path, &mode, &content, &content_len);
+    if (kind != SG_WT_REGULAR && kind != SG_WT_SYMLINK) {
         fprintf(stderr, "sg: failed to read %s\n", sg_quote_path_delimited(display));
         return -1;
     }
 
-    mode = (st.st_mode & 0111) ? 0100755 : 0100644;
-
     memset(&entry, 0, sizeof(entry));
-    entry.ctime_sec = (unsigned int)st.st_ctime;
+    entry.ctime_sec = (unsigned int)lst.st_ctime;
 #if defined(__APPLE__)
-    entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
-    entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
+    entry.ctime_nsec = (unsigned int)lst.st_ctimespec.tv_nsec;
+    entry.mtime_nsec = (unsigned int)lst.st_mtimespec.tv_nsec;
 #else
-    entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
-    entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
+    entry.ctime_nsec = (unsigned int)lst.st_ctim.tv_nsec;
+    entry.mtime_nsec = (unsigned int)lst.st_mtim.tv_nsec;
 #endif
-    entry.mtime_sec = (unsigned int)st.st_mtime;
-    entry.dev = (unsigned int)st.st_dev;
-    entry.ino = (unsigned int)st.st_ino;
+    entry.mtime_sec = (unsigned int)lst.st_mtime;
+    entry.dev = (unsigned int)lst.st_dev;
+    entry.ino = (unsigned int)lst.st_ino;
     entry.mode = mode;
-    entry.uid = (unsigned int)st.st_uid;
-    entry.gid = (unsigned int)st.st_gid;
+    entry.uid = (unsigned int)lst.st_uid;
+    entry.gid = (unsigned int)lst.st_gid;
     entry.file_size = (unsigned int)content_len;
     entry.path = (char *)rel_path; /* sg_index_upsert copies it */
 
@@ -131,7 +212,9 @@ static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
 
         sg_repo_read_chunk_config(git_dir, &enabled, &threshold);
 
-        if (enabled)
+        /* Item 1: a symlink's target text is always tiny and never goes
+           through content-defined chunking, regardless of config. */
+        if (kind == SG_WT_REGULAR && enabled)
             write_ok = sg_chunk_store_blob(git_dir, content, content_len, threshold, entry.sha1,
                                            &chunked) == 0;
         else
@@ -154,6 +237,11 @@ static int stage_file(const char *git_dir, const char *repo_root, sg_index *idx,
         fprintf(stderr, "sg: failed to stage %s\n", sg_quote_path_delimited(display));
         return -1;
     }
+
+    /* Phase 81b (81b extra measurement): staging a non-directory entry at
+       rel_path evicts every stale index entry that used to live below it as
+       a directory -- see sg_index_remove_under's own header comment. */
+    sg_index_remove_under(idx, rel_path);
 
     return 0;
 }
@@ -300,11 +388,10 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
             }
             rc = add_walk(git_dir, repo_root, idx, ig, relpath, force);
             sg_ignore_pop_dir(ig);
-        } else if (S_ISLNK(st.st_mode)) {
-            rc = stage_file(git_dir, repo_root, idx, relpath, relpath); /* warns + skips */
-        } else if (S_ISREG(st.st_mode)) {
-            /* Tracked files are staged even when ignored (tracked wins);
-               untracked ignored files are skipped silently. */
+        } else if (S_ISLNK(st.st_mode) || S_ISREG(st.st_mode)) {
+            /* Phase 81b: a symlink is staged exactly like a regular file --
+               tracked wins over ignore, untracked-and-ignored is skipped
+               silently (ORACLE.md X10-X13). */
             if (!force && !tracked_any_stage(idx, relpath) &&
                 sg_ignore_is_ignored(ig, relpath, 0))
                 continue;
@@ -323,11 +410,14 @@ static int add_walk(const char *git_dir, const char *repo_root, sg_index *idx, s
 /* After walking an added directory, stages deletions the way `git add <dir>`
    does: every stage-0 index entry under prefix ("" = the whole repo) whose
    working-tree file is gone (lstat fails with ENOENT) is removed from the
-   index. Entries whose path now names a symlink or another non-regular type
-   are left alone: sg treats those as unsupported, and dropping the entry on
-   a file->symlink swap would lose the last tracked content. Paths are
-   collected first and removed afterwards so removal never invalidates the
-   iteration. Returns 0 on success, -1 on allocation failure. */
+   index. Entries whose path still names SOMETHING (a symlink, a regular
+   file, or another non-regular type) are left alone here: add_walk's own
+   S_ISLNK/S_ISREG dispatch above is what re-stages a path that is still
+   present but changed (including a file<->symlink swap, Phase 81b), and a
+   type this project still does not stage (FIFO/socket/device) keeps its
+   last tracked content rather than losing it. Paths are collected first and
+   removed afterwards so removal never invalidates the iteration. Returns 0
+   on success, -1 on allocation failure. */
 static int stage_deletions_under(const char *repo_root, sg_index *idx, const char *prefix)
 {
     size_t plen = strlen(prefix);
@@ -477,6 +567,16 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
         return -1;
     }
 
+    /* Item 6: refused BEFORE anything is staged for every argument here too
+       (belt-and-braces -- sg_cmd_add's own validate_args_not_beyond_symlink
+       pre-pass already refuses the whole command before this function is
+       ever called for ANY argument, including object writes; see its own
+       comment for why a second check is still needed here). */
+    if (path_beyond_symlink_check(repo_root, rel, arg) != 0) {
+        free(rel);
+        return -1;
+    }
+
     if (sg_path_join(abs_path, sizeof(abs_path), repo_root, rel) != 0) {
         fprintf(stderr, "sg: path too long, cannot process %s\n", sg_quote_path_delimited(arg));
         free(rel);
@@ -514,9 +614,7 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
                 rc = stage_deletions_under(repo_root, idx, rel);
         }
         pop_n(ig, pushed);
-    } else if (S_ISLNK(st.st_mode)) {
-        rc = stage_file(git_dir, repo_root, idx, rel, arg); /* warning + skip */
-    } else if (S_ISREG(st.st_mode)) {
+    } else if (S_ISLNK(st.st_mode) || S_ISREG(st.st_mode)) {
         int pushed = push_parents(ig, rel, 0);
 
         if (pushed < 0) {
@@ -541,6 +639,54 @@ static int add_one_arg(const char *git_dir, const char *repo_root, sg_index *idx
 
     free(rel);
     return rc;
+}
+
+/* Item 3 (round 1 fix): "beyond a symbolic link" must refuse the WHOLE
+   command before anything is staged -- including before any blob is
+   written to .git/objects, not merely before the index is written back.
+   The pre-existing all-or-nothing guarantee (sg_cmd_add's own comment)
+   only ever covered the INDEX file: add_one_arg's per-argument check
+   caught a later bad argument only after stage_file had already hashed
+   and loose-written every earlier, otherwise-good argument's content as a
+   real object -- `sg add f.txt ld/a.txt` left f.txt's blob sitting in
+   .git/objects even though nothing was ultimately staged, where git
+   (measured, ORACLE.md "81b extra measurements") writes nothing at all.
+   This walks argv the same way sg_cmd_add's own loops do (honoring `--`
+   and skipping `-f`/`--force`) and runs every argument through the exact
+   same path_beyond_symlink_check add_one_arg uses, entirely before
+   sg_cmd_add opens the index or touches the working tree for real.
+   Returns 0 if every argument passes, -1 on the first refusal (message
+   already printed by path_beyond_symlink_check). */
+static int validate_args_not_beyond_symlink(const char *repo_root, int argc, char **argv)
+{
+    int i;
+    int no_more_flags = 0;
+
+    for (i = 1; i < argc; i++) {
+        char *rel;
+        int refused;
+
+        if (!no_more_flags && strcmp(argv[i], "--") == 0) {
+            no_more_flags = 1;
+            continue;
+        }
+        if (!no_more_flags && (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--force") == 0))
+            continue;
+
+        rel = sg_resolve_repo_path_allow_root(repo_root, argv[i]);
+        if (rel == NULL)
+            continue; /* not this pass's concern -- add_one_arg reports it */
+        if (rel[0] != '\0' && !sg_relpath_is_safe(rel)) {
+            free(rel);
+            continue; /* likewise reported by add_one_arg */
+        }
+
+        refused = path_beyond_symlink_check(repo_root, rel, argv[i]) != 0;
+        free(rel);
+        if (refused)
+            return -1;
+    }
+    return 0;
 }
 
 int sg_cmd_add(int argc, char **argv)
@@ -579,6 +725,12 @@ int sg_cmd_add(int argc, char **argv)
     if (repo_root == NULL) {
         fprintf(stderr, "sg: failed to determine repository root\n");
         free(git_dir);
+        return 1;
+    }
+
+    if (validate_args_not_beyond_symlink(repo_root, argc, argv) != 0) {
+        free(git_dir);
+        free(repo_root);
         return 1;
     }
 
