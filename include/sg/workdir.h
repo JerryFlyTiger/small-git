@@ -74,11 +74,20 @@ int sg_write_file_mkdirs(const char *path, const unsigned char *data, size_t len
    refused, not followed) and chmod'd to mode. A directory sitting at the
    final component is a failure (-1) unless a caller already removed it.
 
-   Symlink (mode 120000) blob content is unaffected: sg does not check out
-   symlinks at all (a separate, future phase), so this function never
-   receives one.
+   Phase 81c: mode's type bits (mode & 0170000) decide the write shape, not
+   just its permission bits. 0120000 creates a REAL symlink whose target is
+   data/len verbatim (an embedded NUL truncates it exactly like a C string
+   would, matching git's own observed behavior for a hand-built 120000 blob
+   with a NUL inside it -- ORACLE.md c9); anything else takes the regular-
+   file path below. A symlink is never chmod'd afterward -- chmod() follows
+   a symlink and would change the TARGET's permissions instead of the
+   link's own.
 
-   Returns 0 on success, -1 on any failure. */
+   Returns 0 on success, -1 on any failure (including symlink() itself
+   failing, e.g. a target too long for the platform -- this project has no
+   "continue a partly applied checkout" machinery, so that failure aborts
+   the whole caller like any other write failure, deliberate divergence
+   #12 from git's own "warn on stderr and continue" answer). */
 int sg_write_file_worktree(const char *repo_root, const char *relpath,
                           const unsigned char *data, size_t len, int mode);
 

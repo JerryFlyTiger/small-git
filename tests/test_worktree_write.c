@@ -545,6 +545,225 @@ static void test_empty_relpath_rejected(void)
     free(git_dir);
 }
 
+/* ==================== Phase 81c: the WRITE side creates real symlinks ==================== */
+
+static int read_link_target(const char *repo_root, const char *rel, char *out, size_t out_size)
+{
+    char abspath[4096];
+    ssize_t n;
+
+    snprintf(abspath, sizeof(abspath), "%s/%s", repo_root, rel);
+    n = readlink(abspath, out, out_size - 1);
+    if (n < 0)
+        return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+/* ---- regular / exec still take the non-symlink path, unaffected by the
+   new dispatch on mode's type bits. ---- */
+
+static void test_write_regular_and_exec_unaffected(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    struct stat st;
+    char abspath[4096];
+
+    CHECK(sg_write_file_worktree(repo_root, "reg.txt", (const unsigned char *)"x\n", 2, 0100644) == 0,
+         "regular write failed");
+    CHECK(!path_is_symlink(repo_root, "reg.txt"), "reg.txt must be a regular file");
+
+    CHECK(sg_write_file_worktree(repo_root, "exe.sh", (const unsigned char *)"#!/bin/sh\n", 10,
+                                 0100755) == 0,
+         "exec write failed");
+    snprintf(abspath, sizeof(abspath), "%s/exe.sh", repo_root);
+    CHECK(lstat(abspath, &st) == 0 && S_ISREG(st.st_mode), "exe.sh must be a regular file");
+    CHECK((st.st_mode & 0111) != 0, "exe.sh must keep its executable bit");
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- item 1: a 120000 mode creates a REAL symlink, target bytes verbatim. ---- */
+
+static void test_write_symlink_to_file(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    char target[4096];
+
+    CHECK(sg_write_file_worktree(repo_root, "lf", (const unsigned char *)"f.txt", 5, 0120000) == 0,
+         "symlink write failed");
+    CHECK(path_is_symlink(repo_root, "lf"), "lf must be a real symlink");
+    CHECK(read_link_target(repo_root, "lf", target, sizeof(target)) == 0 &&
+             strcmp(target, "f.txt") == 0,
+         "unexpected symlink target: %s", target);
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- a dangling target is written verbatim too -- sg never checks whether
+   the target exists. ---- */
+
+static void test_write_symlink_dangling(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    char target[4096];
+
+    CHECK(sg_write_file_worktree(repo_root, "dangling", (const unsigned char *)"nowhere", 7,
+                                 0120000) == 0,
+         "dangling symlink write failed");
+    CHECK(path_is_symlink(repo_root, "dangling"), "dangling must be a real symlink");
+    CHECK(read_link_target(repo_root, "dangling", target, sizeof(target)) == 0 &&
+             strcmp(target, "nowhere") == 0,
+         "unexpected symlink target: %s", target);
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- item 2: creating a symlink must NEVER chmod() afterward -- chmod()
+   follows a symlink and would silently change the TARGET's permissions
+   instead of the (mostly meaningless) permission bits of the link itself. ---- */
+
+static void test_write_symlink_never_chmods_target(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    char outside_dir[4096];
+    char outside_file[4096];
+    struct stat before, after;
+
+    snprintf(outside_dir, sizeof(outside_dir), "%s_outside_chmod", repo_root);
+    CHECK(mkdir(outside_dir, 0755) == 0, "failed to mkdir outside dir");
+    snprintf(outside_file, sizeof(outside_file), "%s/target.txt", outside_dir);
+    CHECK(sg_write_file_mkdirs(outside_file, (const unsigned char *)"hi\n", 3, 0400) == 0,
+         "failed to seed outside target with unusual permission bits");
+    CHECK(stat(outside_file, &before) == 0, "failed to stat outside target before");
+
+    CHECK(sg_write_file_worktree(repo_root, "eo", (const unsigned char *)outside_file,
+                                 strlen(outside_file), 0120000) == 0,
+         "symlink write to outside target failed");
+    CHECK(path_is_symlink(repo_root, "eo"), "eo must be a real symlink");
+    CHECK(stat(outside_file, &after) == 0, "failed to stat outside target after");
+    CHECK((before.st_mode & 07777) == (after.st_mode & 07777),
+         "the symlink target's own permission bits must never change (0%o -> 0%o)",
+         (unsigned)(before.st_mode & 07777), (unsigned)(after.st_mode & 07777));
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- item 3: NUL truncation is git's own behavior -- do not pre-scan,
+   reject or translate the target bytes. ---- */
+
+static void test_write_symlink_nul_truncates(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    static const unsigned char raw[] = {'f', '.', '\0', 't', 'x', 't'};
+    char target[4096];
+
+    CHECK(sg_write_file_worktree(repo_root, "nul", raw, sizeof(raw), 0120000) == 0,
+         "NUL-containing symlink target write failed");
+    CHECK(path_is_symlink(repo_root, "nul"), "nul must be a real symlink");
+    CHECK(read_link_target(repo_root, "nul", target, sizeof(target)) == 0 &&
+             strcmp(target, "f.") == 0,
+         "target must be C-string-truncated at the embedded NUL, got: %s", target);
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- item 4: an over-long target fails symlink() outright, and that
+   failure takes the ordinary write-failure path (-1), nothing left behind
+   at the final component -- deliberate divergence #12 from git's own "warn
+   on stderr and continue" checkout. ---- */
+
+static void test_write_symlink_long_target_fails(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char *big = malloc(5000);
+    char abspath[4096];
+    struct stat st;
+
+    memset(big, 'a', 5000);
+    CHECK(sg_write_file_worktree(repo_root, "long", big, 5000, 0120000) == -1,
+         "an over-long symlink target must fail, not silently truncate");
+    snprintf(abspath, sizeof(abspath), "%s/long", repo_root);
+    CHECK(lstat(abspath, &st) != 0, "nothing must be left behind at the final component");
+
+    free(big);
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- item 3 (empty target): platform-dependent (symlink("") succeeds on
+   macOS/APFS, fails ENOENT on Linux) -- probe at runtime and assert our own
+   function agrees with a direct symlink() call rather than assuming either
+   answer. ---- */
+
+static void test_write_symlink_empty_target_matches_platform(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    char probe_path[4096];
+    int probe_ok;
+    int rc;
+
+    snprintf(probe_path, sizeof(probe_path), "%s_empty_probe", repo_root);
+    unlink(probe_path);
+    probe_ok = symlink("", probe_path) == 0;
+    unlink(probe_path);
+
+    rc = sg_write_file_worktree(repo_root, "empty", (const unsigned char *)"", 0, 0120000);
+    if (probe_ok) {
+        char target[4096];
+
+        CHECK(rc == 0, "platform allows an empty symlink target, sg must too");
+        CHECK(path_is_symlink(repo_root, "empty"), "empty must be a real symlink");
+        CHECK(read_link_target(repo_root, "empty", target, sizeof(target)) == 0 &&
+                 target[0] == '\0',
+             "unexpected symlink target: %s", target);
+    } else {
+        CHECK(rc == -1, "platform refuses an empty symlink target, sg must fail closed too");
+    }
+
+    free(repo_root);
+    free(git_dir);
+}
+
+/* ---- item 2 (ancestor guard applies identically to a symlink write): a
+   symlink ancestor below repo_root refuses the write, same as an ordinary
+   file, and nothing is created. ---- */
+
+static void test_symlink_write_ancestor_blocked_nothing_created(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    char elsewhere[4096];
+    char link_path[4096];
+
+    snprintf(elsewhere, sizeof(elsewhere), "%s/elsewhere2", repo_root);
+    CHECK(mkdir(elsewhere, 0755) == 0, "failed to mkdir elsewhere2");
+    snprintf(link_path, sizeof(link_path), "%s/a", repo_root);
+    CHECK(symlink(elsewhere, link_path) == 0, "failed to symlink a -> elsewhere2");
+
+    CHECK(sg_write_file_worktree(repo_root, "a/b/lf", (const unsigned char *)"f.txt", 5, 0120000) ==
+             -1,
+         "expected a symlink write through the ancestor symlink 'a' to fail");
+    CHECK(!path_exists(repo_root, "elsewhere2/b"),
+         "the write must never have traversed into the symlink's target");
+    CHECK(path_is_symlink(repo_root, "a"), "the ancestor symlink itself must be untouched");
+
+    free(repo_root);
+    free(git_dir);
+}
+
 int main(void)
 {
     test_write_creates_missing_dirs();
@@ -562,6 +781,14 @@ int main(void)
     test_remove_missing_final_component_is_success();
     test_prune_empty_parents_blocked_by_ancestor_symlink();
     test_empty_relpath_rejected();
+    test_write_regular_and_exec_unaffected();
+    test_write_symlink_to_file();
+    test_write_symlink_dangling();
+    test_write_symlink_never_chmods_target();
+    test_write_symlink_nul_truncates();
+    test_write_symlink_long_target_fails();
+    test_write_symlink_empty_target_matches_platform();
+    test_symlink_write_ancestor_blocked_nothing_created();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

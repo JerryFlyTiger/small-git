@@ -156,36 +156,65 @@ int sg_apply_tree_to_workdir(const char *git_dir, const char *repo_root,
         }
         if (sg_worktree_clear_write_path(ig, repo_root, target_flat.entries[i].path, NULL) != 0 ||
            sg_write_file_worktree(repo_root, target_flat.entries[i].path, blob_content, blob_len,
-                                  (int)(target_flat.entries[i].mode & 0777)) != 0) {
+                                  (int)target_flat.entries[i].mode) != 0) {
             fprintf(stderr, "sg: failed to write %s\n",
                    sg_quote_path_delimited(target_flat.entries[i].path));
             free(blob_content);
             rc = -1;
             continue;
         }
-        free(blob_content);
+        {
+            size_t written_len = blob_len;
 
-        if (stat(abspath, &st) != 0) {
-            rc = -1;
-            continue;
-        }
+            free(blob_content);
+            blob_content = NULL;
 
-        memset(&entry, 0, sizeof(entry));
-        entry.ctime_sec = (unsigned int)st.st_ctime;
-        entry.mtime_sec = (unsigned int)st.st_mtime;
+            /* Phase 81c (item 5): lstat, never stat -- a stat() here would
+               follow a freshly created symlink and record the TARGET's
+               metadata (size included), so a second `sg status` right after
+               a checkout would see the link's own size disagree with the
+               index and report a bogus modification (ORACLE.md c1's "status
+               empty AGAIN on a second call" row). file_size comes from the
+               content just written (cmd_add.c's own template), not from
+               st_size, so it is right for a symlink and a regular file
+               alike without depending on lstat's st_size formula. */
+            if (lstat(abspath, &st) != 0) {
+                rc = -1;
+                continue;
+            }
+
+            memset(&entry, 0, sizeof(entry));
+            entry.ctime_sec = (unsigned int)st.st_ctime;
+            entry.mtime_sec = (unsigned int)st.st_mtime;
 #if defined(__APPLE__)
-        entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
+            entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
+            entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
 #else
-        entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
+            entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
+            entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
 #endif
-        entry.dev = (unsigned int)st.st_dev;
-        entry.ino = (unsigned int)st.st_ino;
-        entry.mode = target_flat.entries[i].mode;
-        entry.uid = (unsigned int)st.st_uid;
-        entry.gid = (unsigned int)st.st_gid;
-        entry.file_size = (unsigned int)st.st_size;
+            entry.dev = (unsigned int)st.st_dev;
+            entry.ino = (unsigned int)st.st_ino;
+            entry.mode = target_flat.entries[i].mode;
+            entry.uid = (unsigned int)st.st_uid;
+            entry.gid = (unsigned int)st.st_gid;
+            /* Phase 81c (cold-read round 1, MEASURED against git 2.55.0):
+               neither "what we wrote" nor "what lstat says" -- git's own
+               rule. On a hand-built 120000 blob, git records a link's true
+               lstat size when the target landed intact (size 5 for
+               "f.txt"), and records 0 when the target was truncated at an
+               embedded NUL. The 0 is deliberate: size, mtime, ino and mode
+               would otherwise ALL match the link git just wrote, and a
+               stat-only check would then call a link whose content does not
+               match its blob CLEAN. Recording st_size here would
+               reintroduce exactly that hole; recording the pre-truncation
+               blob length merely happens to differ. Follow git: on any
+               mismatch between what we asked for and what landed, zero the
+               cached size so the next reader must compare content. */
+            entry.file_size = ((off_t)written_len == st.st_size)
+                                  ? (unsigned int)st.st_size
+                                  : 0;
+        }
         memcpy(entry.sha1, target_flat.entries[i].sha1, SG_SHA1_RAW_LEN);
         entry.path = target_flat.entries[i].path;
 

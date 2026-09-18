@@ -2174,7 +2174,8 @@ static int add_stage_entry(sg_index *idx, const char *path, unsigned int stage, 
 }
 
 static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *path,
-                              unsigned int mode, const unsigned char sha1[SG_SHA1_RAW_LEN])
+                              unsigned int mode, const unsigned char sha1[SG_SHA1_RAW_LEN],
+                              long written_len)
 {
     char abspath[SG_PATH_MAX];
     struct stat st;
@@ -2196,7 +2197,12 @@ static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *
         fprintf(stderr, "sg: path too long, cannot resolve %s\n", sg_quote_path_delimited(path));
         return -1;
     }
-    if (stat(abspath, &st) == 0) {
+    /* Phase 81c (item 5): lstat, never stat -- the caller just wrote this
+       path with sg_write_file_worktree, possibly as a real symlink; stat()
+       here would follow it and record the TARGET's metadata, including its
+       size, instead of the link's own (whose size is the readlink length --
+       see ORACLE.md's "index stat data" c9 sub-row). */
+    if (lstat(abspath, &st) == 0) {
         entry.ctime_sec = (unsigned int)st.st_ctime;
         entry.mtime_sec = (unsigned int)st.st_mtime;
 #if defined(__APPLE__)
@@ -2210,7 +2216,16 @@ static int add_resolved_entry(const char *repo_root, sg_index *idx, const char *
         entry.ino = (unsigned int)st.st_ino;
         entry.uid = (unsigned int)st.st_uid;
         entry.gid = (unsigned int)st.st_gid;
-        entry.file_size = (unsigned int)st.st_size;
+        /* Phase 81c (cold-read round 1): when this call follows a write
+           THIS function's caller just performed, written_len is that
+           write's length and git's measured rule applies (see apply.c's
+           long comment): a mismatch between what was asked for and what
+           landed zeroes the cached size. written_len < 0 means "nobody
+           wrote this path in this pass" (the untouched-path branch), and
+           then lstat's own size is the only honest answer. */
+        entry.file_size = (written_len >= 0 && (off_t)written_len != st.st_size)
+                              ? 0
+                              : (unsigned int)st.st_size;
     }
     entry.mode = mode;
     entry.stage = 0;
@@ -2354,9 +2369,27 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
         }
 
         if (e->conflict) {
-            int mode = e->ours_present ? (int)(e->ours_mode & 0777)
-                                       : (e->theirs_present ? (int)(e->theirs_mode & 0777) : 0644);
+            int mode = e->ours_present ? (int)e->ours_mode
+                                       : (e->theirs_present ? (int)e->theirs_mode : 0100644);
             char **grown;
+
+            /* Phase 81c (cold-read round 1, F3): conflict_content is diff3
+               MARKER TEXT, never a link target. Until this phase the & 0777
+               mask collapsed a 120000 side to mode 0, so the markers landed
+               as an unreadable regular file; passing the full mode through
+               would instead make sg call symlink() with the whole marker
+               block as the TARGET -- a real, dangling link named
+               "<<<<<<< ours\n...", which a user cannot even open to resolve
+               the conflict. Measured git 2.55.0 on that exact shape
+               (base/ours/theirs all 120000, all different): git does not
+               merge symlink content at all -- it records the three stages
+               and leaves OURS' link in the working tree. Reproducing that
+               is merge semantics, which this project defers to 81d
+               (ORACLE.md X40/X41); until then sg keeps the pre-81c SHAPE,
+               markers in a plain regular file, rather than becoming the
+               first thing here to create a new kind of on-disk artifact. */
+            if ((mode & 0170000) == 0120000)
+                mode = 0100644;
 
             /* Phase 49: rename/rename-1to2's original path keeps only a
                stage-1 index entry and has no working-tree file at all --
@@ -2370,6 +2403,13 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                                        e->conflict_content_len, mode) != 0)) {
                 fprintf(stderr, "sg: failed to write conflicted %s\n",
                        sg_quote_path_delimited(e->path));
+                /* Phase 81c (investigate-and-report item): unlike the clean
+                   writer just below, this branch printed a failure and kept
+                   going without ever setting content_missing -- a fail-open
+                   found while auditing every sg_write_file_worktree call
+                   site for the mode-mask removal. Small and local, fixed
+                   here rather than only recorded. */
+                content_missing = 1;
             }
 
             if (e->base_present && add_stage_entry(index_out, e->path, 1, e->base_mode,
@@ -2403,6 +2443,8 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                comment) -- cmd_merge.c and cmd_rebase.c build the merge
                commit's tree straight from new_idx, so a missing path here
                would silently drop a file from the resulting commit. */
+            long written_len = -1;
+
             if (sg_merge_entry_touches_ours(e)) {
                 unsigned char *content;
                 size_t content_len;
@@ -2412,9 +2454,15 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                 if (read_rc == 0) {
                     if (sg_worktree_clear_write_path(ig, repo_root, e->path, NULL) != 0 ||
                        sg_write_file_worktree(repo_root, e->path, content, content_len,
-                                              (int)(e->mode & 0777)) != 0) {
+                                              (int)e->mode) != 0) {
                         fprintf(stderr, "sg: failed to write %s\n", sg_quote_path_delimited(e->path));
                         content_missing = 1;
+                    } else {
+                        /* Phase 81c: only a SUCCESSFUL write licenses the
+                           "what we asked for vs what landed" comparison in
+                           add_resolved_entry; after a failure there is no
+                           write of ours to compare against. */
+                        written_len = (long)content_len;
                     }
                     free(content);
                 } else if (read_rc == -2) {
@@ -2431,7 +2479,8 @@ int sg_merge_result_apply(const char *git_dir, const char *repo_root, const sg_m
                     content_missing = 1;
                 }
             }
-            if (add_resolved_entry(repo_root, index_out, e->path, e->mode, e->sha1) != 0)
+            if (add_resolved_entry(repo_root, index_out, e->path, e->mode, e->sha1,
+                                   written_len) != 0)
                 index_ok = 0;
         }
     }

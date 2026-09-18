@@ -310,8 +310,6 @@ int sg_write_file_worktree(const char *repo_root, const char *relpath,
 {
     char abs[SG_PATH_MAX];
     struct stat st;
-    int fd;
-    FILE *f;
 
     /* Phase 80 (fix round, finding 3): an empty relpath makes abs equal
        repo_root exactly (sg_path_join's own "rel is empty, just copy base"
@@ -337,23 +335,61 @@ int sg_write_file_worktree(const char *repo_root, const char *relpath,
         return -1;
     }
 
-    fd = open(abs, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0666);
-    if (fd < 0)
-        return -1;
-    f = fdopen(fd, "wb");
-    if (f == NULL) {
-        close(fd);
-        return -1;
+    /* Phase 81c (item 1): dispatch on the type bits of the caller's real
+       mode, not a masked-down permission-only value. A 120000 entry becomes
+       a REAL symlink, target bytes verbatim (item 3: no pre-scan, no
+       rejection, no translation -- an embedded NUL truncates the target the
+       same way a C string always would, matching git's own observed
+       behavior; an over-long target fails symlink() outright, which falls
+       into the ordinary -1 return below, this project's own deliberate
+       divergence #12 from git's "warn and continue" checkout). Item 2: never
+       chmod() a freshly created symlink -- chmod() follows a symlink and
+       would silently change the TARGET's permissions instead of the link's
+       own (which most platforms do not even let you set). */
+    if ((mode & 0170000) == 0120000) {
+        char *target = malloc(len + 1);
+
+        if (target == NULL)
+            return -1;
+        if (len > 0)
+            memcpy(target, data, len);
+        target[len] = '\0';
+        if (symlink(target, abs) != 0) {
+            free(target);
+            return -1;
+        }
+        free(target);
+        return 0;
     }
-    if (len > 0 && fwrite(data, 1, len, f) != len) {
-        fclose(f);
-        return -1;
+
+    {
+        int fd;
+        FILE *f;
+
+        fd = open(abs, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0666);
+        if (fd < 0)
+            return -1;
+        f = fdopen(fd, "wb");
+        if (f == NULL) {
+            close(fd);
+            return -1;
+        }
+        if (len > 0 && fwrite(data, 1, len, f) != len) {
+            fclose(f);
+            return -1;
+        }
+        if (fclose(f) != 0)
+            return -1;
+        /* Phase 81c (cold-read round 1): mask the type bits off explicitly.
+           Callers now pass the entry's FULL mode (0100644, not 0644), and
+           POSIX leaves chmod's behaviour for bits outside 07777
+           unspecified -- macOS and Linux both happen to ignore them
+           (measured), which is exactly the kind of platform freedom this
+           project removes at the call site instead of documenting. */
+        if (chmod(abs, (mode_t)(mode & 07777)) != 0)
+            return -1;
+        return 0;
     }
-    if (fclose(f) != 0)
-        return -1;
-    if (chmod(abs, (mode_t)mode) != 0)
-        return -1;
-    return 0;
 }
 
 /* Phase 80 (fix round, finding 1): removes a WORKING-TREE file or empty

@@ -477,36 +477,49 @@ static int restore_matched_paths(const char *git_dir, const char *repo_root,
         }
         if (sg_worktree_clear_write_path(ig, repo_root, target_flat.entries[i].path, NULL) != 0 ||
            sg_write_file_worktree(repo_root, target_flat.entries[i].path, blob_content, blob_len,
-                                  (int)(target_flat.entries[i].mode & 0777)) != 0) {
+                                  (int)target_flat.entries[i].mode) != 0) {
             fprintf(stderr, "sg: failed to write %s\n",
                    sg_quote_path_delimited(target_flat.entries[i].path));
             free(blob_content);
             rc = -1;
             continue;
         }
-        free(blob_content);
+        {
+            size_t written_len = blob_len;
 
-        if (stat(abspath, &st) != 0) {
-            rc = -1;
-            continue;
-        }
+            free(blob_content);
 
-        memset(&entry, 0, sizeof(entry));
-        entry.ctime_sec = (unsigned int)st.st_ctime;
-        entry.mtime_sec = (unsigned int)st.st_mtime;
+            /* Phase 81c (item 5): lstat, never stat -- see apply.c's
+               identical rule (same "second status call sees stale symlink
+               metadata" oracle row, ORACLE.md c1/c11). file_size comes from
+               the content just written, not st_size. */
+            if (lstat(abspath, &st) != 0) {
+                rc = -1;
+                continue;
+            }
+
+            memset(&entry, 0, sizeof(entry));
+            entry.ctime_sec = (unsigned int)st.st_ctime;
+            entry.mtime_sec = (unsigned int)st.st_mtime;
 #if defined(__APPLE__)
-        entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
+            entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
+            entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
 #else
-        entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
+            entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
+            entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
 #endif
-        entry.dev = (unsigned int)st.st_dev;
-        entry.ino = (unsigned int)st.st_ino;
-        entry.mode = target_flat.entries[i].mode;
-        entry.uid = (unsigned int)st.st_uid;
-        entry.gid = (unsigned int)st.st_gid;
-        entry.file_size = (unsigned int)st.st_size;
+            entry.dev = (unsigned int)st.st_dev;
+            entry.ino = (unsigned int)st.st_ino;
+            entry.mode = target_flat.entries[i].mode;
+            entry.uid = (unsigned int)st.st_uid;
+            entry.gid = (unsigned int)st.st_gid;
+            /* Phase 81c (cold-read round 1): git's measured rule, identical
+               to apply.c's -- see the long comment there for the
+               measurement and for why st_size alone is the wrong answer. */
+            entry.file_size = ((off_t)written_len == st.st_size)
+                                  ? (unsigned int)st.st_size
+                                  : 0;
+        }
         memcpy(entry.sha1, target_flat.entries[i].sha1, SG_SHA1_RAW_LEN);
         entry.path = target_flat.entries[i].path;
 
@@ -1099,7 +1112,7 @@ static int restore_untracked_flat(const char *git_dir, const char *repo_root, co
         }
         if (sg_worktree_clear_write_path(ig, repo_root, flat->entries[i].path, NULL) != 0 ||
            sg_write_file_worktree(repo_root, flat->entries[i].path, blob_content, blob_len,
-                                  (int)(flat->entries[i].mode & 0777)) != 0) {
+                                  (int)flat->entries[i].mode) != 0) {
             fprintf(stderr, "sg: failed to write %s\n", sg_quote_path_delimited(flat->entries[i].path));
             free(blob_content);
             sg_ignore_free(ig);

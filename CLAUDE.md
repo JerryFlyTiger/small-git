@@ -331,8 +331,8 @@ point where the harness warns that it is too large to keep in context.
 
 ## Deliberate divergences from real git
 
-Nine places where sg's answer differs from real git (the numbering still
-runs 1-10, with entry 8 retired -- see the parenthetical below for where it
+Eleven places where sg's answer differs from real git (the numbering runs
+1-12, with entry 8 retired -- see the parenthetical below for where it
 went; do not renumber the rest into a lie). Each was measured
 against git 2.55.0 and each is pinned on both sides by an interop check, so
 accidentally "fixing" one back into silent agreement with git would itself go
@@ -690,6 +690,37 @@ marked "fixed" in place, same as the other two retired entries above.)
     regardless of its ignored status. Pinned on both sides in interop's
     `phase80 N2` row (and covered structurally by every other `phase80`
     row, since none of them ever rely on sg deleting non-ignored content).
+12. **`sg switch` REFUSES the whole branch switch when a 120000 entry's
+    target cannot be created on this platform; real `git switch` warns on
+    stderr, writes everything else, moves HEAD and exits 0** (Phase 81c) --
+    an ACCEPTED answer, not a deferred defect. Reachable with an ordinary
+    commit made by real git whose symlink target is longer than the
+    platform's limit (macOS caps a target at PATH_MAX = 1024, Linux at
+    ~4096; the interop fixture uses 5000 bytes so it is past both, behind a
+    runtime probe). Measured, git 2.55.0: `git switch weird` prints
+    `error: unable to create symlink long: File name too long`, prints
+    `D\tlong` on stdout, ends up on the new branch with the entry reading
+    ` D long`; `sg switch weird` prints `sg: failed to write "long"`, exits
+    1, and leaves HEAD where it was. sg has no "continue a partly applied
+    checkout" machinery -- `sg_apply_tree_to_workdir` reports one failure
+    for the whole tree -- so completing the switch would mean claiming a
+    branch is checked out when part of it never landed. Both sides leave
+    the entries written before the failure on disk (as untracked files, in
+    sg's case, since HEAD did not move).
+    **`sg reset --hard` is NOT part of this divergence**, and the
+    distinction is the whole point of measuring per command: there git
+    ALSO fails the whole operation (exit 128, `fatal: Could not reset
+    index file to revision '<rev>'.`), also leaves HEAD alone, and also
+    leaves the already-written entries on disk -- measured identical to sg
+    on every observable except the exit code and the message, which is
+    this project's own "exit codes are only ever 0 or 1" convention (the
+    same class as divergence 3). An earlier draft of this entry got that
+    backwards by measuring `reset --hard` and writing the conclusion about
+    `switch`; if a future reader finds a claim about "the long-target
+    divergence" with no command named, it is not usable.
+    Pinned on both sides in interop's `phase81c c9` (reset --hard) and
+    `c9sw` (switch) rows -- literal per-side assertions, never a git-vs-sg
+    comparison, each behind the platform probe.
 
 ## Core types cheat sheet
 

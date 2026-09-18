@@ -20590,3 +20590,96 @@ Residuals (recorded, not fixed):
    semantics today).
 4. `sg stash apply`'s dirty gate now also compares mode, so an
    exec-bit-only change counts as dirty.
+
+## Phase 81c: symlinks on the working-tree WRITE side
+
+Every worktree writer now creates a REAL symlink for a 120000 entry.
+Before this phase all six of them masked the mode with `& 0777`, so a
+symlink blob became a regular file with permissions 000 -- unreadable, and
+reported as modified forever.
+
+### What changed
+- `sg_write_file_worktree` dispatches on `mode & 0170000`; the six callers
+  (apply.c, merge.c x2, cmd_restore.c, stash.c x2) stopped masking. The
+  ancestor walk and final-component unlink Phase 80 added run BEFORE the
+  dispatch, so the "never write through a symlink" guarantee is untouched.
+- The three index stat refreshes became `lstat` (apply.c, merge.c's
+  `add_resolved_entry`, stash.c), and the cached size follows git's own
+  measured rule. See `docs/RULES-paths-strings.md`.
+- Two things found while auditing the call sites rather than asked for:
+  merge.c's conflict writer never set `content_missing` on a failed write
+  (a fail-open, fixed), and the same writer had to be stopped from turning
+  diff3 markers into a link target (`docs/RULES-merge.md`).
+
+### Oracle
+Measured against git 2.55.0 on macOS APFS before any code was written.
+`.git/p81-oracle/cases4.py` registers SIXTEEN side-by-side cases, c1-c16,
+raw output in `81c-oracle-1.txt`; c17 (the symlink <-> directory swap) and
+controls A/B/C were separate one-off scripts, now kept in
+`.git/p81-oracle/81c-measure/` with a README mapping each file to the row
+it measured -- they were throwaway scripts in a session-scoped /tmp, and a
+claim whose evidence has evaporated is not a measured claim. Interop's own
+case numbering later grew past that (c18 and c19 were added by a cold-read
+round, and c7/c8 exist only as recorded out-of-scope rows), so the
+harness's count and interop's are NOT the same number and neither should
+be quoted for the other. Switch, reset --hard, restore, stash push/pop,
+merge and cherry-pick all agree with git afterwards. Interop 5248 -> 5309,
+0 skipped; unit tests 91 -> 92 binaries (`tests/test_restore_symlink.c` is
+new -- `restore_worktree` had never had one).
+
+### Three measured corrections worth remembering
+1. **"git warns and continues" is true of `switch`, false of
+   `reset --hard`.** The implementer reported the spec's row as wrong; it
+   had measured a different command. Both readings were right about their
+   own command. Only the `switch` cell is a real divergence (#12); in the
+   `reset --hard` cell git and sg agree on disk state, HEAD and status,
+   differing only in exit code and wording.
+2. **A cold read recommended recording `st.st_size` for a symlink's cached
+   size.** Measured: that is precisely the value git avoids, because it
+   would let a stat-only reader call a NUL-truncated link clean. The fix
+   went the other way (git's own rule), and the reverse mutation c20 pins
+   it.
+3. **A 1401-byte symlink target only fails on macOS.** Linux's cap is
+   ~4096, so six checks would have gone red on the three ubuntu CI cells
+   while staying green locally. Fixed with a 5000-byte target AND a
+   runtime probe, not just a bigger number.
+
+### Verification
+Three cold-read rounds (1296 lines, then 318, then 123), each on the tail
+produced after the previous one. Round 1 found the platform assumption,
+the cached-size rule and the conflict-marker symlink; round 2 found that
+the first version of the `c1 index` check captured its fixture long after
+a later step had switched it back to a branch with no symlinks in it, so
+it compared two plain files and could never have gone red for the rule it
+named -- the project's own "a check that verifies nothing" failure mode,
+invisible to every gate.
+The mutation battery is `.git/p81-oracle/mut81c.py`'s `M` list, one entry
+per site AND target -- a few sites appear twice, once aimed at interop and
+once at a unit binary, so entries outnumber sites -- each with its log
+under `mut81c/`. Every entry but one names the
+checks that catch it; the single genuine green is the conflict-writer
+fail-open, which no fixture can reach -- recorded rather than faked. **The
+count is deliberately not written here**: this phase's own docs round added
+`c21` to that list and made a "17-mutation battery" sentence stale in the
+same breath, which is the exact failure this project keeps rediscovering.
+Read the list. Two process notes: five interop mutations in the first run
+TIMED OUT under parallelism 3 (interop alone takes ~220s against a 300s
+default), and mutate.sh counts a timeout as "caught", which is not evidence
+about any named check; and the missing-NUL-terminator mutation is green
+under plain `make test` and red only under `make sanitize`, where the
+sanitizer's allocator changes what follows the buffer.
+
+### Residuals
+1. The index stat-fill block is copied three times (apply.c, merge.c,
+   stash.c) -- identical field-by-field assignments plus the shared size
+   rule. It predates this phase; converging it into one helper is a
+   separate change.
+2. merge.c's conflict writer writing markers into a regular file is a
+   placeholder for 81d, which has git's measured answer waiting
+   (git keeps OURS' link and does not merge symlink content at all).
+3. `sg stash pop` zeroes the cached size of every entry, not just the one
+   it rewrote (pre-existing, pinned in `phase81c c11 index`).
+4. `sg switch`/`cherry-pick`/`rebase`/`revert` still lack the untracked
+   pre-flight `sg merge` has (Phase 79 residual 1, unchanged here), and
+   the "automatic snapshot failed" answer for a directory sitting at a
+   tracked path is pre-existing for regular files too (control A).

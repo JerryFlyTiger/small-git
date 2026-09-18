@@ -86,7 +86,7 @@ static int restore_worktree(const char *git_dir, const char *repo_root, sg_ignor
     }
     rc = sg_worktree_clear_write_path(ig, repo_root, rel, NULL) != 0 ||
         sg_write_file_worktree(repo_root, rel, content, content_len,
-                               (int)(idx->entries[pos].mode & 0777)) != 0
+                               (int)idx->entries[pos].mode) != 0
             ? -1
             : 0;
     free(content);
