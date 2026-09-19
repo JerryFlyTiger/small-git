@@ -923,6 +923,45 @@ bumping the version, keep the man page in sync.
   (measured in Phase 25: of `sg_chunk_effective_id`'s two sites, one had
   coverage and one was a genuine blind spot).
 
+  **Running a BATCH of mutations has three failure modes of its own, all
+  measured in Phase 81c, all of which produce results that read as
+  verdicts and are not:**
+  - **Budget the timeout before launching.** `SG_MUTATE_TIMEOUT` defaults
+    to 300s while interop alone takes ~220s, so three mutations in
+    parallel pushed five of them past the limit. mutate.sh counts a
+    timeout as "caught", so those five looked like passes and had to be
+    thrown away and re-run. Compute `single-run time x parallelism` against
+    the timeout first, and read the exit code of every log: `137` plus a
+    "timed out" line is not a verdict.
+  - **Do not edit a file the running batch reads.** Adding interop checks
+    while the battery ran meant later mutations were scored against a
+    different `tests/interop.sh` than earlier ones; the only verdicts that
+    can be distorted are the ones the new checks were written to fix,
+    which is exactly where it matters. Freeze the test files, or re-run
+    every entry after the edit.
+  - **A claimed mutation needs a log.** A doc sentence here once said
+    "deleting this guard reds a named check" when that mutation had never
+    been run -- the guard had only been reproduced by hand BEFORE the
+    check existed, which proves nothing about it. Before writing "mutation
+    X reds Y", confirm `X`'s log exists under the phase's `mut*/`
+    directory and names `Y`.
+
+  **Evidence has to outlive the session.** One-off oracle scripts written
+  in a scratch directory disappear with it, and a "measured" claim whose
+  script is gone cannot be re-checked by the next reader. Keep them beside
+  the phase's other artifacts (`.git/<phase>-oracle/`) with a README
+  mapping each file to the row it measured. Same reason `--interop` logs
+  are kept: a summary you cannot trace back to raw output is just a new
+  place for lies to live.
+
+  **A count written into narrative prose is a defect, not a fact.** It has
+  gone stale inside the very round that changed it twice now: Phase 81b's
+  review bullet kept gaining a new wrong number on each rewrite until it
+  was replaced with a count-free sentence, and Phase 81c's "17-mutation
+  battery" was made false by the mutation that same docs round added.
+  Point at the list (`mut*.py`'s own entries, the gate's own `N/M` line)
+  and name the exceptions instead of counting them.
+
   Going red is not enough by itself, **it has to be red for the right
   reason**: confirm the failure message actually points at the property you
   meant to verify. There was once a test that did go red under a 2-commit
