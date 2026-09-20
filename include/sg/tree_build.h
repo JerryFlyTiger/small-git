@@ -92,6 +92,23 @@ typedef enum {
    RECORD_DELETION the result can cover fewer paths than idx, down to an
    empty tree if every path was deleted -- that is success, not an error.
 
+   Phase 81b (round 2): the MODE recorded for a path whose working-tree
+   file was actually read is the OBSERVED on-disk type/mode (120000 for a
+   symlink; 100644/100755 for a regular file, by its exec bit), never the
+   index's own mode -- git has no "snapshot" of its own to compare against,
+   but this matches what was actually measured for `git stash push`'s own
+   tree (git 2.55.0): stashing a tracked 100644 file swapped for a symlink
+   records 120000 in the stash commit's tree, and a bare `chmod +x` with no
+   other change is recorded as 100755, even though the INDEX itself -- a
+   separate tree, sg_tree_build_from_index above / `stash@{0}^2` -- still
+   says 100644 in both cases, since it was never re-staged. sg_snapshot_create
+   calls this SAME function (sg_tree_build_from_workdir), so its own
+   snapshot tree follows the identical observed-mode rule, by construction
+   rather than by a second, separately-measured behaviour. A path whose
+   working tree is never consulted at all (an ancestor beyond a symlink, a
+   pathspec miss, or the KEEP_INDEX_BLOB fallback for a genuinely missing
+   file) keeps the index's own mode, unaffected by this.
+
    Phase 36: also hard-fails (before ever touching the working tree for that
    entry) if an index path fails sg_relpath_is_safe -- e.g. "../secret.txt"
    or a path under ".git/". sg_index_read validates nothing about index

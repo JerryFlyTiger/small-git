@@ -327,3 +327,60 @@ do not read the whole thing).
   git's own `xdl_change_compact` condition. **Do not go add a test for
   those three speculatively**; they are recorded as measured-inert, not as
   an open coverage gap.
+
+- **Phase 81a: a TYPECHANGE (both sides present, file TYPE differs --
+  `sg_diff_entry_is_typechange`, `include/sg/diff.h`) renders as TWO
+  ordinary 2-way blocks for the SAME path, delete then add, not as one
+  modify hunk with "old mode"/"new mode"** -- measured against git 2.55.0:
+  `git diff`/`git show`/`git log -p` on a 100644<->120000 (or
+  100755<->120000, or 160000<->anything) row print "diff --git a/p b/p" +
+  "deleted file mode <old>" + a full delete hunk, then a SECOND
+  "diff --git a/p b/p" + "new file mode <new>" + a full add hunk -- each
+  half byte-identical to what git would print for a PURE deletion/addition
+  of that path. `100644<->100755` is NOT a typechange (only the exec bit
+  differs, same S_IFMT), and keeps the existing single-block "old mode"/
+  "new mode" rendering. `diff_out.c`'s `render_two_way_block` is the one
+  ordinary-block renderer, shared by the plain per-row path and (since this
+  phase) by `render_typechange_blocks`, which calls it twice with a
+  stack-local `sg_diff_entry` copy per half (`new_side`/`old_side` memset to
+  ABSENT respectively) -- a typechange row's `old_path` is always NULL (see
+  below), so neither synthetic half ever needs rename-specific handling.
+  `entry_status` (name-status) returns `'T'` for it, checked AFTER the
+  add/delete checks (an add or delete is never itself a typechange -- the
+  predicate already requires both sides present) and BEFORE falling back to
+  `'M'`. `--stat`/`--numstat`/`--shortstat`/`--name-only` are UNCHANGED: git
+  counts a typechange as one ordinary modify-shaped row there, which is
+  what sg already printed before this phase (regression-pinned, not
+  newly-fixed).
+  WARNING: **a typechange row is never paired with a rename** (measured:
+  a commit that both retargets-and-changes-type one path AND exact-renames
+  a pair of symlinks elsewhere pairs the rename normally and leaves the
+  typechange row alone) -- `sg_diff_entry_is_typechange` only needs
+  `old_side`/`new_side`, never touches `old_path`, and is checked in
+  `print_patch`'s loop before any rename-specific branch, so this needs no
+  guard against `old_path != NULL`; if a future change ever taught rename
+  detection to pair a typechange row, that assumption would need
+  revisiting together with this predicate's callers.
+  `sg_status_diff_staged`/`sg_status_diff_unstaged` (`workdir/status.c`)
+  route the identical predicate to a fourth `sg_status_kind`,
+  `SG_STATUS_TYPECHANGE` -- long format label `"typechange: "` (11 bytes +
+  one space, same 12-column width as every other label in `kind_label`),
+  porcelain code `'T'`. Reachable today with NO worktree symlink support at
+  all (this is a PRE-EXISTING bug, not new symlink behavior): index 120000
+  + worktree regular file already differs in TYPE because
+  `workdir_entry_mode` conservatively reports every worktree file as
+  100644/100755, never 120000 (see `diff.h`'s Phase 26 note, unchanged by
+  this phase) -- so a CLEAN checked-out symlink will show as an unstaged
+  `T` under this phase where it used to show `M`, until Phase 81b taught
+  the worktree side to read a real symlink's own type (fixed there; a clean
+  committed symlink is now pinned clean by phase81b B5). Phase 81a itself
+  never pinned that transitional wrongness -- every phase81a fixture that touches the worktree keeps the
+  worktree file an ordinary regular file at measurement time specifically
+  to avoid exercising it. Interop's `phase81a` group covers tree-to-tree
+  (`show`/`show --name-status`/`log -p`/`log --graph -p`/`diff A B`
+  [+`--name-status`/`--stat`/`--numstat`]), the rename-pairing fixture, a
+  binary-content half, the 100644<->100755 control, a 100755<->120000 row,
+  and staged/unstaged/`TT` status (porcelain, short, and long). The long
+  format needs TWO compares: `p38_cmp_named` (the Phase 38 skeleton, which
+  drops every TAB-indented entry line) and `p81a_entries` (the entry lines
+  byte-for-byte) -- see `docs/RULES-status.md`'s Phase 81a entry.

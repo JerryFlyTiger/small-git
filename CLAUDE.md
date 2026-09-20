@@ -3,8 +3,12 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (2185 checks, using real `git` as
-the oracle).
+git; this is guarded by `tests/interop.sh`, which uses real `git` as the
+oracle. **How many checks it has is deliberately not written here** -- it
+grows every phase, the number below in "Build and verification" is the one
+the gate itself prints, and a count in prose is the defect this file's own
+Testing conventions section now names (this sentence said 2185 while the
+real total had passed 5300).
 
 On top of that there are two things real git does not have: `src/safety/`
 (automatic snapshots before destructive operations) and `src/storage/chunk.c`
@@ -331,8 +335,8 @@ point where the harness warns that it is too large to keep in context.
 
 ## Deliberate divergences from real git
 
-Nine places where sg's answer differs from real git (the numbering still
-runs 1-10, with entry 8 retired -- see the parenthetical below for where it
+Eleven places where sg's answer differs from real git (the numbering runs
+1-12, with entry 8 retired -- see the parenthetical below for where it
 went; do not renumber the rest into a lie). Each was measured
 against git 2.55.0 and each is pinned on both sides by an interop check, so
 accidentally "fixing" one back into silent agreement with git would itself go
@@ -690,6 +694,37 @@ marked "fixed" in place, same as the other two retired entries above.)
     regardless of its ignored status. Pinned on both sides in interop's
     `phase80 N2` row (and covered structurally by every other `phase80`
     row, since none of them ever rely on sg deleting non-ignored content).
+12. **`sg switch` REFUSES the whole branch switch when a 120000 entry's
+    target cannot be created on this platform; real `git switch` warns on
+    stderr, writes everything else, moves HEAD and exits 0** (Phase 81c) --
+    an ACCEPTED answer, not a deferred defect. Reachable with an ordinary
+    commit made by real git whose symlink target is longer than the
+    platform's limit (macOS caps a target at PATH_MAX = 1024, Linux at
+    ~4096; the interop fixture uses 5000 bytes so it is past both, behind a
+    runtime probe). Measured, git 2.55.0: `git switch weird` prints
+    `error: unable to create symlink long: File name too long`, prints
+    `D\tlong` on stdout, ends up on the new branch with the entry reading
+    ` D long`; `sg switch weird` prints `sg: failed to write "long"`, exits
+    1, and leaves HEAD where it was. sg has no "continue a partly applied
+    checkout" machinery -- `sg_apply_tree_to_workdir` reports one failure
+    for the whole tree -- so completing the switch would mean claiming a
+    branch is checked out when part of it never landed. Both sides leave
+    the entries written before the failure on disk (as untracked files, in
+    sg's case, since HEAD did not move).
+    **`sg reset --hard` is NOT part of this divergence**, and the
+    distinction is the whole point of measuring per command: there git
+    ALSO fails the whole operation (exit 128, `fatal: Could not reset
+    index file to revision '<rev>'.`), also leaves HEAD alone, and also
+    leaves the already-written entries on disk -- measured identical to sg
+    on every observable except the exit code and the message, which is
+    this project's own "exit codes are only ever 0 or 1" convention (the
+    same class as divergence 3). An earlier draft of this entry got that
+    backwards by measuring `reset --hard` and writing the conclusion about
+    `switch`; if a future reader finds a claim about "the long-target
+    divergence" with no command named, it is not usable.
+    Pinned on both sides in interop's `phase81c c9` (reset --hard) and
+    `c9sw` (switch) rows -- literal per-side assertions, never a git-vs-sg
+    comparison, each behind the platform probe.
 
 ## Core types cheat sheet
 
@@ -891,6 +926,48 @@ bumping the version, keep the man page in sync.
   context (indentation depth, the preceding call) instead, `/g` is not needed
   (measured in Phase 25: of `sg_chunk_effective_id`'s two sites, one had
   coverage and one was a genuine blind spot).
+
+  **Running a BATCH of mutations has three failure modes of its own, all
+  measured in Phase 81c, all of which produce results that read as
+  verdicts and are not:**
+  - **Budget the timeout before launching.** `SG_MUTATE_TIMEOUT` defaults
+    to 300s while interop alone takes ~220s, so three mutations in
+    parallel pushed five of them past the limit. mutate.sh counts a
+    timeout as "caught", so those five looked like passes and had to be
+    thrown away and re-run. Compute `single-run time x parallelism` against
+    the timeout first, and read the exit code of every log: `137` plus a
+    "timed out" line is not a verdict.
+  - **Do not edit a file the running batch reads.** Adding interop checks
+    while the battery ran meant later mutations were scored against a
+    different `tests/interop.sh` than earlier ones. THAT time the damage
+    was traced to the two entries the new checks were written to fix,
+    which is exactly where it mattered -- but that was a measurement of
+    one incident, not a rule: shared fixtures, shared helpers and resource
+    contention can reach entries the edit had nothing to do with. Freeze
+    the test files, and if an edit did land mid-run, re-run every entry
+    rather than reasoning about which ones could have been touched.
+  - **A claimed mutation needs a log.** A doc sentence here once said
+    "deleting this guard reds a named check" when that mutation had never
+    been run -- the guard had only been reproduced by hand BEFORE the
+    check existed, which proves nothing about it. Before writing "mutation
+    X reds Y", confirm `X`'s log exists under the phase's `mut*/`
+    directory and names `Y`.
+
+  **Evidence has to outlive the session.** One-off oracle scripts written
+  in a scratch directory disappear with it, and a "measured" claim whose
+  script is gone cannot be re-checked by the next reader. Keep them beside
+  the phase's other artifacts (`.git/<phase>-oracle/`) with a README
+  mapping each file to the row it measured. Same reason `--interop` logs
+  are kept: a summary you cannot trace back to raw output is just a new
+  place for lies to live.
+
+  **A count written into narrative prose is a defect, not a fact.** It has
+  gone stale inside the very round that changed it twice now: Phase 81b's
+  review bullet kept gaining a new wrong number on each rewrite until it
+  was replaced with a count-free sentence, and Phase 81c's "17-mutation
+  battery" was made false by the mutation that same docs round added.
+  Point at the list (`mut*.py`'s own entries, the gate's own `N/M` line)
+  and name the exceptions instead of counting them.
 
   Going red is not enough by itself, **it has to be red for the right
   reason**: confirm the failure message actually points at the property you

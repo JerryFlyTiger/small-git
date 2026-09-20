@@ -1988,6 +1988,56 @@ static void test_dirty_gate_content_matches_stash_still_rejected(void)
     free(git_dir);
 }
 
+/* Phase 81b round 1 (item 1, regression): a path that EXISTS (lstat/
+   classify says it is a regular file) but cannot be READ (permission
+   denied) must count as dirty -- fail CLOSED, same as the pre-81b
+   lstat()+sg_hash_file_blob() pair did. Round 1's rewrite folded
+   sg_worktree_hash_entry's failure into "leave dirty_here alone", which is
+   correct only for a genuinely ABSENT path; this fixture reproduces the
+   "present but unreadable" case specifically: chmod 000 on mod.txt after
+   the stash push leaves it at HEAD's own content (still "m1\n", byte for
+   byte), so a fail-OPEN implementation would report it clean (rc == 0)
+   purely because it could not prove otherwise -- exactly backwards from
+   the safety this gate exists for. */
+static void test_dirty_gate_unreadable_existing_path_fails_closed(void)
+{
+    char *git_dir = make_tmp_repo();
+    char *repo_root = sg_repo_root(git_dir);
+    unsigned char stash_id[SG_SHA1_RAW_LEN];
+    char abspath[4096];
+    int rc;
+
+    if (geteuid() == 0) {
+        fprintf(stderr,
+               "SKIP test_dirty_gate_unreadable_existing_path_fails_closed: running as root, "
+               "chmod 000 would not actually block the read\n");
+        free(repo_root);
+        free(git_dir);
+        return;
+    }
+
+    dirty_gate_base_repo(git_dir, repo_root);
+    push_dirty_gate_stash(git_dir, repo_root, stash_id);
+
+    snprintf(abspath, sizeof(abspath), "%s/mod.txt", repo_root);
+    CHECK(chmod(abspath, 0000) == 0, "chmod 000 on mod.txt failed");
+
+    rc = sg_stash_apply_check_dirty(git_dir, repo_root, 0, &check_dirty_paths, &check_dirty_count);
+    CHECK(rc == 1,
+         "an existing-but-unreadable path on the stash's own touched set must fail CLOSED "
+         "(dirty), got rc=%d",
+         rc);
+    CHECK(check_dirty_count == 1 && strcmp(check_dirty_paths[0], "mod.txt") == 0,
+         "expected mod.txt alone in the dirty list, got %zu entries (%s)", check_dirty_count,
+         check_dirty_count > 0 ? check_dirty_paths[0] : "(none)");
+    free_check_dirty_result();
+
+    chmod(abspath, 0644); /* restore so cleanup (if any) can remove the tree */
+
+    free(repo_root);
+    free(git_dir);
+}
+
 /* Row 4: dirty on a path the stash DELETES. */
 static void test_dirty_gate_deleted_path_dirty_rejected(void)
 {
@@ -2262,6 +2312,7 @@ int main(void)
     test_dirty_gate_untouched_path_allowed();
     test_dirty_gate_modified_path_rejected();
     test_dirty_gate_content_matches_stash_still_rejected();
+    test_dirty_gate_unreadable_existing_path_fails_closed();
     test_dirty_gate_deleted_path_dirty_rejected();
     test_dirty_gate_deleted_from_worktree_allowed();
     test_dirty_gate_untouched_staged_change_survives();

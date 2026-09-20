@@ -60,6 +60,17 @@ int sg_index_remove(sg_index *index, const char *path);
    actually removed (0 if none were present). */
 int sg_index_remove_all_stages(sg_index *index, const char *path);
 
+/* Phase 81b: removes every entry (any stage) whose path lives strictly
+   UNDER dir -- i.e. starts with "dir/" -- without touching an entry AT dir
+   itself. This is the index's D/F (directory/file) rule: staging a
+   non-directory entry at "dir" (a regular file or a symlink replacing what
+   used to be a tracked directory) must evict every stale entry that used to
+   live below it, or a deleted-on-disk tracked path lingers forever
+   (measured against git 2.55.0: `git add dir` on a fixture where `dir` is
+   now a symlink evicts `dir/a.txt`, ORACLE.md "81b extra measurements").
+   Preserves sort order. Returns the number of entries removed. */
+int sg_index_remove_under(sg_index *index, const char *dir);
+
 /* Non-zero if the index has any stage 1/2/3 entry, i.e. an unresolved merge
    conflict is currently recorded. */
 int sg_index_has_unmerged(const sg_index *index);

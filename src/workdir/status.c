@@ -124,6 +124,7 @@ int sg_status_diff_staged(const char *git_dir, const char *repo_root,
 
         kind = e->old_side.kind == SG_DIFF_SIDE_ABSENT   ? SG_STATUS_NEW
              : e->new_side.kind == SG_DIFF_SIDE_ABSENT   ? SG_STATUS_DELETED
+             : sg_diff_entry_is_typechange(e)            ? SG_STATUS_TYPECHANGE
                                                          : SG_STATUS_MODIFIED;
         if (status_list_add(out, e->path, e->old_path, kind) != 0) {
             rc = -1;
@@ -209,6 +210,8 @@ int sg_status_diff_unstaged(const char *git_dir, const char *repo_root, const sg
             kind = SG_STATUS_NEW;
         else if (dl.entries[i].new_side.kind == SG_DIFF_SIDE_ABSENT)
             kind = SG_STATUS_DELETED;
+        else if (sg_diff_entry_is_typechange(&dl.entries[i]))
+            kind = SG_STATUS_TYPECHANGE;
         else
             kind = SG_STATUS_MODIFIED;
 
@@ -418,7 +421,10 @@ static int collect_untracked(const char *repo_root, const char *reldir, const sg
                 return -1;
             }
             sg_ignore_pop_dir(ig);
-        } else if (S_ISREG(st.st_mode)) {
+        } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+            /* Phase 81b: a symlink is a leaf here just like a regular file
+               (never descended, matched against ignore rules with is_dir=0)
+               -- ORACLE.md R01-R03/X10-X13. */
             if (path_tracked_any_stage(idx, relpath))
                 continue;
             if (!include_ignored && sg_ignore_is_ignored(ig, relpath, 0))
@@ -631,10 +637,6 @@ static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *
             continue;
         }
 
-        /* Symlinks are not S_ISDIR or S_ISREG here, so an untracked symlink
-           is neither counted nor listed -- this is collect_untracked's own
-           pre-existing behavior (symlink support is deliberately deferred,
-           see docs/DESIGN.md), not a regression introduced by this walk. */
         if (S_ISDIR(st.st_mode)) {
             int rc;
 
@@ -648,7 +650,10 @@ static int dir_scan_flags(const char *repo_root, const char *reldir, sg_ignore *
                 closedir(d);
                 return -1;
             }
-        } else if (S_ISREG(st.st_mode)) {
+        } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+            /* Phase 81b: a symlink counts as a leaf file here too -- a
+               directory holding only a symlink still folds normally
+               (ORACLE.md "81b extra measurements", `nd/` holding `nd/l`). */
             /* Phase 37: a file that a pathspec excludes does not count
                towards either flag -- it must not be able to justify folding
                (or even listing) a directory none of whose actual matches lie
@@ -737,11 +742,6 @@ static int collect_ignored_within(const char *repo_root, const char *reldir, sg_
         }
 
         if (S_ISDIR(st.st_mode)) {
-            /* Symlinks are not S_ISDIR or S_ISREG here, so an untracked
-               symlink is neither counted nor listed -- this is
-               collect_untracked's own pre-existing behavior (symlink
-               support is deliberately deferred, see docs/DESIGN.md), not a
-               regression introduced by this walk. */
             int has_nonignored = 0;
             int has_any = 0;
             int rc;
@@ -764,7 +764,9 @@ static int collect_ignored_within(const char *repo_root, const char *reldir, sg_
                 closedir(d);
                 return -1;
             }
-        } else if (S_ISREG(st.st_mode)) {
+        } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+            /* Phase 81b: a symlink is a leaf here too, same as
+               collect_untracked. */
             if (ps != NULL && !sg_pathspec_matches(ps, relpath))
                 continue;
             if (sg_ignore_is_ignored(ig, relpath, 0)) {
@@ -876,11 +878,6 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
                 continue;
             }
 
-            /* Symlinks are not S_ISDIR or S_ISREG here, so an untracked
-               symlink is neither counted nor listed -- this is
-               collect_untracked's own pre-existing behavior (symlink
-               support is deliberately deferred, see docs/DESIGN.md), not a
-               regression introduced by this walk. */
             if (S_ISDIR(st.st_mode)) {
                 if (!include_ignored && sg_ignore_is_ignored(ig, relpath, 1))
                     continue; /* prune: nothing below can be re-included */
@@ -895,7 +892,9 @@ static int collect_untracked_folded(const char *repo_root, const char *reldir, c
                     return -1;
                 }
                 sg_ignore_pop_dir(ig);
-            } else if (S_ISREG(st.st_mode)) {
+            } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+                /* Phase 81b: a symlink is a leaf here too, same as
+                   collect_untracked. */
                 if (path_tracked_any_stage(idx, relpath))
                     continue;
                 if (!include_ignored && sg_ignore_is_ignored(ig, relpath, 0))

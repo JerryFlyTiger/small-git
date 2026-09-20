@@ -477,36 +477,49 @@ static int restore_matched_paths(const char *git_dir, const char *repo_root,
         }
         if (sg_worktree_clear_write_path(ig, repo_root, target_flat.entries[i].path, NULL) != 0 ||
            sg_write_file_worktree(repo_root, target_flat.entries[i].path, blob_content, blob_len,
-                                  (int)(target_flat.entries[i].mode & 0777)) != 0) {
+                                  (int)target_flat.entries[i].mode) != 0) {
             fprintf(stderr, "sg: failed to write %s\n",
                    sg_quote_path_delimited(target_flat.entries[i].path));
             free(blob_content);
             rc = -1;
             continue;
         }
-        free(blob_content);
+        {
+            size_t written_len = blob_len;
 
-        if (stat(abspath, &st) != 0) {
-            rc = -1;
-            continue;
-        }
+            free(blob_content);
 
-        memset(&entry, 0, sizeof(entry));
-        entry.ctime_sec = (unsigned int)st.st_ctime;
-        entry.mtime_sec = (unsigned int)st.st_mtime;
+            /* Phase 81c (item 5): lstat, never stat -- see apply.c's
+               identical rule (same "second status call sees stale symlink
+               metadata" oracle row, ORACLE.md c1/c11). file_size comes from
+               the content just written, not st_size. */
+            if (lstat(abspath, &st) != 0) {
+                rc = -1;
+                continue;
+            }
+
+            memset(&entry, 0, sizeof(entry));
+            entry.ctime_sec = (unsigned int)st.st_ctime;
+            entry.mtime_sec = (unsigned int)st.st_mtime;
 #if defined(__APPLE__)
-        entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
+            entry.ctime_nsec = (unsigned int)st.st_ctimespec.tv_nsec;
+            entry.mtime_nsec = (unsigned int)st.st_mtimespec.tv_nsec;
 #else
-        entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
-        entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
+            entry.ctime_nsec = (unsigned int)st.st_ctim.tv_nsec;
+            entry.mtime_nsec = (unsigned int)st.st_mtim.tv_nsec;
 #endif
-        entry.dev = (unsigned int)st.st_dev;
-        entry.ino = (unsigned int)st.st_ino;
-        entry.mode = target_flat.entries[i].mode;
-        entry.uid = (unsigned int)st.st_uid;
-        entry.gid = (unsigned int)st.st_gid;
-        entry.file_size = (unsigned int)st.st_size;
+            entry.dev = (unsigned int)st.st_dev;
+            entry.ino = (unsigned int)st.st_ino;
+            entry.mode = target_flat.entries[i].mode;
+            entry.uid = (unsigned int)st.st_uid;
+            entry.gid = (unsigned int)st.st_gid;
+            /* Phase 81c (cold-read round 1): git's measured rule, identical
+               to apply.c's -- see the long comment there for the
+               measurement and for why st_size alone is the wrong answer. */
+            entry.file_size = ((off_t)written_len == st.st_size)
+                                  ? (unsigned int)st.st_size
+                                  : 0;
+        }
         memcpy(entry.sha1, target_flat.entries[i].sha1, SG_SHA1_RAW_LEN);
         entry.path = target_flat.entries[i].path;
 
@@ -1099,7 +1112,7 @@ static int restore_untracked_flat(const char *git_dir, const char *repo_root, co
         }
         if (sg_worktree_clear_write_path(ig, repo_root, flat->entries[i].path, NULL) != 0 ||
            sg_write_file_worktree(repo_root, flat->entries[i].path, blob_content, blob_len,
-                                  (int)(flat->entries[i].mode & 0777)) != 0) {
+                                  (int)flat->entries[i].mode) != 0) {
             fprintf(stderr, "sg: failed to write %s\n", sg_quote_path_delimited(flat->entries[i].path));
             free(blob_content);
             sg_ignore_free(ig);
@@ -1318,21 +1331,45 @@ int sg_stash_apply_check_dirty(const char *git_dir, const char *repo_root, size_
             }
         }
 
-        /* Rows 2/3/4. */
+        /* Rows 2/3/4. Phase 81b: sg_worktree_classify+sg_worktree_hash_entry
+           replace the old lstat()+sg_hash_file_blob() pair -- symlink-aware
+           (a worktree symlink hashes as its own 120000 blob, never
+           following it) and ancestor-blocked-aware (a path beyond a
+           symlinked ancestor is treated the same as "not there", matching
+           item 4 elsewhere in this phase).
+
+           Fail CLOSED, same as the pre-81b pair: the old code's
+           `lstat(...) == 0` branch entered on ANYTHING at all sitting at
+           that path (a regular file, a symlink, even a directory or fifo),
+           and inside it, `sg_hash_file_blob` failing counted as dirty, not
+           clean -- a hash failure never fell through silently. Round 1 of
+           this phase collapsed that: `sg_worktree_hash_entry(...) != 0` was
+           treated as "leave dirty_here alone", which is correct ONLY for
+           the genuinely-absent case (kind == SG_WT_ABSENT, whether truly
+           missing or beyond a blocked ancestor) and wrong for "something is
+           there but couldn't be hashed" (kind != SG_WT_ABSENT) -- that
+           second case must still force dirty_here, exactly like the old
+           code's `sg_hash_file_blob(...) != 0` branch did, or a symlink
+           whose target sg_worktree_hash_entry could not read races into
+           looking clean instead of blocking the stash apply. */
         if (!dirty_here && hf != NULL) {
             char abspath[SG_PATH_MAX];
-            struct stat st;
 
             /* A truncated path can't be verified clean, and this is a gate:
                the conservative answer is dirty, never clean. */
             if (sg_path_join(abspath, sizeof(abspath), repo_root, path) != 0) {
                 dirty_here = 1;
-            } else if (lstat(abspath, &st) == 0) {
-                unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+            } else {
+                unsigned int wd_mode;
+                sg_wt_kind kind = sg_worktree_classify(repo_root, path, &wd_mode);
 
-                if (sg_hash_file_blob(abspath, wd_sha1) != 0 ||
-                   memcmp(wd_sha1, hf->sha1, SG_SHA1_RAW_LEN) != 0)
-                    dirty_here = 1;
+                if (kind != SG_WT_ABSENT) {
+                    unsigned char wd_sha1[SG_SHA1_RAW_LEN];
+
+                    if (sg_worktree_hash_entry(repo_root, path, &wd_mode, wd_sha1) != 0 ||
+                       memcmp(wd_sha1, hf->sha1, SG_SHA1_RAW_LEN) != 0 || wd_mode != hf->mode)
+                        dirty_here = 1;
+                }
             }
         }
 

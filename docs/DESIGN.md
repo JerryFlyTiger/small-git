@@ -20400,3 +20400,286 @@ Residuals carried forward unchanged (recorded, not fixed): findings 4
 (`sg_write_file_mkdirs` still exported as a test-only fixture helper;
 moving it out of the public header would touch ~30 test files) from the
 first cold read.
+
+## Phase 81a: typechange rendering (diff, show, log, status)
+
+First of four Phase 81 commits (81a typechange rendering, 81b worktree
+READ side, 81c worktree WRITE side, 81d merge semantics for symlinks).
+81a is a PRE-EXISTING bug, reachable without any symlink worktree
+support: any commit made by real git that turns a file into a symlink
+(or back) rendered wrong in `sg show`, `sg log -p`, `sg diff A B`,
+`sg diff --cached`, and a staged `sg status`.
+
+Oracle, git 2.55.0, `LC_ALL=C`, `TZ=UTC`, `GIT_CONFIG_NOSYSTEM=1`,
+isolated `HOME`:
+
+| input | git | sg before |
+|---|---|---|
+| patch of a 120000<->100644 (or 100755) row | two blocks, delete first: `deleted file mode <old>` + full delete hunk, then `new file mode <new>` + full add hunk | `old mode`/`new mode` + one modify hunk |
+| `--name-status` | `T` | `M` |
+| `--stat`, `--numstat`, `--shortstat`, `--name-only` | one modify-shaped row | same (already agreed) |
+| `--summary` | `mode change 120000 => 100644` (NOT split) | no CLI flag |
+| rename pairing: delete `f.txt` "hello\n", `lf` link->file "hello\n", `lk` link "k" deleted, `lk2` file "k" added, `lk3` link "k" added | `D f.txt`, `T lf`, `A lk2`, `R100 lk lk3` | same (already agreed) |
+| status staged / unstaged / both | `T `, ` T`, `TT`; long `\ttypechange: <path>` | `M `, ` M`, `MM`; `modified:` |
+| 100644<->100755 | `old mode`/`new mode` (not a typechange) | same |
+
+Implementation: one predicate `sg_diff_entry_is_typechange` (both sides
+present, both modes nonzero, `(mode & 0170000)` differs), used by
+`entry_status` (`T`), `print_patch` (via `render_typechange_blocks`,
+which renders the one row twice through the extracted
+`render_two_way_block` with one side forced ABSENT) and both status
+producers. The diff row itself is NOT split, so stat/numstat/rename
+code is untouched. Combined (`-c`/`--cc`) rows are intercepted before
+the typechange branch.
+
+Transitional, accepted until 81b: `workdir_entry_mode` still reports an
+on-disk symlink as 100644, so a CLEAN committed symlink shows ` T`
+instead of the previous (also wrong) ` M`. Not pinned.
+
+Interop: `phase81a` group, 32 checks, 5110 -> 5142, 0 skipped. Gates
+(main conversation, `gates.sh --rebuild --sanitize`): make 0 warnings,
+make test 90/90, sanitize 0 errors. `python3 tests/fuzz_diff.py` and
+`--histogram`, 200 iterations from seed 0 each: 0 mismatches (both rerun
+with output saved after a docs cold read found the first, unsaved run
+had left no artifact to check the claim against).
+
+Mutation battery (`tests/mutate.sh`, main conversation):
+
+| mutation | result |
+|---|---|
+| predicate `!=` -> `==` (interop and unit test) | RED, including the 100644<->100755 control |
+| predicate always 0 | RED |
+| `entry_status` without `T` | RED, 5 `--name-status` checks only |
+| typechange delete half turned into an add half | RED |
+| add half rendered before delete half | RED |
+| staged producer never TYPECHANGE | RED, 4 staged/TT checks only |
+| unstaged producer never TYPECHANGE | RED, 4 unstaged/TT checks only |
+| `kind_char` `T` -> `X` | RED |
+| patch dispatch never takes the typechange branch | RED |
+| ABSENT guard `\|\|` -> `&&`; mode==0 guard `\|\|` -> `&&` | GREEN: redundant guards -- every ABSENT side constructor also zeroes mode, so each guard alone rejects the same inputs |
+| long label `"typechange: "` -> `"typechange:"` | GREEN at first: `p38_skel` drops every TAB-indented (entry) line. Fixed with `p81a_entries` (+3 checks); rerun RED on exactly those 3 |
+
+Cold reads: round 1 on the batch found (1) three checks named `phase38:`
+because `p38_cmp` hardcoded its prefix -- fixed with `p38_cmp_named`;
+(2) the redundant guards above -- recorded; (3) an unmerged path's
+stage2-vs-worktree companion row passes through the typechange
+predicate, with no unmerged+typechange oracle -- deferred to 81d;
+(4) 160000<->regular has unit coverage only -- recorded. Round 2 on the
+test-only tail (`p38_cmp_named`, `p81a_entries`) found nothing to change;
+it recorded that the 34 Phase 38 `p38_cmp` sites keep the entry-line
+blindness (see `docs/RULES-status.md`), and that the check-name prefix
+string itself is unobservable by any mutation (`check()` never compares
+names), a diagnostic-only property.
+
+## Phase 81b: symlinks on the working-tree READ side
+
+Second of four Phase 81 commits. sg now reads a working-tree symlink the
+way git does -- as a blob whose bytes are the link target, mode 120000,
+never followed -- in status, diff, add, stash push and automatic
+snapshots, and in the restore/stash dirty checks. Writing real symlinks
+(checkout, restore, reset, merge, stash apply) is 81c; merge semantics
+for 120000 entries are 81d.
+
+Oracle, git 2.55.0, `LC_ALL=C`, `TZ=UTC`, `GIT_CONFIG_NOSYSTEM=1`,
+isolated `HOME`; `lf -> f.txt`, `ld -> dir`, `dangling -> nowhere`,
+`eo -> ../out` (outside the repository):
+
+| input | git | sg before |
+|---|---|---|
+| untracked `lf`, `ld`, `dangling`, `status --porcelain [-uall]` | `?? dangling`, `?? ld`, `?? lf`; a dir symlink is ONE entry, never descended | nothing listed |
+| `add lf ld dangling` / `add .` / `add dir` (dir contains a link) | index `120000`, blob = readlink bytes | "symlink, skipping (unsupported in phase 2)" |
+| `add ld/a.txt`, `add ld/`, `add lf/`, `add eo/x` | `fatal: pathspec '...' is beyond a symbolic link`, nothing staged, no object written, all-or-nothing across args | `add eo/x` staged the OUTSIDE file's content |
+| tracked `dir/a.txt`, `dir` replaced by a symlink | ` D dir/a.txt` + `?? dir`; `add .` / `add dir` evict `dir/a.txt` | read through the link, reported clean |
+| committed links untouched / retargeted / replaced by a file | clean / ` M` / ` T` | ` D`, ` M` (hashed the target's content) |
+| `.gitignore` `ld/` vs dir symlink `ld` | not ignored (a symlink is not a directory) | not listed |
+| untracked dir holding only a link; ignored dir holding only a link; ignored link inside an untracked dir, `--ignored` | `?? nd/`; `!! ig/`; `?? mix/` + `!! mix/x.lnk` | nothing |
+| `git stash push` tree for file->link, link->file, exec-bit-only, dangling, retarget | the OBSERVED type and bytes (`120000` + link text; `100644` + file bytes; `100755`) | index mode + followed content |
+
+Implementation: one set of helpers in `workdir.h` (`sg_worktree_classify`,
+`sg_worktree_mode_from_stat`, `sg_worktree_readlink`,
+`sg_worktree_read_entry`, `sg_worktree_hash_entry`,
+`sg_worktree_ancestor_blocked`) used by every worktree read in
+`workdir/diff.c`, `cli/cmd_restore.c`, `safety/stash.c` and
+`workdir/tree_build.c`; `S_ISLNK` as a leaf in all four untracked walks
+in `workdir/status.c`; `sg add` stages 120000 with a pre-pass for the
+"beyond a symbolic link" refusal and `sg_index_remove_under` for the
+index D/F eviction. Rules: `docs/RULES-paths-strings.md` and
+`docs/RULES-status.md` (Phase 81b entries), `docs/RULES-duplication.md`
+(tree_build's probe).
+
+Decision taken by the main conversation: Phase 80's five `D` interop
+checks pinned the guarded-delete message ("cannot remove") for
+merge/switch/reset/cherry-pick through a symlinked ancestor. 81b's
+pre-flight now correctly reports that path as changed, so all five
+refuse earlier. They were re-pinned to the pre-flight refusal
+(`modified (unstaged): a/b/tracked.txt`), and the guarded delete kept an
+end-to-end witness through `switch --force` and `reset --hard --force`
+(which skip `sg_safe_apply_tree`'s confirmation) and `merge --abort`
+(B16, no dirty gate). Fresh `sg merge` (even `--force`) and `sg
+cherry-pick` refuse at `sg_require_clean_workdir`; git refuses the same
+cherry-pick with exit 128 "would be overwritten" (B17).
+
+Transitional, accepted until 81c: anything that WRITES a 120000 entry
+still produces a mode-000 regular file (e.g. the file `sg stash pop` or
+`sg reset --hard` restores).
+
+Gates (main conversation), one final run on the final code and tests, after
+B20: `gates.sh --rebuild --sanitize` -- make 0 warnings, make test 91/91,
+interop 5142 -> 5248 with 0 skipped, sanitize 0 errors; then
+`fuzz_ignore.py` and `fuzz_diff.py`, 200 rounds each, 0 mismatches.
+The oracle harness agreed on 9 of 72 cases before 81b and 48 of 72 after
+the first implementation round; every remaining case was classified as
+81c/81d scope, sg's exit-code/hint-line conventions, or a command-surface
+gap outside symlinks (`sg commit`'s summary line, `sg show <rev> --
+<path>`).
+
+Mutation battery (`tests/mutate.sh`, main conversation, per site):
+
+| mutation | result |
+|---|---|
+| ancestor-blocked check disabled (interop; unit) | RED, 8 interop checks incl. the re-pinned Phase 80 `D` rows; RED unit |
+| symlink mode 120000 -> 100644 in `sg_worktree_mode_from_stat` | RED, 23 |
+| exec bit dropped in the same helper | RED, 13 (incl. phase49 renmode) |
+| `sg_index_remove_under` boundary `P/` -> string prefix | RED unit, precisely; interop crash-shaped (668 reds) |
+| stash dirty gate fail-open for an unreadable path | RED, the new unit test only |
+| `sg add` pre-pass disabled | RED, exactly the two no-object checks |
+| `sg_worktree_readlink` `n < cap` -> `n <= cap` | RED, boundary lengths 257+ |
+| tree_build probe dispatch keyed on the index mode (interop; unit) | RED, B18/B19; RED unit |
+| tree_build chunk eligibility keyed on the index mode | RED, both chunk-enabled unit tests |
+| `S_ISLNK` removed from each status walk, per site | site 1 RED 3, site 4 RED 1; sites 2 (`dir_scan_flags`) and 3 (`collect_ignored_within`) GREEN at first -- B20 added, then RED 2 and RED 1 |
+| `S_ISLNK` removed from `sg add`'s walk / argv branch | RED 1 / RED 18 |
+
+Cold reads; what they found, and what the main conversation
+found checking the implementer's reports:
+- Round 1 (batch): stash dirty gate turned fail-open for an unreadable
+  path (fixed); the "porcelain-unreachable" claim about merge's delete
+  route overstated (fixed: B16, comment); `sg_index_remove_under`'s
+  boundary untested (fixed); long-target interop missing (fixed: B12,
+  lengths 255/256/257/511/512/513/1023); tree_build classify-then-read
+  race (fixed); `sg add` wrote earlier arguments' blobs before refusing
+  (fixed: pre-pass); missing real-symlink pins for `TT`, a staged symlink
+  rename and a not-paired file/link swap (fixed: B13-B15).
+- Main, on the round-1 fixes: B17 shipped two `sh -c "true"` checks and a
+  comment claiming a plain cherry-pick has no dirty gate (the implementer
+  had grepped for `sg_safe_apply_tree` only). Measured and rewritten.
+- Round 2: tree_build chose readlink/fopen from the index mode (both
+  directions reproduced by the main conversation; fixed, B18/B19 + unit
+  tests).
+- Main, on the round-2 fixes: B18's `symlink_to_file` case actually built
+  file->symlink, and the implementer's measurement table was wrong for
+  that row (git stores `100644` + the file's bytes). Renamed and a real
+  case added. The main conversation also edited `tests/interop.sh` while
+  a gate run was executing it; that run was discarded and rerun.
+- Round 3: the chunk-eligibility condition was never evaluated with
+  chunking on (fixed: two chunk-enabled unit tests); duplicated mode
+  formula (fixed: `sg_worktree_mode_from_stat`); stale comments and the
+  Phase 21 rule in `docs/RULES-duplication.md` (fixed).
+- Round 4: nothing to change.
+- Rounds 5-7 (B20 and this section): the fixture and the section's
+  numbers checked out; the remaining findings were wording fixes to this
+  section only, chiefly that its gates sentence had combined numbers from
+  separate earlier runs and now cites the single final run.
+
+Residuals (recorded, not fixed):
+1. Whether merge.c's own delete pass (`sg_merge_result_apply`) is still
+   reachable with a symlinked ancestor through `rebase --continue` or
+   `stash apply` is NOT measured; carried to 81d, which works in that code.
+2. tree_build's race-only reset of the entry mode after a path vanishes
+   between probe and read is black-box unobservable.
+3. The argv flag scan exists three times in `cli/cmd_add.c` (identical
+   semantics today).
+4. `sg stash apply`'s dirty gate now also compares mode, so an
+   exec-bit-only change counts as dirty.
+
+## Phase 81c: symlinks on the working-tree WRITE side
+
+Every worktree writer now creates a REAL symlink for a 120000 entry.
+Before this phase all six of them masked the mode with `& 0777`, so a
+symlink blob became a regular file with permissions 000 -- unreadable, and
+reported as modified forever.
+
+### What changed
+- `sg_write_file_worktree` dispatches on `mode & 0170000`; the six callers
+  (apply.c, merge.c x2, cmd_restore.c, stash.c x2) stopped masking. The
+  ancestor walk and final-component unlink Phase 80 added run BEFORE the
+  dispatch, so the "never write through a symlink" guarantee is untouched.
+- The three index stat refreshes became `lstat` (apply.c, merge.c's
+  `add_resolved_entry`, stash.c), and the cached size follows git's own
+  measured rule. See `docs/RULES-paths-strings.md`.
+- Two things found while auditing the call sites rather than asked for:
+  merge.c's conflict writer never set `content_missing` on a failed write
+  (a fail-open, fixed), and the same writer had to be stopped from turning
+  diff3 markers into a link target (`docs/RULES-merge.md`).
+
+### Oracle
+Measured against git 2.55.0 on macOS APFS before any code was written.
+`.git/p81-oracle/cases4.py` registers SIXTEEN side-by-side cases, c1-c16,
+raw output in `81c-oracle-1.txt`; c17 (the symlink <-> directory swap) and
+controls A/B/C were separate one-off scripts, now kept in
+`.git/p81-oracle/81c-measure/` with a README mapping each file to the row
+it measured -- they were throwaway scripts in a session-scoped /tmp, and a
+claim whose evidence has evaporated is not a measured claim. Interop's own
+case numbering later grew past that (c18 and c19 were added by a cold-read
+round, and c7/c8 exist only as recorded out-of-scope rows), so the
+harness's count and interop's are NOT the same number and neither should
+be quoted for the other. Switch, reset --hard, restore, stash push/pop,
+merge and cherry-pick all agree with git afterwards. Interop 5248 -> 5309,
+0 skipped; unit tests 91 -> 92 binaries (`tests/test_restore_symlink.c` is
+new -- `restore_worktree` had never had one).
+
+### Three measured corrections worth remembering
+1. **"git warns and continues" is true of `switch`, false of
+   `reset --hard`.** The implementer reported the spec's row as wrong; it
+   had measured a different command. Both readings were right about their
+   own command. Only the `switch` cell is a real divergence (#12); in the
+   `reset --hard` cell git and sg agree on disk state, HEAD and status,
+   differing only in exit code and wording.
+2. **A cold read recommended recording `st.st_size` for a symlink's cached
+   size.** Measured: that is precisely the value git avoids, because it
+   would let a stat-only reader call a NUL-truncated link clean. The fix
+   went the other way (git's own rule), and the reverse mutation c20 pins
+   it.
+3. **A 1401-byte symlink target only fails on macOS.** Linux's cap is
+   ~4096, so six checks would have gone red on the three ubuntu CI cells
+   while staying green locally. Fixed with a 5000-byte target AND a
+   runtime probe, not just a bigger number.
+
+### Verification
+Three cold-read rounds (1296 lines, then 318, then 123), each on the tail
+produced after the previous one. Round 1 found the platform assumption,
+the cached-size rule and the conflict-marker symlink; round 2 found that
+the first version of the `c1 index` check captured its fixture long after
+a later step had switched it back to a branch with no symlinks in it, so
+it compared two plain files and could never have gone red for the rule it
+named -- the project's own "a check that verifies nothing" failure mode,
+invisible to every gate.
+The mutation battery is `.git/p81-oracle/mut81c.py`'s `M` list, one entry
+per site AND target -- a few sites appear twice, once aimed at interop and
+once at a unit binary, so entries outnumber sites -- each with its log
+under `mut81c/`. Every entry but one names the
+checks that catch it; the single genuine green is the conflict-writer
+fail-open, which no fixture can reach -- recorded rather than faked. **The
+count is deliberately not written here**: this phase's own docs round added
+`c21` to that list and made a "17-mutation battery" sentence stale in the
+same breath, which is the exact failure this project keeps rediscovering.
+Read the list. Two process notes: five interop mutations in the first run
+TIMED OUT under parallelism 3 (interop alone takes ~220s against a 300s
+default), and mutate.sh counts a timeout as "caught", which is not evidence
+about any named check; and the missing-NUL-terminator mutation is green
+under plain `make test` and red only under `make sanitize`, where the
+sanitizer's allocator changes what follows the buffer.
+
+### Residuals
+1. The index stat-fill block is copied three times (apply.c, merge.c,
+   stash.c) -- identical field-by-field assignments plus the shared size
+   rule. It predates this phase; converging it into one helper is a
+   separate change.
+2. merge.c's conflict writer writing markers into a regular file is a
+   placeholder for 81d, which has git's measured answer waiting
+   (git keeps OURS' link and does not merge symlink content at all).
+3. `sg stash pop` zeroes the cached size of every entry, not just the one
+   it rewrote (pre-existing, pinned in `phase81c c11 index`).
+4. `sg switch`/`cherry-pick`/`rebase`/`revert` still lack the untracked
+   pre-flight `sg merge` has (Phase 79 residual 1, unchanged here), and
+   the "automatic snapshot failed" answer for a directory sitting at a
+   tracked path is pre-existing for regular files too (control A).

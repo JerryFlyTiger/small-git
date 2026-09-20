@@ -12,6 +12,12 @@ typedef enum {
     SG_STATUS_NEW,
     SG_STATUS_MODIFIED,
     SG_STATUS_DELETED,
+    /* Phase 81a: both sides present but the file TYPE differs (see
+       sg_diff_entry_is_typechange in sg/diff.h). Measured against git
+       2.55.0: `sg status`'s long format prints "typechange:", porcelain
+       prints 'T'. Never set for a rename row (old_path != NULL): a
+       typechange row is never paired with a rename, see sg/diff.h's note. */
+    SG_STATUS_TYPECHANGE,
 } sg_status_kind;
 
 typedef struct {

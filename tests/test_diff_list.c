@@ -1317,51 +1317,66 @@ static void test_tree_workdir_unreadable_blob_does_not_silence_others(void)
     free(git_dir);
 }
 
-/* workdir_entry_mode's S_ISLNK guard (diff.c): a tracked path that is
-   actually a symlink on disk must be reported as mode 100644, never 100755,
-   regardless of the symlink's OWN permission bits -- which on both Linux and
-   macOS are conventionally lrwxrwxrwx (all exec bits set) no matter what the
-   *target* file's permissions are. Without the guard, workdir_entry_mode
-   would read the symlink's own S_IXUSR bit (always set) via lstat and
-   compute 100755, a mode this codebase never intends to produce for a
-   symlink (120000 is out of scope this round -- see sg/diff.h). This is the
-   codebase's ACTUAL current behavior, confirmed by this test, not merely the
-   author's expectation: it is what makes the row below stay absent from the
-   diff list even though the symlink's own mode bits look executable. */
+/* Phase 81b: sg_worktree_classify's S_ISLNK case reports a tracked path
+   that is actually a symlink on disk as mode 120000 with the readlink
+   target as its content -- never 100755 (the symlink's OWN permission bits,
+   conventionally lrwxrwxrwx on both Linux and macOS regardless of what the
+   *target* file's permissions are), and never the TARGET's content (the
+   pre-81b behavior, when sg_hash_file_blob's fopen() followed the link).
+   This is the codebase's ACTUAL current behavior, confirmed by this test,
+   not merely the author's expectation. */
 static void test_symlink_guard_reports_fixed_mode(void)
 {
     char *git_dir = make_tmp_repo();
     char *repo_root = sg_repo_root(git_dir);
-    unsigned char id[SG_SHA1_RAW_LEN];
-    char target_abspath[4096];
+    unsigned char target_id[SG_SHA1_RAW_LEN];
+    unsigned char link_id[SG_SHA1_RAW_LEN];
     char link_abspath[4096];
     sg_index idx;
     sg_diff_list list;
 
-    blob(git_dir, "target content\n", id);
+    blob(git_dir, "target content\n", target_id);
     write_workdir_file(repo_root, "target.txt", "target content\n");
 
-    snprintf(target_abspath, sizeof(target_abspath), "%s/target.txt", repo_root);
     snprintf(link_abspath, sizeof(link_abspath), "%s/link.txt", repo_root);
     CHECK(symlink("target.txt", link_abspath) == 0, "symlink() failed");
-    (void)target_abspath;
 
-    /* link.txt is tracked at mode 100644 with the SAME content id as the
-       symlink's target -- sg_hash_file_blob follows the symlink via fopen(),
-       so its computed content matches. If workdir_entry_mode reported
-       100755 for this path (the mutated, guard-less behavior), the mode
-       mismatch alone would put link.txt in the list even though its content
-       is unchanged. */
+    /* link.txt is tracked at mode 120000 with the readlink TARGET TEXT as
+       its blob content ("target.txt", not "target content\n") -- the same
+       fixed value sg_worktree_classify/sg_worktree_hash_entry compute for
+       this path, regardless of the symlink's own always-executable
+       permission bits or of what its target file contains. */
+    blob(git_dir, "target.txt", link_id);
     memset(&idx, 0, sizeof(idx));
-    index_upsert_blob(&idx, "link.txt", 0100644, id);
+    index_upsert_blob(&idx, "link.txt", 0120000, link_id);
 
     CHECK(sg_diff_index_workdir(git_dir, repo_root, &idx, &list) == 0,
          "sg_diff_index_workdir failed");
     CHECK(list.count == 0,
-         "a tracked symlink whose target content is unchanged must not appear in the diff list "
-         "(got %zu rows) -- workdir_entry_mode must report 100644 for a symlink, not its own "
-         "(always-executable) permission bits",
+         "a tracked symlink whose target text is unchanged must not appear in the diff list "
+         "(got %zu rows) -- sg_worktree_classify must report 120000 + the readlink target for a "
+         "symlink, not the target FILE's content or the symlink's own executable mode bits",
          list.count);
+
+    sg_diff_list_free(&list);
+    sg_index_free(&idx);
+
+    /* Control: tracking the SAME path as an ordinary 100644 blob (the
+       target file's content, as a pre-81b index entry would) while the
+       worktree still holds the symlink is a genuine typechange and MUST
+       appear -- proving the empty list above comes from a real match, not
+       from the row being silently swallowed for some other reason. */
+    memset(&idx, 0, sizeof(idx));
+    index_upsert_blob(&idx, "link.txt", 0100644, target_id);
+    CHECK(sg_diff_index_workdir(git_dir, repo_root, &idx, &list) == 0,
+         "sg_diff_index_workdir failed");
+    CHECK(list.count == 1, "a 100644-tracked path that is actually a symlink on disk must appear "
+                           "as a typechange (got %zu rows)",
+         list.count);
+    if (list.count == 1) {
+        CHECK(list.entries[0].new_side.mode == 0120000, "expected new mode 120000, got %o",
+             list.entries[0].new_side.mode);
+    }
 
     sg_diff_list_free(&list);
     sg_index_free(&idx);

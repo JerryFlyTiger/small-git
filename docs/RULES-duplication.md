@@ -41,9 +41,23 @@ do not read the whole thing).
   `sg stash push`** (it also calls `sg_snapshot_create` itself). Also, "the
   file exists but cannot be read" is **a hard failure under both policies**,
   so `sg_snapshot_create`'s contract is "resolve it or reject the snapshot",
-  not "always resolves"; the classifying `lstat` **must come after
-  `sg_read_file` fails**, doing the probe up front would turn a benign race
-  into a hard failure (rationale in Phase 21 of `docs/DESIGN.md`). The loop
+  not "always resolves". Phase 81b round 2/3: the ON-DISK type (never the
+  index's) decides both which read to attempt (readlink vs `sg_read_file`)
+  and the mode recorded in the tree, via a single `lstat` PROBE before the
+  read (`sg_worktree_mode_from_stat`, `include/sg/workdir.h`, shared with
+  `sg_worktree_classify` so the mode formula has one definition, not two).
+  If the matching read then fails anyway (the file vanished between the
+  probe and the read, or a genuine permission error), a SECOND `lstat`
+  classifies the failure: "no such path" (ENOENT/ENOTDIR) is an ordinary
+  deletion under either `sg_workdir_missing` policy, anything else present
+  or a different errno is a hard failure -- this is what keeps a benign
+  probe-to-read race from becoming a hard failure, one level down from
+  where the pre-Phase-81b, single-type version put it (that version had no
+  probe at all, calling `sg_read_file` directly and classifying only on
+  failure; a probe became unavoidable once deciding readlink-vs-fopen
+  needed the on-disk type up front; original single-type rationale still in
+  Phase 21 of `docs/DESIGN.md`; the probe's reasons are in its Phase 81b
+  section). The loop
   shared by merge/rebase/stash that "lands `sg_merge_result` onto the
   working directory + index" has also been extracted into
   `sg_merge_result_apply` (`include/sg/merge.h`). **Since Phase 20 it skips

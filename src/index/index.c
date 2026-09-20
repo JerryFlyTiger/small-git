@@ -522,6 +522,37 @@ int sg_index_remove_all_stages(sg_index *index, const char *path)
     return (int)n;
 }
 
+int sg_index_remove_under(sg_index *index, const char *dir)
+{
+    size_t dir_len = strlen(dir);
+    size_t write = 0;
+    size_t read;
+    int removed = 0;
+
+    if (dir_len == 0)
+        return 0; /* no repo-relative path is ever "" or starts with '/' */
+
+    for (read = 0; read < index->count; read++) {
+        const char *p = index->entries[read].path;
+        int under = strncmp(p, dir, dir_len) == 0 && p[dir_len] == '/';
+
+        if (under) {
+            free(index->entries[read].path);
+            removed++;
+            continue;
+        }
+        if (write != read)
+            index->entries[write] = index->entries[read];
+        write++;
+    }
+    index->count = write;
+    if (index->count == 0) {
+        free(index->entries);
+        index->entries = NULL;
+    }
+    return removed;
+}
+
 int sg_index_has_unmerged(const sg_index *index)
 {
     size_t i;

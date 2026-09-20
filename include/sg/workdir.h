@@ -2,6 +2,7 @@
 #define SG_WORKDIR_H
 
 #include <stddef.h>
+#include <sys/stat.h>
 
 #include "sg/hash.h"
 
@@ -73,11 +74,20 @@ int sg_write_file_mkdirs(const char *path, const unsigned char *data, size_t len
    refused, not followed) and chmod'd to mode. A directory sitting at the
    final component is a failure (-1) unless a caller already removed it.
 
-   Symlink (mode 120000) blob content is unaffected: sg does not check out
-   symlinks at all (a separate, future phase), so this function never
-   receives one.
+   Phase 81c: mode's type bits (mode & 0170000) decide the write shape, not
+   just its permission bits. 0120000 creates a REAL symlink whose target is
+   data/len verbatim (an embedded NUL truncates it exactly like a C string
+   would, matching git's own observed behavior for a hand-built 120000 blob
+   with a NUL inside it -- ORACLE.md c9); anything else takes the regular-
+   file path below. A symlink is never chmod'd afterward -- chmod() follows
+   a symlink and would change the TARGET's permissions instead of the
+   link's own.
 
-   Returns 0 on success, -1 on any failure. */
+   Returns 0 on success, -1 on any failure (including symlink() itself
+   failing, e.g. a target too long for the platform -- this project has no
+   "continue a partly applied checkout" machinery, so that failure aborts
+   the whole caller like any other write failure, deliberate divergence
+   #12 from git's own "warn on stderr and continue" answer). */
 int sg_write_file_worktree(const char *repo_root, const char *relpath,
                           const unsigned char *data, size_t len, int mode);
 
@@ -106,6 +116,96 @@ int sg_remove_file_worktree(const char *repo_root, const char *relpath);
 /* Non-zero if path exists and is a symlink (checked with lstat, so it isn't
    followed). */
 int sg_is_symlink(const char *path);
+
+/* Phase 81b: the worktree READ side's shared classification of what lstat
+   finds at a repo-relative path, mirroring the tree/index mode space
+   (100644/100755/120000) instead of collapsing a symlink into 100644 the
+   way the pre-81b sg_diff.c workdir_entry_mode did. */
+typedef enum {
+    SG_WT_ABSENT = 0,  /* missing, or blocked by a non-directory ancestor */
+    SG_WT_REGULAR,     /* S_ISREG -- mode_out is 100644 or 100755 */
+    SG_WT_SYMLINK,     /* S_ISLNK -- mode_out is 120000 */
+    SG_WT_OTHER        /* directory, fifo, socket, device, ... -- not a blob */
+} sg_wt_kind;
+
+/* Non-zero if a proper ancestor component of repo_root/relpath (strictly
+   below repo_root) EXISTS but is not a real directory -- a symlink, a
+   regular file, or any other non-directory blocker. This is the case a
+   plain lstat()/stat() of the full path cannot detect on its own: when the
+   blocking ancestor is a symlink to a real directory, ordinary path
+   resolution silently follows it and reads through to whatever is really
+   there (measured against git 2.55.0: git treats the tracked path as gone
+   instead -- ORACLE.md X01-X03). A MISSING ancestor is not reported here
+   (returns 0): a plain lstat of the full path already fails with ENOENT in
+   that case, with no special handling needed. Shares the walk with
+   sg_write_file_worktree/sg_remove_file_worktree (walk_worktree_ancestors in
+   workdir.c, per docs/RULES-duplication.md); never creates or removes
+   anything. relpath == "" (the repo root itself) is never blocked. */
+int sg_worktree_ancestor_blocked(const char *repo_root, const char *relpath);
+
+/* The tree/index mode formula for an already-lstat'd entry: S_ISREG ->
+   100644/100755 (by the exec bit), S_ISLNK -> 120000, anything else ->
+   SG_WT_OTHER with *mode_out left untouched. Factored out of
+   sg_worktree_classify (docs/RULES-duplication.md) so a caller that must
+   lstat the path itself first -- tree_build.c's sg_tree_build_from_workdir,
+   which needs a single probe to decide BOTH which read to attempt and the
+   mode to record, and cannot afford sg_worktree_classify's own internal
+   lstat as a second, separate probe -- shares this exact formula instead of
+   re-deriving it. */
+sg_wt_kind sg_worktree_mode_from_stat(const struct stat *st, unsigned int *mode_out);
+
+/* Classifies repo_root/relpath with lstat (never following a symlink),
+   after first checking sg_worktree_ancestor_blocked -- a blocked ancestor
+   makes the whole path SG_WT_ABSENT regardless of what lstat itself would
+   say. For SG_WT_REGULAR/SG_WT_SYMLINK, *mode_out is set (100644/100755, or
+   120000); left untouched otherwise. Does not read any content. */
+sg_wt_kind sg_worktree_classify(const char *repo_root, const char *relpath,
+                                unsigned int *mode_out);
+
+/* readlink() with a buffer that grows until the target fits (never
+   truncated, unlike a fixed PATH_MAX-sized buffer). abspath is an already-
+   joined absolute path, never following a symlink itself (this IS the
+   readlink). *data is malloc'd on success (caller frees). Returns 0 on
+   success, -1 on failure (not a symlink, permission denied, ...). Exposed
+   directly (not only via sg_worktree_read_entry below) for callers that
+   need to attempt a symlink-specific read WITHOUT a preceding lstat --
+   sg_tree_build_from_workdir is the one that needs this, to avoid turning
+   an ordinary "file existed when probed, gone by the time of the read" race
+   into a hard failure; see its own comment. */
+int sg_worktree_readlink(const char *abspath, unsigned char **data, size_t *len_out);
+
+/* Combines sg_worktree_classify with a content read: SG_WT_REGULAR reads the
+   file's bytes, SG_WT_SYMLINK readlink()s it with a buffer that grows as
+   needed (so a target longer than SG_PATH_MAX is read in full, never
+   truncated -- this never routes through storage/chunk.c, a symlink target
+   is always tiny). *data is malloc'd on success (caller frees) and *len_out
+   is set; both are left as NULL/0 otherwise. "Exists but unreadable"
+   (permission denied, a race with a delete, ...) is folded into
+   SG_WT_ABSENT, matching sg_hash_file_blob's existing convention. Returns
+   the classification actually achieved: SG_WT_REGULAR/SG_WT_SYMLINK only
+   when *data was populated. */
+sg_wt_kind sg_worktree_read_entry(const char *repo_root, const char *relpath,
+                                  unsigned int *mode_out,
+                                  unsigned char **data, size_t *len_out);
+
+/* Like sg_hash_file_blob, but symlink-aware and ancestor-blocked-aware: the
+   single worktree hashing primitive that replaces the
+   workdir_entry_mode()+sg_hash_file_blob() pair at every worktree diff/
+   status/restore/stash call site (docs/RULES-duplication.md -- one helper,
+   not N copies of the stat+hash pair). Returns 0 and sets *mode_out/
+   sha1_out on a regular file or symlink, -1 (leaving both untouched)
+   otherwise -- absent, blocked, another type, or unreadable. */
+int sg_worktree_hash_entry(const char *repo_root, const char *relpath,
+                           unsigned int *mode_out,
+                           unsigned char sha1_out[SG_SHA1_RAW_LEN]);
+
+/* Like sg_read_file, but symlink-aware and ancestor-blocked-aware: used by
+   sg_diff_side_read for an SG_DIFF_SIDE_WORKDIR side, so a patch against a
+   worktree symlink diffs its target text instead of failing to open() it.
+   Returns 0 and sets *data and *len_out on a regular file or symlink, -1
+   otherwise (same collapsing convention as sg_worktree_hash_entry). */
+int sg_worktree_read_blob(const char *repo_root, const char *relpath,
+                          unsigned char **data, size_t *len_out);
 
 /* Joins base and rel as "base/rel" into out, or copies whichever side is
    non-empty when the other is NULL/"". Returns 0, or -1 if the result does

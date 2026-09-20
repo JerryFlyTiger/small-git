@@ -375,73 +375,150 @@ int sg_tree_build_from_workdir(const char *git_dir, const char *repo_root, const
             continue;
         }
 
-        /* A truncated path must hard-fail here, before sg_read_file ever
-           runs: a truncated buffer usually still names some real,
-           unrelated path higher up the tree, and if sg_read_file happened
-           to fail against THAT path (e.g. it doesn't exist), this loop's
-           existing "gone or unreadable" fallback below would silently
-           record the entry as deleted from the working tree using the
-           index's own blob -- the exact silent-data-loss shape this
-           function must never produce. */
+        /* A truncated path must hard-fail here, before any classification
+           or read ever runs: a truncated buffer usually still names some
+           real, unrelated path higher up the tree, and letting
+           sg_worktree_classify/sg_worktree_read_entry silently redo (and
+           fail) the same join internally would fall through to this loop's
+           "gone" fallback below and silently record the entry as deleted
+           from the working tree using the index's own blob -- the exact
+           silent-data-loss shape this function must never produce. abspath
+           itself is otherwise unused: every actual worktree access below
+           goes through repo_root + idx->entries[i].path instead. */
         if (sg_path_join(abspath, sizeof(abspath), repo_root, idx->entries[i].path) != 0)
             goto out_free_entries;
-        if (sg_read_file(abspath, &content, &content_len) == 0) {
-            int write_ok;
 
-            if (chunk_enabled) {
-                int chunked;
+        /* Round 2 fix (item 1): the tree recorded here must reflect the
+           ON-DISK type/mode, not the index's, exactly like real git's own
+           stash/snapshot tree does (measured: `git stash push` on a
+           file->symlink swap records 120000 in the STASH's own tree even
+           though the index -- stash@{0}^2 -- still says 100644; likewise a
+           bare chmod +x on a tracked 100644 file is recorded as 100755).
+           entry_mode defaults to the index's own mode, and is the value
+           used whenever the working tree is not actually consulted (a
+           blocked ancestor, a pathspec miss above, or the KEEP_INDEX_BLOB
+           fallback below) -- only a SUCCESSFUL worktree read overrides it
+           with the OBSERVED mode. */
+        unsigned int entry_mode = idx->entries[i].mode;
 
-                write_ok = sg_chunk_store_blob(git_dir, content, content_len, chunk_threshold,
-                                              blob_id, &chunked) == 0;
-            } else {
-                write_ok = sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, blob_id) == 0;
+        /* Item 4: an ancestor beyond a symlink (or any other non-directory)
+           makes this path "gone" for read purposes, exactly like a missing
+           file -- this is a STRUCTURAL fact about the fixture (an ancestor
+           component's type), not something that changes between two
+           syscalls a moment apart, so checking it here, before the
+           race-sensitive read attempt below, does not reintroduce the race
+           that attempt is designed to avoid (see the comment above it). */
+        if (sg_worktree_ancestor_blocked(repo_root, idx->entries[i].path)) {
+            if (missing == SG_WORKDIR_MISSING_RECORD_DELETION)
+                continue;
+            memcpy(blob_id, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
+        } else {
+            /* Round 2 fix (item 1, regression from round 1): round 1 chose
+               readlink-vs-fopen from the INDEX's mode, not the ON-DISK
+               type -- wrong in both directions (measured by the main
+               conversation): index 120000 but the worktree is now a plain
+               file makes readlink() fail EINVAL even though the file is
+               perfectly readable via fopen, hard-failing the whole
+               build/stash/snapshot; index 100644 but the worktree is now a
+               symlink to a readable tracked file makes fopen() follow the
+               link and hash the TARGET's content, exactly the pre-Phase-81b
+               bug this phase exists to fix.
+
+               Fixed by a single lstat PROBE of the actual on-disk entry,
+               deciding both which read to attempt AND the mode to record
+               from what is REALLY there -- never from the index. This adds
+               one syscall the pre-81b single-type code did not have in its
+               happy path (it called sg_read_file directly, no probe), but
+               is what "decide by a single probe" requires once two
+               different read functions exist to choose between; the race
+               tolerance the pre-81b ordering protected is preserved
+               one level down instead: a read failure AFTER a successful
+               probe (the file vanished, or is a race-y readlink) still
+               falls through to the SAME lstat-after-failure classification
+               below as before, so "existed at the probe, gone by the read"
+               is still an ordinary deletion, not a hard failure -- only
+               "still there and still unreadable" (or a real, non-ENOENT
+               error) is fatal, exactly as it always was. */
+            struct stat probe_st;
+            int rc_read = -1;
+
+            if (lstat(abspath, &probe_st) == 0) {
+                /* sg_worktree_mode_from_stat (workdir.h) is the SAME mode
+                   formula sg_worktree_classify uses -- shared rather than
+                   re-derived here, since this probe cannot use
+                   sg_worktree_classify itself (that would lstat a SECOND
+                   time, reintroducing exactly the extra probe this
+                   function's single-lstat design avoids). */
+                sg_wt_kind probe_kind = sg_worktree_mode_from_stat(&probe_st, &entry_mode);
+
+                if (probe_kind == SG_WT_SYMLINK)
+                    rc_read = sg_worktree_readlink(abspath, &content, &content_len);
+                else if (probe_kind == SG_WT_REGULAR)
+                    rc_read = sg_read_file(abspath, &content, &content_len);
+                /* Any other on-disk type (directory, fifo, ...) leaves
+                   rc_read at -1 with no read attempted at all -- the
+                   fallback lstat below will find it still there and hard
+                   fail, matching the pre-81b "lstat succeeded on a
+                   non-regular type" rule. */
             }
 
-            free(content);
-            if (!write_ok)
-                goto out_free_entries;
-        } else {
-            /* sg_read_file failed. Classify with lstat, AFTER the read
-               attempt and never before it: sg_read_file's own errno is not
-               usable here (workdir.c: the failure path runs free()/fclose()
-               first, and malloc failure shares the same return -1 as an
-               I/O error on the file itself), so lstat is the only signal
-               available, and it must be a second, separate syscall rather
-               than a probe run ahead of the read.
+            if (rc_read == 0) {
+                int write_ok;
 
-               Classifying after the read (not before) matters because the
-               common race is "existed when probed, gone by the time we
-               tried to read it" -- probing first would turn that ordinary
-               race into a hard failure of the whole snapshot/stash. Doing
-               the lstat second means the only race that can still fool us
-               is the rare opposite direction (absent when probed, present
-               and unreadable by the time we lstat), which is exactly the
-               direction that is safe to hard-fail on.
+                /* Item 1: a symlink's target text never goes through
+                   content-defined chunking -- only a REGULAR file's bytes
+                   are eligible. */
+                if (entry_mode != 0120000 && chunk_enabled) {
+                    int chunked;
 
-               lstat (not stat) matches the existence test stash.c's dirty
-               gate already uses for the same path, so both agree.
+                    write_ok = sg_chunk_store_blob(git_dir, content, content_len, chunk_threshold,
+                                                   blob_id, &chunked) == 0;
+                } else {
+                    write_ok =
+                        sg_loose_write(git_dir, SG_OBJ_BLOB, content, content_len, blob_id) == 0;
+                }
+                free(content);
+                content = NULL;
+                if (!write_ok)
+                    goto out_free_entries;
+            } else {
+                /* The probe found nothing to read (rc_read still -1: no
+                   entry, or a type neither branch above handles), or the
+                   matching read attempt itself failed. Classify with a
+                   SECOND lstat -- the common race this whole two-lstat
+                   shape exists to tolerate is "existed at the first probe,
+                   gone by the time of the read"; the only race this
+                   ordering can still be fooled by is the rare opposite
+                   direction (absent at the probe, present and unreadable
+                   by the time of this second lstat), which is exactly the
+                   direction that is safe to hard-fail on.
 
-               If lstat finds something there, or fails for a reason other
-               than "no such path", something IS there and unreadable:
-               that is always a hard failure regardless of policy, under
-               both KEEP_INDEX_BLOB and RECORD_DELETION. Recording the
-               index's stale blob for a file that exists-but-can't-be-read
-               would produce a "snapshot" that silently omits or
-               misrepresents that file's real content -- worse than no
-               snapshot at all. */
-            struct stat st;
+                   If this lstat finds something there, or fails for a
+                   reason other than "no such path", something IS there and
+                   unreadable: always a hard failure regardless of policy,
+                   under both KEEP_INDEX_BLOB and RECORD_DELETION.
+                   Recording the index's stale blob for a file that
+                   exists-but-can't-be-read would produce a "snapshot" that
+                   silently omits or misrepresents that file's real content
+                   -- worse than no snapshot at all. entry_mode is reset to
+                   the index's own mode here: any observed on-disk mode
+                   from a since-invalidated probe must not survive into the
+                   KEEP_INDEX_BLOB fallback below. */
+                struct stat st;
 
-            if (lstat(abspath, &st) == 0 || (errno != ENOENT && errno != ENOTDIR))
-                goto out_free_entries;
-            if (missing == SG_WORKDIR_MISSING_RECORD_DELETION)
-                continue; /* omitted: the resulting tree records the deletion */
-            /* KEEP_INDEX_BLOB: fall back to the blob the index already
-               recorded, so this entry still resolves. */
-            memcpy(blob_id, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
+                if (lstat(abspath, &st) == 0 || (errno != ENOENT && errno != ENOTDIR))
+                    goto out_free_entries;
+                entry_mode = idx->entries[i].mode;
+                if (missing == SG_WORKDIR_MISSING_RECORD_DELETION)
+                    continue; /* omitted: the resulting tree records the deletion */
+                /* KEEP_INDEX_BLOB: fall back to the blob the index already
+                   recorded, so this entry still resolves. */
+                memcpy(blob_id, idx->entries[i].sha1, SG_SHA1_RAW_LEN);
+            }
         }
 
         entries[entry_count].path = idx->entries[i].path; /* transient view, not owned */
-        entries[entry_count].mode = idx->entries[i].mode;
+        entries[entry_count].mode = entry_mode;
         memcpy(entries[entry_count].sha1, blob_id, SG_SHA1_RAW_LEN);
         entry_count++;
     }
@@ -486,8 +563,8 @@ int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, con
         unsigned char *content = NULL;
         size_t content_len = 0;
         unsigned char blob_id[SG_SHA1_RAW_LEN];
-        struct stat st;
         unsigned int mode = 0100644;
+        sg_wt_kind kind;
 
         /* sg_status_list_untracked only emits a path after collect_untracked
            has already joined repo_root with it into a buffer this same size
@@ -496,16 +573,22 @@ int sg_tree_build_from_untracked(const char *git_dir, const char *repo_root, con
            another module and recorded nowhere near this line: if that
            enumerator ever gains a second source of paths, the failure here
            would be silent and would hash some unrelated file's content into
-           this path's blob. */
+           this path's blob. abspath is otherwise unused -- every actual
+           access below goes through repo_root + paths[i]. */
         if (sg_path_join(abspath, sizeof(abspath), repo_root, paths[i]) != 0)
             goto out_free_entries;
-        if (stat(abspath, &st) == 0 && (st.st_mode & 0111))
-            mode = 0100755;
 
-        if (sg_read_file(abspath, &content, &content_len) != 0)
+        /* Phase 81b: sg_worktree_read_entry replaces stat()+sg_read_file --
+           an untracked symlink (now listed by sg_status_list_untracked,
+           status.c's four traversal copies) reads as its own 120000 blob
+           (readlink target) instead of being followed by fopen. Item 1: its
+           bytes never go through content-defined chunking below, only a
+           REGULAR file's do. */
+        kind = sg_worktree_read_entry(repo_root, paths[i], &mode, &content, &content_len);
+        if (kind != SG_WT_REGULAR && kind != SG_WT_SYMLINK)
             goto out_free_entries;
 
-        if (chunk_enabled) {
+        if (kind == SG_WT_REGULAR && chunk_enabled) {
             int chunked;
 
             if (sg_chunk_store_blob(git_dir, content, content_len, chunk_threshold, blob_id,

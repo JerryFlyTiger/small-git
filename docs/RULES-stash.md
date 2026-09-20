@@ -121,3 +121,25 @@ failure messages use `sg_ref_lock_err_report(stderr, NULL)` (see
 `docs/RULES-refs-revparse.md`'s Phase 77 entry) to get git's own "cannot
 lock ref 'refs/stash': ..." wording when the failure is a lock collision,
 falling back to the pre-existing generic message otherwise.
+
+## Phase 81c: which stash path actually writes the working tree
+
+`restore_matched_paths` is reached ONLY by a partial `sg stash push --
+<pathspec>`. A plain `stash push` goes through `sg_apply_tree_to_workdir`
+(apply.c) and `stash pop`/`apply` go through `sg_merge_result_apply`
+(merge.c). Phase 81c changed all three, but every stash fixture in the
+project drove the plain push/pop pair, so `restore_matched_paths`'s mode
+handling and its `lstat` had **zero coverage** and two mutations against
+them stayed green. Interop `phase81c c18` is the fixture that reaches it;
+if you touch that function, that is the row that guards you.
+
+**Pre-existing divergence, pinned but NOT fixed by Phase 81c**: after
+`stash pop`, real git keeps a real cached size for every entry the stash
+never touched and zeroes only the path it rewrote, while sg zeroes the
+cached size for ALL of them. sg's answer is safe -- a zero forces the next
+reader to compare content, so nothing is ever wrongly called clean -- it
+is merely slower. Pinned on both sides in interop's `phase81c c11 index`
+rows so a future change to either side fails by name. It predates the
+symlink work and was only made visible by adding an index-bytes oracle;
+see `docs/RULES-paths-strings.md`'s Phase 81c entry for the size rule
+itself.

@@ -163,3 +163,36 @@ do not read the whole thing).
   combinations** (`unmerged_label` in `cmd_status.c`), shared by the long
   format and porcelain. The long format's label column width is **17**, the
   staged/unstaged section is **12**, they differ, do not conflate them.
+- **Phase 81a: `SG_STATUS_TYPECHANGE` is `T` in porcelain/short and
+  `typechange: ` in the long format** (11 bytes + one space, the same
+  12-column width as `modified:   `). Both producers in `workdir/status.c`
+  decide it through the one shared predicate `sg_diff_entry_is_typechange`
+  (`diff.h`); see `docs/RULES-diff.md`'s Phase 81a entry for its contract.
+  WARNING: **`p38_skel` (interop) drops every TAB-indented line, and every
+  long-format ENTRY line is TAB-indented** -- so a `p38_cmp`/`p38_cmp_named`
+  check compares section headers and closing lines only, never an entry's
+  label, padding or path. Measured: removing the trailing space from
+  `"typechange: "` stayed green against all three Phase 81a long checks.
+  Phase 81a added `p81a_entries`, a byte-for-byte compare of the
+  TAB-indented lines, for its own three fixtures only. **This blindness is
+  by design, not an accident**: the comment above `p38_skel` delegates path
+  lines to separate groups' own strip-tab compares (it names Phase 23,
+  Phase 25 and Phase 32), so an entry line is byte-checked only where some
+  group built a fixture containing that entry and wrote its own compare --
+  the 34 `p38_cmp` cases check none of their own entry lines (recorded, not
+  changed). A new long-status check that needs the entry text must add its
+  own entry-line compare -- the existing `sed -n 's/^\t//p'` compares in
+  those groups and `p81a_entries` are the templates -- and must not rely on
+  `p38_cmp_named`.
+- **Phase 81b: all four untracked-traversal loops in `workdir/status.c`**
+  (`collect_untracked`, `dir_scan_flags`, `collect_ignored_within`,
+  `collect_untracked_folded`) treat `S_ISLNK` as a non-directory leaf:
+  listed, never descended, ignore-matched with `is_dir = 0` (measured: a
+  `ld/` pattern does NOT ignore a directory symlink `ld`; `ld` does).
+  WARNING: **each copy needs its own fixture.** The first Phase 81b
+  interop group covered only two of the four: removing `S_ISLNK` from
+  `dir_scan_flags` (folding) or from `collect_ignored_within` stayed
+  5243/5243 green. `collect_ignored_within` is reached ONLY for an ignored
+  entry inside a folded untracked directory (`?? mix/` + `!! mix/x.lnk`);
+  interop `phase81b B20` pins all four, and a per-site mutation of each
+  copy now goes red.

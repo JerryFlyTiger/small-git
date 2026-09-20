@@ -531,3 +531,51 @@ delete-side entry) and the same escalation-on-failure discipline: a failed
 delete sets `content_missing = 1` and prints `sg: cannot remove "<p>"`,
 aborting the whole apply rather than being silently swallowed the way a
 bare `remove()` failure used to be here.
+
+## Phase 81c: conflict content is never a symlink target
+
+`sg_merge_result_apply`'s conflict writer downgrades a `0120000` mode to
+`0100644` before writing. The reason is mechanical: `conflict_content` is
+diff3 MARKER TEXT. Until Phase 81c the `& 0777` mask collapsed a symlink
+side's mode to 0, so the markers landed as an unreadable regular file;
+passing the full mode through (which Phase 81c had to do everywhere else)
+would instead hand that whole marker block to `symlink()` AS THE TARGET.
+Reproduced before the guard existed: a real, dangling link literally named
+`<<<<<<< master\nc.txt\n=======\nb.txt\n>>>>>>> side\n`, which the user
+cannot open, edit or resolve.
+
+**Measured, git 2.55.0** (base/ours/theirs all 120000, all different
+targets): git does NOT merge symlink content at all. It prints
+`CONFLICT (content): Merge conflict in <p>`, records all three stages as
+120000, leaves OURS' link in the working tree, and `status` shows `UU`.
+sg records the identical three stages (byte-compared in interop) but keeps
+the markers-in-a-regular-file SHAPE, because reproducing git's answer is
+merge semantics and belongs to the symlink merge phase (81d, ORACLE.md
+X40/X41). **This is a deliberate placeholder, not the target behaviour**:
+when 81d converges it onto git's answer, this downgrade goes away with it.
+Pinned on both sides in interop's `phase81c F3` rows. Both mutations were
+actually run, and their logs are under `.git/p81-oracle/mut81c/`: `c03`
+(restoring the `& 0777` mask) reds one F3 row, `c21` (deleting the
+downgrade, so the markers reach `symlink()`) reds the two sg-side F3 rows
+that assert the conflicted path is a plain file and still holds both
+targets. It does NOT red the third sg-side row, the index-stage
+comparison, and that is correct rather than a gap: the stages come from
+`e->base_mode`/`e->ours_mode`/`e->theirs_mode` and never from this
+downgraded local, so they stay 120000 either way.
+`c21` exists because a cold read of this very paragraph found it claiming a
+mutation that had never been run -- the guard had only been reproduced by
+hand BEFORE the F3 checks existed, which proves nothing about them.
+
+`add_resolved_entry` takes a `long written_len`: the length the CALLER
+just wrote at that path, or **< 0 meaning "this pass wrote nothing here"**
+(the untouched-path branch, which deliberately leaves a dirty-but-
+untouched file alone). Only a non-negative value licenses the
+"asked for N, M landed" comparison that zeroes the cached index size --
+see `docs/RULES-paths-strings.md`'s Phase 81c entry for git's own measured
+rule. Set it ONLY after a successful write; after a failed one there is no
+write of ours to compare against.
+WARNING: the only shape that reaches the mismatch branch through merge is
+a clean ADD of a 120000 blob whose bytes contain a NUL (interop `c19`).
+Every other merge row writes a target that survives intact, where the new
+rule and a plain `st.st_size` give the same answer -- so without c19 that
+branch was indistinguishable from the code it replaced.

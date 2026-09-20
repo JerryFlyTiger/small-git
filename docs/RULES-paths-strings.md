@@ -455,3 +455,88 @@ future caller never doing it.
   of `include/sg/workdir.h` into a test-only location is a future cleanup
   that touches roughly 30 test files for no behavior change; not done
   here.
+- **Phase 81b: every read of a working-tree path as a blob goes through
+  `workdir.h`'s symlink-aware helpers**, never `sg_hash_file_blob`/
+  `sg_read_file` directly: `sg_worktree_classify` (one `lstat`, type and
+  mode via `sg_worktree_mode_from_stat`), `sg_worktree_read_entry`/
+  `sg_worktree_hash_entry` (a symlink's blob is its `readlink` bytes,
+  read by `sg_worktree_readlink` with a growing buffer, never truncated),
+  and `sg_worktree_ancestor_blocked` (a tracked path under a symlinked or
+  non-directory ancestor is ABSENT, measured: git reports ` D dir/a.txt`
+  plus `?? dir`). A dangling symlink EXISTS. The repo root itself may still
+  be reached through a symlink (Phase 80 rule): only components below it
+  are checked.
+  WARNING: **`sg_worktree_read_entry`/`_hash_entry` fold "exists but
+  unreadable" into ABSENT**, which is right for status/diff but wrong for a
+  gate that must fail CLOSED. Round 1 of Phase 81b shipped exactly that
+  regression in `sg_stash_apply_check_dirty` (an unreadable tracked file
+  stopped counting as dirty, so `stash apply`/`pop` would overwrite it);
+  such a gate must classify first and treat any non-ABSENT path it cannot
+  hash as dirty.
+  WARNING: **decide how to read a path from its ON-DISK type, never from
+  the index's mode.** Round 2 keyed `sg_tree_build_from_workdir`'s
+  readlink-vs-fopen choice on the index mode and broke both directions,
+  with all gates green: index 120000 + worktree regular file made every
+  automatic snapshot fail (`sg reset --hard --force` refused); index 100644
+  + worktree symlink made `sg stash push` store the link TARGET's content
+  as 100644 (git stores 120000 + the link text). The recorded mode is the
+  observed one too, exec bit included (measured against `git stash push`).
+- **Phase 81b: `sg add` refuses a pathspec that is "beyond a symbolic
+  link"** (a symlink as a proper ancestor component, or a symlink named
+  with a trailing slash) with git's own wording, exit 1, in a PRE-PASS
+  over every argument before any object is written: `sg add f.txt
+  ld/a.txt` writes nothing, not even f.txt's blob (git writes nothing
+  either). The escape case matters: without it `sg add eo/x` (eo ->
+  ../out) copied a file from OUTSIDE the repository into the index.
+  Staging a non-directory at `P` evicts every index entry under `P/`
+  (`sg_index_remove_under`, `P/` boundary -- `dir2/x`, `dir.txt` and
+  `dir-x/y` survive `sg add dir`).
+
+## Phase 81c: the worktree write path creates real symlinks
+
+`sg_write_file_worktree` now dispatches on the caller's mode TYPE bits
+(`mode & 0170000`), not on permission bits alone: `0120000` calls
+`symlink()` with the blob bytes as the target, anything else takes the
+old `open(O_EXCL|O_NOFOLLOW)` + `fwrite` + `chmod` path. Three rules come
+with it, all measured:
+
+- **Callers must pass the FULL mode.** All six writers used to mask with
+  `& 0777` (apply.c, merge.c x2, cmd_restore.c, stash.c x2), which
+  collapsed 120000 to 0 before the function ever saw it. While that mask
+  was there, changing `sg_write_file_worktree` alone was a no-op -- if a
+  seventh writer appears, it inherits this requirement.
+- **WARNING: never `chmod()` a path you just created as a symlink.**
+  `chmod()` FOLLOWS a symlink, so it would silently change the TARGET
+  file's permissions -- a file that may be anywhere, including outside
+  the repository. The symlink branch returns before the chmod block for
+  exactly this reason. `tests/test_worktree_write.c`'s
+  `test_write_symlink_never_chmods_target` plants a 0400 file outside the
+  repo and asserts its bits survive; mutation c11 (adding a chmod back)
+  reds it.
+- The regular-file branch masks explicitly: `chmod(abs, mode & 07777)`.
+  POSIX leaves chmod's behaviour undefined for bits outside 07777; macOS
+  and Linux both ignore them (measured), so this removes a platform
+  freedom rather than documenting it. It is deliberately NOT observable
+  on either CI platform -- do not go looking for the test that proves it.
+
+Everything Phase 80 guaranteed still holds: the ancestor `lstat` walk and
+the final-component `unlink` run BEFORE the dispatch, so a symlink is
+never created through a symlinked ancestor, and `symlink()` is itself
+exclusive (it fails if the path exists).
+
+**The index's cached size follows git's rule, which is neither "what we
+wrote" nor "what lstat says"** (apply.c, stash.c, and merge.c's
+`add_resolved_entry`). Measured, git 2.55.0, hand-built 120000 blobs: a
+target that landed intact records its true lstat size (5 for `f.txt`); a
+target truncated at an embedded NUL records **0**. The 0 is deliberate --
+size, mtime, ino and mode would otherwise ALL match the link git just
+wrote, so a stat-only reader would call a link whose content does not
+match its blob CLEAN. sg follows: a mismatch between the length asked for
+and the length that landed zeroes the cached size.
+WARNING: **`st.st_size` is the wrong answer here and it looks like the
+right one.** A cold read recommended it; measuring git showed it is the
+one value git avoids. The reverse mutation (c20) is pinned by
+`phase81c c19 index`, the only check that can tell the two apart.
+Truncation at a NUL is git's own behaviour (`symlink()` takes a C
+string): do not pre-scan the target, do not reject it, do not translate
+it.

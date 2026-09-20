@@ -278,12 +278,64 @@ static void test_multi_stage_round_trip_and_lookup(void)
     free(dir);
 }
 
+/* Phase 81b round 1 (item 4): sg_index_remove_under's boundary -- it must
+   remove every entry strictly UNDER "dir/" and nothing else, in particular
+   not a PREFIX LOOK-ALIKE that merely starts with the same bytes without
+   the '/' boundary right after them ("dir.txt", "dir-x/y") and not an
+   entry AT "dir" itself. A bare strncmp without the boundary check would
+   wrongly sweep the look-alikes away too. */
+static void test_remove_under_boundary(void)
+{
+    sg_index idx;
+    sg_index_entry e;
+    int removed;
+
+    memset(&idx, 0, sizeof(idx));
+
+    fill_entry(&e, "dir", 0120000, 0x01);
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert dir failed");
+    fill_entry(&e, "dir/a.txt", 0100644, 0x02);
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert dir/a.txt failed");
+    fill_entry(&e, "dir/sub/b.txt", 0100644, 0x03);
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert dir/sub/b.txt failed");
+    fill_entry(&e, "dir.txt", 0100644, 0x04);
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert dir.txt failed");
+    fill_entry(&e, "dir-x/y", 0100644, 0x05);
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert dir-x/y failed");
+    fill_entry(&e, "dir2/x", 0100644, 0x06);
+    CHECK(sg_index_upsert(&idx, &e) == 0, "upsert dir2/x failed");
+
+    CHECK(idx.count == 6, "expected 6 entries before removal, got %zu", idx.count);
+
+    removed = sg_index_remove_under(&idx, "dir");
+    CHECK(removed == 2, "expected 2 entries removed (dir/a.txt, dir/sub/b.txt), got %d", removed);
+    CHECK(idx.count == 4, "expected 4 entries to remain, got %zu", idx.count);
+
+    CHECK(sg_index_find(&idx, "dir") >= 0, "the entry AT dir itself must survive");
+    CHECK(sg_index_find(&idx, "dir/a.txt") == -1, "dir/a.txt must be evicted");
+    CHECK(sg_index_find(&idx, "dir/sub/b.txt") == -1, "dir/sub/b.txt must be evicted");
+    CHECK(sg_index_find(&idx, "dir.txt") >= 0, "dir.txt (prefix look-alike) must survive");
+    CHECK(sg_index_find(&idx, "dir-x/y") >= 0, "dir-x/y (prefix look-alike) must survive");
+    CHECK(sg_index_find(&idx, "dir2/x") >= 0, "dir2/x (sibling directory) must survive");
+
+    /* A second call finds nothing left to remove. */
+    CHECK(sg_index_remove_under(&idx, "dir") == 0, "second call should report 0 removed");
+
+    /* An empty dir argument is a documented no-op (no repo-relative path is
+       ever "" or starts with '/'). */
+    CHECK(sg_index_remove_under(&idx, "") == 0, "empty dir argument must be a no-op");
+    CHECK(idx.count == 4, "empty dir argument must not remove anything, got %zu", idx.count);
+
+    sg_index_free(&idx);
+}
+
 int main(void)
 {
     test_roundtrip();
     test_missing_index_is_empty();
     test_reads_real_git_index_with_extension();
     test_multi_stage_round_trip_and_lookup();
+    test_remove_under_boundary();
 
     if (failures > 0) {
         fprintf(stderr, "%d failure(s)\n", failures);
