@@ -3,8 +3,12 @@
 A simplified git implemented in C11, executable is `sg`. The goal is
 **bit-for-bit disk-format compatibility with real git** -- objects, index v2,
 packfile, and the pkt-line protocol all have to be directly readable by real
-git; this is guarded by `tests/interop.sh` (2185 checks, using real `git` as
-the oracle).
+git; this is guarded by `tests/interop.sh`, which uses real `git` as the
+oracle. **How many checks it has is deliberately not written here** -- it
+grows every phase, the number below in "Build and verification" is the one
+the gate itself prints, and a count in prose is the defect this file's own
+Testing conventions section now names (this sentence said 2185 while the
+real total had passed 5300).
 
 On top of that there are two things real git does not have: `src/safety/`
 (automatic snapshots before destructive operations) and `src/storage/chunk.c`
@@ -935,10 +939,13 @@ bumping the version, keep the man page in sync.
     "timed out" line is not a verdict.
   - **Do not edit a file the running batch reads.** Adding interop checks
     while the battery ran meant later mutations were scored against a
-    different `tests/interop.sh` than earlier ones; the only verdicts that
-    can be distorted are the ones the new checks were written to fix,
-    which is exactly where it matters. Freeze the test files, or re-run
-    every entry after the edit.
+    different `tests/interop.sh` than earlier ones. THAT time the damage
+    was traced to the two entries the new checks were written to fix,
+    which is exactly where it mattered -- but that was a measurement of
+    one incident, not a rule: shared fixtures, shared helpers and resource
+    contention can reach entries the edit had nothing to do with. Freeze
+    the test files, and if an edit did land mid-run, re-run every entry
+    rather than reasoning about which ones could have been touched.
   - **A claimed mutation needs a log.** A doc sentence here once said
     "deleting this guard reds a named check" when that mutation had never
     been run -- the guard had only been reproduced by hand BEFORE the
