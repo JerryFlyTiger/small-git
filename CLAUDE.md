@@ -168,11 +168,17 @@ directly). On macOS, brew's openssl@3 is not on the default path, so
 `PKG_CONFIG_PATH` needs to be set.
 
 CI (`.github/workflows/ci.yml`) runs a three-cell matrix of
-ubuntu x {gcc,clang} + macos x clang, plus an ASan/UBSan job and a
-`fuzz-ignore` job, on every push to every branch.
+ubuntu x {gcc,clang} + macos x clang, plus an ASan/UBSan job, a `fuzz-ignore`
+job and a `fuzz-parse` job, on every push to every branch.
 **What cannot be tested locally (macOS): gcc, interop.sh under ASan/UBSan, and
-install/uninstall verification into a staging dir. A local green light is not
-sufficient evidence.**
+precise (ASan-based) leak detection. A local green light is not sufficient
+evidence.**
+This list used to name `install`/`uninstall` into a staging dir as the third
+item; measured 2026-09-21, that one runs fine on this machine
+(`make install DESTDIR=<dir> PREFIX=/usr` installs `usr/bin/sg` plus the man
+page, the binary runs, and `make uninstall` removes both), so it was replaced
+by leak detection, which genuinely cannot run here (the `--leaks` gate above
+says why). Do not put the install item back without re-measuring it.
 
 ## Module layout
 
