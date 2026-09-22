@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo.svg" alt="sg logo" width="160">
+</p>
+
 # small_git (`sg`)
 
 A version control tool implemented in pure C11, **fully compatible with git's object
