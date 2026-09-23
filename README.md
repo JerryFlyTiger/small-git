@@ -4,6 +4,21 @@
 
 # small_git (`sg`)
 
+> [!IMPORTANT]
+> **This project is archived and no longer maintained.**
+> It is a complete, heavily tested reimplementation of git's on-disk format and
+> core commands, and it works -- but it is **not a replacement for git** and
+> should not be used as your daily version control tool. Missing everyday
+> commands (`rm`, `mv`, `pull`, `config`, `rebase -i`, hooks, ...), no
+> integration with the tools that call `git` directly (IDEs, CI, hook
+> managers), and one known silent wrong answer in three-way merges of symlinks
+> (see [Known limitations](#known-limitations)) all rule that out.
+>
+> Its most useful idea -- automatic snapshots of uncommitted work before a
+> destructive command -- lives on as
+> [**git-salvage**](https://github.com/JerryFlyTiger/git-salvage), a small
+> add-on for the real `git`.
+
 A version control tool implemented in pure C11, **fully compatible with git's object
 format**. The same `.git` directory can be used interchangeably with `git` and
 `sg` -- commits created by `sg` can be read by `git log` and pass `git fsck --strict`,
@@ -78,7 +93,19 @@ longer scales with pack size (a 448KB repo and a 48MB repo are now equally fast)
 ## Installation
 
 Requires `zlib`, `openssl`, `libcurl` (detected via pkg-config) and a C11
-compiler.
+compiler. These are the same commands CI uses:
+
+```sh
+# Ubuntu / Debian
+sudo apt-get install -y pkg-config zlib1g-dev libssl-dev libcurl4-openssl-dev
+
+# macOS (Homebrew). brew's openssl is not on the default pkg-config path,
+# so PKG_CONFIG_PATH has to point at it or the build cannot find it.
+brew install pkg-config openssl@3
+export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"
+```
+
+Then build and install:
 
 ```sh
 make release                  # optimized build (-O2), produces build/sg
@@ -393,3 +420,7 @@ parser fuzzer job.
 ASan/UBSan, and leak detection (Apple's ASan has no LeakSanitizer and aborts
 on `detect_leaks=1`; `gates.sh --leaks` is a coarse stand-in, not a
 substitute). A green local board is not sufficient evidence.
+
+## License
+
+MIT -- see [LICENSE](LICENSE).
